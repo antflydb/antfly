@@ -890,6 +890,10 @@ type MetadataNodesSpec struct {
 	// +optional
 	Health APISpec `json:"health,omitempty"`
 
+	// StartupProbe defines the startup probe budget for metadata node recovery.
+	// +optional
+	StartupProbe *ProbeConfig `json:"startupProbe,omitempty"`
+
 	// UseSpotPods enables GKE Spot Pods for metadata nodes (standard GKE only)
 	// MUST be false when spec.gke.autopilot=true (use spec.gke.autopilotComputeClass instead)
 	// Not recommended for production metadata nodes as they maintain Raft consensus
@@ -958,6 +962,10 @@ type DataNodesSpec struct {
 	// +optional
 	Health APISpec `json:"health,omitempty"`
 
+	// StartupProbe defines the startup probe budget for data node recovery.
+	// +optional
+	StartupProbe *ProbeConfig `json:"startupProbe,omitempty"`
+
 	// UseSpotPods enables GKE Spot Pods for data nodes (standard GKE only)
 	// MUST be false when spec.gke.autopilot=true (use spec.gke.autopilotComputeClass instead)
 	// Safe for data nodes with 3+ replicas
@@ -1025,6 +1033,10 @@ type SwarmSpec struct {
 	// Health defines the health endpoint configuration.
 	Health APISpec `json:"health,omitempty"`
 
+	// StartupProbe defines the startup probe budget for swarm node recovery.
+	// +optional
+	StartupProbe *ProbeConfig `json:"startupProbe,omitempty"`
+
 	// Inference controls the optional inference sidecar runtime integrated into swarm mode.
 	// +optional
 	Inference *SwarmInferenceSpec `json:"inference,omitempty"`
@@ -1066,6 +1078,24 @@ type APISpec struct {
 
 	// Host is the host to bind to (default: 0.0.0.0)
 	Host string `json:"host,omitempty"`
+}
+
+// ProbeConfig defines basic Kubernetes probe timing settings.
+type ProbeConfig struct {
+	// FailureThreshold is the number of failed probes before Kubernetes restarts the container.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	FailureThreshold *int32 `json:"failureThreshold,omitempty"`
+
+	// PeriodSeconds is the interval between probe attempts.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	PeriodSeconds *int32 `json:"periodSeconds,omitempty"`
+
+	// TimeoutSeconds is the timeout for each probe attempt.
+	// +optional
+	// +kubebuilder:validation:Minimum=1
+	TimeoutSeconds *int32 `json:"timeoutSeconds,omitempty"`
 }
 
 // ResourceSpec defines resource requirements

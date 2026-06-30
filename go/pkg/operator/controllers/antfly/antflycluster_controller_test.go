@@ -7631,6 +7631,32 @@ func TestNodeIDForDataOrdinalUsesDecimalID(t *testing.T) {
 	g.Expect(nodeIDForDataOrdinal(9)).To(Equal("10"))
 }
 
+func TestBuildHTTPStartupProbeUsesDefaultsAndOverrides(t *testing.T) {
+	g := NewWithT(t)
+
+	defaultProbe := buildHTTPStartupProbe(4200, nil)
+	g.Expect(defaultProbe.HTTPGet).NotTo(BeNil())
+	g.Expect(defaultProbe.HTTPGet.Path).To(Equal("/healthz"))
+	g.Expect(defaultProbe.HTTPGet.Port.IntValue()).To(Equal(4200))
+	g.Expect(defaultProbe.InitialDelaySeconds).To(Equal(int32(30)))
+	g.Expect(defaultProbe.PeriodSeconds).To(Equal(int32(10)))
+	g.Expect(defaultProbe.TimeoutSeconds).To(Equal(int32(1)))
+	g.Expect(defaultProbe.FailureThreshold).To(Equal(int32(30)))
+
+	failureThreshold := int32(180)
+	periodSeconds := int32(5)
+	timeoutSeconds := int32(3)
+	customProbe := buildHTTPStartupProbe(4300, &antflyv1.ProbeConfig{
+		FailureThreshold: &failureThreshold,
+		PeriodSeconds:    &periodSeconds,
+		TimeoutSeconds:   &timeoutSeconds,
+	})
+	g.Expect(customProbe.HTTPGet.Port.IntValue()).To(Equal(4300))
+	g.Expect(customProbe.PeriodSeconds).To(Equal(periodSeconds))
+	g.Expect(customProbe.TimeoutSeconds).To(Equal(timeoutSeconds))
+	g.Expect(customProbe.FailureThreshold).To(Equal(failureThreshold))
+}
+
 func TestSetDataScaleDownStatusRecordsAutoscalerSource(t *testing.T) {
 	g := NewWithT(t)
 	reconciler := &AntflyClusterReconciler{}
