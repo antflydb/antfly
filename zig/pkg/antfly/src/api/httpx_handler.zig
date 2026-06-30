@@ -131,6 +131,13 @@ pub const AntflyApiHandler = struct {
         return ctx.response.build();
     }
 
+    fn respondJsonErrorBody(ctx: *httpx.Context, status: u16, body: []const u8) !httpx.Response {
+        _ = ctx.status(status);
+        try ctx.setHeader("content-type", "application/json");
+        _ = ctx.response.body(body);
+        return ctx.response.build();
+    }
+
     const OffloadedTableBatch = struct {
         alloc: std.mem.Allocator,
         table_name: []const u8,
@@ -1347,7 +1354,13 @@ pub const AntflyApiHandler = struct {
                 query_json: []const u8,
             ) !query_api.QueryResponse {
                 const runner: *@This() = @ptrCast(@alignCast(ptr));
-                var semantic_resolver = http_server_mod.SemanticStatusResolver{ .source = runner.server.source, .antfly_provider = runner.server.antfly_provider };
+                var semantic_resolver = http_server_mod.SemanticStatusResolver{
+                    .source = runner.server.source,
+                    .antfly_provider = runner.server.antfly_provider,
+                    .remote_content = runner.server.cfg.remote_content,
+                    .inference_api_url = runner.server.configuredInferenceAPIURL(),
+                    .inference_api_key = runner.server.cfg.inference_api_key,
+                };
                 var query_req = query_api.parsePublicQueryRequest(a, semantic_resolver.iface(), table_name, query_json) catch |err| switch (err) {
                     error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidRetrievalAgentRequest,
                     else => return err,
@@ -1532,6 +1545,7 @@ pub const AntflyApiHandler = struct {
                 .antfly_provider = self.api_server.antfly_provider,
                 .secret_store = self.api_server.cfg.secret_store,
                 .remote_content = self.api_server.cfg.remote_content,
+                .inference_api_url = self.api_server.configuredInferenceAPIURL(),
                 .inference_api_key = self.api_server.cfg.inference_api_key,
             },
         ) catch |err| switch (err) {
@@ -1539,6 +1553,7 @@ pub const AntflyApiHandler = struct {
                 _ = ctx.status(400);
                 return ctx.text("unsupported table index configuration");
             },
+            error.ModelNotFound => return respondJsonErrorBody(ctx, 404, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}"),
             error.EmbeddingProbeUnavailable => {
                 _ = ctx.status(503);
                 return ctx.text("table index validation probe unavailable");

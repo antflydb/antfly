@@ -2273,6 +2273,7 @@ pub const DataServer = struct {
         if (self.data_raft_apply) |apply_sm| {
             _ = apply_sm.write_source.withEntitySink(entity_sink);
         }
+        self.syncInferenceRuntimeConfig();
         self.http_server = antfly.public_api.ApiHttpServer.init(
             self.alloc,
             api_server_cfg,
@@ -2487,6 +2488,22 @@ pub const DataServer = struct {
             apply_sm.write_cache.antfly_provider = provider;
         }
         if (self.http_server) |*server| server.antfly_provider = provider;
+        self.syncInferenceRuntimeConfig();
+    }
+
+    fn configuredInferenceAPIURL(self: *const DataServer) ?[]const u8 {
+        const node_config = self.api_server_cfg.node_config orelse return null;
+        return node_config.inference.api_url;
+    }
+
+    fn syncInferenceRuntimeConfig(self: *DataServer) void {
+        const inference_api_url = self.configuredInferenceAPIURL();
+        _ = self.read_source.withInferenceAPIURL(inference_api_url);
+        _ = self.write_source.withInferenceAPIURL(inference_api_url);
+        if (self.data_raft_apply) |apply_sm| {
+            _ = apply_sm.write_source.withInferenceAPIURL(inference_api_url);
+            apply_sm.write_cache.inference_api_url = inference_api_url;
+        }
     }
 
     pub fn start(self: *DataServer) !void {
