@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const replay_source_mod = @import("replay_source.zig");
 const change_journal_mod = @import("change_journal.zig");
@@ -306,7 +307,7 @@ pub const DerivedRuntime = struct {
                 }
                 if (!all_persisted) {
                     self.mutex.unlock();
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -327,7 +328,7 @@ pub const DerivedRuntime = struct {
                 return;
             }
             self.mutex.unlock();
-            std.Thread.yield() catch {};
+            platform.time.yieldBriefly();
         }
     }
 
@@ -371,7 +372,7 @@ pub const DerivedRuntime = struct {
                 }
                 if (!all_persisted) {
                     self.mutex.unlock();
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     continue;
                 }
                 const truncate_sequence = truncate: {
@@ -392,7 +393,7 @@ pub const DerivedRuntime = struct {
                 return;
             }
             self.mutex.unlock();
-            std.Thread.yield() catch {};
+            platform.time.yieldBriefly();
         }
     }
 
@@ -447,7 +448,7 @@ fn workerMain(worker: *Worker) void {
                 runtime.recordError(err);
                 return;
             };
-            std.Thread.yield() catch {};
+            platform.time.yieldBriefly();
             continue;
         }
 
@@ -465,7 +466,7 @@ fn workerMain(worker: *Worker) void {
                     runtime.recordError(close_err);
                     return;
                 };
-                std.Thread.yield() catch {};
+                platform.time.yieldBriefly();
                 continue;
             }
             close_success = false;
@@ -480,7 +481,7 @@ fn workerMain(worker: *Worker) void {
                     return;
                 };
                 if (!target_visible) {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     continue;
                 }
             } else if (worker.replay_cursor != null) {
@@ -497,7 +498,7 @@ fn workerMain(worker: *Worker) void {
                             runtime.recordError(close_err);
                             return;
                         };
-                        std.Thread.yield() catch {};
+                        platform.time.yieldBriefly();
                         continue;
                     }
                     close_success = false;
@@ -536,7 +537,7 @@ fn workerMain(worker: *Worker) void {
         if (caught_up_sequence > from_sequence) {
             closeWorkerCatchUpState(runtime, worker, true) catch |err| {
                 if (isRecoverablePublishError(worker, err)) {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     continue;
                 }
                 close_success = false;
@@ -549,7 +550,7 @@ fn workerMain(worker: *Worker) void {
         if (caught_up_sequence > from_sequence) {
             persisted = runtime.persist_fn(runtime.ctx, worker.name, caught_up_sequence, forcePersistAppliedSequence(worker)) catch |err| {
                 if (err == error.WriterLocked) {
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     continue;
                 }
                 runtime.recordError(err);
@@ -587,7 +588,7 @@ fn workerMain(worker: *Worker) void {
                     lock(runtime);
                     runtime.truncates_in_flight -= 1;
                     runtime.mutex.unlock();
-                    std.Thread.yield() catch {};
+                    platform.time.yieldBriefly();
                     continue;
                 }
                 lock(runtime);
@@ -728,12 +729,7 @@ fn waitForReplayWindow(runtime: *DerivedRuntime, worker: *Worker, from_sequence:
 }
 
 fn sleepNs(ns: u64) void {
-    if (@TypeOf(std.c.nanosleep) == void) return;
-    var req: std.c.timespec = .{
-        .sec = @intCast(ns / std.time.ns_per_s),
-        .nsec = @intCast(ns % std.time.ns_per_s),
-    };
-    _ = std.c.nanosleep(&req, null);
+    platform.time.sleepNs(ns);
 }
 
 fn catchUpWorker(runtime: *DerivedRuntime, worker: *Worker) !derived_worker.CatchUpStats {
@@ -765,9 +761,7 @@ fn shouldRefreshReplayCursor(worker: *const Worker, caught_up_sequence: u64) boo
 }
 
 fn lock(runtime: *DerivedRuntime) void {
-    while (!runtime.mutex.tryLock()) {
-        std.Thread.yield() catch {};
-    }
+    _ = platform.sync.lockAtomic(&runtime.mutex);
 }
 
 const TestRuntimeCapture = struct {

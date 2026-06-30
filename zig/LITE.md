@@ -123,6 +123,42 @@ profile is deliberately added. The v1 serve command should bind only to
 loopback hosts; wildcard or LAN listeners should require a future explicit
 remote/development override.
 
+### Relational And SQL In Lite
+
+Lite is a storage/open profile, not a separate data model. Relational tables in
+Lite must use the same relational base-store contract described in
+`RELATIONAL.md`, and SQL in Lite must use the same parser, binder, session, and
+typed lowering contract described in `SQL.md`.
+
+The preferred long-term CLI shape is one SQL executor with two entrypoints:
+
+```sh
+antfly sql --lite app.aflite -c "SELECT * FROM users"
+antfly lite sql app.aflite -c "SELECT * FROM users"
+```
+
+`antfly lite sql` is only a convenience wrapper for opening a `.aflite` handle
+and invoking the shared SQL executor. It must not grow a separate dialect,
+catalog resolver, row encoder, or DDL path.
+
+Lite capabilities are the public gate for this integration:
+
+- `relational.tables=true` means the Lite profile can open and query relational
+  tables through the native relational row participant.
+- `relational.transactions="local"` means transaction semantics are local to
+  the single file; distributed coordination remains false.
+- `relational.portable_backup=false` means promotion/export of relational
+  physical rows is not yet safe through the portable AFB path.
+- `sql.adapter=true`, `sql.ddl=true`, and `sql.dml=true` mean SQL semantics are
+  native Antfly typed semantics, not durable SQL strings.
+- `sql.embedded_exec=true` means Lite can execute the first embedded SQL path
+  directly against a `.aflite` file through `antfly lite sql` or
+  `antfly sql --lite`, without a localhost HTTP server.
+
+`antfly lite schema set` remains a raw schema-JSON operation. SQL DDL is a
+compatibility frontend and must lower into the same typed catalog/table
+mutation path used by REST, SDK, C API, and internal callers.
+
 ### Embedded Library
 
 The library API should be small and boring:
@@ -569,7 +605,8 @@ Build profiles:
 - `lite-core`: embedded database, indexes, CLI, and narrow `/lite/v1` local
   serve mode, with no heavyweight inference runtime.
 - `lite-full`: embedded database plus local inference runtime.
-- `lite-wasm`: hosted/manual maintenance profile.
+- `lite-test`: Lite CLI, native, C ABI, Go binding, packaging, and WASM profile
+  checks.
 - `lite-dev`: debug/status tooling and compatibility experiments.
 
 ## Testing

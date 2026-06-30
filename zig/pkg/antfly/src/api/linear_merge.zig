@@ -333,7 +333,7 @@ fn isIgnoredSystemField(field: []const u8) bool {
 
 test "linear merge request parser sorts keys and accepts sync level aliases" {
     var req = try parseRequest(std.testing.allocator,
-        \\{"records":{"doc:b":{"title":"bravo"},"doc:a":{"title":"alpha"}},"sync_level":"full_text"}
+        \\{"records":{"doc:b":{"title":"bravo"},"doc:a":{"title":"alpha"}},"sync_level":"query"}
     );
     defer req.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(usize, 2), req.writes.len);

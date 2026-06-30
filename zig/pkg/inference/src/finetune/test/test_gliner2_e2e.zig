@@ -27,7 +27,7 @@
 //   - subsequent forward passes reflect those weight changes
 //
 // NOTE: This test requires the full build module graph (`ml`, system BLAS linkage).
-// Run via `zig build test-gliner2-e2e` after adding a build step in build.zig,
+// Run via `zig build gliner2-e2e-test` after adding a build step in build.zig,
 // or by referencing this file from an existing test root that has the required
 // imports.
 

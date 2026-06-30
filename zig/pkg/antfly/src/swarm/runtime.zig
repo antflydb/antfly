@@ -23,6 +23,11 @@ const usermgr_openapi = @import("antfly_usermgr_openapi");
 const fs_paths = @import("../common/fs_paths.zig");
 const platform_time = @import("../platform/time.zig");
 const platform = @import("antfly_platform");
+const catalog_resources = @import("../metadata/catalog/resources.zig");
+const catalog_source = @import("../metadata/catalog/source.zig");
+const catalog_table_ddl = @import("../metadata/catalog/table_ddl.zig");
+const relational_sql_ddl = @import("../metadata/catalog/relational_ddl.zig");
+const sql_adapter = @import("../sql/mod.zig");
 
 const AntflyApiHandler = antfly.public_api.httpx_handler.AntflyApiHandler;
 const http_common = antfly.common.http;
@@ -43,6 +48,8 @@ const CliConfig = struct {
     config_path: ?[]const u8 = null,
     bind_host: ?[]const u8 = null,
     bind_port: ?u16 = null,
+    pgwire_host: ?[]const u8 = null,
+    pgwire_port: ?u16 = null,
     health_enabled: ?bool = null,
     health_port: ?u16 = null,
     tick_ms: ?u64 = null,
@@ -174,6 +181,7 @@ const LocalSwarmMetadata = struct {
         epoch: u64 = 1,
         tables: []const antfly.metadata.TableRecord = &.{},
         ranges: []const antfly.metadata.RangeRecord = &.{},
+        sequences: []const antfly.metadata.SequenceRecord = &.{},
         extension_packages: []const antfly.extensions.PackageManifest = &.{},
         installed_extensions: []const antfly.extensions.InstalledExtension = &.{},
         extension_members: []const antfly.extensions.ExtensionMember = &.{},
@@ -208,6 +216,7 @@ const LocalSwarmMetadata = struct {
         };
         errdefer self.deinit();
         try self.loadPersistedCatalog();
+        try self.manager.ensureDefaultCatalog();
         return self;
     }
 
@@ -220,12 +229,19 @@ const LocalSwarmMetadata = struct {
         self.* = undefined;
     }
 
-    fn catalogSource(self: *LocalSwarmMetadata) antfly.public_api.table_catalog.CatalogSource {
+    fn catalogSource(self: *LocalSwarmMetadata) catalog_source.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
                 .admin_snapshot = catalogAdminSnapshot,
                 .free_admin_snapshot = catalogFreeAdminSnapshot,
+                .upsert_table_emptying_job = statusUpsertTableEmptyingJob,
+                .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_batch_update_with_schema_rewrite_jobs = statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_drop_with_schema_rewrite_jobs = statusApplyTableCatalogDropWithSchemaRewriteJobs,
+                .promote_table_emptying_barrier = statusPromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = statusResetIdentityAllocatorsForTableEmptyingBarrier,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = statusSupportsIdentityAllocatorResetForTableEmptyingBarrier,
             },
         };
     }
@@ -244,6 +260,14 @@ const LocalSwarmMetadata = struct {
                 .update_schema = updateSchema,
                 .create_index = createIndex,
                 .drop_index = dropIndex,
+                .apply_relational_sql_ddl_plan_with_session = applyRelationalSqlDdlPlanWithSession,
+                .apply_table_catalog_update_with_schema_rewrite_jobs = statusApplyTableCatalogUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_batch_update_with_schema_rewrite_jobs = statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs,
+                .apply_table_catalog_drop_with_schema_rewrite_jobs = statusApplyTableCatalogDropWithSchemaRewriteJobs,
+                .upsert_table_emptying_job = statusUpsertTableEmptyingJob,
+                .promote_table_emptying_barrier = statusPromoteTableEmptyingBarrier,
+                .reset_identity_allocators_for_table_emptying_barrier = statusResetIdentityAllocatorsForTableEmptyingBarrier,
+                .supports_identity_allocator_reset_for_table_emptying_barrier = statusSupportsIdentityAllocatorResetForTableEmptyingBarrier,
                 .put_artifact_enrichment = putArtifactEnrichment,
                 .delete_artifact_enrichment = deleteArtifactEnrichment,
                 .wait_table_lifecycle = waitTableLifecycle,
@@ -289,8 +313,20 @@ const LocalSwarmMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
 
+        return try self.catalogAdminSnapshotLocked();
+    }
+
+    fn catalogAdminSnapshotLocked(self: *LocalSwarmMetadata) !antfly.metadata_api.AdminSnapshot {
         const tables = try self.manager.listTables(self.alloc);
         errdefer self.manager.freeTables(self.alloc, tables);
+        const databases = try self.manager.listDatabases(self.alloc);
+        errdefer self.manager.freeDatabases(self.alloc, databases);
+        const namespaces = try self.manager.listNamespaces(self.alloc);
+        errdefer self.manager.freeNamespaces(self.alloc, namespaces);
+        const tablespaces = try self.manager.listTablespaces(self.alloc);
+        errdefer self.manager.freeTablespaces(self.alloc, tablespaces);
+        const sequences = try self.manager.listSequences(self.alloc);
+        errdefer self.manager.freeSequences(self.alloc, sequences);
         const ranges = try self.manager.listRanges(self.alloc);
         errdefer self.manager.freeRanges(self.alloc, ranges);
         const extension_packages = try self.extension_catalog.listPackages(self.alloc);
@@ -345,6 +381,10 @@ const LocalSwarmMetadata = struct {
                 .projected_placement_intents = placement_intents.len,
                 .metrics = .{},
             },
+            .databases = databases,
+            .namespaces = namespaces,
+            .tablespaces = tablespaces,
+            .sequences = sequences,
             .tables = tables,
             .ranges = ranges,
             .stores = stores,
@@ -360,6 +400,10 @@ const LocalSwarmMetadata = struct {
 
     fn catalogFreeAdminSnapshot(ptr: *anyopaque, snapshot: *antfly.metadata_api.AdminSnapshot) void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        self.manager.freeDatabases(self.alloc, snapshot.databases);
+        self.manager.freeNamespaces(self.alloc, snapshot.namespaces);
+        self.manager.freeTablespaces(self.alloc, snapshot.tablespaces);
+        self.manager.freeSequences(self.alloc, snapshot.sequences);
         self.manager.freeTables(self.alloc, snapshot.tables);
         self.manager.freeRanges(self.alloc, snapshot.ranges);
         for (snapshot.stores) |store| antfly.metadata.table_manager.freeStore(self.alloc, store);
@@ -374,22 +418,330 @@ const LocalSwarmMetadata = struct {
         snapshot.* = undefined;
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: antfly.public_api.tables.CreateTableRequest) !void {
+    pub fn adminSnapshot(self: *LocalSwarmMetadata) !antfly.metadata_api.AdminSnapshot {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return try self.catalogAdminSnapshotLocked();
+    }
+
+    pub fn freeAdminSnapshot(self: *LocalSwarmMetadata, snapshot: *antfly.metadata_api.AdminSnapshot) void {
+        catalogFreeAdminSnapshot(self, snapshot);
+    }
+
+    pub fn upsertTable(self: *LocalSwarmMetadata, record: antfly.metadata.TableRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertTable(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: *LocalSwarmMetadata,
+        request: antfly.metadata.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: *LocalSwarmMetadata,
+        request: antfly.metadata.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: *LocalSwarmMetadata,
+        request: antfly.metadata.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.applyTableCatalogDropWithSchemaRewriteJobs(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn upsertSequence(self: *LocalSwarmMetadata, record: antfly.metadata.SequenceRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertSequence(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn removeSequence(self: *LocalSwarmMetadata, sequence_id: u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const removed = try self.manager.removeSequence(sequence_id);
+        antfly.metadata.table_manager.freeSequence(self.alloc, removed);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn statusApplyTableCatalogUpdateWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: antfly.metadata.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
         const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
-        const table = antfly.public_api.tables.deriveTableRecord(table_name, req);
-        const ranges = try antfly.public_api.tables.deriveInitialRanges(alloc, table);
+        return try self.applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+    }
+
+    fn statusApplyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: antfly.metadata.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+    }
+
+    fn statusApplyTableCatalogDropWithSchemaRewriteJobs(
+        ptr: *anyopaque,
+        request: antfly.metadata.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.applyTableCatalogDropWithSchemaRewriteJobs(request);
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.TableEmptyingBarrierPromotionRequest) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.promoteTableEmptyingBarrier(request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *LocalSwarmMetadata, request: antfly.metadata.TableEmptyingIdentityAllocatorResetRequest) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        _ = try self.manager.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, request);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn upsertTableEmptyingJob(self: *LocalSwarmMetadata, record: antfly.metadata.TableEmptyingJobRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertTableEmptyingJob(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    fn statusUpsertTableEmptyingJob(ptr: *anyopaque, record: antfly.metadata.TableEmptyingJobRecord) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.upsertTableEmptyingJob(record);
+    }
+
+    fn statusPromoteTableEmptyingBarrier(ptr: *anyopaque, request: antfly.metadata.TableEmptyingBarrierPromotionRequest) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.promoteTableEmptyingBarrier(request);
+    }
+
+    fn statusResetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: antfly.metadata.TableEmptyingIdentityAllocatorResetRequest) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try self.resetIdentityAllocatorsForTableEmptyingBarrier(request);
+    }
+
+    fn statusSupportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+        return true;
+    }
+
+    pub fn upsertRange(self: *LocalSwarmMetadata, record: antfly.metadata.RangeRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertRange(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn removeRange(self: *LocalSwarmMetadata, group_id: u64) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        _ = self.manager.removeRange(group_id);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn upsertSchemaRewriteJob(self: *LocalSwarmMetadata, record: antfly.metadata.SchemaRewriteJobRecord) !void {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        try self.manager.upsertSchemaRewriteJob(record);
+        self.epoch +|= 1;
+        try self.persistLocked();
+    }
+
+    pub fn listProjectedTables(self: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.metadata.TableRecord {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return try self.manager.listTables(allocator);
+    }
+
+    pub fn freeProjectedTables(self: *LocalSwarmMetadata, allocator: std.mem.Allocator, records: []antfly.metadata.TableRecord) void {
+        self.manager.freeTables(allocator, records);
+    }
+
+    pub fn listProjectedRanges(self: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.metadata.RangeRecord {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return try self.manager.listRanges(allocator);
+    }
+
+    pub fn freeProjectedRanges(self: *LocalSwarmMetadata, allocator: std.mem.Allocator, records: []antfly.metadata.RangeRecord) void {
+        self.manager.freeRanges(allocator, records);
+    }
+
+    pub fn listProjectedStores(self: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.metadata.StoreRecord {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const stores = try allocator.alloc(antfly.metadata.StoreRecord, 1);
+        errdefer allocator.free(stores);
+        stores[0] = try antfly.metadata.table_manager.cloneStore(allocator, .{
+            .store_id = self.store_id,
+            .node_id = self.local_node_id,
+            .api_url = self.api_url,
+            .role = "data",
+            .health_class = "healthy",
+            .live = true,
+        });
+        return stores;
+    }
+
+    pub fn freeProjectedStores(_: *LocalSwarmMetadata, allocator: std.mem.Allocator, records: []antfly.metadata.StoreRecord) void {
+        for (records) |record| antfly.metadata.table_manager.freeStore(allocator, record);
+        allocator.free(records);
+    }
+
+    pub fn listProjectedPlacementIntents(self: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.raft.PlacementIntent {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        const ranges = try self.manager.listRanges(allocator);
+        defer self.manager.freeRanges(allocator, ranges);
+        const intents = try allocator.alloc(antfly.raft.PlacementIntent, ranges.len);
+        for (ranges, 0..) |range, i| {
+            intents[i] = .{
+                .record = .{
+                    .group_id = range.group_id,
+                    .replica_id = 1,
+                    .local_node_id = self.local_node_id,
+                    .bootstrap_mode = .persisted,
+                    .metadata_version = self.epoch,
+                },
+                .store_id = self.store_id,
+                .peer_node_ids = &.{},
+            };
+        }
+        return intents;
+    }
+
+    pub fn freeProjectedPlacementIntents(_: *LocalSwarmMetadata, allocator: std.mem.Allocator, intents: []antfly.raft.PlacementIntent) void {
+        allocator.free(intents);
+    }
+
+    pub fn listProjectedSchemaRewriteJobs(self: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.metadata.SchemaRewriteJobRecord {
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+        return try self.manager.listSchemaRewriteJobs(allocator);
+    }
+
+    pub fn freeProjectedSchemaRewriteJobs(self: *LocalSwarmMetadata, allocator: std.mem.Allocator, records: []antfly.metadata.SchemaRewriteJobRecord) void {
+        self.manager.freeSchemaRewriteJobs(allocator, records);
+    }
+
+    pub fn listProjectedSplitTransitions(_: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.metadata.SplitTransitionRecord {
+        return try allocator.alloc(antfly.metadata.SplitTransitionRecord, 0);
+    }
+
+    pub fn freeProjectedSplitTransitions(_: *LocalSwarmMetadata, allocator: std.mem.Allocator, records: []antfly.metadata.SplitTransitionRecord) void {
+        allocator.free(records);
+    }
+
+    pub fn listProjectedMergeTransitions(_: *LocalSwarmMetadata, allocator: std.mem.Allocator) ![]antfly.metadata.MergeTransitionRecord {
+        return try allocator.alloc(antfly.metadata.MergeTransitionRecord, 0);
+    }
+
+    pub fn freeProjectedMergeTransitions(_: *LocalSwarmMetadata, allocator: std.mem.Allocator, records: []antfly.metadata.MergeTransitionRecord) void {
+        allocator.free(records);
+    }
+
+    pub fn observeSplitTransition(_: *LocalSwarmMetadata, _: u64) !?antfly.metadata.SplitObservation {
+        return null;
+    }
+
+    pub fn observeMergeTransition(_: *LocalSwarmMetadata, _: u64) !?antfly.metadata.MergeObservation {
+        return null;
+    }
+
+    pub fn applyReconciliationPlan(self: *LocalSwarmMetadata, plan: *const antfly.metadata.ReconciliationPlan) !void {
+        if (plan.split_upserts.len != 0 or
+            plan.merge_upserts.len != 0 or
+            plan.split_removals.len != 0 or
+            plan.merge_removals.len != 0 or
+            plan.split_steps.len != 0 or
+            plan.merge_steps.len != 0 or
+            plan.clear_reallocation_request)
+        {
+            return error.UnsupportedOperation;
+        }
+
+        lockAtomic(&self.mutex);
+        defer self.mutex.unlock();
+
+        var changed = false;
+        for (plan.table_upserts) |record| {
+            try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
+            changed = true;
+        }
+        for (plan.range_upserts) |record| {
+            try self.manager.upsertRange(record);
+            changed = true;
+        }
+        for (plan.table_removals) |table_id| {
+            _ = self.manager.removeTableTopology(table_id);
+            changed = true;
+        }
+        for (plan.range_removals) |group_id| {
+            _ = self.manager.removeRange(group_id);
+            changed = true;
+        }
+
+        if (changed) {
+            self.epoch +|= 1;
+            try self.persistLocked();
+        }
+    }
+
+    pub fn proposeTransitionCommand(_: *LocalSwarmMetadata, _: anytype) !void {}
+
+    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        var normalized_req = req;
+        const indexes_json = req.indexes_json orelse catalog_table_ddl.default_indexes_json;
+        const prepared_indexes_json = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, catalog_table_ddl.effectiveSchemaJson(req.schema_json));
+        defer alloc.free(prepared_indexes_json);
+        normalized_req.indexes_json = prepared_indexes_json;
+        const table = catalog_table_ddl.deriveTableRecord(table_name, normalized_req);
+        const ranges = try catalog_table_ddl.deriveInitialRanges(alloc, table);
         defer {
             for (ranges) |record| antfly.metadata.table_manager.freeRange(alloc, record);
             alloc.free(ranges);
         }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
-        try self.manager.upsertTable(table);
-        for (ranges) |range| try self.manager.upsertRange(range);
-        self.epoch +|= 1;
-        try self.persistLocked();
+        {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        }
+
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(self, table, ranges);
     }
 
     fn restoreTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, location_uri: []const u8, backup_id: []const u8) !void {
@@ -407,13 +759,15 @@ const LocalSwarmMetadata = struct {
             alloc.free(ranges);
         }
 
-        lockAtomic(&self.mutex);
-        defer self.mutex.unlock();
-        if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
-        try self.manager.upsertTable(table);
-        for (ranges) |range| try self.manager.upsertRange(range);
-        self.epoch +|= 1;
-        try self.persistLocked();
+        {
+            lockAtomic(&self.mutex);
+            defer self.mutex.unlock();
+            if (self.findTableByNameLocked(table_name) != null) return error.TableAlreadyExists;
+        }
+
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(self, table, ranges);
     }
 
     fn dropTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8) !void {
@@ -431,9 +785,9 @@ const LocalSwarmMetadata = struct {
         lockAtomic(&self.mutex);
         defer self.mutex.unlock();
         const table = self.findTableByNameLocked(table_name) orelse return error.TableNotFound;
-        const updated = try antfly.public_api.tables.applySchemaUpdateRecord(alloc, table, schema_json);
+        const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
         defer antfly.metadata.table_manager.freeTable(alloc, updated);
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -446,7 +800,7 @@ const LocalSwarmMetadata = struct {
         var updated = table.*;
         updated.indexes_json = try antfly.public_api.indexes.addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
         defer alloc.free(updated.indexes_json);
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -460,9 +814,19 @@ const LocalSwarmMetadata = struct {
         defer alloc.free(indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
+    }
+
+    fn applyRelationalSqlDdlPlanWithSession(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        plan: *sql_adapter.DurableSqlPlan,
+        session: catalog_resources.SqlCatalogSession,
+    ) !catalog_table_ddl.AppliedRelationalSqlDdlRecord {
+        const self: *LocalSwarmMetadata = @ptrCast(@alignCast(ptr));
+        return try relational_sql_ddl.applyDurablePlanOnServiceWithSessionAlloc(alloc, self, plan, session);
     }
 
     fn putArtifactEnrichment(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, artifact_name: []const u8, enrichment_json: []const u8) !void {
@@ -474,7 +838,7 @@ const LocalSwarmMetadata = struct {
         updated.indexes_json = try antfly.public_api.indexes.addEnrichmentToTableIndexesJson(alloc, table.indexes_json, artifact_name, enrichment_json);
         defer alloc.free(updated.indexes_json);
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, updated.indexes_json);
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -489,7 +853,7 @@ const LocalSwarmMetadata = struct {
         try antfly.public_api.indexes.validateArtifactEnrichmentsForTableIndexesJson(alloc, indexes_json);
         var updated = table.*;
         updated.indexes_json = indexes_json;
-        try self.manager.upsertTable(updated);
+        try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
         self.epoch +|= 1;
         try self.persistLocked();
     }
@@ -715,7 +1079,7 @@ const LocalSwarmMetadata = struct {
             self.alloc.free(updated.read_schema_json);
             updated.read_schema_json = try self.alloc.dupe(u8, "");
 
-            try self.manager.upsertTable(updated);
+            try self.manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = updated });
             changed = true;
         }
 
@@ -729,6 +1093,19 @@ const LocalSwarmMetadata = struct {
         var it = self.manager.tables.valueIterator();
         while (it.next()) |table| {
             if (std.mem.eql(u8, table.name, table_name)) return table;
+        }
+        return null;
+    }
+
+    fn findTableByQualifiedNameLocked(
+        self: *LocalSwarmMetadata,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        table_name: []const u8,
+    ) ?*const antfly.metadata.TableRecord {
+        var it = self.manager.tables.valueIterator();
+        while (it.next()) |table| {
+            if (catalog_table_ddl.tableCatalogIdentityMatches(table.*, database_name, namespace_name, table_name)) return table;
         }
         return null;
     }
@@ -747,6 +1124,7 @@ const LocalSwarmMetadata = struct {
         defer parsed.deinit();
 
         _ = try self.manager.replaceProjectedTopology(parsed.value.tables, parsed.value.ranges);
+        for (parsed.value.sequences) |record| try self.manager.upsertSequence(record);
         try self.extension_catalog.loadProjectedRows(
             parsed.value.extension_packages,
             parsed.value.installed_extensions,
@@ -761,6 +1139,8 @@ const LocalSwarmMetadata = struct {
         defer self.manager.freeTables(self.alloc, tables);
         const ranges = try self.manager.listRanges(self.alloc);
         defer self.manager.freeRanges(self.alloc, ranges);
+        const sequences = try self.manager.listSequences(self.alloc);
+        defer self.manager.freeSequences(self.alloc, sequences);
         const extension_packages = try self.extension_catalog.listPackages(self.alloc);
         defer self.extension_catalog.freePackages(self.alloc, extension_packages);
         const installed_extensions = try self.extension_catalog.listInstalled(self.alloc);
@@ -774,6 +1154,7 @@ const LocalSwarmMetadata = struct {
             .epoch = self.epoch,
             .tables = tables,
             .ranges = ranges,
+            .sequences = sequences,
             .extension_packages = extension_packages,
             .installed_extensions = installed_extensions,
             .extension_members = extension_members,
@@ -817,7 +1198,7 @@ fn dropFullTextIndexForVersion(
 
     var versioned_name_buf: [64]u8 = undefined;
     const stale_name = if (version == 0)
-        antfly.public_api.tables.default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         try std.fmt.bufPrint(&versioned_name_buf, "full_text_index_v{d}", .{version});
     _ = object.swapRemove(stale_name);
@@ -1056,6 +1437,15 @@ pub fn runFromIterator(
     };
 
     const api_server = &data_server.http_server.?;
+    var public_api_surface = antfly.public_api.public_runtime.PublicApiSurface.initForBorrowedApiServer(alloc, api_server);
+    defer public_api_surface.deinit();
+    try public_api_surface.startPgwireOptional(.{
+        .bind_host = cli.pgwire_host,
+        .default_bind_host = public_listener.bind_host,
+        .bind_port = cli.pgwire_port,
+        .auth_enabled = auth_enabled,
+        .auth_error_message = "swarm pgwire listener does not support auth yet; disable --auth or omit --pgwire-port",
+    });
 
     // ---------------------------------------------------------------
     // Unified httpx.Server — all routes on a single port
@@ -1584,21 +1974,26 @@ fn PrefixedServer(comptime prefix: []const u8, comptime Inner: type) type {
         inner: *Inner,
 
         pub fn post(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.post(prefix ++ path, handler_fn);
+            try self.inner.post(prefixedRoutePath(prefix, path), handler_fn);
         }
 
         pub fn get(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.get(prefix ++ path, handler_fn);
+            try self.inner.get(prefixedRoutePath(prefix, path), handler_fn);
         }
 
         pub fn put(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.put(prefix ++ path, handler_fn);
+            try self.inner.put(prefixedRoutePath(prefix, path), handler_fn);
         }
 
         pub fn delete(self: *const @This(), comptime path: []const u8, handler_fn: httpx.Handler) !void {
-            try self.inner.delete(prefix ++ path, handler_fn);
+            try self.inner.delete(prefixedRoutePath(prefix, path), handler_fn);
         }
     };
+}
+
+fn prefixedRoutePath(comptime prefix: []const u8, comptime path: []const u8) []const u8 {
+    if (std.mem.eql(u8, path, prefix) or std.mem.startsWith(u8, path, prefix ++ "/")) return path;
+    return prefix ++ path;
 }
 
 fn healthzHandler(ctx: *httpx.Context) anyerror!httpx.Response {
@@ -1785,16 +2180,31 @@ fn hasUnsafeStaticPath(path: []const u8) bool {
 fn isAntfarmReservedPath(path: []const u8) bool {
     const reserved = [_][]const u8{
         "/api",
+        "/a2a",
+        "/agents",
+        "/auth",
+        "/backup",
+        "/backups",
+        "/connections",
+        "/databases",
+        "/db",
+        "/eval",
         "/ml",
         "/antfly",
         "/metadata",
         "/admin",
+        "/ai",
         "/internal",
         "/mcp",
         "/extensions",
         "/healthz",
         "/readyz",
         "/registry",
+        "/restore",
+        "/secrets",
+        "/tables",
+        "/tablespaces",
+        "/transactions",
     };
     for (reserved) |prefix| {
         if (std.mem.eql(u8, path, prefix)) return true;
@@ -1973,6 +2383,9 @@ fn registerInternalGroupRoutes(server: anytype) !void {
         table_prefix ++ routes.join_partition_suffix,
         table_prefix ++ routes.query_suffix,
         table_prefix ++ routes.batch_suffix,
+        table_prefix ++ routes.secondary_index_rebuild_suffix,
+        table_prefix ++ routes.schema_rewrite_suffix,
+        table_prefix ++ routes.table_emptying_suffix,
         table_prefix ++ routes.txn_begin_suffix,
         table_prefix ++ routes.txn_prepare_suffix,
         table_prefix ++ routes.txn_resolve_suffix,
@@ -2106,6 +2519,14 @@ fn parseCli(alloc: std.mem.Allocator, args: *std.process.Args.Iterator) !CliConf
         }
         if (std.mem.eql(u8, arg, "--port")) {
             cfg.bind_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-host")) {
+            cfg.pgwire_host = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-port")) {
+            cfg.pgwire_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--health-port")) {
@@ -2875,6 +3296,8 @@ fn printUsage() void {
         \\  --config <path>                       JSON common config file
         \\  --host <host>                         Public API host (default: 127.0.0.1)
         \\  --port <port>                         Public API port (default: 8080)
+        \\  --pgwire-host <host>                  Pgwire bind host (default: --host)
+        \\  --pgwire-port <port>                  Enable pgwire TCP listener on this port
         \\  --id <node-id>                        Local node id (default: 1)
         \\  --health <true|false>                 Enable health/metrics server (default: true)
         \\  --health-port <port>                  Dedicated health/metrics port on --host (default: 4200)
@@ -3022,6 +3445,19 @@ test "swarm runtime module compiles" {
     _ = runFromIterator;
 }
 
+test "swarm runtime registers public SQL route under db api prefix once" {
+    var server = RecordingServer{ .allocator = std.testing.allocator };
+    defer server.deinit();
+
+    var handler: AntflyApiHandler = undefined;
+    const public_router = metadata_openapi.server.ServerRouter(AntflyApiHandler).init(&handler);
+    var public_prefixed = PrefixedServer("/db/v1", RecordingServer){ .inner = &server };
+    try public_router.register(&public_prefixed);
+
+    try std.testing.expect(server.hasRoute(.post, "/db/v1/sql"));
+    try std.testing.expect(!server.hasRoute(.post, "/db/v1/db/v1/sql"));
+}
+
 test "swarm runtime local generator accepts media url data uris" {
     const alloc = std.testing.allocator;
     const messages = [_]antfly.inference.ChatMessage{.{
@@ -3132,6 +3568,9 @@ test "swarm runtime registers internal group routes explicitly" {
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.join_partition_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.query_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.batch_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.secondary_index_rebuild_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.schema_rewrite_suffix));
+    try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.table_emptying_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_begin_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_prepare_suffix));
     try std.testing.expect(server.hasRoute(.post, table_prefix ++ routes.txn_resolve_suffix));
@@ -4210,6 +4649,125 @@ test "swarm runtime resolves explicit extension package store path" {
     try std.testing.expectEqualStrings("/opt/antfly/extensions", resolved.extension_package_store_dir);
 }
 
+test "swarm local metadata drop table cascade removes child foreign keys" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(std.testing.io, "replicas");
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/replicas", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const catalog_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/local-metadata.json", .{tmp.sub_path});
+    defer alloc.free(catalog_path);
+
+    var backend_runtime = try antfly.db.background_runtime.BackendRuntimeHandle.init(alloc, .{});
+    defer backend_runtime.deinit();
+
+    var metadata = try LocalSwarmMetadata.init(
+        alloc,
+        1,
+        1,
+        "http://127.0.0.1:8080",
+        replica_root_dir,
+        catalog_path,
+        backend_runtime.ptr(),
+    );
+    defer metadata.deinit();
+
+    const tables = [_]antfly.metadata.TableRecord{
+        .{
+            .table_id = 8,
+            .name = "customers",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .placement_role = "data",
+        },
+        .{
+            .table_id = 7,
+            .name = "orders",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"},"account_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"},{"name":"orders_account_id_fkey","columns":["account_id"],"references":{"table":"accounts","columns":["id"]},"on_delete":"restrict","validation_state":"enforced"}]}
+            ,
+            .placement_role = "data",
+        },
+        .{
+            .table_id = 9,
+            .name = "accounts",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .placement_role = "data",
+        },
+        .{
+            .table_id = 10,
+            .name = "invoices",
+            .schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+            ,
+            .placement_role = "data",
+        },
+    };
+    for (tables) |table| try metadata.manager.upsertTable(table);
+
+    {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE invoices_id_seq AS bigint START WITH 10 OWNED BY public.invoices.id");
+        defer parsed_sql.deinit(alloc);
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer durable_plan.deinit(alloc);
+
+        var applied = try LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
+        defer applied.deinit(alloc);
+        try std.testing.expect(applied.created_sequence);
+    }
+    {
+        const sequences = try metadata.manager.listSequences(alloc);
+        defer metadata.manager.freeSequences(alloc, sequences);
+        try std.testing.expectEqual(@as(usize, 1), sequences.len);
+        try std.testing.expectEqualStrings("invoices_id_seq", sequences[0].name);
+    }
+    {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE invoices");
+        defer parsed_sql.deinit(alloc);
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer durable_plan.deinit(alloc);
+        try std.testing.expectError(
+            error.TableReferencedBySequence,
+            LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default()),
+        );
+    }
+    {
+        var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE invoices CASCADE");
+        defer parsed_sql.deinit(alloc);
+        var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+        defer durable_plan.deinit(alloc);
+
+        var applied = try LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
+        defer applied.deinit(alloc);
+        try std.testing.expect(applied.dropped_table);
+    }
+    try std.testing.expect(metadata.findTableByNameLocked("invoices") == null);
+    {
+        const sequences = try metadata.manager.listSequences(alloc);
+        defer metadata.manager.freeSequences(alloc, sequences);
+        try std.testing.expectEqual(@as(usize, 0), sequences.len);
+    }
+
+    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, "DROP TABLE customers CASCADE");
+    defer parsed_sql.deinit(alloc);
+    var durable_plan = try sql_adapter.planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(alloc, &parsed_sql, .{});
+    defer durable_plan.deinit(alloc);
+
+    var applied = try LocalSwarmMetadata.applyRelationalSqlDdlPlanWithSession(&metadata, alloc, &durable_plan, catalog_resources.SqlCatalogSession.default());
+    defer applied.deinit(alloc);
+    try std.testing.expect(applied.dropped_table);
+
+    try std.testing.expect(metadata.findTableByNameLocked("customers") == null);
+    const orders = metadata.findTableByNameLocked("orders") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(std.mem.indexOf(u8, orders.schema_json, "orders_customer_id_fkey") == null);
+    try std.testing.expect(std.mem.indexOf(u8, orders.schema_json, "orders_account_id_fkey") != null);
+}
+
 test "swarm runtime resolves extension package store env before local default" {
     const alloc = std.testing.allocator;
 
@@ -4246,12 +4804,26 @@ test "swarm runtime data dir overrides common storage base dir" {
 
     const local_base = try resolveLocalBaseDir(alloc, .{ .data_dir = "/tmp/from-cli" }, &cfg);
     defer alloc.free(local_base);
-    try std.testing.expectEqualStrings("/tmp/from-cli", local_base);
+    const expected_local_base = try normalizeResolvedPathAlloc(alloc, "/tmp/from-cli");
+    defer alloc.free(expected_local_base);
+    try std.testing.expectEqualStrings(expected_local_base, local_base);
 
     const resolved = try resolvePaths(alloc, .{ .data_dir = "/tmp/from-cli" }, &cfg);
     defer resolved.deinit(alloc);
-    try std.testing.expectEqualStrings("/tmp/from-cli/data/replicas", resolved.replica_root_dir);
-    try std.testing.expectEqualStrings("/tmp/from-cli/data/catalog.txt", resolved.replica_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/from-cli/metadata/local-metadata.json", resolved.local_metadata_catalog_path);
-    try std.testing.expectEqualStrings("/tmp/from-cli/data/snapshots", resolved.snapshot_root_dir);
+    const expected_data_base = try std.fs.path.join(alloc, &.{ expected_local_base, "data" });
+    defer alloc.free(expected_data_base);
+    const expected_metadata_base = try std.fs.path.join(alloc, &.{ expected_local_base, "metadata" });
+    defer alloc.free(expected_metadata_base);
+    const expected_replica_root = try std.fs.path.join(alloc, &.{ expected_data_base, "replicas" });
+    defer alloc.free(expected_replica_root);
+    const expected_replica_catalog = try std.fs.path.join(alloc, &.{ expected_data_base, "catalog.txt" });
+    defer alloc.free(expected_replica_catalog);
+    const expected_local_metadata = try std.fs.path.join(alloc, &.{ expected_metadata_base, "local-metadata.json" });
+    defer alloc.free(expected_local_metadata);
+    const expected_snapshot_root = try std.fs.path.join(alloc, &.{ expected_data_base, "snapshots" });
+    defer alloc.free(expected_snapshot_root);
+    try std.testing.expectEqualStrings(expected_replica_root, resolved.replica_root_dir);
+    try std.testing.expectEqualStrings(expected_replica_catalog, resolved.replica_catalog_path);
+    try std.testing.expectEqualStrings(expected_local_metadata, resolved.local_metadata_catalog_path);
+    try std.testing.expectEqualStrings(expected_snapshot_root, resolved.snapshot_root_dir);
 }

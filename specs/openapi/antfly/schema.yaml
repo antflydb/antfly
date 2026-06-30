@@ -24,6 +24,7 @@ components:
         - blob
         - link
         - search_as_you_type
+        - json
 
     DocumentSchema:
       type: object
@@ -38,6 +39,10 @@ components:
           description: |
             A valid JSON Schema defining the document's structure.
             This is used to infer indexing rules and field types.
+            Relational-mode scalar properties may include optional
+            `collation` metadata. The metadata is preserved in the
+            durable relational column catalog and reported on result
+            schemas for source-backed text/keyword fields.
 
     TableSchema:
       type: object
@@ -47,6 +52,18 @@ components:
           type: integer
           format: uint32
           description: Version of the schema. Used for migrations.
+        storage_mode:
+          type: string
+          enum: [document, relational]
+          description: |
+            Storage profile for the table.
+            - "document" (default): schemaless JSON documents with optional,
+              soft schema validation. All indexes are derived from the document.
+            - "relational": required closed schema with typed columns. Documents
+              must match a declared type; declared scalar properties are stored
+              as typed columns for columnar predicate pushdown and aggregation.
+              A field typed "json" stores a subtree that is still indexed like a
+              document. Implies enforce_types and closed document types.
         default_type:
           type: string
           description: Default type to use from the document_types.
@@ -78,6 +95,438 @@ components:
             Rules for mapping dynamically detected fields. When a document contains fields
             that don't have explicit mappings and dynamic mapping is enabled, templates are
             evaluated in order to determine how those fields should be indexed.
+        foreign_keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/ForeignKey"
+          description: |
+            Relational-mode referential constraints. Supported targets are a
+            parent table's `_id` document key or a same-table declared unique
+            parent column tuple with `on_delete: "restrict"` /
+            `on_delete: "no_action"` or bounded local nullable-column
+            `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`.
+            `on_update: "restrict"` and `on_update: "no_action"` are accepted
+            as parent-key update checks, and mutating `set_null`/`cascade`
+            update actions are supported where owner topology is configured.
+            Temporal foreign keys with `period` on both child and parent
+            references accept restrictive actions plus bounded delete-side
+            `set_null` / `cascade` actions through remaining-coverage proofs.
+            Mutating temporal update actions are rejected because changing a
+            parent interval/key requires update-side period action semantics
+            broader than a scalar child-row rewrite.
+            `match: "simple"` is the default; `full` is accepted for composite
+            nullable references, and `partial` is rejected until row-subset
+            parent matching is implemented.
+            Cross-table unique targets require routed parent-table unique participants.
+            Unsupported shapes are rejected during schema validation.
+        periods:
+          type: array
+          items:
+            $ref: "#/components/schemas/RelationalPeriod"
+          description: |
+            Application-time period declarations over two numeric or datetime
+            relational columns. SQL `PERIOD FOR name (start, end)` and range
+            column temporal DDL lower into this metadata.
+        primary_key:
+          $ref: "#/components/schemas/PrimaryKey"
+          description: |
+            Relational-mode primary key over one or more ordered declared
+            non-json relational columns. Every component must be required and
+            present on every row. When omitted, `_id` remains the document-key
+            primary identity. `_id` cannot be mixed into a declared composite
+            primary-key tuple.
+        unique_constraints:
+          type: array
+          items:
+            $ref: "#/components/schemas/UniqueConstraint"
+          description: |
+            Relational-mode unique constraints over one or more ordered declared
+            non-json relational columns. Present scalar tuples are enforced by
+            committed integrity rows; rows with any absent nullable component do
+            not create unique rows.
+
+    ForeignKeyReference:
+      type: object
+      additionalProperties: false
+      description: Parent side of a relational foreign-key constraint.
+      properties:
+        table:
+          type: string
+          description: Referenced relational table name.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
+        period:
+          type: string
+          description: Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints.
+
+    PrimaryKey:
+      type: object
+      additionalProperties: false
+      description: Relational primary-key constraint.
+      properties:
+        name:
+          type: string
+          description: Optional durable primary-key constraint name used by DDL and conflict-target resolution.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Primary-key columns. One or more ordered required non-json relational columns are supported.
+        without_overlaps_period:
+          type: string
+          description: Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness.
+
+    RelationalPeriod:
+      type: object
+      additionalProperties: false
+      description: Application-time period over a start and end column.
+      properties:
+        name:
+          type: string
+          description: Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
+        start_column:
+          type: string
+          description: Inclusive period start column.
+        end_column:
+          type: string
+          description: Exclusive period end column.
+        range_type:
+          type: string
+          enum: [numrange, daterange, tsrange, tstzrange]
+          description: Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+      required:
+        - name
+        - start_column
+        - end_column
+
+    RowsUniquePredicate:
+      type: object
+      additionalProperties: false
+      description: Predicate atom that must match a partial unique constraint definition.
+      properties:
+        field:
+          type: string
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - eq
+            - ne
+        value:
+          description: Predicate comparison value. Omit for null-test operators.
+      required:
+        - field
+        - op
+
+    RowsUniquePredicateGroup:
+      type: object
+      additionalProperties: false
+      description: Conjunction of partial-unique predicate atoms.
+      properties:
+        all:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsUniquePredicate"
+      required:
+        - all
+
+    RowsExpression:
+      description: |
+        Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+        `{ "value": ... }`, or an operator node such as
+        `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+        operators are the shared row-local expression surface used by schema
+        predicates, mutation expressions, query projections, filters, grouping,
+        ordering, and SQL lowering.
+      oneOf:
+        - $ref: "#/components/schemas/RowsExpressionField"
+        - $ref: "#/components/schemas/RowsExpressionValue"
+        - $ref: "#/components/schemas/RowsExpressionOperator"
+
+    RowsExpressionField:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+      properties:
+        field:
+          type: string
+          minLength: 1
+        source:
+          type: string
+          enum:
+            - row
+            - existing
+            - proposed
+            - source
+
+    RowsExpressionValue:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+      properties:
+        value:
+          description: Literal JSON value for a value node.
+
+    RowsExpressionOperator:
+      type: object
+      additionalProperties: false
+      required:
+        - op
+      properties:
+        op:
+          type: string
+          enum:
+            - now
+            - coalesce
+            - lower
+            - upper
+            - initcap
+            - trim
+            - btrim
+            - ltrim
+            - rtrim
+            - replace
+            - translate
+            - substring
+            - substr
+            - overlay
+            - split_part
+            - strpos
+            - left
+            - right
+            - lpad
+            - rpad
+            - repeat
+            - reverse
+            - starts_with
+            - ends_with
+            - ascii
+            - chr
+            - md5
+            - like
+            - ilike
+            - bool_and
+            - and
+            - bool_or
+            - or
+            - bool_not
+            - not
+            - concat
+            - concat_ws
+            - length
+            - char_length
+            - character_length
+            - octet_length
+            - nullif
+            - greatest
+            - least
+            - abs
+            - round
+            - trunc
+            - floor
+            - ceil
+            - sqrt
+            - sign
+            - power
+            - add
+            - sub
+            - mul
+            - div
+            - mod
+            - interval_ns
+            - interval_months
+            - date_trunc
+            - date_bin
+            - date_part
+            - extract
+            - cast
+            - json_extract
+            - json_extract_path
+            - json_extract_path_text
+            - jsonb_extract_path
+            - jsonb_extract_path_text
+            - json_typeof
+            - jsonb_typeof
+            - json_array_length
+            - jsonb_array_length
+            - array_length
+            - cardinality
+            - array_position
+            - array_positions
+            - array_append
+            - array_prepend
+            - array_cat
+            - array_remove
+            - array_replace
+            - array_to_string
+            - string_to_array
+            - uuid_v4
+            - gen_random_uuid
+            - uuid_generate_v4
+            - json_build_object
+            - jsonb_build_object
+            - to_jsonb
+            - json_path_exists
+            - regexp_replace
+            - case
+        args:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpression"
+          description: Operand expressions for operator nodes.
+        to:
+          type: string
+          enum:
+            - text
+            - numeric
+            - bool
+            - boolean
+            - datetime
+          description: Cast target for `cast`.
+        path:
+          description: Structured JSON path for `json_extract` and `json_path_exists`.
+        as_text:
+          type: boolean
+          description: Return JSON path extraction as text.
+        cases:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionCaseBranch"
+          description: Searched case branches, each with `when` and `then`.
+        else:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: "#/components/schemas/RowsExpression"
+          description: Fallback expression for searched `case`.
+
+    RowsExpressionCaseBranch:
+      type: object
+      additionalProperties: false
+      properties:
+        when:
+          $ref: "#/components/schemas/RowsExpressionCondition"
+        then:
+          $ref: "#/components/schemas/RowsExpression"
+      required:
+        - when
+        - then
+
+    RowsExpressionCondition:
+      type: object
+      additionalProperties: false
+      description: Computed expression predicate over the shared row-expression AST.
+      properties:
+        lhs:
+          $ref: "#/components/schemas/RowsExpression"
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+        rhs:
+          $ref: "#/components/schemas/RowsExpression"
+      required:
+        - lhs
+        - op
+
+    ForeignKey:
+      type: object
+      additionalProperties: false
+      description: Relational foreign-key constraint.
+      properties:
+        name:
+          type: string
+          description: Constraint name, unique within the table schema.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
+        period:
+          type: string
+          description: Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints.
+        references:
+          $ref: "#/components/schemas/ForeignKeyReference"
+        on_delete:
+          type: string
+          enum: [restrict, no_action, set_null, cascade]
+          description: Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+        on_update:
+          type: string
+          enum: [restrict, no_action, set_null, cascade]
+          description: Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+        timing:
+          type: string
+          description: Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
+        deferrable:
+          oneOf:
+            - type: boolean
+            - type: string
+          description: Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+        match:
+          type: string
+          enum: [simple, full]
+          description: Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+        validation_state:
+          type: string
+          enum: [enforced, unvalidated]
+          description: Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+
+    UniqueConstraint:
+      type: object
+      additionalProperties: false
+      description: Relational unique constraint.
+      properties:
+        name:
+          type: string
+          description: Constraint name, unique within the table schema.
+        columns:
+          type: array
+          items:
+            type: string
+          description: Unique columns. One or more ordered non-json relational columns are supported.
+        expressions:
+          type: array
+          items:
+            type: object
+            additionalProperties: false
+            properties:
+              op:
+                type: string
+                enum: [lower, upper, md5]
+              field:
+                type: string
+            required: [op, field]
+          description: Stable expression keys supported by unique-owner maintenance.
+        without_overlaps_period:
+          type: string
+          description: Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness.
+        where:
+          $ref: "#/components/schemas/RowsUniquePredicateGroup"
+          description: Field-only partial unique predicate shorthand.
+        where_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+          description: Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
+        validation_state:
+          type: string
+          enum: [enforced, unvalidated]
+          description: Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
 
     DynamicTemplate:
       type: object

@@ -59,6 +59,13 @@ pub const MetadataMutationPayload = struct {
     schema_version: u32 = 1,
     kind: MetadataMutationKind,
     schema_bytes: []const u8,
+    local_schema_json: ?[]const u8 = null,
+    lite_sql_table_record_json: ?[]const u8 = null,
+};
+
+pub const SchemaMetadataMutationOptions = struct {
+    local_schema_json: ?[]const u8 = null,
+    lite_sql_table_record_json: ?[]const u8 = null,
 };
 
 pub fn encodeBatchMutationRequestAlloc(
@@ -108,11 +115,21 @@ pub fn encodeSchemaMetadataMutationAlloc(
     alloc: Allocator,
     schema: schema_mod.TableSchema,
 ) ![]u8 {
+    return try encodeSchemaMetadataMutationWithOptionsAlloc(alloc, schema, .{});
+}
+
+pub fn encodeSchemaMetadataMutationWithOptionsAlloc(
+    alloc: Allocator,
+    schema: schema_mod.TableSchema,
+    options: SchemaMetadataMutationOptions,
+) ![]u8 {
     const schema_bytes = try schema_mod.serializeSchema(alloc, schema);
     defer alloc.free(schema_bytes);
     return try std.json.Stringify.valueAlloc(alloc, MetadataMutationPayload{
         .kind = .schema,
         .schema_bytes = schema_bytes,
+        .local_schema_json = options.local_schema_json,
+        .lite_sql_table_record_json = options.lite_sql_table_record_json,
     }, .{});
 }
 
@@ -122,7 +139,17 @@ pub fn appendSchemaMetadataMutation(
     schema: schema_mod.TableSchema,
     options: AppendMetadataMutationOptions,
 ) !u64 {
-    const payload = try encodeSchemaMetadataMutationAlloc(alloc, schema);
+    return try appendSchemaMetadataMutationWithPayloadOptions(alloc, primary, schema, .{}, options);
+}
+
+pub fn appendSchemaMetadataMutationWithPayloadOptions(
+    alloc: Allocator,
+    primary: *primary_mod.Primary,
+    schema: schema_mod.TableSchema,
+    payload_options: SchemaMetadataMutationOptions,
+    options: AppendMetadataMutationOptions,
+) !u64 {
+    const payload = try encodeSchemaMetadataMutationWithOptionsAlloc(alloc, schema, payload_options);
     defer alloc.free(payload);
 
     return try primary.append(.{
@@ -341,6 +368,51 @@ test "storage.ha effects appends schema metadata payload as HA metadata mutation
     try std.testing.expectEqualStrings("doc", decoded.default_type);
     try std.testing.expectEqual(@as(u64, 123), decoded.ttl_duration_ns);
     try std.testing.expectEqualStrings("expires_at", decoded.ttl_field);
+}
+
+test "storage.ha effects appends lite sql table metadata in schema metadata payload" {
+    const alloc = std.testing.allocator;
+    const log_path = try testPath(alloc, "lite-metadata-log");
+    defer alloc.free(log_path);
+    const slots_path = try testPath(alloc, "lite-metadata-slots");
+    defer alloc.free(slots_path);
+
+    var primary = try primary_mod.Primary.open(alloc, log_path.ptr, slots_path.ptr, .{
+        .cluster_id = 103,
+        .shard_id = 9,
+        .table_id = 13,
+        .timeline_id = 3,
+        .epoch = 4,
+    }, .{});
+    defer primary.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true}
+    ;
+    const table_record_json =
+        \\{"table_id":42,"name":"usage_records","database_name":"tenant_db","namespace_name":"billing","placement_role":"data","desired_replica_count":1,"schema_json":"{}","indexes_json":"{}"}
+    ;
+    const lsn = try appendSchemaMetadataMutationWithPayloadOptions(alloc, &primary, .{
+        .version = 8,
+        .default_type = "row",
+    }, .{
+        .local_schema_json = schema_json,
+        .lite_sql_table_record_json = table_record_json,
+    }, .{});
+    try std.testing.expectEqual(@as(u64, 1), lsn);
+
+    var entry = (try primary.log.entryAt(alloc, lsn)) orelse return error.TestExpectedEqual;
+    defer entry.deinit(alloc);
+    var decoded = try decodeMetadataMutation(alloc, entry.record);
+    defer decoded.deinit();
+    try std.testing.expectEqual(MetadataMutationKind.schema, decoded.value.kind);
+    try std.testing.expectEqualStrings(schema_json, decoded.value.local_schema_json orelse return error.TestUnexpectedResult);
+    try std.testing.expectEqualStrings(table_record_json, decoded.value.lite_sql_table_record_json orelse return error.TestUnexpectedResult);
+
+    const decoded_schema = try schema_mod.deserializeSchema(alloc, decoded.value.schema_bytes);
+    defer schema_mod.freeSchema(alloc, decoded_schema);
+    try std.testing.expectEqual(@as(u32, 8), decoded_schema.version);
+    try std.testing.expectEqualStrings("row", decoded_schema.default_type);
 }
 
 test "storage.ha effects rejects non-derived HA records when decoding derived payloads" {

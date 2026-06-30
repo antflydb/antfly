@@ -31,14 +31,13 @@ pub const embeddings_generated = @import("antfly_embeddings_openapi");
 pub const common_generated = @import("antfly_common_openapi");
 pub const generating_generated = @import("antfly_generating_openapi");
 pub const reranking_generated = @import("antfly_reranking_openapi");
+const httpx_handler = @import("httpx_handler.zig");
 
 test "public openapi contract module is generated and wired" {
     try std.testing.expect(@hasDecl(generated, "CreateTableRequest"));
     try std.testing.expect(@hasDecl(generated, "Table"));
     try std.testing.expect(@hasDecl(generated, "TableStatus"));
     try std.testing.expect(@hasDecl(generated, "IndexStatus"));
-    try std.testing.expect(@hasDecl(generated, "IndexStats"));
-    try std.testing.expect(@hasDecl(generated, "FullTextIndexStats"));
     try std.testing.expect(@hasDecl(generated, "TableMigration"));
     try std.testing.expect(@hasDecl(generated, "QueryRequest"));
     try std.testing.expect(@hasDecl(generated, "BackupRequest"));
@@ -127,6 +126,17 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(@hasField(indexes_generated.FullTextIndexStats, "total_indexed"));
     try std.testing.expect(@hasField(indexes_generated.EmbeddingsIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "index_type"));
+    try std.testing.expect(@hasDecl(indexes_generated, "GraphMetricRuntimeStats"));
+    try std.testing.expect(@hasField(indexes_generated.GraphIndexStats, "graph_metric_runtime"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "owner_id_hash"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "worker_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "takeover_count"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "lost_leases"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "total_pages_claimed"));
+    try std.testing.expect(@hasField(indexes_generated.GraphMetricRuntimeStats, "last_pages_completed"));
+    try std.testing.expect(@hasDecl(client_generated, "GraphMetricRuntimeStats"));
+    try std.testing.expect(@hasField(client_generated.GraphIndexStats, "graph_metric_runtime"));
+    try std.testing.expect(@hasField(client_generated.GraphMetricRuntimeStats, "owner_id_hash"));
     try std.testing.expect(@hasDecl(indexes_generated, "AlgebraicIndexStats"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "index_type"));
     try std.testing.expect(@hasField(indexes_generated.AlgebraicIndexStats, "healthy"));
@@ -157,6 +167,55 @@ test "public index contract exposes runtime status metadata" {
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "active_progress_applied_sequence"));
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "materialization_id"));
     try std.testing.expect(!@hasField(indexes_generated.AlgebraicIndexStats, "engine_state_id"));
+}
+
+test "indexes openapi parses graph metric runtime summary" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(indexes_generated.IndexStats, alloc,
+        \\{"index_type":"graph","total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"worker_pool","owner_id_hash":17,"worker_id_hash":23,"worker_count":3,"lease_owned":true,"has_lease":true,"takeover_count":2,"lost_leases":1,"ticks_started":9,"ticks_completed":8,"durable_progress_ticks":7,"total_pages_claimed":6,"total_pages_completed":5,"last_pages_claimed":4,"last_pages_completed":3}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .graph_index_stats => |stats| {
+            const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
+            try std.testing.expect(runtime.enabled.?);
+            try std.testing.expectEqualStrings("worker_pool", runtime.role.?);
+            try std.testing.expectEqual(@as(i64, 17), runtime.owner_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 23), runtime.worker_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.worker_count.?);
+            try std.testing.expect(runtime.lease_owned.?);
+            try std.testing.expect(runtime.has_lease.?);
+            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
+            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
+}
+
+test "client openapi parses graph metric runtime summary" {
+    const alloc = std.testing.allocator;
+    var parsed = try std.json.parseFromSlice(client_generated.IndexStats, alloc,
+        \\{"index_type":"graph","total_edges":4,"graph_metric_runtime":{"enabled":true,"role":"coordinator","owner_id_hash":99,"worker_count":1,"takeover_count":2,"lost_leases":1,"total_pages_claimed":6,"last_pages_completed":3}}
+    , .{ .allocate = .alloc_always, .ignore_unknown_fields = true });
+    defer parsed.deinit();
+
+    switch (parsed.value) {
+        .graph_index_stats => |stats| {
+            const runtime = stats.graph_metric_runtime orelse return error.UnexpectedOpenApiVariant;
+            try std.testing.expect(runtime.enabled.?);
+            try std.testing.expectEqualStrings("coordinator", runtime.role.?);
+            try std.testing.expectEqual(@as(i64, 99), runtime.owner_id_hash.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.worker_count.?);
+            try std.testing.expectEqual(@as(i64, 2), runtime.takeover_count.?);
+            try std.testing.expectEqual(@as(i64, 1), runtime.lost_leases.?);
+            try std.testing.expectEqual(@as(i64, 6), runtime.total_pages_claimed.?);
+            try std.testing.expectEqual(@as(i64, 3), runtime.last_pages_completed.?);
+        },
+        else => return error.UnexpectedOpenApiVariant,
+    }
 }
 
 test "indexes openapi parses algebraic status as algebraic stats" {
@@ -215,6 +274,14 @@ test "indexes openapi rejects stats without discriminator" {
 
 test "generated extractors: path param structs exist" {
     const server = generated.server;
+    try std.testing.expect(@hasField(server.GetNamespaceTablePathParams, "database_name"));
+    try std.testing.expect(@hasField(server.GetNamespaceTablePathParams, "namespace_name"));
+    try std.testing.expect(@hasField(server.GetNamespaceTablePathParams, "table_name"));
+    try std.testing.expect(@hasField(server.QueryNamespaceTablePathParams, "database_name"));
+    try std.testing.expect(@hasField(server.QueryNamespaceTablePathParams, "namespace_name"));
+    try std.testing.expect(@hasField(server.QueryNamespaceTablePathParams, "table_name"));
+    try std.testing.expect(@hasField(server.LookupNamespaceTableDocumentPathParams, "key"));
+    try std.testing.expect(@hasField(server.GetNamespaceTableIndexPathParams, "index_name"));
     try std.testing.expect(@hasField(server.GetTablePathParams, "table_name"));
     try std.testing.expect(@hasField(server.CreateTablePathParams, "table_name"));
     try std.testing.expect(@hasField(server.LookupKeyPathParams, "table_name"));
@@ -227,6 +294,18 @@ test "generated extractors: route table covers public API" {
     const server = generated.server;
     try std.testing.expect(server.routes.len >= 33);
     var found_get_status = false;
+    var found_list_databases = false;
+    var found_get_namespace_table = false;
+    var found_query_namespace_table = false;
+    var found_batch_namespace_table = false;
+    var found_rows_batch_namespace_table = false;
+    var found_backup_namespace_table = false;
+    var found_restore_namespace_table = false;
+    var found_lookup_namespace_table_document = false;
+    var found_list_namespace_table_indexes = false;
+    var found_get_namespace_table_index = false;
+    var found_create_namespace_table_index = false;
+    var found_drop_namespace_table_index = false;
     var found_create_table = false;
     var found_lookup_key = false;
     var found_batch_write = false;
@@ -238,6 +317,18 @@ test "generated extractors: route table covers public API" {
     var found_remove_row_filter = false;
     for (server.routes) |route| {
         if (std.mem.eql(u8, route.operation_id, "getStatus")) found_get_status = true;
+        if (std.mem.eql(u8, route.operation_id, "listDatabases")) found_list_databases = true;
+        if (std.mem.eql(u8, route.operation_id, "getNamespaceTable")) found_get_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "queryNamespaceTable")) found_query_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "batchNamespaceTable")) found_batch_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "rowsBatchNamespaceTable")) found_rows_batch_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "backupNamespaceTable")) found_backup_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "restoreNamespaceTable")) found_restore_namespace_table = true;
+        if (std.mem.eql(u8, route.operation_id, "lookupNamespaceTableDocument")) found_lookup_namespace_table_document = true;
+        if (std.mem.eql(u8, route.operation_id, "listNamespaceTableIndexes")) found_list_namespace_table_indexes = true;
+        if (std.mem.eql(u8, route.operation_id, "getNamespaceTableIndex")) found_get_namespace_table_index = true;
+        if (std.mem.eql(u8, route.operation_id, "createNamespaceTableIndex")) found_create_namespace_table_index = true;
+        if (std.mem.eql(u8, route.operation_id, "dropNamespaceTableIndex")) found_drop_namespace_table_index = true;
         if (std.mem.eql(u8, route.operation_id, "createTable")) found_create_table = true;
         if (std.mem.eql(u8, route.operation_id, "lookupKey")) found_lookup_key = true;
         if (std.mem.eql(u8, route.operation_id, "batchWrite")) found_batch_write = true;
@@ -249,6 +340,18 @@ test "generated extractors: route table covers public API" {
         if (std.mem.eql(u8, route.operation_id, "removeRowFilter")) found_remove_row_filter = true;
     }
     try std.testing.expect(found_get_status);
+    try std.testing.expect(found_list_databases);
+    try std.testing.expect(found_get_namespace_table);
+    try std.testing.expect(found_query_namespace_table);
+    try std.testing.expect(found_batch_namespace_table);
+    try std.testing.expect(found_rows_batch_namespace_table);
+    try std.testing.expect(found_backup_namespace_table);
+    try std.testing.expect(found_restore_namespace_table);
+    try std.testing.expect(found_lookup_namespace_table_document);
+    try std.testing.expect(found_list_namespace_table_indexes);
+    try std.testing.expect(found_get_namespace_table_index);
+    try std.testing.expect(found_create_namespace_table_index);
+    try std.testing.expect(found_drop_namespace_table_index);
     try std.testing.expect(found_create_table);
     try std.testing.expect(found_lookup_key);
     try std.testing.expect(found_batch_write);
@@ -258,6 +361,10 @@ test "generated extractors: route table covers public API" {
     try std.testing.expect(found_get_row_filter);
     try std.testing.expect(found_set_row_filter);
     try std.testing.expect(found_remove_row_filter);
+}
+
+test "metadata generated router accepts AntflyApiHandler implementation" {
+    _ = metadata_generated.server.ServerRouter(httpx_handler.AntflyApiHandler);
 }
 
 test "bleve and metadata openapi modules are generated and wired" {
@@ -505,6 +612,10 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     try std.testing.expect(@hasField(server.GetIndexPathParams, "table_name"));
     try std.testing.expect(@hasField(server.GetIndexPathParams, "index_name"));
     try std.testing.expect(@hasField(server.DropIndexPathParams, "index_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "table_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "index_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "metric_name"));
+    try std.testing.expect(@hasField(server.ExecuteGraphMetricActionPathParams, "action"));
 
     var found_get_status = false;
     var found_list_secrets = false;
@@ -533,6 +644,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     var found_create_index = false;
     var found_drop_index = false;
     var found_get_index = false;
+    var found_execute_graph_metric_action = false;
     var found_put_artifact_enrichment = false;
     var found_delete_artifact_enrichment = false;
     for (server.routes) |route| {
@@ -563,6 +675,7 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
         if (std.mem.eql(u8, route.operation_id, "createIndex")) found_create_index = true;
         if (std.mem.eql(u8, route.operation_id, "dropIndex")) found_drop_index = true;
         if (std.mem.eql(u8, route.operation_id, "getIndex")) found_get_index = true;
+        if (std.mem.eql(u8, route.operation_id, "executeGraphMetricAction")) found_execute_graph_metric_action = true;
         if (std.mem.eql(u8, route.operation_id, "putArtifactEnrichment")) found_put_artifact_enrichment = true;
         if (std.mem.eql(u8, route.operation_id, "deleteArtifactEnrichment")) found_delete_artifact_enrichment = true;
     }
@@ -593,20 +706,21 @@ test "metadata openapi module generates extractor surface for routed endpoints" 
     try std.testing.expect(found_create_index);
     try std.testing.expect(found_drop_index);
     try std.testing.expect(found_get_index);
+    try std.testing.expect(found_execute_graph_metric_action);
     try std.testing.expect(found_put_artifact_enrichment);
     try std.testing.expect(found_delete_artifact_enrichment);
 }
 
 test "public chunker config keeps flattened provider-specific fields" {
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "provider"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "max_chunks"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "threshold"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "text"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "audio"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "api_url"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "model"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "store_chunks"));
-    try std.testing.expect(@hasField(generated.ChunkerConfig, "full_text_index"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "provider"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "max_chunks"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "threshold"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "text"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "audio"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "api_url"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "model"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "store_chunks"));
+    try std.testing.expect(@hasField(chunking_generated.ChunkerConfig, "full_text_index"));
 }
 
 test "public bundled root still exposes foreign-owned shared contract types" {
@@ -628,8 +742,9 @@ test "public openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@FieldType(generated.Table, "schema") == ?schema_generated.TableSchema);
     try std.testing.expect(@FieldType(generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
     try std.testing.expect(@FieldType(generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
-    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentRequest, "steps") == ?generated.RetrievalAgentSteps);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "generation") == ?generating_api_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(generated.RetrievalAgentSteps, "eval") == ?eval_generated.EvalConfig);
 }
 
 test "client openapi module resolves shared refs through owner modules" {
@@ -641,6 +756,18 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "backup"));
     try std.testing.expect(@hasDecl(client_generated.Client, "restore"));
     try std.testing.expect(@hasDecl(client_generated.Client, "listBackups"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "listDatabases"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "getNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "queryNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "batchNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "rowsBatchNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "backupNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "restoreNamespaceTable"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "lookupNamespaceTableDocument"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "listNamespaceTableIndexes"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "getNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "createNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "dropNamespaceTableIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "listTables"));
     try std.testing.expect(@hasDecl(client_generated.Client, "createTable"));
     try std.testing.expect(@hasDecl(client_generated.Client, "getTable"));
@@ -655,6 +782,31 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "createIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "dropIndex"));
     try std.testing.expect(@hasDecl(client_generated.Client, "getIndex"));
+    try std.testing.expect(@hasDecl(client_generated.Client, "executeGraphMetricAction"));
+    try std.testing.expect(@FieldType(client_generated.GraphMetricActionResponse, "status") == client_generated.GraphMetricStatus);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "phase") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "metadata_version") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "target_edge_generation") == i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_queued") == bool);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "queued_generation") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "building_generation") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_job_id") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_started_at_ms") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_iteration") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_lease_expires_at_ms") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_worker_id") == ?[]const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_pages") == ?[]const client_generated.GraphMetricBuildPageStatus);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "build_pages_truncated") == ?bool);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "phase") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "page_id") == i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "state") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "range_kind") == []const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricBuildPageStatus, "worker_id") == ?[]const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "retry_count") == ?i64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "last_error") == ?[]const u8);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "progress") == f64);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "last_event") == ?client_generated.GraphMetricEvent);
+    try std.testing.expect(@FieldType(client_generated.GraphMetricStatus, "recent_events") == ?[]const client_generated.GraphMetricEvent);
     try std.testing.expect(@hasDecl(client_generated.Client, "putArtifactEnrichment"));
     try std.testing.expect(@hasDecl(client_generated.Client, "deleteArtifactEnrichment"));
     try std.testing.expect(@hasDecl(client_generated.Client, "evaluate"));
@@ -662,9 +814,10 @@ test "client openapi module resolves shared refs through owner modules" {
     try std.testing.expect(@hasDecl(client_generated.Client, "retrievalAgent"));
     try std.testing.expect(@hasField(client_generated.TableStatus, "artifact_enrichments"));
     try std.testing.expect(@hasField(client_generated.EnrichmentConfig, "full_text_index"));
-    try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?schema_generated.TableSchema);
-    try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?indexes_generated.Pruner);
-    try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?reranking_generated.RerankerConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "generation") == ?generating_api_generated.GenerationStepConfig);
-    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "evaluators") == ?[]const eval_generated.EvaluatorName);
+    try std.testing.expect(@FieldType(client_generated.CreateTableRequest, "schema") == ?client_generated.TableSchema);
+    try std.testing.expect(@FieldType(client_generated.QueryRequest, "pruner") == ?client_generated.Pruner);
+    try std.testing.expect(@FieldType(client_generated.QueryRequest, "reranker") == ?client_generated.RerankerConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentRequest, "steps") == ?client_generated.RetrievalAgentSteps);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentSteps, "generation") == ?client_generated.GenerationStepConfig);
+    try std.testing.expect(@FieldType(client_generated.RetrievalAgentSteps, "eval") == ?client_generated.EvalConfig);
 }

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const db_config = @import("config.zig");
 const apply_rw_lock_mod = @import("apply_rw_lock.zig");
@@ -26,6 +27,7 @@ const mapper = @import("document_mapper.zig");
 const index_manager_mod = @import("catalog/index_manager.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
 const transaction_runtime_mod = @import("maintenance/transaction_runtime.zig");
+const relational_store_mod = @import("relational_store.zig");
 const mem_backend_mod = @import("../mem_backend.zig");
 const persistent_mod = @import("../persistent.zig");
 const range_state_mod = @import("range_state.zig");
@@ -55,6 +57,7 @@ pub const PendingWorkStats = struct {
     resolution: types.ReplayStageStats = .{},
     promotion: types.ReplayStageStats = .{},
     text_merge: types.TextMergeStats = .{},
+    graph_metric: index_manager_mod.IndexManager.GraphMetricPlannedWorkStats = .{},
 };
 
 pub const MaintenanceDriver = struct {
@@ -191,6 +194,13 @@ pub const PrimaryStoreOwner = union(enum) {
         switch (self.*) {
             .none, .mem => {},
             .lsm => |owner| try owner.handle.backend.checkpointWalAfterDurableBoundary(),
+        }
+    }
+
+    pub fn forceFlushLsmMutable(self: *PrimaryStoreOwner) !void {
+        switch (self.*) {
+            .none, .mem => {},
+            .lsm => |owner| try owner.handle.backend.forceFlushMutable(),
         }
     }
 
@@ -735,6 +745,11 @@ pub const DBCore = struct {
         });
     }
 
+    pub fn putArtifactPresenceMarker(self: *DBCore) !void {
+        self.artifact_cleanup_maybe.store(true, .release);
+        try self.store.put(internal_keys.artifact_presence_key[0..], "1");
+    }
+
     pub fn collectAndDeleteEnrichmentArtifactsForDocContext(
         self: *DBCore,
         alloc: Allocator,
@@ -811,6 +826,8 @@ pub const DBCore = struct {
             .store = self.store,
             .identity_namespace = self.identity_namespace,
             .alloc = alloc,
+            .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
+            .relational_columns = relationalColumnsForSchema(self.schema),
         };
         var effective_config = config;
         effective_config.resolution_extra_hooks = transactionRecoveryIdentityHooks(&identity_ctx);
@@ -861,9 +878,14 @@ pub const DBCore = struct {
     }
 
     pub fn setSchema(self: *DBCore, table_schema: schema_mod.TableSchema) !void {
-        try schema_mod.saveSchema(self.store, self.alloc, table_schema);
+        try self.setSchemaWithMetadata(table_schema, &.{});
+    }
+
+    pub fn setSchemaWithMetadata(self: *DBCore, table_schema: schema_mod.TableSchema, metadata_puts: []const schema_mod.SchemaMetadataPut) !void {
+        try schema_mod.saveSchemaWithMetadata(self.store, self.alloc, table_schema, metadata_puts);
         if (self.schema) |existing| schema_mod.freeSchema(self.alloc, existing);
         self.schema = try schema_mod.loadSchema(self.store, self.alloc);
+        self.index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(self.schema));
     }
 
     pub fn saveSchemaCloneTo(self: *DBCore, dest_store: *docstore_mod.DocStore) !void {
@@ -1134,6 +1156,27 @@ pub const DBCore = struct {
         try manager.collectIntentDocumentKeys(alloc, txn_id, upserts, deletes);
     }
 
+    pub fn collectTransactionIntentMutations(
+        self: *DBCore,
+        alloc: Allocator,
+        txn_id: transactions_mod.TxnId,
+    ) ![]transactions_mod.OwnedIntentMutation {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.collectIntentMutations(alloc, txn_id);
+    }
+
+    pub fn collectPendingTransactionIntentsForKey(
+        self: *DBCore,
+        alloc: Allocator,
+        key: []const u8,
+        exclude_txn_id: ?transactions_mod.TxnId,
+    ) ![]transactions_mod.PendingIntentInfo {
+        var manager = try self.initTxnManager();
+        defer manager.deinit();
+        return try manager.collectPendingIntentsForKeyAlloc(alloc, key, exclude_txn_id);
+    }
+
     pub fn getTransactionStatus(self: *DBCore, txn_id: transactions_mod.TxnId) !transactions_mod.TxnStatus {
         var manager = try self.initTxnManager();
         defer manager.deinit();
@@ -1171,6 +1214,8 @@ pub const DBCore = struct {
             .store = self.store,
             .identity_namespace = self.identity_namespace,
             .alloc = self.alloc,
+            .relational_base_rows = schemaUsesRelationalBaseRows(self.schema),
+            .relational_columns = relationalColumnsForSchema(self.schema),
         };
         return try manager.recoverTransactionsWithExtraBatchHooks(
             cutoff_timestamp,
@@ -1184,6 +1229,8 @@ pub const TransactionRecoveryIdentityContext = struct {
     store: *docstore_mod.DocStore,
     identity_namespace: doc_identity.Namespace,
     alloc: Allocator,
+    relational_base_rows: bool = false,
+    relational_columns: []const schema_mod.RelationalColumn = &.{},
 };
 
 pub fn transactionRecoveryIdentityHooks(ctx: *TransactionRecoveryIdentityContext) transactions_mod.TxnManager.RecoveryExtraBatchHooks {
@@ -1208,7 +1255,6 @@ fn buildTransactionRecoveryIdentityExtraBatch(
     status: transactions_mod.TxnStatus,
     timestamp: u64,
 ) anyerror!transactions_mod.ResolutionExtraBatch {
-    _ = timestamp;
     if (status != .committed) return .{};
     const identity_ctx: *TransactionRecoveryIdentityContext = @ptrCast(@alignCast(ctx.?));
     const alloc = identity_ctx.alloc;
@@ -1236,26 +1282,113 @@ fn buildTransactionRecoveryIdentityExtraBatch(
         if (!transactionIdentityMetadataKey(key)) try identity_deletes.append(alloc, key);
     }
 
-    var identity_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
+    var extra_writes = std.ArrayListUnmanaged(docstore_mod.KVPair).empty;
     errdefer {
-        for (identity_writes.items) |item| {
+        for (extra_writes.items) |item| {
             alloc.free(@constCast(item.key));
             alloc.free(@constCast(item.value));
         }
-        identity_writes.deinit(alloc);
+        extra_writes.deinit(alloc);
     }
     try doc_identity.appendBatchIdentityMetadataForNamespaceAlloc(
         alloc,
         identity_ctx.store,
         identity_ctx.identity_namespace,
         identity_ctx.store.lastReplaySequence(0),
-        &identity_writes,
+        &extra_writes,
         identity_upserts.items,
         identity_deletes.items,
     );
-    if (identity_writes.items.len == 0) return .{};
+    var extra_deletes = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (extra_deletes.items) |key| alloc.free(@constCast(key));
+        extra_deletes.deinit(alloc);
+    }
+    var extra_skip_intent_keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (extra_skip_intent_keys.items) |key| alloc.free(@constCast(key));
+        extra_skip_intent_keys.deinit(alloc);
+    }
+    if (identity_ctx.relational_base_rows) {
+        const mutations = try manager.collectIntentMutations(alloc, txn_id);
+        defer {
+            for (mutations) |*mutation| mutation.deinit(alloc);
+            if (mutations.len > 0) alloc.free(mutations);
+        }
+        for (mutations) |mutation| {
+            if (transactionIdentityMetadataKey(mutation.key) or internal_keys.isInternalUserKey(mutation.key)) continue;
+            const skip_key = try alloc.dupe(u8, mutation.key);
+            var skip_key_owned = true;
+            errdefer if (skip_key_owned) alloc.free(skip_key);
+            try extra_skip_intent_keys.append(alloc, skip_key);
+            skip_key_owned = false;
+
+            const primary_key = try internal_keys.documentKeyAlloc(alloc, mutation.key);
+            var primary_key_owned = true;
+            errdefer if (primary_key_owned) alloc.free(primary_key);
+            try extra_deletes.append(alloc, primary_key);
+            primary_key_owned = false;
+
+            if (mutation.value) |value| {
+                const row_value = try alloc.dupe(u8, value);
+                var row_value_owned = true;
+                errdefer if (row_value_owned) alloc.free(row_value);
+                try relational_store_mod.appendUpsertOwnedBatchWithColumnIndexPolicy(
+                    alloc,
+                    identity_ctx.store,
+                    &extra_writes,
+                    &extra_deletes,
+                    mutation.key,
+                    row_value,
+                    relational_store_mod.ColumnIndexPolicy.fromColumns(identity_ctx.relational_columns),
+                );
+                row_value_owned = false;
+
+                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, mutation.key);
+                var timestamp_key_owned = true;
+                errdefer if (timestamp_key_owned) alloc.free(timestamp_key);
+                const timestamp_value = try alloc.alloc(u8, 8);
+                var timestamp_value_owned = true;
+                errdefer if (timestamp_value_owned) alloc.free(timestamp_value);
+                std.mem.writeInt(u64, timestamp_value[0..8], timestamp, .little);
+                try extra_writes.append(alloc, .{ .key = timestamp_key, .value = timestamp_value });
+                timestamp_key_owned = false;
+                timestamp_value_owned = false;
+            } else {
+                try relational_store_mod.appendDeleteOwnedBatch(
+                    alloc,
+                    identity_ctx.store,
+                    &extra_deletes,
+                    mutation.key,
+                );
+
+                const timestamp_key = try internal_keys.ttlKeyAlloc(alloc, mutation.key);
+                var timestamp_key_owned = true;
+                errdefer if (timestamp_key_owned) alloc.free(timestamp_key);
+                try extra_deletes.append(alloc, timestamp_key);
+                timestamp_key_owned = false;
+            }
+        }
+    }
+    if (extra_writes.items.len == 0 and extra_deletes.items.len == 0 and extra_skip_intent_keys.items.len == 0) return .{};
+    const owned_writes = try extra_writes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_writes) |item| {
+            alloc.free(@constCast(item.key));
+            alloc.free(@constCast(item.value));
+        }
+        if (owned_writes.len > 0) alloc.free(owned_writes);
+    }
+    const owned_deletes = try extra_deletes.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_deletes) |key| alloc.free(@constCast(key));
+        if (owned_deletes.len > 0) alloc.free(owned_deletes);
+    }
+    const owned_skip_intent_keys = try extra_skip_intent_keys.toOwnedSlice(alloc);
     return .{
-        .writes = try identity_writes.toOwnedSlice(alloc),
+        .writes = owned_writes,
+        .deletes = owned_deletes,
+        .skip_intent_keys = owned_skip_intent_keys,
     };
 }
 
@@ -1267,13 +1400,10 @@ fn cleanupTransactionRecoveryIdentityExtraBatch(ctx: ?*anyopaque, batch: transac
         alloc.free(@constCast(item.value));
     }
     if (batch.writes.len > 0) alloc.free(@constCast(batch.writes));
+    for (batch.deletes) |key| alloc.free(@constCast(key));
     if (batch.deletes.len > 0) alloc.free(@constCast(batch.deletes));
-}
-
-fn lockAtomic(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        std.atomic.spinLoopHint();
-    }
+    for (batch.skip_intent_keys) |key| alloc.free(@constCast(key));
+    if (batch.skip_intent_keys.len > 0) alloc.free(@constCast(batch.skip_intent_keys));
 }
 
 pub const Engine = struct {
@@ -1448,6 +1578,7 @@ pub fn openCoreResourcesFromPrimaryStore(
     index_manager.updateRange(shard_manager.getByteRange());
 
     const schema = try schema_mod.loadSchema(store, alloc);
+    index_manager.setRelationalBaseRows(schemaUsesRelationalBaseRows(schema));
 
     owned_path = null;
     owned_applied_sequence_checkpoint_path = null;
@@ -1473,6 +1604,17 @@ pub fn openCoreResourcesFromPrimaryStore(
         .identity_namespace = identity_namespace,
         .artifact_cleanup_maybe = artifact_cleanup_maybe,
     };
+}
+
+fn schemaUsesRelationalBaseRows(schema: ?schema_mod.TableSchema) bool {
+    const active = schema orelse return false;
+    return active.storage_mode == .relational and active.relational_columns.len > 0;
+}
+
+fn relationalColumnsForSchema(schema: ?schema_mod.TableSchema) []const schema_mod.RelationalColumn {
+    const active = schema orelse return &.{};
+    if (active.storage_mode != .relational) return &.{};
+    return active.relational_columns;
 }
 
 fn loadArtifactCleanupMaybe(alloc: Allocator, store: *docstore_mod.DocStore) !bool {

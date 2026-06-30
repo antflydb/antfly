@@ -235,6 +235,159 @@ Implemented now:
 - [x] Move longer metadata VOPR/chaos campaigns behind `chaos-test`, keeping
   `sim-test` bounded and replayable.
 
+## Foreign Key And Composite Primary Key Chaos Extensions
+
+Foreign keys, unique owners, and composite primary keys need their own VOPR
+workload because their correctness depends on several independently durable
+records staying in agreement: base rows, primary/unique owner rows, FK-ref
+reverse-reference rows, deferred proof metadata, and action schedule/job/page
+cursors. The simulator should exercise those records as one modeled relational
+system rather than as isolated unit tests.
+
+Current coverage:
+
+- `metadata-fk-test` covers deterministic catalog/reconciler derivation of
+  primary-key owner ranges, unique-owner ranges, and FK-ref owner ranges from
+  relational schemas.
+- `lib-metadata-vopr-chaos-test` includes
+  `metadata VOPR relational identity owner topology campaign`, which runs a
+  virtual metadata cluster through deterministic transport faults, creates a
+  composite-primary-key parent with a composite unique constraint, a
+  composite-primary-key child with FKs to both the parent primary key and
+  parent unique key, and a grandchild with a cascading FK to the child primary
+  key. It asserts primary-key, unique-owner, and FK-ref owner ranges converge as
+  routable metadata topology.
+- `metadata-fk-test` covers owner-range lifecycle behavior for primary,
+  unique-owner, and FK-ref topology, including the reconciler contract that
+  schema-derived defaults seed missing ranges but do not overwrite committed
+  split, merge, or rebuild topology for still-declared constraints.
+- `db-foreign-key-test` covers FK-ref owner validation and repair for exact
+  parent prefixes and bounded parent-key owner ranges. Range repair deletes
+  stale reverse-reference rows only inside the claimed owner span, leaves
+  out-of-range owner rows untouched, and preserves committed base rows. It also
+  includes a deterministic modeled relational identity workload with composite
+  primary identity, composite unique identity, FKs to both, invalid-write
+  rejection, FK-ref repair, durable paged `set_null`, durable paged `cascade`,
+  reopen handoff, and final invariant checks. Durable paged action-job tests
+  cover cursor persistence and reverse-reference cleanup across reopen.
+- `api-transactions-test` covers distributed FK participant planning, including
+  child writes, parent deletes, unique-parent routing, set-null and cascade
+  action scheduling/execution, recursive cascade scheduling, and fail-closed
+  behavior when FK-ref owner topology is transitional. It also includes a
+  deterministic relational identity workload that mutates FK-ref and
+  unique-owner topology across active, split-active, splitting, and merging
+  states while live child writes, unique-parent checks, set-null action pages,
+  cascade action pages, and child owner movement during pending action work
+  continue to route through durable owner records or fail closed before any
+  worker mutation.
+
+The workload model should add operations for:
+
+- Creating relational tables with default `_id` primary identity, declared
+  composite primary keys, single-column unique constraints, composite unique
+  constraints, and foreign keys to each supported target shape.
+- Adding, validating, dropping, and recreating FK and unique constraints while
+  row writes continue.
+- Inserting, updating, deleting, and explaining deletes for parent and child
+  rows under `restrict`, `no_action`, `set_null`, `cascade`,
+  `update_set_null`, and `update_cascade`.
+- Generating nullable composite references with both `MATCH SIMPLE` and
+  `MATCH FULL`, including partial-null violations.
+- Updating primary-key and unique-key components so the action executor sees
+  key movement, reverse-reference movement, and deferred proof rows.
+- Splitting, merging, moving, and temporarily withholding primary-key,
+  unique-owner, and FK-ref owner ranges while writes and long-running action
+  jobs are pending.
+- Running validation, repair, and rebuild jobs against committed rows after
+  simulated crashes and topology movement.
+
+The model checker should maintain a compact logical state for committed tables:
+row contents, primary-key tuples, unique tuples, FK parent tuples, reverse
+references, pending schedules, and in-flight 2PC decisions. Every simulation
+step should check these invariants:
+
+- Every committed non-null immediate FK reference has a committed parent tuple,
+  unless the operation is inside an allowed deferred transaction state.
+- Every committed child reference has exactly one FK-ref owner row, and every
+  FK-ref owner row points to a committed child row whose FK tuple still matches.
+- Primary-key and unique-owner rows are one-to-one with committed base rows for
+  their encoded tuples.
+- Duplicate primary-key and unique tuples can never commit, including after
+  coordinator restart, participant retry, or replayed internal group requests.
+- `restrict` and immediate `no_action` parent deletes/updates fail before
+  commit when references exist; deferred `no_action` succeeds only if the final
+  transaction state removes the reference.
+- `set_null`, `cascade`, `update_set_null`, and `update_cascade` action jobs are
+  idempotent: re-running a page cannot double-apply a child mutation, skip a
+  child, or advance a durable cursor past unapplied work.
+- Owner-range split, merge, and movement preserve epochs. Missing or
+  transitional topology fails closed rather than broad-fanning a constraint
+  check.
+- Validation can only promote an unvalidated constraint after the model and the
+  durable owner rows agree; repair must be able to rebuild owner rows from
+  committed base rows without inventing parents or children.
+
+The fault matrix should include:
+
+- Coordinator crash after parent/child participant prepare and before
+  resolution.
+- Owner participant restart after FK-ref mutation prepare but before local
+  apply.
+- Metadata leader restart while adopting primary-key, unique-owner, or FK-ref
+  topology.
+- Action schedule committed but controller restart before seeding jobs.
+- Action job claimed, child page mutation prepared, and worker crash before
+  cursor advance.
+- Owner-range split or merge during validation and during action job draining.
+- Directed source-to-target partitions between row participants, owner
+  participants, and metadata leader.
+- Duplicate, reordered, and replayed internal group write requests.
+- Combining the storage-backed row-level modeled workload with metadata owner
+  movement in one cluster-level campaign: live row writes, owner
+  split/merge/rebuild/move, validation, repair, action jobs, partitions, and
+  restarts in the same replayable run. The API transaction coordinator now has
+  deterministic combined owner-topology/action-routing coverage, including
+  child owner movement while action work is pending, but the remaining gap is
+  wiring that same combined schedule through real table storage groups inside a
+  cluster simulation with partitions and restarts.
+
+Build-target placement:
+
+- `metadata-fk-test` keeps deterministic catalog/owner resolver unit coverage
+  for primary-key, unique-owner, FK-ref, validation, and repair topology.
+- `db-foreign-key-test` owns focused local storage and transaction tests for
+  tuple encoding, duplicate rejection, reverse-reference rows, local
+  deferrable behavior, and action executor page idempotence.
+- `lib-metadata-vopr-test` should include a small seeded relational-integrity
+  campaign: a few tables, bounded rows, one or two owner-range movements, and a
+  heal-then-progress liveness phase. This is the PR feedback gate.
+- `lib-metadata-vopr-chaos-test` should run the expanded campaign with more
+  tables, composite primary keys, concurrent constraint validation/repair,
+  action-job interruption, partitions, leader restart, and owner-range churn.
+- `chaos-test` aggregates the expanded campaign. It must remain deterministic
+  and replayable, but it can use larger seed counts and operation budgets than
+  `sim-test`.
+
+Failure output must print seed, operation index, current transaction id, table
+schema fingerprint, topology epoch, active action job id, owner range id, and a
+minimal model snapshot. Replays should never depend on wall-clock sleeps or live
+network timing; the same seed and fault schedule must reproduce the same
+violation locally.
+
+Recommended implementation order:
+
+1. Add a reusable relational-integrity model with tuple encoding shared with the
+   production primary-key/unique/FK code.
+2. Generate table schemas and simple row writes without faults, then compare
+   model state to durable base rows and owner rows after every commit.
+3. Add FK actions and deferred/no-action transactions with crash-free
+   deterministic replay.
+4. Add owner-range split/merge/move operations and fail-closed topology checks.
+5. Add crash/restart, duplicate request, partition, and action-job lease
+   handoff faults.
+6. Promote a small bounded seed set into `sim-test` and the expanded campaign
+   into `chaos-test`.
+
 ## Storage Modeled I/O Plan
 
 For concrete storage simulation targets, fixture layout, replay artifact

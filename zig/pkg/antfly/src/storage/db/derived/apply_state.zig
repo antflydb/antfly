@@ -32,10 +32,6 @@ const checkpoint_lock_alloc = std.heap.page_allocator;
 var checkpoint_lock_registry_mutex: std.atomic.Mutex = .unlocked;
 var checkpoint_locks: std.StringHashMapUnmanaged(*CheckpointFileLock) = .empty;
 
-fn lockAtomicMutex(mutex: *std.atomic.Mutex) void {
-    platform_sync.lockYielding(mutex);
-}
-
 const CheckpointFileLock = struct {
     path: []u8,
     mutex: std.atomic.Mutex = .unlocked,
@@ -53,12 +49,12 @@ const CheckpointWriteGuard = struct {
 
 fn acquireCheckpointFileLock(path: []const u8) !CheckpointWriteGuard {
     const lock = try retainCheckpointFileLock(path);
-    lockAtomicMutex(&lock.mutex);
+    _ = platform_sync.lockAtomic(&lock.mutex);
     return .{ .lock = lock };
 }
 
 fn retainCheckpointFileLock(path: []const u8) !*CheckpointFileLock {
-    lockAtomicMutex(&checkpoint_lock_registry_mutex);
+    _ = platform_sync.lockAtomic(&checkpoint_lock_registry_mutex);
     defer checkpoint_lock_registry_mutex.unlock();
 
     const gop = try checkpoint_locks.getOrPut(checkpoint_lock_alloc, path);
@@ -82,7 +78,7 @@ fn retainCheckpointFileLock(path: []const u8) !*CheckpointFileLock {
 }
 
 fn releaseCheckpointFileLock(lock: *CheckpointFileLock) void {
-    lockAtomicMutex(&checkpoint_lock_registry_mutex);
+    _ = platform_sync.lockAtomic(&checkpoint_lock_registry_mutex);
     defer checkpoint_lock_registry_mutex.unlock();
 
     std.debug.assert(lock.refs > 0);
@@ -663,7 +659,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
         fn wait(self: *@This(), total: usize) void {
             var registered = false;
             while (true) {
-                lockAtomicMutex(&self.mutex);
+                _ = platform_sync.lockAtomic(&self.mutex);
                 if (!registered) {
                     self.waiting += 1;
                     registered = true;
@@ -672,7 +668,7 @@ test "derived apply checkpoint serializes concurrent sidecar writers" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldBriefly();
             }
         }
     };

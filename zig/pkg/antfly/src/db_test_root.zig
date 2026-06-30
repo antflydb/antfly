@@ -12,8 +12,25 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
+pub const storage_backend_erased = @import("storage/backend_erased.zig");
+pub const lsm_backend = @import("storage/lsm_backend.zig");
+
 test {
-    _ = @import("storage/db/db.zig");
+    _ = @import("storage/db/mod.zig");
+    _ = @import("storage/db/internal.zig");
+    _ = @import("storage/db/lifecycle.zig");
+    _ = @import("storage/db/ha_replication.zig");
+    _ = @import("storage/db/write_path.zig");
+    _ = @import("storage/db/transactions.zig");
+    _ = @import("storage/db/derived_async.zig");
+    _ = @import("storage/db/split_restore.zig");
+    _ = @import("storage/db/schema_runtime.zig");
+    _ = @import("storage/db/relational_integrity.zig");
+    _ = @import("storage/db/relational_rows.zig");
+    _ = @import("storage/db/search_runtime.zig");
+    _ = @import("storage/db/graph_runtime.zig");
+    _ = @import("storage/db/db_sim_test.zig");
     _ = @import("storage/db/promotion_runtime.zig");
     _ = @import("storage/db/resolution_runtime.zig");
+    _ = @import("storage/db/split_restore_test.zig");
 }

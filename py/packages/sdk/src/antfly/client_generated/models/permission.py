@@ -17,7 +17,8 @@ class Permission:
     """
     Attributes:
         resource (str): Resource name (e.g., table name, target username, or '*' for global). Example: orders_table.
-        resource_type (ResourceType): Type of the resource, e.g., table, user, or global ('*'). Example: table.
+        resource_type (ResourceType): Type of the resource, e.g., database, namespace, table, tablespace, user, or
+            global ('*'). Example: table.
         type_ (PermissionType): Type of permission. Example: read.
     """
 

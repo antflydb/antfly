@@ -126,6 +126,119 @@ type (
 	KeyRange              = oapi.KeyRange
 	SyncLevel             = oapi.SyncLevel
 
+	// Row filter policy types
+	RowFilterEntry = oapi.RowFilterEntry
+
+	// Relational row plan types
+	RowPrimarySelector                        = oapi.RowPrimarySelector
+	RowUniqueSelector                         = oapi.RowUniqueSelector
+	RowSelector                               = oapi.RowSelector
+	RowOperation                              = oapi.RowOperation
+	RowOperationOp                            = oapi.RowOperationOp
+	RowsBatchRequest                          = oapi.RowsBatchRequest
+	RowsPlanRequest                           = oapi.RowsPlanRequest
+	RowsQueryPlanRequest                      = oapi.RowsQueryPlanRequest
+	RowsAggregatePlanRequest                  = oapi.RowsAggregatePlanRequest
+	RowsWindowPlanRequest                     = oapi.RowsWindowPlanRequest
+	RowsJoinPlanRequest                       = oapi.RowsJoinPlanRequest
+	RowsLateralPlanRequest                    = oapi.RowsLateralPlanRequest
+	RowsGetRequest                            = oapi.RowsGetRequest
+	RowsGetResult                             = oapi.RowsGetResult
+	RowsGetResultSet                          = oapi.RowsGetResultSet
+	RowsQueryRequest                          = oapi.RowsQueryRequest
+	RowsWhere                                 = oapi.RowsWhere
+	RowsWhere0                                = oapi.RowsWhere0
+	RowsWhere1                                = oapi.RowsWhere1
+	RowsWhereOp                               = oapi.RowsWhere0Op
+	RowsWhereAtom                             = oapi.RowsWhereAtom
+	RowsWhereAtomOp                           = oapi.RowsWhereAtomOp
+	RowsWhereBranch                           = oapi.RowsWhereBranch
+	RowsWhereBranchAll                        = oapi.RowsWhereBranchAll
+	RowsWhereBranchAtom                       = oapi.RowsWhereBranchAtom
+	RowsWhereBranchAtomOp                     = oapi.RowsWhereBranchAtomOp
+	RowsCte                                   = oapi.RowsCte
+	RowsQueryOrder                            = oapi.RowsQueryOrder
+	RowsQueryOrderExpression                  = oapi.RowsQueryOrderExpression
+	RowsQueryOrderExpressionDirection         = oapi.RowsQueryOrderExpressionDirection
+	RowsQueryOrderExpressionNullTest          = oapi.RowsQueryOrderExpressionNullTest
+	RowsQueryOrderField                       = oapi.RowsQueryOrderField
+	RowsQueryOrderFieldDirection              = oapi.RowsQueryOrderFieldDirection
+	RowsQueryOrderFieldNullTest               = oapi.RowsQueryOrderFieldNullTest
+	RowsRowClaim                              = oapi.RowsRowClaim
+	RowsRowClaimMode                          = oapi.RowsRowClaimMode
+	RowsDocKeyRange                           = oapi.RowsDocKeyRange
+	RowsRowDocument                           = oapi.RowsRowDocument
+	RowsFieldPatch                            = oapi.RowsFieldPatch
+	RowsNumericIncrement                      = oapi.RowsNumericIncrement
+	RowsExpressionAssignmentMap               = oapi.RowsExpressionAssignmentMap
+	RowsJsonSetTransform                      = oapi.RowsJsonSetTransform
+	RowsArrayUpdateTransform                  = oapi.RowsArrayUpdateTransform
+	RowsArrayUpdateTransformOp                = oapi.RowsArrayUpdateTransformOp
+	RowsUniquePredicate                       = oapi.RowsUniquePredicate
+	RowsUniquePredicateOp                     = oapi.RowsUniquePredicateOp
+	RowsUniquePredicateGroup                  = oapi.RowsUniquePredicateGroup
+	RowsConflictUniqueTarget                  = oapi.RowsConflictUniqueTarget
+	RowsConflictTarget                        = oapi.RowsConflictTarget
+	RowsOnConflict                            = oapi.RowsOnConflict
+	RowsOnConflictAction                      = oapi.RowsOnConflictAction
+	RowsJsonExtractProjection                 = oapi.RowsJsonExtractProjection
+	RowsArrayLengthProjection                 = oapi.RowsArrayLengthProjection
+	RowsCoalesceOperand                       = oapi.RowsCoalesceOperand
+	RowsCoalesceFieldOperand                  = oapi.RowsCoalesceFieldOperand
+	RowsCoalesceValueOperand                  = oapi.RowsCoalesceValueOperand
+	RowsCoalesceProjection                    = oapi.RowsCoalesceProjection
+	RowsFieldAliasProjection                  = oapi.RowsFieldAliasProjection
+	RowsExpression                            = oapi.RowsExpression
+	RowsExpressionCaseBranch                  = oapi.RowsExpressionCaseBranch
+	RowsExpressionField                       = oapi.RowsExpressionField
+	RowsExpressionFieldSource                 = oapi.RowsExpressionFieldSource
+	RowsExpressionOperator                    = oapi.RowsExpressionOperator
+	RowsExpressionOperatorOp                  = oapi.RowsExpressionOperatorOp
+	RowsExpressionOperatorTo                  = oapi.RowsExpressionOperatorTo
+	RowsExpressionValue                       = oapi.RowsExpressionValue
+	RowsExpressionCondition                   = oapi.RowsExpressionCondition
+	RowsExpressionConditionOp                 = oapi.RowsExpressionConditionOp
+	RowsExpressionConditionGroup              = oapi.RowsExpressionConditionGroup
+	RowsExpressionArrayContainsPredicate      = oapi.RowsExpressionArrayContainsPredicate
+	RowsExpressionProjection                  = oapi.RowsExpressionProjection
+	RowsAggregateHaving                       = oapi.RowsAggregateHaving
+	RowsAggregateHavingPredicate              = oapi.RowsAggregateHavingPredicate
+	RowsAggregateHavingPredicateOp            = oapi.RowsAggregateHavingPredicateOp
+	RowsAggregateRequest                      = oapi.RowsAggregateRequest
+	RowsAggregateSpec                         = oapi.RowsAggregateSpec
+	RowsAggregateSpecOp                       = oapi.RowsAggregateSpecOp
+	RowsWindowRequest                         = oapi.RowsWindowRequest
+	RowsWindowFrame                           = oapi.RowsWindowFrame
+	RowsWindowFrameEnd                        = oapi.RowsWindowFrameEnd
+	RowsWindowFrameStart                      = oapi.RowsWindowFrameStart
+	RowsWindowFrameUnit                       = oapi.RowsWindowFrameUnit
+	RowsWindowSpec                            = oapi.RowsWindowSpec
+	RowsJoinRequest                           = oapi.RowsJoinRequest
+	RowsJoinOn                                = oapi.RowsJoinOn
+	RowsJoinProjection                        = oapi.RowsJoinProjection
+	RowsJoinProjectionSide                    = oapi.RowsJoinProjectionSide
+	RowsJoinRequestJoinType                   = oapi.RowsJoinRequestJoinType
+	RowsJoinedMutationSourceAssignment        = oapi.RowsJoinedMutationSourceAssignment
+	RowsJoinedMutationSourceAssignmentSide    = oapi.RowsJoinedMutationSourceAssignmentSide
+	RowsJoinedMutationSourceRequest           = oapi.RowsJoinedMutationSourceRequest
+	RowsJoinedMutationSourceRequestOp         = oapi.RowsJoinedMutationSourceRequestOp
+	RowsJoinedMutationSourceRequestTargetSide = oapi.RowsJoinedMutationSourceRequestTargetSide
+	RowsInsertSourceAssignment                = oapi.RowsInsertSourceAssignment
+	RowsInsertSourceRequest                   = oapi.RowsInsertSourceRequest
+	RowsInsertSourceRequestOp                 = oapi.RowsInsertSourceRequestOp
+	RowsLateralRequest                        = oapi.RowsLateralRequest
+	RowsLateralCorrelation                    = oapi.RowsLateralCorrelation
+	RowsMutationSourceRequest                 = oapi.RowsMutationSourceRequest
+	RowsMutationSourceRequestOp               = oapi.RowsMutationSourceRequestOp
+	RowsMutationSourceResultSet               = oapi.RowsMutationSourceResultSet
+	RowsResultColumn                          = oapi.RowsResultColumn
+	RowsQueryResultSet                        = oapi.RowsQueryResultSet
+	RowsAggregateResultSet                    = oapi.RowsAggregateResultSet
+	RowsStreamResultSet                       = oapi.RowsStreamResultSet
+	SqlStatementRequest                       = oapi.SqlStatementRequest
+	SqlStatementResponse                      = oapi.SqlStatementResponse
+	SqlStatementResponseKind                  = oapi.SqlStatementResponseKind
+
 	// Transform types for MongoDB-style atomic updates
 	Transform       = oapi.Transform
 	TransformOp     = oapi.TransformOp
@@ -233,13 +346,16 @@ type (
 	ReplicationRoute       = oapi.ReplicationRoute
 
 	// Graph index types
-	GraphIndexConfig       = oapi.GraphIndexConfig
-	GraphIndexStats        = oapi.GraphIndexStats
-	EdgeTypeConfig         = oapi.EdgeTypeConfig
-	EdgeTypeConfigTopology = oapi.EdgeTypeConfigTopology
-	EdgeDirection          = oapi.EdgeDirection
-	Edge                   = oapi.Edge
-	EdgesResponse          = oapi.EdgesResponse
+	GraphIndexConfig            = oapi.GraphIndexConfig
+	GraphIndexStats             = oapi.GraphIndexStats
+	GraphIndexStatsIndexType    = oapi.GraphIndexStatsIndexType
+	GraphMetricRuntimeStats     = oapi.GraphMetricRuntimeStats
+	GraphMetricRuntimeStatsRole = oapi.GraphMetricRuntimeStatsRole
+	EdgeTypeConfig              = oapi.EdgeTypeConfig
+	EdgeTypeConfigTopology      = oapi.EdgeTypeConfigTopology
+	EdgeDirection               = oapi.EdgeDirection
+	Edge                        = oapi.Edge
+	EdgesResponse               = oapi.EdgesResponse
 
 	// Graph query types
 	GraphQuery        = oapi.GraphQuery
@@ -371,10 +487,14 @@ const (
 	// SyncLevel values
 	SyncLevelPropose     = oapi.SyncLevelPropose
 	SyncLevelWrite       = oapi.SyncLevelWrite
-	SyncLevelFullText    = oapi.SyncLevelFullText
-	SyncLevelAknn        = oapi.SyncLevelAknn
+	SyncLevelQuery       = oapi.SyncLevelQuery
 	SyncLevelFullIndex   = oapi.SyncLevelFullIndex
 	SyncLevelEnrichments = oapi.SyncLevelEnrichments
+
+	// SQL statement response kinds
+	SqlStatementResponseKindDdl   = oapi.SqlStatementResponseKindDdl
+	SqlStatementResponseKindRead  = oapi.SqlStatementResponseKindRead
+	SqlStatementResponseKindWrite = oapi.SqlStatementResponseKindWrite
 
 	// RouteType values
 	RouteTypeQuestion = oapi.RouteTypeQuestion
@@ -530,9 +650,6 @@ const (
 	TransformOpTypePop         = oapi.TransformOpTypePop
 	TransformOpTypeRename      = oapi.TransformOpTypeRename
 	TransformOpTypeCurrentDate = oapi.TransformOpTypeCurrentDate
-
-	// SyncLevel embeddings (renamed from SyncLevelAknn)
-	SyncLevelEmbeddings = oapi.SyncLevelAknn
 
 	// EdgeDirection values
 	EdgeDirectionBoth = oapi.EdgeDirectionBoth

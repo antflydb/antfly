@@ -14,11 +14,17 @@
 
 const std = @import("std");
 const document_mapper = @import("../storage/db/document_mapper.zig");
+const tables = @import("../metadata/catalog/table_ddl.zig");
 
 pub const cluster = @import("cluster.zig");
 pub const batch = @import("batch.zig");
 pub const backups = @import("backups.zig");
 pub const linear_merge = @import("linear_merge.zig");
+pub const relational_rows = @import("relational_rows.zig");
+pub const catalog_resources = @import("catalog_resources.zig");
+pub const sql_adapter = @import("../sql/mod.zig");
+const sql_adapter_integration = @import("sql_adapter_integration.zig");
+pub const catalog_jobs = @import("../metadata/catalog/jobs.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
@@ -34,12 +40,12 @@ pub const distributed_txn = @import("distributed_txn.zig");
 pub const transactions = @import("transactions.zig");
 const e2e = @import("e2e.zig");
 const multi_node_e2e = @import("multi_node_e2e.zig");
-pub const table_catalog = @import("table_catalog.zig");
+const catalog_routing = @import("../metadata/catalog/routing.zig");
 pub const table_router = @import("table_router.zig");
-pub const tables = @import("tables.zig");
 pub const table_contract = @import("table_contract.zig");
 pub const indexes = @import("indexes.zig");
 pub const http_routes = @import("http_routes.zig");
+pub const auth_sql_adapter = @import("auth_sql_adapter.zig");
 pub const provisioned_storage = @import("provisioned_storage.zig");
 pub const table_reads = @import("table_reads.zig");
 pub const table_writes = @import("table_writes.zig");
@@ -50,9 +56,14 @@ pub const distributed_graph = @import("distributed_graph.zig");
 pub const artifact_reprocess_jobs = @import("artifact_reprocess_jobs.zig");
 pub const http_internal_group_read_routes = @import("http_internal_group_read_routes.zig");
 pub const http_internal_group_join_routes = @import("http_internal_group_join_routes.zig");
+pub const http_internal_group_write_routes = @import("http_internal_group_write_routes.zig");
 pub const http_server = @import("http_server.zig");
 pub const http_client = @import("http_client.zig");
+pub const pgwire_backend = @import("pgwire_backend.zig");
+pub const public_runtime = @import("public_runtime.zig");
 pub const httpx_handler = @import("httpx_handler.zig");
+pub const openapi_contract = @import("openapi_contract.zig");
+pub const protocol_adapters = @import("protocol_adapters.zig");
 pub const connections = @import("connections.zig");
 
 pub const ClusterHealth = cluster.ClusterHealth;
@@ -79,6 +90,25 @@ pub const HostedProvisionedTableWriteSource = table_writes.HostedProvisionedTabl
 pub const HostedGroupRouter = table_router.HostedGroupRouter;
 pub const ApiHttpServer = http_server.ApiHttpServer;
 pub const ApiHttpClient = http_client.ApiHttpClient;
+
+test {
+    _ = auth_sql_adapter;
+    _ = catalog_jobs;
+    _ = openapi_contract.metadata_generated.server.ServerRouter(httpx_handler.AntflyApiHandler);
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "queryNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "batchNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "rowsBatchNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "backupNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "restoreNamespaceTable"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "lookupNamespaceTableDocument"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "listNamespaceTableIndexes"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "getNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "createNamespaceTableIndex"));
+    try std.testing.expect(@hasDecl(openapi_contract.client_generated.Client, "dropNamespaceTableIndex"));
+    _ = public_runtime;
+    _ = pgwire_backend;
+    _ = protocol_adapters;
+}
 
 test "linear merge request parser accepts raw payload value under public request cap" {
     const alloc = std.testing.allocator;
@@ -194,6 +224,8 @@ test "api module compiles" {
     _ = cluster;
     _ = batch;
     _ = backups;
+    _ = relational_rows;
+    _ = sql_adapter_integration;
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;
@@ -208,9 +240,8 @@ test "api module compiles" {
     _ = transactions;
     _ = e2e;
     _ = multi_node_e2e;
-    _ = table_catalog;
+    _ = catalog_routing;
     _ = table_router;
-    _ = tables;
     _ = table_contract;
     _ = indexes;
     _ = http_routes;
@@ -223,6 +254,7 @@ test "api module compiles" {
     _ = distributed_graph;
     _ = http_internal_group_read_routes;
     _ = http_internal_group_join_routes;
+    _ = http_internal_group_write_routes;
     _ = http_server;
     _ = http_client;
     _ = httpx_handler;
@@ -293,7 +325,7 @@ test "api table reads reject stale doc identity before multigroup fanout" {
     const FakeCatalog = struct {
         statuses: []const metadata_reconciler.MergedGroupStatus,
 
-        fn iface(self: *@This()) table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_routing.CatalogSource {
             return .{
                 .ptr = self,
                 .vtable = &.{

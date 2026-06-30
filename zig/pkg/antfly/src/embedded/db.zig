@@ -246,6 +246,10 @@ pub const DB = struct {
         try self.inner.addEnrichment(cfg);
     }
 
+    pub fn applyTableSchemaJson(self: *DB, alloc: Allocator, schema_json: []const u8) !void {
+        try self.inner.applyTableSchemaJson(alloc, schema_json, .{});
+    }
+
     pub fn deleteEnrichment(self: *DB, kind: types.EnrichmentKind, name: []const u8) !bool {
         return try self.inner.deleteEnrichment(kind, name);
     }
@@ -263,8 +267,8 @@ pub const DB = struct {
     }
 
     pub fn exportPortable(self: *DB, alloc: Allocator, out: *std.ArrayList(u8)) !void {
-        try support.portable_backup.exportPortable(alloc, self.inner.core.store, out);
-        try support.portable_backup.validatePortable(alloc, out.items);
+        try support.portable_backup.exportPortableDb(alloc, &self.inner, out);
+        try support.portable_backup.validatePortableDb(alloc, out.items);
     }
 
     pub fn importPortable(self: *DB, alloc: Allocator, backup: []const u8) !void {
@@ -272,8 +276,8 @@ pub const DB = struct {
             try lite_restore_staging.importPortableIntoLiteDb(alloc, &self.inner, backup);
             return;
         }
-        try support.portable_backup.validatePortable(alloc, backup);
-        try support.portable_backup.importPortable(alloc, self.inner.core.store, backup);
+        try support.portable_backup.validatePortableDb(alloc, backup);
+        try support.portable_backup.importPortableDb(alloc, &self.inner, backup);
     }
 
     pub fn checkLite(self: *DB) !LiteCheckReport {

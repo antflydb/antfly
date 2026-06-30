@@ -22,6 +22,160 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const raft_service = @import("../raft/service.zig");
 const transition_state = @import("transition_state.zig");
 
+pub const ForeignKeySchemaControllerStatus = struct {
+    enabled: bool = false,
+    worker_id: []const u8 = "",
+    rounds_total: u64 = 0,
+    tables_scanned_total: u64 = 0,
+    tables_with_pending_constraints_total: u64 = 0,
+    tables_executed_total: u64 = 0,
+    jobs_scanned_total: u64 = 0,
+    jobs_executed_total: u64 = 0,
+    action_schedules_scanned_total: u64 = 0,
+    action_schedules_executed_total: u64 = 0,
+    action_schedules_invalid_total: u64 = 0,
+    action_jobs_scanned_total: u64 = 0,
+    action_jobs_executed_total: u64 = 0,
+    action_jobs_invalid_total: u64 = 0,
+    action_jobs_failed_total: u64 = 0,
+    action_jobs_depth_limit_failed_total: u64 = 0,
+    claim_attempts_total: u64 = 0,
+    terminal_valid_results_total: u64 = 0,
+    terminal_invalid_results_total: u64 = 0,
+    terminal_invalid_missing_parent_rows_total: u64 = 0,
+    terminal_invalid_missing_ref_rows_total: u64 = 0,
+    terminal_invalid_stale_ref_rows_total: u64 = 0,
+    terminal_invalid_violation_samples_total: u64 = 0,
+    terminal_invalid_violations_truncated_total: u64 = 0,
+    terminal_invalid_missing_parent_violations_total: u64 = 0,
+    terminal_invalid_missing_ref_violations_total: u64 = 0,
+    terminal_invalid_stale_ref_violations_total: u64 = 0,
+    last_run_at_ms: u64 = 0,
+    last_tables_scanned: usize = 0,
+    last_tables_with_pending_constraints: usize = 0,
+    last_tables_executed: usize = 0,
+    last_jobs_scanned: usize = 0,
+    last_jobs_executed: usize = 0,
+    last_action_schedules_scanned: usize = 0,
+    last_action_schedules_executed: usize = 0,
+    last_action_schedules_invalid: usize = 0,
+    last_failed_action_schedule_group_id: u64 = 0,
+    last_failed_action_schedule_id: []const u8 = "",
+    last_failed_action_schedule_action_job_id: []const u8 = "",
+    last_failed_action_schedule_action: []const u8 = "",
+    last_failed_action_schedule_status: []const u8 = "",
+    last_failed_action_schedule_error: []const u8 = "",
+    last_failed_action_schedule_constraint_name: []const u8 = "",
+    last_failed_action_schedule_parent_table: []const u8 = "",
+    last_failed_action_schedule_parent_key: []const u8 = "",
+    last_failed_action_schedule_scheduled_groups: u64 = 0,
+    last_failed_action_schedule_cascade_depth: u32 = 0,
+    last_failed_action_schedule_cascade_max_depth: u32 = 0,
+    last_failed_action_schedule_requeue_count: u64 = 0,
+    last_failed_action_schedule_last_requeued_at_ns: ?u64 = null,
+    last_action_jobs_scanned: usize = 0,
+    last_action_jobs_executed: usize = 0,
+    last_action_jobs_invalid: usize = 0,
+    last_action_jobs_completed: usize = 0,
+    last_action_jobs_failed: usize = 0,
+    last_action_jobs_depth_limit_failed: usize = 0,
+    last_action_job_applied_children: u64 = 0,
+    last_failed_action_job_group_id: u64 = 0,
+    last_failed_action_job_id: []const u8 = "",
+    last_failed_action_job_action: []const u8 = "",
+    last_failed_action_job_status: []const u8 = "",
+    last_failed_action_job_error: []const u8 = "",
+    last_failed_action_job_constraint_name: []const u8 = "",
+    last_failed_action_job_parent_table: []const u8 = "",
+    last_failed_action_job_parent_key: []const u8 = "",
+    last_failed_action_job_next_child_table: []const u8 = "",
+    last_failed_action_job_next_child_key: []const u8 = "",
+    last_failed_action_job_attempts: u32 = 0,
+    last_failed_action_job_applied_children: u64 = 0,
+    last_failed_action_job_failure_count: u64 = 0,
+    last_failed_action_job_first_failed_at_ns: u64 = 0,
+    last_failed_action_job_last_failed_at_ns: u64 = 0,
+    last_failed_action_job_requeue_count: u64 = 0,
+    last_failed_action_job_last_requeued_at_ns: u64 = 0,
+    last_failed_action_job_cascade_depth: u32 = 0,
+    last_failed_action_job_cascade_max_depth: u32 = 0,
+    last_failed_action_job_depth_limit_exhausted: bool = false,
+    last_terminal_invalid_table_name: []const u8 = "",
+    last_terminal_invalid_constraint_name: []const u8 = "",
+    last_terminal_invalid_job_id: []const u8 = "",
+    last_terminal_invalid_diagnostic_passes: u64 = 0,
+    last_terminal_invalid_violating_passes: u64 = 0,
+    last_terminal_invalid_first_violation_at_ns: u64 = 0,
+    last_terminal_invalid_last_violation_at_ns: u64 = 0,
+    last_terminal_invalid_missing_parent_rows: u64 = 0,
+    last_terminal_invalid_missing_ref_rows: u64 = 0,
+    last_terminal_invalid_stale_ref_rows: u64 = 0,
+    last_terminal_invalid_missing_parent_violations: u64 = 0,
+    last_terminal_invalid_missing_ref_violations: u64 = 0,
+    last_terminal_invalid_stale_ref_violations: u64 = 0,
+    last_terminal_invalid_violation_sample_count: usize = 0,
+    last_terminal_invalid_violations_truncated: bool = false,
+    last_terminal_invalid_violation_group_id: u64 = 0,
+    last_terminal_invalid_violation_kind: []const u8 = "",
+    last_terminal_invalid_violation_child_table: []const u8 = "",
+    last_terminal_invalid_violation_child_key: []const u8 = "",
+    last_terminal_invalid_violation_parent_table: []const u8 = "",
+    last_terminal_invalid_violation_parent_key: []const u8 = "",
+    last_terminal_invalid_violation_observed_parent_key: []const u8 = "",
+    last_claim_attempts: usize = 0,
+    last_terminal_valid_results: usize = 0,
+    last_terminal_invalid_results: usize = 0,
+    last_complete: bool = true,
+    last_valid: bool = true,
+    scanned_child_rows_total: u64 = 0,
+    referenced_child_rows_total: u64 = 0,
+    scanned_ref_rows_total: u64 = 0,
+    missing_parent_rows_total: u64 = 0,
+    missing_ref_rows_total: u64 = 0,
+    stale_ref_rows_total: u64 = 0,
+    repaired_ref_rows_total: u64 = 0,
+    deleted_stale_ref_rows_total: u64 = 0,
+    last_scanned_child_rows: u64 = 0,
+    last_referenced_child_rows: u64 = 0,
+    last_scanned_ref_rows: u64 = 0,
+    last_missing_parent_rows: u64 = 0,
+    last_missing_ref_rows: u64 = 0,
+    last_stale_ref_rows: u64 = 0,
+    last_repaired_ref_rows: u64 = 0,
+    last_deleted_stale_ref_rows: u64 = 0,
+};
+
+pub const UniqueConstraintSchemaControllerStatus = struct {
+    enabled: bool = false,
+    worker_id: []const u8 = "",
+    rounds_total: u64 = 0,
+    tables_scanned_total: u64 = 0,
+    tables_with_pending_constraints_total: u64 = 0,
+    tables_executed_total: u64 = 0,
+    terminal_valid_results_total: u64 = 0,
+    terminal_invalid_results_total: u64 = 0,
+    missing_unique_rows_total: u64 = 0,
+    duplicate_unique_rows_total: u64 = 0,
+    stale_unique_rows_total: u64 = 0,
+    repaired_unique_rows_total: u64 = 0,
+    deleted_stale_unique_rows_total: u64 = 0,
+    last_run_at_ms: u64 = 0,
+    last_tables_scanned: usize = 0,
+    last_tables_with_pending_constraints: usize = 0,
+    last_tables_executed: usize = 0,
+    last_terminal_valid_results: usize = 0,
+    last_terminal_invalid_results: usize = 0,
+    last_complete: bool = true,
+    last_valid: bool = true,
+    last_terminal_invalid_table_name: []const u8 = "",
+    last_terminal_invalid_constraint_name: []const u8 = "",
+    last_missing_unique_rows: u64 = 0,
+    last_duplicate_unique_rows: u64 = 0,
+    last_stale_unique_rows: u64 = 0,
+    last_repaired_unique_rows: u64 = 0,
+    last_deleted_stale_unique_rows: u64 = 0,
+};
+
 pub const MetadataStatus = struct {
     metadata_group_id: u64,
     metadata_epoch: u64 = 0,
@@ -50,6 +204,8 @@ pub const MetadataStatus = struct {
     metadata_raft_transport_served_groups: usize = 0,
     metadata_raft_transport_pending_retries: usize = 0,
     metrics: raft_service.ManagedServiceMetrics,
+    foreign_key_schema_controller: ForeignKeySchemaControllerStatus = .{},
+    unique_constraint_schema_controller: UniqueConstraintSchemaControllerStatus = .{},
     reconcile_lease_enabled: bool = false,
     reconcile_lease_owner_node_id: u64 = 0,
     reconcile_lease_expires_at_ms: u64 = 0,
@@ -96,6 +252,11 @@ pub const MetadataStatus = struct {
     projected_extension_members: usize = 0,
     projected_extension_dependencies: usize = 0,
     projected_ranges: usize = 0,
+    projected_foreign_key_ref_ranges: usize = 0,
+    projected_unique_constraint_ranges: usize = 0,
+    projected_secondary_index_rebuild_ranges: usize = 0,
+    projected_schema_rewrite_jobs: usize = 0,
+    projected_table_emptying_jobs: usize = 0,
     projected_stores: usize = 0,
     projected_placement_intents: usize = 0,
     projected_snapshot_bootstrap_intents: usize = 0,
@@ -137,8 +298,17 @@ pub const ReplicationSourceActionHint = struct {
 
 pub const AdminSnapshot = struct {
     status: MetadataStatus,
+    databases: []table_manager.DatabaseRecord = &.{},
+    namespaces: []table_manager.NamespaceRecord = &.{},
+    tablespaces: []table_manager.TablespaceRecord = &.{},
+    sequences: []table_manager.SequenceRecord = &.{},
     tables: []table_manager.TableRecord,
     ranges: []table_manager.RangeRecord,
+    foreign_key_ref_ranges: []table_manager.ForeignKeyReferenceRangeRecord = &.{},
+    unique_constraint_ranges: []table_manager.UniqueConstraintRangeRecord = &.{},
+    secondary_index_rebuild_ranges: []table_manager.SecondaryIndexRebuildRangeRecord = &.{},
+    schema_rewrite_jobs: []table_manager.SchemaRewriteJobRecord = &.{},
+    table_emptying_jobs: []table_manager.TableEmptyingJobRecord = &.{},
     nodes: []table_manager.NodeRecord = &.{},
     stores: []table_manager.StoreRecord,
     placement_intents: []raft_reconciler.PlacementIntent,
@@ -174,8 +344,35 @@ pub fn captureSnapshot(alloc: std.mem.Allocator, source: anytype) !AdminSnapshot
         .merge_transitions = &.{},
     };
     errdefer freeSnapshot(alloc, source, &snapshot);
+    if (@hasDecl(SourceDeclType, "listProjectedDatabases")) {
+        snapshot.databases = try source.listProjectedDatabases(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedNamespaces")) {
+        snapshot.namespaces = try source.listProjectedNamespaces(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedTablespaces")) {
+        snapshot.tablespaces = try source.listProjectedTablespaces(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedSequences")) {
+        snapshot.sequences = try source.listProjectedSequences(alloc);
+    }
     snapshot.tables = try source.listProjectedTables(alloc);
     snapshot.ranges = try source.listProjectedRanges(alloc);
+    if (@hasDecl(SourceDeclType, "listProjectedForeignKeyReferenceRanges")) {
+        snapshot.foreign_key_ref_ranges = try source.listProjectedForeignKeyReferenceRanges(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedUniqueConstraintRanges")) {
+        snapshot.unique_constraint_ranges = try source.listProjectedUniqueConstraintRanges(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedSecondaryIndexRebuildRanges")) {
+        snapshot.secondary_index_rebuild_ranges = try source.listProjectedSecondaryIndexRebuildRanges(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedSchemaRewriteJobs")) {
+        snapshot.schema_rewrite_jobs = try source.listProjectedSchemaRewriteJobs(alloc);
+    }
+    if (@hasDecl(SourceDeclType, "listProjectedTableEmptyingJobs")) {
+        snapshot.table_emptying_jobs = try source.listProjectedTableEmptyingJobs(alloc);
+    }
     if (@hasDecl(SourceDeclType, "listProjectedNodes")) {
         snapshot.nodes = try source.listProjectedNodes(alloc);
     }
@@ -239,8 +436,35 @@ pub fn freeSnapshot(alloc: std.mem.Allocator, source: anytype, snapshot: *AdminS
         .pointer => |pointer| pointer.child,
         else => SourceType,
     };
+    if (@hasDecl(SourceDeclType, "freeProjectedDatabases") and snapshot.databases.len > 0) {
+        source.freeProjectedDatabases(alloc, snapshot.databases);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedNamespaces") and snapshot.namespaces.len > 0) {
+        source.freeProjectedNamespaces(alloc, snapshot.namespaces);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedTablespaces") and snapshot.tablespaces.len > 0) {
+        source.freeProjectedTablespaces(alloc, snapshot.tablespaces);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSequences") and snapshot.sequences.len > 0) {
+        source.freeProjectedSequences(alloc, snapshot.sequences);
+    }
     source.freeProjectedTables(alloc, snapshot.tables);
     source.freeProjectedRanges(alloc, snapshot.ranges);
+    if (@hasDecl(SourceDeclType, "freeProjectedForeignKeyReferenceRanges") and snapshot.foreign_key_ref_ranges.len > 0) {
+        source.freeProjectedForeignKeyReferenceRanges(alloc, snapshot.foreign_key_ref_ranges);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedUniqueConstraintRanges") and snapshot.unique_constraint_ranges.len > 0) {
+        source.freeProjectedUniqueConstraintRanges(alloc, snapshot.unique_constraint_ranges);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSecondaryIndexRebuildRanges") and snapshot.secondary_index_rebuild_ranges.len > 0) {
+        source.freeProjectedSecondaryIndexRebuildRanges(alloc, snapshot.secondary_index_rebuild_ranges);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedSchemaRewriteJobs") and snapshot.schema_rewrite_jobs.len > 0) {
+        source.freeProjectedSchemaRewriteJobs(alloc, snapshot.schema_rewrite_jobs);
+    }
+    if (@hasDecl(SourceDeclType, "freeProjectedTableEmptyingJobs") and snapshot.table_emptying_jobs.len > 0) {
+        source.freeProjectedTableEmptyingJobs(alloc, snapshot.table_emptying_jobs);
+    }
     if (@hasDecl(SourceDeclType, "freeProjectedNodes") and snapshot.nodes.len > 0) {
         source.freeProjectedNodes(alloc, snapshot.nodes);
     }

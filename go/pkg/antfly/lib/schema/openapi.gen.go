@@ -7,12 +7,14 @@ import (
 	"bytes"
 	"compress/gzip"
 	"encoding/base64"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"path"
 	"strings"
 
 	"github.com/getkin/kin-openapi/openapi3"
+	"github.com/oapi-codegen/runtime"
 )
 
 // Defines values for AntflyType.
@@ -24,6 +26,7 @@ const (
 	AntflyTypeGeopoint        AntflyType = "geopoint"
 	AntflyTypeGeoshape        AntflyType = "geoshape"
 	AntflyTypeHtml            AntflyType = "html"
+	AntflyTypeJson            AntflyType = "json"
 	AntflyTypeKeyword         AntflyType = "keyword"
 	AntflyTypeLink            AntflyType = "link"
 	AntflyTypeNumeric         AntflyType = "numeric"
@@ -40,6 +43,197 @@ const (
 	DynamicTemplateMatchMappingTypeString  DynamicTemplateMatchMappingType = "string"
 )
 
+// Defines values for ForeignKeyMatch.
+const (
+	ForeignKeyMatchFull   ForeignKeyMatch = "full"
+	ForeignKeyMatchSimple ForeignKeyMatch = "simple"
+)
+
+// Defines values for ForeignKeyOnDelete.
+const (
+	ForeignKeyOnDeleteCascade  ForeignKeyOnDelete = "cascade"
+	ForeignKeyOnDeleteNoAction ForeignKeyOnDelete = "no_action"
+	ForeignKeyOnDeleteRestrict ForeignKeyOnDelete = "restrict"
+	ForeignKeyOnDeleteSetNull  ForeignKeyOnDelete = "set_null"
+)
+
+// Defines values for ForeignKeyOnUpdate.
+const (
+	ForeignKeyOnUpdateCascade  ForeignKeyOnUpdate = "cascade"
+	ForeignKeyOnUpdateNoAction ForeignKeyOnUpdate = "no_action"
+	ForeignKeyOnUpdateRestrict ForeignKeyOnUpdate = "restrict"
+	ForeignKeyOnUpdateSetNull  ForeignKeyOnUpdate = "set_null"
+)
+
+// Defines values for ForeignKeyValidationState.
+const (
+	ForeignKeyValidationStateEnforced    ForeignKeyValidationState = "enforced"
+	ForeignKeyValidationStateUnvalidated ForeignKeyValidationState = "unvalidated"
+)
+
+// Defines values for RelationalPeriodRangeType.
+const (
+	RelationalPeriodRangeTypeDaterange RelationalPeriodRangeType = "daterange"
+	RelationalPeriodRangeTypeNumrange  RelationalPeriodRangeType = "numrange"
+	RelationalPeriodRangeTypeTsrange   RelationalPeriodRangeType = "tsrange"
+	RelationalPeriodRangeTypeTstzrange RelationalPeriodRangeType = "tstzrange"
+)
+
+// Defines values for RowsExpressionConditionOp.
+const (
+	RowsExpressionConditionOpEq            RowsExpressionConditionOp = "eq"
+	RowsExpressionConditionOpGt            RowsExpressionConditionOp = "gt"
+	RowsExpressionConditionOpGte           RowsExpressionConditionOp = "gte"
+	RowsExpressionConditionOpIsDistinct    RowsExpressionConditionOp = "is_distinct"
+	RowsExpressionConditionOpIsNotDistinct RowsExpressionConditionOp = "is_not_distinct"
+	RowsExpressionConditionOpIsNotNull     RowsExpressionConditionOp = "is_not_null"
+	RowsExpressionConditionOpIsNull        RowsExpressionConditionOp = "is_null"
+	RowsExpressionConditionOpLt            RowsExpressionConditionOp = "lt"
+	RowsExpressionConditionOpLte           RowsExpressionConditionOp = "lte"
+	RowsExpressionConditionOpNe            RowsExpressionConditionOp = "ne"
+)
+
+// Defines values for RowsExpressionFieldSource.
+const (
+	RowsExpressionFieldSourceExisting RowsExpressionFieldSource = "existing"
+	RowsExpressionFieldSourceProposed RowsExpressionFieldSource = "proposed"
+	RowsExpressionFieldSourceRow      RowsExpressionFieldSource = "row"
+	RowsExpressionFieldSourceSource   RowsExpressionFieldSource = "source"
+)
+
+// Defines values for RowsExpressionOperatorOp.
+const (
+	RowsExpressionOperatorOpAbs                  RowsExpressionOperatorOp = "abs"
+	RowsExpressionOperatorOpAdd                  RowsExpressionOperatorOp = "add"
+	RowsExpressionOperatorOpAnd                  RowsExpressionOperatorOp = "and"
+	RowsExpressionOperatorOpArrayAppend          RowsExpressionOperatorOp = "array_append"
+	RowsExpressionOperatorOpArrayCat             RowsExpressionOperatorOp = "array_cat"
+	RowsExpressionOperatorOpArrayLength          RowsExpressionOperatorOp = "array_length"
+	RowsExpressionOperatorOpArrayPosition        RowsExpressionOperatorOp = "array_position"
+	RowsExpressionOperatorOpArrayPositions       RowsExpressionOperatorOp = "array_positions"
+	RowsExpressionOperatorOpArrayPrepend         RowsExpressionOperatorOp = "array_prepend"
+	RowsExpressionOperatorOpArrayRemove          RowsExpressionOperatorOp = "array_remove"
+	RowsExpressionOperatorOpArrayReplace         RowsExpressionOperatorOp = "array_replace"
+	RowsExpressionOperatorOpArrayToString        RowsExpressionOperatorOp = "array_to_string"
+	RowsExpressionOperatorOpAscii                RowsExpressionOperatorOp = "ascii"
+	RowsExpressionOperatorOpBoolAnd              RowsExpressionOperatorOp = "bool_and"
+	RowsExpressionOperatorOpBoolNot              RowsExpressionOperatorOp = "bool_not"
+	RowsExpressionOperatorOpBoolOr               RowsExpressionOperatorOp = "bool_or"
+	RowsExpressionOperatorOpBtrim                RowsExpressionOperatorOp = "btrim"
+	RowsExpressionOperatorOpCardinality          RowsExpressionOperatorOp = "cardinality"
+	RowsExpressionOperatorOpCase                 RowsExpressionOperatorOp = "case"
+	RowsExpressionOperatorOpCast                 RowsExpressionOperatorOp = "cast"
+	RowsExpressionOperatorOpCeil                 RowsExpressionOperatorOp = "ceil"
+	RowsExpressionOperatorOpCharLength           RowsExpressionOperatorOp = "char_length"
+	RowsExpressionOperatorOpCharacterLength      RowsExpressionOperatorOp = "character_length"
+	RowsExpressionOperatorOpChr                  RowsExpressionOperatorOp = "chr"
+	RowsExpressionOperatorOpCoalesce             RowsExpressionOperatorOp = "coalesce"
+	RowsExpressionOperatorOpConcat               RowsExpressionOperatorOp = "concat"
+	RowsExpressionOperatorOpConcatWs             RowsExpressionOperatorOp = "concat_ws"
+	RowsExpressionOperatorOpDateBin              RowsExpressionOperatorOp = "date_bin"
+	RowsExpressionOperatorOpDatePart             RowsExpressionOperatorOp = "date_part"
+	RowsExpressionOperatorOpDateTrunc            RowsExpressionOperatorOp = "date_trunc"
+	RowsExpressionOperatorOpDiv                  RowsExpressionOperatorOp = "div"
+	RowsExpressionOperatorOpEndsWith             RowsExpressionOperatorOp = "ends_with"
+	RowsExpressionOperatorOpExtract              RowsExpressionOperatorOp = "extract"
+	RowsExpressionOperatorOpFloor                RowsExpressionOperatorOp = "floor"
+	RowsExpressionOperatorOpGenRandomUuid        RowsExpressionOperatorOp = "gen_random_uuid"
+	RowsExpressionOperatorOpGreatest             RowsExpressionOperatorOp = "greatest"
+	RowsExpressionOperatorOpIlike                RowsExpressionOperatorOp = "ilike"
+	RowsExpressionOperatorOpInitcap              RowsExpressionOperatorOp = "initcap"
+	RowsExpressionOperatorOpIntervalMonths       RowsExpressionOperatorOp = "interval_months"
+	RowsExpressionOperatorOpIntervalNs           RowsExpressionOperatorOp = "interval_ns"
+	RowsExpressionOperatorOpJsonArrayLength      RowsExpressionOperatorOp = "json_array_length"
+	RowsExpressionOperatorOpJsonBuildObject      RowsExpressionOperatorOp = "json_build_object"
+	RowsExpressionOperatorOpJsonExtract          RowsExpressionOperatorOp = "json_extract"
+	RowsExpressionOperatorOpJsonExtractPath      RowsExpressionOperatorOp = "json_extract_path"
+	RowsExpressionOperatorOpJsonExtractPathText  RowsExpressionOperatorOp = "json_extract_path_text"
+	RowsExpressionOperatorOpJsonPathExists       RowsExpressionOperatorOp = "json_path_exists"
+	RowsExpressionOperatorOpJsonTypeof           RowsExpressionOperatorOp = "json_typeof"
+	RowsExpressionOperatorOpJsonbArrayLength     RowsExpressionOperatorOp = "jsonb_array_length"
+	RowsExpressionOperatorOpJsonbBuildObject     RowsExpressionOperatorOp = "jsonb_build_object"
+	RowsExpressionOperatorOpJsonbExtractPath     RowsExpressionOperatorOp = "jsonb_extract_path"
+	RowsExpressionOperatorOpJsonbExtractPathText RowsExpressionOperatorOp = "jsonb_extract_path_text"
+	RowsExpressionOperatorOpJsonbTypeof          RowsExpressionOperatorOp = "jsonb_typeof"
+	RowsExpressionOperatorOpLeast                RowsExpressionOperatorOp = "least"
+	RowsExpressionOperatorOpLeft                 RowsExpressionOperatorOp = "left"
+	RowsExpressionOperatorOpLength               RowsExpressionOperatorOp = "length"
+	RowsExpressionOperatorOpLike                 RowsExpressionOperatorOp = "like"
+	RowsExpressionOperatorOpLower                RowsExpressionOperatorOp = "lower"
+	RowsExpressionOperatorOpLpad                 RowsExpressionOperatorOp = "lpad"
+	RowsExpressionOperatorOpLtrim                RowsExpressionOperatorOp = "ltrim"
+	RowsExpressionOperatorOpMd5                  RowsExpressionOperatorOp = "md5"
+	RowsExpressionOperatorOpMod                  RowsExpressionOperatorOp = "mod"
+	RowsExpressionOperatorOpMul                  RowsExpressionOperatorOp = "mul"
+	RowsExpressionOperatorOpNot                  RowsExpressionOperatorOp = "not"
+	RowsExpressionOperatorOpNow                  RowsExpressionOperatorOp = "now"
+	RowsExpressionOperatorOpNullif               RowsExpressionOperatorOp = "nullif"
+	RowsExpressionOperatorOpOctetLength          RowsExpressionOperatorOp = "octet_length"
+	RowsExpressionOperatorOpOr                   RowsExpressionOperatorOp = "or"
+	RowsExpressionOperatorOpOverlay              RowsExpressionOperatorOp = "overlay"
+	RowsExpressionOperatorOpPower                RowsExpressionOperatorOp = "power"
+	RowsExpressionOperatorOpRegexpReplace        RowsExpressionOperatorOp = "regexp_replace"
+	RowsExpressionOperatorOpRepeat               RowsExpressionOperatorOp = "repeat"
+	RowsExpressionOperatorOpReplace              RowsExpressionOperatorOp = "replace"
+	RowsExpressionOperatorOpReverse              RowsExpressionOperatorOp = "reverse"
+	RowsExpressionOperatorOpRight                RowsExpressionOperatorOp = "right"
+	RowsExpressionOperatorOpRound                RowsExpressionOperatorOp = "round"
+	RowsExpressionOperatorOpRpad                 RowsExpressionOperatorOp = "rpad"
+	RowsExpressionOperatorOpRtrim                RowsExpressionOperatorOp = "rtrim"
+	RowsExpressionOperatorOpSign                 RowsExpressionOperatorOp = "sign"
+	RowsExpressionOperatorOpSplitPart            RowsExpressionOperatorOp = "split_part"
+	RowsExpressionOperatorOpSqrt                 RowsExpressionOperatorOp = "sqrt"
+	RowsExpressionOperatorOpStartsWith           RowsExpressionOperatorOp = "starts_with"
+	RowsExpressionOperatorOpStringToArray        RowsExpressionOperatorOp = "string_to_array"
+	RowsExpressionOperatorOpStrpos               RowsExpressionOperatorOp = "strpos"
+	RowsExpressionOperatorOpSub                  RowsExpressionOperatorOp = "sub"
+	RowsExpressionOperatorOpSubstr               RowsExpressionOperatorOp = "substr"
+	RowsExpressionOperatorOpSubstring            RowsExpressionOperatorOp = "substring"
+	RowsExpressionOperatorOpToJsonb              RowsExpressionOperatorOp = "to_jsonb"
+	RowsExpressionOperatorOpTranslate            RowsExpressionOperatorOp = "translate"
+	RowsExpressionOperatorOpTrim                 RowsExpressionOperatorOp = "trim"
+	RowsExpressionOperatorOpTrunc                RowsExpressionOperatorOp = "trunc"
+	RowsExpressionOperatorOpUpper                RowsExpressionOperatorOp = "upper"
+	RowsExpressionOperatorOpUuidGenerateV4       RowsExpressionOperatorOp = "uuid_generate_v4"
+	RowsExpressionOperatorOpUuidV4               RowsExpressionOperatorOp = "uuid_v4"
+)
+
+// Defines values for RowsExpressionOperatorTo.
+const (
+	RowsExpressionOperatorToBool     RowsExpressionOperatorTo = "bool"
+	RowsExpressionOperatorToBoolean  RowsExpressionOperatorTo = "boolean"
+	RowsExpressionOperatorToDatetime RowsExpressionOperatorTo = "datetime"
+	RowsExpressionOperatorToNumeric  RowsExpressionOperatorTo = "numeric"
+	RowsExpressionOperatorToText     RowsExpressionOperatorTo = "text"
+)
+
+// Defines values for RowsUniquePredicateOp.
+const (
+	RowsUniquePredicateOpEq        RowsUniquePredicateOp = "eq"
+	RowsUniquePredicateOpIsNotNull RowsUniquePredicateOp = "is_not_null"
+	RowsUniquePredicateOpIsNull    RowsUniquePredicateOp = "is_null"
+	RowsUniquePredicateOpNe        RowsUniquePredicateOp = "ne"
+)
+
+// Defines values for TableSchemaStorageMode.
+const (
+	TableSchemaStorageModeDocument   TableSchemaStorageMode = "document"
+	TableSchemaStorageModeRelational TableSchemaStorageMode = "relational"
+)
+
+// Defines values for UniqueConstraintExpressionsOp.
+const (
+	UniqueConstraintExpressionsOpLower UniqueConstraintExpressionsOp = "lower"
+	UniqueConstraintExpressionsOpMd5   UniqueConstraintExpressionsOp = "md5"
+	UniqueConstraintExpressionsOpUpper UniqueConstraintExpressionsOp = "upper"
+)
+
+// Defines values for UniqueConstraintValidationState.
+const (
+	UniqueConstraintValidationStateEnforced    UniqueConstraintValidationState = "enforced"
+	UniqueConstraintValidationStateUnvalidated UniqueConstraintValidationState = "unvalidated"
+)
+
 // AntflyType Field type annotations for schema fields
 type AntflyType string
 
@@ -50,6 +244,10 @@ type DocumentSchema struct {
 
 	// Schema A valid JSON Schema defining the document's structure.
 	// This is used to infer indexing rules and field types.
+	// Relational-mode scalar properties may include optional
+	// `collation` metadata. The metadata is preserved in the
+	// durable relational column catalog and reported on result
+	// schemas for source-backed text/keyword fields.
 	Schema map[string]interface{} `json:"schema,omitempty,omitzero"`
 }
 
@@ -84,6 +282,211 @@ type DynamicTemplate struct {
 // DynamicTemplateMatchMappingType Filter by detected JSON type
 type DynamicTemplateMatchMappingType string
 
+// ForeignKey Relational foreign-key constraint.
+type ForeignKey struct {
+	// Columns Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Deferrable Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+	Deferrable ForeignKey_Deferrable `json:"deferrable,omitempty,omitzero"`
+
+	// Match Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+	Match ForeignKeyMatch `json:"match,omitempty,omitzero"`
+
+	// Name Constraint name, unique within the table schema.
+	Name string `json:"name,omitempty,omitzero"`
+
+	// OnDelete Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+	OnDelete ForeignKeyOnDelete `json:"on_delete,omitempty,omitzero"`
+
+	// OnUpdate Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+	OnUpdate ForeignKeyOnUpdate `json:"on_update,omitempty,omitzero"`
+
+	// Period Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints.
+	Period string `json:"period,omitempty,omitzero"`
+
+	// References Parent side of a relational foreign-key constraint.
+	References ForeignKeyReference `json:"references,omitempty,omitzero"`
+
+	// Timing Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
+	Timing string `json:"timing,omitempty,omitzero"`
+
+	// ValidationState Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+	ValidationState ForeignKeyValidationState `json:"validation_state,omitempty,omitzero"`
+}
+
+// ForeignKeyDeferrable0 defines model for .
+type ForeignKeyDeferrable0 = bool
+
+// ForeignKeyDeferrable1 defines model for .
+type ForeignKeyDeferrable1 = string
+
+// ForeignKey_Deferrable Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+type ForeignKey_Deferrable struct {
+	union json.RawMessage
+}
+
+// ForeignKeyMatch Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+type ForeignKeyMatch string
+
+// ForeignKeyOnDelete Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+type ForeignKeyOnDelete string
+
+// ForeignKeyOnUpdate Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+type ForeignKeyOnUpdate string
+
+// ForeignKeyValidationState Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+type ForeignKeyValidationState string
+
+// ForeignKeyReference Parent side of a relational foreign-key constraint.
+type ForeignKeyReference struct {
+	// Columns Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Period Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints.
+	Period string `json:"period,omitempty,omitzero"`
+
+	// Table Referenced relational table name.
+	Table string `json:"table,omitempty,omitzero"`
+}
+
+// PrimaryKey Relational primary-key constraint.
+type PrimaryKey struct {
+	// Columns Primary-key columns. One or more ordered required non-json relational columns are supported.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Name Optional durable primary-key constraint name used by DDL and conflict-target resolution.
+	Name string `json:"name,omitempty,omitzero"`
+
+	// WithoutOverlapsPeriod Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness.
+	WithoutOverlapsPeriod string `json:"without_overlaps_period,omitempty,omitzero"`
+}
+
+// RelationalPeriod Application-time period over a start and end column.
+type RelationalPeriod struct {
+	// EndColumn Exclusive period end column.
+	EndColumn string `json:"end_column"`
+
+	// Name Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
+	Name string `json:"name"`
+
+	// RangeType Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+	RangeType RelationalPeriodRangeType `json:"range_type,omitempty,omitzero"`
+
+	// StartColumn Inclusive period start column.
+	StartColumn string `json:"start_column"`
+}
+
+// RelationalPeriodRangeType Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+type RelationalPeriodRangeType string
+
+// RowsExpression Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+// `{ "value": ... }`, or an operator node such as
+// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+// operators are the shared row-local expression surface used by schema
+// predicates, mutation expressions, query projections, filters, grouping,
+// ordering, and SQL lowering.
+type RowsExpression struct {
+	union json.RawMessage
+}
+
+// RowsExpressionCaseBranch defines model for RowsExpressionCaseBranch.
+type RowsExpressionCaseBranch struct {
+	// Then Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+	// `{ "value": ... }`, or an operator node such as
+	// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+	// operators are the shared row-local expression surface used by schema
+	// predicates, mutation expressions, query projections, filters, grouping,
+	// ordering, and SQL lowering.
+	Then RowsExpression `json:"then"`
+
+	// When Computed expression predicate over the shared row-expression AST.
+	When RowsExpressionCondition `json:"when"`
+}
+
+// RowsExpressionCondition Computed expression predicate over the shared row-expression AST.
+type RowsExpressionCondition struct {
+	// Lhs Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+	// `{ "value": ... }`, or an operator node such as
+	// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+	// operators are the shared row-local expression surface used by schema
+	// predicates, mutation expressions, query projections, filters, grouping,
+	// ordering, and SQL lowering.
+	Lhs RowsExpression            `json:"lhs"`
+	Op  RowsExpressionConditionOp `json:"op"`
+
+	// Rhs Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+	// `{ "value": ... }`, or an operator node such as
+	// `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+	// operators are the shared row-local expression surface used by schema
+	// predicates, mutation expressions, query projections, filters, grouping,
+	// ordering, and SQL lowering.
+	Rhs RowsExpression `json:"rhs,omitempty,omitzero"`
+}
+
+// RowsExpressionConditionOp defines model for RowsExpressionCondition.Op.
+type RowsExpressionConditionOp string
+
+// RowsExpressionField defines model for RowsExpressionField.
+type RowsExpressionField struct {
+	Field  string                    `json:"field"`
+	Source RowsExpressionFieldSource `json:"source,omitempty,omitzero"`
+}
+
+// RowsExpressionFieldSource defines model for RowsExpressionField.Source.
+type RowsExpressionFieldSource string
+
+// RowsExpressionOperator defines model for RowsExpressionOperator.
+type RowsExpressionOperator struct {
+	// Args Operand expressions for operator nodes.
+	Args []RowsExpression `json:"args,omitempty,omitzero"`
+
+	// AsText Return JSON path extraction as text.
+	AsText bool `json:"as_text,omitempty,omitzero"`
+
+	// Cases Searched case branches, each with `when` and `then`.
+	Cases []RowsExpressionCaseBranch `json:"cases,omitempty,omitzero"`
+
+	// Else Fallback expression for searched `case`.
+	Else *RowsExpression          `json:"else,omitempty"`
+	Op   RowsExpressionOperatorOp `json:"op"`
+
+	// Path Structured JSON path for `json_extract` and `json_path_exists`.
+	Path interface{} `json:"path,omitempty,omitzero"`
+
+	// To Cast target for `cast`.
+	To RowsExpressionOperatorTo `json:"to,omitempty,omitzero"`
+}
+
+// RowsExpressionOperatorOp defines model for RowsExpressionOperator.Op.
+type RowsExpressionOperatorOp string
+
+// RowsExpressionOperatorTo Cast target for `cast`.
+type RowsExpressionOperatorTo string
+
+// RowsExpressionValue defines model for RowsExpressionValue.
+type RowsExpressionValue struct {
+	// Value Literal JSON value for a value node.
+	Value interface{} `json:"value"`
+}
+
+// RowsUniquePredicate Predicate atom that must match a partial unique constraint definition.
+type RowsUniquePredicate struct {
+	Field string                `json:"field"`
+	Op    RowsUniquePredicateOp `json:"op"`
+
+	// Value Predicate comparison value. Omit for null-test operators.
+	Value interface{} `json:"value,omitempty,omitzero"`
+}
+
+// RowsUniquePredicateOp defines model for RowsUniquePredicate.Op.
+type RowsUniquePredicateOp string
+
+// RowsUniquePredicateGroup Conjunction of partial-unique predicate atoms.
+type RowsUniquePredicateGroup struct {
+	All []RowsUniquePredicate `json:"all"`
+}
+
 // TableSchema Schema definition for a table with multiple document types
 type TableSchema struct {
 	// DefaultType Default type to use from the document_types.
@@ -101,6 +504,45 @@ type TableSchema struct {
 	// If false, documents not matching any type will be accepted but not indexed.
 	EnforceTypes bool `json:"enforce_types,omitempty,omitzero"`
 
+	// ForeignKeys Relational-mode referential constraints. Supported targets are a
+	// parent table's `_id` document key or a same-table declared unique
+	// parent column tuple with `on_delete: "restrict"` /
+	// `on_delete: "no_action"` or bounded local nullable-column
+	// `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`.
+	// `on_update: "restrict"` and `on_update: "no_action"` are accepted
+	// as parent-key update checks, and mutating `set_null`/`cascade`
+	// update actions are supported where owner topology is configured.
+	// Temporal foreign keys with `period` on both child and parent
+	// references accept restrictive actions plus bounded delete-side
+	// `set_null` / `cascade` actions through remaining-coverage proofs.
+	// Mutating temporal update actions are rejected because changing a
+	// parent interval/key requires update-side period action semantics
+	// broader than a scalar child-row rewrite.
+	// `match: "simple"` is the default; `full` is accepted for composite
+	// nullable references, and `partial` is rejected until row-subset
+	// parent matching is implemented.
+	// Cross-table unique targets require routed parent-table unique participants.
+	// Unsupported shapes are rejected during schema validation.
+	ForeignKeys []ForeignKey `json:"foreign_keys,omitempty,omitzero"`
+
+	// Periods Application-time period declarations over two numeric or datetime
+	// relational columns. SQL `PERIOD FOR name (start, end)` and range
+	// column temporal DDL lower into this metadata.
+	Periods []RelationalPeriod `json:"periods,omitempty,omitzero"`
+
+	// PrimaryKey Relational primary-key constraint.
+	PrimaryKey PrimaryKey `json:"primary_key,omitempty,omitzero"`
+
+	// StorageMode Storage profile for the table.
+	// - "document" (default): schemaless JSON documents with optional,
+	//   soft schema validation. All indexes are derived from the document.
+	// - "relational": required closed schema with typed columns. Documents
+	//   must match a declared type; declared scalar properties are stored
+	//   as typed columns for columnar predicate pushdown and aggregation.
+	//   A field typed "json" stores a subtree that is still indexed like a
+	//   document. Implies enforce_types and closed document types.
+	StorageMode TableSchemaStorageMode `json:"storage_mode,omitempty,omitzero"`
+
 	// TtlDuration The duration after which documents should expire, based on the ttl_field timestamp (optional).
 	// Uses Go duration format (e.g., '24h', '7d', '168h').
 	TtlDuration string `json:"ttl_duration,omitempty,omitzero"`
@@ -109,9 +551,25 @@ type TableSchema struct {
 	// Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
 	TtlField string `json:"ttl_field,omitempty,omitzero"`
 
+	// UniqueConstraints Relational-mode unique constraints over one or more ordered declared
+	// non-json relational columns. Present scalar tuples are enforced by
+	// committed integrity rows; rows with any absent nullable component do
+	// not create unique rows.
+	UniqueConstraints []UniqueConstraint `json:"unique_constraints,omitempty,omitzero"`
+
 	// Version Version of the schema. Used for migrations.
 	Version uint32 `json:"version,omitempty,omitzero"`
 }
+
+// TableSchemaStorageMode Storage profile for the table.
+//   - "document" (default): schemaless JSON documents with optional,
+//     soft schema validation. All indexes are derived from the document.
+//   - "relational": required closed schema with typed columns. Documents
+//     must match a declared type; declared scalar properties are stored
+//     as typed columns for columnar predicate pushdown and aggregation.
+//     A field typed "json" stores a subtree that is still indexed like a
+//     document. Implies enforce_types and closed document types.
+type TableSchemaStorageMode string
 
 // TemplateFieldMapping Field mapping to apply when a dynamic template matches
 type TemplateFieldMapping struct {
@@ -135,36 +593,278 @@ type TemplateFieldMapping struct {
 	Type AntflyType `json:"type,omitempty,omitzero"`
 }
 
+// UniqueConstraint Relational unique constraint.
+type UniqueConstraint struct {
+	// Columns Unique columns. One or more ordered non-json relational columns are supported.
+	Columns []string `json:"columns,omitempty,omitzero"`
+
+	// Expressions Stable expression keys supported by unique-owner maintenance.
+	Expressions []struct {
+		Field string                        `json:"field"`
+		Op    UniqueConstraintExpressionsOp `json:"op"`
+	} `json:"expressions,omitempty,omitzero"`
+
+	// Name Constraint name, unique within the table schema.
+	Name string `json:"name,omitempty,omitzero"`
+
+	// ValidationState Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+	ValidationState UniqueConstraintValidationState `json:"validation_state,omitempty,omitzero"`
+
+	// Where Conjunction of partial-unique predicate atoms.
+	Where RowsUniquePredicateGroup `json:"where,omitempty,omitzero"`
+
+	// WhereExpressions Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
+	WhereExpressions []RowsExpressionCondition `json:"where_expressions,omitempty,omitzero"`
+
+	// WithoutOverlapsPeriod Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness.
+	WithoutOverlapsPeriod string `json:"without_overlaps_period,omitempty,omitzero"`
+}
+
+// UniqueConstraintExpressionsOp defines model for UniqueConstraint.Expressions.Op.
+type UniqueConstraintExpressionsOp string
+
+// UniqueConstraintValidationState Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+type UniqueConstraintValidationState string
+
+// AsForeignKeyDeferrable0 returns the union data inside the ForeignKey_Deferrable as a ForeignKeyDeferrable0
+func (t ForeignKey_Deferrable) AsForeignKeyDeferrable0() (ForeignKeyDeferrable0, error) {
+	var body ForeignKeyDeferrable0
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromForeignKeyDeferrable0 overwrites any union data inside the ForeignKey_Deferrable as the provided ForeignKeyDeferrable0
+func (t *ForeignKey_Deferrable) FromForeignKeyDeferrable0(v ForeignKeyDeferrable0) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeForeignKeyDeferrable0 performs a merge with any union data inside the ForeignKey_Deferrable, using the provided ForeignKeyDeferrable0
+func (t *ForeignKey_Deferrable) MergeForeignKeyDeferrable0(v ForeignKeyDeferrable0) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsForeignKeyDeferrable1 returns the union data inside the ForeignKey_Deferrable as a ForeignKeyDeferrable1
+func (t ForeignKey_Deferrable) AsForeignKeyDeferrable1() (ForeignKeyDeferrable1, error) {
+	var body ForeignKeyDeferrable1
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromForeignKeyDeferrable1 overwrites any union data inside the ForeignKey_Deferrable as the provided ForeignKeyDeferrable1
+func (t *ForeignKey_Deferrable) FromForeignKeyDeferrable1(v ForeignKeyDeferrable1) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeForeignKeyDeferrable1 performs a merge with any union data inside the ForeignKey_Deferrable, using the provided ForeignKeyDeferrable1
+func (t *ForeignKey_Deferrable) MergeForeignKeyDeferrable1(v ForeignKeyDeferrable1) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t ForeignKey_Deferrable) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *ForeignKey_Deferrable) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
+// AsRowsExpressionField returns the union data inside the RowsExpression as a RowsExpressionField
+func (t RowsExpression) AsRowsExpressionField() (RowsExpressionField, error) {
+	var body RowsExpressionField
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRowsExpressionField overwrites any union data inside the RowsExpression as the provided RowsExpressionField
+func (t *RowsExpression) FromRowsExpressionField(v RowsExpressionField) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRowsExpressionField performs a merge with any union data inside the RowsExpression, using the provided RowsExpressionField
+func (t *RowsExpression) MergeRowsExpressionField(v RowsExpressionField) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsRowsExpressionValue returns the union data inside the RowsExpression as a RowsExpressionValue
+func (t RowsExpression) AsRowsExpressionValue() (RowsExpressionValue, error) {
+	var body RowsExpressionValue
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRowsExpressionValue overwrites any union data inside the RowsExpression as the provided RowsExpressionValue
+func (t *RowsExpression) FromRowsExpressionValue(v RowsExpressionValue) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRowsExpressionValue performs a merge with any union data inside the RowsExpression, using the provided RowsExpressionValue
+func (t *RowsExpression) MergeRowsExpressionValue(v RowsExpressionValue) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+// AsRowsExpressionOperator returns the union data inside the RowsExpression as a RowsExpressionOperator
+func (t RowsExpression) AsRowsExpressionOperator() (RowsExpressionOperator, error) {
+	var body RowsExpressionOperator
+	err := json.Unmarshal(t.union, &body)
+	return body, err
+}
+
+// FromRowsExpressionOperator overwrites any union data inside the RowsExpression as the provided RowsExpressionOperator
+func (t *RowsExpression) FromRowsExpressionOperator(v RowsExpressionOperator) error {
+	b, err := json.Marshal(v)
+	t.union = b
+	return err
+}
+
+// MergeRowsExpressionOperator performs a merge with any union data inside the RowsExpression, using the provided RowsExpressionOperator
+func (t *RowsExpression) MergeRowsExpressionOperator(v RowsExpressionOperator) error {
+	b, err := json.Marshal(v)
+	if err != nil {
+		return err
+	}
+
+	merged, err := runtime.JSONMerge(t.union, b)
+	t.union = merged
+	return err
+}
+
+func (t RowsExpression) MarshalJSON() ([]byte, error) {
+	b, err := t.union.MarshalJSON()
+	return b, err
+}
+
+func (t *RowsExpression) UnmarshalJSON(b []byte) error {
+	err := t.union.UnmarshalJSON(b)
+	return err
+}
+
 // Base64 encoded, gzipped, json marshaled Swagger object
 var swaggerSpec = []string{
 
-	"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",
-	"5uV/AQAA//+Khc395RAAAA==",
+	"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",
+	"u8WfFt9loY/psiOMBe//LwAA//+278vyDUIAAA==",
 }
 
 // GetSwagger returns the content of the embedded swagger specification file

@@ -63,7 +63,7 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - chunk-aware full-text publication-state specific assertions
   - named vector/sparse publication-action visibility during metadata-only republish
 - `test_sync_levels.py`
-  - shared backend-agnostic `sync_level=full_text` visibility on `/tables/{table}/batch`
+  - shared backend-agnostic `sync_level=query` visibility on `/tables/{table}/batch`
   - serverless-specific `sync_level=enrichments` rejection when background materialization is required
 - `test_transforms.py`
   - stateful public `$max` update semantics
@@ -91,6 +91,10 @@ Use product-area names for test files. Do not use migration labels like `*_parit
   - full-suite MemoryAF extension package projection from `extensions/memoryaf`
   - swarm and distributed extension lifecycle dry-run coverage
   - swarm install plus scoped `/mcp/v1/extensions/memoryaf` tool listing coverage
+- `test_pgwire.py`
+  - optional PostgreSQL wire listener coverage for swarm and metadata runtimes
+  - `antfly sql` HTTP host/port and pgwire host/port CLI coverage
+  - pgx default extended-query smoke coverage, simple query multi-statement coverage, auth, transaction status, cancellation key data, PostgreSQL compatibility probes, row descriptions, text and binary parameter/result formats
 ## Harnesses
 
 - `serverless_api`
@@ -111,8 +115,8 @@ Use product-area names for test files. Do not use migration labels like `*_parit
 - Keep one product-area file even when some tests are backend-specific.
   - If an assertion is still part of index lifecycle, keep it in `test_index_lifecycle.py` and use `serverless_api` directly for serverless-only publication checks.
 - Normalize visibility semantics explicitly in shared tests when needed.
-  - Example: chunker-driven full-text routing is shared behavior, but the visibility wait differs by backend today, so the shared test uses index-visible semantics:
-    - stateful: `sync_level=full_text`
+  - Example: chunker-driven full-text routing is shared behavior, but the visibility wait differs by backend today, so the shared test uses query-visible semantics:
+    - stateful: `sync_level=query`
     - serverless: write then explicit publish
 - Keep publication/status checks in the same product-area file when they are part of that lifecycle.
   - Example: chunker-driven full-text searchability and serverless `full_text_source_mode` / publication-action assertions now both live in `test_index_lifecycle.py`.

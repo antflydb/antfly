@@ -70,10 +70,10 @@ Add primitives with `pnpm dlx shadcn@latest add <name>` from inside
 
 - `@antfly/components` (this repo, `packages/components/`) — unstyled search
   primitives. Not merged with `@antfly/design-system`.
-- `@searchaf/ui` (in `colony/frontend/packages/ui`) — legacy shadcn library;
-  future work will migrate the dashboard off it onto `@antfly/design-system`.
-- `@antfly/www-design` (in `colony/frontend/packages/www-design`) —
-  predecessor for tokens + Aeonik; still used by marketing sites.
+- `@searchaf/ui` — shadcn-based UI package used by dashboard surfaces; future
+  work will migrate the dashboard onto `@antfly/design-system`.
+- `@antfly/www-design` — predecessor for tokens + Aeonik; still used by
+  marketing sites.
 
 ## What does NOT belong here
 

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.edge import Edge
     from ..models.graph_result_node_document import GraphResultNodeDocument
     from ..models.graph_result_node_evidence import GraphResultNodeEvidence
+    from ..models.graph_result_node_metrics import GraphResultNodeMetrics
     from ..models.path_edge import PathEdge
 
 
@@ -31,6 +32,8 @@ class GraphResultNode:
         path_edges (list[PathEdge] | Unset): Edges in path from start to this node
         provenance (list[str] | Unset): Algebraic provenance labels folded into this result, when requested by an
             algebraic graph executor
+        metrics (GraphResultNodeMetrics | Unset): Projected graph metric scores keyed by metric name. Values are numbers
+            or null when a requested metric has no score for the node.
         evidence (GraphResultNodeEvidence | Unset): Parsed evidence envelope for provenance labels and edge metadata
         edges (list[Edge] | Unset): Connected edges (when include_edges=true)
     """
@@ -42,6 +45,7 @@ class GraphResultNode:
     path: list[str] | Unset = UNSET
     path_edges: list[PathEdge] | Unset = UNSET
     provenance: list[str] | Unset = UNSET
+    metrics: GraphResultNodeMetrics | Unset = UNSET
     evidence: GraphResultNodeEvidence | Unset = UNSET
     edges: list[Edge] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
@@ -71,6 +75,10 @@ class GraphResultNode:
         provenance: list[str] | Unset = UNSET
         if not isinstance(self.provenance, Unset):
             provenance = self.provenance
+
+        metrics: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metrics, Unset):
+            metrics = self.metrics.to_dict()
 
         evidence: dict[str, Any] | Unset = UNSET
         if not isinstance(self.evidence, Unset):
@@ -102,6 +110,8 @@ class GraphResultNode:
             field_dict["path_edges"] = path_edges
         if provenance is not UNSET:
             field_dict["provenance"] = provenance
+        if metrics is not UNSET:
+            field_dict["metrics"] = metrics
         if evidence is not UNSET:
             field_dict["evidence"] = evidence
         if edges is not UNSET:
@@ -114,6 +124,7 @@ class GraphResultNode:
         from ..models.edge import Edge
         from ..models.graph_result_node_document import GraphResultNodeDocument
         from ..models.graph_result_node_evidence import GraphResultNodeEvidence
+        from ..models.graph_result_node_metrics import GraphResultNodeMetrics
         from ..models.path_edge import PathEdge
 
         d = dict(src_dict)
@@ -143,6 +154,13 @@ class GraphResultNode:
 
         provenance = cast(list[str], d.pop("provenance", UNSET))
 
+        _metrics = d.pop("metrics", UNSET)
+        metrics: GraphResultNodeMetrics | Unset
+        if isinstance(_metrics, Unset):
+            metrics = UNSET
+        else:
+            metrics = GraphResultNodeMetrics.from_dict(_metrics)
+
         _evidence = d.pop("evidence", UNSET)
         evidence: GraphResultNodeEvidence | Unset
         if isinstance(_evidence, Unset):
@@ -167,6 +185,7 @@ class GraphResultNode:
             path=path,
             path_edges=path_edges,
             provenance=provenance,
+            metrics=metrics,
             evidence=evidence,
             edges=edges,
         )

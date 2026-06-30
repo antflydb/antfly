@@ -152,6 +152,38 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a graph metric operational action
+         * @description Refresh, rebuild, delete, pause, or resume maintenance for a configured
+         *     graph metric. The metric configuration remains owned by the graph index.
+         *     `delete` clears materialized metric state and maintenance controls; a
+         *     later refresh or rebuild can publish a new generation.
+         */
+        post: operations["executeGraphMetricAction"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/transactions/commit": {
         parameters: {
             query?: never;
@@ -483,6 +515,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/sql": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute SQL text in a logical SQL session
+         * @description Executes SQL through Antfly's psql-style HTTP ingress. The request is a
+         *     single synchronous statement and the response returns the logical
+         *     `session_id` that should be supplied on later requests when session
+         *     state such as prepared statements, LISTEN/NOTIFY subscriptions, or SQL
+         *     catalog defaults must be reused. Prepared statements and cursors are
+         *     SQL session state, not durable REST resources. Cursor-backed fetches and
+         *     asynchronous statement jobs are reserved for later extensions.
+         */
+        post: operations["executeSql"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/query": {
         parameters: {
             query?: never;
@@ -653,6 +711,483 @@ export interface paths {
          */
         post: operations["retrievalAgent"];
         delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tablespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List tablespaces
+         * @description Lists tablespace catalog objects visible to the caller.
+         */
+        get: operations["listTablespaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tablespaces/{tablespaceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        /** Get tablespace */
+        get: operations["getTablespace"];
+        put?: never;
+        /**
+         * Create tablespace
+         * @description Creates a tablespace catalog object. The server applies the same lifecycle semantics as `CREATE TABLESPACE`.
+         */
+        post: operations["createTablespace"];
+        /**
+         * Drop tablespace
+         * @description Drops a tablespace catalog object. Table placement by tablespace is fail-closed until native placement planning consumes tablespace policy.
+         */
+        delete: operations["dropTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        /**
+         * List databases
+         * @description Lists database catalog objects visible to the caller. Shorthand table APIs resolve through the caller's current/default database.
+         */
+        get: operations["listDatabases"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        /** Get database */
+        get: operations["getDatabase"];
+        put?: never;
+        /**
+         * Create database
+         * @description Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
+         */
+        post: operations["createDatabase"];
+        /**
+         * Drop database
+         * @description Drops an empty database catalog object. Non-empty databases fail with a conflict.
+         */
+        delete: operations["dropDatabase"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/tablespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set database tablespace
+         * @description Binds the database catalog object to an existing tablespace.
+         */
+        put: operations["setDatabaseTablespace"];
+        post?: never;
+        /**
+         * Clear database tablespace
+         * @description Clears the database catalog object's durable tablespace binding.
+         */
+        delete: operations["clearDatabaseTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List namespaces
+         * @description Lists namespace catalog objects inside a database. PostgreSQL schemas map to these namespaces.
+         */
+        get: operations["listNamespaces"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Create namespace
+         * @description Creates a namespace catalog object in a database. The server applies the same semantics as `CREATE SCHEMA` for the selected database.
+         */
+        post: operations["createNamespace"];
+        /**
+         * Drop namespace
+         * @description Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+         */
+        delete: operations["dropNamespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tablespace": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        /**
+         * Set namespace tablespace
+         * @description Binds the namespace catalog object to an existing tablespace.
+         */
+        put: operations["setNamespaceTablespace"];
+        post?: never;
+        /**
+         * Clear namespace tablespace
+         * @description Clears the namespace catalog object's durable tablespace binding.
+         */
+        delete: operations["clearNamespaceTablespace"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List tables in namespace
+         * @description Lists table catalog objects under an explicit database and namespace.
+         */
+        get: operations["listNamespaceTables"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Get namespace table details
+         * @description Gets a table through an explicit database and namespace route.
+         */
+        get: operations["getNamespaceTable"];
+        put?: never;
+        /**
+         * Create namespace table
+         * @description Creates a table through an explicit database and namespace route.
+         */
+        post: operations["createNamespaceTable"];
+        /**
+         * Drop namespace table
+         * @description Drops a table through an explicit database and namespace route.
+         */
+        delete: operations["dropNamespaceTable"];
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Query an explicit namespace table
+         * @description Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["queryNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform batch inserts and deletes on an explicit namespace table
+         * @description Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["batchNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform structured relational row writes on an explicit namespace table
+         * @description Relational row batch endpoint for an explicit database and namespace table. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        post: operations["rowsBatchNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Backup an explicit namespace table */
+        post: operations["backupNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Restore an explicit namespace table from backup */
+        post: operations["restoreNamespaceTable"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Key of the document to retrieve */
+                key: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * Retrieve a document by key from an explicit namespace table
+         * @description Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+         */
+        get: operations["lookupNamespaceTableDocument"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List indexes for an explicit namespace table
+         * @description Lists index metadata through an explicit database and namespace route.
+         */
+        get: operations["listNamespaceTableIndexes"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        /** Get index details for an explicit namespace table */
+        get: operations["getNamespaceTableIndex"];
+        put?: never;
+        /** Add an index to an explicit namespace table */
+        post: operations["createNamespaceTableIndex"];
+        /** Drop an index from an explicit namespace table */
+        delete: operations["dropNamespaceTableIndex"];
         options?: never;
         head?: never;
         patch?: never;
@@ -835,6 +1370,221 @@ export interface paths {
         put?: never;
         /** Perform batch inserts and deletes on a table */
         post: operations["batchWrite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/batch": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Perform structured relational row writes by row identity
+         * @description Relational row batch endpoint for tables with a declared `primary_key`.
+         *     Callers address rows by structured primary-key identity or declared
+         *     unique-key identity instead of physical document keys. The server
+         *     derives the storage-owned physical row key from the canonical typed
+         *     primary-key tuple, or resolves a unique selector through durable
+         *     unique-owner rows, then executes through the normal batch/2PC path.
+         */
+        post: operations["rowsBatchWrite"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/mutation-source": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Stage typed relational update/delete operations from a claimed row source
+         * @description Transaction-staging endpoint for bounded multi-row relational writes.
+         *     Update/delete sources use either a typed base row query with a
+         *     `row_claim` and transaction id, or a typed joined mutation-source plan
+         *     whose target side carries the row claim. Insert-source requests expose
+         *     the native source-to-target insert plan shape: the server reads the
+         *     typed source query, applies target-column assignments and conflict
+         *     actions through the row-batch constraint path, and returns optional
+         *     projections from the planned final target image. Update/delete plans
+         *     claim selected target rows, record committed-version predicates, stage
+         *     intents into the existing transaction, and return optional projections
+         *     from the planned final target image or deleted target row image.
+         */
+        post: operations["rowsMutationSource"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/get": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Lookup relational rows by structured row identity
+         * @description Point lookup endpoint for relational tables with a declared
+         *     `primary_key`. The request uses structured primary-key selectors or
+         *     declared unique-key selectors. Unique selectors resolve through durable
+         *     unique-owner rows; a missing unique owner returns `found: false`
+         *     without scanning. Responses include row JSON, version, and optional
+         *     diagnostic physical keys.
+         */
+        post: operations["rowsGet"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/plan": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /**
+         * Execute a typed relational row read plan
+         * @description Executes exactly one typed read-plan envelope. This endpoint accepts the
+         *     same query, aggregate, window, join, and lateral plan bodies as the
+         *     operation-specific endpoints and dispatches them by the single operation
+         *     branch present in the request.
+         */
+        post: operations["rowsPlan"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/query": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row query plan */
+        post: operations["rowsQuery"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/aggregate": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row aggregate plan */
+        post: operations["rowsAggregate"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/window": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row window plan */
+        post: operations["rowsWindow"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/join": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row join plan */
+        post: operations["rowsJoin"];
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
+    "/db/v1/tables/{tableName}/rows/lateral": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        get?: never;
+        put?: never;
+        /** Execute a typed relational row lateral plan */
+        post: operations["rowsLateral"];
         delete?: never;
         options?: never;
         head?: never;
@@ -2317,6 +3067,54 @@ export interface components {
             /** @example An error message */
             error: string;
         };
+        /**
+         * @description Synchronous SQL statement request. `session_id` is optional on the first
+         *     request and should be reused from prior responses when SQL session state
+         *     must persist across requests.
+         */
+        SqlStatementRequest: {
+            /** @description SQL statement text to execute. */
+            sql: string;
+            /**
+             * Format: int64
+             * @description Logical SQL session id returned by an earlier SQL response.
+             */
+            session_id?: number | null;
+            /** @description Optional current database override for this request. */
+            database?: string | null;
+            /** @description Optional single search-path namespace override for this request. */
+            namespace?: string | null;
+            /**
+             * @description Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
+             * @default false
+             */
+            read_only?: boolean;
+        };
+        /**
+         * @description Synchronous SQL statement result metadata. Catalog/session/control
+         *     statements route through the typed DDL/session execution path. Read
+         *     statements lower through the same typed row-plan executor used by the
+         *     JSON relational rows APIs. Point write statements lower through the
+         *     typed row-batch mutation path, and insert-from-source statements lower
+         *     through the typed row-read plus row-batch mutation path.
+         */
+        SqlStatementResponse: {
+            /** @enum {string} */
+            kind: "ddl" | "read" | "write";
+            /** Format: int64 */
+            session_id: number;
+            noop?: boolean;
+            /** @description Applied DDL/session result record. */
+            applied?: {
+                [key: string]: unknown;
+            };
+            /** @description Lowered read or write statement family for data responses. */
+            statement_kind?: string | null;
+            /** @description Typed relational row-plan, row-batch, or mutation-source response for data statements. */
+            result?: {
+                [key: string]: unknown;
+            } | null;
+        };
         /** @description Sort direction for a single field. true = descending, false = ascending. */
         SortDirection: boolean;
         /** @description A single sort field with direction. */
@@ -2970,14 +3768,13 @@ export interface components {
          * @description Synchronization level for batch operations:
          *     - "propose": Wait for Raft proposal acceptance (fastest, default)
          *     - "write": Wait for Pebble KV write
-         *     - "full_text": Wait for full-text index WAL write
+         *     - "query": Wait until affected documents are visible to query paths such as full-text search
          *     - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-         *     - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "aknn" | "full_index";
+        SyncLevel: "propose" | "write" | "query" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -3046,6 +3843,28 @@ export interface components {
                 [key: string]: components["schemas"]["IndexConfig"];
             };
             /**
+             * @description Table-level typed document path metadata used by SQL planning for
+             *     JSON/path scalar comparison semantics. This is not a physical index
+             *     and does not imply indexed lookup, rebuild, catch-up, compaction, or
+             *     PostgreSQL `CREATE INDEX` behavior. Use real index definitions for
+             *     physical access paths.
+             *
+             *     Keys are scalar type names such as `keyword`, `numeric`, `boolean`,
+             *     or `datetime`; values are a path string or an array of path strings.
+             * @example {
+             *       "numeric": [
+             *         "metrics.score"
+             *       ],
+             *       "keyword": [
+             *         "status",
+             *         "metadata.plan"
+             *       ]
+             *     }
+             */
+            typed_paths?: {
+                [key: string]: unknown;
+            };
+            /**
              * @description Optional schema definition specifying field types, primary key, and TTL configuration.
              *     While optional, defining a schema provides type safety, optimized indexing, and better search performance.
              *
@@ -3076,6 +3895,12 @@ export interface components {
              *     Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
              */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+            /**
+             * @description Optional tablespace binding for the table. When set, the named tablespace must exist and
+             *     cannot be dropped while the table references it.
+             * @example fastspace
+             */
+            tablespace_name?: string;
         };
         /** @enum {string} */
         AntflyType: "search_as_you_type" | "keyword" | "text" | "html" | "numeric" | "datetime" | "boolean" | "link" | "geopoint" | "geoshape" | "embedding" | "blob";
@@ -3086,6 +3911,8 @@ export interface components {
              * @example Table for user data
              */
             description?: string;
+            /** @description Optional durable tablespace binding for this table. */
+            tablespace_name?: string;
             indexes: {
                 [key: string]: components["schemas"]["IndexConfig"];
             };
@@ -3097,6 +3924,104 @@ export interface components {
             migration?: components["schemas"]["TableMigration"];
             /** @description PostgreSQL CDC replication sources configured for this table. */
             replication_sources?: components["schemas"]["ReplicationSource"][];
+        };
+        /** @description Database catalog object. Tables and namespaces resolve under a database before authorization and routing. */
+        DatabaseCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable database catalog identifier.
+             * @example 22
+             */
+            database_id: number;
+            /**
+             * @description Database name.
+             * @example tenant_ops
+             */
+            name: string;
+            /**
+             * @description JSON-encoded database settings owned by the catalog.
+             * @example {}
+             */
+            settings_json: string;
+            /**
+             * @description Optional durable tablespace binding inherited by new namespace/table placement policy.
+             * @example fastspace
+             */
+            tablespace_name?: string | null;
+        };
+        /** @description Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces. */
+        NamespaceCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable namespace catalog identifier.
+             * @example 222
+             */
+            namespace_id: number;
+            /**
+             * Format: uint64
+             * @description Parent database identifier.
+             * @example 22
+             */
+            database_id: number;
+            /**
+             * @description Parent database name.
+             * @example tenant_ops
+             */
+            database_name: string;
+            /**
+             * @description Namespace name.
+             * @example analytics
+             */
+            name: string;
+            /**
+             * @description Optional durable tablespace binding inherited by new table placement policy in this namespace.
+             * @example fastspace
+             */
+            tablespace_name?: string | null;
+        };
+        CatalogTablespaceBindingRequest: {
+            /**
+             * @description Existing tablespace name to bind to the catalog object.
+             * @example fastspace
+             */
+            tablespace_name: string;
+        };
+        /** @description Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface. */
+        TablespaceCatalogRecord: {
+            /**
+             * Format: uint64
+             * @description Stable tablespace catalog identifier.
+             * @example 42
+             */
+            tablespace_id: number;
+            /**
+             * @description Tablespace name.
+             * @example fastspace
+             */
+            name: string;
+            /**
+             * @description JSON-encoded location descriptor. String locations are encoded as JSON strings.
+             * @example "/var/lib/antfly/fastspace"
+             */
+            location_json: string;
+            /**
+             * @description JSON-encoded placement policy reserved for native placement planning.
+             * @example {}
+             */
+            placement_policy_json: string;
+        };
+        /** @description Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it. */
+        CreateTablespaceRequest: {
+            /**
+             * @description JSON-encoded location descriptor. Defaults to `null`.
+             * @example "/var/lib/antfly/fastspace"
+             */
+            location_json?: string;
+            /**
+             * @description JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+             * @example {}
+             */
+            placement_policy_json?: string;
         };
         /** @description Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema. */
         TableMigration: {
@@ -3113,6 +4038,15 @@ export interface components {
          * @enum {string}
          */
         AggregationType: "sum" | "avg" | "min" | "max" | "count" | "sumsquares" | "stats" | "cardinality" | "terms" | "range" | "date_range" | "histogram" | "date_histogram" | "geohash_grid" | "geo_distance" | "significant_terms";
+        /**
+         * @description Exact-vs-approximate selection for a cardinality aggregation:
+         *     - auto: use a materialized HyperLogLog sketch when one applies and is
+         *       current, else an exact distinct scan (default).
+         *     - exact: always compute an exact distinct count.
+         *     - approximate: require a matching sketch; error if none applies.
+         * @enum {string}
+         */
+        CardinalityMode: "auto" | "exact" | "approximate";
         AggregationRange: {
             /** @description Name of the range bucket */
             name: string;
@@ -3190,6 +4124,8 @@ export interface components {
             type: components["schemas"]["AggregationType"];
             /** @description Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation. */
             field?: string;
+            /** @description Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types. */
+            mode?: components["schemas"]["CardinalityMode"];
             /** @description Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order. */
             fields?: string[];
             /**
@@ -3274,6 +4210,13 @@ export interface components {
              * @description Single value for metric aggregations (sum, avg, min, max, count, cardinality)
              */
             value?: number;
+            /** @description For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations. */
+            approximate?: boolean;
+            /**
+             * Format: float
+             * @description For an approximate cardinality value, the relative standard error of the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate is true.
+             */
+            relative_error?: number;
             /** @description Document count for stats aggregations */
             count?: number;
             /**
@@ -3320,6 +4263,9 @@ export interface components {
             };
             config: components["schemas"]["IndexConfig"];
             status: components["schemas"]["IndexStats"];
+        };
+        GraphMetricActionResponse: {
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /** @description Compact LSM backend operational status. Detailed low-level counters are available through metrics. */
         LsmStorageStatus: {
@@ -3771,6 +4717,914 @@ export interface components {
             deleted?: number;
             /** @description Number of documents successfully transformed */
             transformed?: number;
+        };
+        /**
+         * @description Structured primary-key identity. Keys are the declared
+         *     `primary_key.columns`; values are JSON scalar values coerced with the
+         *     table's relational column types.
+         * @example {
+         *       "tenant_id": "t1",
+         *       "order_id": "o9"
+         *     }
+         */
+        RowPrimarySelector: {
+            [key: string]: unknown;
+        };
+        /**
+         * @description Structured unique-key selector. The server encodes `values` with the
+         *     same relational tuple encoder used by storage, routes to the durable
+         *     unique-owner range, and reads the owner row to resolve the physical row
+         *     identity. This is a point lookup, not a query scan. The selector object
+         *     is exact: only `name` and `values` are accepted.
+         */
+        RowUniqueSelector: {
+            /** @description Unique constraint name. */
+            name: string;
+            /** @description Values for the declared unique-constraint columns. */
+            values: {
+                [key: string]: unknown;
+            };
+        };
+        /**
+         * @description Structured row selector. `primary` addresses declared primary-key
+         *     tables directly. `unique` addresses a declared unique constraint through
+         *     durable unique-owner rows. The selector is exact and accepts exactly one
+         *     of `primary` or `unique`.
+         */
+        RowSelector: {
+            primary?: components["schemas"]["RowPrimarySelector"];
+            unique?: components["schemas"]["RowUniqueSelector"];
+        } & (unknown | unknown);
+        /**
+         * @description Full relational row document. Keys are declared relational columns and
+         *     values are JSON values coerced through the table schema before storage.
+         */
+        RowsRowDocument: {
+            [key: string]: unknown;
+        };
+        /**
+         * @description Static field patch for top-level relational columns. Primary-key fields
+         *     are rejected by the server.
+         */
+        RowsFieldPatch: {
+            [key: string]: unknown;
+        };
+        /** @description Numeric increment map keyed by declared numeric columns. */
+        RowsNumericIncrement: {
+            [key: string]: number;
+        };
+        /** @description Field-to-expression assignment map over the shared row-expression AST. */
+        RowsExpressionAssignmentMap: {
+            [key: string]: components["schemas"]["RowsExpression"];
+        };
+        /** @description JSON path assignment for a declared `json` column. Exactly one of `value` or `expr` must be supplied. */
+        RowsJsonSetTransform: {
+            /** @description Declared `json` column to update. */
+            field: string;
+            /** @description Non-empty path under the JSON column. */
+            path: string[];
+            /** @description JSON value to write at the path. */
+            value?: unknown;
+            /** @description Expression value to evaluate at mutation time and write at the path. */
+            expr?: components["schemas"]["RowsExpression"];
+        };
+        /** @description Array transform for a declared `array` column. */
+        RowsArrayUpdateTransform: {
+            /** @description Declared `array` column to update. */
+            field: string;
+            /** @enum {string} */
+            op: "append" | "remove" | "add_to_set";
+            /** @description JSON value to append, remove, or add if absent. */
+            value: unknown;
+        };
+        /** @description Predicate atom that must match a partial unique constraint definition. */
+        RowsUniquePredicate: {
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "eq" | "ne";
+            /** @description Predicate comparison value. Omit for null-test operators. */
+            value?: unknown;
+        };
+        /** @description Conjunction of partial-unique predicate atoms. */
+        RowsUniquePredicateGroup: {
+            all: components["schemas"]["RowsUniquePredicate"][];
+        };
+        /** @description Declared unique constraint target for `ON CONFLICT`. */
+        RowsConflictUniqueTarget: {
+            /** @description Unique constraint name. */
+            name: string;
+            where?: components["schemas"]["RowsUniquePredicateGroup"];
+            /**
+             * @description Expression predicates for expression-partial unique conflict targets.
+             *     When present, the list must exactly match the named unique
+             *     constraint's stored expression predicate metadata.
+             */
+            where_expressions?: components["schemas"]["RowsExpressionCondition"][];
+        };
+        /** @description Primary-key or named unique constraint conflict target. */
+        RowsConflictTarget: {
+            /** @description Set to `true` to target the declared primary key. */
+            primary?: boolean;
+            unique?: components["schemas"]["RowsConflictUniqueTarget"];
+        } & (unknown | unknown);
+        /**
+         * @description Typed conflict action for insert operations. `nothing` skips the insert
+         *     when the target already exists. `update` applies the same typed update
+         *     operators as ordinary row updates, with expression sources allowed to
+         *     reference `existing` and `proposed` row images.
+         */
+        RowsOnConflict: {
+            target: components["schemas"]["RowsConflictTarget"];
+            /** @enum {string} */
+            action: "update" | "nothing";
+            patch?: components["schemas"]["RowsFieldPatch"];
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            json_set?: components["schemas"]["RowsJsonSetTransform"][];
+            array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            where_expression?: components["schemas"]["RowsExpressionCondition"];
+        };
+        /**
+         * @description Structured relational row mutation. `insert` fails if the primary
+         *     identity already exists, `upsert` overwrites or creates, `update`
+         *     applies a non-upsert patch by primary or unique identity, and `delete`
+         *     removes by primary or unique identity. `update.patch` cannot change
+         *     primary-key components. Missing unique selectors fail the write request
+         *     rather than falling back to scans. The operation envelope is exact and
+         *     operation-specific: unsupported fields for the selected `op` fail
+         *     validation instead of being ignored.
+         */
+        RowOperation: {
+            /** @enum {string} */
+            op: "insert" | "upsert" | "update" | "delete";
+            /** @description Full row document for insert/upsert. Must include primary-key columns. */
+            row?: components["schemas"]["RowsRowDocument"];
+            where?: components["schemas"]["RowSelector"];
+            /** @description Top-level field patch for update operations. */
+            patch?: components["schemas"]["RowsFieldPatch"];
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            json_set?: components["schemas"]["RowsJsonSetTransform"][];
+            array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            on_conflict?: components["schemas"]["RowsOnConflict"];
+            /** @description Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections. */
+            returning?: string[];
+            /** @description Typed row-expression projections from the committed mutation image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+            /**
+             * Format: int64
+             * @description Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+             */
+            expected_version?: number;
+        };
+        RowsBatchRequest: {
+            operations: components["schemas"]["RowOperation"][];
+            sync_level?: components["schemas"]["SyncLevel"];
+        };
+        /**
+         * @description Typed relational mutation-source plan. The `source` is a lockable base
+         *     row-query request with `row_claim.transaction_id` and no
+         *     `source_cte` or `doc_key_range`; update/delete intents are staged into
+         *     that transaction using committed-version predicates from the selected
+         *     preimages. Claims over physical ranges, CTEs, joins, aggregates,
+         *     windows, and lateral outputs are rejected until those stages expose an
+         *     explicit lockable base-row contract.
+         */
+        RowsMutationSourceRequest: {
+            /** @enum {string} */
+            op: "update" | "delete";
+            source: components["schemas"]["RowsQueryRequest"];
+            /** @description Top-level static field patch for update operations. */
+            patch?: components["schemas"]["RowsFieldPatch"];
+            /** @description Numeric increments for update operations. */
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            /** @description Field-to-expression assignments evaluated over the selected row image. */
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description Field-to-expression numeric deltas evaluated over the selected row image. */
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description JSON path transforms for update operations. */
+            json_set?: components["schemas"]["RowsJsonSetTransform"][];
+            /** @description Array transforms for update operations. */
+            array_update?: components["schemas"]["RowsArrayUpdateTransform"][];
+            /** @description Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans. */
+            temporal_portion?: components["schemas"]["RowsTemporalPortion"];
+            /** @description Fields to return from the final update image or deleted row image. `*` returns the full row. */
+            returning?: string[];
+            /** @description Typed row-expression projections over the final update image or deleted row image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
+        /** @description Application-time temporal slice for update/delete mutation-source plans. */
+        RowsTemporalPortion: {
+            /** @description Period name declared on the relational table schema. */
+            period: string;
+            /** @description Inclusive lower bound encoded as the period start column's JSON type. */
+            from: unknown;
+            /** @description Exclusive upper bound encoded as the period end column's JSON type. */
+            to: unknown;
+        };
+        /** @description Target-column assignment for a typed insert-source plan. */
+        RowsInsertSourceAssignment: {
+            /** @description Declared target-table relational field to populate. */
+            target_field: string;
+            /** @description Typed expression evaluated over each source row. A field expression copies a source field; operator expressions build generated insert values without carrying SQL text. */
+            expr: components["schemas"]["RowsExpression"];
+        };
+        /**
+         * @description Typed relational insert-source plan. The `source` is a read-only row
+         *     query over `source_table` or, when omitted, the target table named in the
+         *     path. Each selected source row is projected through `assignments` into a
+         *     target insert row, then optional conflict handling and `RETURNING`
+         *     projection run through the same row-batch semantics as ordinary
+         *     inserts. Execution is fail-closed until the storage/runtime layer
+         *     implements source-to-target routing, duplicate-target detection, and
+         *     owner-local insert staging for this native plan.
+         */
+        RowsInsertSourceRequest: {
+            /** @enum {string} */
+            op: "insert";
+            /** @description Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support. */
+            source_table?: string;
+            source: components["schemas"]["RowsQueryRequest"];
+            /** @description Ordered target-field assignments used to build each proposed insert row from the source row. */
+            assignments: components["schemas"]["RowsInsertSourceAssignment"][];
+            on_conflict?: components["schemas"]["RowsOnConflict"];
+            /** @description Fields to return from the committed inserted or conflict-updated row image. `*` returns the full row. */
+            returning?: string[];
+            /** @description Typed row-expression projections over the committed inserted or conflict-updated row image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
+        /** @description Source-side assignment for joined mutation-source updates. */
+        RowsJoinedMutationSourceAssignment: {
+            /** @description Declared target-side relational field to assign. */
+            target_field: string;
+            /**
+             * @description Join side that supplies the source field. Must be the non-target side.
+             * @enum {string}
+             */
+            side: "left" | "right";
+            /** @description Declared relational field to copy from the source side. */
+            field: string;
+        };
+        /**
+         * @description Typed relational joined mutation-source plan. The target side of the
+         *     `join` must carry a lockable `row_claim.transaction_id`; the non-target
+         *     side is read-only input. Update plans can copy same-typed values from
+         *     the source side through `source_assignments` and can apply target-local
+         *     patches or expression assignments. Delete plans reject update
+         *     assignments. Execution must stage intents only for claimed target rows.
+         */
+        RowsJoinedMutationSourceRequest: {
+            /** @enum {string} */
+            op: "update" | "delete";
+            /** @description Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges. */
+            source_table?: string;
+            /** @enum {string} */
+            target_side: "left" | "right";
+            join: components["schemas"]["RowsJoinRequest"];
+            /** @description Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row. */
+            match_expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of post-match computed predicates over the target row and joined source row. */
+            match_expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of post-match computed predicates over the target row and joined source row. */
+            match_expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Post-match computed array-containment predicates over the target row and joined source row. */
+            match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            /** @description Source-side assignments that copy values from the read-only joined source side into the claimed target side. */
+            source_assignments?: components["schemas"]["RowsJoinedMutationSourceAssignment"][];
+            /** @description Target-local static field patch for update operations. */
+            patch?: components["schemas"]["RowsFieldPatch"];
+            /** @description Target-local numeric increments for update operations. */
+            increment?: components["schemas"]["RowsNumericIncrement"];
+            /** @description Target-local field-to-expression assignments evaluated over the target row image. */
+            patch_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description Target-local field-to-expression numeric deltas evaluated over the target row image. */
+            increment_expr?: components["schemas"]["RowsExpressionAssignmentMap"];
+            /** @description Fields to return from the final target update image or deleted target row image. `*` returns the full row. */
+            returning?: string[];
+            /** @description Typed row-expression projections over the final target update image or deleted target row image. */
+            returning_expressions?: components["schemas"]["RowsExpressionProjection"][];
+        };
+        RowsMutationSourceResultSet: {
+            /**
+             * Format: int64
+             * @description Number of source rows that matched before lock/limit selection.
+             */
+            matched?: number;
+            /**
+             * Format: int64
+             * @description Number of rows staged into the claimed transaction.
+             */
+            staged?: number;
+            /** @description Optional returning rows from the staged mutation. */
+            returning?: {
+                [key: string]: unknown;
+            }[];
+        };
+        RowsGetRequest: {
+            keys: components["schemas"]["RowSelector"][];
+            /**
+             * @description Include the diagnostic storage-owned physical key in each result.
+             * @default false
+             */
+            include_physical_key?: boolean;
+        };
+        RowsGetResult: {
+            identity?: components["schemas"]["RowSelector"];
+            found?: boolean;
+            row?: {
+                [key: string]: unknown;
+            };
+            /** Format: uint64 */
+            version?: number;
+            /** @description Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity. */
+            physical_key?: string | null;
+        };
+        RowsGetResultSet: {
+            rows?: components["schemas"]["RowsGetResult"][];
+        };
+        /** @description Ordered row-stream key. Exactly one of `field` or `expr` is required. `field` names an output/base field; `expr` carries a typed row-expression AST for computed ordering. */
+        RowsQueryOrder: components["schemas"]["RowsQueryOrderField"] | components["schemas"]["RowsQueryOrderExpression"];
+        RowsQueryOrderField: {
+            /** @description Output/base field to order by. Mutually exclusive with `expr`. */
+            field: string;
+            /** @enum {string} */
+            null_test?: "is_null" | "is_not_null";
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+        };
+        RowsQueryOrderExpression: {
+            /** @description Typed row-expression AST for computed ordering. Mutually exclusive with `field`. */
+            expr: components["schemas"]["RowsExpression"];
+            /** @enum {string} */
+            null_test?: "is_null" | "is_not_null";
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+        };
+        /**
+         * @description Lockable base-row claim metadata. Public row-plan endpoints reject this
+         *     field; it is only accepted by `rows/mutation-source` lockable base-row
+         *     sources and internal/coordinator execution paths. `transaction_id` is
+         *     the canonical field name.
+         */
+        RowsRowClaim: {
+            /**
+             * @default for_update
+             * @enum {string}
+             */
+            mode?: "for_update" | "for_no_key_update";
+            /**
+             * @default wait
+             * @enum {string}
+             */
+            wait_policy?: "wait" | "nowait" | "skip_locked";
+            /**
+             * @deprecated
+             * @default false
+             */
+            skip_locked?: boolean;
+            /**
+             * Format: int64
+             * @default 30000
+             */
+            lease_ms?: number;
+            owner_id?: string;
+            /** @description Canonical 16-byte transaction id encoded as 32 hex characters. */
+            transaction_id?: string;
+        };
+        /**
+         * @description Physical row-key range selector used by routed typed row plans after
+         *     durable range ownership is known. At least one of `start` or `end` must be present,
+         *     and a bounded range must have `start < end`.
+         */
+        RowsDocKeyRange: {
+            /** @description Inclusive physical row-key lower bound. */
+            start?: string;
+            /** @description Exclusive physical row-key upper bound. */
+            end?: string;
+        } | unknown | unknown;
+        /**
+         * @description Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+         *     `{ "value": ... }`, or an operator node such as
+         *     `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+         *     operators are the shared row-local expression surface used by schema
+         *     predicates, mutation expressions, query projections, filters, grouping,
+         *     ordering, and SQL lowering.
+         *     Mutation expressions may set `source` to `existing` or `proposed`; query
+         *     expressions use the default row source.
+         */
+        RowsExpression: components["schemas"]["RowsExpressionField"] | components["schemas"]["RowsExpressionValue"] | components["schemas"]["RowsExpressionOperator"];
+        RowsExpressionField: {
+            field: string;
+            /** @enum {string} */
+            source?: "row" | "existing" | "proposed" | "source";
+        };
+        RowsExpressionValue: {
+            /** @description Literal JSON value for a value node. */
+            value: unknown;
+        };
+        RowsExpressionOperator: {
+            /** @enum {string} */
+            op: "now" | "coalesce" | "lower" | "upper" | "trim" | "btrim" | "ltrim" | "rtrim" | "replace" | "translate" | "substring" | "substr" | "overlay" | "split_part" | "strpos" | "left" | "right" | "lpad" | "rpad" | "repeat" | "reverse" | "starts_with" | "ends_with" | "ascii" | "chr" | "md5" | "like" | "ilike" | "bool_and" | "and" | "bool_or" | "or" | "bool_not" | "not" | "concat" | "concat_ws" | "length" | "char_length" | "character_length" | "octet_length" | "nullif" | "greatest" | "least" | "abs" | "round" | "trunc" | "floor" | "ceil" | "sqrt" | "sign" | "power" | "add" | "sub" | "mul" | "div" | "mod" | "interval_ns" | "interval_months" | "date_trunc" | "date_bin" | "date_part" | "extract" | "cast" | "json_extract" | "json_extract_path" | "json_extract_path_text" | "jsonb_extract_path" | "jsonb_extract_path_text" | "json_typeof" | "jsonb_typeof" | "json_array_length" | "jsonb_array_length" | "array_length" | "cardinality" | "array_position" | "array_positions" | "array_append" | "array_prepend" | "array_cat" | "array_remove" | "array_replace" | "array_to_string" | "string_to_array" | "uuid_v4" | "gen_random_uuid" | "uuid_generate_v4" | "json_build_object" | "jsonb_build_object" | "to_jsonb" | "json_path_exists" | "regexp_replace" | "case";
+            /** @description Operand expressions for operator nodes. */
+            args?: components["schemas"]["RowsExpression"][];
+            /**
+             * @description Cast target for `cast`.
+             * @enum {string}
+             */
+            to?: "text" | "numeric" | "bool" | "boolean" | "datetime";
+            /** @description Structured JSON path for `json_extract` and `json_path_exists`. */
+            path?: unknown;
+            /** @description Return JSON path extraction as text. */
+            as_text?: boolean;
+            /** @description Searched case branches, each with `when` and `then`. */
+            cases?: components["schemas"]["RowsExpressionCaseBranch"][];
+            /** @description Fallback expression for searched `case`. */
+            else?: components["schemas"]["RowsExpression"];
+        };
+        RowsExpressionCaseBranch: {
+            when: components["schemas"]["RowsExpressionCondition"];
+            then: components["schemas"]["RowsExpression"];
+        };
+        /** @description Computed expression predicate over the shared row-expression AST. */
+        RowsExpressionCondition: {
+            lhs: components["schemas"]["RowsExpression"];
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
+            rhs?: components["schemas"]["RowsExpression"];
+        };
+        RowsExpressionConditionGroup: {
+            all: components["schemas"]["RowsExpressionCondition"][];
+        };
+        RowsExpressionArrayContainsPredicate: {
+            expr: components["schemas"]["RowsExpression"];
+            value: unknown[];
+        };
+        RowsExpressionProjection: {
+            as: string;
+            expr: components["schemas"]["RowsExpression"];
+        };
+        /** @description Compact JSON path projection over a declared `json` column. */
+        RowsJsonExtractProjection: {
+            /** @description Output field name. */
+            as: string;
+            /** @description Declared `json` column to read. */
+            field: string;
+            /** @description Non-empty JSON path, encoded as a dot path string or array of path components. */
+            path: unknown;
+            /**
+             * @description Return the extracted value as text, matching SQL `->>` behavior.
+             * @default false
+             */
+            as_text?: boolean;
+        };
+        /** @description Compact array-length projection over a declared `array` column. */
+        RowsArrayLengthProjection: {
+            /** @description Output field name. */
+            as: string;
+            /** @description Declared `array` column to measure. */
+            field: string;
+        };
+        /** @description Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server. */
+        RowsCoalesceOperand: components["schemas"]["RowsCoalesceFieldOperand"] | components["schemas"]["RowsCoalesceValueOperand"];
+        RowsCoalesceFieldOperand: {
+            /** @description Declared column to read. */
+            field: string;
+        };
+        RowsCoalesceValueOperand: {
+            /** @description Literal JSON fallback value. */
+            value: unknown;
+        };
+        /** @description Compact COALESCE projection. */
+        RowsCoalesceProjection: {
+            /** @description Output field name. */
+            as: string;
+            operands: components["schemas"]["RowsCoalesceOperand"][];
+        };
+        /** @description Compact field alias projection over a declared column. */
+        RowsFieldAliasProjection: {
+            /** @description Output field name. */
+            as: string;
+            /** @description Declared column to project. */
+            field: string;
+        };
+        /**
+         * @description Typed scalar, array, JSON, or text-pattern row predicate atom over a
+         *     declared relational column. Null-test operators omit `value`; value
+         *     operators carry one JSON value; `in` and `not_in` carry an array value;
+         *     JSON path operators carry `path`; text-pattern operators carry
+         *     `pattern` and optional flags. The server validates column type and
+         *     operator-specific fields against the table schema.
+         */
+        RowsWhereAtom: {
+            /** @description Declared relational column. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "array_any" | "array_contains" | "array_eq" | "in" | "not_in" | "json_contains" | "json_path_eq" | "json_path_exists" | "text_pattern";
+            /** @description JSON comparison value or array operand for operators that require one. */
+            value?: unknown;
+            /** @description Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components. */
+            path?: unknown;
+            /** @description SQL LIKE pattern for `text_pattern`. */
+            pattern?: string;
+            /**
+             * @description ASCII case-insensitive matching for `text_pattern`.
+             * @default false
+             */
+            case_insensitive?: boolean;
+            /**
+             * @description Negates `text_pattern`.
+             * @default false
+             */
+            negated?: boolean;
+        };
+        /** @description Predicate branch used by `where.any` and `where.not`; exactly one typed atom or an `all`-only conjunction of typed atoms. */
+        RowsWhereBranch: components["schemas"]["RowsWhereBranchAtom"] | components["schemas"]["RowsWhereBranchAll"];
+        RowsWhereBranchAtom: {
+            /** @description Declared relational column for a single-atom branch. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "array_any" | "array_contains" | "array_eq" | "in" | "not_in" | "json_contains" | "json_path_eq" | "json_path_exists" | "text_pattern";
+            /** @description JSON comparison value or array operand for operators that require one. */
+            value?: unknown;
+            /** @description Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components. */
+            path?: unknown;
+            /** @description SQL LIKE pattern for `text_pattern`. */
+            pattern?: string;
+            /**
+             * @description ASCII case-insensitive matching for `text_pattern`.
+             * @default false
+             */
+            case_insensitive?: boolean;
+            /**
+             * @description Negates `text_pattern`.
+             * @default false
+             */
+            negated?: boolean;
+        };
+        RowsWhereBranchAll: {
+            /** @description Conjunction of typed atoms for this branch. */
+            all: components["schemas"]["RowsWhereAtom"][];
+        };
+        /**
+         * @description Canonical row predicate tree. A top-level `where` is one predicate
+         *     atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an
+         *     `all` conjunction plus branch groups. Branches may contain scalar,
+         *     membership, array, JSON, and text-pattern atoms; the server stores
+         *     branches containing structured atoms in native mixed access predicate
+         *     groups and keeps scalar-only branches in scalar predicate groups.
+         */
+        RowsWhere: {
+            /** @description Declared relational column for a single top-level atom. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte" | "array_any" | "array_contains" | "array_eq" | "in" | "not_in" | "json_contains" | "json_path_eq" | "json_path_exists" | "text_pattern";
+            /** @description JSON comparison value or array operand for operators that require one. */
+            value?: unknown;
+            /** @description Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components. */
+            path?: unknown;
+            /** @description SQL LIKE pattern for `text_pattern`. */
+            pattern?: string;
+            /**
+             * @description ASCII case-insensitive matching for `text_pattern`.
+             * @default false
+             */
+            case_insensitive?: boolean;
+            /**
+             * @description Negates `text_pattern`.
+             * @default false
+             */
+            negated?: boolean;
+        } | ({
+            all?: components["schemas"]["RowsWhereAtom"][];
+            any?: components["schemas"]["RowsWhereBranch"][];
+            not?: components["schemas"]["RowsWhereBranch"][];
+        } | unknown | unknown | unknown);
+        /**
+         * @description Typed relational row-query plan. Predicate and expression arrays carry
+         *     Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
+         *     native request shape.
+         */
+        RowsQueryRequest: {
+            /** @description Optional ordered CTE name to read instead of the base table. */
+            source_cte?: string;
+            /** @description Typed scalar, array, JSON, text-pattern, OR, and NOT predicates. */
+            where?: components["schemas"]["RowsWhere"];
+            /** @description All computed expression predicates that must pass. */
+            expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of computed expression predicates. */
+            expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of computed expression predicates. */
+            expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Computed array-containment predicates. */
+            expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            select?: string[];
+            json_extract?: components["schemas"]["RowsJsonExtractProjection"][];
+            array_length?: components["schemas"]["RowsArrayLengthProjection"][];
+            coalesce?: components["schemas"]["RowsCoalesceProjection"][];
+            field_aliases?: components["schemas"]["RowsFieldAliasProjection"][];
+            /** @description Typed row-expression projections. */
+            expressions?: components["schemas"]["RowsExpressionProjection"][];
+            /** @description Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`. */
+            distinct_on?: string[];
+            /** @description Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match. */
+            distinct_on_expressions?: components["schemas"]["RowsExpression"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+            row_claim?: components["schemas"]["RowsRowClaim"];
+            doc_key_range?: components["schemas"]["RowsDocKeyRange"];
+        };
+        /** @description Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce more rows or serialized row bytes than declared. */
+        RowsCte: {
+            name: string;
+            /** Format: int64 */
+            max_rows?: number;
+            /** Format: int64 */
+            max_bytes?: number;
+            query: components["schemas"]["RowsQueryRequest"];
+        };
+        RowsAggregateSpec: {
+            name: string;
+            /** @enum {string} */
+            op: "count" | "sum" | "min" | "max" | "avg" | "array_agg" | "string_agg" | "percentile_cont" | "percentile_disc" | "mode" | "bool_or" | "bool_and";
+            field?: string;
+            expr?: components["schemas"]["RowsExpression"];
+            distinct?: boolean;
+            /** Format: int64 */
+            distinct_max_items?: number;
+            /**
+             * Format: double
+             * @description Fraction for percentile_cont and percentile_disc aggregate specs.
+             */
+            percentile?: number;
+            /** @description Fractions for array-valued percentile_cont and percentile_disc aggregate specs. */
+            percentiles?: number[];
+            /**
+             * Format: int64
+             * @description Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+             */
+            percentile_max_items?: number;
+            /**
+             * @description Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
+             * @enum {string}
+             */
+            percentile_order?: "asc" | "desc";
+            /** Format: int64 */
+            array_max_items?: number;
+            array_order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** @description Delimiter for string_agg aggregate specs. */
+            delimiter?: string;
+            filter?: components["schemas"]["RowsWhere"];
+            /** @description Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`. */
+            filter_array_any?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-array containment filters for this aggregate. Each item must use `op: array_contains`. */
+            filter_array_contains?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-array equality filters for this aggregate. Each item must use `op: array_eq`. */
+            filter_array_eq?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive scalar membership filters for this aggregate. Each item must use `op: in` or `op: not_in`. */
+            filter_in?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-JSON containment filters for this aggregate. Each item must use `op: json_contains`. */
+            filter_json_contains?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-JSON path equality filters for this aggregate. Each item must use `op: json_path_eq`. */
+            filter_json_path_eq?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive declared-JSON path-existence filters for this aggregate. Each item must use `op: json_path_exists`. */
+            filter_json_path_exists?: components["schemas"]["RowsWhereAtom"][];
+            /** @description Conjunctive text-pattern filters for this aggregate. Each item must use `op: text_pattern`. */
+            filter_text_patterns?: components["schemas"]["RowsWhereAtom"][];
+            filter_expressions?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description Conjunctive computed array-containment filters for this aggregate. */
+            filter_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            /** @description Disjunction of input-row expression predicate groups for this aggregate. Each group is a conjunction; the aggregate consumes a row when at least one group matches. */
+            filter_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Negated input-row expression predicate groups for this aggregate. The aggregate skips a row when any group matches. */
+            filter_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+        };
+        /** @description Predicate over emitted aggregate output fields, evaluated after grouping. */
+        RowsAggregateHavingPredicate: {
+            /** @description Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias. */
+            field: string;
+            /** @enum {string} */
+            op: "is_null" | "is_not_null" | "is_distinct" | "is_not_distinct" | "eq" | "ne" | "gt" | "gte" | "lt" | "lte";
+            /** @description Comparison value. Omit for `is_null` and `is_not_null`. */
+            value?: unknown;
+        };
+        /** @description Conjunction of emitted aggregate-output predicates for HAVING. */
+        RowsAggregateHaving: {
+            all: components["schemas"]["RowsAggregateHavingPredicate"][];
+        };
+        RowsAggregateRequest: {
+            source: components["schemas"]["RowsQueryRequest"];
+            group_by?: string[];
+            /** @description Named expression group keys. These are evaluated for each source row, included in the grouping key, and emitted under their `as` names in aggregate result rows. */
+            group_expressions?: components["schemas"]["RowsExpressionProjection"][];
+            /** @description Metric specs to compute for each group. May be empty or omitted only when group_by or group_expressions is non-empty, which returns one row per distinct group key. */
+            aggregations?: components["schemas"]["RowsAggregateSpec"][];
+            having?: components["schemas"]["RowsAggregateHaving"];
+            /** @description Expression predicates over aggregate output fields, evaluated after grouping. Field references bind to group keys or aggregation names. */
+            having_expressions?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description Disjunction of aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row passes when at least one group matches. */
+            having_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Negated aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row is rejected when any group matches. */
+            having_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        RowsWindowFrame: {
+            /** @enum {string} */
+            unit: "rows" | "range";
+            /** @enum {string} */
+            start: "unbounded_preceding" | "offset_preceding" | "current_row" | "offset_following";
+            /** Format: int64 */
+            start_offset?: number;
+            /** @enum {string} */
+            end: "offset_preceding" | "current_row" | "offset_following" | "unbounded_following";
+            /** Format: int64 */
+            end_offset?: number;
+        };
+        RowsWindowSpec: {
+            as: string;
+            /** @description Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and `max`. */
+            function: string;
+            partition_by?: string[];
+            order_by: components["schemas"]["RowsQueryOrder"][];
+            expr?: components["schemas"]["RowsExpression"];
+            /** Format: int64 */
+            offset?: number;
+            default?: unknown;
+            frame?: components["schemas"]["RowsWindowFrame"];
+        };
+        RowsWindowRequest: {
+            source: components["schemas"]["RowsQueryRequest"];
+            windows: components["schemas"]["RowsWindowSpec"][];
+            select?: string[];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        RowsJoinOn: {
+            left_field: string;
+            right_field: string;
+        };
+        RowsJoinProjection: {
+            as: string;
+            /** @enum {string} */
+            side: "left" | "right";
+            field: string;
+        };
+        /**
+         * @description Physical join strategy requested by the typed plan. `auto` lets Antfly choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the leading join keys.
+         * @enum {string}
+         */
+        RowsJoinStrategy: "auto" | "lookup" | "hash" | "merge";
+        /** @description Join strategy admission metadata returned by native join execution. */
+        RowsJoinStrategySelection: {
+            requested: components["schemas"]["RowsJoinStrategy"];
+            selected: components["schemas"]["RowsJoinStrategy"];
+        };
+        /** @description Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`. */
+        RowsJoinRequest: {
+            left: components["schemas"]["RowsQueryRequest"];
+            right: components["schemas"]["RowsQueryRequest"];
+            on: components["schemas"]["RowsJoinOn"][];
+            /** @description Post-match computed predicates over the joined rows. Unqualified fields bind to the left row; fields with `source: source` bind to the right row. */
+            match_expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of post-match computed predicates over the joined rows. */
+            match_expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of post-match computed predicates over the joined rows. */
+            match_expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Post-match computed array-containment predicates over the joined rows. */
+            match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            /** @enum {string} */
+            join_type?: "inner" | "left";
+            strategy?: components["schemas"]["RowsJoinStrategy"];
+            select?: components["schemas"]["RowsJoinProjection"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        RowsLateralCorrelation: {
+            left_field: string;
+            right_field: string;
+        };
+        /** @description Typed bounded lateral plan. The right side must include a limit and can read an ordered CTE through `source_cte`. */
+        RowsLateralRequest: {
+            left: components["schemas"]["RowsQueryRequest"];
+            right: components["schemas"]["RowsQueryRequest"];
+            correlations: components["schemas"]["RowsLateralCorrelation"][];
+            /** @description Post-match computed predicates over the left row and each bounded right row. Unqualified fields bind to the left row; fields with `source: source` bind to the right row. */
+            match_expression_where?: components["schemas"]["RowsExpressionCondition"][];
+            /** @description OR groups of post-match computed predicates over the left row and each bounded right row. */
+            match_expression_any?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description NOT groups of post-match computed predicates over the left row and each bounded right row. */
+            match_expression_not?: components["schemas"]["RowsExpressionConditionGroup"][];
+            /** @description Post-match computed array-containment predicates over the left row and each bounded right row. */
+            match_expression_array_contains?: components["schemas"]["RowsExpressionArrayContainsPredicate"][];
+            select?: components["schemas"]["RowsJoinProjection"][];
+            order_by?: components["schemas"]["RowsQueryOrder"][];
+            /** Format: int64 */
+            limit?: number;
+            /** Format: int64 */
+            offset?: number;
+        };
+        /**
+         * @description Generic typed relational row plan envelope. It is exactly one
+         *     operation-specific envelope: query, aggregate, window, join, or
+         *     lateral. Query, aggregate, and window plans use `ranges`; join and
+         *     lateral plans use paired `left_ranges` and `right_ranges`.
+         */
+        RowsPlanRequest: components["schemas"]["RowsQueryPlanRequest"] | components["schemas"]["RowsAggregatePlanRequest"] | components["schemas"]["RowsWindowPlanRequest"] | components["schemas"]["RowsJoinPlanRequest"] | components["schemas"]["RowsLateralPlanRequest"];
+        /** @description Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`. */
+        RowsQueryPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            ranges?: components["schemas"]["RowsDocKeyRange"][];
+            query: components["schemas"]["RowsQueryRequest"];
+        };
+        /** @description Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`. */
+        RowsAggregatePlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            ranges?: components["schemas"]["RowsDocKeyRange"][];
+            aggregate: components["schemas"]["RowsAggregateRequest"];
+        };
+        /** @description Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes` and declared `ranges`. */
+        RowsWindowPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            ranges?: components["schemas"]["RowsDocKeyRange"][];
+            window: components["schemas"]["RowsWindowRequest"];
+        };
+        /** @description Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`. */
+        RowsJoinPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            /** @description Optional source table for the left side. Omitted or empty uses the endpoint table. */
+            left_table?: string;
+            /** @description Optional source table for the right side. Omitted or empty uses the endpoint table. */
+            right_table?: string;
+            left_ranges?: components["schemas"]["RowsDocKeyRange"][];
+            right_ranges?: components["schemas"]["RowsDocKeyRange"][];
+            join: components["schemas"]["RowsJoinRequest"];
+        };
+        /** @description Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`. */
+        RowsLateralPlanRequest: {
+            ctes?: components["schemas"]["RowsCte"][];
+            /** @description Optional source table for the left side. Omitted or empty uses the endpoint table. */
+            left_table?: string;
+            /** @description Optional source table for the right side. Omitted or empty uses the endpoint table. */
+            right_table?: string;
+            left_ranges?: components["schemas"]["RowsDocKeyRange"][];
+            right_ranges?: components["schemas"]["RowsDocKeyRange"][];
+            lateral: components["schemas"]["RowsLateralRequest"];
+        };
+        /** @description Typed column metadata emitted by a native relational read plan. */
+        RowsResultColumn: {
+            /** @description Unique public result-object field name. */
+            name: string;
+            /** @description Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key. */
+            display_name?: string | null;
+            /** @description Source path represented by this result field. */
+            path: string;
+            /** @description Antfly scalar/container type for the result field. */
+            type: string;
+            /** @description Item type when `type` is `array`. */
+            array_item_type?: string | null;
+            /** @description Optional source collation metadata for source-backed text or keyword result fields. */
+            collation?: string | null;
+            /** @description Whether the result field may be null. */
+            nullable: boolean;
+        };
+        RowsQueryResultSet: {
+            /** Format: int64 */
+            total?: number;
+            result_schema?: components["schemas"]["RowsResultColumn"][];
+            rows?: {
+                [key: string]: unknown;
+            }[];
+        };
+        RowsAggregateResultSet: {
+            /** Format: int64 */
+            total_groups?: number;
+            result_schema?: components["schemas"]["RowsResultColumn"][];
+            rows?: {
+                [key: string]: unknown;
+            }[];
+        };
+        RowsStreamResultSet: {
+            /** Format: int64 */
+            total_rows?: number;
+            join_strategy?: components["schemas"]["RowsJoinStrategySelection"];
+            result_schema?: components["schemas"]["RowsResultColumn"][];
+            rows?: {
+                [key: string]: unknown;
+            }[];
         };
         /**
          * @description Cross-table batch operations in a single atomic transaction.
@@ -5179,6 +7033,12 @@ export interface components {
              *     ```
              */
             reranker?: components["schemas"]["RerankerConfig"];
+            /**
+             * @description Optional graph metric score feature to blend into ordinary search hit ranking.
+             *     The metric must have a published generation. With `metric_freshness: fresh`,
+             *     the request fails if graph writes have made the published generation stale.
+             */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerank"];
             analyses?: components["schemas"]["Analyses"];
             /**
              * @description Declarative graph queries to execute after full-text/vector searches.
@@ -5462,6 +7322,22 @@ export interface components {
             reranker?: components["schemas"]["RerankerProfile"];
             /** @description Result merge statistics (present for hybrid search). */
             merge?: components["schemas"]["MergeProfile"];
+            /** @description Graph metric freshness and generation details for metric-aware query work. */
+            graph_metrics?: components["schemas"]["GraphMetricProfile"][];
+        };
+        GraphMetricProfile: {
+            /** @description Name of the graph query or graph metric query that used the metric. */
+            query_name: string;
+            /** @description Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`. */
+            source: string;
+            /** @description Graph index that owns the metric. */
+            index_name: string;
+            /** @description Graph metric name within the index. */
+            metric_name: string;
+            /** @description Effective freshness mode requested for this metric use. */
+            freshness: string;
+            /** @description Published generation and freshness status observed by the query. */
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /** @description Shard-level execution statistics. */
         ShardsProfile: {
@@ -5578,6 +7454,54 @@ export interface components {
             pca?: number[];
             tsne?: number[];
         };
+        /** @description Optional score provenance for ranking features that changed the final hit score. */
+        QueryScoreDetails: {
+            /** @description Score contribution from an explicit graph_metric_rerank request. */
+            graph_metric_rerank?: components["schemas"]["GraphMetricRerankScoreDetails"];
+        };
+        GraphMetricRerankScoreDetails: {
+            /** @description Graph index that provided the metric score. */
+            index_name: string;
+            /** @description Graph metric used as a score feature. */
+            metric_name: string;
+            /**
+             * Format: double
+             * @description Hit score before graph metric rerank composition.
+             */
+            base_score: number;
+            /**
+             * Format: double
+             * @description Weight applied to the base score.
+             */
+            base_weight: number;
+            /**
+             * Format: double
+             * @description Published metric score for this hit, or null when the hit was missing from the metric generation.
+             */
+            metric_score?: number | null;
+            /**
+             * Format: double
+             * @description Metric feature value used in the formula after applying missing_score fallback if needed.
+             */
+            metric_score_used: number;
+            /**
+             * Format: double
+             * @description Weight applied to the metric score feature.
+             */
+            metric_weight: number;
+            /** @description True when metric_score was missing and the request's missing_score fallback was used. */
+            missing_score_used: boolean;
+            /**
+             * Format: double
+             * @description Final hit score after graph metric rerank composition.
+             */
+            final_score: number;
+            /**
+             * Format: int64
+             * @description Published graph metric score generation used for this hit.
+             */
+            published_generation: number;
+        };
         /** @description A single query result hit */
         QueryHit: {
             /** @description ID of the record. */
@@ -5591,6 +7515,8 @@ export interface components {
             _index_scores?: {
                 [key: string]: unknown;
             };
+            /** @description Optional explain-style score provenance for score features applied to this hit. */
+            _score_details?: components["schemas"]["QueryScoreDetails"];
             _source?: {
                 [key: string]: unknown;
             };
@@ -5667,6 +7593,10 @@ export interface components {
             /** @description Results from declarative graph queries. */
             graph_results?: {
                 [key: string]: components["schemas"]["GraphQueryResult"];
+            };
+            /** @description Results from direct graph metric reads. */
+            graph_metric_results?: {
+                [key: string]: components["schemas"]["GraphMetricResult"];
             };
             /** @description Detailed execution profile (present when `profile: true` in request). */
             profile?: components["schemas"]["QueryProfile"];
@@ -6240,11 +8170,11 @@ export interface components {
             } | null;
         };
         /**
-         * @description Type of the resource, e.g., table, user, or global ('*').
+         * @description Type of the resource, e.g., database, namespace, table, tablespace, user, or global ('*').
          * @example table
          * @enum {string}
          */
-        ResourceType: "table" | "user" | "*";
+        ResourceType: "database" | "namespace" | "table" | "tablespace" | "user" | "*";
         /**
          * @description Type of permission.
          * @example read
@@ -7491,6 +9421,10 @@ export interface components {
             /**
              * @description A valid JSON Schema defining the document's structure.
              *     This is used to infer indexing rules and field types.
+             *     Relational-mode scalar properties may include optional
+             *     `collation` metadata. The metadata is preserved in the
+             *     durable relational column catalog and reported on result
+             *     schemas for source-backed text/keyword fields.
              */
             schema?: {
                 [key: string]: unknown;
@@ -7500,7 +9434,7 @@ export interface components {
          * @description Field type annotations for schema fields
          * @enum {string}
          */
-        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type";
+        "AntflyType-2": "text" | "html" | "keyword" | "numeric" | "boolean" | "datetime" | "geopoint" | "geoshape" | "embedding" | "blob" | "link" | "search_as_you_type" | "json";
         /** @description Field mapping to apply when a dynamic template matches */
         TemplateFieldMapping: {
             type?: components["schemas"]["AntflyType-2"];
@@ -7561,6 +9495,96 @@ export interface components {
             match_mapping_type?: "string" | "number" | "boolean" | "date" | "object";
             mapping?: components["schemas"]["TemplateFieldMapping"];
         };
+        /** @description Parent side of a relational foreign-key constraint. */
+        ForeignKeyReference: {
+            /** @description Referenced relational table name. */
+            table?: string;
+            /** @description Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint. */
+            columns?: string[];
+            /** @description Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints. */
+            period?: string;
+        };
+        /** @description Relational foreign-key constraint. */
+        ForeignKey: {
+            /** @description Constraint name, unique within the table schema. */
+            name?: string;
+            /** @description Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple. */
+            columns?: string[];
+            /** @description Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints. */
+            period?: string;
+            references?: components["schemas"]["ForeignKeyReference"];
+            /**
+             * @description Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+             * @enum {string}
+             */
+            on_delete?: "restrict" | "no_action" | "set_null" | "cascade";
+            /**
+             * @description Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+             * @enum {string}
+             */
+            on_update?: "restrict" | "no_action" | "set_null" | "cascade";
+            /** @description Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing. */
+            timing?: string;
+            /** @description Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility. */
+            deferrable?: boolean | string;
+            /**
+             * @description Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+             * @enum {string}
+             */
+            match?: "simple" | "full";
+            /**
+             * @description Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+             * @enum {string}
+             */
+            validation_state?: "enforced" | "unvalidated";
+        };
+        /** @description Application-time period over a start and end column. */
+        RelationalPeriod: {
+            /** @description Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans. */
+            name: string;
+            /** @description Inclusive period start column. */
+            start_column: string;
+            /** @description Exclusive period end column. */
+            end_column: string;
+            /**
+             * @description Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+             * @enum {string}
+             */
+            range_type?: "numrange" | "daterange" | "tsrange" | "tstzrange";
+        };
+        /** @description Relational primary-key constraint. */
+        PrimaryKey: {
+            /** @description Optional durable primary-key constraint name used by DDL and conflict-target resolution. */
+            name?: string;
+            /** @description Primary-key columns. One or more ordered required non-json relational columns are supported. */
+            columns?: string[];
+            /** @description Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness. */
+            without_overlaps_period?: string;
+        };
+        /** @description Relational unique constraint. */
+        UniqueConstraint: {
+            /** @description Constraint name, unique within the table schema. */
+            name?: string;
+            /** @description Unique columns. One or more ordered non-json relational columns are supported. */
+            columns?: string[];
+            /** @description Stable expression keys supported by unique-owner maintenance. */
+            expressions?: {
+                /** @enum {string} */
+                op: "lower" | "upper" | "md5";
+                field: string;
+            }[];
+            /** @description Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness. */
+            without_overlaps_period?: string;
+            /** @description Field-only partial unique predicate shorthand. */
+            where?: components["schemas"]["RowsUniquePredicateGroup"];
+            /** @description Deterministic row-expression predicates that decide whether a row participates in this unique constraint. */
+            where_expressions?: components["schemas"]["RowsExpressionCondition"][];
+            /**
+             * @description Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+             * @enum {string}
+             */
+            validation_state?: "enforced" | "unvalidated";
+        };
         /** @description Schema definition for a table with multiple document types */
         TableSchema: {
             /**
@@ -7568,6 +9592,18 @@ export interface components {
              * @description Version of the schema. Used for migrations.
              */
             version?: number;
+            /**
+             * @description Storage profile for the table.
+             *     - "document" (default): schemaless JSON documents with optional,
+             *       soft schema validation. All indexes are derived from the document.
+             *     - "relational": required closed schema with typed columns. Documents
+             *       must match a declared type; declared scalar properties are stored
+             *       as typed columns for columnar predicate pushdown and aggregation.
+             *       A field typed "json" stores a subtree that is still indexed like a
+             *       document. Implies enforce_types and closed document types.
+             * @enum {string}
+             */
+            storage_mode?: "document" | "relational";
             /** @description Default type to use from the document_types. */
             default_type?: string;
             /**
@@ -7595,6 +9631,49 @@ export interface components {
              *     evaluated in order to determine how those fields should be indexed.
              */
             dynamic_templates?: components["schemas"]["DynamicTemplate"][];
+            /**
+             * @description Relational-mode referential constraints. Supported targets are a
+             *     parent table's `_id` document key or a same-table declared unique
+             *     parent column tuple with `on_delete: "restrict"` /
+             *     `on_delete: "no_action"` or bounded local nullable-column
+             *     `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`.
+             *     `on_update: "restrict"` and `on_update: "no_action"` are accepted
+             *     as parent-key update checks, and mutating `set_null`/`cascade`
+             *     update actions are supported where owner topology is configured.
+             *     Temporal foreign keys with `period` on both child and parent
+             *     references accept restrictive actions plus bounded delete-side
+             *     `set_null` / `cascade` actions through remaining-coverage proofs.
+             *     Mutating temporal update actions are rejected because changing a
+             *     parent interval/key requires update-side period action semantics
+             *     broader than a scalar child-row rewrite.
+             *     `match: "simple"` is the default; `full` is accepted for composite
+             *     nullable references, and `partial` is rejected until row-subset
+             *     parent matching is implemented.
+             *     Cross-table unique targets require routed parent-table unique participants.
+             *     Unsupported shapes are rejected during schema validation.
+             */
+            foreign_keys?: components["schemas"]["ForeignKey"][];
+            /**
+             * @description Application-time period declarations over two numeric or datetime
+             *     relational columns. SQL `PERIOD FOR name (start, end)` and range
+             *     column temporal DDL lower into this metadata.
+             */
+            periods?: components["schemas"]["RelationalPeriod"][];
+            /**
+             * @description Relational-mode primary key over one or more ordered declared
+             *     non-json relational columns. Every component must be required and
+             *     present on every row. When omitted, `_id` remains the document-key
+             *     primary identity. `_id` cannot be mixed into a declared composite
+             *     primary-key tuple.
+             */
+            primary_key?: components["schemas"]["PrimaryKey"];
+            /**
+             * @description Relational-mode unique constraints over one or more ordered declared
+             *     non-json relational columns. Present scalar tuples are enforced by
+             *     committed integrity rows; rows with any absent nullable component do
+             *     not create unique rows.
+             */
+            unique_constraints?: components["schemas"]["UniqueConstraint"][];
         };
         /**
          * Format: double
@@ -7865,6 +9944,89 @@ export interface components {
              */
             backfill_items_processed?: number;
         };
+        /** @description Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers. */
+        GraphMetricRuntimeStats: {
+            enabled?: boolean;
+            /** @enum {string} */
+            role?: "combined" | "coordinator" | "worker" | "worker_pool";
+            /** Format: uint64 */
+            runtime_id_hash?: number;
+            /** Format: uint64 */
+            owner_id_hash?: number;
+            /** Format: uint64 */
+            lease_key_hash?: number;
+            /** Format: uint64 */
+            worker_id_hash?: number;
+            /** Format: uint64 */
+            worker_count?: number;
+            lease_owned?: boolean;
+            has_lease?: boolean;
+            /** Format: uint64 */
+            acquisition_count?: number;
+            /** Format: uint64 */
+            takeover_count?: number;
+            /** Format: uint64 */
+            lease_acquire_failures?: number;
+            /** Format: uint64 */
+            lost_leases?: number;
+            /** Format: uint64 */
+            last_acquired_ms?: number;
+            started?: boolean;
+            shutdown?: boolean;
+            notified?: boolean;
+            /** Format: uint64 */
+            ticks_started?: number;
+            /** Format: uint64 */
+            ticks_completed?: number;
+            /** Format: uint64 */
+            durable_progress_ticks?: number;
+            /** Format: uint64 */
+            idle_ticks?: number;
+            /** Format: uint64 */
+            error_ticks?: number;
+            last_error_name?: string;
+            /** Format: uint64 */
+            total_metrics_scanned?: number;
+            /** Format: uint64 */
+            total_active_builds?: number;
+            /** Format: uint64 */
+            total_builds_started?: number;
+            /** Format: uint64 */
+            total_worker_steps?: number;
+            /** Format: uint64 */
+            total_coordinator_steps?: number;
+            /** Format: uint64 */
+            total_pages_claimed?: number;
+            /** Format: uint64 */
+            total_pages_completed?: number;
+            /** Format: uint64 */
+            total_phases_advanced?: number;
+            /** Format: uint64 */
+            total_published?: number;
+            /** Format: uint64 */
+            total_failed_builds?: number;
+            /** Format: uint64 */
+            last_metrics_scanned?: number;
+            /** Format: uint64 */
+            last_active_builds?: number;
+            /** Format: uint64 */
+            last_builds_started?: number;
+            /** Format: uint64 */
+            last_worker_steps?: number;
+            /** Format: uint64 */
+            last_coordinator_steps?: number;
+            /** Format: uint64 */
+            last_pages_claimed?: number;
+            /** Format: uint64 */
+            last_pages_completed?: number;
+            /** Format: uint64 */
+            last_phases_advanced?: number;
+            /** Format: uint64 */
+            last_published?: number;
+            /** Format: uint64 */
+            last_failed_builds?: number;
+            last_budget_exhausted?: boolean;
+        };
         /** @description Statistics for graph index */
         GraphIndexStats: {
             /**
@@ -7910,6 +10072,7 @@ export interface components {
                     result_nodes?: number;
                 };
             };
+            graph_metric_runtime?: components["schemas"]["GraphMetricRuntimeStats"];
         };
         /** @description Compact public statistics for an algebraic sidecar index. Detailed runtime, adaptive, and materialization records remain internal diagnostics. */
         AlgebraicIndexStats: {
@@ -7992,6 +10155,152 @@ export interface components {
         };
         /** @description Statistics for an index */
         IndexStats: components["schemas"]["FullTextIndexStats"] | components["schemas"]["EmbeddingsIndexStats"] | components["schemas"]["GraphIndexStats"] | components["schemas"]["AlgebraicIndexStats"];
+        GraphMetricEdgeFilterStatus: {
+            /** @enum {string} */
+            mode: "all" | "types";
+            types?: string[];
+        };
+        GraphMetricBuildPageStatus: {
+            phase: string;
+            /** Format: int64 */
+            iteration: number;
+            /** Format: int64 */
+            page_id: number;
+            /** @enum {string} */
+            state: "pending" | "leased" | "complete" | "failed";
+            /** @enum {string} */
+            range_kind: "full" | "reverse_edges" | "nodes" | "scores" | "contributions" | "job_control";
+            /** @description Worker id that owns or last failed this page. */
+            worker_id?: string;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+             */
+            lease_expires_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Current attempt number for this page.
+             */
+            attempt?: number;
+            /** @description Opaque resumable cursor for this page. */
+            cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for this page.
+             */
+            completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for this page.
+             */
+            total_units?: number;
+            /** @description Last page-level error. */
+            last_error?: string;
+        };
+        GraphMetricEvent: {
+            /** Format: int64 */
+            sequence: number;
+            /** @enum {string} */
+            kind: "publish" | "delete" | "pause" | "resume" | "failed";
+            /** Format: int64 */
+            at_ms: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            score_count: number;
+        };
+        GraphMetricStatus: {
+            state: string;
+            /** @enum {string} */
+            phase: "idle" | "computing" | "publishing" | "complete" | "prepare_generation" | "scan_edges_and_out_degree" | "initialize_ranks" | "iterate_contributions" | "reduce_ranks" | "hits_hub_contributions" | "hits_hub_reduce_ranks" | "check_convergence" | "publish_generation" | "cleanup_old_generations";
+            edge_filter?: components["schemas"]["GraphMetricEdgeFilterStatus"];
+            /**
+             * Format: int64
+             * @description Version of the published graph metric metadata schema.
+             */
+            metadata_version?: number;
+            maintenance_paused?: boolean;
+            /** @description Whether a local or distributed build is queued after the currently published or building generation. */
+            build_queued: boolean;
+            /** Format: int64 */
+            published_generation: number;
+            /** Format: int64 */
+            edge_generation: number;
+            /** Format: int64 */
+            target_edge_generation: number;
+            /**
+             * Format: int64
+             * @description Pending edge generation waiting to build, or 0 when no build is queued.
+             */
+            queued_generation?: number;
+            /**
+             * Format: int64
+             * @description Edge generation currently held by an active build lease, or 0 when idle.
+             */
+            building_generation?: number;
+            /**
+             * Format: int64
+             * @description Durable identifier for the active graph metric build job, or 0 when idle.
+             */
+            build_job_id?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+             */
+            build_started_at_ms?: number;
+            /**
+             * Format: int64
+             * @description Iteration number reported by the active build lease, or 0 when idle or not iterative.
+             */
+            build_iteration?: number;
+            /**
+             * Format: int64
+             * @description Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+             */
+            build_lease_expires_at_ms?: number;
+            /** @description Worker id that owns the active build lease. Local builds use `local`. */
+            build_worker_id?: string;
+            /** @description Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor. */
+            build_cursor?: string;
+            /**
+             * Format: int64
+             * @description Completed work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_completed_units?: number;
+            /**
+             * Format: int64
+             * @description Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+             */
+            build_total_units?: number;
+            /** @description Active leased or failed build pages for the current build phase, capped and ordered by durable page key. */
+            build_pages?: components["schemas"]["GraphMetricBuildPageStatus"][];
+            /** @description Whether build_pages was capped before every active page could be included. */
+            build_pages_truncated?: boolean;
+            /**
+             * Format: int64
+             * @description Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+             */
+            retry_count?: number;
+            /** @description Last build error for the current failed target generation. */
+            last_error?: string;
+            /**
+             * Format: double
+             * @description Build progress for the target edge generation, from 0.0 to 1.0
+             */
+            progress: number;
+            converged: boolean;
+            /** Format: int64 */
+            iterations_completed: number;
+            /** Format: double */
+            delta: number;
+            /** Format: int64 */
+            computed_at_ms: number;
+            last_event?: components["schemas"]["GraphMetricEvent"];
+            /** @description Recent graph metric events, newest first. */
+            recent_events?: components["schemas"]["GraphMetricEvent"][];
+        };
         /**
          * @description Available tool names for retrieval agents.
          *     - add_filter: Add search filters (field constraints)
@@ -8995,6 +11304,36 @@ export interface components {
             /** @description Handlebars template to render document text for reranking. */
             template?: string;
         } & (components["schemas"]["AntflyRerankerConfig"] | components["schemas"]["OllamaRerankerConfig"] | components["schemas"]["CohereRerankerConfig"] | components["schemas"]["VertexRerankerConfig"]);
+        GraphMetricRerank: {
+            /** @description Graph index that owns the published metric. */
+            index: string;
+            /** @description Graph metric name to blend into the search hit score. */
+            metric: string;
+            /**
+             * Format: double
+             * @description Multiplier applied to the existing hit score before adding the graph metric feature.
+             * @default 1
+             */
+            base_weight?: number;
+            /**
+             * Format: double
+             * @description Multiplier applied to the graph metric score before it is added to the existing hit score.
+             * @default 1
+             */
+            weight?: number;
+            /**
+             * Format: double
+             * @description Metric feature value to use for hits that do not have a score in the published metric generation.
+             * @default 0
+             */
+            missing_score?: number;
+            /**
+             * @description Whether stale published generations are acceptable or the metric must be fresh.
+             * @default published
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+        };
         /**
          * @description Type of graph query to execute
          * @enum {string}
@@ -9102,6 +11441,20 @@ export interface components {
             /** @description Edge to traverse to reach this step (null for first step) */
             edge?: components["schemas"]["PatternEdgeStep"];
         };
+        GraphMetricOrder: {
+            metric: string;
+            /** @enum {string} */
+            direction?: "asc" | "desc";
+            /** @enum {string} */
+            nulls?: "first" | "last" | "nulls_first" | "nulls_last";
+        };
+        GraphMetricFilter: {
+            metric: string;
+            /** @enum {string} */
+            op: ">" | ">=" | "<" | "<=" | "=" | "==" | "!=";
+            /** Format: double */
+            value: number;
+        };
         /** @description Declarative graph query to execute after full-text/vector searches */
         GraphQuery: {
             type: components["schemas"]["GraphQueryType"];
@@ -9123,6 +11476,19 @@ export interface components {
             include_edges?: boolean;
             /** @description Which fields to return from documents */
             fields?: string[];
+            /** @description Graph metric names to project onto result nodes */
+            metrics?: string[];
+            /** @description Sort graph result nodes by graph metric scores */
+            order_by?: components["schemas"]["GraphMetricOrder"][];
+            /** @description Filter graph result nodes by graph metric scores */
+            where_metric?: components["schemas"]["GraphMetricFilter"][];
+            /**
+             * @description Freshness mode for projected, ordered, and filtered graph metrics
+             * @enum {string}
+             */
+            metric_freshness?: "published" | "fresh";
+            /** @description Include graph metric status metadata in the graph result */
+            include_metric_status?: boolean;
         };
         /**
          * @description Configuration for pruning search results based on score quality.
@@ -9191,6 +11557,10 @@ export interface components {
             path_edges?: components["schemas"]["PathEdge"][];
             /** @description Algebraic provenance labels folded into this result, when requested by an algebraic graph executor */
             provenance?: string[];
+            /** @description Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node. */
+            metrics?: {
+                [key: string]: unknown;
+            };
             /** @description Parsed evidence envelope for provenance labels and edge metadata */
             evidence?: {
                 [key: string]: unknown;
@@ -9223,6 +11593,21 @@ export interface components {
              * @description Query execution time
              */
             took?: number;
+            /** @description Graph metric status metadata keyed by metric name */
+            metric_status?: {
+                [key: string]: components["schemas"]["GraphMetricStatus"];
+            };
+        };
+        GraphMetricScore: {
+            node: string;
+            /** Format: double */
+            score: number;
+        };
+        GraphMetricResult: {
+            index_name: string;
+            metric: string;
+            scores: components["schemas"]["GraphMetricScore"][];
+            status: components["schemas"]["GraphMetricStatus"];
         };
         /**
          * @description Standalone evaluation request for POST /eval endpoint.
@@ -10785,6 +13170,15 @@ export interface components {
                 "application/json": components["schemas"]["Error"];
             };
         };
+        /** @description Forbidden */
+        Forbidden: {
+            headers: {
+                [name: string]: unknown;
+            };
+            content: {
+                "application/json": components["schemas"]["Error"];
+            };
+        };
         /** @description Method not allowed for this resource */
         MethodNotAllowed: {
             headers: {
@@ -11085,6 +13479,47 @@ export interface operations {
             };
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    executeGraphMetricAction: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+                /** @description Name of the graph index */
+                indexName: string;
+                /** @description Name of the configured graph metric */
+                metricName: string;
+                /** @description Operational action to apply to the graph metric materialization */
+                action: "refresh" | "rebuild" | "delete" | "pause" | "resume";
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated graph metric status */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["GraphMetricActionResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Graph metric actions are unavailable for this runtime */
+            405: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["Error"];
+                };
+            };
             500: components["responses"]["InternalServerError"];
         };
     };
@@ -11548,6 +13983,45 @@ export interface operations {
             500: components["responses"]["InternalServerError"];
         };
     };
+    executeSql: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["SqlStatementRequest"];
+            };
+        };
+        responses: {
+            /** @description SQL statement result metadata */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["SqlStatementResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description SQL statement timeout */
+            408: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            /** @description SQL statement shape is not supported by the HTTP SQL ingress yet */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     globalQuery: {
         parameters: {
             query?: never;
@@ -11727,6 +14201,957 @@ export interface operations {
             };
         };
     };
+    listTablespaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of tablespaces */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"][];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tablespace details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: {
+            content: {
+                "application/json": components["schemas"]["CreateTablespaceRequest"];
+            };
+        };
+        responses: {
+            /** @description Tablespace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TablespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Tablespace already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Tablespace name */
+                tablespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Tablespace dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listDatabases: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path?: never;
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of databases */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"][];
+                };
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Database already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropDatabase: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Database dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Database is not empty */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    setDatabaseTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogTablespaceBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    clearDatabaseTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["DatabaseCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listNamespaces: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of namespaces in the database */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    createNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Namespace created */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Namespace already exists */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    dropNamespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Namespace dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Namespace is not empty */
+            409: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    setNamespaceTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CatalogTablespaceBindingRequest"];
+            };
+        };
+        responses: {
+            /** @description Updated namespace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    clearNamespaceTablespace: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Updated namespace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["NamespaceCatalogRecord"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    listNamespaceTables: {
+        parameters: {
+            query?: {
+                /** @description Filter tables by name prefix. */
+                prefix?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of tables in the namespace */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"][];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    getNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Table details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+        };
+    };
+    createNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["CreateTableRequest"];
+            };
+        };
+        responses: {
+            /** @description Table created */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableStatus"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Table dropped */
+            204: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            /** @description Explicit catalog table lifecycle is not supported by the configured local table write backend. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    queryNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["QueryRequest"];
+                "application/x-ndjson": string;
+            };
+        };
+        responses: {
+            /** @description Query successful */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["QueryResponses"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    batchNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    rowsBatchNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Row batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    backupNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["BackupRequest"];
+            };
+        };
+        responses: {
+            /** @description Backup process initiated successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example successful */
+                        backup?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    restoreNamespaceTable: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RestoreRequest"];
+            };
+        };
+        responses: {
+            /** @description Restore process triggered successfully */
+            202: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        /** @example triggered */
+                        restore?: string;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    lookupNamespaceTableDocument: {
+        parameters: {
+            query?: {
+                /** @description Comma-separated list of fields to include in the response. */
+                fields?: string;
+            };
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Key of the document to retrieve */
+                key: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Record found */
+            200: {
+                headers: {
+                    /** @description Version token for this document. */
+                    "X-Antfly-Version"?: string;
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": {
+                        [key: string]: unknown;
+                    };
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    listNamespaceTableIndexes: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description A list of indexes for the table */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexStatus"][];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    getNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index details */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["IndexStatus"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    createNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["IndexConfig"];
+            };
+        };
+        responses: {
+            /** @description Index added successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
+    dropNamespaceTableIndex: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Database name */
+                databaseName: string;
+                /** @description Namespace name */
+                namespaceName: string;
+                /** @description Table name */
+                tableName: string;
+                /** @description Name of the index */
+                indexName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Index dropped successfully */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+            400: components["responses"]["BadRequest"];
+            500: components["responses"]["InternalServerError"];
+            /** @description Catalog target cannot be delegated to legacy table storage unambiguously. */
+            501: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content?: never;
+            };
+        };
+    };
     listTables: {
         parameters: {
             query?: {
@@ -11894,6 +15319,284 @@ export interface operations {
             400: components["responses"]["BadRequest"];
             404: components["responses"]["NotFound"];
             500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsBatchWrite: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsBatchRequest"];
+            };
+        };
+        responses: {
+            /** @description Row batch operation successful */
+            201: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["BatchResponse"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsMutationSource: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsMutationSourceRequest"] | components["schemas"]["RowsInsertSourceRequest"] | components["schemas"]["RowsJoinedMutationSourceRequest"];
+            };
+        };
+        responses: {
+            /** @description Rows staged into the claimed transaction or inserted from a typed source */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsMutationSourceResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            409: components["responses"]["Conflict"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsGet: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsGetRequest"];
+            };
+        };
+        responses: {
+            /** @description Row lookup response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsGetResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsPlan: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row read-plan response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsQueryResultSet"] | components["schemas"]["RowsAggregateResultSet"] | components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsQuery: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsQueryPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row query response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsQueryResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsAggregate: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsAggregatePlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row aggregate response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsAggregateResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsWindow: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsWindowPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row window response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsJoin: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsJoinPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row join response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
+        };
+    };
+    rowsLateral: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the relational table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody: {
+            content: {
+                "application/json": components["schemas"]["RowsLateralPlanRequest"];
+            };
+        };
+        responses: {
+            /** @description Row lateral response */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["RowsStreamResultSet"];
+                };
+            };
+            400: components["responses"]["BadRequest"];
+            403: components["responses"]["Forbidden"];
+            404: components["responses"]["NotFound"];
+            501: components["responses"]["InternalServerError"];
         };
     };
     linearMerge: {

@@ -30,8 +30,8 @@ def _hit_ids(result: dict) -> list[str]:
     return [hit.get("_id") for hit in responses[0].get("hits", {}).get("hits", [])]
 
 
-def test_table_full_text_sync_level_makes_text_search_visible(table_api):
-    table_name = f"docs_sync_full_text_{table_api.backend}"
+def test_table_query_sync_level_makes_text_search_visible(table_api):
+    table_name = f"docs_sync_query_{table_api.backend}"
 
     created = table_api.create_table(table_name)
     assert _table_name(created) == table_name
@@ -43,7 +43,7 @@ def test_table_full_text_sync_level_makes_text_search_visible(table_api):
                 "body": "alpha sync level",
             }
         },
-        sync_level="full_text",
+        sync_level="query",
     )
     assert batch["inserted"] == 1
 

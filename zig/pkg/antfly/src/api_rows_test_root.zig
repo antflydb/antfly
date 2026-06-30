@@ -1,0 +1,27 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const http_server = @import("api/http_server.zig");
+const pgwire = @import("pgwire/mod.zig");
+const sql_adapter_integration = @import("api/sql_adapter_integration.zig");
+const relational_rows = @import("sql/relational_rows.zig");
+const table_reads = @import("api/table_reads.zig");
+
+test {
+    _ = http_server;
+    _ = pgwire;
+    _ = sql_adapter_integration;
+    _ = relational_rows;
+    _ = table_reads;
+}

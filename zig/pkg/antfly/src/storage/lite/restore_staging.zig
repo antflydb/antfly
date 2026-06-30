@@ -18,12 +18,12 @@ const Allocator = std.mem.Allocator;
 const backup_codec = @import("../backup_codec.zig");
 const backups_api = @import("../../api/backups.zig");
 const connection = @import("connection.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("../db/mod.zig");
 const db_types = @import("../db/types.zig");
 const group_ids = @import("../../common/group_ids.zig");
 const portable_backup = @import("../portable_backup.zig");
 const query_api = @import("../../api/query.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_writes = @import("../../api/table_writes.zig");
 
 pub const max_afb_file_bytes: usize = 16 * 1024 * 1024 * 1024;
@@ -65,8 +65,8 @@ pub fn finalizeRestoredLiteDb(allocator: Allocator, db: *db_mod.DB) !void {
 }
 
 pub fn importPortableIntoLiteDb(allocator: Allocator, db: *db_mod.DB, backup: []const u8) !void {
-    try portable_backup.validatePortable(allocator, backup);
-    try portable_backup.importPortable(allocator, db.core.store, backup);
+    try portable_backup.validatePortableDb(allocator, backup);
+    try portable_backup.importPortableDb(allocator, db, backup);
     try finalizeRestoredLiteDb(allocator, db);
 }
 
@@ -145,8 +145,8 @@ pub fn stageAfliteRestoreBackup(
 
     var portable = std.ArrayList(u8).empty;
     defer portable.deinit(allocator);
-    try portable_backup.exportPortable(allocator, lite.db.core.store, &portable);
-    try portable_backup.validatePortable(allocator, portable.items);
+    try portable_backup.exportPortableDb(allocator, &lite.db, &portable);
+    try portable_backup.validatePortableDb(allocator, portable.items);
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
@@ -177,7 +177,7 @@ pub fn stageAfbRestoreBackup(
 
     const portable = try readFileAlloc(allocator, path, max_afb_file_bytes);
     defer allocator.free(portable);
-    try portable_backup.validatePortable(allocator, portable);
+    try portable_backup.validatePortableDb(allocator, portable);
 
     const snapshot_path = try std.fmt.allocPrint(allocator, "{s}.afb", .{backup_id});
     errdefer allocator.free(snapshot_path);
@@ -610,7 +610,7 @@ test "lite restore staging preserves portable afb schema index and enrichment me
         defer index.deinit();
         try source.db.addIndex(index.value);
 
-        try portable_backup.exportPortable(allocator, source.db.core.store, &portable);
+        try portable_backup.exportPortableDb(allocator, &source.db, &portable);
     }
 
     {
@@ -891,7 +891,7 @@ test "lite restore staging exports stable aflite data while writer has open tran
     defer allocator.free(afb_path);
     const portable = try readFileAlloc(allocator, afb_path, max_afb_file_bytes);
     defer allocator.free(portable);
-    try portable_backup.validatePortable(allocator, portable);
+    try portable_backup.validatePortableDb(allocator, portable);
 
     var restored = try LiteDb.create(allocator, restored_path, true);
     defer restored.close();
@@ -1040,7 +1040,7 @@ test "lite portable backup roundtrips through normal table backup APIs" {
     defer allocator.free(normal_afb_path);
     const normal_portable = try readFileAlloc(allocator, normal_afb_path, max_afb_file_bytes);
     defer allocator.free(normal_portable);
-    try portable_backup.validatePortable(allocator, normal_portable);
+    try portable_backup.validatePortableDb(allocator, normal_portable);
 
     {
         var restored = try LiteDb.create(allocator, restored_path, true);

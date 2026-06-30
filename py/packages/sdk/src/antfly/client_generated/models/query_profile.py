@@ -9,6 +9,7 @@ from attrs import field as _attrs_field
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_metric_profile import GraphMetricProfile
     from ..models.join_profile import JoinProfile
     from ..models.merge_profile import MergeProfile
     from ..models.reranker_profile import RerankerProfile
@@ -28,12 +29,15 @@ class QueryProfile:
             join (JoinProfile | Unset): Join execution statistics.
             reranker (RerankerProfile | Unset): Reranking execution statistics.
             merge (MergeProfile | Unset): Result merge statistics for hybrid search.
+            graph_metrics (list[GraphMetricProfile] | Unset): Graph metric freshness and generation details for metric-aware
+                query work.
     """
 
     shards: ShardsProfile | Unset = UNSET
     join: JoinProfile | Unset = UNSET
     reranker: RerankerProfile | Unset = UNSET
     merge: MergeProfile | Unset = UNSET
+    graph_metrics: list[GraphMetricProfile] | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -53,6 +57,13 @@ class QueryProfile:
         if not isinstance(self.merge, Unset):
             merge = self.merge.to_dict()
 
+        graph_metrics: list[dict[str, Any]] | Unset = UNSET
+        if not isinstance(self.graph_metrics, Unset):
+            graph_metrics = []
+            for graph_metrics_item_data in self.graph_metrics:
+                graph_metrics_item = graph_metrics_item_data.to_dict()
+                graph_metrics.append(graph_metrics_item)
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update({})
@@ -64,11 +75,14 @@ class QueryProfile:
             field_dict["reranker"] = reranker
         if merge is not UNSET:
             field_dict["merge"] = merge
+        if graph_metrics is not UNSET:
+            field_dict["graph_metrics"] = graph_metrics
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_metric_profile import GraphMetricProfile
         from ..models.join_profile import JoinProfile
         from ..models.merge_profile import MergeProfile
         from ..models.reranker_profile import RerankerProfile
@@ -103,11 +117,21 @@ class QueryProfile:
         else:
             merge = MergeProfile.from_dict(_merge)
 
+        _graph_metrics = d.pop("graph_metrics", UNSET)
+        graph_metrics: list[GraphMetricProfile] | Unset = UNSET
+        if _graph_metrics is not UNSET:
+            graph_metrics = []
+            for graph_metrics_item_data in _graph_metrics:
+                graph_metrics_item = GraphMetricProfile.from_dict(graph_metrics_item_data)
+
+                graph_metrics.append(graph_metrics_item)
+
         query_profile = cls(
             shards=shards,
             join=join,
             reranker=reranker,
             merge=merge,
+            graph_metrics=graph_metrics,
         )
 
         query_profile.additional_properties = d

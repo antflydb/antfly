@@ -33,11 +33,11 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const api_http_client = @import("http_client.zig");
 const api_routes = @import("http_routes.zig");
 const api_http_server = @import("http_server.zig");
-const api_table_catalog = @import("table_catalog.zig");
+const api_table_catalog = @import("../metadata/catalog/routing.zig");
 const api_table_reads = @import("table_reads.zig");
 const api_table_router = @import("table_router.zig");
 const api_table_writes = @import("table_writes.zig");
-const api_tables = @import("tables.zig");
+const api_tables = @import("../metadata/catalog/table_ddl.zig");
 const test_contract_helpers = @import("test_contract_helpers.zig");
 const indexes_api = @import("indexes.zig");
 const db_mod = @import("../storage/db/mod.zig");
@@ -437,7 +437,12 @@ const PublicApiStatusSource = struct {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
         defer workflow.deinit();
-        const table = api_tables.deriveTableRecord(table_name, req);
+        var normalized_req = req;
+        const indexes_json = req.indexes_json orelse api_tables.default_indexes_json;
+        const prepared_indexes_json = try api_tables.prepareTableIndexesForSchemaAlloc(alloc, table_name, indexes_json, api_tables.effectiveSchemaJson(req.schema_json));
+        defer alloc.free(prepared_indexes_json);
+        normalized_req.indexes_json = prepared_indexes_json;
+        const table = api_tables.deriveTableRecord(table_name, normalized_req);
         _ = try workflow.createTable(&self.node, table, api_tables.deriveInitialRange(table));
     }
 

@@ -24,9 +24,14 @@ const mem_backend = @import("../../mem_backend.zig");
 const schema_mod = @import("../../schema.zig");
 const ttl_mod = @import("../../ttl.zig");
 const types = @import("../types.zig");
+const db_config = @import("../config.zig");
+const relational_store_mod = @import("../relational_store.zig");
 const ownership_mod = @import("../ownership.zig");
+const platform = @import("antfly_platform");
 const platform_clock = @import("../../../platform/clock.zig");
 const background_runtime_mod = @import("../../background_runtime.zig");
+
+const TestHelpers = if (builtin.is_test) @import("../test_support.zig") else struct {};
 
 pub const Config = struct {
     enabled: bool = builtin.os.tag != .freestanding and !builtin.is_test,
@@ -491,4 +496,474 @@ test "ttl runtime runOnce works with lsm backend store" {
     try std.testing.expectEqual(@as(u32, 1), stats.deleted_docs);
     try std.testing.expectEqual(@as(u64, 1), stats.scanned_timestamps);
     try expectMissingDoc(&runtime_store, alloc, "doc1");
+}
+
+test "db lookup hides expired documents when ttl schema is configured" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:old", .value = "{\"title\":\"old\"}" }},
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:new", .value = "{\"title\":\"new\"}" }},
+        .timestamp_ns = now_ns,
+    });
+
+    try std.testing.expect((try db.lookup(alloc, "doc:old", .{})) == null);
+    var fresh = (try db.lookup(alloc, "doc:new", .{})).?;
+    defer fresh.deinit(alloc);
+    try std.testing.expect(true);
+}
+
+test "db search filters expired documents when ttl schema is configured" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:old", .value = "{\"title\":\"alpha\",\"body\":\"common token\"}" },
+            .{ .key = "doc:new", .value = "{\"title\":\"beta\",\"body\":\"common token\"}" },
+        },
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+    });
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:fresh", .value = "{\"title\":\"fresh\",\"body\":\"common token\"}" }},
+        .timestamp_ns = now_ns,
+    });
+
+    var all = try db.search(alloc, .{
+        .query = .{ .match_all = {} },
+        .limit = 10,
+    });
+    defer all.deinit();
+    try std.testing.expectEqual(@as(u32, 1), all.total_hits);
+    try std.testing.expectEqualStrings("doc:fresh", all.hits[0].id);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.runUntilIdle();
+
+    var text = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "common" } },
+        .limit = 10,
+    });
+    defer text.deinit();
+    try std.testing.expectEqual(@as(u32, 1), text.total_hits);
+    try std.testing.expectEqualStrings("doc:fresh", text.hits[0].id);
+}
+
+test "db ttl falls back to write timestamp when ttl field is missing" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const ttl_duration_ns: u64 = 60 * std.time.ns_per_s;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = ttl_duration_ns,
+        .ttl_field = "expires_at",
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:old", .value = "{\"title\":\"alpha\",\"body\":\"common token\"}" },
+        },
+        .timestamp_ns = now_ns - 2 * ttl_duration_ns,
+    });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:fresh", .value = "{\"title\":\"beta\",\"body\":\"common token\"}" },
+        },
+        .timestamp_ns = now_ns,
+    });
+
+    var lookup_old = try db.lookup(alloc, "doc:old", .{});
+    defer if (lookup_old) |*result| result.deinit(alloc);
+    try std.testing.expect(lookup_old == null);
+
+    var lookup_fresh = try db.lookup(alloc, "doc:fresh", .{});
+    defer if (lookup_fresh) |*result| result.deinit(alloc);
+    try std.testing.expect(lookup_fresh != null);
+
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+    try db.runUntilIdle();
+
+    var text = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "common" } },
+        .limit = 10,
+    });
+    defer text.deinit();
+    try std.testing.expectEqual(@as(u32, 1), text.total_hits);
+    try std.testing.expectEqualStrings("doc:fresh", text.hits[0].id);
+}
+
+test "db ttl cleanup reclaims expired documents through normal delete semantics" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 1_000_000_000,
+    });
+    try db.addIndex(.{
+        .name = "ft_v1",
+        .kind = .full_text,
+        .config_json = "{}",
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    try db.runUntilIdle();
+    try std.testing.expectEqual(@as(u64, 0), try db.getTimestamp(alloc, "doc:expired"));
+    {
+        const stats = try db.diagnosticStats(alloc);
+        defer types.freeDBStats(alloc, stats);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.state_rows);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.live_ordinals);
+        try std.testing.expectEqual(@as(u64, 1), stats.doc_identity.tombstone_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_ordinals);
+        try std.testing.expectEqual(@as(u64, 0), stats.doc_identity.primary_docs_missing_identity_state);
+        try std.testing.expect(!stats.doc_identity.rebuild_required);
+    }
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 0,
+    });
+
+    var text = try db.search(alloc, .{
+        .index_name = "ft_v1",
+        .query = .{ .match = .{ .field = "body", .text = "common" } },
+        .limit = 10,
+    });
+    defer text.deinit();
+    try std.testing.expectEqual(@as(u32, 0), text.total_hits);
+}
+
+test "db ttl cleanup deletes relational base rows" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+    const table_schema_api = @import("../../../schema/mod.zig");
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"body":{"type":"text"}},"required":["title","body"],"additionalProperties":false}}}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    var runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    runtime_schema.ttl_duration_ns = 1_000_000_000;
+    try db.setSchema(runtime_schema);
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "row:expired", .value = "{\"title\":\"gone\",\"body\":\"common token\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try TestHelpers.waitForRawDelete(alloc, &db, "row:expired", 200);
+    try std.testing.expect((try relational_store_mod.getRawAlloc(alloc, db.core.store, "row:expired")) == null);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:expired");
+    defer alloc.free(primary_key);
+    const maybe_primary = db.core.store.get(alloc, primary_key) catch |err| switch (err) {
+        error.NotFound => null,
+        else => return err,
+    };
+    if (maybe_primary) |primary_value| {
+        defer alloc.free(primary_value);
+        return error.TestExpectedEqual;
+    }
+}
+
+test "db stats expose ttl cleanup activity" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 1_000_000_000,
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    var stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var attempts: usize = 0;
+    while ((stats.ttl_cleanup.deleted_docs == 0 or stats.ttl_cleanup.scanned_timestamps == 0) and attempts < 200) : (attempts += 1) {
+        platform.time.sleepMs(10);
+        types.freeDBStats(alloc, stats);
+        stats = try db.stats(alloc);
+    }
+    try std.testing.expect(stats.ttl_cleanup.enabled);
+    try std.testing.expect(stats.ttl_cleanup.runs > 0);
+    try std.testing.expect(stats.ttl_cleanup.scanned_timestamps > 0);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+    try std.testing.expect(stats.ttl_cleanup.last_run_ns > 0);
+}
+
+test "db ttl cleanup can run under lease ownership" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .lease_owned = true,
+            .owner_id = "ttl-owner-a",
+            .lease_ttl_ms = 250,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 1_000_000_000,
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    var stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var attempts: usize = 0;
+    while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
+        platform.time.sleepMs(10);
+        types.freeDBStats(alloc, stats);
+        stats = try db.stats(alloc);
+    }
+
+    try std.testing.expect(stats.ttl_cleanup.enabled);
+    try std.testing.expect(stats.ttl_cleanup.lease_owned);
+    try std.testing.expect(stats.ttl_cleanup.has_lease);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+}
+
+test "db ttl cleanup can run under lease ownership with durable lsm primary backend" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const primary_backend: db_config.PrimaryBackend = .{ .lsm = .{ .flush_threshold = 1 } };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = primary_backend,
+        .ttl_cleanup = .{
+            .enabled = true,
+            .lease_owned = true,
+            .owner_id = "ttl-owner-a",
+            .lease_ttl_ms = 250,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = 1_000_000_000,
+    });
+
+    const now_ns = platform_clock.Clock.real().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2_000_000_000,
+    });
+
+    try TestHelpers.waitForRawDelete(alloc, &db, "doc:expired", 200);
+    var stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    var attempts: usize = 0;
+    while ((!stats.ttl_cleanup.has_lease or stats.ttl_cleanup.deleted_docs == 0) and attempts < 200) : (attempts += 1) {
+        platform.time.sleepMs(10);
+        types.freeDBStats(alloc, stats);
+        stats = try db.stats(alloc);
+    }
+
+    try std.testing.expect(stats.ttl_cleanup.enabled);
+    try std.testing.expect(stats.ttl_cleanup.lease_owned);
+    try std.testing.expect(stats.ttl_cleanup.has_lease);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
+}
+
+test "db ttl cleanup can run with manual clock" {
+    const alloc = std.testing.allocator;
+    const DB = @import("../mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var clock = platform_clock.ManualClock{
+        .now_realtime_ns = 10 * std.time.ns_per_s,
+    };
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .ttl_cleanup = .{
+            .enabled = true,
+            .interval_ms = 10,
+            .batch_size = 8,
+            .grace_period_ns = 0,
+            .clock = clock.clock(),
+        },
+    });
+    defer db.close();
+
+    try db.setSchema(.{
+        .version = 1,
+        .default_type = "_default",
+        .ttl_duration_ns = std.time.ns_per_s,
+    });
+
+    const now_ns = clock.clock().nowRealtimeNs();
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:expired_manual", .value = "{\"title\":\"gone\"}" }},
+        .timestamp_ns = now_ns - 2 * std.time.ns_per_s,
+    });
+
+    var deleted = false;
+    var attempts: usize = 0;
+    while (attempts < 32) : (attempts += 1) {
+        const raw = try db.get(alloc, "doc:expired_manual");
+        if (raw) |bytes| alloc.free(bytes) else {
+            deleted = true;
+            break;
+        }
+        clock.advanceMs(10);
+        platform.time.sleepMs(10);
+    }
+    try std.testing.expect(deleted);
+
+    var stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    attempts = 0;
+    while ((stats.ttl_cleanup.runs == 0 or stats.ttl_cleanup.deleted_docs == 0) and attempts < 32) : (attempts += 1) {
+        clock.advanceMs(10);
+        platform.time.sleepMs(10);
+        types.freeDBStats(alloc, stats);
+        stats = try db.stats(alloc);
+    }
+    try std.testing.expect(stats.ttl_cleanup.runs > 0);
+    try std.testing.expect(stats.ttl_cleanup.deleted_docs > 0);
 }

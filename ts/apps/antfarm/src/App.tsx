@@ -34,6 +34,7 @@ import RagPlaygroundPage from "./pages/RagPlaygroundPage";
 import ReaderPlaygroundPage from "./pages/ReaderPlaygroundPage";
 import RerankingPlaygroundPage from "./pages/RerankingPlaygroundPage";
 import { SecretsPage } from "./pages/SecretsPage";
+import SqlWorkbenchPage from "./pages/SqlWorkbenchPage";
 import TableDetailsPage from "./pages/TableDetailsPage";
 import TablesListPage from "./pages/TablesListPage";
 import TranscribePlaygroundPage from "./pages/TranscribePlaygroundPage";
@@ -199,6 +200,7 @@ function AppContent() {
                         )}
                         <Route path="/cluster" element={<ClusterPage />} />
                         <Route path="/connections" element={<ConnectionsPage />} />
+                        <Route path="/sql" element={<SqlWorkbenchPage />} />
                         <Route path="/data/playground/evals" element={<EvalsPlaygroundPage />} />
                         <Route path="/data/playground/rag" element={<RagPlaygroundPage />} />
                         <Route path="/data/playground/chat" element={<ChatPlaygroundPage />} />

@@ -288,6 +288,170 @@ type wrapper struct {
 	*SecretsApi
 }
 
+func unsupportedMetadataRoute(rw http.ResponseWriter, message string) {
+	http.Error(rw, message, http.StatusNotImplemented)
+}
+
+func (w wrapper) ListDatabases(rw http.ResponseWriter, r *http.Request) {
+	unsupportedMetadataRoute(rw, "database catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) DropDatabase(rw http.ResponseWriter, r *http.Request, databaseName string) {
+	unsupportedMetadataRoute(rw, "database catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) GetDatabase(rw http.ResponseWriter, r *http.Request, databaseName string) {
+	unsupportedMetadataRoute(rw, "database catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) CreateDatabase(rw http.ResponseWriter, r *http.Request, databaseName string) {
+	unsupportedMetadataRoute(rw, "database catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ListNamespaces(rw http.ResponseWriter, r *http.Request, databaseName string) {
+	unsupportedMetadataRoute(rw, "namespace catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) DropNamespace(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string) {
+	unsupportedMetadataRoute(rw, "namespace catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) CreateNamespace(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string) {
+	unsupportedMetadataRoute(rw, "namespace catalog route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ListNamespaceTables(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, params ListNamespaceTablesParams) {
+	w.TableApi.ListTables(rw, r, ListTablesParams{Prefix: params.Prefix})
+}
+
+func (w wrapper) DropNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.DropTable(rw, r, tableName)
+}
+
+func (w wrapper) GetNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.GetTable(rw, r, tableName)
+}
+
+func (w wrapper) CreateNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.CreateTable(rw, r, tableName)
+}
+
+func (w wrapper) BackupNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.BackupTable(rw, r, tableName)
+}
+
+func (w wrapper) BatchNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.BatchWrite(rw, r, tableName)
+}
+
+func (w wrapper) LookupNamespaceTableDocument(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string, key string, params LookupNamespaceTableDocumentParams) {
+	w.TableApi.LookupKey(rw, r, tableName, key, LookupKeyParams{Fields: params.Fields})
+}
+
+func (w wrapper) ListNamespaceTableIndexes(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.ListIndexes(rw, r, tableName)
+}
+
+func (w wrapper) DropNamespaceTableIndex(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string, indexName string) {
+	w.TableApi.DropIndex(rw, r, tableName, indexName)
+}
+
+func (w wrapper) GetNamespaceTableIndex(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string, indexName string) {
+	w.TableApi.GetIndex(rw, r, tableName, indexName)
+}
+
+func (w wrapper) CreateNamespaceTableIndex(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string, indexName string) {
+	w.TableApi.CreateIndex(rw, r, tableName, indexName)
+}
+
+func (w wrapper) QueryNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.QueryTable(rw, r, tableName)
+}
+
+func (w wrapper) RestoreNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	w.TableApi.RestoreTable(rw, r, tableName)
+}
+
+func (w wrapper) RowsBatchNamespaceTable(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string, tableName string) {
+	unsupportedMetadataRoute(rw, "namespace row batch route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ClearNamespaceTablespace(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string) {
+	unsupportedMetadataRoute(rw, "namespace tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) SetNamespaceTablespace(rw http.ResponseWriter, r *http.Request, databaseName string, namespaceName string) {
+	unsupportedMetadataRoute(rw, "namespace tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ClearDatabaseTablespace(rw http.ResponseWriter, r *http.Request, databaseName string) {
+	unsupportedMetadataRoute(rw, "database tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) SetDatabaseTablespace(rw http.ResponseWriter, r *http.Request, databaseName string) {
+	unsupportedMetadataRoute(rw, "database tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ListTablespaces(rw http.ResponseWriter, r *http.Request) {
+	unsupportedMetadataRoute(rw, "tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) DropTablespace(rw http.ResponseWriter, r *http.Request, tablespaceName string) {
+	unsupportedMetadataRoute(rw, "tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) GetTablespace(rw http.ResponseWriter, r *http.Request, tablespaceName string) {
+	unsupportedMetadataRoute(rw, "tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) CreateTablespace(rw http.ResponseWriter, r *http.Request, tablespaceName string) {
+	unsupportedMetadataRoute(rw, "tablespace route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ExecuteGraphMetricAction(rw http.ResponseWriter, r *http.Request, tableName string, indexName string, metricName string, action string) {
+	unsupportedMetadataRoute(rw, "graph metric route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) ExecuteSql(rw http.ResponseWriter, r *http.Request) {
+	unsupportedMetadataRoute(rw, "SQL route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsAggregate(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsBatchWrite(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsGet(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsJoin(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsLateral(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsMutationSource(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsPlan(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsQuery(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
+func (w wrapper) RowsWindow(rw http.ResponseWriter, r *http.Request, tableName string) {
+	unsupportedMetadataRoute(rw, "relational row route is not implemented in the Go metadata server")
+}
+
 // NewTableApi creates a new TableApi instance. This is used by the A2A facade
 // package to call agent methods directly.
 func NewTableApi(logger *zap.Logger, ln *MetadataStore, tm *tablemgr.TableManager) *TableApi {
@@ -1806,9 +1970,11 @@ func parseSyncLevel(level SyncLevel) (db.Op_SyncLevel, error) {
 		return db.Op_SyncLevelPropose, nil
 	case "write":
 		return db.Op_SyncLevelWrite, nil
-	case "full_text":
+	case "query":
 		return db.Op_SyncLevelFullText, nil
-	case "embeddings", "aknn":
+	case "enrichments":
+		return db.Op_SyncLevelEnrichments, nil
+	case "full_index":
 		return db.Op_SyncLevelEmbeddings, nil
 	default:
 		return db.Op_SyncLevelPropose, fmt.Errorf("invalid sync_level: %s", level)

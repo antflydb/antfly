@@ -143,6 +143,89 @@ func TestMergeIndexStats_Graph(t *testing.T) {
 		assert.Equal(t, uint64(15), (*got.EdgeTypes)["parent"])
 		assert.Equal(t, uint64(3), (*got.EdgeTypes)["child"])
 	})
+
+	t.Run("merge graph metric runtime summary", func(t *testing.T) {
+		u64 := func(v uint64) *uint64 { return &v }
+		boolPtr := func(v bool) *bool { return &v }
+		role := GraphMetricRuntimeStatsRoleWorkerPool
+
+		dst := GraphIndexStats{
+			GraphMetricRuntime: &GraphMetricRuntimeStats{
+				Enabled:             boolPtr(true),
+				Role:                &role,
+				OwnerIdHash:         u64(0x11),
+				WorkerIdHash:        u64(0x40),
+				WorkerCount:         u64(2),
+				LeaseOwned:          boolPtr(true),
+				HasLease:            boolPtr(false),
+				TakeoverCount:       u64(1),
+				TicksStarted:        u64(4),
+				TotalPagesClaimed:   u64(5),
+				LastPagesCompleted:  u64(1),
+				LastBudgetExhausted: boolPtr(false),
+			},
+		}.AsIndexStats()
+		src := GraphIndexStats{
+			GraphMetricRuntime: &GraphMetricRuntimeStats{
+				Enabled:             boolPtr(false),
+				Role:                &role,
+				OwnerIdHash:         u64(0x22),
+				WorkerIdHash:        u64(0x02),
+				WorkerCount:         u64(1),
+				LeaseOwned:          boolPtr(false),
+				HasLease:            boolPtr(true),
+				LostLeases:          u64(3),
+				TicksStarted:        u64(6),
+				TotalPagesClaimed:   u64(7),
+				LastPagesCompleted:  u64(3),
+				LastBudgetExhausted: boolPtr(true),
+			},
+		}.AsIndexStats()
+
+		MergeIndexStats(&dst, src)
+		got, err := dst.AsGraphIndexStats()
+		require.NoError(t, err)
+		require.NotNil(t, got.GraphMetricRuntime)
+		require.NotNil(t, got.GraphMetricRuntime.Role)
+		assert.Equal(t, GraphMetricRuntimeStatsRoleWorkerPool, *got.GraphMetricRuntime.Role)
+		assert.Equal(t, uint64(0x33), *got.GraphMetricRuntime.OwnerIdHash)
+		assert.Equal(t, uint64(0x42), *got.GraphMetricRuntime.WorkerIdHash)
+		assert.Equal(t, uint64(3), *got.GraphMetricRuntime.WorkerCount)
+		assert.True(t, *got.GraphMetricRuntime.Enabled)
+		assert.True(t, *got.GraphMetricRuntime.LeaseOwned)
+		assert.True(t, *got.GraphMetricRuntime.HasLease)
+		assert.Equal(t, uint64(1), *got.GraphMetricRuntime.TakeoverCount)
+		assert.Equal(t, uint64(3), *got.GraphMetricRuntime.LostLeases)
+		assert.Equal(t, uint64(10), *got.GraphMetricRuntime.TicksStarted)
+		assert.Equal(t, uint64(12), *got.GraphMetricRuntime.TotalPagesClaimed)
+		assert.Equal(t, uint64(4), *got.GraphMetricRuntime.LastPagesCompleted)
+		assert.True(t, *got.GraphMetricRuntime.LastBudgetExhausted)
+	})
+
+	t.Run("clears runtime role when merged runtimes disagree", func(t *testing.T) {
+		u64 := func(v uint64) *uint64 { return &v }
+		workerPool := GraphMetricRuntimeStatsRoleWorkerPool
+		coordinator := GraphMetricRuntimeStatsRoleCoordinator
+		dst := GraphIndexStats{
+			GraphMetricRuntime: &GraphMetricRuntimeStats{
+				Role:        &workerPool,
+				WorkerCount: u64(1),
+			},
+		}.AsIndexStats()
+		src := GraphIndexStats{
+			GraphMetricRuntime: &GraphMetricRuntimeStats{
+				Role:        &coordinator,
+				WorkerCount: u64(1),
+			},
+		}.AsIndexStats()
+
+		MergeIndexStats(&dst, src)
+		got, err := dst.AsGraphIndexStats()
+		require.NoError(t, err)
+		require.NotNil(t, got.GraphMetricRuntime)
+		assert.Nil(t, got.GraphMetricRuntime.Role)
+		assert.Equal(t, uint64(2), *got.GraphMetricRuntime.WorkerCount)
+	})
 }
 
 func TestMergeIndexStats_Algebraic(t *testing.T) {

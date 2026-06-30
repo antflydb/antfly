@@ -18,7 +18,8 @@ const fs_paths = @import("../../common/fs_paths.zig");
 const shard_state_store = @import("shard_state_store.zig");
 const internal_keys = @import("../../storage/internal_keys.zig");
 const shard_mod = @import("../../storage/shard.zig");
-const db_mod = @import("../../storage/db/db.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const relational_store_mod = @import("../../storage/db/relational_store.zig");
 const doc_identity = @import("../../storage/db/doc_identity.zig");
 const db_types = @import("../../storage/db/types.zig");
 const range_state = @import("../../storage/db/range_state.zig");
@@ -318,11 +319,21 @@ pub const Destination = struct {
             for (deletes.items) |key| alloc.free(@constCast(key));
             deletes.deinit(alloc);
         }
+        var seen_doc_keys = std.StringHashMapUnmanaged(void).empty;
+        defer seen_doc_keys.deinit(alloc);
 
         for (docs) |kv| {
-            const doc_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
-            errdefer alloc.free(doc_key);
+            const doc_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, kv.key)) orelse continue;
+            var doc_key_owned = true;
+            errdefer if (doc_key_owned) alloc.free(doc_key);
+            const gop = try seen_doc_keys.getOrPut(alloc, doc_key);
+            if (gop.found_existing) {
+                alloc.free(doc_key);
+                doc_key_owned = false;
+                continue;
+            }
             try deletes.append(alloc, doc_key);
+            doc_key_owned = false;
         }
 
         if (deletes.items.len > 0) {
@@ -330,6 +341,7 @@ pub const Destination = struct {
                 .deletes = deletes.items,
             });
         }
+        try relational_store_mod.deleteColumnIndexesByDocRange(alloc, self.db.core.store, byte_range.start, byte_range.end);
     }
 
     pub fn applyMergeReplay(
@@ -709,7 +721,7 @@ pub const MergeCoordinator = struct {
 
     pub fn ensureReceiverBootstrapped(self: *MergeCoordinator) !bool {
         try self.requireConfiguredReceiverIdentityReassignmentOptIn();
-        if (!self.receiver_accepts_donor_range or self.merge_phase == .rolled_back) return false;
+        if (!self.receiver_accepts_donor_range or self.merge_phase != .accepting) return false;
         const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
         defer range_state.freeRange(self.alloc, donor_range);
 
@@ -818,12 +830,14 @@ pub const MergeCoordinator = struct {
         if (self.allow_doc_identity_reassignment) try self.requireConfiguredReceiverIdentityReassignmentOptIn();
         const transition_status = try self.status();
         switch (transition_status.phase) {
-            .prepare, .bootstrap_peer, .replay_deltas, .cutover_ready => {},
+            .prepare, .bootstrap_peer, .replay_deltas, .cutover_ready, .rolling_back => {},
             else => return false,
         }
 
-        self.merge_phase = .rolling_back;
-        try self.persistMergeState();
+        if (self.merge_phase != .rolling_back) {
+            self.merge_phase = .rolling_back;
+            try self.persistMergeState();
+        }
 
         const donor_range = try self.donor.currentRange(self.alloc, self.donor_group_id);
         defer range_state.freeRange(self.alloc, donor_range);
@@ -1670,6 +1684,161 @@ test "db merge coordinator bootstraps receiver for donor range" {
         try std.testing.expect(status.receiver_ready_for_reads);
         try std.testing.expectEqual(@as(u64, 5), status.donor_delta_sequence);
         try std.testing.expectEqual(@as(u64, 5), status.receiver_delta_sequence);
+    }
+}
+
+pub fn testMergeCoordinatorBootstrapsRelationalRowsAndColumnEntries() !void {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const donor_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/db-merge-relational-donor", .{tmp.sub_path});
+    defer alloc.free(donor_root);
+    const receiver_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/db-merge-relational-receiver", .{tmp.sub_path});
+    defer alloc.free(receiver_root);
+
+    {
+        var donor = try data_store.RaftApplyStore.init(alloc, .{ .root_dir = donor_root });
+        defer donor.deinit();
+
+        const donor_setup = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = 1, .entry_type = .normal, .data = @constCast("range:row:m:row:z") },
+            .{ .term = 1, .index = 2, .entry_type = .normal, .data = @constCast("put:row:t={\"title\":\"theta\",\"status\":\"closed\",\"amount\":90}") },
+            .{ .term = 1, .index = 3, .entry_type = .normal, .data = @constCast("put:row:y={\"title\":\"upsilon\",\"status\":\"pending\",\"amount\":30}") },
+        });
+        defer alloc.free(donor_setup);
+        try donor.snapshotBuilder().applyBatch(.{
+            .group_id = 171,
+            .commit_index = 3,
+            .entries_bytes = donor_setup,
+        });
+    }
+
+    {
+        var receiver = try Destination.init(alloc, .{ .root_dir = receiver_root });
+        defer receiver.deinit();
+        try receiver.db.updateRange(.{ .start = "row:a", .end = "row:m" });
+
+        const schema_json =
+            \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["title"],"additionalProperties":false}}}}
+        ;
+        try receiver.db.applyTableSchemaJson(alloc, schema_json, .{});
+
+        try receiver.db.batch(.{
+            .writes = &.{
+                .{ .key = "row:b", .value = "{\"title\":\"beta\",\"status\":\"open\",\"amount\":10}" },
+            },
+        });
+    }
+
+    {
+        var coord = try MergeCoordinator.init(alloc, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 171,
+            .receiver_group_id = 172,
+        });
+        defer coord.deinit();
+
+        try coord.acceptDonorRange();
+        {
+            const status = try coord.syncOnce();
+            try std.testing.expectEqual(range_transition.TransitionPhase.cutover_ready, status.phase);
+            try std.testing.expectEqualStrings("row:a", coord.receiver.getRange().start);
+            try std.testing.expectEqualStrings("row:z", coord.receiver.getRange().end);
+
+            const donor_doc = (try coord.receiver.get(alloc, "row:t")) orelse return error.TestExpectedEqual;
+            defer alloc.free(donor_doc);
+            try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"title\":\"theta\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"status\":\"closed\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, donor_doc, "\"amount\":90") != null);
+
+            const bootstrapped_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:t", "row:t");
+            defer relational_store_mod.freeColumnValues(alloc, bootstrapped_amounts);
+            try std.testing.expectEqual(@as(usize, 1), bootstrapped_amounts.len);
+            try std.testing.expectEqual(.f64_val, bootstrapped_amounts[0].value_type);
+            try std.testing.expectEqual(@as(f64, 90), bootstrapped_amounts[0].value.f64_val);
+        }
+
+        const catchup = try raft_state_machine.encodeCommittedEntries(alloc, &.{
+            .{ .term = 1, .index = 4, .entry_type = .normal, .data = @constCast("put:row:x={\"title\":\"xi\",\"status\":\"closed\",\"amount\":95}") },
+            .{ .term = 1, .index = 5, .entry_type = .normal, .data = @constCast("del:row:t") },
+        });
+        defer alloc.free(catchup);
+        try coord.donor.snapshotBuilder().applyBatch(.{
+            .group_id = 171,
+            .commit_index = 5,
+            .entries_bytes = catchup,
+        });
+
+        {
+            const status = try coord.syncOnce();
+            try std.testing.expectEqual(range_transition.TransitionPhase.cutover_ready, status.phase);
+            try std.testing.expect((try coord.receiver.get(alloc, "row:t")) == null);
+
+            const removed_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:t", "row:t");
+            defer relational_store_mod.freeColumnValues(alloc, removed_amounts);
+            try std.testing.expectEqual(@as(usize, 0), removed_amounts.len);
+
+            const replayed_amounts = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:x", "row:x");
+            defer relational_store_mod.freeColumnValues(alloc, replayed_amounts);
+            try std.testing.expectEqual(@as(usize, 1), replayed_amounts.len);
+            try std.testing.expectEqual(@as(f64, 95), replayed_amounts[0].value.f64_val);
+        }
+
+        coord.merge_phase = .rolling_back;
+        try coord.persistMergeState();
+
+        const donor_range = try coord.donor.currentRange(alloc, coord.donor_group_id);
+        defer range_state.freeRange(alloc, donor_range);
+        try coord.receiver.deleteDocsInRange(alloc, .{
+            .start = donor_range.start,
+            .end = donor_range.end,
+        });
+        try coord.receiver.db.updateRange(.{
+            .start = coord.receiver_base_range.start,
+            .end = coord.receiver_base_range.end,
+        });
+        try coord.receiver.db.clearSplitDeltaFinalSeq();
+    }
+
+    {
+        var coord = try MergeCoordinator.init(alloc, .{
+            .donor_root_dir = donor_root,
+            .receiver_root_dir = receiver_root,
+            .donor_group_id = 171,
+            .receiver_group_id = 172,
+        });
+        defer coord.deinit();
+
+        const resumed = try coord.status();
+        try std.testing.expectEqual(range_transition.TransitionPhase.rolling_back, resumed.phase);
+        _ = try coord.syncOnce();
+        try std.testing.expect((try coord.receiver.get(alloc, "row:x")) == null);
+        try std.testing.expectEqual(@as(u64, 0), try coord.receiver.db.getSplitDeltaFinalSeq(alloc));
+
+        try std.testing.expect(try coord.rollbackMerge());
+        const status = try coord.status();
+        try std.testing.expectEqual(range_transition.TransitionPhase.rolled_back, status.phase);
+        try std.testing.expectEqualStrings("row:a", coord.receiver.getRange().start);
+        try std.testing.expectEqualStrings("row:m", coord.receiver.getRange().end);
+
+        try std.testing.expect((try coord.receiver.get(alloc, "row:x")) == null);
+        try std.testing.expect((try coord.receiver.get(alloc, "row:y")) == null);
+        try std.testing.expect((try coord.receiver.get(alloc, "row:t")) == null);
+
+        const receiver_doc = (try coord.receiver.get(alloc, "row:b")) orelse return error.TestExpectedEqual;
+        defer alloc.free(receiver_doc);
+        try std.testing.expect(std.mem.indexOf(u8, receiver_doc, "\"title\":\"beta\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, receiver_doc, "\"amount\":10") != null);
+
+        const replayed_after_rollback = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:x", "row:x");
+        defer relational_store_mod.freeColumnValues(alloc, replayed_after_rollback);
+        try std.testing.expectEqual(@as(usize, 0), replayed_after_rollback.len);
+
+        const bootstrapped_after_rollback = try relational_store_mod.scanColumnAlloc(alloc, coord.receiver.db.core.store, "amount", "row:y", "row:y");
+        defer relational_store_mod.freeColumnValues(alloc, bootstrapped_after_rollback);
+        try std.testing.expectEqual(@as(usize, 0), bootstrapped_after_rollback.len);
     }
 }
 

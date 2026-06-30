@@ -27,12 +27,15 @@ const checkpoint_max_bytes: usize = 1024 * 1024;
 
 pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
+    var catalog = cli.CatalogFlags.defaultsFromEnv();
     var key: ?[]const u8 = null;
     var value_json: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             table_name = args.next();
+        } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
+            continue;
         } else if (std.mem.eql(u8, arg, "--key")) {
             key = args.next();
         } else if (std.mem.eql(u8, arg, "--value")) {
@@ -51,7 +54,7 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
     defer inserts.deinit(allocator);
     try inserts.map.put(allocator, k, parsed.value);
 
-    var resp = try client.batch(tbl, .{
+    var resp = try sendBatch(client, catalog, tbl, .{
         .inserts = inserts,
         .sync_level = .full_index,
     });
@@ -61,11 +64,14 @@ pub fn insert(allocator: std.mem.Allocator, _: std.Io, client: *antfly_client.An
 
 pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClient, args: *std.process.Args.Iterator) !void {
     var table_name: ?[]const u8 = null;
+    var catalog = cli.CatalogFlags.defaultsFromEnv();
     var key: ?[]const u8 = null;
 
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             table_name = args.next();
+        } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
+            continue;
         } else if (std.mem.eql(u8, arg, "--key")) {
             key = args.next();
         }
@@ -75,7 +81,7 @@ pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClie
     const k = key orelse cli.fatal("--key is required", .{});
 
     const deletes = [_][]const u8{k};
-    var resp = try client.batch(tbl, .{
+    var resp = try sendBatch(client, catalog, tbl, .{
         .deletes = &deletes,
         .sync_level = .full_index,
     });
@@ -91,6 +97,7 @@ pub fn delete(_: std.mem.Allocator, _: std.Io, client: *antfly_client.AntflyClie
 
 const LoadOptions = struct {
     table_name: []const u8,
+    catalog: cli.CatalogFlags = .{},
     file_path: []const u8,
     batch_size: usize = default_batch_size,
     max_batches: usize = default_max_batches,
@@ -135,6 +142,8 @@ const LoadCheckpoint = struct {
     source_size: u64,
     source_mtime_ns: i128,
     table_name: []const u8,
+    database_name: ?[]const u8 = null,
+    namespace_name: ?[]const u8 = null,
     id_field: ?[]const u8 = null,
     id_template: ?[]const u8 = null,
     sync_level: ?[]const u8 = null,
@@ -543,7 +552,7 @@ const LoadProcessor = struct {
         if (self.stopForBatchLimit()) return;
 
         if (!self.opts.dry_run) {
-            var resp = try self.client.?.batch(self.opts.table_name, .{
+            var resp = try sendBatch(self.client.?, self.opts.catalog, self.opts.table_name, .{
                 .inserts = self.batch.inserts,
                 .sync_level = self.opts.sync_level,
             });
@@ -571,6 +580,8 @@ const LoadProcessor = struct {
             .source_size = self.file_meta.size,
             .source_mtime_ns = self.file_meta.mtime_ns,
             .table_name = self.opts.table_name,
+            .database_name = self.opts.catalog.database,
+            .namespace_name = self.opts.catalog.namespace,
             .id_field = self.opts.id_field,
             .id_template = self.opts.id_template,
             .sync_level = if (self.opts.sync_level) |level| syncLevelName(level) else null,
@@ -603,6 +614,7 @@ pub fn load(allocator: std.mem.Allocator, io: std.Io, client: *antfly_client.Ant
 
 fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterator) LoadOptions {
     var table_name: ?[]const u8 = null;
+    var catalog = cli.CatalogFlags.defaultsFromEnv();
     var file_path: ?[]const u8 = null;
     var batch_size: usize = default_batch_size;
     var max_batches: usize = default_max_batches;
@@ -621,6 +633,8 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
     while (args.next()) |arg| {
         if (std.mem.eql(u8, arg, "--table") or std.mem.eql(u8, arg, "-t")) {
             table_name = args.next();
+        } else if (cli.parseCatalogFlag(&catalog, arg, args)) {
+            continue;
         } else if (std.mem.eql(u8, arg, "--file") or std.mem.eql(u8, arg, "-f")) {
             file_path = args.next();
         } else if (std.mem.eql(u8, arg, "--size")) {
@@ -668,6 +682,7 @@ fn parseLoadOptions(allocator: std.mem.Allocator, args: *std.process.Args.Iterat
 
     return .{
         .table_name = table_name orelse cli.fatal("--table is required", .{}),
+        .catalog = catalog,
         .file_path = file_path orelse cli.fatal("--file is required", .{}),
         .batch_size = batch_size,
         .max_batches = max_batches,
@@ -693,9 +708,8 @@ fn parsePositive(comptime T: type, raw: ?[]const u8, flag: []const u8) T {
 fn parseSyncLevel(text: []const u8) ?antfly_client.types.SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "query")) return .query;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "aknn")) return .aknn;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
 }
@@ -704,9 +718,8 @@ fn syncLevelName(level: antfly_client.types.SyncLevel) []const u8 {
     return switch (level) {
         .propose => "propose",
         .write => "write",
-        .full_text => "full_text",
+        .query => "query",
         .enrichments => "enrichments",
-        .aknn => "aknn",
         .full_index => "full_index",
     };
 }
@@ -812,6 +825,8 @@ fn validateCheckpoint(cp: LoadCheckpoint, opts: LoadOptions, meta: FileMetadata)
     if (!std.mem.eql(u8, cp.source_path, opts.file_path)) return error.InvalidLoadCheckpoint;
     if (cp.source_size != meta.size or cp.source_mtime_ns != meta.mtime_ns) return error.InvalidLoadCheckpoint;
     if (!std.mem.eql(u8, cp.table_name, opts.table_name)) return error.InvalidLoadCheckpoint;
+    if (!optionalStringEql(cp.database_name, opts.catalog.database)) return error.InvalidLoadCheckpoint;
+    if (!optionalStringEql(cp.namespace_name, opts.catalog.namespace)) return error.InvalidLoadCheckpoint;
     if (!optionalStringEql(cp.id_field, opts.id_field)) return error.InvalidLoadCheckpoint;
     if (!optionalStringEql(cp.id_template, opts.id_template)) return error.InvalidLoadCheckpoint;
     const opts_sync_level = if (opts.sync_level) |level| syncLevelName(level) else null;
@@ -823,6 +838,18 @@ fn optionalStringEql(a: ?[]const u8, b: ?[]const u8) bool {
     if (a == null and b == null) return true;
     if (a == null or b == null) return false;
     return std.mem.eql(u8, a.?, b.?);
+}
+
+fn sendBatch(
+    client: *antfly_client.AntflyClient,
+    catalog: cli.CatalogFlags,
+    table_name: []const u8,
+    req: antfly_client.types.BatchRequest,
+) !antfly_client.openapi.ApiResponse(antfly_client.types.BatchResponse) {
+    if (catalog.explicit()) |explicit| {
+        return try client.inner.batchNamespaceTable(explicit.database, explicit.namespace, table_name, req);
+    }
+    return try client.batch(table_name, req);
 }
 
 fn jsonToHandlebarsValue(arena: std.mem.Allocator, value: std.json.Value) std.mem.Allocator.Error!hbs.Value {
@@ -1087,10 +1114,11 @@ test "load processor rejects empty rendered id template" {
 test "load sync level parser supports public values" {
     try std.testing.expectEqual(antfly_client.types.SyncLevel.propose, parseSyncLevel("propose").?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.write, parseSyncLevel("write").?);
-    try std.testing.expectEqual(antfly_client.types.SyncLevel.full_text, parseSyncLevel("full_text").?);
+    try std.testing.expectEqual(antfly_client.types.SyncLevel.query, parseSyncLevel("query").?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.enrichments, parseSyncLevel("enrichments").?);
-    try std.testing.expectEqual(antfly_client.types.SyncLevel.aknn, parseSyncLevel("aknn").?);
     try std.testing.expectEqual(antfly_client.types.SyncLevel.full_index, parseSyncLevel("full_index").?);
+    try std.testing.expect(parseSyncLevel("full_text") == null);
+    try std.testing.expect(parseSyncLevel("aknn") == null);
     try std.testing.expect(parseSyncLevel("full-text") == null);
 }
 
@@ -1126,7 +1154,7 @@ test "checkpoint validation rejects changed source and load config" {
         .table_name = "t",
         .file_path = "a.ndjson",
         .id_field = "id",
-        .sync_level = .full_text,
+        .sync_level = .query,
     }, .{ .size = 10, .mtime_ns = 99 }));
 
     const template_cp = LoadCheckpoint{

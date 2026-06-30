@@ -228,6 +228,10 @@ test "db merge coordinator reapplies target namespace for persisted reassignment
     try std.testing.expectEqual(target_namespace.range_id, after.doc_identity.namespace_range_id);
 }
 
+test "db merge coordinator bootstraps relational rows and column entries" {
+    try db_split_handoff.testMergeCoordinatorBootstrapsRelationalRowsAndColumnEntries();
+}
+
 test "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();

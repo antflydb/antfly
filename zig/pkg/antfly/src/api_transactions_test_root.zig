@@ -13,7 +13,11 @@
 // limitations.
 
 const transactions = @import("api/transactions.zig");
+const distributed_txn = @import("api/distributed_txn.zig");
+const table_catalog = @import("metadata/catalog/routing.zig");
 
 test {
     _ = transactions;
+    _ = distributed_txn;
+    _ = table_catalog;
 }

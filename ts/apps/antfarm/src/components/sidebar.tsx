@@ -26,6 +26,7 @@ import {
   ArrowUpDown,
   Bot,
   ClipboardCheck,
+  Database,
   FileInput,
   FileStack,
   KeyRound,
@@ -204,6 +205,20 @@ export function AppSidebar({ currentSection, onSectionChange, ...props }: AppSid
                       >
                         <TableIcon className="size-4" />
                         <span>Tables</span>
+                      </a>
+                    </SidebarMenuButton>
+                  </SidebarMenuItem>
+                  <SidebarMenuItem>
+                    <SidebarMenuButton asChild isActive={isPath("/sql")} tooltip="SQL">
+                      <a
+                        href="/sql"
+                        onClick={(event) => {
+                          event.preventDefault();
+                          navigateSelectedTableRoute("/sql");
+                        }}
+                      >
+                        <Database className="size-4" />
+                        <span>SQL</span>
                       </a>
                     </SidebarMenuButton>
                   </SidebarMenuItem>

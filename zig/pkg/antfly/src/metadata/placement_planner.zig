@@ -80,8 +80,38 @@ pub const PlacementPlanner = struct {
         defer manager.freeTables(self.alloc, tables);
         const ranges = try manager.listRanges(self.alloc);
         defer manager.freeRanges(self.alloc, ranges);
+        const foreign_key_ref_ranges = try manager.listForeignKeyReferenceRanges(self.alloc);
+        defer manager.freeForeignKeyReferenceRanges(self.alloc, foreign_key_ref_ranges);
+        const unique_constraint_ranges = try manager.listUniqueConstraintRanges(self.alloc);
+        defer manager.freeUniqueConstraintRanges(self.alloc, unique_constraint_ranges);
+        const secondary_index_rebuild_ranges = try manager.listSecondaryIndexRebuildRanges(self.alloc);
+        defer manager.freeSecondaryIndexRebuildRanges(self.alloc, secondary_index_rebuild_ranges);
         std.mem.sort(table_manager.RangeRecord, ranges, current_intents, struct {
             fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.RangeRecord, b: table_manager.RangeRecord) bool {
+                const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
+                const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
+                if (a_has_current != b_has_current) return a_has_current;
+                return a.group_id < b.group_id;
+            }
+        }.lessThan);
+        std.mem.sort(table_manager.ForeignKeyReferenceRangeRecord, foreign_key_ref_ranges, current_intents, struct {
+            fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.ForeignKeyReferenceRangeRecord, b: table_manager.ForeignKeyReferenceRangeRecord) bool {
+                const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
+                const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
+                if (a_has_current != b_has_current) return a_has_current;
+                return a.group_id < b.group_id;
+            }
+        }.lessThan);
+        std.mem.sort(table_manager.UniqueConstraintRangeRecord, unique_constraint_ranges, current_intents, struct {
+            fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.UniqueConstraintRangeRecord, b: table_manager.UniqueConstraintRangeRecord) bool {
+                const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
+                const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
+                if (a_has_current != b_has_current) return a_has_current;
+                return a.group_id < b.group_id;
+            }
+        }.lessThan);
+        std.mem.sort(table_manager.SecondaryIndexRebuildRangeRecord, secondary_index_rebuild_ranges, current_intents, struct {
+            fn lessThan(current: []const raft_reconciler.PlacementIntent, a: table_manager.SecondaryIndexRebuildRangeRecord, b: table_manager.SecondaryIndexRebuildRangeRecord) bool {
                 const a_has_current = findCurrentIntent(current, a.group_id, null) != null;
                 const b_has_current = findCurrentIntent(current, b.group_id, null) != null;
                 if (a_has_current != b_has_current) return a_has_current;
@@ -102,69 +132,63 @@ pub const PlacementPlanner = struct {
 
         for (ranges) |range| {
             const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
-            const replica_count = @min(@as(usize, table.desired_replica_count), countEligibleCandidates(candidate_node_ids, candidate_domains, table.placement_role));
-            if (replica_count == 0) continue;
-            const has_current_group = findCurrentIntent(current_intents, range.group_id, null) != null;
-
-            var selected = std.ArrayListUnmanaged(u64).empty;
-            defer selected.deinit(self.alloc);
-            const preserved = try collectCurrentPeers(
+            try appendGroupPlacementIntents(
                 self.alloc,
+                &out,
+                &load_by_node,
+                &pair_by_nodes,
                 current_intents,
                 range.group_id,
                 candidate_node_ids,
                 candidate_domains,
                 table.placement_role,
+                table.desired_replica_count,
             );
-            defer self.alloc.free(preserved);
-            for (preserved) |node_id| {
-                if (selected.items.len >= replica_count) break;
-                try selected.append(self.alloc, node_id);
-            }
-
-            const start = @as(usize, @intCast(range.group_id % candidate_node_ids.len));
-            const ordered = try orderCandidates(self.alloc, candidate_node_ids, candidate_domains, start, &load_by_node);
-            defer self.alloc.free(ordered);
-            while (selected.items.len < replica_count) {
-                const node_id = chooseNextCandidate(ordered, selected.items, &pair_by_nodes, candidate_domains, table.placement_role) orelse break;
-                if (containsNode(selected.items, node_id)) break;
-                try selected.append(self.alloc, node_id);
-            }
-
-            const peers = try self.alloc.dupe(u64, selected.items);
-            defer self.alloc.free(peers);
-            for (peers) |node_id| {
-                const entry = try load_by_node.getOrPut(self.alloc, node_id);
-                if (!entry.found_existing) entry.value_ptr.* = 0;
-                entry.value_ptr.* += 1;
-            }
-            for (peers, 0..) |left, i| {
-                for (peers[i + 1 ..]) |right| {
-                    const entry = try pair_by_nodes.getOrPut(self.alloc, pairKey(left, right));
-                    if (!entry.found_existing) entry.value_ptr.* = 0;
-                    entry.value_ptr.* += 1;
-                }
-            }
-
-            for (peers, 0..) |node_id, replica_index| {
-                const existing_intent = findCurrentIntent(current_intents, range.group_id, node_id);
-                const bootstrap_mode: raft_catalog.ReplicaBootstrapMode = if (existing_intent) |existing|
-                    existing.record.bootstrap_mode
-                else if (!has_current_group)
-                    .empty
-                else
-                    .persisted;
-                try out.append(self.alloc, .{
-                    .record = .{
-                        .group_id = range.group_id,
-                        .replica_id = @as(u64, @intCast(replica_index + 1)),
-                        .local_node_id = node_id,
-                        .bootstrap_mode = bootstrap_mode,
-                    },
-                    .store_id = chooseStoreIdForNode(current_intents, candidate_domains, range.group_id, node_id),
-                    .peer_node_ids = if (peers.len == 0) &.{} else try self.alloc.dupe(u64, peers),
-                });
-            }
+        }
+        for (foreign_key_ref_ranges) |range| {
+            const table = findTable(tables, range.parent_table_id) orelse return error.UnknownTable;
+            try appendGroupPlacementIntents(
+                self.alloc,
+                &out,
+                &load_by_node,
+                &pair_by_nodes,
+                current_intents,
+                range.group_id,
+                candidate_node_ids,
+                candidate_domains,
+                table.placement_role,
+                table.desired_replica_count,
+            );
+        }
+        for (unique_constraint_ranges) |range| {
+            const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
+            try appendGroupPlacementIntents(
+                self.alloc,
+                &out,
+                &load_by_node,
+                &pair_by_nodes,
+                current_intents,
+                range.group_id,
+                candidate_node_ids,
+                candidate_domains,
+                table.placement_role,
+                table.desired_replica_count,
+            );
+        }
+        for (secondary_index_rebuild_ranges) |range| {
+            const table = findTable(tables, range.table_id) orelse return error.UnknownTable;
+            try appendGroupPlacementIntents(
+                self.alloc,
+                &out,
+                &load_by_node,
+                &pair_by_nodes,
+                current_intents,
+                range.group_id,
+                candidate_node_ids,
+                candidate_domains,
+                table.placement_role,
+                table.desired_replica_count,
+            );
         }
 
         return try out.toOwnedSlice(self.alloc);
@@ -195,6 +219,83 @@ fn findTable(records: []const table_manager.TableRecord, table_id: u64) ?table_m
         if (record.table_id == table_id) return record;
     }
     return null;
+}
+
+fn appendGroupPlacementIntents(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(raft_reconciler.PlacementIntent),
+    load_by_node: *std.AutoHashMapUnmanaged(u64, usize),
+    pair_by_nodes: *std.AutoHashMapUnmanaged(u128, usize),
+    current_intents: []const raft_reconciler.PlacementIntent,
+    group_id: u64,
+    candidate_node_ids: []const u64,
+    candidate_domains: []const CandidateDomain,
+    placement_role: []const u8,
+    desired_replica_count: u32,
+) !void {
+    const replica_count = @min(@as(usize, desired_replica_count), countEligibleCandidates(candidate_node_ids, candidate_domains, placement_role));
+    if (replica_count == 0) return;
+    const has_current_group = findCurrentIntent(current_intents, group_id, null) != null;
+
+    var selected = std.ArrayListUnmanaged(u64).empty;
+    defer selected.deinit(alloc);
+    const preserved = try collectCurrentPeers(
+        alloc,
+        current_intents,
+        group_id,
+        candidate_node_ids,
+        candidate_domains,
+        placement_role,
+    );
+    defer alloc.free(preserved);
+    for (preserved) |node_id| {
+        if (selected.items.len >= replica_count) break;
+        try selected.append(alloc, node_id);
+    }
+
+    const start = @as(usize, @intCast(group_id % candidate_node_ids.len));
+    const ordered = try orderCandidates(alloc, candidate_node_ids, candidate_domains, start, load_by_node);
+    defer alloc.free(ordered);
+    while (selected.items.len < replica_count) {
+        const node_id = chooseNextCandidate(ordered, selected.items, pair_by_nodes, candidate_domains, placement_role) orelse break;
+        if (containsNode(selected.items, node_id)) break;
+        try selected.append(alloc, node_id);
+    }
+
+    const peers = try alloc.dupe(u64, selected.items);
+    defer alloc.free(peers);
+    for (peers) |node_id| {
+        const entry = try load_by_node.getOrPut(alloc, node_id);
+        if (!entry.found_existing) entry.value_ptr.* = 0;
+        entry.value_ptr.* += 1;
+    }
+    for (peers, 0..) |left, i| {
+        for (peers[i + 1 ..]) |right| {
+            const entry = try pair_by_nodes.getOrPut(alloc, pairKey(left, right));
+            if (!entry.found_existing) entry.value_ptr.* = 0;
+            entry.value_ptr.* += 1;
+        }
+    }
+
+    for (peers, 0..) |node_id, replica_index| {
+        const existing_intent = findCurrentIntent(current_intents, group_id, node_id);
+        const bootstrap_mode: raft_catalog.ReplicaBootstrapMode = if (existing_intent) |existing|
+            existing.record.bootstrap_mode
+        else if (!has_current_group)
+            .empty
+        else
+            .persisted;
+        try out.append(alloc, .{
+            .record = .{
+                .group_id = group_id,
+                .replica_id = @as(u64, @intCast(replica_index + 1)),
+                .local_node_id = node_id,
+                .bootstrap_mode = bootstrap_mode,
+            },
+            .store_id = chooseStoreIdForNode(current_intents, candidate_domains, group_id, node_id),
+            .peer_node_ids = if (peers.len == 0) &.{} else try alloc.dupe(u64, peers),
+        });
+    }
 }
 
 fn chooseStoreIdForNode(
@@ -490,6 +591,97 @@ test "placement planner derives stable local intents from topology" {
     try std.testing.expectEqual(@as(u64, 701), intents[0].record.group_id);
     try std.testing.expectEqual(@as(u64, 2), intents[0].record.local_node_id);
     try std.testing.expectEqual(@as(usize, 3), intents[0].peer_node_ids.len);
+}
+
+test "placement planner places foreign key reference owner ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 10, .name = "orders", .desired_replica_count = 3 });
+    try manager.upsertTable(.{ .table_id = 20, .name = "customers", .placement_role = "serving", .desired_replica_count = 2 });
+    try manager.upsertForeignKeyReferenceRange(.{
+        .group_id = 3001,
+        .child_table_id = 10,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 20,
+        .start_parent_key = "",
+        .end_parent_key = null,
+    });
+
+    const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 1, .store_id = 101, .role = "data", .failure_domain = "a" },
+        .{ .node_id = 2, .store_id = 102, .role = "serving", .failure_domain = "b" },
+        .{ .node_id = 3, .store_id = 103, .role = "serving", .failure_domain = "c" },
+    };
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 1, 2, 3 }, &.{}, &candidate_domains);
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    var fk_owner_intents: usize = 0;
+    for (intents) |intent| {
+        if (intent.record.group_id != 3001) continue;
+        fk_owner_intents += 1;
+        try std.testing.expect(intent.record.local_node_id == 2 or intent.record.local_node_id == 3);
+        try std.testing.expect(intent.store_id == 102 or intent.store_id == 103);
+    }
+    try std.testing.expectEqual(@as(usize, 2), fk_owner_intents);
+}
+
+test "placement planner places unique constraint owner ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 10, .name = "users", .placement_role = "serving", .desired_replica_count = 2 });
+    try manager.upsertUniqueConstraintRange(.{
+        .group_id = 4001,
+        .table_id = 10,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+    });
+
+    const candidate_domains = [_]CandidateDomain{
+        .{ .node_id = 1, .store_id = 101, .role = "data", .failure_domain = "a" },
+        .{ .node_id = 2, .store_id = 102, .role = "serving", .failure_domain = "b" },
+        .{ .node_id = 3, .store_id = 103, .role = "serving", .failure_domain = "c" },
+    };
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntentsWithCurrentAndDomains(&manager, &.{ 1, 2, 3 }, &.{}, &candidate_domains);
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    var unique_owner_intents: usize = 0;
+    for (intents) |intent| {
+        if (intent.record.group_id != 4001) continue;
+        unique_owner_intents += 1;
+        try std.testing.expect(intent.record.local_node_id == 2 or intent.record.local_node_id == 3);
+        try std.testing.expect(intent.store_id == 102 or intent.store_id == 103);
+    }
+    try std.testing.expectEqual(@as(usize, 2), unique_owner_intents);
+}
+
+test "placement planner places secondary index rebuild ranges" {
+    var manager = table_manager.TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 16, .name = "users", .desired_replica_count = 2 });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 16,
+        .index_name = "users_status_idx",
+        .index_generation = 77,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 16001,
+    });
+
+    var planner = PlacementPlanner.init(std.testing.allocator);
+    const intents = try planner.planAllIntents(&manager, &.{ 1, 2, 3 });
+    defer planner.freeIntents(std.testing.allocator, intents);
+
+    var rebuild_intents: usize = 0;
+    for (intents) |intent| {
+        if (intent.record.group_id == 16001) rebuild_intents += 1;
+    }
+    try std.testing.expectEqual(@as(usize, 2), rebuild_intents);
 }
 
 test "placement planner spreads multiple ranges across candidate nodes" {

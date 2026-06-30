@@ -30,9 +30,10 @@ const http_common = @import("../raft/transport/http_common.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const routes = @import("http_routes.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_mod = @import("../graph/graph.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
 const table_reads = @import("table_reads.zig");
-const table_catalog = @import("table_catalog.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
 const table_writes = @import("table_writes.zig");
 const generating_api_openapi = @import("antfly_generating_api_openapi");
 const transactions_api = @import("transactions.zig");
@@ -177,8 +178,50 @@ const IndexStatusSummary = struct {
         doc_count: ?u64 = null,
         node_count: ?u64 = null,
         edge_count: ?u64 = null,
+        metric_status: ?std.json.ArrayHashMap(GraphMetricStatusSummary) = null,
     },
 };
+
+const GraphMetricStatusSummary = struct {
+    state: []const u8,
+    edge_filter: ?GraphMetricEdgeFilterSummary = null,
+    maintenance_paused: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    converged: bool = false,
+    iterations_completed: u64 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+};
+
+const GraphMetricEdgeFilterSummary = struct {
+    mode: []const u8,
+    types: ?[]const []const u8 = null,
+};
+
+fn dynamicJsonNumber(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer => |integer| @floatFromInt(integer),
+        .float => |float| float,
+        .number_string => |number_string| try std.fmt.parseFloat(f64, number_string),
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn dynamicJsonUnsigned(value: std.json.Value) !u64 {
+    return switch (value) {
+        .integer => |integer| if (integer >= 0) @intCast(integer) else error.TestUnexpectedResult,
+        .number_string => |number_string| try std.fmt.parseInt(u64, number_string, 10),
+        else => error.TestUnexpectedResult,
+    };
+}
+
+fn dynamicJsonString(value: std.json.Value) ![]const u8 {
+    return switch (value) {
+        .string => |string| string,
+        else => error.TestUnexpectedResult,
+    };
+}
 
 fn startMetadataAdminListener(
     alloc: std.mem.Allocator,
@@ -463,12 +506,12 @@ test "public api smoke e2e creates table inserts and queries documents" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1112,12 +1155,12 @@ test "public api e2e rebuilds schema-migration full-text index on exact backfill
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1286,12 +1329,12 @@ test "public api e2e rejects table backup during active schema migration" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1390,12 +1433,12 @@ test "public api e2e rejects table restore for migration-state backup manifests"
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1507,12 +1550,12 @@ test "public api e2e rejects table restore when target already exists" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1614,12 +1657,12 @@ test "public api e2e rejects table restore for mismatched backup manifests" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1729,12 +1772,12 @@ test "public api e2e validates backup and restore request shapes and locations" 
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1929,12 +1972,12 @@ test "public api e2e backs up drops and restores a table" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -1965,7 +2008,7 @@ test "public api e2e backs up drops and restores a table" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2099,7 +2142,7 @@ test "public api split e2e backs up drops and restores a table" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2249,7 +2292,7 @@ test "public api swarm-like e2e backs up drops and restores a table" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"restored\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2424,7 +2467,7 @@ test "split data runtime registers a store with metadata" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2519,7 +2562,7 @@ test "split data runtime serves retrieval agent pipeline queries" {
         .method = .POST,
         .uri = batch_uri,
         .content_type = "application/json",
-        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"hello retrieval\"},\"doc:b\":{\"title\":\"beta\",\"body\":\"secondary\"}},\"sync_level\":\"full_text\"}",
+        .body = "{\"inserts\":{\"doc:a\":{\"title\":\"alpha\",\"body\":\"hello retrieval\"},\"doc:b\":{\"title\":\"beta\",\"body\":\"secondary\"}},\"sync_level\":\"query\"}",
     });
     defer batch_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 201), batch_resp.status);
@@ -2586,12 +2629,12 @@ test "public api e2e supports managed semantic search and sparse embeddings" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -2720,12 +2763,12 @@ test "public api e2e adds managed embeddings indexes to existing tables" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -2856,12 +2899,12 @@ test "public api e2e recreates managed embeddings index after corrupt artifact" 
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -2990,12 +3033,12 @@ test "public api e2e restores managed embeddings from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3176,12 +3219,12 @@ test "public api e2e supports managed sparse embeddings generation" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3291,12 +3334,12 @@ test "public api e2e supports hybrid query pruner and reranker" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3434,12 +3477,12 @@ test "public api e2e supports retrieval agent pipeline queries" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3530,12 +3573,12 @@ test "public api e2e supports retrieval agent generation step" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3635,12 +3678,12 @@ test "public api e2e supports retrieval agent semantic and hybrid strategies" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3760,12 +3803,12 @@ test "public api e2e supports retrieval agent tree search pipeline" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3866,12 +3909,12 @@ test "public api e2e supports retrieval agent tree search from roots" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -3970,12 +4013,12 @@ test "public api e2e supports retrieval agent classification confidence and foll
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4081,12 +4124,12 @@ test "public api e2e supports retrieval agent fixed-body sse streaming" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4216,12 +4259,12 @@ test "public api e2e retrieval streaming emits clarification events" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4336,12 +4379,12 @@ test "public api e2e supports bounded agentic retrieval mode" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4431,12 +4474,12 @@ test "public api e2e agentic retrieval selects the best declared query" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4524,12 +4567,12 @@ test "public api e2e agentic retrieval evaluates misses and falls back to the ne
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4633,12 +4676,12 @@ test "public api e2e agentic retrieval can require clarification and continue fr
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4741,12 +4784,12 @@ test "public api e2e restores managed sparse embeddings from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -4937,12 +4980,12 @@ test "public api e2e supports embedding_template remote media helper" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5117,12 +5160,12 @@ test "public api e2e supports template chunked remote text enrichment and query 
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5370,12 +5413,12 @@ test "public api e2e supports fixed and antfly chunked semantic search" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5557,12 +5600,12 @@ test "public api e2e restores chunked managed embeddings from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5774,12 +5817,12 @@ test "public api e2e supports graph queries" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -5804,22 +5847,512 @@ test "public api e2e supports graph queries" {
     var created = try client.createTable(base_uri, "docs", create_body);
     defer created.deinit(std.testing.allocator);
 
-    var graph_index_resp = try client.createTableIndex(base_uri, "docs", "graph_idx", "{\"name\":\"graph_idx\",\"type\":\"graph\"}");
+    var graph_index_resp = try client.createTableIndex(base_uri, "docs", "graph_idx",
+        \\{"name":"graph_idx","type":"graph","metrics":{"pagerank":{"enabled":true,"refresh":"background","max_iterations":40,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"degree":{"enabled":true,"kind":"degree","refresh":"background","edge_filter":{"types":["cites"]}},"eigenvector":{"enabled":true,"kind":"eigenvector","refresh":"background","max_iterations":20,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_authority":{"enabled":true,"kind":"hits_authority","refresh":"background","max_iterations":20,"tolerance":0.000001,"edge_filter":{"types":["cites"]}},"hits_hub":{"enabled":true,"kind":"hits_hub","refresh":"background","max_iterations":20,"tolerance":0.000001,"edge_filter":{"types":["cites"]}}}}
+    );
     defer graph_index_resp.deinit(std.testing.allocator);
 
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try svc.runRound();
+
+    const not_ready_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
+        \\{"inserts":{
+        \\  "doc-a":{"title":"alpha","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5}],"related":[{"target":"doc-c","weight":0.5}]}}},
+        \\  "doc-b":{"title":"beta","_edges":{"graph_idx":{"cites":[{"target":"doc-c","weight":2.0}]}}},
+        \\  "doc-c":{"title":"gamma"}
+        \\},"sync_level":"write"}
+    );
+    defer std.testing.allocator.free(not_ready_batch_body);
+    var not_ready_batch = try client.fetchBatch(base_uri, "docs", not_ready_batch_body);
+    defer not_ready_batch.deinit(std.testing.allocator);
+
+    var not_ready_index_status = try client.fetchTableIndex(base_uri, "docs", "graph_idx");
+    defer not_ready_index_status.deinit(std.testing.allocator);
+    var parsed_not_ready_index_status = try parseJsonBody(IndexStatusSummary, std.testing.allocator, not_ready_index_status.body);
+    defer parsed_not_ready_index_status.deinit();
+    const not_ready_metric_status = parsed_not_ready_index_status.value.status.metric_status orelse return error.TestUnexpectedResult;
+    const not_ready_pagerank_status = not_ready_metric_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("not_ready", not_ready_pagerank_status.state);
+    try std.testing.expectEqual(@as(u64, 0), not_ready_pagerank_status.published_generation);
+    try std.testing.expect(not_ready_pagerank_status.edge_generation > 0);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"published\"}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var not_ready_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_not_ready":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer not_ready_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_not_ready_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, not_ready_projected_metric_query.body, .{});
+    defer parsed_not_ready_projected_metric.deinit();
+    const not_ready_projected_neighbors = try expectSingleGraphResult.get(parsed_not_ready_projected_metric.value, "neighbors_metric_not_ready");
+    const not_ready_projected_status = not_ready_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const not_ready_projected_pagerank_status = not_ready_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("not_ready", not_ready_projected_pagerank_status.state);
+    try std.testing.expectEqual(@as(i64, 0), not_ready_projected_pagerank_status.published_generation);
+    const not_ready_projected_nodes = not_ready_projected_neighbors.nodes orelse return error.TestUnexpectedResult;
+    try std.testing.expect(not_ready_projected_nodes.len > 0);
+    const not_ready_projected_metrics = not_ready_projected_nodes[0].metrics orelse return error.TestUnexpectedResult;
+    const not_ready_projected_score = not_ready_projected_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(not_ready_projected_score == .null);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_not_ready\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"published\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
 
     const batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
         \\{"inserts":{
         \\  "doc-a":{"title":"alpha","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5}],"related":[{"target":"doc-c","weight":0.5}]}}},
         \\  "doc-b":{"title":"beta","_edges":{"graph_idx":{"cites":[{"target":"doc-c","weight":2.0}]}}},
         \\  "doc-c":{"title":"gamma"}
-        \\}}
+        \\},"sync_level":"full_index"}
     );
     defer std.testing.allocator.free(batch_body);
     var batch = try client.fetchBatch(base_uri, "docs", batch_body);
     defer batch.deinit(std.testing.allocator);
+
+    var graph_index_status = try client.fetchTableIndex(base_uri, "docs", "graph_idx");
+    defer graph_index_status.deinit(std.testing.allocator);
+    var parsed_graph_index_status = try parseJsonBody(IndexStatusSummary, std.testing.allocator, graph_index_status.body);
+    defer parsed_graph_index_status.deinit();
+    const metric_status = parsed_graph_index_status.value.status.metric_status orelse return error.TestUnexpectedResult;
+    const pagerank_status = metric_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", pagerank_status.state);
+    try std.testing.expect(pagerank_status.published_generation > 0);
+    try std.testing.expect(pagerank_status.edge_generation >= pagerank_status.published_generation);
+    try std.testing.expect(pagerank_status.iterations_completed > 0);
+    const pagerank_scope = pagerank_status.edge_filter orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("types", pagerank_scope.mode);
+    const pagerank_types = pagerank_scope.types orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), pagerank_types.len);
+    try std.testing.expectEqualStrings("cites", pagerank_types[0]);
+    const degree_status = metric_status.map.get("degree") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", degree_status.state);
+    try std.testing.expectEqual(@as(u64, 1), degree_status.iterations_completed);
+    const degree_scope = degree_status.edge_filter orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("types", degree_scope.mode);
+    const degree_types = degree_scope.types orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), degree_types.len);
+    try std.testing.expectEqualStrings("cites", degree_types[0]);
+    const eigenvector_status = metric_status.map.get("eigenvector") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", eigenvector_status.state);
+    try std.testing.expect(eigenvector_status.iterations_completed > 0);
+    const eigenvector_scope = eigenvector_status.edge_filter orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("types", eigenvector_scope.mode);
+    const eigenvector_types = eigenvector_scope.types orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), eigenvector_types.len);
+    try std.testing.expectEqualStrings("cites", eigenvector_types[0]);
+    const authority_status = metric_status.map.get("hits_authority") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", authority_status.state);
+    try std.testing.expect(authority_status.iterations_completed > 0);
+    const authority_scope = authority_status.edge_filter orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("types", authority_scope.mode);
+    const authority_types = authority_scope.types orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), authority_types.len);
+    try std.testing.expectEqualStrings("cites", authority_types[0]);
+    const hub_status = metric_status.map.get("hits_hub") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", hub_status.state);
+    try std.testing.expect(hub_status.iterations_completed > 0);
+    const hub_scope = hub_status.edge_filter orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("types", hub_scope.mode);
+    const hub_types = hub_scope.types orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), hub_types.len);
+    try std.testing.expectEqualStrings("cites", hub_types[0]);
+
+    var metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"fresh"}}
+    );
+    defer metric_query.deinit(std.testing.allocator);
+    var parsed_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, metric_query.body, .{});
+    defer parsed_metric.deinit();
+    const metric_responses = parsed_metric.value.responses orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), metric_responses.len);
+    const graph_metric_results = metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const pagerank_result = graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", pagerank_result.status.state);
+    try std.testing.expectEqual(@as(usize, 2), pagerank_result.scores.len);
+    try std.testing.expect(pagerank_result.scores[0].score >= pagerank_result.scores[1].score);
+
+    var degree_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"degree","top_k":1,"metric_freshness":"fresh"}}
+    );
+    defer degree_query.deinit(std.testing.allocator);
+    var parsed_degree = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, degree_query.body, .{});
+    defer parsed_degree.deinit();
+    const degree_responses = parsed_degree.value.responses orelse return error.TestUnexpectedResult;
+    const degree_results = degree_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const degree_result = degree_results.map.get("degree") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", degree_result.status.state);
+    try std.testing.expectEqual(@as(usize, 1), degree_result.scores.len);
+    try std.testing.expectEqualStrings("doc-b", degree_result.scores[0].node);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.0), degree_result.scores[0].score, 0.001);
+
+    var projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"fresh","include_metric_status":true}}}
+    );
+    defer projected_metric_query.deinit(std.testing.allocator);
+    var parsed_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, projected_metric_query.body, .{});
+    defer parsed_projected_metric.deinit();
+    const projected_neighbors = try expectSingleGraphResult.get(parsed_projected_metric.value, "neighbors_metric");
+    const projected_status = projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const projected_pagerank_status = projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("fresh", projected_pagerank_status.state);
+    const projected_nodes = projected_neighbors.nodes orelse return error.TestUnexpectedResult;
+    try std.testing.expect(projected_nodes.len > 0);
+    const projected_metrics = projected_nodes[0].metrics orelse return error.TestUnexpectedResult;
+    const projected_score = projected_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expect(projected_score != .null);
+
+    var ordered_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"traverse_metric_order":{"type":"traverse","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_depth":2,"max_results":10},"metrics":["pagerank"],"order_by":[{"metric":"pagerank","direction":"desc","nulls":"last"}],"metric_freshness":"fresh"}}}
+    );
+    defer ordered_metric_query.deinit(std.testing.allocator);
+    var parsed_ordered_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, ordered_metric_query.body, .{});
+    defer parsed_ordered_metric.deinit();
+    const ordered_traverse = try expectSingleGraphResult.get(parsed_ordered_metric.value, "traverse_metric_order");
+    const ordered_nodes = ordered_traverse.nodes orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 2), ordered_nodes.len);
+    const first_ordered_metrics = ordered_nodes[0].metrics orelse return error.TestUnexpectedResult;
+    const second_ordered_metrics = ordered_nodes[1].metrics orelse return error.TestUnexpectedResult;
+    const first_ordered_score = try dynamicJsonNumber(first_ordered_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult);
+    const second_ordered_score = try dynamicJsonNumber(second_ordered_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult);
+    try std.testing.expect(first_ordered_score >= second_ordered_score);
+
+    const metric_filter_threshold = (pagerank_result.scores[0].score + pagerank_result.scores[1].score) / 2.0;
+    const filtered_metric_query_body = try std.fmt.allocPrint(std.testing.allocator,
+        \\{{"graph_searches":{{"traverse_metric_filter":{{"type":"traverse","index_name":"graph_idx","start_nodes":{{"keys":["doc-a"]}},"params":{{"edge_types":["cites"],"max_depth":2,"max_results":10}},"metrics":["pagerank"],"where_metric":[{{"metric":"pagerank","op":">=","value":{d}}}],"metric_freshness":"fresh"}}}}}}
+    , .{metric_filter_threshold});
+    defer std.testing.allocator.free(filtered_metric_query_body);
+    var filtered_metric_query = try client.fetchQuery(base_uri, "docs", filtered_metric_query_body);
+    defer filtered_metric_query.deinit(std.testing.allocator);
+    var parsed_filtered_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, filtered_metric_query.body, .{});
+    defer parsed_filtered_metric.deinit();
+    const filtered_traverse = try expectSingleGraphResult.get(parsed_filtered_metric.value, "traverse_metric_filter");
+    const filtered_nodes = filtered_traverse.nodes orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(usize, 1), filtered_nodes.len);
+    const filtered_metrics = filtered_nodes[0].metrics orelse return error.TestUnexpectedResult;
+    const filtered_score = try dynamicJsonNumber(filtered_metrics.object.get("pagerank") orelse return error.TestUnexpectedResult);
+    try std.testing.expect(filtered_score >= metric_filter_threshold);
+
+    const stale_batch_body = try test_contract_helpers.normalizeBatchRequest(std.testing.allocator,
+        \\{"inserts":{
+        \\  "doc-a":{"title":"alpha updated","_edges":{"graph_idx":{"cites":[{"target":"doc-b","weight":1.5},{"target":"doc-c","weight":0.75}]}}},
+        \\  "doc-b":{"title":"beta","_edges":{"graph_idx":{"cites":[{"target":"doc-c","weight":2.0}]}}},
+        \\  "doc-c":{"title":"gamma"}
+        \\},"sync_level":"write"}
+    );
+    defer std.testing.allocator.free(stale_batch_body);
+    var stale_batch = try client.fetchBatch(base_uri, "docs", stale_batch_body);
+    defer stale_batch.deinit(std.testing.allocator);
+
+    var stale_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"published"}}
+    );
+    defer stale_metric_query.deinit(std.testing.allocator);
+    var parsed_stale_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, stale_metric_query.body, .{});
+    defer parsed_stale_metric.deinit();
+    const stale_metric_responses = parsed_stale_metric.value.responses orelse return error.TestUnexpectedResult;
+    const stale_graph_metric_results = stale_metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const stale_pagerank_result = stale_graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("stale", stale_pagerank_result.status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, stale_pagerank_result.status.published_generation);
+    try std.testing.expect(stale_pagerank_result.status.edge_generation > stale_pagerank_result.status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), stale_pagerank_result.scores.len);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var stale_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_stale":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer stale_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_stale_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, stale_projected_metric_query.body, .{});
+    defer parsed_stale_projected_metric.deinit();
+    const stale_projected_neighbors = try expectSingleGraphResult.get(parsed_stale_projected_metric.value, "neighbors_metric_stale");
+    const stale_projected_status = stale_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const stale_projected_pagerank_status = stale_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("stale", stale_projected_pagerank_status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, stale_projected_pagerank_status.published_generation);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_stale\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+
+    var stale_rerank_query = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"query":"title:alpha OR title:beta OR title:gamma"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"published","base_weight":0.25,"weight":1.5},"limit":3,"profile":true}
+    );
+    defer stale_rerank_query.deinit(std.testing.allocator);
+    var parsed_stale_rerank = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, stale_rerank_query.body, .{});
+    defer parsed_stale_rerank.deinit();
+    const stale_rerank_responses = parsed_stale_rerank.value.responses orelse return error.TestUnexpectedResult;
+    const stale_rerank_hits = stale_rerank_responses[0].hits orelse return error.TestUnexpectedResult;
+    try std.testing.expect(stale_rerank_hits.hits.?.len > 0);
+    const stale_rerank_score_details = stale_rerank_hits.hits.?[0]._score_details orelse return error.TestUnexpectedResult;
+    const stale_rerank_details = stale_rerank_score_details.graph_metric_rerank orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("graph_idx", stale_rerank_details.index_name);
+    try std.testing.expectEqualStrings("pagerank", stale_rerank_details.metric_name);
+    try std.testing.expectEqual(
+        @as(i64, @intCast(pagerank_result.status.published_generation)),
+        stale_rerank_details.published_generation,
+    );
+    const stale_rerank_profile = stale_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
+    const stale_rerank_metric_profiles = (stale_rerank_profile.object.get("graph_metrics") orelse return error.TestUnexpectedResult).array.items;
+    var found_stale_rerank_profile = false;
+    for (stale_rerank_metric_profiles) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, try dynamicJsonString(profile.get("source") orelse return error.TestUnexpectedResult), "graph_metric_rerank")) continue;
+        const status = (profile.get("status") orelse return error.TestUnexpectedResult).object;
+        const published_generation = try dynamicJsonUnsigned(status.get("published_generation") orelse return error.TestUnexpectedResult);
+        const edge_generation = try dynamicJsonUnsigned(status.get("edge_generation") orelse return error.TestUnexpectedResult);
+        found_stale_rerank_profile = true;
+        try std.testing.expectEqualStrings("graph_metric_rerank", try dynamicJsonString(profile.get("query_name") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("graph_idx", try dynamicJsonString(profile.get("index_name") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("pagerank", try dynamicJsonString(profile.get("metric_name") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("published", try dynamicJsonString(profile.get("freshness") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqualStrings("stale", try dynamicJsonString(status.get("state") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqual(pagerank_result.status.published_generation, @as(i64, @intCast(published_generation)));
+        try std.testing.expect(edge_generation > published_generation);
+    }
+    try std.testing.expect(found_stale_rerank_profile);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+
+    const projected_ranges = try svc.listProjectedRanges(std.testing.allocator);
+    defer svc.freeProjectedRanges(std.testing.allocator, projected_ranges);
+    try std.testing.expect(projected_ranges.len > 0);
+    const group_id = projected_ranges[0].group_id;
+    const provisioned_db_path = try metadata_mod.groupDbPathFromReplicaRoot(std.testing.allocator, replica_root, group_id);
+    defer std.testing.allocator.free(provisioned_db_path);
+    {
+        var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+        defer db.close();
+        var active_status = try db.ensureGraphMetricPlannedBuild(
+            std.testing.allocator,
+            "graph_idx",
+            "pagerank",
+            @intCast(stale_pagerank_result.status.edge_generation),
+        );
+        defer active_status.deinit(std.testing.allocator);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.building, active_status.state);
+        try std.testing.expectEqual(@as(u64, @intCast(pagerank_result.status.published_generation)), active_status.published_generation);
+        try std.testing.expectEqual(@as(u64, @intCast(stale_pagerank_result.status.edge_generation)), active_status.building_generation);
+    }
+
+    var active_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"published"}}
+    );
+    defer active_metric_query.deinit(std.testing.allocator);
+    var parsed_active_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, active_metric_query.body, .{});
+    defer parsed_active_metric.deinit();
+    const active_metric_responses = parsed_active_metric.value.responses orelse return error.TestUnexpectedResult;
+    const active_graph_metric_results = active_metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const active_pagerank_result = active_graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("building", active_pagerank_result.status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, active_pagerank_result.status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), active_pagerank_result.scores.len);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var active_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_building":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer active_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_active_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, active_projected_metric_query.body, .{});
+    defer parsed_active_projected_metric.deinit();
+    const active_projected_neighbors = try expectSingleGraphResult.get(parsed_active_projected_metric.value, "neighbors_metric_building");
+    const active_projected_status = active_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const active_projected_pagerank_status = active_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("building", active_projected_pagerank_status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, active_projected_pagerank_status.published_generation);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_building\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+
+    var active_rerank_query = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"query":"title:alpha OR title:beta OR title:gamma"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"published","base_weight":0.25,"weight":1.5},"limit":3,"profile":true}
+    );
+    defer active_rerank_query.deinit(std.testing.allocator);
+    var parsed_active_rerank = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, active_rerank_query.body, .{});
+    defer parsed_active_rerank.deinit();
+    const active_rerank_responses = parsed_active_rerank.value.responses orelse return error.TestUnexpectedResult;
+    const active_rerank_hits = active_rerank_responses[0].hits orelse return error.TestUnexpectedResult;
+    try std.testing.expect(active_rerank_hits.hits.?.len > 0);
+    const active_rerank_score_details = active_rerank_hits.hits.?[0]._score_details orelse return error.TestUnexpectedResult;
+    const active_rerank_details = active_rerank_score_details.graph_metric_rerank orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(i64, @intCast(pagerank_result.status.published_generation)), active_rerank_details.published_generation);
+    const active_rerank_profile = active_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
+    const active_rerank_metric_profiles = (active_rerank_profile.object.get("graph_metrics") orelse return error.TestUnexpectedResult).array.items;
+    var found_active_rerank_profile = false;
+    for (active_rerank_metric_profiles) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, try dynamicJsonString(profile.get("source") orelse return error.TestUnexpectedResult), "graph_metric_rerank")) continue;
+        const status = (profile.get("status") orelse return error.TestUnexpectedResult).object;
+        found_active_rerank_profile = true;
+        try std.testing.expectEqualStrings("building", try dynamicJsonString(status.get("state") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqual(pagerank_result.status.published_generation, @as(i64, @intCast(try dynamicJsonUnsigned(status.get("published_generation") orelse return error.TestUnexpectedResult))));
+    }
+    try std.testing.expect(found_active_rerank_profile);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
+
+    {
+        var db = try db_mod.DB.open(std.testing.allocator, provisioned_db_path, .{});
+        defer db.close();
+        var failed_status = try db.failGraphMetricPlannedBuild(
+            std.testing.allocator,
+            "graph_idx",
+            "pagerank",
+            error.InvalidGraphMetricScore,
+        );
+        defer failed_status.deinit(std.testing.allocator);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_status.state);
+        try std.testing.expectEqual(@as(u64, @intCast(pagerank_result.status.published_generation)), failed_status.published_generation);
+    }
+
+    var failed_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":2,"metric_freshness":"published"}}
+    );
+    defer failed_metric_query.deinit(std.testing.allocator);
+    var parsed_failed_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, failed_metric_query.body, .{});
+    defer parsed_failed_metric.deinit();
+    const failed_metric_responses = parsed_failed_metric.value.responses orelse return error.TestUnexpectedResult;
+    const failed_graph_metric_results = failed_metric_responses[0].graph_metric_results orelse return error.TestUnexpectedResult;
+    const failed_pagerank_result = failed_graph_metric_results.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("failed", failed_pagerank_result.status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, failed_pagerank_result.status.published_generation);
+    try std.testing.expectEqual(@as(usize, 2), failed_pagerank_result.scores.len);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_metric\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"top_k\":2,\"metric_freshness\":\"fresh\"}}",
+        ),
+    );
+
+    var failed_projected_metric_query = try client.fetchQuery(base_uri, "docs",
+        \\{"graph_searches":{"neighbors_metric_failed":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc-a"]},"params":{"edge_types":["cites"],"max_results":10},"metrics":["pagerank"],"metric_freshness":"published","include_metric_status":true}}}
+    );
+    defer failed_projected_metric_query.deinit(std.testing.allocator);
+    var parsed_failed_projected_metric = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, failed_projected_metric_query.body, .{});
+    defer parsed_failed_projected_metric.deinit();
+    const failed_projected_neighbors = try expectSingleGraphResult.get(parsed_failed_projected_metric.value, "neighbors_metric_failed");
+    const failed_projected_status = failed_projected_neighbors.metric_status orelse return error.TestUnexpectedResult;
+    const failed_projected_pagerank_status = failed_projected_status.map.get("pagerank") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings("failed", failed_projected_pagerank_status.state);
+    try std.testing.expectEqual(pagerank_result.status.published_generation, failed_projected_pagerank_status.published_generation);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"graph_searches\":{\"neighbors_metric_fresh_failed\":{\"type\":\"neighbors\",\"index_name\":\"graph_idx\",\"start_nodes\":{\"keys\":[\"doc-a\"]},\"params\":{\"edge_types\":[\"cites\"],\"max_results\":10},\"metrics\":[\"pagerank\"],\"metric_freshness\":\"fresh\"}}}",
+        ),
+    );
+
+    var failed_rerank_query = try client.fetchQuery(base_uri, "docs",
+        \\{"full_text_search":{"query":"title:alpha OR title:beta OR title:gamma"},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","metric_freshness":"published","base_weight":0.25,"weight":1.5},"limit":3,"profile":true}
+    );
+    defer failed_rerank_query.deinit(std.testing.allocator);
+    var parsed_failed_rerank = try std.json.parseFromSlice(metadata_openapi.QueryResponses, std.testing.allocator, failed_rerank_query.body, .{});
+    defer parsed_failed_rerank.deinit();
+    const failed_rerank_responses = parsed_failed_rerank.value.responses orelse return error.TestUnexpectedResult;
+    const failed_rerank_profile = failed_rerank_responses[0].profile orelse return error.TestUnexpectedResult;
+    const failed_rerank_metric_profiles = (failed_rerank_profile.object.get("graph_metrics") orelse return error.TestUnexpectedResult).array.items;
+    var found_failed_rerank_profile = false;
+    for (failed_rerank_metric_profiles) |profile_value| {
+        const profile = profile_value.object;
+        if (!std.mem.eql(u8, try dynamicJsonString(profile.get("source") orelse return error.TestUnexpectedResult), "graph_metric_rerank")) continue;
+        const status = (profile.get("status") orelse return error.TestUnexpectedResult).object;
+        found_failed_rerank_profile = true;
+        try std.testing.expectEqualStrings("failed", try dynamicJsonString(status.get("state") orelse return error.TestUnexpectedResult));
+        try std.testing.expectEqual(pagerank_result.status.published_generation, @as(i64, @intCast(try dynamicJsonUnsigned(status.get("published_generation") orelse return error.TestUnexpectedResult))));
+    }
+    try std.testing.expect(found_failed_rerank_profile);
+
+    try std.testing.expectError(
+        error.UnexpectedHttpStatus,
+        client.fetchQuery(
+            base_uri,
+            "docs",
+            "{\"full_text_search\":{\"query\":\"title:alpha OR title:beta OR title:gamma\"},\"graph_metric_rerank\":{\"index\":\"graph_idx\",\"metric\":\"pagerank\",\"metric_freshness\":\"fresh\",\"base_weight\":0.25,\"weight\":1.5},\"limit\":3}",
+        ),
+    );
 
     const graph_query_body = try test_contract_helpers.encodeGraphNeighborsQueryRequest(
         std.testing.allocator,
@@ -5970,12 +6503,12 @@ test "public api e2e graph queries respect full_index sync level" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6103,12 +6636,12 @@ test "public api e2e restores graph indexes from table backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6284,12 +6817,12 @@ test "public api smoke e2e queries across split ranges" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6478,12 +7011,12 @@ test "public api split e2e uses distributed global text stats for bm25 and signi
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6669,12 +7202,12 @@ test "public api e2e serves cluster backup list and restore routes" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -6933,12 +7466,12 @@ test "public api e2e reports partial cluster backup and restore statuses" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7113,12 +7646,12 @@ test "public api e2e reports unsupported multi-range tables in cluster backup" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7352,12 +7885,12 @@ test "public api smoke e2e commits transaction across split ranges" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7522,12 +8055,12 @@ test "public api smoke e2e commits transactions across two tables atomically" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7727,12 +8260,12 @@ test "public api smoke e2e queries after merge finalization" {
 
     var provisioned_read_source = table_reads.ProvisionedTableReadSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
         svc.raft.readableLeaseRequester(),
     );
     var provisioned_write_source = table_writes.ProvisionedTableWriteSource.init(
         replica_root,
-        table_catalog.CatalogSource.fromMetadataService(&svc),
+        svc.catalogSource(),
     );
     var server = http_server.ApiHttpServer.init(
         std.testing.allocator,
@@ -7795,7 +8328,7 @@ test "public api smoke e2e queries after merge finalization" {
     rounds = 0;
     while (rounds < 16) : (rounds += 1) {
         try metadata_client.triggerReallocate(metadata_api);
-        donor_group_id = (try table_catalog.resolveGroupForKey(std.testing.allocator, table_catalog.CatalogSource.fromMetadataService(&svc), "docs", "doc:z")) orelse 0;
+        donor_group_id = (try table_catalog.resolveGroupForKey(std.testing.allocator, svc.catalogSource(), "docs", "doc:z")) orelse 0;
         if (donor_group_id != 0 and donor_group_id != receiver_group_id) break;
     }
     try std.testing.expect(donor_group_id != 0);

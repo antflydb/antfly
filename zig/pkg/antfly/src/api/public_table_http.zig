@@ -71,6 +71,7 @@ pub const TableApi = struct {
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
+        LeaderUnavailable,
         ReadUnavailable,
         ModelNotFound,
         InternalFailure,
@@ -80,6 +81,7 @@ pub const TableApi = struct {
         NotFound,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
+        LeaderUnavailable,
         ReadUnavailable,
         ModelNotFound,
         InternalFailure,
@@ -126,6 +128,13 @@ pub const TableApi = struct {
         InternalFailure,
     };
 
+    pub const ExecuteGraphMetricActionError = error{
+        InvalidGraphMetricAction,
+        NotFound,
+        MethodNotAllowed,
+        InternalFailure,
+    };
+
     pub const ExecutePutArtifactEnrichmentError = error{
         NotFound,
         MethodNotAllowed,
@@ -150,6 +159,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
+        LeaderUnavailable,
         ReadUnavailable,
         InternalFailure,
     };
@@ -159,6 +169,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         DocIdentityUnavailable,
         ReadRequiresPrimary,
+        LeaderUnavailable,
         ReadUnavailable,
         InternalFailure,
     };
@@ -167,6 +178,7 @@ pub const TableApi = struct {
         NotFound,
         MethodNotAllowed,
         DocIdentityUnavailable,
+        WriteUnavailable,
         InternalFailure,
     };
 
@@ -175,6 +187,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         InvalidRequest,
         DocIdentityUnavailable,
+        WriteUnavailable,
         InternalFailure,
     };
 
@@ -245,6 +258,14 @@ pub const TableApi = struct {
             table_name: []const u8,
             index_name: []const u8,
         ) ExecuteDeleteIndexError!void,
+        execute_table_graph_metric_action: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+        ) ExecuteGraphMetricActionError![]u8 = null,
         execute_put_artifact_enrichment: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -377,6 +398,18 @@ pub const TableApi = struct {
         index_name: []const u8,
     ) ExecuteDeleteIndexError!void {
         return try self.vtable.execute_table_delete_index(self.ptr, alloc, table_name, index_name);
+    }
+
+    pub fn executeTableGraphMetricAction(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        index_name: []const u8,
+        metric_name: []const u8,
+        action: []const u8,
+    ) ExecuteGraphMetricActionError![]u8 {
+        const fn_ptr = self.vtable.execute_table_graph_metric_action orelse return error.MethodNotAllowed;
+        return try fn_ptr(self.ptr, alloc, table_name, index_name, metric_name, action);
     }
 
     pub fn executePutArtifactEnrichment(
@@ -534,6 +567,10 @@ pub fn handleTableQueryRequest(
                 std.log.warn("public table query requires primary table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") };
             },
+            error.LeaderUnavailable => {
+                std.log.warn("public table query owner unavailable table={s} err={}", .{ table_name, err });
+                return .{ .status = 503, .body = try alloc.dupe(u8, "read unavailable") };
+            },
             error.ReadUnavailable => {
                 std.log.warn("public table query standby unavailable table={s} err={}", .{ table_name, err });
                 return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") };
@@ -590,6 +627,7 @@ pub fn handleTableQueryView(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
+        error.LeaderUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "read unavailable") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "query failed") },
@@ -607,8 +645,9 @@ pub fn handleTableBackup(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
-    const parsed_req = backups_api.parseBackupRequest(alloc, body) catch {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
+    const parsed_req = backups_api.parseBackupRequest(alloc, body) catch |err| switch (err) {
+        error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") },
+        else => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
     };
     defer parsed_req.deinit();
 
@@ -652,8 +691,9 @@ pub fn handleTableRestore(
     api: TableApi,
     secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
-    const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
+    const parsed_req = backups_api.parseRestoreRequest(alloc, body) catch |err| switch (err) {
+        error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") },
+        else => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
     };
     defer parsed_req.deinit();
 
@@ -736,6 +776,23 @@ pub fn handleTableDeleteIndex(
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
 }
 
+pub fn handleTableGraphMetricAction(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    metric_name: []const u8,
+    action: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const response_body = api.executeTableGraphMetricAction(alloc, table_name, index_name, metric_name, action) catch |err| switch (err) {
+        error.InvalidGraphMetricAction => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid graph metric action") },
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "graph metric action failed") },
+    };
+    return .{ .status = 200, .body = response_body };
+}
+
 pub fn handlePutArtifactEnrichment(
     alloc: std.mem.Allocator,
     table_name: []const u8,
@@ -792,6 +849,7 @@ pub fn handleDocumentArtifactManifest(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
+        error.LeaderUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "read unavailable") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest lookup failed") },
     };
@@ -900,6 +958,7 @@ pub fn handleDocumentArtifactManifests(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.ReadRequiresPrimary => return .{ .status = 503, .body = try alloc.dupe(u8, "read requires primary") },
+        error.LeaderUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "read unavailable") },
         error.ReadUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "standby read unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact manifest list failed") },
     };
@@ -1027,6 +1086,7 @@ pub fn handleReprocessDocumentArtifact(
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact reprocess failed") },
     };
     return .{
@@ -1091,6 +1151,7 @@ pub fn handleReprocessDocumentArtifactRange(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid request") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
+        error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact reprocess failed") },
     };
     defer result.deinit(alloc);
@@ -1276,6 +1337,55 @@ test "public table batch handler returns created batch response" {
     try std.testing.expectEqual(@as(u16, 201), resp.status);
     try std.testing.expect(backend.called);
     try std.testing.expectEqual(@as(i64, 1), parsed.value.inserted.?);
+}
+
+test "public table graph metric action handler returns status response" {
+    const Backend = struct {
+        called: bool = false,
+
+        fn iface(self: *@This()) TableApi {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_table_batch = unsupportedBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                    .execute_table_graph_metric_action = executeGraphMetricAction,
+                },
+            };
+        }
+
+        fn executeGraphMetricAction(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            metric_name: []const u8,
+            action: []const u8,
+        ) TableApi.ExecuteGraphMetricActionError![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (!std.mem.eql(u8, table_name, "docs")) return error.InternalFailure;
+            if (!std.mem.eql(u8, index_name, "graph_idx")) return error.InternalFailure;
+            if (!std.mem.eql(u8, metric_name, "degree")) return error.InternalFailure;
+            if (!std.mem.eql(u8, action, "pause")) return error.InternalFailure;
+            self.called = true;
+            return alloc.dupe(u8, "{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}") catch return error.InternalFailure;
+        }
+    };
+
+    var backend = Backend{};
+    var resp = try handleTableGraphMetricAction(std.testing.allocator, "docs", "graph_idx", "degree", "pause", backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), resp.status);
+    try std.testing.expect(backend.called);
+    try std.testing.expectEqualStrings("{\"status\":{\"state\":\"fresh\",\"maintenance_paused\":true}}", resp.body);
 }
 
 test "public table batch handler maps backend errors" {
@@ -1564,6 +1674,14 @@ test "public table query handler maps HA read gate errors" {
     try std.testing.expectEqual(@as(u16, 503), primary_resp.status);
     try std.testing.expectEqualStrings("read requires primary", primary_resp.body);
 
+    var leader_backend = Backend{ .err = error.LeaderUnavailable };
+    var leader_resp = try handleTableQueryRequest(std.testing.allocator, "docs",
+        \\{"query":{"match_all":{}}}
+    , null, leader_backend.iface());
+    defer leader_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), leader_resp.status);
+    try std.testing.expectEqualStrings("read unavailable", leader_resp.body);
+
     var lag_backend = Backend{ .err = error.ReadUnavailable };
     var lag_resp = try handleTableQueryRequest(std.testing.allocator, "docs",
         \\{"query":{"match_all":{}}}
@@ -1768,9 +1886,11 @@ test "public table query view handler maps doc identity unavailable errors" {
 
 test "public table query view handler maps HA read gate errors" {
     const Backend = struct {
-        fn iface() TableApi {
+        err: TableApi.ExecuteQueryViewError,
+
+        fn iface(self: *@This()) TableApi {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .execute_table_batch = unsupportedBatch,
                     .execute_table_query_request = unsupportedQueryRequest,
@@ -1786,20 +1906,33 @@ test "public table query view handler maps HA read gate errors" {
         }
 
         fn executeTableQueryView(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: TableApi.TableQueryView,
         ) TableApi.ExecuteQueryViewError![]u8 {
-            return error.ReadRequiresPrimary;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.err;
         }
     };
 
-    var resp = try handleTableQueryView(std.testing.allocator, "docs", .latest, Backend.iface());
-    defer resp.deinit(std.testing.allocator);
+    var primary_backend = Backend{ .err = error.ReadRequiresPrimary };
+    var primary_resp = try handleTableQueryView(std.testing.allocator, "docs", .latest, primary_backend.iface());
+    defer primary_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), primary_resp.status);
+    try std.testing.expectEqualStrings("read requires primary", primary_resp.body);
 
-    try std.testing.expectEqual(@as(u16, 503), resp.status);
-    try std.testing.expectEqualStrings("read requires primary", resp.body);
+    var leader_backend = Backend{ .err = error.LeaderUnavailable };
+    var leader_resp = try handleTableQueryView(std.testing.allocator, "docs", .latest, leader_backend.iface());
+    defer leader_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), leader_resp.status);
+    try std.testing.expectEqualStrings("read unavailable", leader_resp.body);
+
+    var lag_backend = Backend{ .err = error.ReadUnavailable };
+    var lag_resp = try handleTableQueryView(std.testing.allocator, "docs", .latest, lag_backend.iface());
+    defer lag_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), lag_resp.status);
+    try std.testing.expectEqualStrings("standby read unavailable", lag_resp.body);
 }
 
 test "public table query view handler returns json response" {
@@ -1980,9 +2113,12 @@ test "public table restore handler maps target already exists" {
 
 test "public document artifact manifest handlers map HA read gate errors" {
     const Backend = struct {
-        fn iface() TableApi {
+        manifest_err: TableApi.ExecuteDocumentArtifactManifestError,
+        list_err: TableApi.ExecuteDocumentArtifactManifestsError,
+
+        fn iface(self: *@This()) TableApi {
             return .{
-                .ptr = undefined,
+                .ptr = self,
                 .vtable = &.{
                     .execute_table_batch = unsupportedBatch,
                     .execute_table_query_request = unsupportedQueryRequest,
@@ -2000,47 +2136,66 @@ test "public document artifact manifest handlers map HA read gate errors" {
         }
 
         fn executeDocumentArtifactManifest(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
             _: []const u8,
         ) TableApi.ExecuteDocumentArtifactManifestError!db_mod.types.DocumentArtifactManifest {
-            return error.ReadUnavailable;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.manifest_err;
         }
 
         fn executeDocumentArtifactManifests(
-            _: *anyopaque,
+            ptr: *anyopaque,
             _: std.mem.Allocator,
             _: []const u8,
             _: []const u8,
         ) TableApi.ExecuteDocumentArtifactManifestsError!db_mod.types.DocumentArtifactManifestList {
-            return error.ReadRequiresPrimary;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return self.list_err;
         }
     };
 
+    var backend = Backend{
+        .manifest_err = error.LeaderUnavailable,
+        .list_err = error.ReadRequiresPrimary,
+    };
     var manifest_resp = try handleDocumentArtifactManifest(
         std.testing.allocator,
         "docs",
         "doc:a",
         "document_units_v1",
         .{},
-        Backend.iface(),
+        backend.iface(),
     );
     defer manifest_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), manifest_resp.status);
-    try std.testing.expectEqualStrings("standby read unavailable", manifest_resp.body);
+    try std.testing.expectEqualStrings("read unavailable", manifest_resp.body);
 
     var list_resp = try handleDocumentArtifactManifests(
         std.testing.allocator,
         "docs",
         "doc:a",
         .{},
-        Backend.iface(),
+        backend.iface(),
     );
     defer list_resp.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 503), list_resp.status);
     try std.testing.expectEqualStrings("read requires primary", list_resp.body);
+
+    backend.manifest_err = error.ReadUnavailable;
+    var lag_resp = try handleDocumentArtifactManifest(
+        std.testing.allocator,
+        "docs",
+        "doc:a",
+        "document_units_v1",
+        .{},
+        backend.iface(),
+    );
+    defer lag_resp.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 503), lag_resp.status);
+    try std.testing.expectEqualStrings("standby read unavailable", lag_resp.body);
 }
 
 test "public document artifact manifest handler returns summary and raw state" {

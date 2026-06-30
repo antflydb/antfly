@@ -899,7 +899,7 @@ fn recordMatchesHintMaskFast(raw: []const u8, required_mask: u8) !bool {
     return false;
 }
 
-fn recordHasHint(record: Record, hint: TargetHint) bool {
+pub fn recordHasHint(record: Record, hint: TargetHint) bool {
     for (record.target_hints) |existing| {
         if (existing == hint) return true;
     }

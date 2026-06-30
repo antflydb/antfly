@@ -118,8 +118,9 @@ pub fn handleClusterBackup(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
-    var req = backups_api.parseClusterBackupRequest(alloc, body) catch {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") };
+    var req = backups_api.parseClusterBackupRequest(alloc, body) catch |err| switch (err) {
+        error.UnsupportedBackupFormat => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported backup format") },
+        else => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid backup request") },
     };
     defer backups_api.freeClusterBackupRequest(alloc, &req);
 
@@ -144,8 +145,8 @@ pub fn handleClusterRestore(
     api: ClusterApi,
     secret_store: ?*common_secrets.FileStore,
 ) !OwnedResponse {
-    var req = backups_api.parseClusterRestoreRequest(alloc, body) catch {
-        return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") };
+    var req = backups_api.parseClusterRestoreRequest(alloc, body) catch |err| switch (err) {
+        else => return .{ .status = 400, .body = try alloc.dupe(u8, "invalid restore request") },
     };
     defer backups_api.freeClusterRestoreRequest(alloc, &req);
 

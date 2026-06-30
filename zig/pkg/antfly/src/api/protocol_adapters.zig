@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const routes = @import("http_routes.zig");
+const catalog_resources = @import("catalog_resources.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const extension_domain = @import("../extensions/mod.zig");
 const wasmtime_runtime = extension_domain.wasmtime_runtime;
@@ -23,6 +24,16 @@ const a2a = @import("antfly_a2a");
 
 const trusted_principal_header = "X-Antfly-Trusted-Principal";
 const max_mcp_sample_documents_limit: i64 = 100;
+
+pub const DelegatedIdentity = struct {
+    username: []const u8,
+    permissions: []const usermgr.Permission = &.{},
+    row_filter: []const usermgr.RowFilterEntry = &.{},
+    metadata_json: []const u8 = &.{},
+    roles: []const []const u8 = &.{},
+    role_settings: []const usermgr.RoleSetting = &.{},
+    role_runtime_settings: []const usermgr.RoleSetting = &.{},
+};
 
 const McpToolKind = enum {
     create_table,
@@ -68,6 +79,18 @@ const McpToolFieldSpec = struct {
     schema_json: ?[]const u8 = null,
 };
 
+const catalog_table_fields = [_]McpToolFieldSpec{
+    .{ .name = "database", .schema_type = .string, .description = "Database name. Defaults to the server default database." },
+    .{ .name = "namespace", .schema_type = .string, .description = "Namespace name. Defaults to public." },
+    .{ .name = "tableName", .schema_type = .string, .required = true },
+};
+
+const a2a_catalog_scopes = [_][]const u8{
+    "database:*",
+    "namespace:*",
+    "table:*",
+};
+
 const full_text_search_schema_json =
     \\{"oneOf":[{"type":"string"},{"type":"object","additionalProperties":true}],"description":"Full-text query string shorthand, or the generic full_text_search query object accepted by the REST API"}
 ;
@@ -90,6 +113,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "create_table",
         .description = "Create an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "numShards", .schema_type = .integer, .default_json = "3" },
             .{ .name = "key", .schema_type = .string },
@@ -100,9 +125,17 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .drop_table,
         .name = "drop_table",
         .description = "Drop an Antfly table",
-        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+        .fields = &catalog_table_fields,
     },
-    .{ .kind = .list_tables, .name = "list_tables", .description = "List Antfly tables" },
+    .{
+        .kind = .list_tables,
+        .name = "list_tables",
+        .description = "List Antfly tables",
+        .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
+        },
+    },
     .{
         .kind = .describe_table,
         .name = "describe_table",
@@ -114,6 +147,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "create_index",
         .description = "Create an Antfly index",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
             .{ .name = "field", .schema_type = .string },
@@ -128,6 +163,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "drop_index",
         .description = "Drop an Antfly index",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "indexName", .schema_type = .string, .required = true },
         },
@@ -136,7 +173,7 @@ const mcp_tool_specs = [_]McpToolSpec{
         .kind = .list_indexes,
         .name = "list_indexes",
         .description = "List indexes for an Antfly table",
-        .fields = &.{.{ .name = "tableName", .schema_type = .string, .required = true }},
+        .fields = &catalog_table_fields,
     },
     .{
         .kind = .describe_indexes,
@@ -149,6 +186,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "get_document",
         .description = "Get an Antfly document by key",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "key", .schema_type = .string, .required = true },
             .{ .name = "fields", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
@@ -172,6 +211,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "query",
         .description = "Run an Antfly table query",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "queryRequest", .schema_type = .object, .schema_json = query_request_schema_json },
             .{ .name = "fullTextSearch", .schema_type = .object, .schema_json = full_text_search_schema_json },
@@ -200,6 +241,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "backup",
         .description = "Backup an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
             .{ .name = "location", .schema_type = .string, .required = true },
@@ -210,6 +253,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "restore",
         .description = "Restore an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "backupId", .schema_type = .string, .required = true },
             .{ .name = "location", .schema_type = .string, .required = true },
@@ -220,6 +265,8 @@ const mcp_tool_specs = [_]McpToolSpec{
         .name = "batch",
         .description = "Insert and delete documents in an Antfly table",
         .fields = &.{
+            catalog_table_fields[0],
+            catalog_table_fields[1],
             .{ .name = "tableName", .schema_type = .string, .required = true },
             .{ .name = "writes", .schema_type = .object },
             .{ .name = "deletes", .schema_type = .array, .items_json = "{\"type\":\"string\"}" },
@@ -294,8 +341,8 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
             return switch (ctx.kind) {
                 .create_table => try ctx.createTable(alloc, args),
-                .drop_table => try ctx.tableRoute(alloc, args, .DELETE, "tableName", null, ""),
-                .list_tables => try ctx.simpleRoute(alloc, .GET, routes.Routes.tables, ""),
+                .drop_table => try ctx.dropTable(alloc, args),
+                .list_tables => try ctx.listTables(alloc, args),
                 .describe_table => try ctx.tableRoute(alloc, args, .GET, "tableName", null, ""),
                 .create_index => try ctx.createIndex(alloc, args),
                 .drop_index => try ctx.indexRoute(alloc, args, .DELETE, ""),
@@ -313,7 +360,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn createTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "num_shards", .{ .integer = jsonIntArg(args, "numShards") orelse 3 });
             if (jsonStringArg(args, "fields")) |fields_json| {
@@ -326,12 +373,24 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
                 if (key.len != 0) try body.put(alloc, "key", .{ .string = key });
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ routes.Routes.tables, table_name });
+            const uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
             return try ctx.simpleRoute(alloc, .POST, uri, body_json);
         }
 
+        fn dropTable(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            return try ctx.simpleRoute(alloc, .DELETE, uri, "");
+        }
+
+        fn listTables(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
+            const target = catalogNamespaceTargetArg(args);
+            const uri = try catalogNamespaceTablesRouteAlloc(alloc, target);
+            return try ctx.simpleRoute(alloc, .GET, uri, "");
+        }
+
         fn createIndex(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "name", .{ .string = index_name });
@@ -345,25 +404,29 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             if (jsonStringArg(args, "summarizer")) |summarizer_json| {
                 if (summarizer_json.len != 0) try body.put(alloc, "summarizer", std.json.parseFromSliceLeaky(std.json.Value, alloc, summarizer_json, .{}) catch return mcpError(alloc, "invalid summarizer JSON"));
             }
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ table_uri, index_name });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
         fn listIndexes(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes", .{ routes.Routes.tables, table_name });
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/indexes", .{table_uri});
             return try ctx.simpleRoute(alloc, .GET, uri, "");
         }
 
         fn getDocument(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const key = jsonStringArg(args, "key") orelse return mcpError(alloc, "missing key");
 
             var uri = std.ArrayListUnmanaged(u8).empty;
             errdefer uri.deinit(alloc);
-            try uri.appendSlice(alloc, routes.Routes.tables);
-            try uri.append(alloc, '/');
-            try uri.appendSlice(alloc, table_name);
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            try uri.appendSlice(alloc, table_uri);
             try uri.appendSlice(alloc, routes.Routes.documents_marker);
             try appendUriPathSegment(alloc, &uri, key);
 
@@ -398,20 +461,24 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn indexRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, body: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const index_name = jsonStringArg(args, "indexName") orelse return mcpError(alloc, "missing indexName");
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/indexes/{s}", .{ routes.Routes.tables, table_name, index_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/indexes/{s}", .{ table_uri, index_name });
             return try ctx.simpleRoute(alloc, method, uri, body);
         }
 
         fn query(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             if (jsonValueArg(args, "queryRequest")) |query_request| {
                 if (query_request != .object) return mcpError(alloc, "queryRequest must be an object");
                 if (hasNonRawQueryArg(args)) return mcpError(alloc, "queryRequest cannot be combined with shorthand query arguments");
                 if (query_request.object.get("table") != null) return mcpError(alloc, "queryRequest.table is not allowed; use tableName");
 
-                const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
+                const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+                defer alloc.free(table_uri);
+                const uri = try std.fmt.allocPrint(alloc, "{s}/query", .{table_uri});
                 return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, query_request));
             }
 
@@ -423,7 +490,9 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             if (jsonValueArg(args, "indexes")) |indexes| try body.put(alloc, "indexes", indexes);
             if (jsonStringArg(args, "filterPrefix")) |prefix| if (prefix.len != 0) try body.put(alloc, "filter_prefix", .{ .string = prefix });
             try body.put(alloc, "limit", .{ .integer = jsonIntArg(args, "limit") orelse 10 });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/query", .{ routes.Routes.tables, table_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/query", .{table_uri});
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
@@ -444,31 +513,38 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         }
 
         fn backupRestore(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, operation: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             const backup_id = jsonStringArg(args, "backupId") orelse return mcpError(alloc, "missing backupId");
             const location = jsonStringArg(args, "location") orelse return mcpError(alloc, "missing location");
             var body = std.json.ObjectMap.empty;
             try body.put(alloc, "backup_id", .{ .string = backup_id });
             try body.put(alloc, "location", .{ .string = location });
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, operation });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, operation });
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
         fn batch(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, "tableName") orelse return mcpError(alloc, "missing tableName");
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
             var body = std.json.ObjectMap.empty;
             if (jsonValueArg(args, "writes")) |writes| try body.put(alloc, "inserts", writes);
             if (jsonValueArg(args, "deletes")) |deletes| try body.put(alloc, "deletes", deletes);
-            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}/batch", .{ routes.Routes.tables, table_name });
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/batch", .{table_uri});
             return try ctx.simpleRoute(alloc, .POST, uri, try stringifyJsonValue(alloc, .{ .object = body }));
         }
 
         fn tableRoute(ctx: *@This(), alloc: std.mem.Allocator, args: std.json.Value, method: http_common.Method, table_arg: []const u8, suffix: ?[]const u8, body: []const u8) !mcp.CallToolResult {
-            const table_name = jsonStringArg(args, table_arg) orelse return mcpError(alloc, "missing tableName");
+            _ = table_arg;
+            const target = catalogLifecycleTableTargetArg(args) catch |err| return catalogTableArgError(alloc, err);
+            const table_uri = try catalogTableRouteAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+            defer alloc.free(table_uri);
             const uri = if (suffix) |route_suffix|
-                try std.fmt.allocPrint(alloc, "{s}/{s}/{s}", .{ routes.Routes.tables, table_name, route_suffix })
+                try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, route_suffix })
             else
-                try std.fmt.allocPrint(alloc, "{s}/{s}", .{ routes.Routes.tables, table_name });
+                try alloc.dupe(u8, table_uri);
             return try ctx.simpleRoute(alloc, method, uri, body);
         }
 
@@ -493,6 +569,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
         server: Server,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8,
+        authenticated_identity: ?DelegatedIdentity,
         installed: *const extension_domain.InstalledExtension,
         tool: *const ExtensionMcpTool,
 
@@ -502,7 +579,7 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
 
         fn call(ptr: *anyopaque, alloc: std.mem.Allocator, args: std.json.Value) !mcp.CallToolResult {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
-            return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.installed, ctx.tool.*, args);
+            return try callExtensionMcpTool(alloc, ctx.server, ctx.authorization, ctx.trusted_principal, ctx.authenticated_identity, ctx.installed, ctx.tool.*, args);
         }
     };
 
@@ -549,6 +626,15 @@ fn handleMcpRequestFiltered(server_ptr: anytype, req: http_common.HttpRequest, a
             .server = server_ptr,
             .authorization = req.authorization,
             .trusted_principal = req.header(trusted_principal_header),
+            .authenticated_identity = if (authenticated_identity) |identity| .{
+                .username = identity.username,
+                .permissions = identity.permissions,
+                .row_filter = identity.row_filter,
+                .metadata_json = identity.metadata_json,
+                .roles = identity.roles,
+                .role_settings = identity.role_settings,
+                .role_runtime_settings = identity.role_runtime_settings,
+            } else null,
             .installed = installed,
             .tool = &extension_tools.items[i],
         };
@@ -614,11 +700,130 @@ fn mcpToolVisibleForIdentity(kind: McpToolKind, authenticated_identity: anytype)
     const identity = authenticated_identity orelse return true;
     return switch (kind) {
         .describe_query_request, .describe_mcp_capabilities => true,
-        .list_tables => identityHasPermission(identity.permissions, .table, "*", .read),
+        .list_tables => identityCanListTables(identity.permissions),
         .query, .describe_table, .describe_indexes, .get_document, .sample_documents, .list_indexes => identityHasAnyPermission(identity.permissions, .table, .read),
         .batch => identityHasAnyPermission(identity.permissions, .table, .write),
         .create_table, .drop_table, .create_index, .drop_index, .backup, .restore => identityHasAnyPermission(identity.permissions, .table, .admin),
     };
+}
+
+const CatalogToolArgError = error{
+    MissingTableName,
+    ExplicitCatalogTableRouteUnsupported,
+};
+
+fn catalogTableNameArg(args: std.json.Value) CatalogToolArgError![]const u8 {
+    const table_name = jsonStringArg(args, "tableName") orelse return error.MissingTableName;
+    try ensureDefaultCatalogArgs(args);
+    return table_name;
+}
+
+fn catalogLifecycleTableTargetArg(args: std.json.Value) CatalogToolArgError!catalog_resources.TableTarget {
+    const table_name = jsonStringArg(args, "tableName") orelse return error.MissingTableName;
+    return catalog_resources.tableTargetFromOptional(jsonStringArg(args, "database"), jsonStringArg(args, "namespace"), table_name) catch return error.ExplicitCatalogTableRouteUnsupported;
+}
+
+fn catalogNamespaceTargetArg(args: std.json.Value) catalog_resources.NamespaceTarget {
+    return catalog_resources.namespaceTargetFromOptional(jsonStringArg(args, "database"), jsonStringArg(args, "namespace"));
+}
+
+fn catalogNamespaceTablesRouteAlloc(alloc: std.mem.Allocator, target: catalog_resources.NamespaceTarget) ![]u8 {
+    if (catalog_resources.namespaceIsDefaultPublic(target)) {
+        return try alloc.dupe(u8, routes.Routes.tables);
+    }
+    var uri = std.ArrayListUnmanaged(u8).empty;
+    errdefer uri.deinit(alloc);
+    try uri.appendSlice(alloc, routes.Routes.databases);
+    try uri.append(alloc, '/');
+    try appendUriPathSegment(alloc, &uri, target.database_name);
+    try uri.appendSlice(alloc, "/namespaces/");
+    try appendUriPathSegment(alloc, &uri, target.namespace_name);
+    try uri.appendSlice(alloc, "/tables");
+    return try uri.toOwnedSlice(alloc);
+}
+
+fn catalogTableRouteAlloc(
+    alloc: std.mem.Allocator,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    table_name: []const u8,
+) ![]u8 {
+    const target = try catalog_resources.tableTargetFromOptional(database_name, namespace_name, table_name);
+    if (catalog_resources.tableIsDefaultPublic(target)) {
+        var uri = std.ArrayListUnmanaged(u8).empty;
+        errdefer uri.deinit(alloc);
+        try uri.appendSlice(alloc, routes.Routes.tables);
+        try uri.append(alloc, '/');
+        try appendUriPathSegment(alloc, &uri, target.table_name);
+        return try uri.toOwnedSlice(alloc);
+    }
+    var uri = std.ArrayListUnmanaged(u8).empty;
+    errdefer uri.deinit(alloc);
+    try uri.appendSlice(alloc, routes.Routes.databases);
+    try uri.append(alloc, '/');
+    try appendUriPathSegment(alloc, &uri, target.database_name);
+    try uri.appendSlice(alloc, "/namespaces/");
+    try appendUriPathSegment(alloc, &uri, target.namespace_name);
+    try uri.appendSlice(alloc, "/tables");
+    try uri.append(alloc, '/');
+    try appendUriPathSegment(alloc, &uri, target.table_name);
+    return try uri.toOwnedSlice(alloc);
+}
+
+fn ensureDefaultCatalogArgs(args: std.json.Value) CatalogToolArgError!void {
+    const target = catalogNamespaceTargetArg(args);
+    if (!catalog_resources.namespaceIsDefaultPublic(target)) {
+        return error.ExplicitCatalogTableRouteUnsupported;
+    }
+}
+
+fn ensureDefaultCatalogQueryTargets(args: std.json.Value) CatalogToolArgError!void {
+    try ensureDefaultCatalogArgs(args);
+    if (args != .object) return;
+    const queries = args.object.get("queries") orelse return;
+    if (queries != .array) return;
+    for (queries.array.items) |query| {
+        try ensureDefaultCatalogArgs(query);
+    }
+}
+
+fn a2aCatalogTableNameFromObjectAlloc(alloc: std.mem.Allocator, object: anytype) !?[]const u8 {
+    const table_name = jsonStringObjectField(object, "table") orelse return null;
+    const target = catalog_resources.tableTargetFromOptional(
+        jsonStringObjectField(object, "database"),
+        jsonStringObjectField(object, "namespace"),
+        table_name,
+    ) catch return error.InvalidA2aCatalogTarget;
+    return try catalog_resources.tableResourceNameAlloc(alloc, target.database_name, target.namespace_name, target.table_name);
+}
+
+fn a2aNormalizedQueriesAlloc(alloc: std.mem.Allocator, queries: std.json.Value) !std.json.Value {
+    if (queries != .array) return queries;
+    var out = std.json.Array.init(alloc);
+    for (queries.array.items) |query| {
+        var normalized = query;
+        if (normalized == .object) {
+            if (try a2aCatalogTableNameFromObjectAlloc(alloc, normalized.object)) |catalog_table_name| {
+                try normalized.object.put(alloc, "table", .{ .string = catalog_table_name });
+                _ = normalized.object.swapRemove("database");
+                _ = normalized.object.swapRemove("namespace");
+            }
+        }
+        try out.append(normalized);
+    }
+    return .{ .array = out };
+}
+
+fn catalogTableArgError(alloc: std.mem.Allocator, err: CatalogToolArgError) !mcp.CallToolResult {
+    return switch (err) {
+        error.MissingTableName => mcpError(alloc, "missing tableName"),
+        error.ExplicitCatalogTableRouteUnsupported => mcpError(alloc, "invalid explicit database/namespace table target"),
+    };
+}
+
+fn identityCanListTables(permissions: []const usermgr.Permission) bool {
+    return identityHasPermission(permissions, .table, "*", .read) or
+        identityHasAnyPermission(permissions, .namespace, .read);
 }
 
 fn extensionMcpToolVisibleForIdentity(installed: *const extension_domain.InstalledExtension, tool: *const ExtensionMcpTool, authenticated_identity: anytype) bool {
@@ -678,7 +883,11 @@ fn identityHasPermission(
 ) bool {
     for (permissions) |permission| {
         const type_match = permission.resource_type == .@"*" or permission.resource_type == resource_type;
-        const resource_match = std.mem.eql(u8, permission.resource, "*") or std.mem.eql(u8, permission.resource, resource);
+        const resource_match = std.mem.eql(u8, permission.resource, "*") or
+            (if (resource_type == .table)
+                catalog_resources.tableResourceMatches(permission.resource, resource)
+            else
+                std.mem.eql(u8, permission.resource, resource));
         if (!type_match or !resource_match) continue;
         if (permission.type == .admin or permission.type == permission_type) return true;
     }
@@ -873,7 +1082,16 @@ fn findInstalledExtensionForRuntimeTool(installed_extensions: []const extension_
     return null;
 }
 
-fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization: ?[]const u8, trusted_principal: ?[]const u8, installed: *const extension_domain.InstalledExtension, tool: ExtensionMcpTool, args: std.json.Value) !mcp.CallToolResult {
+fn callExtensionMcpTool(
+    alloc: std.mem.Allocator,
+    server: anytype,
+    authorization: ?[]const u8,
+    trusted_principal: ?[]const u8,
+    authenticated_identity: ?DelegatedIdentity,
+    installed: *const extension_domain.InstalledExtension,
+    tool: ExtensionMcpTool,
+    args: std.json.Value,
+) !mcp.CallToolResult {
     if (parseWasmHandler(tool.handler)) |handler| {
         const tool_name = handler.tool_name;
         if (!std.mem.eql(u8, tool_name, tool.member.object_name)) {
@@ -886,6 +1104,7 @@ fn callExtensionMcpTool(alloc: std.mem.Allocator, server: anytype, authorization
             .server = server,
             .authorization = authorization,
             .trusted_principal = trusted_principal,
+            .authenticated_identity = authenticated_identity,
             .installed = installed,
         };
         if (wasmtime_runtime.invokeExtensionWithOptions(alloc, binding.runtime(), tool_name, request_json, .{
@@ -919,24 +1138,25 @@ fn ExtensionHostContext(comptime Server: type) type {
         server: Server,
         authorization: ?[]const u8,
         trusted_principal: ?[]const u8,
+        authenticated_identity: ?DelegatedIdentity,
         installed: *const extension_domain.InstalledExtension,
 
         fn dbQuery(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, query_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
-            try ctx.requireCapability("db:read");
-            const table_name = try ctx.resolveTableName(table);
+            const table_target = try ctx.resolveTableTarget(table);
+            try requireExtensionTableAuthority(alloc, ctx.installed, ctx.authenticated_identity, table_target, "db:read", .read);
             const body = try extensionQueryBodyAlloc(alloc, query_json);
             defer alloc.free(body);
-            return try ctx.dispatchJson(alloc, .POST, table_name, "query", body);
+            return try ctx.dispatchJson(alloc, .POST, table_target, "query", body);
         }
 
         fn dbWrite(ptr: ?*anyopaque, alloc: std.mem.Allocator, table: []const u8, writes_json: []const u8) anyerror![]u8 {
             const ctx = hostContext(ptr);
-            try ctx.requireCapability("db:write");
-            const table_name = try ctx.resolveTableName(table);
+            const table_target = try ctx.resolveTableTarget(table);
+            try requireExtensionTableAuthority(alloc, ctx.installed, ctx.authenticated_identity, table_target, "db:write", .write);
             const body = try extensionBatchBodyAlloc(alloc, writes_json);
             defer alloc.free(body);
-            return try ctx.dispatchJson(alloc, .POST, table_name, "batch", body);
+            return try ctx.dispatchJson(alloc, .POST, table_target, "batch", body);
         }
 
         fn aiEmbed(ptr: ?*anyopaque, alloc: std.mem.Allocator, _: []const u8, text: []const u8) anyerror![]f32 {
@@ -971,16 +1191,19 @@ fn ExtensionHostContext(comptime Server: type) type {
             return error.ExtensionCapabilityDenied;
         }
 
-        fn resolveTableName(ctx: *@This(), requested: []const u8) ![]const u8 {
-            return switch (ctx.installed.scope.kind) {
+        fn resolveTableTarget(ctx: *@This(), requested: []const u8) !catalog_resources.TableTarget {
+            const table_name = switch (ctx.installed.scope.kind) {
                 .table => ctx.installed.scope.table_name,
                 .cluster => requested,
-                .embedded_db => error.UnsupportedExtensionScope,
+                .embedded_db => return error.UnsupportedExtensionScope,
             };
+            return try extensionHostTableTarget(table_name);
         }
 
-        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_name: []const u8, route: []const u8, body: []const u8) ![]u8 {
-            const uri = try std.fmt.allocPrint(alloc, "/tables/{s}/{s}", .{ table_name, route });
+        fn dispatchJson(ctx: *@This(), alloc: std.mem.Allocator, method: http_common.Method, table_target: catalog_resources.TableTarget, route: []const u8, body: []const u8) ![]u8 {
+            const table_uri = try catalogTableRouteAlloc(alloc, table_target.database_name, table_target.namespace_name, table_target.table_name);
+            defer alloc.free(table_uri);
+            const uri = try std.fmt.allocPrint(alloc, "{s}/{s}", .{ table_uri, route });
             defer alloc.free(uri);
             const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |principal|
                 &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = principal }}
@@ -999,6 +1222,53 @@ fn ExtensionHostContext(comptime Server: type) type {
             return try alloc.dupe(u8, resp.body);
         }
     };
+}
+
+fn extensionHostTableTarget(table_name: []const u8) !catalog_resources.TableTarget {
+    const first_dot = std.mem.indexOfScalar(u8, table_name, '.');
+    if (first_dot == null) return try catalog_resources.tableTargetFromOptional(null, null, table_name);
+    const first = first_dot.?;
+    const rest = table_name[first + 1 ..];
+    const second_rel = std.mem.indexOfScalar(u8, rest, '.') orelse return error.UnsupportedExtensionTableTarget;
+    const second = first + 1 + second_rel;
+    if (std.mem.indexOfScalar(u8, table_name[second + 1 ..], '.') != null) return error.UnsupportedExtensionTableTarget;
+    return try catalog_resources.tableTargetFromOptional(table_name[0..first], table_name[first + 1 .. second], table_name[second + 1 ..]);
+}
+
+fn requireExtensionTableAuthority(
+    alloc: std.mem.Allocator,
+    installed: *const extension_domain.InstalledExtension,
+    authenticated_identity: ?DelegatedIdentity,
+    table_target: catalog_resources.TableTarget,
+    capability_name: []const u8,
+    permission_type: usermgr.PermissionType,
+) !void {
+    if (!try extensionInstallAllowsTableCapability(alloc, installed, capability_name, table_target)) {
+        return error.ExtensionCapabilityDenied;
+    }
+    const identity = authenticated_identity orelse return;
+    const resource = try catalog_resources.tableResourceNameAlloc(alloc, table_target.database_name, table_target.namespace_name, table_target.table_name);
+    defer alloc.free(resource);
+    if (!identityHasPermission(identity.permissions, .table, resource, permission_type)) {
+        return error.PermissionDenied;
+    }
+}
+
+fn extensionInstallAllowsTableCapability(
+    alloc: std.mem.Allocator,
+    installed: *const extension_domain.InstalledExtension,
+    capability_name: []const u8,
+    table_target: catalog_resources.TableTarget,
+) !bool {
+    const resource = try catalog_resources.tableResourceNameAlloc(alloc, table_target.database_name, table_target.namespace_name, table_target.table_name);
+    defer alloc.free(resource);
+    for (installed.granted_capabilities) |capability| {
+        if (!std.mem.eql(u8, capability.name, capability_name)) continue;
+        if (capability.scope.len == 0 or std.mem.eql(u8, capability.scope, installed.package_name)) return true;
+        if (std.mem.eql(u8, capability.scope, "*")) return true;
+        if (catalog_resources.tableResourceMatches(capability.scope, resource)) return true;
+    }
+    return false;
 }
 
 fn extensionBatchBodyAlloc(alloc: std.mem.Allocator, writes_json: []const u8) ![]u8 {
@@ -1123,10 +1393,10 @@ fn buildMcpInputSchema(alloc: std.mem.Allocator, spec: McpToolSpec) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest) !http_common.HttpResponse {
+pub fn handleA2aRequest(server_ptr: anytype, req: http_common.HttpRequest, authenticated_identity: ?DelegatedIdentity) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, req.header(trusted_principal_header), authenticated_identity);
     if (isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) {
         var sink = A2aSseSink{};
         defer sink.out.deinit(server_ptr.alloc);
@@ -1143,7 +1413,7 @@ pub fn isA2aStreamingRequest(alloc: std.mem.Allocator, req: http_common.HttpRequ
     return req.method == .POST and isJsonRpcMethod(alloc, req.body, "message/stream");
 }
 
-pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter) !bool {
+pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpRequest, writer: http_common.StreamWriter, authenticated_identity: ?DelegatedIdentity) !bool {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
     if (!isJsonRpcMethod(arena_impl.allocator(), req.body, "message/stream")) return false;
@@ -1153,7 +1423,7 @@ pub fn handleA2aStreamingRequest(server_ptr: anytype, req: http_common.HttpReque
         .content_type = "text/event-stream",
     });
 
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), req.authorization, req.header(trusted_principal_header), authenticated_identity);
     var sink = A2aLiveSseSink{ .writer = writer };
     try dispatcher.handleJsonRpcStream(server_ptr.alloc, req.body, sink.iface());
     try writer.writeAll("event: done\ndata: {}\n\n");
@@ -1191,19 +1461,21 @@ const A2aLiveSseSink = struct {
 pub fn handleA2aCard(server_ptr: anytype) !http_common.HttpResponse {
     var arena_impl = std.heap.ArenaAllocator.init(server_ptr.alloc);
     defer arena_impl.deinit();
-    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null);
+    var dispatcher = try buildA2aDispatcher(server_ptr, arena_impl.allocator(), null, null, null);
     const card = try dispatcher.agentCard(arena_impl.allocator());
     const body = try stringifyJsonValue(server_ptr.alloc, card);
     defer server_ptr.alloc.free(body);
     return try jsonBodyResponseWithStatus(server_ptr.alloc, 200, body);
 }
 
-fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, authorization: ?[]const u8) !a2a.Dispatcher {
+fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, authorization: ?[]const u8, trusted_principal: ?[]const u8, authenticated_identity: ?DelegatedIdentity) !a2a.Dispatcher {
     const Server = @TypeOf(server_ptr);
     const HandlerKind = enum { query_builder, retrieval };
     const HandlerContext = struct {
         server: Server,
         authorization: ?[]const u8,
+        trusted_principal: ?[]const u8,
+        authenticated_identity: ?DelegatedIdentity,
         kind: HandlerKind,
 
         fn iface(ctx: *@This()) a2a.AgentHandler {
@@ -1226,8 +1498,8 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
         fn skill(ptr: *anyopaque, _: std.mem.Allocator) !a2a.Skill {
             const ctx: *@This() = @ptrCast(@alignCast(ptr));
             return switch (ctx.kind) {
-                .query_builder => .{ .id = "query-builder", .name = "Query Builder", .description = "Translate natural language into Antfly query requests", .tags = &.{ "antfly", "query" } },
-                .retrieval => .{ .id = "retrieval", .name = "Retrieval", .description = "Run Antfly retrieval and generation workflows", .tags = &.{ "antfly", "retrieval" } },
+                .query_builder => .{ .id = "query-builder", .name = "Query Builder", .description = "Translate natural language into Antfly query requests", .tags = &.{ "antfly", "query" }, .scopes = &a2a_catalog_scopes },
+                .retrieval => .{ .id = "retrieval", .name = "Retrieval", .description = "Run Antfly retrieval and generation workflows", .tags = &.{ "antfly", "retrieval" }, .scopes = &a2a_catalog_scopes },
             };
         }
 
@@ -1245,21 +1517,36 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             try body.put(alloc, "intent", .{ .string = text });
             if (a2a.firstDataPart(request_ctx.message)) |data| {
                 if (data == .object) {
-                    if (jsonStringObjectField(data.object, "table")) |table| try body.put(alloc, "table", .{ .string = table });
+                    const catalog_table_name = a2aCatalogTableNameFromObjectAlloc(alloc, data.object) catch |err| switch (err) {
+                        error.InvalidA2aCatalogTarget => {
+                            try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", "invalid explicit database/namespace table target");
+                            return;
+                        },
+                        else => return err,
+                    };
+                    if (catalog_table_name) |table| {
+                        try body.put(alloc, "table", .{ .string = table });
+                    }
                     if (data.object.get("context")) |context| try body.put(alloc, "context", context);
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
+            const headers: []const http_common.RequestHeader = if (ctx.trusted_principal) |token|
+                &[_]http_common.RequestHeader{.{ .name = trusted_principal_header, .value = token }}
+            else
+                &.{};
             var resp = try ctx.server.handle(.{
                 .method = .POST,
                 .uri = routes.Routes.agents_query_builder,
+                .headers = headers,
                 .authorization = ctx.authorization,
                 .content_type = "application/json",
                 .body = body_json,
             });
             defer resp.deinit(ctx.server.alloc);
             if (resp.status < 200 or resp.status >= 300) {
-                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", resp.body);
+                const failed_body = try alloc.dupe(u8, resp.body);
+                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", failed_body);
                 return;
             }
             const parsed: std.json.Value = std.json.parseFromSliceLeaky(std.json.Value, alloc, resp.body, .{}) catch .{ .string = resp.body };
@@ -1275,10 +1562,24 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
             if (a2a.firstDataPart(request_ctx.message)) |data| {
                 if (data == .object) {
                     if (data.object.get("queries")) |queries| {
-                        try body.put(alloc, "queries", queries);
+                        const normalized_queries = a2aNormalizedQueriesAlloc(alloc, queries) catch |err| switch (err) {
+                            error.InvalidA2aCatalogTarget => {
+                                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", "invalid explicit database/namespace table target");
+                                return;
+                            },
+                            else => return err,
+                        };
+                        try body.put(alloc, "queries", normalized_queries);
                     } else if (jsonStringObjectField(data.object, "table")) |table| {
                         var query_obj = std.json.ObjectMap.empty;
-                        try query_obj.put(alloc, "table", .{ .string = table });
+                        const catalog_table_name = (a2aCatalogTableNameFromObjectAlloc(alloc, data.object) catch |err| switch (err) {
+                            error.InvalidA2aCatalogTarget => {
+                                try queue.status(alloc, request_ctx.task_id, request_ctx.context_id, "failed", "invalid explicit database/namespace table target");
+                                return;
+                            },
+                            else => return err,
+                        }) orelse table;
+                        try query_obj.put(alloc, "table", .{ .string = catalog_table_name });
                         var full_text = std.json.ObjectMap.empty;
                         try full_text.put(alloc, "query", .{ .string = text });
                         try query_obj.put(alloc, "full_text_search", .{ .object = full_text });
@@ -1292,7 +1593,7 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
                 }
             }
             const body_json = try stringifyJsonValue(alloc, .{ .object = body });
-            try ctx.server.executeA2aRetrieval(alloc, body_json, request_ctx.task_id, request_ctx.context_id, queue);
+            try ctx.server.executeA2aRetrieval(alloc, body_json, request_ctx.task_id, request_ctx.context_id, queue, ctx.authenticated_identity);
         }
     };
 
@@ -1303,8 +1604,8 @@ fn buildA2aDispatcher(server_ptr: anytype, dispatcher_alloc: std.mem.Allocator, 
         .task_store = server_ptr.a2a_tasks.iface(),
     };
     const contexts = try dispatcher_alloc.alloc(HandlerContext, 2);
-    contexts[0] = .{ .server = server_ptr, .authorization = authorization, .kind = .query_builder };
-    contexts[1] = .{ .server = server_ptr, .authorization = authorization, .kind = .retrieval };
+    contexts[0] = .{ .server = server_ptr, .authorization = authorization, .trusted_principal = trusted_principal, .authenticated_identity = authenticated_identity, .kind = .query_builder };
+    contexts[1] = .{ .server = server_ptr, .authorization = authorization, .trusted_principal = trusted_principal, .authenticated_identity = authenticated_identity, .kind = .retrieval };
     try dispatcher.addHandler(dispatcher_alloc, contexts[0].iface());
     try dispatcher.addHandler(dispatcher_alloc, contexts[1].iface());
     return dispatcher;
@@ -1543,4 +1844,86 @@ fn mcpResultFromHttpResponse(alloc: std.mem.Allocator, resp: http_common.HttpRes
         .text = try alloc.dupe(u8, if (resp.body.len == 0) "ok" else resp.body),
         .structured = structured,
     };
+}
+
+test "mcp table tools expose catalog fields and route supported catalog lifecycle targets" {
+    const alloc = std.testing.allocator;
+    const schema = try buildMcpInputSchema(alloc, mcp_tool_specs[0]);
+    defer alloc.free(schema);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"database\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"namespace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, schema, "\"tableName\"") != null);
+
+    var default_args = try std.json.parseFromSlice(std.json.Value, alloc, "{\"database\":\"default\",\"namespace\":\"public\",\"tableName\":\"docs\"}", .{});
+    defer default_args.deinit();
+    try std.testing.expectEqualStrings("docs", try catalogTableNameArg(default_args.value));
+
+    var non_default_args = try std.json.parseFromSlice(std.json.Value, alloc, "{\"database\":\"tenant_ops\",\"namespace\":\"analytics\",\"tableName\":\"docs\"}", .{});
+    defer non_default_args.deinit();
+    const non_default_target = try catalogLifecycleTableTargetArg(non_default_args.value);
+    try std.testing.expectEqualStrings("tenant_ops", non_default_target.database_name);
+    try std.testing.expectEqualStrings("analytics", non_default_target.namespace_name);
+    try std.testing.expectEqualStrings("docs", non_default_target.table_name);
+    const non_default_route = try catalogTableRouteAlloc(alloc, non_default_target.database_name, non_default_target.namespace_name, non_default_target.table_name);
+    defer alloc.free(non_default_route);
+    try std.testing.expectEqualStrings("/databases/tenant_ops/namespaces/analytics/tables/docs", non_default_route);
+
+    const list_route = try catalogNamespaceTablesRouteAlloc(alloc, .{
+        .database_name = non_default_target.database_name,
+        .namespace_name = non_default_target.namespace_name,
+    });
+    defer alloc.free(list_route);
+    try std.testing.expectEqualStrings("/databases/tenant_ops/namespaces/analytics/tables", list_route);
+
+    const non_default_query_route = try catalogTableRouteAlloc(alloc, non_default_target.database_name, non_default_target.namespace_name, non_default_target.table_name);
+    defer alloc.free(non_default_query_route);
+    try std.testing.expectEqualStrings("/databases/tenant_ops/namespaces/analytics/tables/docs", non_default_query_route);
+
+    var namespace_read = try usermgr.Permission.initOwned(alloc, .namespace, "tenant_ops.analytics", .read);
+    defer namespace_read.deinit(alloc);
+    try std.testing.expect(identityCanListTables(&.{namespace_read}));
+
+    var unrelated_table_read = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer unrelated_table_read.deinit(alloc);
+    try std.testing.expect(!identityCanListTables(&.{unrelated_table_read}));
+}
+
+test "extension table host imports require install capability and caller table permission" {
+    const alloc = std.testing.allocator;
+    const target = try extensionHostTableTarget("default.public.docs");
+    try std.testing.expectEqualStrings("default", target.database_name);
+    try std.testing.expectEqualStrings("public", target.namespace_name);
+    try std.testing.expectEqualStrings("docs", target.table_name);
+    try std.testing.expectError(error.UnsupportedExtensionTableTarget, extensionHostTableTarget("analytics.docs"));
+
+    const granted = [_]extension_domain.Capability{
+        .{ .name = "db:read", .scope = "default.public.docs" },
+    };
+    const installed = extension_domain.InstalledExtension{
+        .name = "memoryaf",
+        .package_name = "memoryaf",
+        .package_version = "1.0.0",
+        .package_digest = "sha256:abc",
+        .scope = .{ .kind = .table, .table_name = "default.public.docs" },
+        .granted_capabilities = &granted,
+        .status = .ready,
+    };
+
+    var read_docs = try usermgr.Permission.initOwned(alloc, .table, "docs", .read);
+    defer read_docs.deinit(alloc);
+    var read_other = try usermgr.Permission.initOwned(alloc, .table, "other", .read);
+    defer read_other.deinit(alloc);
+
+    const allowed_identity = DelegatedIdentity{
+        .username = "alice",
+        .permissions = &.{read_docs},
+    };
+    const denied_identity = DelegatedIdentity{
+        .username = "alice",
+        .permissions = &.{read_other},
+    };
+
+    try requireExtensionTableAuthority(alloc, &installed, allowed_identity, target, "db:read", .read);
+    try std.testing.expectError(error.PermissionDenied, requireExtensionTableAuthority(alloc, &installed, denied_identity, target, "db:read", .read));
+    try std.testing.expectError(error.ExtensionCapabilityDenied, requireExtensionTableAuthority(alloc, &installed, allowed_identity, target, "db:write", .write));
 }

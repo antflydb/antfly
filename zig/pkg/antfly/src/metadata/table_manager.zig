@@ -15,6 +15,185 @@
 const std = @import("std");
 const group_ids = @import("../common/group_ids.zig");
 const transition_state = @import("transition_state.zig");
+const runtime_schema = @import("../storage/schema.zig");
+const schema_mod = @import("../schema/mod.zig");
+
+pub const default_database_name = "default";
+pub const default_namespace_name = "public";
+
+pub fn deriveDatabaseId(database_name: []const u8) u64 {
+    const id = std.hash.Wyhash.hash(0x44425441, database_name);
+    return if (id == 0) 1 else id;
+}
+
+pub fn deriveNamespaceId(database_id: u64, namespace_name: []const u8) u64 {
+    var hasher = std.hash.Wyhash.init(0x4e535041);
+    hasher.update(std.mem.asBytes(&database_id));
+    hasher.update(&[_]u8{0});
+    hasher.update(namespace_name);
+    const id = hasher.final();
+    return if (id == 0) 1 else id;
+}
+
+pub fn deriveTablespaceId(tablespace_name: []const u8) u64 {
+    const id = std.hash.Wyhash.hash(0x54535041, tablespace_name);
+    return if (id == 0) 1 else id;
+}
+
+pub fn deriveSequenceId(database_name: []const u8, namespace_name: []const u8, sequence_name: []const u8) u64 {
+    const database_id = deriveDatabaseId(database_name);
+    const namespace_id = deriveNamespaceId(database_id, namespace_name);
+    var hasher = std.hash.Wyhash.init(0x53455141);
+    hasher.update(std.mem.asBytes(&namespace_id));
+    hasher.update(&[_]u8{0});
+    hasher.update(sequence_name);
+    const id = hasher.final();
+    return if (id == 0) 1 else id;
+}
+
+pub fn sequenceInitialLastValueFromOptionsJson(alloc: std.mem.Allocator, options_json: []const u8) !i64 {
+    const start = (try sequenceOptionInteger(alloc, options_json, "restart_with")) orelse
+        try sequenceOptionIntegerOrDefault(alloc, options_json, "start_with", 1);
+    const increment = try sequenceOptionIntegerOrDefault(alloc, options_json, "increment_by", 1);
+    return std.math.sub(i64, start, increment) catch return error.InvalidSequenceCatalog;
+}
+
+pub fn sequenceIncrementFromOptionsJson(alloc: std.mem.Allocator, options_json: []const u8) !i64 {
+    return try sequenceOptionIntegerOrDefault(alloc, options_json, "increment_by", 1);
+}
+
+pub fn sequenceNextValueFromRecord(alloc: std.mem.Allocator, record: SequenceRecord) !i64 {
+    const increment = try sequenceIncrementFromOptionsJson(alloc, record.options_json);
+    const next_value = std.math.add(i64, record.last_value, increment) catch return error.SequenceExhausted;
+    if (increment > 0) {
+        if (try sequenceOptionInteger(alloc, record.options_json, "max_value")) |max_value| {
+            if (next_value > max_value) return error.SequenceExhausted;
+        }
+    } else if (increment < 0) {
+        if (try sequenceOptionInteger(alloc, record.options_json, "min_value")) |min_value| {
+            if (next_value < min_value) return error.SequenceExhausted;
+        }
+    } else return error.InvalidSequenceCatalog;
+    return next_value;
+}
+
+fn sequenceOptionIntegerOrDefault(alloc: std.mem.Allocator, options_json: []const u8, key: []const u8, default_value: i64) !i64 {
+    return (try sequenceOptionInteger(alloc, options_json, key)) orelse default_value;
+}
+
+fn sequenceOptionInteger(alloc: std.mem.Allocator, options_json: []const u8, key: []const u8) !?i64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, options_json, .{}) catch return error.InvalidSequenceCatalog;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSequenceCatalog;
+    const value = parsed.value.object.get(key) orelse return null;
+    return switch (value) {
+        .integer => |number| number,
+        .null => null,
+        else => error.InvalidSequenceCatalog,
+    };
+}
+
+fn sequenceIdentityAllocatorResetTargetIndex(targets: []const SequenceIdentityAllocatorReset, sequence_id: u64) ?usize {
+    for (targets, 0..) |target, index| {
+        if (target.sequence_id == sequence_id) return index;
+    }
+    return null;
+}
+
+fn sequenceIdForTableDefaultAlloc(
+    alloc: std.mem.Allocator,
+    table: TableRecord,
+    value_json: []const u8,
+) !u64 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidSequenceCatalog;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSequenceCatalog;
+    const sequence_value = parsed.value.object.get("sequence") orelse return error.InvalidSequenceCatalog;
+    if (sequence_value != .string or sequence_value.string.len == 0) return error.InvalidSequenceCatalog;
+    const database_name = if (parsed.value.object.get("database")) |database_value| blk: {
+        if (database_value != .string) return error.InvalidSequenceCatalog;
+        break :blk if (database_value.string.len == 0) table.database_name else database_value.string;
+    } else table.database_name;
+    const namespace_name = if (parsed.value.object.get("schema")) |schema_value| blk: {
+        if (schema_value != .string) return error.InvalidSequenceCatalog;
+        break :blk if (schema_value.string.len == 0) table.namespace_name else schema_value.string;
+    } else table.namespace_name;
+    return deriveSequenceId(database_name, namespace_name, sequence_value.string);
+}
+
+fn sequenceOwnedByTableColumn(
+    alloc: std.mem.Allocator,
+    sequence: SequenceRecord,
+    table: TableRecord,
+    runtime: runtime_schema.TableSchema,
+) !?[]const u8 {
+    if (!std.mem.eql(u8, sequence.database_name, table.database_name) or
+        !std.mem.eql(u8, sequence.namespace_name, table.namespace_name))
+    {
+        return null;
+    }
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, sequence.options_json, .{}) catch return error.InvalidSequenceCatalog;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidSequenceCatalog;
+    const owned_by = parsed.value.object.get("owned_by") orelse return null;
+    if (owned_by == .null) return null;
+    if (owned_by != .object) return error.InvalidSequenceCatalog;
+    const table_name = owned_by.object.get("table_name") orelse return error.InvalidSequenceCatalog;
+    const column_name = owned_by.object.get("column_name") orelse return error.InvalidSequenceCatalog;
+    if (table_name != .string or column_name != .string or
+        table_name.string.len == 0 or column_name.string.len == 0)
+    {
+        return error.InvalidSequenceCatalog;
+    }
+    if (!std.mem.eql(u8, table_name.string, table.name)) return null;
+    for (runtime.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, column_name.string)) return column.name;
+    }
+    return null;
+}
+
+pub const DatabaseRecord = struct {
+    database_id: u64,
+    name: []const u8,
+    settings_json: []const u8 = "{}",
+    tablespace_name: []const u8 = "",
+};
+
+pub const NamespaceRecord = struct {
+    namespace_id: u64,
+    database_id: u64,
+    name: []const u8,
+    tablespace_name: []const u8 = "",
+};
+
+pub const TablespaceRecord = struct {
+    tablespace_id: u64,
+    name: []const u8,
+    location_json: []const u8 = "null",
+    placement_policy_json: []const u8 = "{}",
+};
+
+pub const SequenceRecord = struct {
+    sequence_id: u64,
+    name: []const u8,
+    database_name: []const u8 = default_database_name,
+    namespace_name: []const u8 = default_namespace_name,
+    options_json: []const u8 = "{}",
+    last_value: i64 = 0,
+    last_allocation_id: u128 = 0,
+};
+
+pub const SequenceCompareAndSwapRequest = struct {
+    sequence_id: u64,
+    expected_last_value: i64,
+    next_last_value: i64,
+    allocation_id: u128,
+};
+
+pub const SequenceIdentityAllocatorReset = struct {
+    sequence_id: u64,
+    reset_last_value: i64,
+};
 
 pub const PlacementClass = enum {
     data,
@@ -28,16 +207,21 @@ pub const PlacementClass = enum {
 pub const TableRecord = struct {
     table_id: u64,
     name: []const u8,
+    database_name: []const u8 = default_database_name,
+    namespace_name: []const u8 = default_namespace_name,
     description: []const u8 = "",
     schema_json: []const u8 = "",
     read_schema_json: []const u8 = "",
+    foreign_key_validation_json: []const u8 = "{}",
     indexes_json: []const u8 = "{}",
     replication_sources_json: []const u8 = "[]",
     placement_role: []const u8 = "data",
+    tablespace_name: []const u8 = "",
     restore_backup_id: []const u8 = "",
     restore_location: []const u8 = "",
     desired_replica_count: u16 = 3,
     min_ranges: u32 = 1,
+    data_generation: u64 = 0,
 
     pub fn migrationState(self: *const TableRecord) TableMigrationState {
         return .{
@@ -82,6 +266,400 @@ pub const RangeRecord = struct {
     restore_location: []const u8 = "",
     restore_snapshot_path: []const u8 = "",
 };
+
+pub const foreign_key_ref_range_active = "active";
+pub const foreign_key_ref_range_splitting = "splitting";
+pub const foreign_key_ref_range_merging = "merging";
+pub const foreign_key_ref_range_rebuilding = "rebuilding";
+
+pub const ForeignKeyReferenceRangeRecord = struct {
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+    start_parent_key: []const u8,
+    end_parent_key: ?[]const u8 = null,
+    group_id: u64,
+    range_id: u64 = 0,
+    topology_epoch: u64 = 0,
+    state: []const u8 = foreign_key_ref_range_active,
+};
+
+pub const unique_constraint_range_active = "active";
+pub const unique_constraint_range_splitting = "splitting";
+pub const unique_constraint_range_merging = "merging";
+pub const unique_constraint_range_rebuilding = "rebuilding";
+
+pub const UniqueConstraintRangeRecord = struct {
+    table_id: u64,
+    constraint_name: []const u8,
+    start_encoded_value: []const u8,
+    end_encoded_value: ?[]const u8 = null,
+    group_id: u64,
+    range_id: u64 = 0,
+    topology_epoch: u64 = 0,
+    state: []const u8 = unique_constraint_range_active,
+};
+
+pub const secondary_index_rebuild_declared = "declared";
+pub const secondary_index_rebuild_building = "building";
+pub const secondary_index_rebuild_ready = "ready";
+pub const secondary_index_rebuild_invalid = "invalid";
+
+pub const SecondaryIndexRebuildRangeRecord = struct {
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    start_row_key: []const u8,
+    end_row_key: ?[]const u8 = null,
+    group_id: u64,
+    range_id: u64 = 0,
+    topology_epoch: u64 = 0,
+    state: []const u8 = secondary_index_rebuild_declared,
+    lease_owner: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempts: u32 = 0,
+    completed_row_count: u64 = 0,
+    progress_row_key: []const u8 = "",
+    last_error: []const u8 = "",
+};
+
+pub const schema_rewrite_declared = "declared";
+pub const schema_rewrite_running = "running";
+pub const schema_rewrite_ready = "ready";
+pub const schema_rewrite_invalid = "invalid";
+
+pub const SchemaRewriteExpression = struct {
+    target_column: []const u8,
+    expression: runtime_schema.RelationalRowsExpression,
+};
+
+pub const SchemaRewriteRename = struct {
+    old_path: []const u8,
+    new_path: []const u8,
+};
+
+pub const SchemaRewriteJobRecord = struct {
+    job_id: u64,
+    table_id: u64,
+    group_id: u64,
+    range_id: u64 = 0,
+    schema_generation: u64,
+    action: []const u8,
+    reason: []const u8,
+    start_row_key: []const u8,
+    end_row_key: ?[]const u8 = null,
+    state: []const u8 = schema_rewrite_declared,
+    target_column: []const u8 = "",
+    expression: ?runtime_schema.RelationalRowsExpression = null,
+    full_row_rewrite: bool = false,
+    rewrite_renames: []const SchemaRewriteRename = &.{},
+    rewrite_drops: []const []const u8 = &.{},
+    lease_owner: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempts: u32 = 0,
+    completed_row_count: u64 = 0,
+    progress_row_key: []const u8 = "",
+    last_error: []const u8 = "",
+};
+
+pub const SchemaRewriteJobBeginRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    now_ms: u64 = 0,
+    lease_expires_at_ms: u64,
+};
+
+pub const SchemaRewriteJobFinishRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
+pub const SchemaRewriteJobInvalidateRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    last_error: []const u8,
+};
+
+pub const TableCatalogUpdateWithSchemaRewriteJobsRequest = struct {
+    table: TableRecord,
+    schema_rewrite_jobs: []const SchemaRewriteJobRecord = &.{},
+};
+
+pub const TableCatalogBatchUpdateWithSchemaRewriteJobsRequest = struct {
+    tables: []const TableRecord,
+    schema_rewrite_jobs: []const SchemaRewriteJobRecord = &.{},
+};
+
+pub const TableCatalogDropWithSchemaRewriteJobsRequest = struct {
+    table_id: u64,
+    sequence_ids: []const u64 = &.{},
+    range_group_ids: []const u64 = &.{},
+    table_updates: []const TableRecord = &.{},
+    schema_rewrite_jobs: []const SchemaRewriteJobRecord = &.{},
+};
+
+pub const table_emptying_declared = "declared";
+pub const table_emptying_running = "running";
+pub const table_emptying_ready = "ready";
+pub const table_emptying_invalid = "invalid";
+
+pub const TableEmptyingJobRecord = struct {
+    job_id: u64,
+    table_id: u64,
+    group_id: u64,
+    range_id: u64 = 0,
+    schema_generation: u64,
+    data_generation: u64 = 0,
+    barrier_id: u64 = 0,
+    start_row_key: []const u8 = "",
+    end_row_key: ?[]const u8 = null,
+    affected_table_ids: []const u64 = &.{},
+    restart_identity: bool = false,
+    cascade: bool = false,
+    state: []const u8 = table_emptying_declared,
+    lease_owner: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempts: u32 = 0,
+    completed_row_count: u64 = 0,
+    progress_row_key: []const u8 = "",
+    last_error: []const u8 = "",
+};
+
+pub const TableEmptyingJobBeginRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    now_ms: u64 = 0,
+    lease_expires_at_ms: u64,
+};
+
+pub const TableEmptyingJobFinishRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
+pub const TableEmptyingJobInvalidateRequest = struct {
+    job_id: u64,
+    lease_owner: []const u8,
+    last_error: []const u8,
+};
+
+pub const TableEmptyingBarrierPromotion = struct {
+    table_id: u64,
+    target_generation: u64,
+};
+
+pub const TableEmptyingBarrierPromotionRequest = struct {
+    job_ids: []const u64 = &.{},
+    promotions: []const TableEmptyingBarrierPromotion = &.{},
+};
+
+pub const TableEmptyingIdentityAllocatorResetRequest = struct {
+    barrier_id: u64,
+    affected_table_ids: []const u64,
+    job_ids: []const u64,
+    cascade: bool = false,
+};
+
+pub const ForeignKeyReferenceRangeSelector = struct {
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+    start_parent_key: []const u8,
+    range_id: u64 = 0,
+};
+
+pub const ForeignKeyReferenceRangeSplitRequest = struct {
+    selector: ForeignKeyReferenceRangeSelector,
+    split_parent_key: []const u8,
+    left_group_id: u64,
+    right_group_id: u64,
+};
+
+pub const ForeignKeyReferenceRangeMergeRequest = struct {
+    left_selector: ForeignKeyReferenceRangeSelector,
+    right_start_parent_key: []const u8,
+    merged_group_id: u64,
+};
+
+pub const UniqueConstraintRangeSelector = struct {
+    table_id: u64,
+    constraint_name: []const u8,
+    start_encoded_value: []const u8,
+    range_id: u64 = 0,
+};
+
+pub const SecondaryIndexRebuildRangeSelector = struct {
+    table_id: u64,
+    index_name: []const u8,
+    index_generation: u64,
+    start_row_key: []const u8,
+};
+
+pub const SecondaryIndexRebuildRangeBeginRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    lease_owner: []const u8,
+    now_ms: u64 = 0,
+    lease_expires_at_ms: u64,
+};
+
+pub const SecondaryIndexRebuildRangeFinishRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    completed_row_count: u64,
+    progress_row_key: []const u8,
+};
+
+pub const SecondaryIndexRebuildRangeInvalidateRequest = struct {
+    selector: SecondaryIndexRebuildRangeSelector,
+    last_error: []const u8,
+};
+
+pub const SecondaryIndexReadyPromotionRequest = struct {
+    table_id: u64,
+    index_name: []const u8,
+    expected_index_generation: u64,
+    expected_schema_json: []const u8,
+    promoted_table: TableRecord,
+};
+
+pub const TableSchemaCompareAndSwapRequest = struct {
+    table_id: u64,
+    expected_schema_json: []const u8,
+    promoted_table: TableRecord,
+};
+
+pub const UniqueConstraintRangeSplitRequest = struct {
+    selector: UniqueConstraintRangeSelector,
+    split_encoded_value: []const u8,
+    left_group_id: u64,
+    right_group_id: u64,
+};
+
+pub const UniqueConstraintRangeMergeRequest = struct {
+    left_selector: UniqueConstraintRangeSelector,
+    right_start_encoded_value: []const u8,
+    merged_group_id: u64,
+};
+
+pub fn foreignKeyReferenceRangeStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, foreign_key_ref_range_active) or
+        std.mem.eql(u8, state, foreign_key_ref_range_splitting) or
+        std.mem.eql(u8, state, foreign_key_ref_range_merging) or
+        std.mem.eql(u8, state, foreign_key_ref_range_rebuilding);
+}
+
+pub fn foreignKeyReferenceRangeRoutable(record: ForeignKeyReferenceRangeRecord) bool {
+    return std.mem.eql(u8, record.state, foreign_key_ref_range_active);
+}
+
+pub fn uniqueConstraintRangeStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, unique_constraint_range_active) or
+        std.mem.eql(u8, state, unique_constraint_range_splitting) or
+        std.mem.eql(u8, state, unique_constraint_range_merging) or
+        std.mem.eql(u8, state, unique_constraint_range_rebuilding);
+}
+
+pub fn uniqueConstraintRangeRoutable(record: UniqueConstraintRangeRecord) bool {
+    return std.mem.eql(u8, record.state, unique_constraint_range_active);
+}
+
+pub fn secondaryIndexRebuildRangeStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, secondary_index_rebuild_declared) or
+        std.mem.eql(u8, state, secondary_index_rebuild_building) or
+        std.mem.eql(u8, state, secondary_index_rebuild_ready) or
+        std.mem.eql(u8, state, secondary_index_rebuild_invalid);
+}
+
+pub fn secondaryIndexRebuildRangeComplete(record: SecondaryIndexRebuildRangeRecord) bool {
+    return std.mem.eql(u8, record.state, secondary_index_rebuild_ready);
+}
+
+pub fn schemaRewriteJobStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, schema_rewrite_declared) or
+        std.mem.eql(u8, state, schema_rewrite_running) or
+        std.mem.eql(u8, state, schema_rewrite_ready) or
+        std.mem.eql(u8, state, schema_rewrite_invalid);
+}
+
+pub fn schemaRewriteJobComplete(record: SchemaRewriteJobRecord) bool {
+    return std.mem.eql(u8, record.state, schema_rewrite_ready);
+}
+
+pub fn tableEmptyingJobStateValid(state: []const u8) bool {
+    return std.mem.eql(u8, state, table_emptying_declared) or
+        std.mem.eql(u8, state, table_emptying_running) or
+        std.mem.eql(u8, state, table_emptying_ready) or
+        std.mem.eql(u8, state, table_emptying_invalid);
+}
+
+pub fn tableEmptyingJobComplete(record: TableEmptyingJobRecord) bool {
+    return std.mem.eql(u8, record.state, table_emptying_ready);
+}
+
+pub fn tableEmptyingAffectedTableIdsValid(primary_table_id: u64, affected_table_ids: []const u64) bool {
+    if (primary_table_id == 0 or affected_table_ids.len == 0) return false;
+    var includes_primary = false;
+    for (affected_table_ids, 0..) |table_id, i| {
+        if (table_id == 0) return false;
+        if (table_id == primary_table_id) includes_primary = true;
+        for (affected_table_ids[0..i]) |prior| {
+            if (prior == table_id) return false;
+        }
+    }
+    return includes_primary;
+}
+
+pub fn tableEmptyingAffectedTableIdsCanonicalSetValid(affected_table_ids: []const u64) bool {
+    if (affected_table_ids.len == 0) return false;
+    for (affected_table_ids, 0..) |table_id, i| {
+        if (table_id == 0) return false;
+        if (i != 0 and affected_table_ids[i - 1] >= table_id) return false;
+    }
+    return true;
+}
+
+pub fn tableEmptyingAffectedTableIdsCanonicalValid(primary_table_id: u64, affected_table_ids: []const u64) bool {
+    return tableEmptyingAffectedTableIdsCanonicalSetValid(affected_table_ids) and
+        tableEmptyingAffectedTableIdsValid(primary_table_id, affected_table_ids);
+}
+
+fn hashTableEmptyingJobU64(hasher: *std.hash.Wyhash, value: u64) void {
+    var raw: [8]u8 = undefined;
+    std.mem.writeInt(u64, &raw, value, .little);
+    hasher.update(&raw);
+}
+
+fn hashTableEmptyingJobBool(hasher: *std.hash.Wyhash, value: bool) void {
+    hasher.update(if (value) "\x01" else "\x00");
+}
+
+pub fn stableTableEmptyingJobId(record: TableEmptyingJobRecord) u64 {
+    var hasher = std.hash.Wyhash.init(0x5445_4d50_5459_2026);
+    hashTableEmptyingJobU64(&hasher, record.table_id);
+    hashTableEmptyingJobU64(&hasher, record.group_id);
+    hashTableEmptyingJobU64(&hasher, record.range_id);
+    hashTableEmptyingJobU64(&hasher, record.schema_generation);
+    hashTableEmptyingJobU64(&hasher, record.data_generation);
+    hashTableEmptyingJobU64(&hasher, record.barrier_id);
+    hasher.update(record.start_row_key);
+    hasher.update(&[_]u8{0});
+    if (record.end_row_key) |end_row_key| hasher.update(end_row_key);
+    hasher.update(&[_]u8{0});
+    hashTableEmptyingJobU64(&hasher, @intCast(record.affected_table_ids.len));
+    for (record.affected_table_ids) |table_id| hashTableEmptyingJobU64(&hasher, table_id);
+    hashTableEmptyingJobBool(&hasher, record.restart_identity);
+    hashTableEmptyingJobBool(&hasher, record.cascade);
+    const id = hasher.final();
+    return if (id == 0) 1 else id;
+}
+
+pub fn schemaRewriteGenerationForSchemaJson(schema_json: []const u8) u64 {
+    const value = std.hash.Wyhash.hash(0x53434a47, schema_json);
+    return if (value == 0) 1 else value;
+}
 
 pub const node_lifecycle_active = "active";
 pub const node_lifecycle_draining = "draining";
@@ -305,8 +883,17 @@ pub const MergeIntent = struct {
 
 pub const TableManager = struct {
     alloc: std.mem.Allocator,
+    databases: std.AutoHashMapUnmanaged(u64, DatabaseRecord) = .empty,
+    namespaces: std.AutoHashMapUnmanaged(u64, NamespaceRecord) = .empty,
+    tablespaces: std.AutoHashMapUnmanaged(u64, TablespaceRecord) = .empty,
+    sequences: std.AutoHashMapUnmanaged(u64, SequenceRecord) = .empty,
     tables: std.AutoHashMapUnmanaged(u64, TableRecord) = .empty,
     ranges: std.AutoHashMapUnmanaged(u64, RangeRecord) = .empty,
+    foreign_key_ref_ranges: std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord) = .empty,
+    unique_constraint_ranges: std.ArrayListUnmanaged(UniqueConstraintRangeRecord) = .empty,
+    secondary_index_rebuild_ranges: std.ArrayListUnmanaged(SecondaryIndexRebuildRangeRecord) = .empty,
+    schema_rewrite_jobs: std.ArrayListUnmanaged(SchemaRewriteJobRecord) = .empty,
+    table_emptying_jobs: std.ArrayListUnmanaged(TableEmptyingJobRecord) = .empty,
     split_intents: std.AutoHashMapUnmanaged(u64, SplitIntent) = .empty,
     merge_intents: std.AutoHashMapUnmanaged(u64, MergeIntent) = .empty,
 
@@ -315,6 +902,22 @@ pub const TableManager = struct {
     }
 
     pub fn deinit(self: *TableManager) void {
+        var database_it = self.databases.valueIterator();
+        while (database_it.next()) |database| freeDatabase(self.alloc, database.*);
+        self.databases.deinit(self.alloc);
+
+        var namespace_it = self.namespaces.valueIterator();
+        while (namespace_it.next()) |namespace| freeNamespace(self.alloc, namespace.*);
+        self.namespaces.deinit(self.alloc);
+
+        var tablespace_it = self.tablespaces.valueIterator();
+        while (tablespace_it.next()) |tablespace| freeTablespace(self.alloc, tablespace.*);
+        self.tablespaces.deinit(self.alloc);
+
+        var sequence_it = self.sequences.valueIterator();
+        while (sequence_it.next()) |sequence| freeSequence(self.alloc, sequence.*);
+        self.sequences.deinit(self.alloc);
+
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
         self.tables.deinit(self.alloc);
@@ -322,6 +925,21 @@ pub const TableManager = struct {
         var range_it = self.ranges.valueIterator();
         while (range_it.next()) |range| freeRange(self.alloc, range.*);
         self.ranges.deinit(self.alloc);
+
+        for (self.foreign_key_ref_ranges.items) |record| freeForeignKeyReferenceRange(self.alloc, record);
+        self.foreign_key_ref_ranges.deinit(self.alloc);
+
+        for (self.unique_constraint_ranges.items) |record| freeUniqueConstraintRange(self.alloc, record);
+        self.unique_constraint_ranges.deinit(self.alloc);
+
+        for (self.secondary_index_rebuild_ranges.items) |record| freeSecondaryIndexRebuildRange(self.alloc, record);
+        self.secondary_index_rebuild_ranges.deinit(self.alloc);
+
+        for (self.schema_rewrite_jobs.items) |record| freeSchemaRewriteJob(self.alloc, record);
+        self.schema_rewrite_jobs.deinit(self.alloc);
+
+        for (self.table_emptying_jobs.items) |record| freeTableEmptyingJob(self.alloc, record);
+        self.table_emptying_jobs.deinit(self.alloc);
 
         var split_it = self.split_intents.valueIterator();
         while (split_it.next()) |intent| freeSplitIntent(self.alloc, intent.*);
@@ -334,7 +952,124 @@ pub const TableManager = struct {
         self.* = undefined;
     }
 
+    pub fn ensureDefaultCatalog(self: *TableManager) !void {
+        const database_id = deriveDatabaseId(default_database_name);
+        try self.upsertDatabase(.{
+            .database_id = database_id,
+            .name = default_database_name,
+        });
+        try self.upsertNamespace(.{
+            .namespace_id = deriveNamespaceId(database_id, default_namespace_name),
+            .database_id = database_id,
+            .name = default_namespace_name,
+        });
+    }
+
+    pub fn upsertDatabase(self: *TableManager, record: DatabaseRecord) !void {
+        const owned = try cloneDatabase(self.alloc, record);
+        errdefer freeDatabase(self.alloc, owned);
+        if (self.databases.getPtr(record.database_id)) |existing| {
+            freeDatabase(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.databases.put(self.alloc, record.database_id, owned);
+    }
+
+    pub fn upsertNamespace(self: *TableManager, record: NamespaceRecord) !void {
+        if (!self.databases.contains(record.database_id)) return error.UnknownDatabase;
+        const owned = try cloneNamespace(self.alloc, record);
+        errdefer freeNamespace(self.alloc, owned);
+        if (self.namespaces.getPtr(record.namespace_id)) |existing| {
+            freeNamespace(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.namespaces.put(self.alloc, record.namespace_id, owned);
+    }
+
+    pub fn upsertTablespace(self: *TableManager, record: TablespaceRecord) !void {
+        const owned = try cloneTablespace(self.alloc, record);
+        errdefer freeTablespace(self.alloc, owned);
+        if (self.tablespaces.getPtr(record.tablespace_id)) |existing| {
+            freeTablespace(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.tablespaces.put(self.alloc, record.tablespace_id, owned);
+    }
+
+    pub fn upsertSequence(self: *TableManager, record: SequenceRecord) !void {
+        try self.ensureCatalogForObject(record.database_name, record.namespace_name);
+        if (record.sequence_id != deriveSequenceId(record.database_name, record.namespace_name, record.name)) return error.InvalidSequenceCatalog;
+        const owned = try cloneSequence(self.alloc, record);
+        errdefer freeSequence(self.alloc, owned);
+        if (self.sequences.getPtr(record.sequence_id)) |existing| {
+            freeSequence(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.sequences.put(self.alloc, record.sequence_id, owned);
+    }
+
+    pub fn removeSequence(self: *TableManager, sequence_id: u64) !SequenceRecord {
+        const kv = self.sequences.fetchRemove(sequence_id) orelse return error.SequenceNotFound;
+        return kv.value;
+    }
+
+    pub fn allocateSequenceValue(
+        self: *TableManager,
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) !i64 {
+        const sequence_id = deriveSequenceId(database_name, namespace_name, sequence_name);
+        const record = self.sequences.getPtr(sequence_id) orelse return error.SequenceNotFound;
+        const next_value = try sequenceNextValueFromRecord(alloc, record.*);
+        record.last_value = next_value;
+        return next_value;
+    }
+
+    pub fn tableEmptyingIdentityAllocatorResetTargetsAlloc(
+        self: *TableManager,
+        alloc: std.mem.Allocator,
+        request: TableEmptyingIdentityAllocatorResetRequest,
+    ) ![]SequenceIdentityAllocatorReset {
+        try self.validateTableEmptyingIdentityAllocatorReset(request);
+
+        var targets = std.ArrayListUnmanaged(SequenceIdentityAllocatorReset).empty;
+        errdefer targets.deinit(alloc);
+
+        for (request.affected_table_ids) |table_id| {
+            const table = self.tables.get(table_id) orelse return error.UnknownTable;
+            try self.appendSequenceIdentityAllocatorResetTargetsForTableAlloc(alloc, &targets, table);
+        }
+
+        return try targets.toOwnedSlice(alloc);
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(
+        self: *TableManager,
+        alloc: std.mem.Allocator,
+        request: TableEmptyingIdentityAllocatorResetRequest,
+    ) !usize {
+        const targets = try self.tableEmptyingIdentityAllocatorResetTargetsAlloc(alloc, request);
+        defer alloc.free(targets);
+        var reset_count: usize = 0;
+        for (targets) |target| {
+            const record = self.sequences.getPtr(target.sequence_id) orelse return error.SequenceNotFound;
+            if (record.last_value != target.reset_last_value or record.last_allocation_id != 0) {
+                record.last_value = target.reset_last_value;
+                record.last_allocation_id = 0;
+                reset_count += 1;
+            }
+        }
+        return reset_count;
+    }
+
     pub fn upsertTable(self: *TableManager, record: TableRecord) !void {
+        try self.ensureCatalogForTable(record);
         const owned = try cloneTable(self.alloc, record);
         errdefer freeTable(self.alloc, owned);
         if (self.tables.getPtr(record.table_id)) |existing| {
@@ -345,6 +1080,173 @@ pub const TableManager = struct {
         try self.tables.put(self.alloc, record.table_id, owned);
     }
 
+    fn appendSequenceIdentityAllocatorResetTargetsForTableAlloc(
+        self: *TableManager,
+        alloc: std.mem.Allocator,
+        targets: *std.ArrayListUnmanaged(SequenceIdentityAllocatorReset),
+        table: TableRecord,
+    ) !void {
+        var parsed_schema = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest => return,
+            else => return err,
+        };
+        defer parsed_schema.deinit(alloc);
+        const runtime = schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema) catch |err| switch (err) {
+            error.InvalidSchemaUpdateRequest => return,
+            else => return err,
+        };
+        defer runtime_schema.freeSchema(alloc, runtime);
+
+        for (runtime.relational_columns) |column| {
+            const default_value = column.default_value orelse continue;
+            if (default_value.kind != .sequence_next) continue;
+            const sequence_id = try sequenceIdForTableDefaultAlloc(alloc, table, default_value.value_json);
+            if (sequenceIdentityAllocatorResetTargetIndex(targets.items, sequence_id) != null) continue;
+            const sequence = self.sequences.get(sequence_id) orelse return error.SequenceNotFound;
+            try targets.append(alloc, .{
+                .sequence_id = sequence_id,
+                .reset_last_value = try sequenceInitialLastValueFromOptionsJson(alloc, sequence.options_json),
+            });
+        }
+
+        var sequence_it = self.sequences.valueIterator();
+        while (sequence_it.next()) |sequence| {
+            if ((try sequenceOwnedByTableColumn(alloc, sequence.*, table, runtime)) == null) continue;
+            if (sequenceIdentityAllocatorResetTargetIndex(targets.items, sequence.sequence_id) != null) continue;
+            try targets.append(alloc, .{
+                .sequence_id = sequence.sequence_id,
+                .reset_last_value = try sequenceInitialLastValueFromOptionsJson(alloc, sequence.options_json),
+            });
+        }
+    }
+
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(self: *TableManager, request: TableCatalogUpdateWithSchemaRewriteJobsRequest) !void {
+        try self.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(.{
+            .tables = &[_]TableRecord{request.table},
+            .schema_rewrite_jobs = request.schema_rewrite_jobs,
+        });
+    }
+
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(self: *TableManager, request: TableCatalogBatchUpdateWithSchemaRewriteJobsRequest) !void {
+        try self.validateTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+
+        for (request.tables) |table| try self.upsertTable(table);
+        for (request.schema_rewrite_jobs) |job| try self.upsertSchemaRewriteJob(job);
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(self: *TableManager, request: TableCatalogDropWithSchemaRewriteJobsRequest) !void {
+        try self.validateTableCatalogDropWithSchemaRewriteJobs(request);
+        if (request.table_updates.len > 0) {
+            try self.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(.{
+                .tables = request.table_updates,
+                .schema_rewrite_jobs = request.schema_rewrite_jobs,
+            });
+        } else if (request.schema_rewrite_jobs.len > 0) {
+            return error.InvalidSchemaRewriteJob;
+        }
+        for (request.range_group_ids) |group_id| _ = self.removeRange(group_id);
+        for (request.sequence_ids) |sequence_id| {
+            const removed = try self.removeSequence(sequence_id);
+            freeSequence(self.alloc, removed);
+        }
+        if (!self.removeTable(request.table_id)) return error.UnknownTable;
+    }
+
+    fn validateTableCatalogBatchUpdateWithSchemaRewriteJobs(self: *TableManager, request: TableCatalogBatchUpdateWithSchemaRewriteJobsRequest) !void {
+        if (request.tables.len == 0) return error.UnknownTable;
+        var validator = TableManager.init(self.alloc);
+        defer validator.deinit();
+
+        for (request.tables, 0..) |table, i| {
+            if (table.table_id == 0) return error.UnknownTable;
+            if (schemaRewriteGenerationForSchemaJson(table.schema_json) == 0) return error.InvalidSchemaRewriteGeneration;
+            for (request.tables[0..i]) |previous| {
+                if (previous.table_id == table.table_id) return error.UnknownTable;
+            }
+            try validator.upsertTable(table);
+        }
+        for (request.schema_rewrite_jobs, 0..) |job, i| {
+            try validateSchemaRewriteJobForBatchUpdate(request.tables, job);
+            try validator.upsertSchemaRewriteJob(job);
+            for (request.schema_rewrite_jobs[0..i]) |previous| {
+                if (previous.job_id == job.job_id) return error.InvalidSchemaRewriteJob;
+            }
+        }
+    }
+
+    fn validateTableCatalogDropWithSchemaRewriteJobs(self: *TableManager, request: TableCatalogDropWithSchemaRewriteJobsRequest) !void {
+        if (request.table_id == 0) return error.UnknownTable;
+        if (!self.tables.contains(request.table_id)) return error.UnknownTable;
+        if (request.table_updates.len > 0 or request.schema_rewrite_jobs.len > 0) {
+            try self.validateTableCatalogBatchUpdateWithSchemaRewriteJobs(.{
+                .tables = request.table_updates,
+                .schema_rewrite_jobs = request.schema_rewrite_jobs,
+            });
+        }
+        for (request.table_updates) |table| {
+            if (table.table_id == request.table_id) return error.UnknownTable;
+        }
+        for (request.sequence_ids, 0..) |sequence_id, i| {
+            if (!self.sequences.contains(sequence_id)) return error.SequenceNotFound;
+            for (request.sequence_ids[0..i]) |previous| {
+                if (previous == sequence_id) return error.SequenceNotFound;
+            }
+        }
+        for (request.range_group_ids, 0..) |group_id, i| {
+            const range = self.ranges.get(group_id) orelse return error.UnknownRange;
+            if (range.table_id != request.table_id) return error.UnknownRange;
+            for (request.range_group_ids[0..i]) |previous| {
+                if (previous == group_id) return error.UnknownRange;
+            }
+        }
+        var range_it = self.ranges.valueIterator();
+        while (range_it.next()) |range| {
+            if (range.table_id != request.table_id) continue;
+            if (std.mem.indexOfScalar(u64, request.range_group_ids, range.group_id) == null) return error.UnknownRange;
+        }
+    }
+
+    fn validateSchemaRewriteJobForTableUpdate(table_id: u64, schema_generation: u64, record: SchemaRewriteJobRecord) !void {
+        if (record.table_id != table_id) return error.InvalidSchemaRewriteJob;
+        if (record.schema_generation != schema_generation) return error.InvalidSchemaRewriteGeneration;
+        try group_ids.requireDataGroupId(record.group_id);
+        if (record.job_id == 0) return error.InvalidSchemaRewriteJob;
+    }
+
+    fn validateSchemaRewriteJobForBatchUpdate(tables: []const TableRecord, record: SchemaRewriteJobRecord) !void {
+        for (tables) |table| {
+            if (record.table_id != table.table_id) continue;
+            return try validateSchemaRewriteJobForTableUpdate(
+                table.table_id,
+                schemaRewriteGenerationForSchemaJson(table.schema_json),
+                record,
+            );
+        }
+        return error.InvalidSchemaRewriteJob;
+    }
+
+    fn ensureCatalogForTable(self: *TableManager, record: TableRecord) !void {
+        try self.ensureCatalogForObject(record.database_name, record.namespace_name);
+    }
+
+    fn ensureCatalogForObject(self: *TableManager, database_name: []const u8, namespace_name: []const u8) !void {
+        const database_id = deriveDatabaseId(database_name);
+        if (!self.databases.contains(database_id)) {
+            try self.upsertDatabase(.{
+                .database_id = database_id,
+                .name = database_name,
+            });
+        }
+        const namespace_id = deriveNamespaceId(database_id, namespace_name);
+        if (!self.namespaces.contains(namespace_id)) {
+            try self.upsertNamespace(.{
+                .namespace_id = namespace_id,
+                .database_id = database_id,
+                .name = namespace_name,
+            });
+        }
+    }
+
     pub fn upsertRange(self: *TableManager, record: RangeRecord) !void {
         try group_ids.requireDataGroupId(record.group_id);
         const table = self.tables.get(record.table_id) orelse return error.UnknownTable;
@@ -352,6 +1254,9 @@ pub const TableManager = struct {
 
         var normalized = record;
         if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.secondaryIndexRebuildRangeGroupExists(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
         const owned = try cloneRange(self.alloc, normalized);
         errdefer freeRange(self.alloc, owned);
         if (self.ranges.getPtr(record.group_id)) |existing| {
@@ -362,6 +1267,162 @@ pub const TableManager = struct {
         try self.ranges.put(self.alloc, record.group_id, owned);
     }
 
+    pub fn upsertForeignKeyReferenceRange(self: *TableManager, record: ForeignKeyReferenceRangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.child_table_id)) return error.UnknownChildTable;
+        if (!self.tables.contains(record.parent_table_id)) return error.UnknownParentTable;
+        if (record.constraint_name.len == 0) return error.InvalidForeignKeyConstraint;
+        if (!foreignKeyReferenceRangeStateValid(record.state)) return error.InvalidForeignKeyReferenceRangeState;
+        if (self.ranges.contains(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.secondaryIndexRebuildRangeGroupExists(record.group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (record.end_parent_key) |end_parent_key| {
+            if (std.mem.order(u8, record.start_parent_key, end_parent_key) != .lt) return error.InvalidForeignKeyReferenceRange;
+        }
+        for (self.foreign_key_ref_ranges.items) |existing| {
+            if (foreignKeyReferenceRangeIdentityMatches(existing, record)) continue;
+            if (!foreignKeyReferenceRangeConstraintMatches(existing, record)) continue;
+            if (foreignKeyReferenceRangesOverlap(existing, record)) return error.ForeignKeyReferenceRangeOverlap;
+        }
+
+        var normalized = record;
+        if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        const owned = try cloneForeignKeyReferenceRange(self.alloc, normalized);
+        errdefer freeForeignKeyReferenceRange(self.alloc, owned);
+        for (self.foreign_key_ref_ranges.items) |*existing| {
+            if (!foreignKeyReferenceRangeIdentityMatches(existing.*, record)) continue;
+            freeForeignKeyReferenceRange(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.foreign_key_ref_ranges.append(self.alloc, owned);
+    }
+
+    pub fn upsertUniqueConstraintRange(self: *TableManager, record: UniqueConstraintRangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.constraint_name.len == 0) return error.InvalidUniqueConstraint;
+        if (!uniqueConstraintRangeStateValid(record.state)) return error.InvalidUniqueConstraintRangeState;
+        if (self.ranges.contains(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.secondaryIndexRebuildRangeGroupExists(record.group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (record.end_encoded_value) |end_encoded_value| {
+            if (std.mem.order(u8, record.start_encoded_value, end_encoded_value) != .lt) return error.InvalidUniqueConstraintRange;
+        }
+        for (self.unique_constraint_ranges.items) |existing| {
+            if (uniqueConstraintRangeIdentityMatches(existing, record)) continue;
+            if (existing.group_id == record.group_id) return error.UniqueConstraintRangeGroupCollision;
+            if (!uniqueConstraintRangeConstraintMatches(existing, record)) continue;
+            if (uniqueConstraintRangesOverlap(existing, record)) return error.UniqueConstraintRangeOverlap;
+        }
+
+        var normalized = record;
+        if (normalized.range_id == 0) normalized.range_id = normalized.group_id;
+        const owned = try cloneUniqueConstraintRange(self.alloc, normalized);
+        errdefer freeUniqueConstraintRange(self.alloc, owned);
+        for (self.unique_constraint_ranges.items) |*existing| {
+            if (!uniqueConstraintRangeIdentityMatches(existing.*, record)) continue;
+            freeUniqueConstraintRange(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.unique_constraint_ranges.append(self.alloc, owned);
+    }
+
+    pub fn upsertSecondaryIndexRebuildRange(self: *TableManager, record: SecondaryIndexRebuildRangeRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.index_name.len == 0) return error.InvalidSecondaryIndex;
+        if (record.index_generation == 0) return error.InvalidSecondaryIndexGeneration;
+        if (!secondaryIndexRebuildRangeStateValid(record.state)) return error.InvalidSecondaryIndexRebuildRangeState;
+        if (self.ranges.contains(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(record.group_id)) return error.SecondaryIndexRebuildRangeGroupCollision;
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidSecondaryIndexRebuildRange;
+        }
+        for (self.secondary_index_rebuild_ranges.items) |existing| {
+            if (secondaryIndexRebuildRangeIdentityMatches(existing, record)) continue;
+            if (existing.group_id == record.group_id) return error.SecondaryIndexRebuildRangeGroupCollision;
+            if (!secondaryIndexRebuildRangeIndexMatches(existing, record)) continue;
+            if (secondaryIndexRebuildRangesOverlap(existing, record)) return error.SecondaryIndexRebuildRangeOverlap;
+        }
+
+        const owned = try cloneSecondaryIndexRebuildRange(self.alloc, record);
+        errdefer freeSecondaryIndexRebuildRange(self.alloc, owned);
+        for (self.secondary_index_rebuild_ranges.items) |*existing| {
+            if (!secondaryIndexRebuildRangeIdentityMatches(existing.*, record)) continue;
+            freeSecondaryIndexRebuildRange(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.secondary_index_rebuild_ranges.append(self.alloc, owned);
+    }
+
+    pub fn upsertSchemaRewriteJob(self: *TableManager, record: SchemaRewriteJobRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.job_id == 0) return error.InvalidSchemaRewriteJob;
+        if (record.schema_generation == 0) return error.InvalidSchemaRewriteGeneration;
+        if (record.action.len == 0 or record.reason.len == 0) return error.InvalidSchemaRewriteJob;
+        if (!schemaRewriteJobStateValid(record.state)) return error.InvalidSchemaRewriteJobState;
+        const has_expression_rewrite = record.expression != null or record.target_column.len != 0;
+        const has_row_rewrite = record.rewrite_renames.len != 0 or record.rewrite_drops.len != 0;
+        if (has_expression_rewrite) {
+            if (record.expression == null or record.target_column.len == 0) return error.InvalidSchemaRewriteExpression;
+            if (has_row_rewrite or record.full_row_rewrite) return error.InvalidSchemaRewriteExpression;
+        } else if (record.full_row_rewrite and has_row_rewrite) {
+            return error.InvalidSchemaRewriteExpression;
+        } else if (std.mem.eql(u8, record.action, "rewrite") and std.mem.eql(u8, record.reason, "row_images") and !has_row_rewrite and !record.full_row_rewrite) {
+            return error.InvalidSchemaRewriteExpression;
+        }
+        for (record.rewrite_renames) |rename| {
+            if (rename.old_path.len == 0 or rename.new_path.len == 0) return error.InvalidSchemaRewriteExpression;
+            if (std.mem.eql(u8, rename.old_path, rename.new_path)) return error.InvalidSchemaRewriteExpression;
+        }
+        for (record.rewrite_drops) |drop| {
+            if (drop.len == 0) return error.InvalidSchemaRewriteExpression;
+        }
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidSchemaRewriteJobRange;
+        }
+
+        const owned = try cloneSchemaRewriteJob(self.alloc, record);
+        errdefer freeSchemaRewriteJob(self.alloc, owned);
+        for (self.schema_rewrite_jobs.items) |*existing| {
+            if (existing.job_id != record.job_id) continue;
+            freeSchemaRewriteJob(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.schema_rewrite_jobs.append(self.alloc, owned);
+    }
+
+    pub fn upsertTableEmptyingJob(self: *TableManager, record: TableEmptyingJobRecord) !void {
+        try group_ids.requireDataGroupId(record.group_id);
+        if (!self.tables.contains(record.table_id)) return error.UnknownTable;
+        if (record.job_id == 0) return error.InvalidTableEmptyingJob;
+        if (record.schema_generation == 0) return error.InvalidTableEmptyingGeneration;
+        if (!tableEmptyingJobStateValid(record.state)) return error.InvalidTableEmptyingJobState;
+        if (record.end_row_key) |end_row_key| {
+            if (std.mem.order(u8, record.start_row_key, end_row_key) != .lt) return error.InvalidTableEmptyingJob;
+        }
+        if (!tableEmptyingAffectedTableIdsCanonicalValid(record.table_id, record.affected_table_ids)) return error.InvalidTableEmptyingJob;
+        for (record.affected_table_ids) |table_id| {
+            if (!self.tables.contains(table_id)) return error.UnknownTable;
+        }
+
+        const owned = try cloneTableEmptyingJob(self.alloc, record);
+        errdefer freeTableEmptyingJob(self.alloc, owned);
+        for (self.table_emptying_jobs.items) |*existing| {
+            if (existing.job_id != record.job_id) continue;
+            freeTableEmptyingJob(self.alloc, existing.*);
+            existing.* = owned;
+            return;
+        }
+        try self.table_emptying_jobs.append(self.alloc, owned);
+    }
+
     pub fn clearTopology(self: *TableManager) void {
         var table_it = self.tables.valueIterator();
         while (table_it.next()) |table| freeTable(self.alloc, table.*);
@@ -370,12 +1431,75 @@ pub const TableManager = struct {
         var range_it = self.ranges.valueIterator();
         while (range_it.next()) |range| freeRange(self.alloc, range.*);
         self.ranges.clearRetainingCapacity();
+
+        for (self.foreign_key_ref_ranges.items) |record| freeForeignKeyReferenceRange(self.alloc, record);
+        self.foreign_key_ref_ranges.clearRetainingCapacity();
+
+        for (self.unique_constraint_ranges.items) |record| freeUniqueConstraintRange(self.alloc, record);
+        self.unique_constraint_ranges.clearRetainingCapacity();
+
+        for (self.secondary_index_rebuild_ranges.items) |record| freeSecondaryIndexRebuildRange(self.alloc, record);
+        self.secondary_index_rebuild_ranges.clearRetainingCapacity();
+
+        for (self.schema_rewrite_jobs.items) |record| freeSchemaRewriteJob(self.alloc, record);
+        self.schema_rewrite_jobs.clearRetainingCapacity();
+
+        for (self.table_emptying_jobs.items) |record| freeTableEmptyingJob(self.alloc, record);
+        self.table_emptying_jobs.clearRetainingCapacity();
     }
 
     pub fn replaceTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !void {
+        try self.replaceTopologyWithForeignKeyReferenceRanges(tables, ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithForeignKeyReferenceRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+    ) !void {
+        try self.replaceTopologyWithConstraintOwnerRanges(tables, ranges, foreign_key_ref_ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithConstraintOwnerRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+    ) !void {
+        try self.replaceTopologyWithDerivedRanges(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, &.{});
+    }
+
+    pub fn replaceTopologyWithDerivedRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+    ) !void {
+        try self.replaceTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{}, &.{});
+    }
+
+    pub fn replaceTopologyWithDerivedWork(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+        schema_rewrite_jobs: []const SchemaRewriteJobRecord,
+        table_emptying_jobs: []const TableEmptyingJobRecord,
+    ) !void {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
         for (ranges) |record| try self.upsertRange(record);
+        for (foreign_key_ref_ranges) |record| try self.upsertForeignKeyReferenceRange(record);
+        for (unique_constraint_ranges) |record| try self.upsertUniqueConstraintRange(record);
+        for (secondary_index_rebuild_ranges) |record| try self.upsertSecondaryIndexRebuildRange(record);
+        for (schema_rewrite_jobs) |record| try self.upsertSchemaRewriteJob(record);
+        for (table_emptying_jobs) |record| try self.upsertTableEmptyingJob(record);
     }
 
     pub const ProjectedTopologyLoadResult = struct {
@@ -383,6 +1507,49 @@ pub const TableManager = struct {
     };
 
     pub fn replaceProjectedTopology(self: *TableManager, tables: []const TableRecord, ranges: []const RangeRecord) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithForeignKeyReferenceRanges(tables, ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithForeignKeyReferenceRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+    ) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithConstraintOwnerRanges(tables, ranges, foreign_key_ref_ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithConstraintOwnerRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+    ) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithDerivedRanges(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithDerivedRanges(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+    ) !ProjectedTopologyLoadResult {
+        return try self.replaceProjectedTopologyWithDerivedWork(tables, ranges, foreign_key_ref_ranges, unique_constraint_ranges, secondary_index_rebuild_ranges, &.{}, &.{});
+    }
+
+    pub fn replaceProjectedTopologyWithDerivedWork(
+        self: *TableManager,
+        tables: []const TableRecord,
+        ranges: []const RangeRecord,
+        foreign_key_ref_ranges: []const ForeignKeyReferenceRangeRecord,
+        unique_constraint_ranges: []const UniqueConstraintRangeRecord,
+        secondary_index_rebuild_ranges: []const SecondaryIndexRebuildRangeRecord,
+        schema_rewrite_jobs: []const SchemaRewriteJobRecord,
+        table_emptying_jobs: []const TableEmptyingJobRecord,
+    ) !ProjectedTopologyLoadResult {
         self.clearTopology();
         for (tables) |record| try self.upsertTable(record);
 
@@ -394,6 +1561,41 @@ pub const TableManager = struct {
             }
             try self.upsertRange(record);
         }
+        for (foreign_key_ref_ranges) |record| {
+            if (!self.tables.contains(record.child_table_id) or !self.tables.contains(record.parent_table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertForeignKeyReferenceRange(record);
+        }
+        for (unique_constraint_ranges) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertUniqueConstraintRange(record);
+        }
+        for (secondary_index_rebuild_ranges) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertSecondaryIndexRebuildRange(record);
+        }
+        for (schema_rewrite_jobs) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertSchemaRewriteJob(record);
+        }
+        for (table_emptying_jobs) |record| {
+            if (!self.tables.contains(record.table_id)) {
+                result.skipped_orphan_ranges += 1;
+                continue;
+            }
+            try self.upsertTableEmptyingJob(record);
+        }
         return result;
     }
 
@@ -401,9 +1603,55 @@ pub const TableManager = struct {
         const removed = self.tables.fetchRemove(table_id);
         if (removed) |entry| {
             freeTable(self.alloc, entry.value);
+            _ = self.removeForeignKeyReferenceRangesForTable(table_id);
+            _ = self.removeUniqueConstraintRangesForTable(table_id);
+            _ = self.removeSecondaryIndexRebuildRangesForTable(table_id);
+            _ = self.removeSchemaRewriteJobsForTable(table_id);
+            _ = self.removeTableEmptyingJobsForTable(table_id);
             return true;
         }
         return false;
+    }
+
+    pub fn removeNamespace(self: *TableManager, namespace_id: u64) !bool {
+        const namespace = self.namespaces.get(namespace_id) orelse return false;
+        var table_it = self.tables.valueIterator();
+        while (table_it.next()) |table| {
+            if (deriveDatabaseId(table.database_name) != namespace.database_id) continue;
+            if (std.mem.eql(u8, table.namespace_name, namespace.name)) return error.NamespaceNotEmpty;
+        }
+        var sequence_it = self.sequences.valueIterator();
+        while (sequence_it.next()) |sequence| {
+            if (deriveDatabaseId(sequence.database_name) != namespace.database_id) continue;
+            if (std.mem.eql(u8, sequence.namespace_name, namespace.name)) return error.NamespaceNotEmpty;
+        }
+        const removed = self.namespaces.fetchRemove(namespace_id) orelse return false;
+        freeNamespace(self.alloc, removed.value);
+        return true;
+    }
+
+    pub fn removeDatabase(self: *TableManager, database_id: u64) !bool {
+        var namespace_it = self.namespaces.valueIterator();
+        while (namespace_it.next()) |namespace| {
+            if (namespace.database_id == database_id) return error.DatabaseNotEmpty;
+        }
+        var table_it = self.tables.valueIterator();
+        while (table_it.next()) |table| {
+            if (deriveDatabaseId(table.database_name) == database_id) return error.DatabaseNotEmpty;
+        }
+        var sequence_it = self.sequences.valueIterator();
+        while (sequence_it.next()) |sequence| {
+            if (deriveDatabaseId(sequence.database_name) == database_id) return error.DatabaseNotEmpty;
+        }
+        const removed = self.databases.fetchRemove(database_id) orelse return false;
+        freeDatabase(self.alloc, removed.value);
+        return true;
+    }
+
+    pub fn removeTablespace(self: *TableManager, tablespace_id: u64) !bool {
+        const removed = self.tablespaces.fetchRemove(tablespace_id) orelse return false;
+        freeTablespace(self.alloc, removed.value);
+        return true;
     }
 
     pub fn removeTableTopology(self: *TableManager, table_id: u64) usize {
@@ -432,6 +1680,780 @@ pub const TableManager = struct {
         return false;
     }
 
+    pub fn removeForeignKeyReferenceRangesForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.foreign_key_ref_ranges.items.len) {
+            const record = self.foreign_key_ref_ranges.items[i];
+            if (record.child_table_id != table_id and record.parent_table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeForeignKeyReferenceRange(self.alloc, record);
+            _ = self.foreign_key_ref_ranges.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *TableManager,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) bool {
+        for (self.foreign_key_ref_ranges.items, 0..) |record, i| {
+            if (record.child_table_id != child_table_id) continue;
+            if (record.parent_table_id != parent_table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_parent_key, start_parent_key)) continue;
+            freeForeignKeyReferenceRange(self.alloc, record);
+            _ = self.foreign_key_ref_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeUniqueConstraintRangesForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.unique_constraint_ranges.items.len) {
+            const record = self.unique_constraint_ranges.items[i];
+            if (record.table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeUniqueConstraintRange(self.alloc, record);
+            _ = self.unique_constraint_ranges.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *TableManager,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) bool {
+        for (self.unique_constraint_ranges.items, 0..) |record, i| {
+            if (record.table_id != table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_encoded_value, start_encoded_value)) continue;
+            freeUniqueConstraintRange(self.alloc, record);
+            _ = self.unique_constraint_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeSecondaryIndexRebuildRangesForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.secondary_index_rebuild_ranges.items.len) {
+            const record = self.secondary_index_rebuild_ranges.items[i];
+            if (record.table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeSecondaryIndexRebuildRange(self.alloc, record);
+            _ = self.secondary_index_rebuild_ranges.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeSecondaryIndexRebuildRange(
+        self: *TableManager,
+        table_id: u64,
+        index_name: []const u8,
+        index_generation: u64,
+        start_row_key: []const u8,
+    ) bool {
+        for (self.secondary_index_rebuild_ranges.items, 0..) |record, i| {
+            if (record.table_id != table_id) continue;
+            if (record.index_generation != index_generation) continue;
+            if (!std.mem.eql(u8, record.index_name, index_name)) continue;
+            if (!std.mem.eql(u8, record.start_row_key, start_row_key)) continue;
+            freeSecondaryIndexRebuildRange(self.alloc, record);
+            _ = self.secondary_index_rebuild_ranges.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeSchemaRewriteJobsForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.schema_rewrite_jobs.items.len) {
+            const record = self.schema_rewrite_jobs.items[i];
+            if (record.table_id != table_id) {
+                i += 1;
+                continue;
+            }
+            freeSchemaRewriteJob(self.alloc, record);
+            _ = self.schema_rewrite_jobs.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeSchemaRewriteJob(self: *TableManager, job_id: u64) bool {
+        for (self.schema_rewrite_jobs.items, 0..) |record, i| {
+            if (record.job_id != job_id) continue;
+            freeSchemaRewriteJob(self.alloc, record);
+            _ = self.schema_rewrite_jobs.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn removeTableEmptyingJobsForTable(self: *TableManager, table_id: u64) usize {
+        var removed: usize = 0;
+        var i: usize = 0;
+        while (i < self.table_emptying_jobs.items.len) {
+            const record = self.table_emptying_jobs.items[i];
+            if (record.table_id != table_id and !u64SliceContains(record.affected_table_ids, table_id)) {
+                i += 1;
+                continue;
+            }
+            freeTableEmptyingJob(self.alloc, record);
+            _ = self.table_emptying_jobs.orderedRemove(i);
+            removed += 1;
+        }
+        return removed;
+    }
+
+    pub fn removeTableEmptyingJob(self: *TableManager, job_id: u64) bool {
+        for (self.table_emptying_jobs.items, 0..) |record, i| {
+            if (record.job_id != job_id) continue;
+            freeTableEmptyingJob(self.alloc, record);
+            _ = self.table_emptying_jobs.orderedRemove(i);
+            return true;
+        }
+        return false;
+    }
+
+    pub fn beginSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobBeginRequest) !void {
+        if (request.lease_owner.len == 0 or request.lease_expires_at_ms <= request.now_ms) return error.InvalidSchemaRewriteJobLease;
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        const claimable = std.mem.eql(u8, record.state, schema_rewrite_declared) or
+            (std.mem.eql(u8, record.state, schema_rewrite_running) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, schema_rewrite_running)) return error.SchemaRewriteJobClaimBusy;
+            return error.SchemaRewriteJobNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = schema_rewrite_running;
+        updated.lease_owner = request.lease_owner;
+        updated.lease_expires_at_ms = request.lease_expires_at_ms;
+        updated.attempts +%= 1;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn finishSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobFinishRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (!std.mem.eql(u8, record.state, schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.SchemaRewriteJobLeaseMismatch;
+        var updated = record.*;
+        updated.state = schema_rewrite_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *TableManager, request: SchemaRewriteJobInvalidateRequest) !void {
+        const record = self.findSchemaRewriteJob(request.job_id) orelse return error.UnknownSchemaRewriteJob;
+        if (!std.mem.eql(u8, record.state, schema_rewrite_running)) return error.SchemaRewriteJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.SchemaRewriteJobLeaseMismatch;
+        var updated = record.*;
+        updated.state = schema_rewrite_invalid;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.last_error;
+        try self.upsertSchemaRewriteJob(updated);
+    }
+
+    pub fn beginTableEmptyingJob(self: *TableManager, request: TableEmptyingJobBeginRequest) !void {
+        if (request.lease_owner.len == 0 or request.lease_expires_at_ms <= request.now_ms) return error.InvalidTableEmptyingJobLease;
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        const claimable = std.mem.eql(u8, record.state, table_emptying_declared) or
+            (std.mem.eql(u8, record.state, table_emptying_running) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, table_emptying_running)) return error.TableEmptyingJobClaimBusy;
+            return error.TableEmptyingJobNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = table_emptying_running;
+        updated.lease_owner = request.lease_owner;
+        updated.lease_expires_at_ms = request.lease_expires_at_ms;
+        updated.attempts +%= 1;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn finishTableEmptyingJob(self: *TableManager, request: TableEmptyingJobFinishRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_running)) return error.TableEmptyingJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.TableEmptyingJobLeaseMismatch;
+        var updated = record.*;
+        updated.state = table_emptying_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn invalidateTableEmptyingJob(self: *TableManager, request: TableEmptyingJobInvalidateRequest) !void {
+        const record = self.findTableEmptyingJob(request.job_id) orelse return error.UnknownTableEmptyingJob;
+        if (!std.mem.eql(u8, record.state, table_emptying_running)) return error.TableEmptyingJobNotRunning;
+        if (request.lease_owner.len == 0 or !std.mem.eql(u8, record.lease_owner, request.lease_owner)) return error.TableEmptyingJobLeaseMismatch;
+        var updated = record.*;
+        updated.state = table_emptying_invalid;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.last_error;
+        try self.upsertTableEmptyingJob(updated);
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *TableManager, request: TableEmptyingBarrierPromotionRequest) !void {
+        if (request.job_ids.len == 0 or request.promotions.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+
+        const first_record = self.findTableEmptyingJob(request.job_ids[0]) orelse return error.UnknownTableEmptyingJob;
+        if (first_record.barrier_id == 0 or first_record.affected_table_ids.len == 0) return error.InvalidTableEmptyingBarrierPromotion;
+        if (!tableEmptyingAffectedTableIdsCanonicalValid(first_record.table_id, first_record.affected_table_ids)) return error.InvalidTableEmptyingBarrierPromotion;
+        if (request.promotions.len != first_record.affected_table_ids.len) return error.InvalidTableEmptyingBarrierPromotion;
+
+        for (request.job_ids, 0..) |job_id, i| {
+            if (job_id == 0) return error.InvalidTableEmptyingBarrierPromotion;
+            for (request.job_ids[0..i]) |previous| {
+                if (previous == job_id) return error.InvalidTableEmptyingBarrierPromotion;
+            }
+            const record = self.findTableEmptyingJob(job_id) orelse return error.UnknownTableEmptyingJob;
+            if (!std.mem.eql(u8, record.state, table_emptying_ready)) return error.TableEmptyingJobNotReady;
+            if (record.barrier_id != first_record.barrier_id or
+                record.restart_identity != first_record.restart_identity or
+                record.cascade != first_record.cascade or
+                !u64SlicesEqual(record.affected_table_ids, first_record.affected_table_ids) or
+                !u64SliceContains(first_record.affected_table_ids, record.table_id))
+            {
+                return error.InvalidTableEmptyingBarrierPromotion;
+            }
+        }
+
+        for (request.promotions, 0..) |promotion, i| {
+            if (promotion.table_id == 0 or promotion.target_generation == 0) return error.InvalidTableEmptyingBarrierPromotion;
+            const table = self.tables.getPtr(promotion.table_id) orelse return error.UnknownTable;
+            if (!u64SliceContains(first_record.affected_table_ids, promotion.table_id)) return error.InvalidTableEmptyingBarrierPromotion;
+            if (promotion.target_generation != table.data_generation +| 1) return error.InvalidTableEmptyingBarrierPromotion;
+            for (request.promotions[0..i]) |previous| {
+                if (previous.table_id == promotion.table_id) return error.InvalidTableEmptyingBarrierPromotion;
+            }
+        }
+        for (first_record.affected_table_ids) |table_id| {
+            if (!promotionListContainsTable(request.promotions, table_id)) return error.InvalidTableEmptyingBarrierPromotion;
+            try self.validateCompleteTableEmptyingBarrierTable(first_record.*, request.job_ids, table_id);
+        }
+
+        if (first_record.restart_identity) {
+            _ = try self.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, .{
+                .barrier_id = first_record.barrier_id,
+                .affected_table_ids = first_record.affected_table_ids,
+                .job_ids = request.job_ids,
+                .cascade = first_record.cascade,
+            });
+        }
+
+        for (request.promotions) |promotion| {
+            const table = self.tables.getPtr(promotion.table_id).?;
+            if (table.data_generation < promotion.target_generation) {
+                table.data_generation = promotion.target_generation;
+            }
+        }
+
+        for (request.job_ids) |job_id| {
+            if (!self.removeTableEmptyingJob(job_id)) return error.UnknownTableEmptyingJob;
+        }
+    }
+
+    pub fn validateTableEmptyingIdentityAllocatorReset(self: *TableManager, request: TableEmptyingIdentityAllocatorResetRequest) !void {
+        if (request.barrier_id == 0 or request.job_ids.len == 0 or
+            !tableEmptyingAffectedTableIdsCanonicalSetValid(request.affected_table_ids))
+        {
+            return error.InvalidTableEmptyingIdentityAllocatorReset;
+        }
+
+        const first_record = self.findTableEmptyingJob(request.job_ids[0]) orelse return error.UnknownTableEmptyingJob;
+        if (first_record.barrier_id != request.barrier_id or
+            !first_record.restart_identity or
+            first_record.cascade != request.cascade or
+            !tableEmptyingAffectedTableIdsCanonicalValid(first_record.table_id, first_record.affected_table_ids) or
+            !u64SlicesEqual(first_record.affected_table_ids, request.affected_table_ids))
+        {
+            return error.InvalidTableEmptyingIdentityAllocatorReset;
+        }
+
+        for (request.affected_table_ids) |table_id| {
+            if (self.tables.get(table_id) == null) return error.UnknownTable;
+        }
+
+        for (request.job_ids, 0..) |job_id, i| {
+            if (job_id == 0) return error.InvalidTableEmptyingIdentityAllocatorReset;
+            for (request.job_ids[0..i]) |previous| {
+                if (previous == job_id) return error.InvalidTableEmptyingIdentityAllocatorReset;
+            }
+            const record = self.findTableEmptyingJob(job_id) orelse return error.UnknownTableEmptyingJob;
+            if (!std.mem.eql(u8, record.state, table_emptying_ready)) return error.TableEmptyingJobNotReady;
+            if (record.barrier_id != request.barrier_id or
+                !record.restart_identity or
+                record.cascade != request.cascade or
+                !u64SlicesEqual(record.affected_table_ids, request.affected_table_ids) or
+                !u64SliceContains(request.affected_table_ids, record.table_id))
+            {
+                return error.InvalidTableEmptyingIdentityAllocatorReset;
+            }
+        }
+
+        for (request.affected_table_ids) |table_id| {
+            self.validateCompleteTableEmptyingBarrierTable(first_record.*, request.job_ids, table_id) catch |err| switch (err) {
+                error.InvalidTableEmptyingBarrierPromotion => return error.InvalidTableEmptyingIdentityAllocatorReset,
+                else => return err,
+            };
+        }
+    }
+
+    fn validateCompleteTableEmptyingBarrierTable(
+        self: *TableManager,
+        barrier: TableEmptyingJobRecord,
+        job_ids: []const u64,
+        table_id: u64,
+    ) !void {
+        const table = self.tables.get(table_id) orelse return error.UnknownTable;
+        var range_count: usize = 0;
+        var range_it = self.ranges.valueIterator();
+        while (range_it.next()) |range| {
+            if (range.table_id != table_id) continue;
+            range_count += 1;
+            if (!self.tableEmptyingPromotionHasReadyRangeJob(barrier, job_ids, table, range.*)) {
+                return error.InvalidTableEmptyingBarrierPromotion;
+            }
+        }
+        if (range_count == 0) return error.InvalidTableEmptyingBarrierPromotion;
+    }
+
+    fn tableEmptyingPromotionHasReadyRangeJob(
+        self: *TableManager,
+        barrier: TableEmptyingJobRecord,
+        job_ids: []const u64,
+        table: TableRecord,
+        range: RangeRecord,
+    ) bool {
+        const schema_generation = schemaRewriteGenerationForSchemaJson(table.schema_json);
+        for (job_ids) |job_id| {
+            const record = self.findTableEmptyingJob(job_id) orelse continue;
+            if (!std.mem.eql(u8, record.state, table_emptying_ready)) continue;
+            if (record.barrier_id != barrier.barrier_id) continue;
+            if (record.table_id != table.table_id) continue;
+            if (record.group_id != range.group_id) continue;
+            if (record.range_id != 0 and record.range_id != range.range_id) continue;
+            if (record.schema_generation != schema_generation) continue;
+            if (record.data_generation != table.data_generation) continue;
+            if (!std.mem.eql(u8, record.start_row_key, range.start_key)) continue;
+            if (!optionalStringSlicesEqual(record.end_row_key, range.end_key)) continue;
+            if (!u64SlicesEqual(record.affected_table_ids, barrier.affected_table_ids)) continue;
+            if (record.restart_identity != barrier.restart_identity) continue;
+            if (record.cascade != barrier.cascade) continue;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidForeignKeyReferenceRangeSplit;
+        const source = self.findForeignKeyReferenceRange(request.selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, source.state, foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        if (!keyStrictlyInsideRange(request.split_parent_key, source.start_parent_key, source.end_parent_key)) return error.InvalidForeignKeyReferenceRangeSplit;
+        if (request.left_group_id != source.group_id and self.foreignKeyReferenceRangeGroupExists(request.left_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(request.right_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        var updated = source.*;
+        updated.state = foreign_key_ref_range_splitting;
+        updated.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated);
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *TableManager, request: ForeignKeyReferenceRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidForeignKeyReferenceRangeSplit;
+        const source = self.findForeignKeyReferenceRange(request.selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, source.state, foreign_key_ref_range_splitting)) return error.ForeignKeyReferenceRangeNotSplitting;
+        if (!keyStrictlyInsideRange(request.split_parent_key, source.start_parent_key, source.end_parent_key)) return error.InvalidForeignKeyReferenceRangeSplit;
+        if (request.left_group_id != source.group_id and self.foreignKeyReferenceRangeGroupExists(request.left_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+        if (self.foreignKeyReferenceRangeGroupExists(request.right_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        const original = try cloneForeignKeyReferenceRange(self.alloc, source.*);
+        defer freeForeignKeyReferenceRange(self.alloc, original);
+        if (!self.removeForeignKeyReferenceRange(original.child_table_id, original.constraint_name, original.parent_table_id, original.start_parent_key)) return error.UnknownForeignKeyReferenceRange;
+        errdefer self.restoreForeignKeyReferenceRangeBestEffort(original);
+
+        try self.upsertForeignKeyReferenceRange(.{
+            .child_table_id = original.child_table_id,
+            .constraint_name = original.constraint_name,
+            .parent_table_id = original.parent_table_id,
+            .start_parent_key = original.start_parent_key,
+            .end_parent_key = request.split_parent_key,
+            .group_id = request.left_group_id,
+            .range_id = original.range_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = foreign_key_ref_range_active,
+        });
+        errdefer _ = self.removeForeignKeyReferenceRange(original.child_table_id, original.constraint_name, original.parent_table_id, original.start_parent_key);
+        try self.upsertForeignKeyReferenceRange(.{
+            .child_table_id = original.child_table_id,
+            .constraint_name = original.constraint_name,
+            .parent_table_id = original.parent_table_id,
+            .start_parent_key = request.split_parent_key,
+            .end_parent_key = original.end_parent_key,
+            .group_id = request.right_group_id,
+            .range_id = request.right_group_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = foreign_key_ref_range_active,
+        });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *TableManager, request: ForeignKeyReferenceRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findForeignKeyReferenceRange(request.left_selector) orelse return error.UnknownForeignKeyReferenceRange;
+        const right = self.findForeignKeyReferenceRange(.{
+            .child_table_id = request.left_selector.child_table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .parent_table_id = request.left_selector.parent_table_id,
+            .start_parent_key = request.right_start_parent_key,
+        }) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!foreignKeyReferenceRangesAdjacent(left.*, right.*)) return error.ForeignKeyReferenceRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, foreign_key_ref_range_active) or !std.mem.eql(u8, right.state, foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.foreignKeyReferenceRangeGroupExists(request.merged_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        var updated_left = left.*;
+        updated_left.state = foreign_key_ref_range_merging;
+        updated_left.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated_left);
+        var updated_right = right.*;
+        updated_right.state = foreign_key_ref_range_merging;
+        updated_right.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated_right);
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *TableManager, request: ForeignKeyReferenceRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findForeignKeyReferenceRange(request.left_selector) orelse return error.UnknownForeignKeyReferenceRange;
+        const right = self.findForeignKeyReferenceRange(.{
+            .child_table_id = request.left_selector.child_table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .parent_table_id = request.left_selector.parent_table_id,
+            .start_parent_key = request.right_start_parent_key,
+        }) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!foreignKeyReferenceRangesAdjacent(left.*, right.*)) return error.ForeignKeyReferenceRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, foreign_key_ref_range_merging) or !std.mem.eql(u8, right.state, foreign_key_ref_range_merging)) return error.ForeignKeyReferenceRangeNotMerging;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.foreignKeyReferenceRangeGroupExists(request.merged_group_id)) return error.ForeignKeyReferenceRangeGroupCollision;
+
+        const owned_left = try cloneForeignKeyReferenceRange(self.alloc, left.*);
+        defer freeForeignKeyReferenceRange(self.alloc, owned_left);
+        const owned_right = try cloneForeignKeyReferenceRange(self.alloc, right.*);
+        defer freeForeignKeyReferenceRange(self.alloc, owned_right);
+        if (!self.removeForeignKeyReferenceRange(owned_left.child_table_id, owned_left.constraint_name, owned_left.parent_table_id, owned_left.start_parent_key)) return error.UnknownForeignKeyReferenceRange;
+        errdefer self.restoreForeignKeyReferenceRangeBestEffort(owned_left);
+        if (!self.removeForeignKeyReferenceRange(owned_right.child_table_id, owned_right.constraint_name, owned_right.parent_table_id, owned_right.start_parent_key)) return error.UnknownForeignKeyReferenceRange;
+        errdefer self.restoreForeignKeyReferenceRangeBestEffort(owned_right);
+
+        try self.upsertForeignKeyReferenceRange(.{
+            .child_table_id = owned_left.child_table_id,
+            .constraint_name = owned_left.constraint_name,
+            .parent_table_id = owned_left.parent_table_id,
+            .start_parent_key = owned_left.start_parent_key,
+            .end_parent_key = owned_right.end_parent_key,
+            .group_id = request.merged_group_id,
+            .range_id = mergedForeignKeyReferenceRangeId(request.merged_group_id, owned_left, owned_right),
+            .topology_epoch = @max(owned_left.topology_epoch, owned_right.topology_epoch) +% 1,
+            .state = foreign_key_ref_range_active,
+        });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *TableManager, selector: ForeignKeyReferenceRangeSelector) !void {
+        const record = self.findForeignKeyReferenceRange(selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, record.state, foreign_key_ref_range_active)) return error.ForeignKeyReferenceRangeNotActive;
+        var updated = record.*;
+        updated.state = foreign_key_ref_range_rebuilding;
+        updated.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated);
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *TableManager, selector: ForeignKeyReferenceRangeSelector) !void {
+        const record = self.findForeignKeyReferenceRange(selector) orelse return error.UnknownForeignKeyReferenceRange;
+        if (!std.mem.eql(u8, record.state, foreign_key_ref_range_rebuilding)) return error.ForeignKeyReferenceRangeNotRebuilding;
+        var updated = record.*;
+        updated.state = foreign_key_ref_range_active;
+        updated.topology_epoch +%= 1;
+        try self.upsertForeignKeyReferenceRange(updated);
+    }
+
+    fn foreignKeyReferenceRangeGroupExists(self: *const TableManager, group_id: u64) bool {
+        for (self.foreign_key_ref_ranges.items) |record| {
+            if (record.group_id == group_id) return true;
+        }
+        return false;
+    }
+
+    fn findForeignKeyReferenceRange(self: *TableManager, selector: ForeignKeyReferenceRangeSelector) ?*ForeignKeyReferenceRangeRecord {
+        for (self.foreign_key_ref_ranges.items) |*record| {
+            if (record.child_table_id != selector.child_table_id) continue;
+            if (record.parent_table_id != selector.parent_table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, selector.constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_parent_key, selector.start_parent_key)) continue;
+            if (selector.range_id != 0 and record.range_id != selector.range_id) continue;
+            return record;
+        }
+        return null;
+    }
+
+    fn restoreForeignKeyReferenceRangeBestEffort(self: *TableManager, record: ForeignKeyReferenceRangeRecord) void {
+        self.upsertForeignKeyReferenceRange(record) catch {};
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: *TableManager, request: UniqueConstraintRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidUniqueConstraintRangeSplit;
+        const source = self.findUniqueConstraintRange(request.selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, source.state, unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        if (!keyStrictlyInsideRange(request.split_encoded_value, source.start_encoded_value, source.end_encoded_value)) return error.InvalidUniqueConstraintRangeSplit;
+        if (request.left_group_id != source.group_id and self.uniqueConstraintRangeGroupExists(request.left_group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(request.right_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        var updated = source.*;
+        updated.state = unique_constraint_range_splitting;
+        updated.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated);
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: *TableManager, request: UniqueConstraintRangeSplitRequest) !void {
+        try group_ids.requireDataGroupId(request.left_group_id);
+        try group_ids.requireDataGroupId(request.right_group_id);
+        if (request.left_group_id == request.right_group_id) return error.InvalidUniqueConstraintRangeSplit;
+        const source = self.findUniqueConstraintRange(request.selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, source.state, unique_constraint_range_splitting)) return error.UniqueConstraintRangeNotSplitting;
+        if (!keyStrictlyInsideRange(request.split_encoded_value, source.start_encoded_value, source.end_encoded_value)) return error.InvalidUniqueConstraintRangeSplit;
+        if (request.left_group_id != source.group_id and self.uniqueConstraintRangeGroupExists(request.left_group_id)) return error.UniqueConstraintRangeGroupCollision;
+        if (self.uniqueConstraintRangeGroupExists(request.right_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        const original = try cloneUniqueConstraintRange(self.alloc, source.*);
+        defer freeUniqueConstraintRange(self.alloc, original);
+        if (!self.removeUniqueConstraintRange(original.table_id, original.constraint_name, original.start_encoded_value)) return error.UnknownUniqueConstraintRange;
+        errdefer self.restoreUniqueConstraintRangeBestEffort(original);
+
+        try self.upsertUniqueConstraintRange(.{
+            .table_id = original.table_id,
+            .constraint_name = original.constraint_name,
+            .start_encoded_value = original.start_encoded_value,
+            .end_encoded_value = request.split_encoded_value,
+            .group_id = request.left_group_id,
+            .range_id = original.range_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = unique_constraint_range_active,
+        });
+        errdefer _ = self.removeUniqueConstraintRange(original.table_id, original.constraint_name, original.start_encoded_value);
+        try self.upsertUniqueConstraintRange(.{
+            .table_id = original.table_id,
+            .constraint_name = original.constraint_name,
+            .start_encoded_value = request.split_encoded_value,
+            .end_encoded_value = original.end_encoded_value,
+            .group_id = request.right_group_id,
+            .range_id = request.right_group_id,
+            .topology_epoch = original.topology_epoch +% 1,
+            .state = unique_constraint_range_active,
+        });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: *TableManager, request: UniqueConstraintRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findUniqueConstraintRange(request.left_selector) orelse return error.UnknownUniqueConstraintRange;
+        const right = self.findUniqueConstraintRange(.{
+            .table_id = request.left_selector.table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .start_encoded_value = request.right_start_encoded_value,
+        }) orelse return error.UnknownUniqueConstraintRange;
+        if (!uniqueConstraintRangesAdjacent(left.*, right.*)) return error.UniqueConstraintRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, unique_constraint_range_active) or !std.mem.eql(u8, right.state, unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.uniqueConstraintRangeGroupExists(request.merged_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        var updated_left = left.*;
+        updated_left.state = unique_constraint_range_merging;
+        updated_left.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated_left);
+        var updated_right = right.*;
+        updated_right.state = unique_constraint_range_merging;
+        updated_right.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated_right);
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: *TableManager, request: UniqueConstraintRangeMergeRequest) !void {
+        try group_ids.requireDataGroupId(request.merged_group_id);
+        const left = self.findUniqueConstraintRange(request.left_selector) orelse return error.UnknownUniqueConstraintRange;
+        const right = self.findUniqueConstraintRange(.{
+            .table_id = request.left_selector.table_id,
+            .constraint_name = request.left_selector.constraint_name,
+            .start_encoded_value = request.right_start_encoded_value,
+        }) orelse return error.UnknownUniqueConstraintRange;
+        if (!uniqueConstraintRangesAdjacent(left.*, right.*)) return error.UniqueConstraintRangesNotAdjacent;
+        if (!std.mem.eql(u8, left.state, unique_constraint_range_merging) or !std.mem.eql(u8, right.state, unique_constraint_range_merging)) return error.UniqueConstraintRangeNotMerging;
+        if (request.merged_group_id != left.group_id and request.merged_group_id != right.group_id and self.uniqueConstraintRangeGroupExists(request.merged_group_id)) return error.UniqueConstraintRangeGroupCollision;
+
+        const owned_left = try cloneUniqueConstraintRange(self.alloc, left.*);
+        defer freeUniqueConstraintRange(self.alloc, owned_left);
+        const owned_right = try cloneUniqueConstraintRange(self.alloc, right.*);
+        defer freeUniqueConstraintRange(self.alloc, owned_right);
+        if (!self.removeUniqueConstraintRange(owned_left.table_id, owned_left.constraint_name, owned_left.start_encoded_value)) return error.UnknownUniqueConstraintRange;
+        errdefer self.restoreUniqueConstraintRangeBestEffort(owned_left);
+        if (!self.removeUniqueConstraintRange(owned_right.table_id, owned_right.constraint_name, owned_right.start_encoded_value)) return error.UnknownUniqueConstraintRange;
+        errdefer self.restoreUniqueConstraintRangeBestEffort(owned_right);
+
+        try self.upsertUniqueConstraintRange(.{
+            .table_id = owned_left.table_id,
+            .constraint_name = owned_left.constraint_name,
+            .start_encoded_value = owned_left.start_encoded_value,
+            .end_encoded_value = owned_right.end_encoded_value,
+            .group_id = request.merged_group_id,
+            .range_id = mergedUniqueConstraintRangeId(request.merged_group_id, owned_left, owned_right),
+            .topology_epoch = @max(owned_left.topology_epoch, owned_right.topology_epoch) +% 1,
+            .state = unique_constraint_range_active,
+        });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: *TableManager, selector: UniqueConstraintRangeSelector) !void {
+        const record = self.findUniqueConstraintRange(selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, record.state, unique_constraint_range_active)) return error.UniqueConstraintRangeNotActive;
+        var updated = record.*;
+        updated.state = unique_constraint_range_rebuilding;
+        updated.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated);
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: *TableManager, selector: UniqueConstraintRangeSelector) !void {
+        const record = self.findUniqueConstraintRange(selector) orelse return error.UnknownUniqueConstraintRange;
+        if (!std.mem.eql(u8, record.state, unique_constraint_range_rebuilding)) return error.UniqueConstraintRangeNotRebuilding;
+        var updated = record.*;
+        updated.state = unique_constraint_range_active;
+        updated.topology_epoch +%= 1;
+        try self.upsertUniqueConstraintRange(updated);
+    }
+
+    fn uniqueConstraintRangeGroupExists(self: *const TableManager, group_id: u64) bool {
+        for (self.unique_constraint_ranges.items) |record| {
+            if (record.group_id == group_id) return true;
+        }
+        return false;
+    }
+
+    fn findUniqueConstraintRange(self: *TableManager, selector: UniqueConstraintRangeSelector) ?*UniqueConstraintRangeRecord {
+        for (self.unique_constraint_ranges.items) |*record| {
+            if (record.table_id != selector.table_id) continue;
+            if (!std.mem.eql(u8, record.constraint_name, selector.constraint_name)) continue;
+            if (!std.mem.eql(u8, record.start_encoded_value, selector.start_encoded_value)) continue;
+            if (selector.range_id != 0 and record.range_id != selector.range_id) continue;
+            return record;
+        }
+        return null;
+    }
+
+    fn restoreUniqueConstraintRangeBestEffort(self: *TableManager, record: UniqueConstraintRangeRecord) void {
+        self.upsertUniqueConstraintRange(record) catch {};
+    }
+
+    pub fn beginSecondaryIndexRebuildRange(self: *TableManager, request: SecondaryIndexRebuildRangeBeginRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        const claimable = std.mem.eql(u8, record.state, secondary_index_rebuild_declared) or
+            (std.mem.eql(u8, record.state, secondary_index_rebuild_building) and record.lease_expires_at_ms != 0 and record.lease_expires_at_ms <= request.now_ms);
+        if (!claimable) {
+            if (std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeClaimBusy;
+            return error.SecondaryIndexRebuildRangeNotDeclared;
+        }
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_building;
+        updated.lease_owner = request.lease_owner;
+        updated.lease_expires_at_ms = request.lease_expires_at_ms;
+        updated.attempts +%= 1;
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    pub fn finishSecondaryIndexRebuildRange(self: *TableManager, request: SecondaryIndexRebuildRangeFinishRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        if (!std.mem.eql(u8, record.state, secondary_index_rebuild_building)) return error.SecondaryIndexRebuildRangeNotBuilding;
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_ready;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.completed_row_count = request.completed_row_count;
+        updated.progress_row_key = request.progress_row_key;
+        updated.last_error = "";
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    pub fn invalidateSecondaryIndexRebuildRange(self: *TableManager, request: SecondaryIndexRebuildRangeInvalidateRequest) !void {
+        const selector = request.selector;
+        const record = self.findSecondaryIndexRebuildRange(selector) orelse return error.UnknownSecondaryIndexRebuildRange;
+        var updated = record.*;
+        updated.state = secondary_index_rebuild_invalid;
+        updated.lease_owner = "";
+        updated.lease_expires_at_ms = 0;
+        updated.last_error = request.last_error;
+        updated.topology_epoch +%= 1;
+        try self.upsertSecondaryIndexRebuildRange(updated);
+    }
+
+    fn secondaryIndexRebuildRangeGroupExists(self: *const TableManager, group_id: u64) bool {
+        for (self.secondary_index_rebuild_ranges.items) |record| {
+            if (record.group_id == group_id) return true;
+        }
+        return false;
+    }
+
+    fn findSecondaryIndexRebuildRange(self: *TableManager, selector: SecondaryIndexRebuildRangeSelector) ?*SecondaryIndexRebuildRangeRecord {
+        for (self.secondary_index_rebuild_ranges.items) |*record| {
+            if (record.table_id != selector.table_id) continue;
+            if (record.index_generation != selector.index_generation) continue;
+            if (!std.mem.eql(u8, record.index_name, selector.index_name)) continue;
+            if (!std.mem.eql(u8, record.start_row_key, selector.start_row_key)) continue;
+            return record;
+        }
+        return null;
+    }
+
+    fn findSchemaRewriteJob(self: *TableManager, job_id: u64) ?*SchemaRewriteJobRecord {
+        for (self.schema_rewrite_jobs.items) |*record| {
+            if (record.job_id == job_id) return record;
+        }
+        return null;
+    }
+
+    fn findTableEmptyingJob(self: *TableManager, job_id: u64) ?*TableEmptyingJobRecord {
+        for (self.table_emptying_jobs.items) |*record| {
+            if (record.job_id == job_id) return record;
+        }
+        return null;
+    }
+
     pub fn listTables(self: *TableManager, alloc: std.mem.Allocator) ![]TableRecord {
         var out = std.ArrayListUnmanaged(TableRecord).empty;
         errdefer {
@@ -448,6 +2470,70 @@ pub const TableManager = struct {
         alloc.free(records);
     }
 
+    pub fn listDatabases(self: *TableManager, alloc: std.mem.Allocator) ![]DatabaseRecord {
+        var out = std.ArrayListUnmanaged(DatabaseRecord).empty;
+        errdefer {
+            for (out.items) |record| freeDatabase(alloc, record);
+            out.deinit(alloc);
+        }
+        var it = self.databases.valueIterator();
+        while (it.next()) |record| try out.append(alloc, try cloneDatabase(alloc, record.*));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeDatabases(_: *TableManager, alloc: std.mem.Allocator, records: []DatabaseRecord) void {
+        for (records) |record| freeDatabase(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listNamespaces(self: *TableManager, alloc: std.mem.Allocator) ![]NamespaceRecord {
+        var out = std.ArrayListUnmanaged(NamespaceRecord).empty;
+        errdefer {
+            for (out.items) |record| freeNamespace(alloc, record);
+            out.deinit(alloc);
+        }
+        var it = self.namespaces.valueIterator();
+        while (it.next()) |record| try out.append(alloc, try cloneNamespace(alloc, record.*));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeNamespaces(_: *TableManager, alloc: std.mem.Allocator, records: []NamespaceRecord) void {
+        for (records) |record| freeNamespace(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listTablespaces(self: *TableManager, alloc: std.mem.Allocator) ![]TablespaceRecord {
+        var out = std.ArrayListUnmanaged(TablespaceRecord).empty;
+        errdefer {
+            for (out.items) |record| freeTablespace(alloc, record);
+            out.deinit(alloc);
+        }
+        var it = self.tablespaces.valueIterator();
+        while (it.next()) |record| try out.append(alloc, try cloneTablespace(alloc, record.*));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeTablespaces(_: *TableManager, alloc: std.mem.Allocator, records: []TablespaceRecord) void {
+        for (records) |record| freeTablespace(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listSequences(self: *TableManager, alloc: std.mem.Allocator) ![]SequenceRecord {
+        var out = std.ArrayListUnmanaged(SequenceRecord).empty;
+        errdefer {
+            for (out.items) |record| freeSequence(alloc, record);
+            out.deinit(alloc);
+        }
+        var it = self.sequences.valueIterator();
+        while (it.next()) |record| try out.append(alloc, try cloneSequence(alloc, record.*));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeSequences(_: *TableManager, alloc: std.mem.Allocator, records: []SequenceRecord) void {
+        for (records) |record| freeSequence(alloc, record);
+        alloc.free(records);
+    }
+
     pub fn listRanges(self: *TableManager, alloc: std.mem.Allocator) ![]RangeRecord {
         var out = std.ArrayListUnmanaged(RangeRecord).empty;
         errdefer {
@@ -461,6 +2547,81 @@ pub const TableManager = struct {
 
     pub fn freeRanges(_: *TableManager, alloc: std.mem.Allocator, records: []RangeRecord) void {
         for (records) |record| freeRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listForeignKeyReferenceRanges(self: *TableManager, alloc: std.mem.Allocator) ![]ForeignKeyReferenceRangeRecord {
+        var out = std.ArrayListUnmanaged(ForeignKeyReferenceRangeRecord).empty;
+        errdefer {
+            for (out.items) |record| freeForeignKeyReferenceRange(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.foreign_key_ref_ranges.items) |record| try out.append(alloc, try cloneForeignKeyReferenceRange(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeForeignKeyReferenceRanges(_: *TableManager, alloc: std.mem.Allocator, records: []ForeignKeyReferenceRangeRecord) void {
+        for (records) |record| freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listUniqueConstraintRanges(self: *TableManager, alloc: std.mem.Allocator) ![]UniqueConstraintRangeRecord {
+        var out = std.ArrayListUnmanaged(UniqueConstraintRangeRecord).empty;
+        errdefer {
+            for (out.items) |record| freeUniqueConstraintRange(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.unique_constraint_ranges.items) |record| try out.append(alloc, try cloneUniqueConstraintRange(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeUniqueConstraintRanges(_: *TableManager, alloc: std.mem.Allocator, records: []UniqueConstraintRangeRecord) void {
+        for (records) |record| freeUniqueConstraintRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listSecondaryIndexRebuildRanges(self: *TableManager, alloc: std.mem.Allocator) ![]SecondaryIndexRebuildRangeRecord {
+        var out = std.ArrayListUnmanaged(SecondaryIndexRebuildRangeRecord).empty;
+        errdefer {
+            for (out.items) |record| freeSecondaryIndexRebuildRange(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.secondary_index_rebuild_ranges.items) |record| try out.append(alloc, try cloneSecondaryIndexRebuildRange(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeSecondaryIndexRebuildRanges(_: *TableManager, alloc: std.mem.Allocator, records: []SecondaryIndexRebuildRangeRecord) void {
+        for (records) |record| freeSecondaryIndexRebuildRange(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listSchemaRewriteJobs(self: *TableManager, alloc: std.mem.Allocator) ![]SchemaRewriteJobRecord {
+        var out = std.ArrayListUnmanaged(SchemaRewriteJobRecord).empty;
+        errdefer {
+            for (out.items) |record| freeSchemaRewriteJob(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.schema_rewrite_jobs.items) |record| try out.append(alloc, try cloneSchemaRewriteJob(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeSchemaRewriteJobs(_: *TableManager, alloc: std.mem.Allocator, records: []SchemaRewriteJobRecord) void {
+        for (records) |record| freeSchemaRewriteJob(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listTableEmptyingJobs(self: *TableManager, alloc: std.mem.Allocator) ![]TableEmptyingJobRecord {
+        var out = std.ArrayListUnmanaged(TableEmptyingJobRecord).empty;
+        errdefer {
+            for (out.items) |record| freeTableEmptyingJob(alloc, record);
+            out.deinit(alloc);
+        }
+        for (self.table_emptying_jobs.items) |record| try out.append(alloc, try cloneTableEmptyingJob(alloc, record));
+        return try out.toOwnedSlice(alloc);
+    }
+
+    pub fn freeTableEmptyingJobs(_: *TableManager, alloc: std.mem.Allocator, records: []TableEmptyingJobRecord) void {
+        for (records) |record| freeTableEmptyingJob(alloc, record);
         alloc.free(records);
     }
 
@@ -655,6 +2816,34 @@ fn keyStrictlyInsideRange(key: []const u8, start_key: []const u8, end_key: ?[]co
     return true;
 }
 
+fn u64SliceContains(values: []const u64, needle: u64) bool {
+    for (values) |value| {
+        if (value == needle) return true;
+    }
+    return false;
+}
+
+fn u64SlicesEqual(a: []const u64, b: []const u64) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left != right) return false;
+    }
+    return true;
+}
+
+fn optionalStringSlicesEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn promotionListContainsTable(promotions: []const TableEmptyingBarrierPromotion, table_id: u64) bool {
+    for (promotions) |promotion| {
+        if (promotion.table_id == table_id) return true;
+    }
+    return false;
+}
+
 fn rangesAdjacent(a: RangeRecord, b: RangeRecord) bool {
     if (a.end_key) |a_end| {
         if (std.mem.eql(u8, a_end, b.start_key)) return true;
@@ -679,21 +2868,116 @@ fn freeOwnedOptional(alloc: std.mem.Allocator, value: ?[]const u8) void {
     if (value) |bytes| alloc.free(bytes);
 }
 
+pub fn cloneDatabase(alloc: std.mem.Allocator, record: DatabaseRecord) !DatabaseRecord {
+    const name = try alloc.dupe(u8, record.name);
+    errdefer alloc.free(name);
+    const settings_json = try alloc.dupe(u8, record.settings_json);
+    errdefer alloc.free(settings_json);
+    const tablespace_name = try alloc.dupe(u8, record.tablespace_name);
+    errdefer alloc.free(tablespace_name);
+    return .{
+        .database_id = record.database_id,
+        .name = name,
+        .settings_json = settings_json,
+        .tablespace_name = tablespace_name,
+    };
+}
+
+pub fn freeDatabase(alloc: std.mem.Allocator, record: DatabaseRecord) void {
+    alloc.free(record.name);
+    alloc.free(record.settings_json);
+    alloc.free(record.tablespace_name);
+}
+
+pub fn cloneNamespace(alloc: std.mem.Allocator, record: NamespaceRecord) !NamespaceRecord {
+    const name = try alloc.dupe(u8, record.name);
+    errdefer alloc.free(name);
+    const tablespace_name = try alloc.dupe(u8, record.tablespace_name);
+    errdefer alloc.free(tablespace_name);
+    return .{
+        .namespace_id = record.namespace_id,
+        .database_id = record.database_id,
+        .name = name,
+        .tablespace_name = tablespace_name,
+    };
+}
+
+pub fn freeNamespace(alloc: std.mem.Allocator, record: NamespaceRecord) void {
+    alloc.free(record.name);
+    alloc.free(record.tablespace_name);
+}
+
+pub fn cloneTablespace(alloc: std.mem.Allocator, record: TablespaceRecord) !TablespaceRecord {
+    const name = try alloc.dupe(u8, record.name);
+    errdefer alloc.free(name);
+    const location_json = try alloc.dupe(u8, record.location_json);
+    errdefer alloc.free(location_json);
+    const placement_policy_json = try alloc.dupe(u8, record.placement_policy_json);
+    errdefer alloc.free(placement_policy_json);
+    return .{
+        .tablespace_id = record.tablespace_id,
+        .name = name,
+        .location_json = location_json,
+        .placement_policy_json = placement_policy_json,
+    };
+}
+
+pub fn freeTablespace(alloc: std.mem.Allocator, record: TablespaceRecord) void {
+    alloc.free(record.name);
+    alloc.free(record.location_json);
+    alloc.free(record.placement_policy_json);
+}
+
+pub fn cloneSequence(alloc: std.mem.Allocator, record: SequenceRecord) !SequenceRecord {
+    const name = try alloc.dupe(u8, record.name);
+    errdefer alloc.free(name);
+    const database_name = try alloc.dupe(u8, record.database_name);
+    errdefer alloc.free(database_name);
+    const namespace_name = try alloc.dupe(u8, record.namespace_name);
+    errdefer alloc.free(namespace_name);
+    const options_json = try alloc.dupe(u8, record.options_json);
+    errdefer alloc.free(options_json);
+    return .{
+        .sequence_id = record.sequence_id,
+        .name = name,
+        .database_name = database_name,
+        .namespace_name = namespace_name,
+        .options_json = options_json,
+        .last_value = record.last_value,
+        .last_allocation_id = record.last_allocation_id,
+    };
+}
+
+pub fn freeSequence(alloc: std.mem.Allocator, record: SequenceRecord) void {
+    alloc.free(record.name);
+    alloc.free(record.database_name);
+    alloc.free(record.namespace_name);
+    alloc.free(record.options_json);
+}
+
 pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     const name = try alloc.dupe(u8, record.name);
     errdefer alloc.free(name);
+    const database_name = try alloc.dupe(u8, record.database_name);
+    errdefer alloc.free(database_name);
+    const namespace_name = try alloc.dupe(u8, record.namespace_name);
+    errdefer alloc.free(namespace_name);
     const description = try alloc.dupe(u8, record.description);
     errdefer alloc.free(description);
     const schema_json = try alloc.dupe(u8, record.schema_json);
     errdefer alloc.free(schema_json);
     const read_schema_json = try alloc.dupe(u8, record.read_schema_json);
     errdefer alloc.free(read_schema_json);
+    const foreign_key_validation_json = try alloc.dupe(u8, record.foreign_key_validation_json);
+    errdefer alloc.free(foreign_key_validation_json);
     const indexes_json = try alloc.dupe(u8, record.indexes_json);
     errdefer alloc.free(indexes_json);
     const replication_sources_json = try alloc.dupe(u8, record.replication_sources_json);
     errdefer alloc.free(replication_sources_json);
     const placement_role = try alloc.dupe(u8, record.placement_role);
     errdefer alloc.free(placement_role);
+    const tablespace_name = try alloc.dupe(u8, record.tablespace_name);
+    errdefer alloc.free(tablespace_name);
     const restore_backup_id = try alloc.dupe(u8, record.restore_backup_id);
     errdefer alloc.free(restore_backup_id);
     const restore_location = try alloc.dupe(u8, record.restore_location);
@@ -701,27 +2985,36 @@ pub fn cloneTable(alloc: std.mem.Allocator, record: TableRecord) !TableRecord {
     return .{
         .table_id = record.table_id,
         .name = name,
+        .database_name = database_name,
+        .namespace_name = namespace_name,
         .description = description,
         .schema_json = schema_json,
         .read_schema_json = read_schema_json,
+        .foreign_key_validation_json = foreign_key_validation_json,
         .indexes_json = indexes_json,
         .replication_sources_json = replication_sources_json,
         .placement_role = placement_role,
+        .tablespace_name = tablespace_name,
         .restore_backup_id = restore_backup_id,
         .restore_location = restore_location,
         .desired_replica_count = record.desired_replica_count,
         .min_ranges = record.min_ranges,
+        .data_generation = record.data_generation,
     };
 }
 
 pub fn freeTable(alloc: std.mem.Allocator, record: TableRecord) void {
     alloc.free(record.name);
+    alloc.free(record.database_name);
+    alloc.free(record.namespace_name);
     alloc.free(record.description);
     alloc.free(record.schema_json);
     alloc.free(record.read_schema_json);
+    alloc.free(record.foreign_key_validation_json);
     alloc.free(record.indexes_json);
     alloc.free(record.replication_sources_json);
     alloc.free(record.placement_role);
+    alloc.free(record.tablespace_name);
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_location);
 }
@@ -766,6 +3059,344 @@ pub fn freeRange(alloc: std.mem.Allocator, record: RangeRecord) void {
     alloc.free(record.restore_backup_id);
     alloc.free(record.restore_location);
     alloc.free(record.restore_snapshot_path);
+}
+
+fn foreignKeyReferenceRangeIdentityMatches(a: ForeignKeyReferenceRangeRecord, b: ForeignKeyReferenceRangeRecord) bool {
+    return a.child_table_id == b.child_table_id and
+        a.parent_table_id == b.parent_table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name) and
+        (a.range_id == 0 or b.range_id == 0 or a.range_id == b.range_id) and
+        std.mem.eql(u8, a.start_parent_key, b.start_parent_key);
+}
+
+fn foreignKeyReferenceRangeConstraintMatches(a: ForeignKeyReferenceRangeRecord, b: ForeignKeyReferenceRangeRecord) bool {
+    return a.child_table_id == b.child_table_id and
+        a.parent_table_id == b.parent_table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name);
+}
+
+fn foreignKeyReferenceRangesOverlap(a: ForeignKeyReferenceRangeRecord, b: ForeignKeyReferenceRangeRecord) bool {
+    if (a.end_parent_key) |a_end| {
+        if (std.mem.order(u8, a_end, b.start_parent_key) != .gt) return false;
+    }
+    if (b.end_parent_key) |b_end| {
+        if (std.mem.order(u8, b_end, a.start_parent_key) != .gt) return false;
+    }
+    return true;
+}
+
+fn foreignKeyReferenceRangesAdjacent(left: ForeignKeyReferenceRangeRecord, right: ForeignKeyReferenceRangeRecord) bool {
+    if (left.child_table_id != right.child_table_id) return false;
+    if (left.parent_table_id != right.parent_table_id) return false;
+    if (!std.mem.eql(u8, left.constraint_name, right.constraint_name)) return false;
+    const left_end = left.end_parent_key orelse return false;
+    return std.mem.eql(u8, left_end, right.start_parent_key);
+}
+
+fn uniqueConstraintRangeIdentityMatches(a: UniqueConstraintRangeRecord, b: UniqueConstraintRangeRecord) bool {
+    return a.table_id == b.table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name) and
+        (a.range_id == 0 or b.range_id == 0 or a.range_id == b.range_id) and
+        std.mem.eql(u8, a.start_encoded_value, b.start_encoded_value);
+}
+
+fn uniqueConstraintRangeConstraintMatches(a: UniqueConstraintRangeRecord, b: UniqueConstraintRangeRecord) bool {
+    return a.table_id == b.table_id and
+        std.mem.eql(u8, a.constraint_name, b.constraint_name);
+}
+
+fn uniqueConstraintRangesOverlap(a: UniqueConstraintRangeRecord, b: UniqueConstraintRangeRecord) bool {
+    if (a.end_encoded_value) |a_end| {
+        if (std.mem.order(u8, a_end, b.start_encoded_value) != .gt) return false;
+    }
+    if (b.end_encoded_value) |b_end| {
+        if (std.mem.order(u8, b_end, a.start_encoded_value) != .gt) return false;
+    }
+    return true;
+}
+
+fn uniqueConstraintRangesAdjacent(left: UniqueConstraintRangeRecord, right: UniqueConstraintRangeRecord) bool {
+    if (left.table_id != right.table_id) return false;
+    if (!std.mem.eql(u8, left.constraint_name, right.constraint_name)) return false;
+    const left_end = left.end_encoded_value orelse return false;
+    return std.mem.eql(u8, left_end, right.start_encoded_value);
+}
+
+fn mergedForeignKeyReferenceRangeId(merged_group_id: u64, left: ForeignKeyReferenceRangeRecord, right: ForeignKeyReferenceRangeRecord) u64 {
+    if (merged_group_id == left.group_id) return left.range_id;
+    if (merged_group_id == right.group_id) return right.range_id;
+    return merged_group_id;
+}
+
+fn mergedUniqueConstraintRangeId(merged_group_id: u64, left: UniqueConstraintRangeRecord, right: UniqueConstraintRangeRecord) u64 {
+    if (merged_group_id == left.group_id) return left.range_id;
+    if (merged_group_id == right.group_id) return right.range_id;
+    return merged_group_id;
+}
+
+fn secondaryIndexRebuildRangeIdentityMatches(a: SecondaryIndexRebuildRangeRecord, b: SecondaryIndexRebuildRangeRecord) bool {
+    return a.table_id == b.table_id and
+        a.index_generation == b.index_generation and
+        std.mem.eql(u8, a.index_name, b.index_name) and
+        (a.range_id == 0 or b.range_id == 0 or a.range_id == b.range_id) and
+        std.mem.eql(u8, a.start_row_key, b.start_row_key);
+}
+
+fn secondaryIndexRebuildRangeIndexMatches(a: SecondaryIndexRebuildRangeRecord, b: SecondaryIndexRebuildRangeRecord) bool {
+    return a.table_id == b.table_id and
+        a.index_generation == b.index_generation and
+        std.mem.eql(u8, a.index_name, b.index_name);
+}
+
+fn secondaryIndexRebuildRangesOverlap(a: SecondaryIndexRebuildRangeRecord, b: SecondaryIndexRebuildRangeRecord) bool {
+    if (a.end_row_key) |a_end| {
+        if (std.mem.order(u8, a_end, b.start_row_key) != .gt) return false;
+    }
+    if (b.end_row_key) |b_end| {
+        if (std.mem.order(u8, b_end, a.start_row_key) != .gt) return false;
+    }
+    return true;
+}
+
+pub fn cloneForeignKeyReferenceRange(alloc: std.mem.Allocator, record: ForeignKeyReferenceRangeRecord) !ForeignKeyReferenceRangeRecord {
+    const constraint_name = try alloc.dupe(u8, record.constraint_name);
+    errdefer alloc.free(constraint_name);
+    const start_parent_key = try alloc.dupe(u8, record.start_parent_key);
+    errdefer alloc.free(start_parent_key);
+    const end_parent_key = try cloneOwnedOptional(alloc, record.end_parent_key);
+    errdefer freeOwnedOptional(alloc, end_parent_key);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    return .{
+        .child_table_id = record.child_table_id,
+        .constraint_name = constraint_name,
+        .parent_table_id = record.parent_table_id,
+        .start_parent_key = start_parent_key,
+        .end_parent_key = end_parent_key,
+        .group_id = record.group_id,
+        .range_id = record.range_id,
+        .topology_epoch = record.topology_epoch,
+        .state = state,
+    };
+}
+
+pub fn freeForeignKeyReferenceRange(alloc: std.mem.Allocator, record: ForeignKeyReferenceRangeRecord) void {
+    alloc.free(record.constraint_name);
+    alloc.free(record.start_parent_key);
+    freeOwnedOptional(alloc, record.end_parent_key);
+    alloc.free(record.state);
+}
+
+pub fn cloneUniqueConstraintRange(alloc: std.mem.Allocator, record: UniqueConstraintRangeRecord) !UniqueConstraintRangeRecord {
+    const constraint_name = try alloc.dupe(u8, record.constraint_name);
+    errdefer alloc.free(constraint_name);
+    const start_encoded_value = try alloc.dupe(u8, record.start_encoded_value);
+    errdefer alloc.free(start_encoded_value);
+    const end_encoded_value = try cloneOwnedOptional(alloc, record.end_encoded_value);
+    errdefer freeOwnedOptional(alloc, end_encoded_value);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    return .{
+        .table_id = record.table_id,
+        .constraint_name = constraint_name,
+        .start_encoded_value = start_encoded_value,
+        .end_encoded_value = end_encoded_value,
+        .group_id = record.group_id,
+        .range_id = record.range_id,
+        .topology_epoch = record.topology_epoch,
+        .state = state,
+    };
+}
+
+pub fn freeUniqueConstraintRange(alloc: std.mem.Allocator, record: UniqueConstraintRangeRecord) void {
+    alloc.free(record.constraint_name);
+    alloc.free(record.start_encoded_value);
+    freeOwnedOptional(alloc, record.end_encoded_value);
+    alloc.free(record.state);
+}
+
+pub fn cloneSecondaryIndexRebuildRange(alloc: std.mem.Allocator, record: SecondaryIndexRebuildRangeRecord) !SecondaryIndexRebuildRangeRecord {
+    const index_name = try alloc.dupe(u8, record.index_name);
+    errdefer alloc.free(index_name);
+    const start_row_key = try alloc.dupe(u8, record.start_row_key);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = try cloneOwnedOptional(alloc, record.end_row_key);
+    errdefer freeOwnedOptional(alloc, end_row_key);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    const lease_owner = try alloc.dupe(u8, record.lease_owner);
+    errdefer alloc.free(lease_owner);
+    const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
+    errdefer alloc.free(progress_row_key);
+    const last_error = try alloc.dupe(u8, record.last_error);
+    errdefer alloc.free(last_error);
+    return .{
+        .table_id = record.table_id,
+        .index_name = index_name,
+        .index_generation = record.index_generation,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
+        .group_id = record.group_id,
+        .range_id = record.range_id,
+        .topology_epoch = record.topology_epoch,
+        .state = state,
+        .lease_owner = lease_owner,
+        .lease_expires_at_ms = record.lease_expires_at_ms,
+        .attempts = record.attempts,
+        .completed_row_count = record.completed_row_count,
+        .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+pub fn freeSecondaryIndexRebuildRange(alloc: std.mem.Allocator, record: SecondaryIndexRebuildRangeRecord) void {
+    alloc.free(record.index_name);
+    alloc.free(record.start_row_key);
+    freeOwnedOptional(alloc, record.end_row_key);
+    alloc.free(record.state);
+    alloc.free(record.lease_owner);
+    alloc.free(record.progress_row_key);
+    alloc.free(record.last_error);
+}
+
+pub fn cloneSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRecord) !SchemaRewriteJobRecord {
+    const action = try alloc.dupe(u8, record.action);
+    errdefer alloc.free(action);
+    const reason = try alloc.dupe(u8, record.reason);
+    errdefer alloc.free(reason);
+    const start_row_key = try alloc.dupe(u8, record.start_row_key);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = if (record.end_row_key) |value| try alloc.dupe(u8, value) else null;
+    errdefer if (end_row_key) |value| alloc.free(value);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    const target_column = try alloc.dupe(u8, record.target_column);
+    errdefer alloc.free(target_column);
+    const expression = if (record.expression) |expr| try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, expr) else null;
+    errdefer if (expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
+    const rewrite_renames = try alloc.alloc(SchemaRewriteRename, record.rewrite_renames.len);
+    var rewrite_renames_initialized: usize = 0;
+    errdefer {
+        for (rewrite_renames[0..rewrite_renames_initialized]) |rename| {
+            alloc.free(rename.old_path);
+            alloc.free(rename.new_path);
+        }
+        alloc.free(rewrite_renames);
+    }
+    for (record.rewrite_renames, 0..) |rename, i| {
+        const old_path = try alloc.dupe(u8, rename.old_path);
+        errdefer alloc.free(old_path);
+        const new_path = try alloc.dupe(u8, rename.new_path);
+        rewrite_renames[i] = .{ .old_path = old_path, .new_path = new_path };
+        rewrite_renames_initialized += 1;
+    }
+    const rewrite_drops = try alloc.alloc([]const u8, record.rewrite_drops.len);
+    var rewrite_drops_initialized: usize = 0;
+    errdefer {
+        for (rewrite_drops[0..rewrite_drops_initialized]) |drop| alloc.free(drop);
+        alloc.free(rewrite_drops);
+    }
+    for (record.rewrite_drops, 0..) |drop, i| {
+        rewrite_drops[i] = try alloc.dupe(u8, drop);
+        rewrite_drops_initialized += 1;
+    }
+    const lease_owner = try alloc.dupe(u8, record.lease_owner);
+    errdefer alloc.free(lease_owner);
+    const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
+    errdefer alloc.free(progress_row_key);
+    const last_error = try alloc.dupe(u8, record.last_error);
+    errdefer alloc.free(last_error);
+    return .{
+        .job_id = record.job_id,
+        .table_id = record.table_id,
+        .group_id = record.group_id,
+        .range_id = record.range_id,
+        .schema_generation = record.schema_generation,
+        .action = action,
+        .reason = reason,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
+        .state = state,
+        .target_column = target_column,
+        .expression = expression,
+        .full_row_rewrite = record.full_row_rewrite,
+        .rewrite_renames = rewrite_renames,
+        .rewrite_drops = rewrite_drops,
+        .lease_owner = lease_owner,
+        .lease_expires_at_ms = record.lease_expires_at_ms,
+        .attempts = record.attempts,
+        .completed_row_count = record.completed_row_count,
+        .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+pub fn freeSchemaRewriteJob(alloc: std.mem.Allocator, record: SchemaRewriteJobRecord) void {
+    alloc.free(record.action);
+    alloc.free(record.reason);
+    alloc.free(record.start_row_key);
+    freeOwnedOptional(alloc, record.end_row_key);
+    alloc.free(record.state);
+    alloc.free(record.target_column);
+    if (record.expression) |expr| runtime_schema.freeRelationalRowsExpression(alloc, expr);
+    for (record.rewrite_renames) |rename| {
+        alloc.free(rename.old_path);
+        alloc.free(rename.new_path);
+    }
+    alloc.free(record.rewrite_renames);
+    for (record.rewrite_drops) |drop| alloc.free(drop);
+    alloc.free(record.rewrite_drops);
+    alloc.free(record.lease_owner);
+    alloc.free(record.progress_row_key);
+    alloc.free(record.last_error);
+}
+
+pub fn cloneTableEmptyingJob(alloc: std.mem.Allocator, record: TableEmptyingJobRecord) !TableEmptyingJobRecord {
+    const affected_table_ids = try alloc.dupe(u64, record.affected_table_ids);
+    errdefer alloc.free(affected_table_ids);
+    const start_row_key = try alloc.dupe(u8, record.start_row_key);
+    errdefer alloc.free(start_row_key);
+    const end_row_key = if (record.end_row_key) |end_row_key| try alloc.dupe(u8, end_row_key) else null;
+    errdefer if (end_row_key) |owned| alloc.free(owned);
+    const state = try alloc.dupe(u8, record.state);
+    errdefer alloc.free(state);
+    const lease_owner = try alloc.dupe(u8, record.lease_owner);
+    errdefer alloc.free(lease_owner);
+    const progress_row_key = try alloc.dupe(u8, record.progress_row_key);
+    errdefer alloc.free(progress_row_key);
+    const last_error = try alloc.dupe(u8, record.last_error);
+    errdefer alloc.free(last_error);
+    return .{
+        .job_id = record.job_id,
+        .table_id = record.table_id,
+        .group_id = record.group_id,
+        .range_id = record.range_id,
+        .schema_generation = record.schema_generation,
+        .data_generation = record.data_generation,
+        .barrier_id = record.barrier_id,
+        .start_row_key = start_row_key,
+        .end_row_key = end_row_key,
+        .affected_table_ids = affected_table_ids,
+        .restart_identity = record.restart_identity,
+        .cascade = record.cascade,
+        .state = state,
+        .lease_owner = lease_owner,
+        .lease_expires_at_ms = record.lease_expires_at_ms,
+        .attempts = record.attempts,
+        .completed_row_count = record.completed_row_count,
+        .progress_row_key = progress_row_key,
+        .last_error = last_error,
+    };
+}
+
+pub fn freeTableEmptyingJob(alloc: std.mem.Allocator, record: TableEmptyingJobRecord) void {
+    alloc.free(record.start_row_key);
+    if (record.end_row_key) |end_row_key| alloc.free(end_row_key);
+    alloc.free(record.affected_table_ids);
+    alloc.free(record.state);
+    alloc.free(record.lease_owner);
+    alloc.free(record.progress_row_key);
+    alloc.free(record.last_error);
 }
 
 pub fn cloneRestoreProgress(alloc: std.mem.Allocator, record: RestoreProgressRecord) !RestoreProgressRecord {
@@ -1356,6 +3987,1843 @@ test "table manager can replace topology from projected state" {
     try std.testing.expectEqualStrings("new", listed_tables[0].name);
     try std.testing.expectEqual(@as(usize, 1), listed_ranges.len);
     try std.testing.expectEqual(@as(u64, 21), listed_ranges[0].group_id);
+}
+
+test "table manager owns foreign key reference owner ranges" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "customers" });
+    try manager.upsertTable(.{ .table_id = 9, .name = "accounts" });
+
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "",
+        .end_parent_key = "customer:m",
+        .group_id = 9001,
+        .topology_epoch = 11,
+    });
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:m",
+        .end_parent_key = null,
+        .group_id = 9002,
+        .topology_epoch = 12,
+    });
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_account_id_fkey",
+        .parent_table_id = 9,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .group_id = 9003,
+        .state = foreign_key_ref_range_rebuilding,
+    });
+    try std.testing.expectError(error.InvalidForeignKeyReferenceRangeState, manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_account_id_fkey",
+        .parent_table_id = 9,
+        .start_parent_key = "account:z",
+        .end_parent_key = null,
+        .group_id = 9004,
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.ForeignKeyReferenceRangeOverlap, manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:h",
+        .end_parent_key = "customer:t",
+        .group_id = 9005,
+    }));
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:m",
+        .end_parent_key = null,
+        .group_id = 9012,
+        .topology_epoch = 22,
+    });
+    try std.testing.expectError(error.ForeignKeyReferenceRangeGroupCollision, manager.upsertRange(.{
+        .group_id = 9012,
+        .table_id = 7,
+        .start_key = "order:a",
+        .end_key = "order:z",
+    }));
+    try manager.upsertRange(.{
+        .group_id = 9100,
+        .table_id = 7,
+        .start_key = "order:a",
+        .end_key = "order:z",
+    });
+    try std.testing.expectError(error.ForeignKeyReferenceRangeGroupCollision, manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "customer:z",
+        .end_parent_key = null,
+        .group_id = 9100,
+    }));
+
+    const listed = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+    defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    var saw_replaced = false;
+    for (listed) |record| {
+        if (!std.mem.eql(u8, record.constraint_name, "orders_customer_id_fkey")) continue;
+        if (!std.mem.eql(u8, record.start_parent_key, "customer:m")) continue;
+        try std.testing.expectEqual(@as(u64, 9012), record.group_id);
+        try std.testing.expectEqual(@as(u64, 22), record.topology_epoch);
+        saw_replaced = true;
+    }
+    try std.testing.expect(saw_replaced);
+
+    try std.testing.expectEqual(@as(usize, 2), manager.removeForeignKeyReferenceRangesForTable(8));
+    const remaining = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+    defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 1), remaining.len);
+    try std.testing.expectEqualStrings("orders_account_id_fkey", remaining[0].constraint_name);
+    try std.testing.expectEqualStrings(foreign_key_ref_range_rebuilding, remaining[0].state);
+}
+
+test "table manager applies foreign key reference range lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "customers" });
+    const selector: ForeignKeyReferenceRangeSelector = .{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "",
+    };
+    try manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 7,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 8,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .group_id = 9001,
+    });
+
+    try manager.beginForeignKeyReferenceRangeRebuild(selector);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_rebuilding, ranges[0].state);
+        try std.testing.expect(!foreignKeyReferenceRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishForeignKeyReferenceRangeRebuild(selector);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_active, ranges[0].state);
+        try std.testing.expect(foreignKeyReferenceRangeRoutable(ranges[0]));
+    }
+
+    const split_request: ForeignKeyReferenceRangeSplitRequest = .{
+        .selector = selector,
+        .split_parent_key = "customer:m",
+        .left_group_id = 9001,
+        .right_group_id = 9002,
+    };
+    try manager.beginForeignKeyReferenceRangeSplit(split_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_splitting, ranges[0].state);
+        try std.testing.expect(!foreignKeyReferenceRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishForeignKeyReferenceRangeSplit(split_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 2), ranges.len);
+        var saw_left = false;
+        var saw_right = false;
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(foreign_key_ref_range_active, record.state);
+            if (std.mem.eql(u8, record.start_parent_key, "")) {
+                try std.testing.expectEqualStrings("customer:m", record.end_parent_key.?);
+                try std.testing.expectEqual(@as(u64, 9001), record.group_id);
+                try std.testing.expectEqual(@as(u64, 9001), record.range_id);
+                saw_left = true;
+            } else if (std.mem.eql(u8, record.start_parent_key, "customer:m")) {
+                try std.testing.expect(record.end_parent_key == null);
+                try std.testing.expectEqual(@as(u64, 9002), record.group_id);
+                try std.testing.expectEqual(@as(u64, 9002), record.range_id);
+                saw_right = true;
+            }
+        }
+        try std.testing.expect(saw_left and saw_right);
+    }
+
+    const merge_request: ForeignKeyReferenceRangeMergeRequest = .{
+        .left_selector = selector,
+        .right_start_parent_key = "customer:m",
+        .merged_group_id = 9001,
+    };
+    try manager.beginForeignKeyReferenceRangeMerge(merge_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(foreign_key_ref_range_merging, record.state);
+            try std.testing.expect(!foreignKeyReferenceRangeRoutable(record));
+        }
+    }
+
+    try manager.finishForeignKeyReferenceRangeMerge(merge_request);
+    {
+        const ranges = try manager.listForeignKeyReferenceRanges(std.testing.allocator);
+        defer manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings("", ranges[0].start_parent_key);
+        try std.testing.expect(ranges[0].end_parent_key == null);
+        try std.testing.expectEqual(@as(u64, 9001), ranges[0].group_id);
+        try std.testing.expectEqual(@as(u64, 9001), ranges[0].range_id);
+        try std.testing.expectEqualStrings(foreign_key_ref_range_active, ranges[0].state);
+    }
+}
+
+test "table manager owns unique constraint owner ranges" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "users" });
+
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = "email:m",
+        .group_id = 7101,
+        .topology_epoch = 21,
+    });
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:m",
+        .end_encoded_value = null,
+        .group_id = 7102,
+        .topology_epoch = 22,
+    });
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_username_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+        .group_id = 7201,
+        .state = unique_constraint_range_rebuilding,
+    });
+    try std.testing.expectError(error.InvalidUniqueConstraintRangeState, manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_username_key",
+        .start_encoded_value = "username:z",
+        .end_encoded_value = null,
+        .group_id = 7202,
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.UniqueConstraintRangeOverlap, manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:h",
+        .end_encoded_value = "email:t",
+        .group_id = 7105,
+    }));
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:m",
+        .end_encoded_value = null,
+        .group_id = 7112,
+        .topology_epoch = 32,
+    });
+    try std.testing.expectError(error.UniqueConstraintRangeGroupCollision, manager.upsertRange(.{
+        .group_id = 7112,
+        .table_id = 7,
+        .start_key = "user:a",
+        .end_key = "user:z",
+    }));
+    try manager.upsertRange(.{
+        .group_id = 7300,
+        .table_id = 7,
+        .start_key = "user:a",
+        .end_key = "user:z",
+    });
+    try std.testing.expectError(error.UniqueConstraintRangeGroupCollision, manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "email:z",
+        .end_encoded_value = null,
+        .group_id = 7300,
+    }));
+
+    const listed = try manager.listUniqueConstraintRanges(std.testing.allocator);
+    defer manager.freeUniqueConstraintRanges(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    var saw_replaced = false;
+    for (listed) |record| {
+        if (!std.mem.eql(u8, record.constraint_name, "users_email_key")) continue;
+        if (!std.mem.eql(u8, record.start_encoded_value, "email:m")) continue;
+        try std.testing.expectEqual(@as(u64, 7112), record.group_id);
+        try std.testing.expectEqual(@as(u64, 32), record.topology_epoch);
+        saw_replaced = true;
+    }
+    try std.testing.expect(saw_replaced);
+
+    try std.testing.expectEqual(@as(usize, 3), manager.removeUniqueConstraintRangesForTable(7));
+    const remaining = try manager.listUniqueConstraintRanges(std.testing.allocator);
+    defer manager.freeUniqueConstraintRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager applies unique constraint range lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "users" });
+    const selector: UniqueConstraintRangeSelector = .{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+    };
+    try manager.upsertUniqueConstraintRange(.{
+        .table_id = 7,
+        .constraint_name = "users_email_key",
+        .start_encoded_value = "",
+        .end_encoded_value = null,
+        .group_id = 7101,
+    });
+
+    try manager.beginUniqueConstraintRangeRebuild(selector);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(unique_constraint_range_rebuilding, ranges[0].state);
+        try std.testing.expect(!uniqueConstraintRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishUniqueConstraintRangeRebuild(selector);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(unique_constraint_range_active, ranges[0].state);
+        try std.testing.expect(uniqueConstraintRangeRoutable(ranges[0]));
+    }
+
+    const split_request: UniqueConstraintRangeSplitRequest = .{
+        .selector = selector,
+        .split_encoded_value = "email:m",
+        .left_group_id = 7101,
+        .right_group_id = 7102,
+    };
+    try manager.beginUniqueConstraintRangeSplit(split_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(unique_constraint_range_splitting, ranges[0].state);
+        try std.testing.expect(!uniqueConstraintRangeRoutable(ranges[0]));
+    }
+
+    try manager.finishUniqueConstraintRangeSplit(split_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 2), ranges.len);
+        var saw_left = false;
+        var saw_right = false;
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(unique_constraint_range_active, record.state);
+            if (std.mem.eql(u8, record.start_encoded_value, "")) {
+                try std.testing.expectEqualStrings("email:m", record.end_encoded_value.?);
+                try std.testing.expectEqual(@as(u64, 7101), record.group_id);
+                try std.testing.expectEqual(@as(u64, 7101), record.range_id);
+                saw_left = true;
+            } else if (std.mem.eql(u8, record.start_encoded_value, "email:m")) {
+                try std.testing.expect(record.end_encoded_value == null);
+                try std.testing.expectEqual(@as(u64, 7102), record.group_id);
+                try std.testing.expectEqual(@as(u64, 7102), record.range_id);
+                saw_right = true;
+            }
+        }
+        try std.testing.expect(saw_left and saw_right);
+    }
+
+    const merge_request: UniqueConstraintRangeMergeRequest = .{
+        .left_selector = selector,
+        .right_start_encoded_value = "email:m",
+        .merged_group_id = 7101,
+    };
+    try manager.beginUniqueConstraintRangeMerge(merge_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        for (ranges) |record| {
+            try std.testing.expectEqualStrings(unique_constraint_range_merging, record.state);
+            try std.testing.expect(!uniqueConstraintRangeRoutable(record));
+        }
+    }
+
+    try manager.finishUniqueConstraintRangeMerge(merge_request);
+    {
+        const ranges = try manager.listUniqueConstraintRanges(std.testing.allocator);
+        defer manager.freeUniqueConstraintRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings("", ranges[0].start_encoded_value);
+        try std.testing.expect(ranges[0].end_encoded_value == null);
+        try std.testing.expectEqual(@as(u64, 7101), ranges[0].group_id);
+        try std.testing.expectEqual(@as(u64, 7101), ranges[0].range_id);
+        try std.testing.expectEqualStrings(unique_constraint_range_active, ranges[0].state);
+    }
+}
+
+test "table manager owns secondary index rebuild work ranges" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "",
+        .end_row_key = "order:m",
+        .group_id = 8101,
+        .topology_epoch = 11,
+    });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "order:m",
+        .end_row_key = null,
+        .group_id = 8102,
+        .topology_epoch = 12,
+    });
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_email_idx",
+        .index_generation = 99,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 8103,
+        .state = secondary_index_rebuild_building,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 1234,
+    });
+    try std.testing.expectError(error.InvalidSecondaryIndexRebuildRangeState, manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_email_idx",
+        .index_generation = 99,
+        .start_row_key = "order:z",
+        .end_row_key = null,
+        .group_id = 8104,
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.InvalidSecondaryIndexGeneration, manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_bad_idx",
+        .index_generation = 0,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 8104,
+    }));
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeOverlap, manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "order:h",
+        .end_row_key = "order:t",
+        .group_id = 8105,
+    }));
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "order:m",
+        .end_row_key = null,
+        .group_id = 8112,
+        .topology_epoch = 22,
+    });
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeGroupCollision, manager.upsertRange(.{
+        .group_id = 8112,
+        .table_id = 7,
+        .start_key = "order:a",
+        .end_key = "order:z",
+    }));
+
+    const listed = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+    defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 3), listed.len);
+
+    var saw_replaced = false;
+    for (listed) |record| {
+        if (!std.mem.eql(u8, record.index_name, "orders_status_idx")) continue;
+        if (!std.mem.eql(u8, record.start_row_key, "order:m")) continue;
+        try std.testing.expectEqual(@as(u64, 8112), record.group_id);
+        try std.testing.expectEqual(@as(u64, 22), record.topology_epoch);
+        saw_replaced = true;
+    }
+    try std.testing.expect(saw_replaced);
+
+    try std.testing.expectEqual(@as(usize, 3), manager.removeSecondaryIndexRebuildRangesForTable(7));
+    const remaining = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+    defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager owns schema rewrite jobs" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+
+    const status_expr: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{
+            .{ .kind = .field, .field = "status" },
+        },
+    };
+
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = "m",
+        .target_column = "status_norm",
+        .expression = status_expr,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 1234,
+    });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9102,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = 42,
+        .action = "validate",
+        .reason = "constraints",
+        .start_row_key = "m",
+        .end_row_key = null,
+        .state = schema_rewrite_ready,
+        .completed_row_count = 12,
+        .progress_row_key = "order:z",
+    });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9104,
+        .table_id = 7,
+        .group_id = 9003,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "z",
+        .rewrite_renames = &.{.{ .old_path = "status", .new_path = "state" }},
+        .rewrite_drops = &.{"legacy_status"},
+    });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9105,
+        .table_id = 7,
+        .group_id = 9004,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "zz",
+        .full_row_rewrite = true,
+    });
+    try std.testing.expectError(error.UnknownTable, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9199,
+        .table_id = 99,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, manager.upsertSchemaRewriteJob(.{
+        .job_id = 0,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteGeneration, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 0,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteJobState, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .expression = status_expr,
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteExpression, manager.upsertSchemaRewriteJob(.{
+        .job_id = 9103,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .full_row_rewrite = true,
+        .rewrite_drops = &.{"legacy_status"},
+    }));
+
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 43,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = "m",
+        .state = schema_rewrite_invalid,
+        .target_column = "status_norm",
+        .expression = status_expr,
+        .last_error = "schema generation moved",
+    });
+
+    const listed = try manager.listSchemaRewriteJobs(std.testing.allocator);
+    defer manager.freeSchemaRewriteJobs(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 4), listed.len);
+
+    var saw_replaced = false;
+    var saw_ready = false;
+    var saw_row_plan = false;
+    var saw_full_row_rewrite = false;
+    for (listed) |record| {
+        if (record.job_id == 9101) {
+            try std.testing.expectEqual(@as(u64, 43), record.schema_generation);
+            try std.testing.expectEqualStrings(schema_rewrite_invalid, record.state);
+            try std.testing.expectEqualStrings("schema generation moved", record.last_error);
+            try std.testing.expectEqualStrings("status_norm", record.target_column);
+            try std.testing.expect(record.expression != null);
+            try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.lower, record.expression.?.kind);
+            try std.testing.expectEqual(@as(usize, 1), record.expression.?.operands.len);
+            try std.testing.expectEqualStrings("status", record.expression.?.operands[0].field);
+            saw_replaced = true;
+        } else if (record.job_id == 9102) {
+            try std.testing.expect(schemaRewriteJobComplete(record));
+            try std.testing.expectEqual(@as(u64, 12), record.completed_row_count);
+            try std.testing.expectEqualStrings("order:z", record.progress_row_key);
+            saw_ready = true;
+        } else if (record.job_id == 9104) {
+            try std.testing.expectEqual(@as(usize, 1), record.rewrite_renames.len);
+            try std.testing.expectEqualStrings("status", record.rewrite_renames[0].old_path);
+            try std.testing.expectEqualStrings("state", record.rewrite_renames[0].new_path);
+            try std.testing.expectEqual(@as(usize, 1), record.rewrite_drops.len);
+            try std.testing.expectEqualStrings("legacy_status", record.rewrite_drops[0]);
+            saw_row_plan = true;
+        } else if (record.job_id == 9105) {
+            try std.testing.expect(record.full_row_rewrite);
+            try std.testing.expectEqual(@as(usize, 0), record.rewrite_renames.len);
+            try std.testing.expectEqual(@as(usize, 0), record.rewrite_drops.len);
+            saw_full_row_rewrite = true;
+        }
+    }
+    try std.testing.expect(saw_replaced and saw_ready and saw_row_plan and saw_full_row_rewrite);
+
+    try std.testing.expect(manager.removeSchemaRewriteJob(9102));
+    try std.testing.expect(!manager.removeSchemaRewriteJob(9102));
+    try std.testing.expectEqual(@as(usize, 3), manager.removeSchemaRewriteJobsForTable(7));
+    const remaining = try manager.listSchemaRewriteJobs(std.testing.allocator);
+    defer manager.freeSchemaRewriteJobs(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table manager atomically applies table catalog updates with schema rewrite jobs" {
+    const alloc = std.testing.allocator;
+    const original_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const updated_schema_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var manager = TableManager.init(alloc);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = original_schema_json });
+    const generation = schemaRewriteGenerationForSchemaJson(updated_schema_json);
+    try manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{
+        .table = .{ .table_id = 7, .name = "orders", .schema_json = updated_schema_json },
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 9101,
+                .table_id = 7,
+                .group_id = 9001,
+                .schema_generation = generation,
+                .action = "validate",
+                .reason = "constraints",
+                .start_row_key = "",
+            },
+        },
+    });
+
+    const tables = try manager.listTables(alloc);
+    defer manager.freeTables(alloc, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings(updated_schema_json, tables[0].schema_json);
+
+    const jobs = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(u64, 9101), jobs[0].job_id);
+
+    const rejected_schema_json = "{\"version\":3}";
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, manager.applyTableCatalogUpdateWithSchemaRewriteJobs(.{
+        .table = .{ .table_id = 7, .name = "orders", .schema_json = rejected_schema_json },
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 0,
+                .table_id = 7,
+                .group_id = 9001,
+                .schema_generation = schemaRewriteGenerationForSchemaJson(rejected_schema_json),
+                .action = "validate",
+                .reason = "constraints",
+                .start_row_key = "",
+            },
+        },
+    }));
+
+    const tables_after_error = try manager.listTables(alloc);
+    defer manager.freeTables(alloc, tables_after_error);
+    try std.testing.expectEqualStrings(updated_schema_json, tables_after_error[0].schema_json);
+}
+
+test "table manager atomically applies multi-table catalog batch updates with schema rewrite jobs" {
+    const alloc = std.testing.allocator;
+    const orders_schema_json =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const invoices_schema_json =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var manager = TableManager.init(alloc);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = "{\"version\":1}" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "invoices", .schema_json = "{\"version\":1}" });
+    try manager.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(.{
+        .tables = &.{
+            .{ .table_id = 7, .name = "orders", .schema_json = orders_schema_json },
+            .{ .table_id = 8, .name = "invoices", .schema_json = invoices_schema_json },
+        },
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 9101,
+                .table_id = 7,
+                .group_id = 9001,
+                .schema_generation = schemaRewriteGenerationForSchemaJson(orders_schema_json),
+                .action = "validate",
+                .reason = "constraints",
+                .start_row_key = "",
+            },
+            .{
+                .job_id = 9102,
+                .table_id = 8,
+                .group_id = 9002,
+                .schema_generation = schemaRewriteGenerationForSchemaJson(invoices_schema_json),
+                .action = "rewrite",
+                .reason = "row_images",
+                .start_row_key = "",
+                .full_row_rewrite = true,
+            },
+        },
+    });
+
+    const tables = try manager.listTables(alloc);
+    defer manager.freeTables(alloc, tables);
+    try std.testing.expectEqual(@as(usize, 2), tables.len);
+
+    const jobs = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 2), jobs.len);
+
+    try std.testing.expectError(error.InvalidSchemaRewriteJob, manager.applyTableCatalogBatchUpdateWithSchemaRewriteJobs(.{
+        .tables = &.{
+            .{ .table_id = 7, .name = "orders", .schema_json = orders_schema_json },
+            .{ .table_id = 8, .name = "invoices", .schema_json = invoices_schema_json },
+        },
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 9103,
+                .table_id = 9,
+                .group_id = 9003,
+                .schema_generation = schemaRewriteGenerationForSchemaJson(orders_schema_json),
+                .action = "validate",
+                .reason = "constraints",
+                .start_row_key = "",
+            },
+        },
+    }));
+}
+
+test "table manager applies table catalog drop with child updates atomically" {
+    const alloc = std.testing.allocator;
+    const child_schema_json =
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    var manager = TableManager.init(alloc);
+    defer manager.deinit();
+
+    const sequence_id = deriveSequenceId(default_database_name, default_namespace_name, "parents_id_seq");
+    try manager.upsertTable(.{ .table_id = 7, .name = "parents", .schema_json = "{\"version\":1}" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "children", .schema_json = "{\"version\":1}" });
+    try manager.upsertSequence(.{ .sequence_id = sequence_id, .name = "parents_id_seq" });
+    try manager.upsertRange(.{ .table_id = 7, .group_id = 9001, .start_key = "", .end_key = null });
+    try manager.upsertRange(.{ .table_id = 8, .group_id = 9002, .start_key = "", .end_key = null });
+
+    try std.testing.expectError(error.UnknownRange, manager.applyTableCatalogDropWithSchemaRewriteJobs(.{
+        .table_id = 7,
+        .range_group_ids = &.{9002},
+        .table_updates = &.{.{ .table_id = 8, .name = "children", .schema_json = child_schema_json }},
+        .schema_rewrite_jobs = &.{},
+    }));
+    try std.testing.expect(manager.tables.contains(7));
+    try std.testing.expect(manager.ranges.contains(9001));
+
+    try manager.applyTableCatalogDropWithSchemaRewriteJobs(.{
+        .table_id = 7,
+        .sequence_ids = &.{sequence_id},
+        .range_group_ids = &.{9001},
+        .table_updates = &.{.{ .table_id = 8, .name = "children", .schema_json = child_schema_json }},
+        .schema_rewrite_jobs = &.{
+            .{
+                .job_id = 9101,
+                .table_id = 8,
+                .group_id = 9002,
+                .schema_generation = schemaRewriteGenerationForSchemaJson(child_schema_json),
+                .action = "rewrite",
+                .reason = "drop_fk_parent",
+                .start_row_key = "",
+                .full_row_rewrite = true,
+            },
+        },
+    });
+
+    try std.testing.expect(!manager.tables.contains(7));
+    try std.testing.expect(!manager.sequences.contains(sequence_id));
+    try std.testing.expect(!manager.ranges.contains(9001));
+    const child = manager.tables.get(8) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqualStrings(child_schema_json, child.schema_json);
+    const jobs = try manager.listSchemaRewriteJobs(alloc);
+    defer manager.freeSchemaRewriteJobs(alloc, jobs);
+    try std.testing.expectEqual(@as(usize, 1), jobs.len);
+    try std.testing.expectEqual(@as(u64, 9101), jobs[0].job_id);
+}
+
+test "table manager applies schema rewrite job lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "",
+        .end_row_key = null,
+        .full_row_rewrite = true,
+    });
+
+    try std.testing.expectError(error.InvalidSchemaRewriteJobLease, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    }));
+    try std.testing.expectError(error.InvalidSchemaRewriteJobLease, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1000,
+    }));
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings(schema_rewrite_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1234), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.SchemaRewriteJobClaimBusy, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .now_ms = 1200,
+        .lease_expires_at_ms = 2000,
+    }));
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .now_ms = 1234,
+        .lease_expires_at_ms = 2000,
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-b", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 2000), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 2), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.SchemaRewriteJobLeaseMismatch, manager.finishSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-a",
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    }));
+    try manager.finishSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(schema_rewrite_ready, jobs[0].state);
+        try std.testing.expect(schemaRewriteJobComplete(jobs[0]));
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 17), jobs[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:z", jobs[0].progress_row_key);
+    }
+
+    try std.testing.expectError(error.SchemaRewriteJobNotDeclared, manager.beginSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    }));
+    try std.testing.expectError(error.SchemaRewriteJobNotRunning, manager.invalidateSchemaRewriteJob(.{
+        .job_id = 9101,
+        .lease_owner = "worker-b",
+        .last_error = "schema generation moved",
+    }));
+    try manager.upsertSchemaRewriteJob(.{
+        .job_id = 9102,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = 42,
+        .action = "rewrite",
+        .reason = "row_images",
+        .start_row_key = "m",
+        .end_row_key = null,
+        .full_row_rewrite = true,
+    });
+    try manager.beginSchemaRewriteJob(.{
+        .job_id = 9102,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    });
+    try std.testing.expectError(error.SchemaRewriteJobLeaseMismatch, manager.invalidateSchemaRewriteJob(.{
+        .job_id = 9102,
+        .lease_owner = "worker-b",
+        .last_error = "schema generation moved",
+    }));
+    try manager.invalidateSchemaRewriteJob(.{
+        .job_id = 9102,
+        .lease_owner = "worker-c",
+        .last_error = "schema generation moved",
+    });
+    {
+        const jobs = try manager.listSchemaRewriteJobs(std.testing.allocator);
+        defer manager.freeSchemaRewriteJobs(std.testing.allocator, jobs);
+        var saw_invalid = false;
+        for (jobs) |job| {
+            if (job.job_id != 9102) continue;
+            try std.testing.expectEqualStrings(schema_rewrite_invalid, job.state);
+            try std.testing.expectEqualStrings("", job.lease_owner);
+            try std.testing.expectEqual(@as(u64, 0), job.lease_expires_at_ms);
+            try std.testing.expectEqualStrings("schema generation moved", job.last_error);
+            saw_invalid = true;
+        }
+        try std.testing.expect(saw_invalid);
+    }
+
+    try std.testing.expectError(error.UnknownSchemaRewriteJob, manager.finishSchemaRewriteJob(.{
+        .job_id = 9999,
+        .lease_owner = "worker-c",
+        .completed_row_count = 1,
+        .progress_row_key = "order:a",
+    }));
+}
+
+test "table emptying affected table ids require primary nonzero unique membership" {
+    try std.testing.expect(tableEmptyingAffectedTableIdsValid(7, &.{7}));
+    try std.testing.expect(tableEmptyingAffectedTableIdsValid(7, &.{ 8, 7, 9 }));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(0, &.{7}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{0}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{8}));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsValid(7, &.{ 7, 8, 7 }));
+    try std.testing.expect(tableEmptyingAffectedTableIdsCanonicalSetValid(&.{ 7, 8, 9 }));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsCanonicalSetValid(&.{ 8, 7, 9 }));
+    try std.testing.expect(tableEmptyingAffectedTableIdsCanonicalValid(7, &.{ 7, 8 }));
+    try std.testing.expect(!tableEmptyingAffectedTableIdsCanonicalValid(7, &.{ 8, 7, 9 }));
+}
+
+test "table manager owns table emptying jobs" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items" });
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 1234,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9202,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 8 },
+        .cascade = true,
+        .state = table_emptying_ready,
+        .completed_row_count = 12,
+        .progress_row_key = "order:z",
+    });
+
+    try std.testing.expectError(error.UnknownTable, manager.upsertTableEmptyingJob(.{
+        .job_id = 9299,
+        .table_id = 99,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{99},
+    }));
+    try std.testing.expectError(error.UnknownTable, manager.upsertTableEmptyingJob(.{
+        .job_id = 9299,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 99 },
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 0,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingGeneration, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 0,
+        .affected_table_ids = &.{7},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJobState, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .state = "unknown",
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{8},
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 7 },
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJob, manager.upsertTableEmptyingJob(.{
+        .job_id = 9203,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 8, 7 },
+    }));
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 43,
+        .affected_table_ids = &.{7},
+        .state = table_emptying_invalid,
+        .last_error = "schema generation moved",
+    });
+
+    const listed = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, listed);
+    try std.testing.expectEqual(@as(usize, 2), listed.len);
+
+    var saw_replaced = false;
+    var saw_ready = false;
+    for (listed) |record| {
+        if (record.job_id == 9201) {
+            try std.testing.expectEqual(@as(u64, 43), record.schema_generation);
+            try std.testing.expectEqualStrings(table_emptying_invalid, record.state);
+            try std.testing.expectEqualStrings("schema generation moved", record.last_error);
+            try std.testing.expectEqual(@as(usize, 1), record.affected_table_ids.len);
+            try std.testing.expectEqual(@as(u64, 7), record.affected_table_ids[0]);
+            saw_replaced = true;
+        } else if (record.job_id == 9202) {
+            try std.testing.expect(tableEmptyingJobComplete(record));
+            try std.testing.expect(record.cascade);
+            try std.testing.expectEqual(@as(usize, 2), record.affected_table_ids.len);
+            try std.testing.expectEqual(@as(u64, 12), record.completed_row_count);
+            try std.testing.expectEqualStrings("order:z", record.progress_row_key);
+            saw_ready = true;
+        }
+    }
+    try std.testing.expect(saw_replaced and saw_ready);
+
+    try std.testing.expect(manager.removeTableEmptyingJob(9201));
+    try std.testing.expect(!manager.removeTableEmptyingJob(9201));
+    try std.testing.expectEqual(@as(usize, 1), manager.removeTableEmptyingJobsForTable(8));
+    const remaining = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, remaining);
+    try std.testing.expectEqual(@as(usize, 0), remaining.len);
+}
+
+test "table emptying stable job id captures durable intent" {
+    const base = TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+    };
+    const same = TableEmptyingJobRecord{
+        .job_id = 1234,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+        .state = table_emptying_invalid,
+        .lease_owner = "worker-a",
+        .lease_expires_at_ms = 123,
+        .attempts = 2,
+        .completed_row_count = 9,
+        .progress_row_key = "row:z",
+        .last_error = "boom",
+    };
+    try std.testing.expect(stableTableEmptyingJobId(base) != 0);
+    try std.testing.expectEqual(stableTableEmptyingJobId(base), stableTableEmptyingJobId(same));
+
+    var changed_generation = base;
+    changed_generation.schema_generation = 43;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_generation));
+
+    var changed_group = base;
+    changed_group.group_id = 9002;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_group));
+
+    var changed_range = base;
+    changed_range.range_id = 9101;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_range));
+
+    var changed_affected = base;
+    changed_affected.affected_table_ids = &.{7};
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_affected));
+
+    var changed_restart_identity = base;
+    changed_restart_identity.restart_identity = false;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_restart_identity));
+
+    var changed_cascade = base;
+    changed_cascade.cascade = false;
+    try std.testing.expect(stableTableEmptyingJobId(base) != stableTableEmptyingJobId(changed_cascade));
+}
+
+test "table manager applies table emptying job lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9201,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+    });
+
+    try std.testing.expectError(error.InvalidTableEmptyingJobLease, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingJobLease, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1000,
+    }));
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 1234,
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 1), jobs.len);
+        try std.testing.expectEqualStrings(table_emptying_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1234), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.TableEmptyingJobClaimBusy, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .now_ms = 1200,
+        .lease_expires_at_ms = 2000,
+    }));
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .now_ms = 1234,
+        .lease_expires_at_ms = 2000,
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_running, jobs[0].state);
+        try std.testing.expectEqualStrings("worker-b", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 2000), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 2), jobs[0].attempts);
+    }
+
+    try std.testing.expectError(error.TableEmptyingJobLeaseMismatch, manager.finishTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-a",
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    }));
+    try manager.finishTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .completed_row_count = 17,
+        .progress_row_key = "order:z",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqualStrings(table_emptying_ready, jobs[0].state);
+        try std.testing.expect(tableEmptyingJobComplete(jobs[0]));
+        try std.testing.expectEqualStrings("", jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 17), jobs[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:z", jobs[0].progress_row_key);
+    }
+
+    try std.testing.expectError(error.TableEmptyingJobNotDeclared, manager.beginTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    }));
+    try std.testing.expectError(error.TableEmptyingJobNotRunning, manager.invalidateTableEmptyingJob(.{
+        .job_id = 9201,
+        .lease_owner = "worker-b",
+        .last_error = "schema generation moved",
+    }));
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 9202,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = 42,
+        .affected_table_ids = &.{7},
+    });
+    try manager.beginTableEmptyingJob(.{
+        .job_id = 9202,
+        .lease_owner = "worker-c",
+        .now_ms = 3000,
+        .lease_expires_at_ms = 4000,
+    });
+    try std.testing.expectError(error.TableEmptyingJobLeaseMismatch, manager.invalidateTableEmptyingJob(.{
+        .job_id = 9202,
+        .lease_owner = "worker-b",
+        .last_error = "schema generation moved",
+    }));
+    try manager.invalidateTableEmptyingJob(.{
+        .job_id = 9202,
+        .lease_owner = "worker-c",
+        .last_error = "schema generation moved",
+    });
+    {
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        var saw_invalid = false;
+        for (jobs) |job| {
+            if (job.job_id != 9202) continue;
+            try std.testing.expectEqualStrings(table_emptying_invalid, job.state);
+            try std.testing.expectEqualStrings("", job.lease_owner);
+            try std.testing.expectEqual(@as(u64, 0), job.lease_expires_at_ms);
+            try std.testing.expectEqualStrings("schema generation moved", job.last_error);
+            saw_invalid = true;
+        }
+        try std.testing.expect(saw_invalid);
+    }
+
+    try std.testing.expectError(error.UnknownTableEmptyingJob, manager.finishTableEmptyingJob(.{
+        .job_id = 9999,
+        .lease_owner = "worker-c",
+        .completed_row_count = 1,
+        .progress_row_key = "order:a",
+    }));
+}
+
+test "table manager applies secondary index rebuild lifecycle operations" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders" });
+    const selector: SecondaryIndexRebuildRangeSelector = .{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "",
+    };
+    try manager.upsertSecondaryIndexRebuildRange(.{
+        .table_id = 7,
+        .index_name = "orders_status_idx",
+        .index_generation = 42,
+        .start_row_key = "",
+        .end_row_key = null,
+        .group_id = 8101,
+    });
+
+    try manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-a", .now_ms = 1000, .lease_expires_at_ms = 1234 });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqual(@as(usize, 1), ranges.len);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_building, ranges[0].state);
+        try std.testing.expectEqualStrings("worker-a", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1234), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), ranges[0].attempts);
+    }
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeClaimBusy, manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-b", .now_ms = 1200, .lease_expires_at_ms = 2000 }));
+    try manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-b", .now_ms = 1234, .lease_expires_at_ms = 2000 });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_building, ranges[0].state);
+        try std.testing.expectEqualStrings("worker-b", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 2000), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 2), ranges[0].attempts);
+    }
+
+    try manager.finishSecondaryIndexRebuildRange(.{ .selector = selector, .completed_row_count = 17, .progress_row_key = "order:z" });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_ready, ranges[0].state);
+        try std.testing.expect(secondaryIndexRebuildRangeComplete(ranges[0]));
+        try std.testing.expectEqualStrings("", ranges[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 0), ranges[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u64, 17), ranges[0].completed_row_count);
+        try std.testing.expectEqualStrings("order:z", ranges[0].progress_row_key);
+    }
+
+    try std.testing.expectError(error.SecondaryIndexRebuildRangeNotDeclared, manager.beginSecondaryIndexRebuildRange(.{ .selector = selector, .lease_owner = "worker-b", .now_ms = 5678, .lease_expires_at_ms = 6000 }));
+    try manager.invalidateSecondaryIndexRebuildRange(.{ .selector = selector, .last_error = "schema generation moved" });
+    {
+        const ranges = try manager.listSecondaryIndexRebuildRanges(std.testing.allocator);
+        defer manager.freeSecondaryIndexRebuildRanges(std.testing.allocator, ranges);
+        try std.testing.expectEqualStrings(secondary_index_rebuild_invalid, ranges[0].state);
+        try std.testing.expectEqualStrings("schema generation moved", ranges[0].last_error);
+    }
+}
+
+test "table manager promotes table-emptying barriers atomically" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = schema_json, .data_generation = 4 });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .schema_json = schema_json, .data_generation = 9 });
+    try manager.upsertRange(.{ .group_id = 9001, .range_id = 9101, .table_id = 7, .start_key = "", .end_key = null });
+    try manager.upsertRange(.{ .group_id = 9002, .range_id = 9102, .table_id = 8, .start_key = "", .end_key = null });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9002,
+        .schema_generation = schema_generation,
+        .data_generation = 9,
+        .barrier_id = 77,
+        .state = table_emptying_declared,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+
+    try std.testing.expectError(error.TableEmptyingJobNotReady, manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{ 7101, 8101 },
+        .promotions = &.{
+            .{ .table_id = 7, .target_generation = 5 },
+            .{ .table_id = 8, .target_generation = 10 },
+        },
+    }));
+
+    {
+        const tables = try manager.listTables(std.testing.allocator);
+        defer manager.freeTables(std.testing.allocator, tables);
+        for (tables) |table| {
+            if (table.table_id == 7) try std.testing.expectEqual(@as(u64, 4), table.data_generation);
+            if (table.table_id == 8) try std.testing.expectEqual(@as(u64, 9), table.data_generation);
+        }
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 2), jobs.len);
+    }
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9002,
+        .schema_generation = schema_generation,
+        .data_generation = 9,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+    try manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{ 7101, 8101 },
+        .promotions = &.{
+            .{ .table_id = 7, .target_generation = 5 },
+            .{ .table_id = 8, .target_generation = 10 },
+        },
+    });
+    {
+        const tables = try manager.listTables(std.testing.allocator);
+        defer manager.freeTables(std.testing.allocator, tables);
+        for (tables) |table| {
+            if (table.table_id == 7) try std.testing.expectEqual(@as(u64, 5), table.data_generation);
+            if (table.table_id == 8) try std.testing.expectEqual(@as(u64, 10), table.data_generation);
+        }
+        const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+        defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+        try std.testing.expectEqual(@as(usize, 0), jobs.len);
+    }
+}
+
+test "table manager promotes restart identity barrier by resetting sequence allocation markers" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{
+        .table_id = 7,
+        .name = "usage_records",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .schema_json = schema_json,
+        .data_generation = 4,
+    });
+    try manager.upsertRange(.{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    });
+    const sequence_id = deriveSequenceId("tenant", "billing", "usage_id_seq");
+    try manager.upsertSequence(.{
+        .sequence_id = sequence_id,
+        .name = "usage_id_seq",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .options_json = "{\"start_with\":10,\"increment_by\":5}",
+        .last_value = 5,
+        .last_allocation_id = 1234,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .range_id = 9101,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+    });
+
+    try manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{7101},
+        .promotions = &.{.{ .table_id = 7, .target_generation = 5 }},
+    });
+
+    try std.testing.expectEqual(@as(u64, 5), manager.tables.get(7).?.data_generation);
+    try std.testing.expectEqual(@as(i64, 5), manager.sequences.get(sequence_id).?.last_value);
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(sequence_id).?.last_allocation_id);
+    const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 0), jobs.len);
+}
+
+test "table manager validates table-emptying identity allocator reset barriers" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = schema_json, .data_generation = 4 });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .schema_json = schema_json, .data_generation = 9 });
+    try manager.upsertRange(.{ .group_id = 9001, .range_id = 9101, .table_id = 7, .start_key = "", .end_key = "m" });
+    try manager.upsertRange(.{ .group_id = 9002, .range_id = 9102, .table_id = 7, .start_key = "m", .end_key = null });
+    try manager.upsertRange(.{ .group_id = 9003, .range_id = 9103, .table_id = 8, .start_key = "", .end_key = null });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .start_row_key = "",
+        .end_row_key = "m",
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7102,
+        .table_id = 7,
+        .group_id = 9002,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .start_row_key = "m",
+        .end_row_key = null,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9003,
+        .schema_generation = schema_generation,
+        .data_generation = 9,
+        .barrier_id = 77,
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = true,
+        .cascade = true,
+    });
+
+    try manager.validateTableEmptyingIdentityAllocatorReset(.{
+        .barrier_id = 77,
+        .affected_table_ids = &.{ 7, 8 },
+        .job_ids = &.{ 7101, 7102, 8101 },
+        .cascade = true,
+    });
+    try std.testing.expectError(error.InvalidTableEmptyingIdentityAllocatorReset, manager.validateTableEmptyingIdentityAllocatorReset(.{
+        .barrier_id = 77,
+        .affected_table_ids = &.{ 7, 8 },
+        .job_ids = &.{ 7101, 7102 },
+        .cascade = true,
+    }));
+    try std.testing.expectError(error.InvalidTableEmptyingIdentityAllocatorReset, manager.validateTableEmptyingIdentityAllocatorReset(.{
+        .barrier_id = 77,
+        .affected_table_ids = &.{ 8, 7 },
+        .job_ids = &.{ 7101, 7102, 8101 },
+        .cascade = true,
+    }));
+
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9003,
+        .schema_generation = schema_generation,
+        .data_generation = 9,
+        .barrier_id = 77,
+        .start_row_key = "",
+        .end_row_key = null,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+        .restart_identity = false,
+        .cascade = true,
+    });
+    try std.testing.expectError(error.InvalidTableEmptyingIdentityAllocatorReset, manager.validateTableEmptyingIdentityAllocatorReset(.{
+        .barrier_id = 77,
+        .affected_table_ids = &.{ 7, 8 },
+        .job_ids = &.{ 7101, 7102, 8101 },
+        .cascade = true,
+    }));
+}
+
+test "table manager rejects mixed table-emptying barrier promotion" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json = "{\"version\":2,\"storage_mode\":\"relational\"}";
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{ .table_id = 7, .name = "orders", .schema_json = schema_json, .data_generation = 4 });
+    try manager.upsertTable(.{ .table_id = 8, .name = "order_items", .schema_json = schema_json, .data_generation = 9 });
+    try manager.upsertRange(.{ .group_id = 9001, .range_id = 9101, .table_id = 7, .start_key = "", .end_key = null });
+    try manager.upsertRange(.{ .group_id = 9002, .range_id = 9102, .table_id = 8, .start_key = "", .end_key = null });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 8101,
+        .table_id = 8,
+        .group_id = 9002,
+        .schema_generation = schema_generation,
+        .data_generation = 9,
+        .barrier_id = 78,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{ 7, 8 },
+    });
+
+    try std.testing.expectError(error.InvalidTableEmptyingBarrierPromotion, manager.promoteTableEmptyingBarrier(.{
+        .job_ids = &.{ 7101, 8101 },
+        .promotions = &.{
+            .{ .table_id = 7, .target_generation = 5 },
+            .{ .table_id = 8, .target_generation = 10 },
+        },
+    }));
+
+    const tables = try manager.listTables(std.testing.allocator);
+    defer manager.freeTables(std.testing.allocator, tables);
+    for (tables) |table| {
+        if (table.table_id == 7) try std.testing.expectEqual(@as(u64, 4), table.data_generation);
+        if (table.table_id == 8) try std.testing.expectEqual(@as(u64, 9), table.data_generation);
+    }
+    const jobs = try manager.listTableEmptyingJobs(std.testing.allocator);
+    defer manager.freeTableEmptyingJobs(std.testing.allocator, jobs);
+    try std.testing.expectEqual(@as(usize, 2), jobs.len);
+}
+
+test "table manager allocates sequence values from durable cursor" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    try manager.upsertDatabase(.{
+        .database_id = deriveDatabaseId("tenant"),
+        .name = "tenant",
+    });
+    try manager.upsertNamespace(.{
+        .namespace_id = deriveNamespaceId(deriveDatabaseId("tenant"), "billing"),
+        .database_id = deriveDatabaseId("tenant"),
+        .name = "billing",
+    });
+    const options_json = "{\"start_with\":10,\"increment_by\":5,\"max_value\":20}";
+    try manager.upsertSequence(.{
+        .sequence_id = deriveSequenceId("tenant", "billing", "usage_id_seq"),
+        .name = "usage_id_seq",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .options_json = options_json,
+        .last_value = try sequenceInitialLastValueFromOptionsJson(std.testing.allocator, options_json),
+    });
+
+    try std.testing.expectEqual(@as(i64, 10), try manager.allocateSequenceValue(std.testing.allocator, "tenant", "billing", "usage_id_seq"));
+    try std.testing.expectEqual(@as(i64, 15), try manager.allocateSequenceValue(std.testing.allocator, "tenant", "billing", "usage_id_seq"));
+    try std.testing.expectEqual(@as(i64, 20), try manager.allocateSequenceValue(std.testing.allocator, "tenant", "billing", "usage_id_seq"));
+    try std.testing.expectError(error.SequenceExhausted, manager.allocateSequenceValue(std.testing.allocator, "tenant", "billing", "usage_id_seq"));
+}
+
+test "table manager resets table-owned sequence defaults for restart identity barriers" {
+    var manager = TableManager.init(std.testing.allocator);
+    defer manager.deinit();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}},"owned_id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = schemaRewriteGenerationForSchemaJson(schema_json);
+    try manager.upsertTable(.{
+        .table_id = 7,
+        .name = "usage_records",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .schema_json = schema_json,
+        .data_generation = 4,
+    });
+    try manager.upsertRange(.{
+        .group_id = 9001,
+        .range_id = 9101,
+        .table_id = 7,
+        .start_key = "",
+        .end_key = null,
+    });
+    const options_json = "{\"start_with\":10,\"increment_by\":5}";
+    const sequence_id = deriveSequenceId("tenant", "billing", "usage_id_seq");
+    const owned_options_json = "{\"start_with\":50,\"increment_by\":10,\"owned_by\":{\"table_name\":\"usage_records\",\"column_name\":\"owned_id\"}}";
+    const owned_sequence_id = deriveSequenceId("tenant", "billing", "usage_owned_id_seq");
+    try manager.upsertSequence(.{
+        .sequence_id = sequence_id,
+        .name = "usage_id_seq",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .options_json = options_json,
+        .last_value = 100,
+    });
+    try manager.upsertSequence(.{
+        .sequence_id = owned_sequence_id,
+        .name = "usage_owned_id_seq",
+        .database_name = "tenant",
+        .namespace_name = "billing",
+        .options_json = owned_options_json,
+        .last_value = 200,
+    });
+    try manager.upsertTableEmptyingJob(.{
+        .job_id = 7101,
+        .table_id = 7,
+        .group_id = 9001,
+        .schema_generation = schema_generation,
+        .data_generation = 4,
+        .barrier_id = 77,
+        .state = table_emptying_ready,
+        .affected_table_ids = &.{7},
+        .restart_identity = true,
+    });
+
+    const request: TableEmptyingIdentityAllocatorResetRequest = .{
+        .barrier_id = 77,
+        .affected_table_ids = &.{7},
+        .job_ids = &.{7101},
+    };
+    const targets = try manager.tableEmptyingIdentityAllocatorResetTargetsAlloc(std.testing.allocator, request);
+    defer std.testing.allocator.free(targets);
+    try std.testing.expectEqual(@as(usize, 2), targets.len);
+    try expectIdentityAllocatorResetTarget(targets, sequence_id, 5);
+    try expectIdentityAllocatorResetTarget(targets, owned_sequence_id, 40);
+
+    try std.testing.expectEqual(@as(usize, 2), try manager.resetIdentityAllocatorsForTableEmptyingBarrier(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(i64, 5), manager.sequences.get(sequence_id).?.last_value);
+    try std.testing.expectEqual(@as(i64, 40), manager.sequences.get(owned_sequence_id).?.last_value);
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(sequence_id).?.last_allocation_id);
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(owned_sequence_id).?.last_allocation_id);
+    try std.testing.expectEqual(@as(usize, 0), try manager.resetIdentityAllocatorsForTableEmptyingBarrier(std.testing.allocator, request));
+
+    manager.sequences.getPtr(sequence_id).?.last_allocation_id = 9001;
+    manager.sequences.getPtr(owned_sequence_id).?.last_allocation_id = 9002;
+    try std.testing.expectEqual(@as(usize, 2), try manager.resetIdentityAllocatorsForTableEmptyingBarrier(std.testing.allocator, request));
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(sequence_id).?.last_allocation_id);
+    try std.testing.expectEqual(@as(u128, 0), manager.sequences.get(owned_sequence_id).?.last_allocation_id);
+}
+
+fn expectIdentityAllocatorResetTarget(targets: []const SequenceIdentityAllocatorReset, sequence_id: u64, reset_last_value: i64) !void {
+    for (targets) |target| {
+        if (target.sequence_id != sequence_id) continue;
+        try std.testing.expectEqual(reset_last_value, target.reset_last_value);
+        return;
+    }
+    return error.SequenceNotFound;
 }
 
 test "table manager parses placement classes and checks compatibility" {

@@ -423,8 +423,7 @@ The repository exposes focused Lite build profiles:
 ```bash
 zig build lite-core
 zig build lite-full -Dlite-local-inference-runtime=true
-zig build lite-wasm
-zig build lite-package-test
+zig build lite-test
 zig build lite-dev
 ```
 
@@ -432,12 +431,10 @@ zig build lite-dev
 and `libantfly` without a heavyweight local inference runtime. `lite-full`
 builds the full Antfly CLI with Lite support and requires the local inference
 runtime capability flag so Lite status, C ABI, and bindings advertise
-`local_embedded` correctly. `lite-wasm` builds the
-hosted/manual-maintenance Lite profile for `wasm32-freestanding` without
-pulling in the broader server or inference WASM bundle. `lite-package-test`
-checks that release packaging preserves the `libantfly` header and library
-artifacts. `lite-dev` runs the broader development and compatibility checks,
-including the Lite WASM profile and packaging regression.
+`local_embedded` correctly. `lite-test` runs the Lite CLI, native, C ABI, Go
+binding, packaging, and hosted/manual-maintenance WASM profile checks.
+`lite-dev` runs the broader development and compatibility checks, including the
+Lite WASM profile and packaging regression.
 
 ## Integrity And Maintenance
 

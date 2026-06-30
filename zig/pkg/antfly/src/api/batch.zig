@@ -26,6 +26,7 @@ pub const BatchResult = struct {
 pub const OwnedBatchRequest = struct {
     writes: []db_mod.types.BatchWrite = &.{},
     deletes: [][]const u8 = &.{},
+    relational_identity_rewrites: []db_mod.types.RelationalIdentityRewrite = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
     req: db_mod.types.BatchRequest = .{},
 
@@ -37,6 +38,12 @@ pub const OwnedBatchRequest = struct {
         if (self.writes.len > 0) alloc.free(self.writes);
         for (self.deletes) |key| alloc.free(key);
         if (self.deletes.len > 0) alloc.free(self.deletes);
+        for (self.relational_identity_rewrites) |rewrite| {
+            alloc.free(@constCast(rewrite.old_key));
+            alloc.free(@constCast(rewrite.new_key));
+            alloc.free(@constCast(rewrite.value));
+        }
+        if (self.relational_identity_rewrites.len > 0) alloc.free(self.relational_identity_rewrites);
         for (self.transforms) |transform| {
             alloc.free(@constCast(transform.key));
             for (transform.operations) |op| {
@@ -52,7 +59,7 @@ pub const OwnedBatchRequest = struct {
     pub fn result(self: OwnedBatchRequest) BatchResult {
         return .{
             .inserted = @intCast(self.writes.len),
-            .deleted = @intCast(self.deletes.len),
+            .deleted = @intCast(self.deletes.len + self.relational_identity_rewrites.len),
             .transformed = @intCast(self.transforms.len),
         };
     }
@@ -98,6 +105,17 @@ fn parseBatchRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, opti
     };
     errdefer freeDeletes(alloc, deletes);
 
+    const relational_identity_rewrites: []db_mod.types.RelationalIdentityRewrite = rewrites: {
+        if (root.get("relational_identity_rewrites")) |rewrites_value| {
+            if (rewrites_value == .null) break :rewrites &.{};
+            const parsed_rewrites = try parseRelationalIdentityRewrites(alloc, rewrites_value);
+            errdefer freeRelationalIdentityRewrites(alloc, parsed_rewrites);
+            break :rewrites parsed_rewrites;
+        }
+        break :rewrites &.{};
+    };
+    errdefer freeRelationalIdentityRewrites(alloc, relational_identity_rewrites);
+
     const transforms: []db_mod.types.DocumentTransform = transforms: {
         if (root.get("transforms")) |transforms_value| {
             if (transforms_value == .null) break :transforms &.{};
@@ -120,10 +138,12 @@ fn parseBatchRequestWithOptions(alloc: std.mem.Allocator, body: []const u8, opti
     return .{
         .writes = writes,
         .deletes = deletes,
+        .relational_identity_rewrites = relational_identity_rewrites,
         .transforms = transforms,
         .req = .{
             .writes = writes,
             .deletes = deletes,
+            .relational_identity_rewrites = relational_identity_rewrites,
             .transforms = transforms,
             .sync_level = sync_level,
         },
@@ -159,6 +179,19 @@ pub fn encodeBatchRequest(alloc: std.mem.Allocator, req: db_mod.types.BatchReque
         try writer.print("{f}", .{std.json.fmt(key, .{})});
     }
     try writer.writeAll("]");
+    if (req.relational_identity_rewrites.len > 0) {
+        try writer.writeAll(",\"relational_identity_rewrites\":[");
+        for (req.relational_identity_rewrites, 0..) |rewrite, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{{\"old_key\":{f},\"new_key\":{f},\"value\":", .{
+                std.json.fmt(rewrite.old_key, .{}),
+                std.json.fmt(rewrite.new_key, .{}),
+            });
+            try writer.writeAll(rewrite.value);
+            try writer.writeByte('}');
+        }
+        try writer.writeAll("]");
+    }
     if (req.transforms.len > 0) {
         try writer.writeAll(",\"transforms\":[");
         for (req.transforms, 0..) |transform, i| {
@@ -190,9 +223,9 @@ fn syncLevelName(sync_level: db_mod.types.SyncLevel) []const u8 {
     return switch (sync_level) {
         .propose => "propose",
         .write => "write",
-        .full_text => "full_text",
+        .full_text => "query",
         .enrichments => "enrichments",
-        .aknn => "aknn",
+        .aknn => "full_index",
         .full_index => "full_index",
     };
 }
@@ -236,6 +269,38 @@ fn parseDeletes(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
         initialized += 1;
     }
     return deletes;
+}
+
+fn parseRelationalIdentityRewrites(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.RelationalIdentityRewrite {
+    if (value != .array) return error.InvalidBatchRequest;
+    const values = value.array.items;
+    const rewrites = try alloc.alloc(db_mod.types.RelationalIdentityRewrite, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        freeRelationalIdentityRewrites(alloc, rewrites[0..initialized]);
+        alloc.free(rewrites);
+    }
+    for (values) |item| {
+        if (item != .object) return error.InvalidBatchRequest;
+        const old_key_value = item.object.get("old_key") orelse return error.InvalidBatchRequest;
+        if (old_key_value != .string) return error.InvalidBatchRequest;
+        const new_key_value = item.object.get("new_key") orelse return error.InvalidBatchRequest;
+        if (new_key_value != .string) return error.InvalidBatchRequest;
+        const value_json = item.object.get("value") orelse return error.InvalidBatchRequest;
+        const old_key = try alloc.dupe(u8, old_key_value.string);
+        errdefer alloc.free(old_key);
+        const new_key = try alloc.dupe(u8, new_key_value.string);
+        errdefer alloc.free(new_key);
+        const owned_value = try std.json.Stringify.valueAlloc(alloc, value_json, .{});
+        errdefer alloc.free(owned_value);
+        rewrites[initialized] = .{
+            .old_key = old_key,
+            .new_key = new_key,
+            .value = owned_value,
+        };
+        initialized += 1;
+    }
+    return rewrites;
 }
 
 fn parseTransforms(alloc: std.mem.Allocator, value: std.json.Value) ![]db_mod.types.DocumentTransform {
@@ -329,9 +394,8 @@ fn syncLevelFromValue(value: std.json.Value) !db_mod.types.SyncLevel {
     const level = value.string;
     if (std.mem.eql(u8, level, "propose")) return .propose;
     if (std.mem.eql(u8, level, "write")) return .write;
-    if (std.mem.eql(u8, level, "full_text")) return .full_text;
+    if (std.mem.eql(u8, level, "query")) return .full_text;
     if (std.mem.eql(u8, level, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, level, "aknn")) return .full_index;
     if (std.mem.eql(u8, level, "full_index")) return .full_index;
     return error.InvalidBatchRequest;
 }
@@ -347,6 +411,15 @@ fn freeWrites(alloc: std.mem.Allocator, writes: []db_mod.types.BatchWrite) void 
 fn freeDeletes(alloc: std.mem.Allocator, deletes: [][]const u8) void {
     for (deletes) |key| alloc.free(key);
     if (deletes.len > 0) alloc.free(deletes);
+}
+
+fn freeRelationalIdentityRewrites(alloc: std.mem.Allocator, rewrites: []db_mod.types.RelationalIdentityRewrite) void {
+    for (rewrites) |rewrite| {
+        alloc.free(@constCast(rewrite.old_key));
+        alloc.free(@constCast(rewrite.new_key));
+        alloc.free(@constCast(rewrite.value));
+    }
+    if (rewrites.len > 0) alloc.free(rewrites);
 }
 
 fn freeTransforms(alloc: std.mem.Allocator, transforms: []db_mod.types.DocumentTransform) void {
@@ -401,9 +474,9 @@ test "batch parser accepts raw payload value under public request cap" {
     try std.testing.expect(std.mem.indexOf(u8, owned.writes[0].value, "\"raw_payload\"") != null);
 }
 
-test "batch parser accepts go sync levels" {
+test "batch parser accepts public sync levels" {
     var owned = try parseBatchRequest(std.testing.allocator,
-        \\{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"aknn"}
+        \\{"inserts":{"doc:a":{"title":"alpha"}},"sync_level":"full_index"}
     );
     defer owned.deinit(std.testing.allocator);
     try std.testing.expectEqual(db_mod.types.SyncLevel.full_index, owned.req.sync_level);
@@ -418,6 +491,29 @@ test "batch parser accepts transforms" {
     try std.testing.expect(owned.transforms[0].upsert);
     try std.testing.expectEqual(db_mod.types.TransformOpType.max, owned.transforms[0].operations[0].op);
     try std.testing.expectEqualStrings("version", owned.transforms[0].operations[0].path);
+}
+
+test "batch parser and encoder preserve relational identity rewrites" {
+    const alloc = std.testing.allocator;
+    var owned = try parseBatchRequest(alloc,
+        \\{"relational_identity_rewrites":[{"old_key":"doc:a","new_key":"doc:z","value":{"id":"z","status":"renamed"}}],"sync_level":"write"}
+    );
+    defer owned.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), owned.relational_identity_rewrites.len);
+    try std.testing.expectEqualStrings("doc:a", owned.relational_identity_rewrites[0].old_key);
+    try std.testing.expectEqualStrings("doc:z", owned.relational_identity_rewrites[0].new_key);
+    try std.testing.expect(std.mem.indexOf(u8, owned.relational_identity_rewrites[0].value, "\"renamed\"") != null);
+    try std.testing.expectEqual(@as(usize, 1), owned.req.relational_identity_rewrites.len);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.write, owned.req.sync_level);
+
+    const encoded = try encodeBatchRequest(alloc, owned.req);
+    defer alloc.free(encoded);
+    var reparsed = try parseBatchRequest(alloc, encoded);
+    defer reparsed.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), reparsed.relational_identity_rewrites.len);
+    try std.testing.expectEqualStrings("doc:a", reparsed.relational_identity_rewrites[0].old_key);
+    try std.testing.expectEqualStrings("doc:z", reparsed.relational_identity_rewrites[0].new_key);
+    try std.testing.expect(std.mem.indexOf(u8, reparsed.relational_identity_rewrites[0].value, "\"renamed\"") != null);
 }
 
 test "batch parser accepts Go transform op spelling" {

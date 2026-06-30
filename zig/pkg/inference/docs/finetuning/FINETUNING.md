@@ -747,14 +747,14 @@ antfly inference finetune run recipe_layoutlmv3_lora_token.json --dry-run
 | `train-eval-layoutlmv3-lora-sequence` | Bounded sequence classification train/eval |
 | `train-eval-layoutlmv3-lora-token` | Bounded token classification train/eval |
 | `run-layoutlmv3-lora-smoke-workflow` | Full bootstrap→train→inspect→materialize chain |
-| `test-layoutlmv3-finetune` | Unit test |
+| `layoutlmv3-finetune-test` | Unit test |
 
 Local verification:
 
 ```bash
 ZIG_GLOBAL_CACHE_DIR=/tmp/zig-global-cache \
 ZIG_LOCAL_CACHE_DIR=/tmp/zig-local-cache \
-zigup run master build test-layoutlmv3-finetune -Dblas=false -Donnx=false -Dmlx=false
+zigup run master build layoutlmv3-finetune-test -Dblas=false -Donnx=false -Dmlx=false
 ```
 
 ### Expected Inputs
@@ -890,7 +890,7 @@ Report contents: dataset stats, bootstrap summary, initial adapter inspection, t
 
 1. Confirm the base bundle contains `config.json` and `model.safetensors`.
 2. Confirm the train/val JSONL data loads cleanly and matches the expected task.
-3. Run `test-layoutlmv3-finetune` once on that machine.
+3. Run `layoutlmv3-finetune-test` once on that machine.
 4. Run `run-layoutlmv3-lora-smoke-workflow` with small example counts first.
 5. Inspect `smoke_workflow_report.json`, `bootstrap/adapter_config.json`, and the trained head config.
 6. If the smoke run is healthy, increase the bounded example counts and epochs.

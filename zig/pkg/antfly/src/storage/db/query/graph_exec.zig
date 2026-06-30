@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const types = @import("../types.zig");
+const graph_mod = @import("../../../graph/graph.zig");
 const graph_query_mod = @import("../../../graph/query.zig");
 const graph_pattern_mod = @import("../../../graph/pattern.zig");
 const fusion_mod = @import("../../../search/fusion.zig");
@@ -22,6 +23,7 @@ const geo_mod = @import("../../../search/geo.zig");
 const levenshtein_mod = @import("../../../search/levenshtein.zig");
 const regex_mod = @import("../../../search/regex.zig");
 const doc_set = @import("../doc_set.zig");
+const db_internal = @import("../internal.zig");
 
 pub const NamedResultSet = struct {
     name: []const u8,
@@ -539,7 +541,7 @@ pub fn applyGraphExpandStrategy(
     }
 }
 
-test "applyGraphUnion deduplicates by ordinals when hit pages are complete" {
+test "db query result shape applyGraphUnion deduplicates by ordinals when hit pages are complete" {
     const alloc = std.testing.allocator;
 
     var result = types.SearchResult{
@@ -578,7 +580,7 @@ test "applyGraphUnion deduplicates by ordinals when hit pages are complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 9), result.hits[1].doc_ordinal);
 }
 
-test "applyGraphIntersection uses ordinals when hit pages are complete" {
+test "db query result shape applyGraphIntersection uses ordinals when hit pages are complete" {
     const alloc = std.testing.allocator;
 
     var result = types.SearchResult{
@@ -988,7 +990,7 @@ pub fn executeSingleNonPatternQueryWithSets(
     defer alloc.free(start_key_refs);
 
     var graph_result = try executor.execute_graph_query(executor.ctx, alloc, named, start_key_refs, target_keys);
-    errdefer graph_result.deinit(alloc);
+    defer graph_result.deinit(alloc);
 
     const total_hits: u32 = @intCast(graph_result.nodes.len);
     const start = @min(req.offset, total_hits);
@@ -1018,6 +1020,10 @@ pub fn executeSingleNonPatternQueryWithSets(
 
     const nodes = graph_result.nodes;
     graph_result.nodes = &.{};
+    const metric_status = if (named.query.include_metric_status)
+        try cloneGraphMetricStatusesFromGraph(alloc, graph_result.metric_status)
+    else
+        @constCast((&[_]types.GraphMetricStatus{})[0..]);
 
     return .{
         .name = try alloc.dupe(u8, named.name),
@@ -1026,7 +1032,75 @@ pub fn executeSingleNonPatternQueryWithSets(
         .matches = &.{},
         .hits = hits,
         .total_hits = total_hits,
+        .metric_status = metric_status,
     };
+}
+
+fn cloneGraphMetricStatusesFromGraph(
+    alloc: Allocator,
+    statuses: []const graph_query_mod.GraphMetricStatus,
+) ![]types.GraphMetricStatus {
+    if (statuses.len == 0) return &.{};
+    const out = try alloc.alloc(types.GraphMetricStatus, statuses.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*status| status.deinit(alloc);
+        alloc.free(out);
+    }
+    for (statuses, 0..) |status, i| {
+        const name = try alloc.dupe(u8, status.name);
+        var name_moved = false;
+        errdefer if (!name_moved) alloc.free(name);
+        var edge_filter = try status.edge_filter.cloneAlloc(alloc);
+        var edge_filter_moved = false;
+        errdefer if (!edge_filter_moved) edge_filter.deinit(alloc);
+        const recent_events = if (status.recent_events.len > 0)
+            try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, status.recent_events)
+        else
+            @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+        var recent_events_moved = false;
+        errdefer if (!recent_events_moved and recent_events.len > 0) alloc.free(recent_events);
+        const last_error = if (status.last_error.len > 0) try alloc.dupe(u8, status.last_error) else "";
+        var last_error_moved = false;
+        errdefer if (!last_error_moved and last_error.len > 0) alloc.free(last_error);
+        const build_worker_id = if (status.build_worker_id.len > 0) try alloc.dupe(u8, status.build_worker_id) else "";
+        var build_worker_id_moved = false;
+        errdefer if (!build_worker_id_moved and build_worker_id.len > 0) alloc.free(build_worker_id);
+        out[i] = .{
+            .name = name,
+            .state = status.state,
+            .phase = status.phase,
+            .edge_filter = edge_filter,
+            .metadata_version = status.metadata_version,
+            .maintenance_paused = status.maintenance_paused,
+            .build_queued = status.build_queued,
+            .published_generation = status.published_generation,
+            .edge_generation = status.edge_generation,
+            .target_edge_generation = status.target_edge_generation,
+            .queued_generation = status.queued_generation,
+            .building_generation = status.building_generation,
+            .build_job_id = status.build_job_id,
+            .build_started_at_ms = status.build_started_at_ms,
+            .build_lease_expires_at_ms = status.build_lease_expires_at_ms,
+            .build_worker_id = build_worker_id,
+            .retry_count = status.retry_count,
+            .last_error = last_error,
+            .progress = status.progress,
+            .converged = status.converged,
+            .iterations_completed = status.iterations_completed,
+            .delta = status.delta,
+            .computed_at_ms = status.computed_at_ms,
+            .last_event = status.last_event,
+            .recent_events = recent_events,
+        };
+        name_moved = true;
+        edge_filter_moved = true;
+        recent_events_moved = true;
+        last_error_moved = true;
+        build_worker_id_moved = true;
+        initialized += 1;
+    }
+    return out;
 }
 
 pub fn executeSearchGraphWithSets(
@@ -1479,6 +1553,8 @@ pub const CompiledPatternFilter = union(enum) {
     pub const FieldPredicate = union(enum) {
         term: []const u8,
         terms: []const []const u8,
+        array_any: std.json.Value,
+        json_contains: std.json.Value,
         match: []const u8,
         prefix: []const u8,
         wildcard: []const u8,
@@ -1499,6 +1575,8 @@ pub const CompiledPatternFilter = union(enum) {
             return switch (self) {
                 .term => |value| jsonValuesContainTerm(values, value),
                 .terms => |terms| jsonValuesContainAnyTerm(values, terms),
+                .array_any => |value| jsonValuesContainArrayAny(values, value),
+                .json_contains => |value| jsonValuesContainJsonContaining(values, value),
                 .match => |value| jsonValuesContainMatch(values, value),
                 .prefix => |value| jsonValuesContainPrefix(values, value),
                 .wildcard => |value| jsonValuesContainWildcard(values, value),
@@ -1693,6 +1771,12 @@ fn extractPatternField(filter_query: std.json.Value) ![]const u8 {
         if (filter_query.object.get("terms")) |terms| {
             break :blk try extractPatternTermsField(terms);
         }
+        if (filter_query.object.get("array_any")) |array_any| {
+            break :blk (try extractPatternFieldJsonValue(array_any)).field;
+        }
+        if (filter_query.object.get("json_contains")) |json_contains| {
+            break :blk (try extractPatternFieldJsonValue(json_contains)).field;
+        }
         if (filter_query.object.get("match")) |match| {
             break :blk try extractPatternFieldFromStringShape(match, "text");
         }
@@ -1776,6 +1860,11 @@ const PatternFieldTerms = struct {
     terms: []const []const u8,
 };
 
+const PatternFieldJsonValue = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
 fn patternFieldOrPathValue(object: std.json.ObjectMap) ?std.json.Value {
     return object.get("field") orelse object.get("path");
 }
@@ -1831,6 +1920,19 @@ fn extractPatternTermsField(value: std.json.Value) ![]const u8 {
     const entry = it.next() orelse return error.InvalidArgument;
     if (entry.value_ptr.* != .array) return error.InvalidArgument;
     return entry.key_ptr.*;
+}
+
+fn extractPatternFieldJsonValue(value: std.json.Value) !PatternFieldJsonValue {
+    if (value != .object) return error.InvalidArgument;
+    if (patternFieldOrPathValue(value.object)) |field_value| {
+        if (field_value != .string) return error.InvalidArgument;
+        const raw_value = value.object.get("value") orelse return error.InvalidArgument;
+        return .{ .field = field_value.string, .value = raw_value };
+    }
+    if (value.object.count() != 1) return error.InvalidArgument;
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidArgument;
+    return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.* };
 }
 
 fn extractPatternFuzzyField(value: std.json.Value) ![]const u8 {
@@ -1920,6 +2022,12 @@ fn compilePatternFieldPredicate(alloc: Allocator, filter_query: std.json.Value) 
     }
     if (filter_query.object.get("terms")) |terms| {
         return .{ .terms = (try extractPatternFieldTerms(alloc, terms)).terms };
+    }
+    if (filter_query.object.get("array_any")) |array_any| {
+        return .{ .array_any = (try extractPatternFieldJsonValue(array_any)).value };
+    }
+    if (filter_query.object.get("json_contains")) |json_contains| {
+        return .{ .json_contains = (try extractPatternFieldJsonValue(json_contains)).value };
     }
     if (filter_query.object.get("match")) |match| {
         return .{ .match = (try extractPatternFieldString(alloc, match, "text")).value };
@@ -2049,6 +2157,97 @@ fn jsonValuesContainAnyTerm(values: []const std.json.Value, terms: []const []con
         if (jsonValuesContainTerm(values, term)) return true;
     }
     return false;
+}
+
+fn jsonValuesContainArrayAny(values: []const std.json.Value, expected: std.json.Value) bool {
+    for (values) |value| {
+        switch (value) {
+            .array => |array| {
+                for (array.items) |item| {
+                    if (jsonValuesEqual(item, expected)) return true;
+                }
+            },
+            else => if (jsonValuesEqual(value, expected)) return true,
+        }
+    }
+    return false;
+}
+
+fn jsonValuesContainJsonContaining(values: []const std.json.Value, expected: std.json.Value) bool {
+    for (values) |value| {
+        if (jsonValueContains(value, expected)) return true;
+    }
+    return false;
+}
+
+fn jsonValueContains(container: std.json.Value, expected: std.json.Value) bool {
+    return switch (expected) {
+        .object => |expected_object| blk: {
+            if (container != .object) break :blk false;
+            for (expected_object.keys(), expected_object.values()) |key, expected_value| {
+                const actual_value = container.object.get(key) orelse break :blk false;
+                if (!jsonValueContains(actual_value, expected_value)) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => |expected_array| blk: {
+            if (container != .array) break :blk false;
+            for (expected_array.items) |expected_item| {
+                var matched = false;
+                for (container.array.items) |actual_item| {
+                    if (jsonValueContains(actual_item, expected_item)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) break :blk false;
+            }
+            break :blk true;
+        },
+        else => jsonValuesEqual(container, expected),
+    };
+}
+
+fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+    return switch (lhs) {
+        .null => rhs == .null,
+        .bool => |value| rhs == .bool and rhs.bool == value,
+        .integer => |value| switch (rhs) {
+            .integer => |other| other == value,
+            .float => |other| @as(f64, @floatFromInt(value)) == other,
+            else => false,
+        },
+        .float => |value| switch (rhs) {
+            .integer => |other| value == @as(f64, @floatFromInt(other)),
+            .float => |other| other == value,
+            else => false,
+        },
+        .number_string => |value| switch (rhs) {
+            .number_string => |other| std.mem.eql(u8, value, other),
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            .number_string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .array => |array| blk: {
+            if (rhs != .array or array.items.len != rhs.array.items.len) break :blk false;
+            for (array.items, rhs.array.items) |lhs_item, rhs_item| {
+                if (!jsonValuesEqual(lhs_item, rhs_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            if (rhs != .object or object.count() != rhs.object.count()) break :blk false;
+            for (object.keys(), object.values()) |key, lhs_value| {
+                const rhs_value = rhs.object.get(key) orelse break :blk false;
+                if (!jsonValuesEqual(lhs_value, rhs_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 fn jsonValuesContainMatch(values: []const std.json.Value, text: []const u8) bool {
@@ -2635,49 +2834,7 @@ fn freePatternGeoPolygons(alloc: Allocator, polygons: []const []const geo_mod.Ge
     alloc.free(polygons);
 }
 
-pub fn parsePatternRfc3339ToNs(text: []const u8) !?u64 {
-    if (text.len < 20) return null;
-    if (text[4] != '-' or text[7] != '-' or text[10] != 'T' or text[13] != ':' or text[16] != ':') return null;
-
-    const year = std.fmt.parseInt(i64, text[0..4], 10) catch return null;
-    const month = std.fmt.parseInt(i64, text[5..7], 10) catch return null;
-    const day = std.fmt.parseInt(i64, text[8..10], 10) catch return null;
-    const hour = std.fmt.parseInt(i64, text[11..13], 10) catch return null;
-    const minute = std.fmt.parseInt(i64, text[14..16], 10) catch return null;
-    const second = std.fmt.parseInt(i64, text[17..19], 10) catch return null;
-
-    var idx: usize = 19;
-    var nanos: u64 = 0;
-    if (idx < text.len and text[idx] == '.') {
-        idx += 1;
-        const frac_start = idx;
-        while (idx < text.len and text[idx] >= '0' and text[idx] <= '9') : (idx += 1) {}
-        const frac = text[frac_start..idx];
-        if (frac.len == 0 or frac.len > 9) return null;
-        var frac_ns = std.fmt.parseInt(u64, frac, 10) catch return null;
-        var scale: usize = frac.len;
-        while (scale < 9) : (scale += 1) frac_ns *= 10;
-        nanos = frac_ns;
-    }
-    if (idx >= text.len or text[idx] != 'Z' or idx + 1 != text.len) return null;
-
-    const days = daysFromCivil(year, month, day);
-    if (days < 0) return null;
-    const secs = days * 86_400 + hour * 3_600 + minute * 60 + second;
-    if (secs < 0) return null;
-    return @as(u64, @intCast(secs)) * std.time.ns_per_s + nanos;
-}
-
-fn daysFromCivil(year: i64, month: i64, day: i64) i64 {
-    var y = year;
-    y -= if (month <= 2) @as(i64, 1) else @as(i64, 0);
-    const era = @divFloor(if (y >= 0) y else y - 399, 400);
-    const yoe = y - era * 400;
-    const mp = month + (if (month > 2) @as(i64, -3) else @as(i64, 9));
-    const doy = @divFloor(153 * mp + 2, 5) + day - 1;
-    const doe = yoe * 365 + @divFloor(yoe, 4) - @divFloor(yoe, 100) + doy;
-    return era * 146_097 + doe - 719_468;
-}
+pub const parsePatternRfc3339ToNs = db_internal.parseRfc3339ToNs;
 
 fn wildcardMatch(pattern: []const u8, text: []const u8) bool {
     var pi: usize = 0;
@@ -2906,6 +3063,31 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     , .{});
     defer parsed_terms_with_null.deinit();
 
+    var parsed_array_any = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"array_any":{"field":"tags","value":"hot"}}
+    , .{});
+    defer parsed_array_any.deinit();
+
+    var parsed_nested_array_any = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"array_any":{"path":"items.sku","value":"sku-2"}}
+    , .{});
+    defer parsed_nested_array_any.deinit();
+
+    var parsed_array_any_miss = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"array_any":{"field":"tags","value":"cold"}}
+    , .{});
+    defer parsed_array_any_miss.deinit();
+
+    var parsed_json_contains = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"json_contains":{"field":"payload","value":{"status":"open","meta":{"priority":2},"labels":["ready"]}}}
+    , .{});
+    defer parsed_json_contains.deinit();
+
+    var parsed_json_contains_miss = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"json_contains":{"field":"payload","value":{"meta":{"priority":3}}}}
+    , .{});
+    defer parsed_json_contains_miss.deinit();
+
     var parsed_bool_with_filter = try std.json.parseFromSlice(std.json.Value, alloc,
         \\{"bool":{"must":[{"term":{"published":"true"}}],"filter":[{"term":{"tag":"mango"}}]}}
     , .{});
@@ -2917,7 +3099,7 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     defer parsed_bool_with_filter_miss.deinit();
 
     var parsed_geo_doc = try std.json.parseFromSlice(std.json.Value, alloc,
-        \\{"published":true,"tag":"mango","score":5.0,"ip":"10.1.2.3","location":{"lon":-122.4194,"lat":37.7749},"meta":{"deleted_at":"2026-01-01T00:00:00Z","archived":false,"optional":null}}
+        \\{"published":true,"tag":"mango","tags":["hot","ready"],"items":[{"sku":"sku-1"},{"sku":"sku-2"}],"score":5.0,"ip":"10.1.2.3","location":{"lon":-122.4194,"lat":37.7749},"meta":{"deleted_at":"2026-01-01T00:00:00Z","archived":false,"optional":null},"payload":{"status":"open","meta":{"priority":2,"owner":"alice"},"labels":["ready","queued"]}}
     , .{});
     defer parsed_geo_doc.deinit();
 
@@ -2936,6 +3118,11 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_path_exists.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_path_term_bool.value));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_terms_with_null.value));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_array_any.value));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_nested_array_any.value));
+    try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_array_any_miss.value)));
+    try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_json_contains.value));
+    try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_json_contains_miss.value)));
     try std.testing.expect(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool_with_filter.value));
     try std.testing.expect(!(try jsonDocMatchesPatternFilter(alloc, "doc:b", parsed_geo_doc.value, parsed_bool_with_filter_miss.value)));
 
@@ -2945,9 +3132,12 @@ test "jsonDocMatchesPatternFilter supports stored structured filters" {
     try std.testing.expect(compiled == .bool_query);
     try std.testing.expectEqual(@as(usize, 2), compiled.bool_query.must.len);
     try std.testing.expect(try compiled.matches(alloc, "doc:b", parsed_geo_doc.value));
+
+    const compiled_contains = try compilePatternFilter(compiled_arena.allocator(), parsed_json_contains.value);
+    try std.testing.expect(try compiled_contains.matches(alloc, "doc:b", parsed_geo_doc.value));
 }
 
-test "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {
+test "db query result shape executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents" {
     const alloc = std.testing.allocator;
 
     const Harness = struct {
@@ -3061,7 +3251,99 @@ test "executeSingleNonPatternQueryWithSets hydrates graph documents from include
     try std.testing.expectEqualStrings("{\"title\":\"child\",\"body\":\"details about the architecture\"}", result.hits[0].stored_data.?);
 }
 
-test "executeSearchGraphWithSets preserves node ordinals" {
+test "db query result shape executeSingleNonPatternQueryWithSets hides metric status unless requested" {
+    const alloc = std.testing.allocator;
+
+    const Harness = struct {
+        fn findShortestPath(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror!?types.GraphPath {
+            return null;
+        }
+
+        fn findKShortestPaths(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const u8,
+            _: []const u8,
+        ) anyerror![]types.GraphPath {
+            return try alloc_inner.alloc(types.GraphPath, 0);
+        }
+
+        fn executeGraphQuery(
+            _: ?*anyopaque,
+            alloc_inner: Allocator,
+            _: *const types.NamedGraphQuery,
+            _: []const []const u8,
+            _: [][]u8,
+        ) anyerror!graph_query_mod.GraphQueryResult {
+            const metric_status = try alloc_inner.alloc(graph_query_mod.GraphMetricStatus, 1);
+            metric_status[0] = .{
+                .name = try alloc_inner.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            };
+            return .{
+                .nodes = try alloc_inner.alloc(graph_query_mod.GraphResultNode, 0),
+                .matches = &.{},
+                .metric_status = metric_status,
+            };
+        }
+
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return null;
+        }
+    };
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    var named = types.NamedGraphQuery{
+        .name = "tree_search",
+        .query = .{
+            .query_type = .traverse,
+            .index_name = "doc_hierarchy",
+            .start_nodes = .{ .keys = &.{"doc:root"} },
+            .params = .{},
+            .order_by = &graph_metric_orders,
+        },
+    };
+    const executor = NonPatternQueryExecutor{
+        .ctx = null,
+        .find_shortest_path = Harness.findShortestPath,
+        .find_k_shortest_paths = Harness.findKShortestPaths,
+        .execute_graph_query = Harness.executeGraphQuery,
+        .load_projected_document = Harness.loadProjectedDocument,
+    };
+
+    var hidden = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer hidden.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), hidden.metric_status.len);
+
+    named.query.include_metric_status = true;
+    var included = try executeSingleNonPatternQueryWithSets(alloc, .{ .limit = 10 }, &named, &.{}, executor);
+    defer included.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), included.metric_status.len);
+    try std.testing.expectEqualStrings("pagerank", included.metric_status[0].name);
+    try std.testing.expectEqual(@as(u64, 5), included.metric_status[0].published_generation);
+}
+
+test "db query result shape executeSearchGraphWithSets preserves node ordinals" {
     const alloc = std.testing.allocator;
 
     const Harness = struct {
@@ -3138,7 +3420,7 @@ test "executeSearchGraphWithSets preserves node ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 77), result.hits[0].doc_ordinal);
 }
 
-test "cloneNamedSetAsResult preserves hit ordinals" {
+test "db query result shape cloneNamedSetAsResult preserves hit ordinals" {
     const alloc = std.testing.allocator;
 
     const hit_id = try alloc.dupe(u8, "doc:a");
@@ -3170,7 +3452,7 @@ test "cloneNamedSetAsResult preserves hit ordinals" {
     try std.testing.expectEqualStrings("{\"title\":\"A\"}", with_stored.hits[0].stored_data.?);
 }
 
-test "buildPatternDocumentHits preserves resolved binding ordinals" {
+test "db query result shape buildPatternDocumentHits preserves resolved binding ordinals" {
     const alloc = std.testing.allocator;
 
     var bindings = try alloc.alloc(types.GraphPatternBinding, 2);
@@ -3261,7 +3543,7 @@ test "buildPatternDocumentHits preserves resolved binding ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), hits[1].doc_ordinal);
 }
 
-test "fuseNamedSets preserves source hit ordinals" {
+test "db query result shape fuseNamedSets preserves source hit ordinals" {
     const alloc = std.testing.allocator;
 
     const id_a = try alloc.dupe(u8, "doc:a");
@@ -3305,7 +3587,7 @@ test "fuseNamedSets preserves source hit ordinals" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 12), result.hits[1].doc_ordinal);
 }
 
-test "fuseNamedSets deduplicates aliases by ordinal when complete" {
+test "db query result shape fuseNamedSets deduplicates aliases by ordinal when complete" {
     const alloc = std.testing.allocator;
 
     const dense_id = try alloc.dupe(u8, "doc:a");
@@ -3361,7 +3643,7 @@ test "fuseNamedSets deduplicates aliases by ordinal when complete" {
     try std.testing.expectEqual(@as(?doc_set.DocOrdinal, 11), result.hits[0].doc_ordinal);
 }
 
-test "fuseNamedSets drops conflicting source hit ordinals" {
+test "db query result shape fuseNamedSets drops conflicting source hit ordinals" {
     const alloc = std.testing.allocator;
 
     const dense_id = try alloc.dupe(u8, "doc:a");
@@ -4261,4 +4543,32 @@ test "graph query result doc-set resolution receives identity generation" {
     }
 
     try std.testing.expect(harness.saw_generation);
+}
+
+test "graph metric status clone owns active build worker id" {
+    const alloc = std.testing.allocator;
+
+    const worker_id = try alloc.dupe(u8, "worker-a");
+    defer alloc.free(worker_id);
+    const statuses = [_]graph_query_mod.GraphMetricStatus{.{
+        .name = "pagerank",
+        .state = .building,
+        .phase = .computing,
+        .build_queued = true,
+        .building_generation = 7,
+        .build_job_id = 12345,
+        .build_iteration = 3,
+        .build_worker_id = worker_id,
+    }};
+
+    const cloned = try cloneGraphMetricStatusesFromGraph(alloc, &statuses);
+    defer {
+        for (cloned) |*status| status.deinit(alloc);
+        alloc.free(cloned);
+    }
+
+    try std.testing.expectEqual(@as(usize, 1), cloned.len);
+    try std.testing.expectEqualStrings("worker-a", cloned[0].build_worker_id);
+    try std.testing.expect(cloned[0].build_worker_id.ptr != worker_id.ptr);
+    try std.testing.expectEqual(@as(u64, 12345), cloned[0].build_job_id);
 }

@@ -15,12 +15,18 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const objectstore = @import("objectstore");
+const common_config = @import("../../common/config.zig");
+const common_secrets = @import("../../common/secrets.zig");
 const artifacts_object_store = @import("../artifacts/object_store.zig");
 const manifest_object_store = @import("../manifest/object_store.zig");
 const wal_object_store = @import("../wal/object_store.zig");
 const catalog_object_store = @import("../catalog/object_store.zig");
 const progress_object_store = @import("../catalog/object_progress_store.zig");
+const configured_object_store_support = @import("../configured_object_store_support.zig");
+const external_binding = @import("../external_source/catalog_binding.zig");
+const object_store_support = @import("../object_store_support.zig");
 const remote_uri = @import("../remote_uri.zig");
+const object_storage = @import("../../storage/object_storage.zig");
 const artifacts_mod = @import("../artifacts/mod.zig");
 const manifest_mod = @import("../manifest/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
@@ -55,11 +61,50 @@ pub const BootstrapConfig = struct {
     compaction_enabled: bool = true,
     prune_enabled: bool = true,
     enrichment_enabled: bool = true,
+    node_config: ?*const common_config.Config = null,
+    secret_store: ?*common_secrets.FileStore = null,
     foreign_registry: ?*const foreign_mod.Registry = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
 };
 
 pub const RuntimeStatus = api_mod.RuntimeStatusResult;
+
+const ConfiguredExternalSourceObjectStoreResolver = struct {
+    node_config: ?*const common_config.Config = null,
+    secret_store: ?*common_secrets.FileStore = null,
+
+    fn configure(
+        self: *@This(),
+        node_config: ?*const common_config.Config,
+        secret_store: ?*common_secrets.FileStore,
+    ) void {
+        self.node_config = node_config;
+        self.secret_store = secret_store;
+    }
+
+    fn resolver(self: *@This()) build_mod.ExternalSourceOpenedObjectStoreResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .open = open,
+            },
+        };
+    }
+
+    fn open(
+        ptr: *anyopaque,
+        alloc: Allocator,
+        binding: external_binding.Binding,
+        options: build_mod.ExternalSourceOpenedObjectStoreResolver.OpenOptions,
+    ) !object_store_support.OpenedObjectStore {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try configured_object_store_support.openBindingObjectStoreAlloc(alloc, binding, .{
+            .file_bucket = options.file_bucket,
+            .node_config = self.node_config,
+            .secret_store = self.secret_store,
+        });
+    }
+};
 
 pub const OwnedStack = struct {
     alloc: Allocator,
@@ -75,6 +120,8 @@ pub const OwnedStack = struct {
     catalog_store: catalog_mod.CatalogStore,
     builder: build_mod.Builder,
     catalog: catalog_mod.CatalogService,
+    external_source_object_store_resolver: ConfiguredExternalSourceObjectStoreResolver = .{},
+    external_source_plan_resolver: build_mod.ExternalSourcePublicationPlanResolver = undefined,
     api: api_mod.Service,
     query_cache: ?query_mod.QueryCache = null,
     managed_query_embedder: ?managed_embedder.ManagedEmbedder = null,
@@ -120,6 +167,14 @@ pub const OwnedStack = struct {
 
         self.builder = build_mod.Builder.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal);
         self.catalog = catalog_mod.CatalogService.init(alloc, &self.artifacts, &self.manifests, &self.progress, &self.wal, &self.builder, &self.catalog_store);
+        self.external_source_object_store_resolver = .{};
+        self.external_source_object_store_resolver.configure(cfg.node_config, cfg.secret_store);
+        self.external_source_plan_resolver = build_mod.ExternalSourcePublicationPlanResolver.init(
+            &self.artifacts,
+            self.external_source_object_store_resolver.resolver(),
+            .{},
+        );
+        self.catalog.setExternalSourcePlanResolver(self.external_source_plan_resolver.planResolver());
         self.api = api_mod.Service.init(alloc, &self.wal, &self.builder);
         if (cfg.query_cache_dir) |query_cache_dir| {
             self.query_cache = try query_mod.QueryCache.initWithConfig(alloc, query_cache_dir, .{
@@ -401,6 +456,78 @@ test "runtime bootstrap assembles serverless stack from uri config" {
     try std.testing.expectEqual(@as(u16, 200), resp.status);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"table_name\":\"docs\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp.body, "\"doc_id\":\"doc-a\"") != null);
+}
+
+test "runtime bootstrap external source resolver pins credentialed parquet inventory" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const artifact_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/artifacts", .{tmp.sub_path});
+    defer alloc.free(artifact_path);
+    const lake_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/allowed/events", .{tmp.sub_path});
+    defer alloc.free(lake_path);
+    const cfg_json = try std.fmt.allocPrint(alloc,
+        \\{{
+        \\  "connections": {{
+        \\    "prod-lake-read": {{
+        \\      "kind": "external_io",
+        \\      "capabilities": ["lake_read"],
+        \\      "external_io": {{
+        \\        "protocol": "filesystem",
+        \\        "prefix": ".zig-cache/tmp/{s}/allowed"
+        \\      }}
+        \\    }}
+        \\  }}
+        \\}}
+    , .{tmp.sub_path});
+    defer alloc.free(cfg_json);
+    var cfg = try common_config.Config.parseFromSlice(alloc, cfg_json);
+    defer cfg.deinit();
+
+    var lake_fs = try object_storage.FilesystemObjectStorage.init(alloc, lake_path);
+    defer lake_fs.deinit();
+    var lake_client = lake_fs.client();
+    if (!(try lake_client.bucketExists("antfly"))) try lake_client.makeBucket("antfly");
+    const parquet_object = try query_mod.buildLakeParquetTestSingleColumnPlainI64ObjectAlloc(
+        alloc,
+        "amount",
+        &[_]i64{ 10, 20, 30 },
+    );
+    defer alloc.free(parquet_object);
+    var put = try lake_client.putObject("antfly", "data-0001.parquet", parquet_object, .{});
+    defer put.deinit(alloc);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, artifact_path);
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var opener = ConfiguredExternalSourceObjectStoreResolver{};
+    opener.configure(&cfg, null);
+    var resolver = build_mod.ExternalSourcePublicationPlanResolver.init(&artifact_store, opener.resolver(), .{});
+    const source_uri = try std.fmt.allocPrint(alloc, "file://{s}", .{lake_path});
+    defer alloc.free(source_uri);
+    var plan = (try resolver.planResolver().resolveAlloc(alloc, .{
+        .namespace = "events",
+        .table_name = "events",
+        .binding = .{
+            .table_id = "events",
+            .format = .parquet,
+            .source_uri = source_uri,
+            .credential_ref = .{ .ref_id = "prod-lake-read", .scope = "events" },
+            .snapshot_mode = .current,
+            .schema_fingerprint = "schema-v1",
+            .write_policy = .read_only,
+        },
+    })).?;
+    defer plan.deinit(alloc);
+
+    try std.testing.expectEqualStrings("events.external-files", plan.artifacts[0].name);
+    try std.testing.expectEqualStrings(plan.artifacts[0].artifact_id, plan.base_source.external_parquet.file_inventory_artifact.?);
+    try std.testing.expectEqualStrings("schema-v1", plan.base_source.external_parquet.schema_fingerprint);
+    var artifact_stat = try artifact_store.stat(plan.artifacts[0].artifact_id);
+    defer artifact_stat.deinit(alloc);
+    try std.testing.expect(artifact_stat.byte_len > 0);
 }
 
 test "runtime bootstrap wires foreign registry into public join handler" {

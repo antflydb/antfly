@@ -17,6 +17,7 @@ const builtin = @import("builtin");
 const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../../common/fs_paths.zig");
+const platform_clock = @import("../../../platform/clock.zig");
 const process_memory = @import("../../../platform/process_memory.zig");
 const platform_time = @import("../../../platform/time.zig");
 const apply_rw_lock_mod = @import("../apply_rw_lock.zig");
@@ -39,11 +40,14 @@ const db_config = @import("../config.zig");
 const persistent_mod = @import("../../persistent.zig");
 const lsm_backend_mod = @import("../../lsm_backend/mod.zig");
 const resource_manager_mod = @import("../../resource_manager.zig");
+const background_runtime_mod = @import("../../background_runtime.zig");
 const docstore_mod = @import("../../docstore.zig");
 const schema_mod = @import("../../schema.zig");
+const schema_api_mod = @import("../../../schema/mod.zig");
 const ttl_mod = @import("../../ttl.zig");
 const lmdb = @import("../../lmdb.zig");
 const mapper = @import("../document_mapper.zig");
+const relational_store_mod = @import("../relational_store.zig");
 const merger_mod = @import("../../../merger.zig");
 const index_mod = @import("../../../index.zig");
 const text_index_maintenance = @import("text_index_maintenance.zig");
@@ -68,8 +72,7 @@ const zig_lmdb = if (builtin.is_test) @import("lmdb_engine") else struct {
 };
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
-    if (!builtin.link_libc) return null;
-    return std.c.getenv(name);
+    return platform.env.getenvZ(name);
 }
 
 const index_catalog_key = "\x00\x00__metadata__:indexes";
@@ -130,6 +133,9 @@ pub var test_inject_index_open_error: ?anyerror = null;
 const sparse_backfill_batch_size: usize = 1024;
 pub var test_sparse_backfill_batch_size: ?usize = null;
 pub var test_abort_sparse_backfill_after_batches: ?usize = null;
+const algebraic_backfill_batch_size: usize = 1024;
+pub var test_algebraic_backfill_batch_size: ?usize = null;
+pub var test_abort_algebraic_backfill_after_batches: ?usize = null;
 
 pub const ManagedIndexRef = struct {
     name: []const u8,
@@ -744,7 +750,13 @@ pub const IndexManager = struct {
     hbc_cache: ?*hbc_mod.Cache,
     lsm_root_generation: u64,
     resource_manager: ?*resource_manager_mod.ResourceManager,
+    // Background lane used by algebraic indexes to run HLL cardinality
+    // maintenance off the foreground write path. Attached after construction
+    // via attachHllMaintenance(); when null, maintenance runs inline.
+    hll_maintenance_lane: ?background_runtime_mod.DurableJobLane = null,
+    hll_maintenance_owner_id: u64 = 0,
     primary_store: ?*docstore_mod.DocStore,
+    relational_base_rows: bool = false,
     applied_sequence_checkpoint_path: ?[]const u8,
     catalog_mutex: apply_rw_lock_mod.ApplyRwLock = .{},
     load_parallelism: ?usize = null,
@@ -790,6 +802,7 @@ pub const IndexManager = struct {
     pub const AlgebraicIndex = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
+        rebuild_root_path: []u8,
         index: algebraic_mod.index.Index,
     };
 
@@ -1205,6 +1218,7 @@ pub const IndexManager = struct {
         apply_mutex: *std.atomic.Mutex,
         config: types.IndexConfig,
         edge_type_configs: []graph_mod.EdgeTypeConfig,
+        metric_configs: []graph_mod.GraphMetricConfig,
         artifact_source: ?GraphArtifactSource = null,
         rebuild_root_path: []u8,
         index: graph_mod.GraphIndex,
@@ -1278,6 +1292,7 @@ pub const IndexManager = struct {
             .lsm_root_generation = opts.lsm_root_generation,
             .resource_manager = opts.resource_manager,
             .primary_store = null,
+            .relational_base_rows = false,
             .applied_sequence_checkpoint_path = null,
             .load_parallelism = null,
             .full_text_pending_bytes_accounted = 0,
@@ -1312,21 +1327,6 @@ pub const IndexManager = struct {
         self.alloc.destroy(mutex);
     }
 
-    fn lockAtomicWithBackoff(mutex: *std.atomic.Mutex) void {
-        var attempts: usize = 0;
-        while (!mutex.tryLock()) : (attempts += 1) {
-            if (builtin.os.tag == .freestanding or builtin.single_threaded) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            if (attempts < 64) {
-                std.atomic.spinLoopHint();
-                continue;
-            }
-            std.Thread.yield() catch {};
-        }
-    }
-
     pub fn lockManagedIndexApply(self: *IndexManager, index_ref: ManagedIndexRef) !ManagedIndexApplyGuard {
         self.catalog_mutex.lockShared();
         errdefer self.catalog_mutex.unlockShared();
@@ -1352,7 +1352,7 @@ pub const IndexManager = struct {
                 break :blk entry.apply_mutex;
             },
         };
-        lockAtomicWithBackoff(mutex);
+        _ = platform.sync.lockAtomic(mutex);
         return .{
             .manager = self,
             .mutex = mutex,
@@ -1404,10 +1404,28 @@ pub const IndexManager = struct {
         self.load_parallelism = if (parallelism) |value| @max(value, 1) else null;
     }
 
+    // Provide the background lane that algebraic indexes use for HLL cardinality
+    // maintenance. Call before loading indexes so newly opened algebraic indexes
+    // pick up the lane; already-open indexes are (re)attached here too.
+    pub fn attachHllMaintenance(self: *IndexManager, lane: background_runtime_mod.DurableJobLane, owner_id: u64) void {
+        self.hll_maintenance_lane = lane;
+        self.hll_maintenance_owner_id = owner_id;
+        for (self.algebraic_indexes.items) |*entry| {
+            entry.index.attachHllMaintenanceLane(lane, owner_id);
+        }
+    }
+
     fn bindPrimaryStore(self: *IndexManager, store: anytype) void {
         const Store = @TypeOf(store);
         if (comptime Store == *docstore_mod.DocStore) {
             self.primary_store = store;
+        }
+    }
+
+    pub fn setRelationalBaseRows(self: *IndexManager, enabled: bool) void {
+        self.relational_base_rows = enabled;
+        for (self.algebraic_indexes.items) |*entry| {
+            entry.index.setRelationalBaseRows(enabled);
         }
     }
 
@@ -1426,9 +1444,301 @@ pub const IndexManager = struct {
         entry.config.deinit(self.alloc);
     }
 
+    /// Regenerate every algebraic index's schema-derived config from `schema_json`
+    /// and persist a pending lifecycle config before the owning table schema is
+    /// durably exposed. This makes crash/reopen conservative even if the process
+    /// dies before local schema application reaches the sidecar rebuild step.
+    pub fn stageAlgebraicSchemaConfigsPending(self: *IndexManager, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
+        if (schema_json.len == 0) return;
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        self.bindPrimaryStore(store);
+
+        for (self.algebraic_indexes.items) |*entry| {
+            const cur = entry.index.config();
+            const new_config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(self.alloc, cur.table, schema_json);
+            defer self.alloc.free(new_config_json);
+
+            var new_parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, self.alloc, new_config_json, .{ .allocate = .alloc_always });
+            defer new_parsed.deinit();
+
+            // Skip when the schema-derived capability is unchanged. Compare the
+            // capability fingerprint (which encodes schema_version, fields, and
+            // dynamic-template rules) rather than raw bytes: the live and durable
+            // serializations differ in shape and tunable knobs, so a byte compare
+            // would never short-circuit and every reconcile would churn the
+            // live config.
+            const capability_changed = cur.capability_fingerprint.len == 0 or
+                !std.mem.eql(u8, new_parsed.value.capability_fingerprint, cur.capability_fingerprint);
+            const lifecycle_pending = algebraicLifecyclePending(cur.capability_lifecycle_status) or
+                cur.dynamic_rules_backfill_pending or
+                anyJsonSubdocumentDomainLifecyclePending(cur);
+            if (!capability_changed and !lifecycle_pending) continue;
+
+            // Carry forward user-tunable runtime knobs so a schema/template
+            // change does not silently reset planner/adaptive/HLL tuning in place.
+            new_parsed.value.adaptive = cur.adaptive;
+            new_parsed.value.pathfact_policy = cur.pathfact_policy;
+            new_parsed.value.max_result_buckets = cur.max_result_buckets;
+            new_parsed.value.max_planner_scan_rows = cur.max_planner_scan_rows;
+            new_parsed.value.max_batch_accumulator_entries = cur.max_batch_accumulator_entries;
+            new_parsed.value.min_max_candidate_cache_size = cur.min_max_candidate_cache_size;
+            new_parsed.value.enable_temporal_range_pruning = cur.enable_temporal_range_pruning;
+            new_parsed.value.hll_cardinalities = cur.hll_cardinalities;
+            new_parsed.value.capability_lifecycle_status = "rebuild_required";
+            markJsonSubdocumentDomainLifecycles(&new_parsed.value, cur);
+
+            // The capability changed against an already-open table, so existing
+            // documents have not been re-projected through the new config. Persist
+            // the blocked state before clearing rows; if the rebuild fails, reopen
+            // keeps schema-derived algebraic planning withheld.
+            new_parsed.value.dynamic_rules_backfill_pending = new_parsed.value.dynamic_field_rules.len > 0;
+
+            const pending_json = try std.json.Stringify.valueAlloc(self.alloc, new_parsed.value, .{ .emit_null_optional_fields = false });
+            defer self.alloc.free(pending_json);
+            try self.replaceAlgebraicConfigJson(entry, pending_json);
+            try self.persistCatalog(store);
+        }
+    }
+
+    /// Rebuild and mark current any algebraic configs already staged pending.
+    /// Call after the table runtime schema has been applied locally.
+    pub fn completePendingAlgebraicSchemaRebuilds(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        self.catalog_mutex.lockExclusive();
+        defer self.catalog_mutex.unlockExclusive();
+        self.bindPrimaryStore(store);
+        try self.resumePendingAlgebraicRebuilds(store);
+    }
+
+    /// Regenerate schema-derived configs and rebuild sidecars for callers that
+    /// already have the runtime schema applied. `DB.applyTableSchemaJson` uses the
+    /// safer staged ordering instead.
+    pub fn reloadAlgebraicSchemaConfigs(self: *IndexManager, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
+        try self.stageAlgebraicSchemaConfigsPending(store, schema_json);
+        try self.completePendingAlgebraicSchemaRebuilds(store);
+    }
+
+    fn resumePendingAlgebraicRebuilds(self: *IndexManager, store: *docstore_mod.DocStore) !void {
+        const active_schema = try schema_mod.loadSchema(store, self.alloc);
+        defer if (active_schema) |schema| schema_mod.freeSchema(self.alloc, schema);
+
+        for (self.algebraic_indexes.items) |*entry| {
+            const cur = entry.index.config();
+            if (!algebraicLifecyclePending(cur.capability_lifecycle_status) and
+                !cur.dynamic_rules_backfill_pending and
+                !anyJsonSubdocumentDomainLifecyclePending(cur)) continue;
+            if (active_schema) |schema| {
+                if (cur.schema_version != 0 and cur.schema_version != schema.version) continue;
+            } else if (cur.schema_version != 0) {
+                continue;
+            }
+
+            try self.completePendingAlgebraicRebuild(store, entry);
+        }
+    }
+
+    fn completePendingAlgebraicRebuild(self: *IndexManager, store: *docstore_mod.DocStore, entry: *AlgebraicIndex) !void {
+        _ = try self.rebuildAlgebraicIndexFromBaseRows(store, entry);
+        try self.saveBackfilledAppliedSequence(store, entry.config);
+
+        var parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, self.alloc, entry.config.config_json, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        parsed.value.capability_lifecycle_status = "current";
+        parsed.value.dynamic_rules_backfill_pending = false;
+        markJsonSubdocumentDomainLifecyclesCurrent(&parsed.value);
+
+        const current_json = try std.json.Stringify.valueAlloc(self.alloc, parsed.value, .{ .emit_null_optional_fields = false });
+        defer self.alloc.free(current_json);
+        try self.replaceAlgebraicConfigJson(entry, current_json);
+        try self.persistCatalog(store);
+    }
+
+    fn replaceAlgebraicConfigJson(self: *IndexManager, entry: *AlgebraicIndex, config_json: []const u8) !void {
+        const owned = try self.alloc.dupe(u8, config_json);
+        errdefer self.alloc.free(owned);
+        try entry.index.reloadConfigJson(config_json);
+        self.alloc.free(entry.config.config_json);
+        entry.config.config_json = owned;
+    }
+
+    fn rebuildAlgebraicIndexFromBaseRows(self: *IndexManager, store: *docstore_mod.DocStore, entry: *AlgebraicIndex) !usize {
+        const lower = try internal_keys.documentRangeLowerAlloc(self.alloc, self.byte_range.start);
+        defer self.alloc.free(lower);
+        const upper = try internal_keys.documentRangeUpperAlloc(self.alloc, if (self.byte_range.end.len > 0) self.byte_range.end else "");
+        defer if (upper) |buf| self.alloc.free(buf);
+
+        const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
+        const resume_from = try rebuild_state.check(self.alloc);
+        defer if (resume_from) |buf| self.alloc.free(buf);
+        if (resume_from == null) {
+            _ = try entry.index.clearPersistedRows(store);
+            try rebuild_state.update("");
+        }
+
+        try entry.index.beginBulkIngestSession();
+        var bulk_session_open = true;
+        errdefer if (bulk_session_open) entry.index.abortBulkIngestSession();
+
+        var scan_after = if (resume_from) |buf| try self.alloc.dupe(u8, buf) else try self.alloc.dupe(u8, "");
+        defer self.alloc.free(scan_after);
+        var rebuilt: usize = 0;
+        var flushed_batches: usize = 0;
+        var completed = false;
+        const configured_batch_size: usize = if (builtin.is_test) test_algebraic_backfill_batch_size orelse algebraic_backfill_batch_size else algebraic_backfill_batch_size;
+        const batch_size: usize = @max(configured_batch_size, 1);
+        const scan_window: usize = if (batch_size > std.math.maxInt(usize) / 4) batch_size else batch_size * 4;
+
+        while (true) {
+            var docs = std.ArrayListUnmanaged(derived_types.DerivedDocument).empty;
+            defer docs.deinit(self.alloc);
+            var owned_doc_ids = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_doc_ids.items) |doc_id| self.alloc.free(doc_id);
+                owned_doc_ids.deinit(self.alloc);
+            }
+            var owned_values = std.ArrayListUnmanaged([]u8).empty;
+            defer {
+                for (owned_values.items) |value| self.alloc.free(value);
+                owned_values.deinit(self.alloc);
+            }
+
+            var last_seen_key: ?[]u8 = null;
+            defer if (last_seen_key) |key| self.alloc.free(key);
+            var exhausted = true;
+            var scanned: usize = 0;
+
+            {
+                var txn = try store.beginReadTxn();
+                defer txn.abort();
+                var cursor = try txn.openCursor();
+                defer cursor.close();
+                cursor.setUpperBound(if (upper) |buf| buf else null);
+
+                const start = if (scan_after.len > 0) scan_after else lower;
+                var row_opt = try cursor.seekAtOrAfter(start);
+                while (row_opt) |row| : (row_opt = try cursor.next()) {
+                    if (upper) |buf| {
+                        if (std.mem.order(u8, row.key, buf) != .lt) break;
+                    }
+                    if (scan_after.len > 0 and std.mem.order(u8, row.key, scan_after) != .gt) continue;
+                    scanned += 1;
+                    if (last_seen_key) |old| self.alloc.free(old);
+                    last_seen_key = try self.alloc.dupe(u8, row.key);
+
+                    if (!isMetadataKey(row.key) and self.visibleBaseDocumentRowKey(row.key)) {
+                        const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, row.key)) orelse {
+                            if (scanned >= scan_window) {
+                                exhausted = false;
+                                break;
+                            }
+                            continue;
+                        };
+                        var doc_id_owned = true;
+                        errdefer if (doc_id_owned) self.alloc.free(doc_id);
+                        if (self.keyInRange(doc_id)) {
+                            const doc_value = if (self.relational_base_rows)
+                                try mapper.materializeRelationalRowValueAlloc(self.alloc, row.value)
+                            else
+                                try self.alloc.dupe(u8, row.value);
+                            var doc_value_owned = true;
+                            errdefer if (doc_value_owned) self.alloc.free(doc_value);
+                            try owned_values.append(self.alloc, doc_value);
+                            doc_value_owned = false;
+                            try owned_doc_ids.append(self.alloc, doc_id);
+                            doc_id_owned = false;
+                            try docs.append(self.alloc, .{
+                                .key = doc_id,
+                                .cleaned_value = doc_value,
+                            });
+                        } else {
+                            self.alloc.free(doc_id);
+                        }
+                    }
+
+                    if (docs.items.len >= batch_size or scanned >= scan_window) {
+                        exhausted = false;
+                        break;
+                    }
+                }
+            }
+
+            if (docs.items.len > 0) {
+                try entry.index.applyBatchWithOptions(store, .{ .documents = docs.items }, .{ .batch_options = .{ .mode = .bulk_ingest } });
+                rebuilt += docs.items.len;
+                flushed_batches += 1;
+            }
+            if (last_seen_key) |key| {
+                try rebuild_state.update(key);
+                self.alloc.free(scan_after);
+                scan_after = try self.alloc.dupe(u8, key);
+            }
+            if (docs.items.len > 0 and @import("builtin").is_test) {
+                if (test_abort_algebraic_backfill_after_batches) |limit| {
+                    if (flushed_batches >= limit) return error.TestInjectedBackfillFailure;
+                }
+            }
+            if (exhausted) {
+                completed = true;
+                break;
+            }
+            if (last_seen_key == null) {
+                completed = true;
+                break;
+            }
+        }
+
+        try entry.index.finishBulkIngestSessionWithOptions(store, .{});
+        bulk_session_open = false;
+        if (completed) try rebuild_state.clear();
+        return rebuilt;
+    }
+
+    fn markJsonSubdocumentDomainLifecycles(new_config: *algebraic_mod.index.Config, current: algebraic_mod.index.Config) void {
+        for (new_config.json_subdocument_domains) |*domain| {
+            const previous = findJsonSubdocumentDomain(current, domain.path);
+            const previous_pending = if (previous) |existing| jsonDomainLifecyclePending(existing.lifecycle_status) else false;
+            const previous_fp = if (previous) |existing| existing.capability_fingerprint else "";
+            const domain_changed = previous_fp.len == 0 or !std.mem.eql(u8, previous_fp, domain.capability_fingerprint);
+            if (domain_changed or previous_pending) {
+                domain.lifecycle_status = "rebuild_required";
+            }
+        }
+    }
+
+    fn findJsonSubdocumentDomain(config: algebraic_mod.index.Config, path: []const u8) ?algebraic_mod.index.JsonSubdocumentDomainConfig {
+        for (config.json_subdocument_domains) |domain| {
+            if (std.mem.eql(u8, domain.path, path)) return domain;
+        }
+        return null;
+    }
+
+    fn jsonDomainLifecyclePending(status: []const u8) bool {
+        return status.len != 0 and
+            !std.mem.eql(u8, status, "current") and
+            !std.mem.eql(u8, status, "compatible_additive");
+    }
+
+    fn algebraicLifecyclePending(status: []const u8) bool {
+        return status.len != 0 and !std.mem.eql(u8, status, "current");
+    }
+
+    fn anyJsonSubdocumentDomainLifecyclePending(config: algebraic_mod.index.Config) bool {
+        for (config.json_subdocument_domains) |domain| {
+            if (jsonDomainLifecyclePending(domain.lifecycle_status)) return true;
+        }
+        return false;
+    }
+
+    fn markJsonSubdocumentDomainLifecyclesCurrent(config: *algebraic_mod.index.Config) void {
+        for (config.json_subdocument_domains) |*domain| {
+            domain.lifecycle_status = "current";
+        }
+    }
+
     fn freeAlgebraicIndexEntry(self: *IndexManager, entry: *AlgebraicIndex) void {
         entry.index.close();
         self.destroyIndexApplyMutex(entry.apply_mutex);
+        self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
         entry.* = undefined;
     }
@@ -1549,6 +1859,7 @@ pub const IndexManager = struct {
             if (cfg.field_name) |field_name| self.alloc.free(field_name);
         }
         self.alloc.free(entry.edge_type_configs);
+        graph_mod.freeGraphMetricConfigs(self.alloc, entry.metric_configs);
         if (entry.artifact_source) |*source| source.deinit(self.alloc);
         self.alloc.free(entry.rebuild_root_path);
         entry.config.deinit(self.alloc);
@@ -2396,6 +2707,747 @@ pub const IndexManager = struct {
         return steps;
     }
 
+    pub fn runGraphMetricMaintenance(self: *IndexManager) !usize {
+        var total_steps: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                if (cfg.refresh != .background) continue;
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+                switch (status.state) {
+                    .not_ready, .stale, .failed => {
+                        var published = try entry.index.runGraphMetric(cfg.name);
+                        published.deinit(entry.index.alloc);
+                        total_steps += 1;
+                    },
+                    .disabled, .fresh, .building => {},
+                }
+            }
+        }
+        return total_steps;
+    }
+
+    pub fn refreshGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn rebuildGraphMetric(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.runGraphMetric(metric_name);
+    }
+
+    pub fn deleteGraphMetricMaterialization(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        try entry.index.deleteGraphMetricMaterialization(metric_name);
+        return try entry.index.graphMetricStatus(metric_name);
+    }
+
+    pub fn pauseGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.pauseGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn resumeGraphMetricMaintenance(self: *IndexManager, index_name: []const u8, metric_name: []const u8) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.resumeGraphMetricMaintenance(metric_name);
+    }
+
+    pub fn ensureGraphMetricPlannedBuild(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.ensureGraphMetricPlannedBuild(metric_name, target_generation);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStep(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedWorkerPageStepForMetric(metric_name, worker_id);
+    }
+
+    pub fn runGraphMetricPlannedWorkerPageStepAt(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        worker_id: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(metric_name, worker_id, now_ms);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStep(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedCoordinatorStepForMetric(metric_name);
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorStepAt(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        now_ms: u64,
+    ) !graph_mod.GraphIndex.GraphMetricBuildWorkerStepResult {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(metric_name, now_ms);
+    }
+
+    pub fn failGraphMetricPlannedBuild(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        err: anyerror,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.failGraphMetricPlannedBuild(metric_name, err);
+    }
+
+    pub fn runGraphMetricPlannedDrain(
+        self: *IndexManager,
+        index_name: []const u8,
+        metric_name: []const u8,
+        target_generation: u64,
+        options: graph_mod.GraphIndex.GraphMetricPlannedDrainOptions,
+    ) !graph_mod.GraphIndex.GraphMetricStatus {
+        const entry = self.graphIndex(index_name) orelse return error.IndexNotFound;
+        return try entry.index.runGraphMetricPlannedDrain(metric_name, target_generation, options);
+    }
+
+    pub const GraphMetricPlannedSchedulerSweepOptions = struct {
+        max_metrics: usize = 64,
+        start_background_builds: bool = true,
+        now_ms: ?u64 = null,
+        auto_idle_options: ?GraphMetricPlannedAutoIdleOptions = null,
+    };
+
+    pub const GraphMetricPlannedWorkerSweepOptions = struct {
+        worker_id: []const u8,
+        max_pages: usize = 64,
+        now_ms: ?u64 = null,
+    };
+
+    pub const GraphMetricPlannedSchedulerSweepResult = struct {
+        metrics_scanned: usize = 0,
+        active_builds: usize = 0,
+        builds_started: usize = 0,
+        worker_steps: usize = 0,
+        coordinator_steps: usize = 0,
+        pages_claimed: usize = 0,
+        pages_completed: usize = 0,
+        phases_advanced: usize = 0,
+        published: usize = 0,
+        failed_builds: usize = 0,
+        rounds_executed: usize = 0,
+        budget_exhausted: bool = false,
+
+        pub fn progressed(self: @This()) bool {
+            return self.builds_started != 0 or
+                self.worker_steps != 0 or
+                self.coordinator_steps != 0 or
+                self.pages_claimed != 0 or
+                self.pages_completed != 0 or
+                self.phases_advanced != 0 or
+                self.published != 0 or
+                self.failed_builds != 0;
+        }
+
+        pub fn durableProgressed(self: @This()) bool {
+            return self.builds_started != 0 or
+                self.pages_claimed != 0 or
+                self.pages_completed != 0 or
+                self.phases_advanced != 0 or
+                self.published != 0 or
+                self.failed_builds != 0;
+        }
+
+        pub fn add(self: *@This(), other: @This()) void {
+            self.metrics_scanned += other.metrics_scanned;
+            self.active_builds += other.active_builds;
+            self.builds_started += other.builds_started;
+            self.worker_steps += other.worker_steps;
+            self.coordinator_steps += other.coordinator_steps;
+            self.pages_claimed += other.pages_claimed;
+            self.pages_completed += other.pages_completed;
+            self.phases_advanced += other.phases_advanced;
+            self.published += other.published;
+            self.failed_builds += other.failed_builds;
+            self.rounds_executed += other.rounds_executed;
+            self.budget_exhausted = self.budget_exhausted or other.budget_exhausted;
+        }
+    };
+
+    pub const GraphMetricPlannedMaintenanceOptions = struct {
+        worker_id: []const u8 = "graph-metric-idle-worker",
+        worker_ids: []const []const u8 = &.{},
+        max_rounds: usize = 1024,
+        max_metrics_per_round: usize = 64,
+        max_pages_per_round: usize = 64,
+        now_ms: ?u64 = null,
+    };
+
+    pub const GraphMetricPlannedWorkStats = struct {
+        metrics_scanned: usize = 0,
+        queued_builds: usize = 0,
+        active_builds: usize = 0,
+        active_pages: usize = 0,
+        failed_pages: usize = 0,
+        paused_metrics: usize = 0,
+        truncated_pages: bool = false,
+
+        pub fn hasWork(self: @This()) bool {
+            return self.queued_builds != 0 or
+                self.active_builds != 0 or
+                self.active_pages != 0 or
+                self.failed_pages != 0;
+        }
+    };
+
+    pub const GraphMetricPlannedAutoIdleOptions = struct {
+        max_pagerank_iterations: u32 = std.math.maxInt(u32),
+        max_eigenvector_iterations: u32 = std.math.maxInt(u32),
+        max_hits_iterations: u32 = std.math.maxInt(u32),
+        max_active_builds: usize = 4,
+        max_active_builds_per_index: usize = 2,
+    };
+
+    pub const GraphMetricPlannedAutoIdleDecision = struct {
+        active_builds: usize = 0,
+        eligible_queued: usize = 0,
+        deferred_queued: usize = 0,
+        ineligible_queued: usize = 0,
+
+        pub fn shouldRunPlanned(self: @This()) bool {
+            return self.active_builds != 0 or self.eligible_queued != 0;
+        }
+    };
+
+    pub const GraphMetricDegreeCanaryOptions = struct {
+        max_control_records: usize = 64,
+    };
+
+    pub const GraphMetricDegreeCanaryDecision = struct {
+        active_degree_builds: usize = 0,
+        eligible_queued_degree: usize = 0,
+        blocked_active_non_degree: usize = 0,
+        blocked_queued_non_degree: usize = 0,
+        control_records: usize = 0,
+        queued_degree_control_records: usize = 0,
+        failed_pages: usize = 0,
+        truncated_pages: bool = false,
+        max_control_records: usize = 64,
+
+        pub fn shouldRunPlanned(self: @This()) bool {
+            if (self.blocked_active_non_degree != 0) return false;
+            if (self.blocked_queued_non_degree != 0) return false;
+            if (self.failed_pages != 0) return false;
+            if (self.truncated_pages) return false;
+            if (self.control_records > self.max_control_records) return false;
+            if (self.control_records +| self.queued_degree_control_records > self.max_control_records) return false;
+            if (self.active_degree_builds == 1 and self.eligible_queued_degree == 0) return true;
+            if (self.active_degree_builds == 0 and self.eligible_queued_degree == 1) return true;
+            return false;
+        }
+    };
+
+    fn graphMetricBackgroundStartCanonical(configs: []const graph_mod.GraphMetricConfig, cfg: graph_mod.GraphMetricConfig) bool {
+        if (cfg.kind != .hits_hub) return true;
+        for (configs) |candidate| {
+            if (candidate.kind == .hits_authority and candidate.refresh == .background) return false;
+        }
+        return true;
+    }
+
+    pub fn graphMetricPlannedWorkStats(self: *IndexManager) !GraphMetricPlannedWorkStats {
+        var stats = GraphMetricPlannedWorkStats{};
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                stats.metrics_scanned += 1;
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) {
+                    stats.paused_metrics += 1;
+                    continue;
+                }
+                if (status.build_pages_truncated) stats.truncated_pages = true;
+                for (status.build_pages) |page| {
+                    switch (page.state) {
+                        .leased => stats.active_pages += 1,
+                        .failed => stats.failed_pages += 1,
+                        .pending, .complete => {},
+                    }
+                }
+                if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                    stats.active_builds += 1;
+                    continue;
+                }
+                if (cfg.refresh != .background) continue;
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                switch (status.state) {
+                    .not_ready, .stale => stats.queued_builds += 1,
+                    .disabled, .fresh, .building => {},
+                    .failed => {},
+                }
+            }
+        }
+        return stats;
+    }
+
+    pub fn shouldRunGraphMetricPlannedAutoIdle(
+        self: *IndexManager,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) !bool {
+        const decision = try self.graphMetricPlannedAutoIdleDecision(options);
+        return decision.shouldRunPlanned();
+    }
+
+    pub fn shouldRunGraphMetricDegreeCanary(
+        self: *IndexManager,
+        options: GraphMetricDegreeCanaryOptions,
+    ) !bool {
+        const decision = try self.graphMetricDegreeCanaryDecision(options);
+        return decision.shouldRunPlanned();
+    }
+
+    pub fn graphMetricDegreeCanaryDecision(
+        self: *IndexManager,
+        options: GraphMetricDegreeCanaryOptions,
+    ) !GraphMetricDegreeCanaryDecision {
+        var decision = GraphMetricDegreeCanaryDecision{
+            .max_control_records = options.max_control_records,
+        };
+
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+
+                const active = status.state == .building or status.phase == .cleanup_old_generations;
+                if (active) decision.control_records += 1;
+                decision.control_records += status.build_pages.len;
+                if (status.build_pages_truncated) decision.truncated_pages = true;
+                for (status.build_pages) |page| {
+                    if (page.state == .failed) decision.failed_pages += 1;
+                }
+
+                const queued = cfg.refresh == .background and
+                    graphMetricBackgroundStartCanonical(entry.metric_configs, cfg) and
+                    (status.state == .not_ready or status.state == .stale);
+                if (cfg.kind == .degree) {
+                    if (active) decision.active_degree_builds += 1;
+                    if (queued) {
+                        decision.eligible_queued_degree += 1;
+                        decision.queued_degree_control_records +|= entry.index.graphMetricPlannedBuildControlRecordEstimate(cfg);
+                    }
+                } else {
+                    if (active) decision.blocked_active_non_degree += 1;
+                    if (queued) decision.blocked_queued_non_degree += 1;
+                }
+            }
+        }
+
+        return decision;
+    }
+
+    pub fn graphMetricPlannedAutoIdleDecision(
+        self: *IndexManager,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedAutoIdleDecision {
+        var decision = GraphMetricPlannedAutoIdleDecision{};
+        for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = try graphMetricIndexActiveBuilds(entry);
+            var index_scheduled_builds: usize = 0;
+            decision.active_builds += index_active_builds;
+            for (entry.metric_configs) |cfg| {
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+
+                if (status.state == .building or status.phase == .cleanup_old_generations) {
+                    continue;
+                }
+
+                if (cfg.refresh != .background) continue;
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                switch (status.state) {
+                    .not_ready, .stale => {
+                        if (!graphMetricQueuedPlannedAutoEligible(entry.metric_configs, cfg, options)) {
+                            decision.ineligible_queued += 1;
+                        } else if (graphMetricPlannedAutoCanStart(
+                            options,
+                            decision.active_builds,
+                            decision.eligible_queued,
+                            index_active_builds,
+                            index_scheduled_builds,
+                        )) {
+                            decision.eligible_queued += 1;
+                            index_scheduled_builds += 1;
+                        } else {
+                            decision.deferred_queued += 1;
+                        }
+                    },
+                    .disabled, .fresh, .building, .failed => {},
+                }
+            }
+        }
+
+        return decision;
+    }
+
+    fn graphMetricIndexActiveBuilds(entry: *GraphIndex) !usize {
+        var active_builds: usize = 0;
+        for (entry.metric_configs) |cfg| {
+            var status = try entry.index.graphMetricStatus(cfg.name);
+            defer status.deinit(entry.index.alloc);
+            if (status.maintenance_paused) continue;
+            if (status.state == .building or status.phase == .cleanup_old_generations) {
+                if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                active_builds += 1;
+            }
+        }
+        return active_builds;
+    }
+
+    fn graphMetricPlannedAutoCanStart(
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        eligible_queued: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (options.max_active_builds == 0 or options.max_active_builds_per_index == 0) return false;
+        if (active_builds + eligible_queued >= options.max_active_builds) return false;
+        if (index_active_builds + index_scheduled_builds >= options.max_active_builds_per_index) return false;
+        return true;
+    }
+
+    fn graphMetricQueuedPlannedAutoEligible(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        return switch (cfg.kind) {
+            .degree => true,
+            .pagerank => cfg.max_iterations <= options.max_pagerank_iterations,
+            .eigenvector => cfg.max_iterations <= options.max_eigenvector_iterations,
+            .hits_authority => options.max_hits_iterations != 0 and
+                cfg.max_iterations <= options.max_hits_iterations and
+                graphMetricHasEligibleBackgroundHitsHub(configs, cfg, options),
+            .hits_hub => false,
+        };
+    }
+
+    fn graphMetricHasEligibleBackgroundHitsHub(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        for (configs) |candidate| {
+            if (graphMetricQueuedHitsHubCompatible(candidate, cfg, options)) {
+                return true;
+            }
+        }
+        return false;
+    }
+
+    fn graphMetricQueuedHitsHubCompatible(
+        candidate: graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+    ) bool {
+        return candidate.kind == .hits_hub and
+            candidate.refresh == .background and
+            !std.mem.eql(u8, candidate.name, cfg.name) and
+            candidate.max_iterations == cfg.max_iterations and
+            candidate.max_iterations <= options.max_hits_iterations and
+            candidate.tolerance == cfg.tolerance and
+            candidate.edge_filter.equivalent(cfg.edge_filter);
+    }
+
+    fn graphMetricShouldAutoStartQueuedBuild(
+        configs: []const graph_mod.GraphMetricConfig,
+        cfg: graph_mod.GraphMetricConfig,
+        options: GraphMetricPlannedAutoIdleOptions,
+        active_builds: usize,
+        scheduled_builds: usize,
+        index_active_builds: usize,
+        index_scheduled_builds: usize,
+    ) bool {
+        if (!graphMetricBackgroundStartCanonical(configs, cfg)) return false;
+        if (!graphMetricQueuedPlannedAutoEligible(configs, cfg, options)) return false;
+        return graphMetricPlannedAutoCanStart(
+            options,
+            active_builds,
+            scheduled_builds,
+            index_active_builds,
+            index_scheduled_builds,
+        );
+    }
+
+    pub fn runGraphMetricPlannedCoordinatorSweep(
+        self: *IndexManager,
+        options: GraphMetricPlannedSchedulerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        var result = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_metrics == 0) return result;
+        const active_builds_before_start: usize = if (options.auto_idle_options != null)
+            try self.graphMetricActiveBuildCount()
+        else
+            0;
+        var scheduled_builds: usize = 0;
+
+        for (self.graph_indexes.items) |*entry| {
+            const index_active_builds = if (options.auto_idle_options != null)
+                try graphMetricIndexActiveBuilds(entry)
+            else
+                0;
+            var index_scheduled_builds: usize = 0;
+            for (entry.metric_configs) |cfg| {
+                if (result.metrics_scanned >= options.max_metrics) {
+                    result.budget_exhausted = true;
+                    return result;
+                }
+                result.metrics_scanned += 1;
+
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+
+                var active = status.state == .building;
+                if (!active and options.start_background_builds and cfg.refresh == .background) {
+                    switch (status.state) {
+                        .not_ready, .stale => {
+                            if (options.auto_idle_options) |auto_options| {
+                                if (!graphMetricShouldAutoStartQueuedBuild(
+                                    entry.metric_configs,
+                                    cfg,
+                                    auto_options,
+                                    active_builds_before_start,
+                                    scheduled_builds,
+                                    index_active_builds,
+                                    index_scheduled_builds,
+                                )) continue;
+                            } else if (!graphMetricBackgroundStartCanonical(entry.metric_configs, cfg)) continue;
+                            var started = try entry.index.ensureGraphMetricPlannedBuild(cfg.name, status.target_edge_generation);
+                            defer started.deinit(entry.index.alloc);
+                            result.builds_started += 1;
+                            scheduled_builds += 1;
+                            index_scheduled_builds += 1;
+                            active = true;
+                        },
+                        .disabled, .fresh, .building, .failed => {},
+                    }
+                }
+                if (!active) continue;
+                result.active_builds += 1;
+
+                const step = (if (options.now_ms) |now_ms|
+                    entry.index.runGraphMetricPlannedCoordinatorStepForMetricAt(cfg.name, now_ms)
+                else
+                    entry.index.runGraphMetricPlannedCoordinatorStepForMetric(cfg.name)) catch |err| switch (err) {
+                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive => continue,
+                    else => return err,
+                };
+                result.coordinator_steps += 1;
+                if (step.advanced_phase) result.phases_advanced += 1;
+                if (step.published or (step.advanced_phase and step.phase == .publish_generation)) {
+                    result.published += 1;
+                }
+                if (step.failed_build) result.failed_builds += 1;
+            }
+        }
+        return result;
+    }
+
+    fn graphMetricActiveBuildCount(self: *IndexManager) !usize {
+        var active_builds: usize = 0;
+        for (self.graph_indexes.items) |*entry| {
+            active_builds += try graphMetricIndexActiveBuilds(entry);
+        }
+        return active_builds;
+    }
+
+    pub fn runGraphMetricPlannedWorkerSweep(
+        self: *IndexManager,
+        options: GraphMetricPlannedWorkerSweepOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+        var result = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_pages == 0) return result;
+
+        for (self.graph_indexes.items) |*entry| {
+            for (entry.metric_configs) |cfg| {
+                if (result.worker_steps >= options.max_pages) {
+                    result.budget_exhausted = true;
+                    return result;
+                }
+
+                var status = try entry.index.graphMetricStatus(cfg.name);
+                defer status.deinit(entry.index.alloc);
+                if (status.maintenance_paused) continue;
+                const active = status.state == .building or status.phase == .cleanup_old_generations;
+                if (!active) continue;
+                result.metrics_scanned += 1;
+                result.active_builds += 1;
+
+                const step = (if (options.now_ms) |now_ms|
+                    entry.index.runGraphMetricPlannedWorkerPageStepForMetricAt(cfg.name, options.worker_id, now_ms)
+                else
+                    entry.index.runGraphMetricPlannedWorkerPageStepForMetric(cfg.name, options.worker_id)) catch |err| switch (err) {
+                    error.GraphMetricBuildJobNotFound, error.GraphMetricBuildNotActive => continue,
+                    else => return err,
+                };
+                result.worker_steps += 1;
+                if (step.claimed_page) result.pages_claimed += 1;
+                if (step.completed_page) result.pages_completed += 1;
+                if (step.advanced_phase) result.phases_advanced += 1;
+                if (result.worker_steps >= options.max_pages) {
+                    var after_status = try entry.index.graphMetricStatus(cfg.name);
+                    defer after_status.deinit(entry.index.alloc);
+                    if (graphMetricStatusHasRunnableWorkerPage(after_status, options.worker_id, options.now_ms)) {
+                        result.budget_exhausted = true;
+                    }
+                    return result;
+                }
+            }
+        }
+        return result;
+    }
+
+    pub fn runGraphMetricPlannedMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, null);
+    }
+
+    pub fn runGraphMetricPlannedAutoMaintenance(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        return try self.runGraphMetricPlannedMaintenanceWithAuto(options, auto_options);
+    }
+
+    fn runGraphMetricPlannedMaintenanceWithAuto(
+        self: *IndexManager,
+        options: GraphMetricPlannedMaintenanceOptions,
+        auto_options: ?GraphMetricPlannedAutoIdleOptions,
+    ) !GraphMetricPlannedSchedulerSweepResult {
+        try validateGraphMetricPlannedMaintenanceWorkers(options);
+        var total = GraphMetricPlannedSchedulerSweepResult{};
+        if (options.max_rounds == 0) {
+            total.budget_exhausted = true;
+            return total;
+        }
+
+        var rounds: usize = 0;
+        while (rounds < options.max_rounds) : (rounds += 1) {
+            var round = GraphMetricPlannedSchedulerSweepResult{};
+            const coordinator_before = try self.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = options.max_metrics_per_round,
+                .start_background_builds = true,
+                .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
+            });
+            round.add(coordinator_before);
+
+            if (options.worker_ids.len == 0) {
+                const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                    .worker_id = options.worker_id,
+                    .max_pages = options.max_pages_per_round,
+                    .now_ms = options.now_ms,
+                });
+                round.add(worker);
+            } else {
+                var pages_remaining = options.max_pages_per_round;
+                while (pages_remaining > 0) {
+                    var worker_progressed = false;
+                    for (options.worker_ids) |worker_id| {
+                        if (pages_remaining == 0) break;
+                        const worker = try self.runGraphMetricPlannedWorkerSweep(.{
+                            .worker_id = worker_id,
+                            .max_pages = 1,
+                            .now_ms = options.now_ms,
+                        });
+                        round.add(worker);
+                        pages_remaining -= @min(pages_remaining, worker.worker_steps);
+                        worker_progressed = worker_progressed or worker.durableProgressed();
+                    }
+                    if (!worker_progressed) break;
+                }
+            }
+
+            const coordinator_after = try self.runGraphMetricPlannedCoordinatorSweep(.{
+                .max_metrics = options.max_metrics_per_round,
+                .start_background_builds = true,
+                .now_ms = options.now_ms,
+                .auto_idle_options = auto_options,
+            });
+            round.add(coordinator_after);
+
+            const round_budget_exhausted = round.budget_exhausted;
+            round.budget_exhausted = false;
+            round.rounds_executed = 1;
+            total.add(round);
+            if (!round.durableProgressed()) {
+                total.budget_exhausted = round_budget_exhausted;
+                return total;
+            }
+        }
+        total.budget_exhausted = true;
+        return total;
+    }
+
+    fn validateGraphMetricPlannedMaintenanceWorkers(options: GraphMetricPlannedMaintenanceOptions) !void {
+        if (options.worker_ids.len == 0) {
+            if (options.worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+            return;
+        }
+
+        for (options.worker_ids, 0..) |worker_id, i| {
+            if (worker_id.len == 0) return error.InvalidGraphMetricBuildWorker;
+            for (options.worker_ids[0..i]) |prior_worker_id| {
+                if (std.mem.eql(u8, worker_id, prior_worker_id)) return error.InvalidGraphMetricBuildWorker;
+            }
+        }
+    }
+
+    fn graphMetricStatusHasRunnableWorkerPage(
+        status: graph_mod.GraphIndex.GraphMetricStatus,
+        worker_id: []const u8,
+        now_ms: ?u64,
+    ) bool {
+        if (status.state == .building or status.phase == .cleanup_old_generations) return true;
+        if (status.build_pages_truncated) return true;
+        const now: u64 = now_ms orelse platform_clock.Clock.real().nowRealtimeMs();
+        for (status.build_pages) |page| {
+            switch (page.state) {
+                .pending, .failed => return true,
+                .leased => {
+                    if (std.mem.eql(u8, page.worker_id, worker_id)) return true;
+                    if (page.lease_expires_at_ms <= now) return true;
+                },
+                .complete => {},
+            }
+        }
+        return false;
+    }
+
     pub const DensePostingMaintenanceOptions = struct {
         max_postings_per_index: usize = 64,
         max_layout_changes_per_index: usize = 8,
@@ -2525,6 +3577,11 @@ pub const IndexManager = struct {
                     try self.ensureConfiguredIndexDir(cfg);
                 }
                 try self.loadConfiguredIndexesParallel(store, configs, parallelism, allow_backfill, read_only);
+            }
+        }
+        if (allow_backfill and !read_only) {
+            if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                try self.resumePendingAlgebraicRebuilds(store);
             }
         }
         try self.refreshGeneratedEnrichmentTargetCache();
@@ -3835,6 +4892,7 @@ pub const IndexManager = struct {
                     split_key,
                     .right,
                     dest_entry.config.config_json,
+                    dest_entry.runtime_schema,
                     collect_skip_doc_keys,
                 );
                 defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
@@ -4398,6 +5456,7 @@ pub const IndexManager = struct {
                             split_key,
                             .left,
                             entry.config.config_json,
+                            entry.runtime_schema,
                             false,
                         );
                         defer if (rebuilt.segment_bytes) |segment_bytes| self.alloc.free(segment_bytes);
@@ -4909,6 +5968,19 @@ pub const IndexManager = struct {
             return null;
         }
         if (self.algebraic_indexes.items.len == 1) return &self.algebraic_indexes.items[0];
+        return null;
+    }
+
+    /// Resolve the algebraic index that should serve an aggregation. `preferred`
+    /// is the query's index_name, which usually names the *text* index, not an
+    /// algebraic one: use it only when it actually names an algebraic index,
+    /// otherwise fall back to the table's default algebraic index (the first
+    /// one). Returns null when the table has no algebraic index.
+    pub fn aggregationAlgebraicIndex(self: *IndexManager, preferred: ?[]const u8) ?*AlgebraicIndex {
+        if (preferred) |name| {
+            if (self.algebraicIndex(name)) |entry| return entry;
+        }
+        if (self.algebraic_indexes.items.len > 0) return &self.algebraic_indexes.items[0];
         return null;
     }
 
@@ -5687,6 +6759,27 @@ pub const IndexManager = struct {
         try self.applySparseEmbeddingWritesEntry(store, entry, writes, batch_options);
     }
 
+    fn visibleBaseDocumentRowKey(self: *const IndexManager, key: []const u8) bool {
+        return if (self.relational_base_rows)
+            internal_keys.isRelationalRowKey(key)
+        else
+            internal_keys.isPrimaryDocumentKey(key);
+    }
+
+    /// Reconstruct relational typed-row values in a freshly scanned set of
+    /// document rows into canonical JSON, in place. Relational mode is strict:
+    /// only relational row keys are materialized, and the value under that
+    /// keyspace must be a typed row. Stale generic primary document rows are not
+    /// a supported relational fallback and are filtered by backfill consumers.
+    fn materializeScannedDocumentRows(self: *IndexManager, rows: anytype) !void {
+        for (rows) |*row| {
+            if (self.relational_base_rows) {
+                if (!internal_keys.isRelationalRowKey(row.key)) continue;
+                row.value = try mapper.materializeOwnedRelationalRowValueAlloc(self.alloc, row.value);
+            }
+        }
+    }
+
     fn backfillTextIndex(self: *IndexManager, store: *docstore_mod.DocStore, entry: *TextIndex, resume_from: ?[]const u8) !void {
         const rebuild_state = backfill_state_mod.RebuildState.init(entry.rebuild_root_path);
         var runtime_store = try initRuntimeStore(self.alloc, store);
@@ -5699,6 +6792,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
         var identity_txn = try runtime_store.store.beginProbe();
         defer identity_txn.abort();
 
@@ -5749,17 +6843,25 @@ pub const IndexManager = struct {
 
         for (docs) |doc| {
             if (isMetadataKey(doc.key)) continue;
-            if (!self.keyInRange(doc.key)) continue;
-            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) continue;
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
+            const doc_id = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
+            errdefer self.alloc.free(doc_id);
+            if (!self.keyInRange(doc_id)) {
+                self.alloc.free(doc_id);
+                continue;
+            }
+            if (!try textIndexShouldConsumeDoc(self, entry, doc.key)) {
+                self.alloc.free(doc_id);
+                continue;
+            }
             if (resume_from) |resume_key| {
-                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
+                if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) {
+                    self.alloc.free(doc_id);
+                    continue;
+                }
             }
 
             saw_visible_doc = true;
-            const doc_id = if (internal_keys.isPrimaryDocumentKey(doc.key))
-                (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue
-            else
-                try self.alloc.dupe(u8, doc.key);
             try owned_doc_ids.append(self.alloc, doc_id);
             try mapped_docs.append(self.alloc, .{
                 .key = doc_id,
@@ -6341,6 +7443,7 @@ pub const IndexManager = struct {
                     .reverse_lsm_options = self.graph_reverse_lsm_options,
                     .reverse_lsm_root_generation = self.lsm_root_generation,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .metric_configs = graph_cfg.metric_configs,
                     .rebuild_root_path = path,
                     .algebraic_semiring_traversal = graph_cfg.algebraic_semiring_traversal,
                 });
@@ -6354,6 +7457,7 @@ pub const IndexManager = struct {
                     .apply_mutex = apply_mutex,
                     .config = cloned_cfg,
                     .edge_type_configs = graph_cfg.edge_type_configs,
+                    .metric_configs = graph_cfg.metric_configs,
                     .artifact_source = graph_cfg.artifact_source,
                     .rebuild_root_path = try self.alloc.dupe(u8, path),
                     .index = index,
@@ -6395,13 +7499,25 @@ pub const IndexManager = struct {
                 return .{ .graph = entry };
             },
             .algebraic => {
+                const path = try self.indexPath(cfg.name);
+                defer self.alloc.free(path);
+                const rebuild_root_path = try self.alloc.dupe(u8, path);
+                var rebuild_root_path_owned = true;
+                errdefer if (rebuild_root_path_owned) self.alloc.free(rebuild_root_path);
                 var index = try algebraic_mod.index.Index.open(self.alloc, cfg.name, cfg.config_json);
                 var index_moved = false;
                 errdefer if (!index_moved) {
                     var doomed = index;
                     doomed.close();
                 };
+                index.setRelationalBaseRows(self.relational_base_rows);
                 if (self.resource_manager) |manager| index.attachResourceManager(manager);
+                if (self.hll_maintenance_lane) |lane| {
+                    index.attachHllMaintenanceLane(lane, self.hll_maintenance_owner_id);
+                    if (comptime @TypeOf(store) == *docstore_mod.DocStore) {
+                        index.loadAdaptiveHllCardinalities(store) catch {};
+                    }
+                }
                 const apply_mutex = try self.allocIndexApplyMutex();
                 var apply_mutex_owned = true;
                 errdefer if (apply_mutex_owned) self.destroyIndexApplyMutex(apply_mutex);
@@ -6409,8 +7525,10 @@ pub const IndexManager = struct {
                 var entry = AlgebraicIndex{
                     .apply_mutex = apply_mutex,
                     .config = try types.IndexConfig.clone(self.alloc, cfg),
+                    .rebuild_root_path = rebuild_root_path,
                     .index = index,
                 };
+                rebuild_root_path_owned = false;
                 apply_mutex_owned = false;
                 index_moved = true;
                 errdefer self.freeAlgebraicIndexEntry(&entry);
@@ -7163,6 +8281,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
 
         var items = std.ArrayListUnmanaged(hbc_mod.BatchInsertItem).empty;
         defer {
@@ -7178,8 +8297,8 @@ pub const IndexManager = struct {
         errdefer mapping_batch.abort();
 
         for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
             const vector_values = (try mapper.extractDenseVectorField(self.alloc, doc.value, entry.field_name, entry.dims)) orelse continue;
@@ -7214,6 +8333,7 @@ pub const IndexManager = struct {
 
         const docs = try backend_scan.scanRange(self.alloc, &runtime_store.store, lower, if (upper) |buf| buf else "");
         defer backend_scan.freeResults(self.alloc, docs);
+        try self.materializeScannedDocumentRows(docs);
 
         var writes = std.ArrayListUnmanaged(sparse_mod.SparseWrite).empty;
         defer {
@@ -7266,11 +8386,11 @@ pub const IndexManager = struct {
 
         const backfill_batch_size = if (builtin.is_test) test_sparse_backfill_batch_size orelse sparse_backfill_batch_size else sparse_backfill_batch_size;
         for (docs) |doc| {
-            if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
+            if (!self.visibleBaseDocumentRowKey(doc.key)) continue;
             if (resume_from) |resume_key| {
                 if (resume_key.len > 0 and std.mem.order(u8, doc.key, resume_key) != .gt) continue;
             }
-            const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(self.alloc, doc.key)) orelse continue;
+            const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(self.alloc, doc.key)) orelse continue;
             defer self.alloc.free(raw_key);
             if (!self.keyInRange(raw_key)) continue;
             var sparse_vec = (try mapper.extractSparseVectorField(self.alloc, doc.value, entry.field_name)) orelse continue;
@@ -10293,14 +11413,16 @@ pub const IndexManager = struct {
                 break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
             }
 
-            const doc_store_key = try internal_keys.documentKeyAlloc(alloc, metadata);
+            const doc_store_key = try manager.denseSourceDocumentStoreKeyAlloc(alloc, metadata);
             defer alloc.free(doc_store_key);
             const raw = manager.loadPrimaryDocumentRawForHbc(store, doc_store_key, load_session, alloc) catch |err| switch (err) {
                 error.NotFound => break :blk try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session),
                 else => return err,
             };
             defer if (load_session == null) alloc.free(raw);
-            break :blk (try mapper.extractDenseVectorField(alloc, raw, entry.field_name, entry.dims)) orelse
+            const doc_value = try manager.materializeDenseSourceDocumentValueAlloc(alloc, metadata, raw);
+            defer if (doc_value.ptr != raw.ptr) alloc.free(doc_value);
+            break :blk (try mapper.extractDenseVectorField(alloc, doc_value, entry.field_name, entry.dims)) orelse
                 try manager.loadDenseVectorArtifactForHbc(alloc, store, metadata, entry.config.name, load_session);
         };
         errdefer alloc.free(vector);
@@ -10808,6 +11930,18 @@ pub const IndexManager = struct {
         _ = self;
         if (load_session) |session| return try session.get(store, doc_store_key);
         return try store.get(alloc, doc_store_key);
+    }
+
+    fn denseSourceDocumentStoreKeyAlloc(self: *const IndexManager, alloc: Allocator, doc_key: []const u8) ![]u8 {
+        return if (self.relational_base_rows and !internal_keys.isInternalUserKey(doc_key))
+            try relational_store_mod.rowKeyAlloc(alloc, doc_key)
+        else
+            try internal_keys.documentKeyAlloc(alloc, doc_key);
+    }
+
+    fn materializeDenseSourceDocumentValueAlloc(self: *const IndexManager, alloc: Allocator, doc_key: []const u8, raw: []const u8) ![]const u8 {
+        if (!self.relational_base_rows or internal_keys.isInternalUserKey(doc_key)) return raw;
+        return try mapper.materializeRelationalRowValueAlloc(alloc, raw);
     }
 
     fn loadDenseEmbeddingArtifactVectorWithSession(
@@ -11565,6 +12699,7 @@ fn buildSplitSegment(
     split_key: []const u8,
     side: SplitSide,
     config_json: ?[]const u8,
+    runtime_schema: ?schema_mod.TableSchema,
     collect_doc_keys: bool,
 ) !SplitRebuiltSegment {
     var reader = try segment_mod.SegmentReader.init(alloc, segment_bytes);
@@ -11632,7 +12767,10 @@ fn buildSplitSegment(
 
     const split_text_analysis = try introducer_mod.parseTextAnalysisConfig(alloc, config_json);
     defer introducer_mod.freeTextAnalysisConfig(alloc, split_text_analysis);
-    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, null);
+    // Pass the runtime schema so a relational table's split segment re-derives
+    // its typed columns + manifest from the reconstructed documents (rather than
+    // degrading to a document-mode segment that has lost columnar pushdown).
+    const rebuilt = try mapper.buildTextSegmentFromDocuments(alloc, docs.items, split_text_analysis, runtime_schema);
     return .{
         .segment_bytes = rebuilt,
         .doc_keys = try doc_keys.toOwnedSlice(alloc),
@@ -11672,6 +12810,13 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
         return internal_keys.matchesChunkArtifactName(key, artifact_name) or
             internal_keys.matchesAssetArtifactName(key, artifact_name);
     }
+    if (self.relational_base_rows) {
+        if (internal_keys.isRelationalRowKey(key)) return true;
+        if (internal_keys.isPrimaryDocumentKey(key)) return false;
+        if (internal_keys.isInternalUserKey(key)) return false;
+        if (docstore_mod.KeyEncoder.parseEdgeKey(key) != null) return false;
+        return true;
+    }
     if (isPrimaryDocumentCandidate(key)) return true;
     if (!internal_keys.isChunkArtifactRecordKey(key)) return false;
     return try self.textIndexIsChunkBacked(self.alloc, entry.config.name);
@@ -11679,6 +12824,7 @@ fn textIndexShouldConsumeDoc(self: *const IndexManager, entry: *const IndexManag
 
 fn isPrimaryDocumentCandidate(key: []const u8) bool {
     if (internal_keys.isPrimaryDocumentKey(key)) return true;
+    if (internal_keys.isRelationalRowKey(key)) return true;
     if (internal_keys.isInternalUserKey(key)) return false;
     if (docstore_mod.KeyEncoder.parseEdgeKey(key) != null) return false;
     return true;
@@ -11955,6 +13101,7 @@ pub const GraphArtifactSource = struct {
 
 const GraphConfig = struct {
     edge_type_configs: []graph_mod.EdgeTypeConfig,
+    metric_configs: []graph_mod.GraphMetricConfig,
     artifact_source: ?GraphArtifactSource = null,
     shorthand_asset: ?enrichment_catalog.EnrichmentConfig = null,
     algebraic_semiring_traversal: bool = false,
@@ -11965,6 +13112,7 @@ const GraphConfig = struct {
             if (cfg.field_name) |field_name| alloc.free(field_name);
         }
         alloc.free(self.edge_type_configs);
+        graph_mod.freeGraphMetricConfigs(alloc, self.metric_configs);
         if (self.artifact_source) |*source| source.deinit(alloc);
         if (self.shorthand_asset) |*asset| asset.deinit(alloc);
     }
@@ -12182,7 +13330,7 @@ fn openTextPersistentIndexWithRetry(
     opts: persistent_mod.PersistentIndexOptions,
 ) !persistent_mod.PersistentIndex {
     const max_attempts: usize = 6;
-    const debug_open = std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    const debug_open = getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
     var attempt: usize = 0;
     while (true) : (attempt += 1) {
         if (debug_open) {
@@ -12227,20 +13375,7 @@ fn isTransientTextPersistentOpenError(err: anyerror) bool {
 fn sleepBeforeTextPersistentOpenRetry(attempt: usize) void {
     const capped = @min(attempt, 5);
     const delay_ns: u64 = (@as(u64, 5) << @intCast(capped)) * std.time.ns_per_ms;
-    if (comptime builtin.os.tag != .freestanding) {
-        var req = std.posix.timespec{
-            .sec = @intCast(delay_ns / std.time.ns_per_s),
-            .nsec = @intCast(delay_ns % std.time.ns_per_s),
-        };
-        while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
-            .SUCCESS => return,
-            .INTR => continue,
-            else => return,
-        };
-    } else {
-        const spins = 64 * (capped + 1);
-        for (0..spins) |_| std.atomic.spinLoopHint();
-    }
+    platform.time.sleepNs(delay_ns);
 }
 
 fn appendSchemaFieldAnalyzers(
@@ -12649,10 +13784,13 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
     errdefer if (shorthand_asset) |*asset| {
         asset.deinit(alloc);
     };
+    const metric_configs = try parseGraphMetricConfigs(alloc, root);
+    errdefer graph_mod.freeGraphMetricConfigs(alloc, metric_configs);
 
     const edge_types = root.object.get("edge_types") orelse {
         return .{
             .edge_type_configs = try alloc.alloc(graph_mod.EdgeTypeConfig, 0),
+            .metric_configs = metric_configs,
             .artifact_source = artifact_source,
             .shorthand_asset = shorthand_asset,
             .algebraic_semiring_traversal = algebraic_semiring_traversal,
@@ -12696,11 +13834,151 @@ fn parseGraphConfig(alloc: Allocator, raw: []const u8) !GraphConfig {
         initialized += 1;
     }
 
+    graph_mod.validateGraphMetricEdgeFilters(configs, metric_configs) catch return error.InvalidIndexConfig;
+
     return .{
         .edge_type_configs = configs,
+        .metric_configs = metric_configs,
         .artifact_source = artifact_source,
         .shorthand_asset = shorthand_asset,
         .algebraic_semiring_traversal = algebraic_semiring_traversal,
+    };
+}
+
+fn parseGraphMetricConfigs(alloc: Allocator, root: std.json.Value) ![]graph_mod.GraphMetricConfig {
+    const metrics_value = root.object.get("metrics") orelse return try alloc.alloc(graph_mod.GraphMetricConfig, 0);
+    if (metrics_value != .object) return error.InvalidIndexConfig;
+
+    var configs = std.ArrayListUnmanaged(graph_mod.GraphMetricConfig).empty;
+    errdefer {
+        for (configs.items) |*cfg| {
+            alloc.free(cfg.name);
+            cfg.edge_filter.deinit(alloc);
+        }
+        configs.deinit(alloc);
+    }
+
+    var it = metrics_value.object.iterator();
+    while (it.next()) |entry| {
+        const name = entry.key_ptr.*;
+        if (entry.value_ptr.* != .object) return error.InvalidIndexConfig;
+        const metric_obj = entry.value_ptr.*.object;
+        const enabled = if (metric_obj.get("enabled")) |value| blk: {
+            if (value != .bool) return error.InvalidIndexConfig;
+            break :blk value.bool;
+        } else true;
+        if (!enabled) continue;
+
+        const kind = if (metric_obj.get("kind")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "pagerank")) break :blk graph_mod.GraphMetricKind.pagerank;
+            if (std.mem.eql(u8, value.string, "degree")) break :blk graph_mod.GraphMetricKind.degree;
+            if (std.mem.eql(u8, value.string, "eigenvector")) break :blk graph_mod.GraphMetricKind.eigenvector;
+            if (std.mem.eql(u8, value.string, "hits_authority")) break :blk graph_mod.GraphMetricKind.hits_authority;
+            if (std.mem.eql(u8, value.string, "hits_hub")) break :blk graph_mod.GraphMetricKind.hits_hub;
+            return error.InvalidIndexConfig;
+        } else if (std.mem.eql(u8, name, "pagerank"))
+            graph_mod.GraphMetricKind.pagerank
+        else if (std.mem.eql(u8, name, "degree"))
+            graph_mod.GraphMetricKind.degree
+        else if (std.mem.eql(u8, name, "eigenvector"))
+            graph_mod.GraphMetricKind.eigenvector
+        else if (std.mem.eql(u8, name, "hits_authority"))
+            graph_mod.GraphMetricKind.hits_authority
+        else if (std.mem.eql(u8, name, "hits_hub"))
+            graph_mod.GraphMetricKind.hits_hub
+        else
+            return error.InvalidIndexConfig;
+
+        const refresh = if (metric_obj.get("refresh")) |value| blk: {
+            if (value != .string) return error.InvalidIndexConfig;
+            if (std.mem.eql(u8, value.string, "background")) break :blk graph_mod.GraphMetricRefreshMode.background;
+            if (std.mem.eql(u8, value.string, "manual")) break :blk graph_mod.GraphMetricRefreshMode.manual;
+            return error.InvalidIndexConfig;
+        } else graph_mod.GraphMetricRefreshMode.background;
+
+        const damping = if (metric_obj.get("damping")) |value| try jsonNumberAsF64(value) else 0.85;
+        if (damping <= 0.0 or damping >= 1.0) return error.InvalidIndexConfig;
+        const tolerance = if (metric_obj.get("tolerance")) |value| try jsonNumberAsF64(value) else 0.000001;
+        if (tolerance <= 0.0) return error.InvalidIndexConfig;
+        const max_iterations = if (metric_obj.get("max_iterations")) |value| blk: {
+            const raw = try jsonNumberAsU32(value);
+            if (raw == 0) return error.InvalidIndexConfig;
+            break :blk raw;
+        } else 50;
+
+        const owned_name = try alloc.dupe(u8, name);
+        var owned_name_moved = false;
+        errdefer if (!owned_name_moved) alloc.free(owned_name);
+
+        var cfg = graph_mod.GraphMetricConfig{
+            .name = owned_name,
+            .kind = kind,
+            .damping = damping,
+            .tolerance = tolerance,
+            .max_iterations = max_iterations,
+            .refresh = refresh,
+            .edge_filter = try parseGraphMetricEdgeFilter(alloc, metric_obj.get("edge_filter")),
+        };
+        var cfg_moved = false;
+        errdefer if (!cfg_moved) {
+            alloc.free(cfg.name);
+            cfg.edge_filter.deinit(alloc);
+        };
+        try configs.append(alloc, cfg);
+        cfg_moved = true;
+        owned_name_moved = true;
+    }
+
+    const owned = try configs.toOwnedSlice(alloc);
+    return owned;
+}
+
+fn parseGraphMetricEdgeFilter(alloc: Allocator, maybe_value: ?std.json.Value) !graph_mod.GraphMetricEdgeFilter {
+    const value = maybe_value orelse return .{};
+    if (value != .object) return error.InvalidIndexConfig;
+    if (value.object.get("types")) |types_value| {
+        if (value.object.contains("mode")) return error.InvalidIndexConfig;
+        if (types_value != .array or types_value.array.items.len == 0) return error.InvalidIndexConfig;
+        const edge_types = try alloc.alloc([]const u8, types_value.array.items.len);
+        var initialized: usize = 0;
+        errdefer {
+            for (edge_types[0..initialized]) |edge_type| alloc.free(edge_type);
+            alloc.free(edge_types);
+        }
+        for (types_value.array.items, 0..) |item, i| {
+            if (item != .string or item.string.len == 0) return error.InvalidIndexConfig;
+            edge_types[i] = try alloc.dupe(u8, item.string);
+            initialized += 1;
+        }
+        std.mem.sort([]const u8, edge_types, {}, struct {
+            fn lessThan(_: void, a: []const u8, b: []const u8) bool {
+                return std.mem.lessThan(u8, a, b);
+            }
+        }.lessThan);
+        return .{ .mode = .types, .types = edge_types };
+    }
+    if (value.object.get("mode")) |mode_value| {
+        if (mode_value != .string) return error.InvalidIndexConfig;
+        if (std.mem.eql(u8, mode_value.string, "all")) return .{};
+        return error.InvalidIndexConfig;
+    }
+    return .{};
+}
+
+fn jsonNumberAsF64(value: std.json.Value) !f64 {
+    return switch (value) {
+        .integer => |v| @floatFromInt(v),
+        .float => |v| v,
+        else => error.InvalidIndexConfig,
+    };
+}
+
+fn jsonNumberAsU32(value: std.json.Value) !u32 {
+    return switch (value) {
+        .integer => |v| if (v > 0 and v <= std.math.maxInt(u32)) @intCast(v) else error.InvalidIndexConfig,
+        .float => |v| if (v > 0 and v <= std.math.maxInt(u32) and @floor(v) == v) @intFromFloat(v) else error.InvalidIndexConfig,
+        else => error.InvalidIndexConfig,
     };
 }
 
@@ -12941,6 +14219,91 @@ test "graph config declares algebraic provenance semiring traversal law" {
     ));
 }
 
+test "graph config validates metric edge filters against declared edge types" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "edge_types":[{"name":"cites"},{"name":"mentions"}],
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["mentions","cites"]}}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cfg.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricEdgeFilterMode.types, cfg.metric_configs[0].edge_filter.mode);
+    try std.testing.expectEqualStrings("cites", cfg.metric_configs[0].edge_filter.types[0]);
+    try std.testing.expectEqualStrings("mentions", cfg.metric_configs[0].edge_filter.types[1]);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{
+        \\  "edge_types":[{"name":"cites"}],
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["related"]}}}
+        \\}
+    ));
+
+    var untyped = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"types":["related"]}}}
+        \\}
+    );
+    defer untyped.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), untyped.edge_type_configs.len);
+
+    try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
+        \\{
+        \\  "edge_types":[{"name":"cites"}],
+        \\  "metrics":{"pagerank":{"enabled":true,"edge_filter":{"mode":"all","types":["cites"]}}}
+        \\}
+    ));
+}
+
+test "graph config parses eigenvector graph metric" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{"eigenvector":{"enabled":true,"max_iterations":25,"tolerance":0.00001}}
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), cfg.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.eigenvector, cfg.metric_configs[0].kind);
+    try std.testing.expectEqualStrings("eigenvector", cfg.metric_configs[0].name);
+    try std.testing.expectEqual(@as(u32, 25), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00001), cfg.metric_configs[0].tolerance, 0.0000001);
+
+    var alias = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{"authority_score":{"enabled":true,"kind":"eigenvector"}}
+        \\}
+    );
+    defer alias.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), alias.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.eigenvector, alias.metric_configs[0].kind);
+    try std.testing.expectEqualStrings("authority_score", alias.metric_configs[0].name);
+}
+
+test "graph config parses hits graph metrics" {
+    const alloc = std.testing.allocator;
+    var cfg = try parseGraphConfig(alloc,
+        \\{
+        \\  "metrics":{
+        \\    "hits_authority":{"enabled":true,"max_iterations":30},
+        \\    "hits_hub":{"enabled":true,"kind":"hits_hub","tolerance":0.00001},
+        \\    "custom_authority":{"enabled":true,"kind":"hits_authority"}
+        \\  }
+        \\}
+    );
+    defer cfg.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), cfg.metric_configs.len);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.hits_authority, cfg.metric_configs[0].kind);
+    try std.testing.expectEqualStrings("hits_authority", cfg.metric_configs[0].name);
+    try std.testing.expectEqual(@as(u32, 30), cfg.metric_configs[0].max_iterations);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.hits_hub, cfg.metric_configs[1].kind);
+    try std.testing.expectEqualStrings("hits_hub", cfg.metric_configs[1].name);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.00001), cfg.metric_configs[1].tolerance, 0.0000001);
+    try std.testing.expectEqual(graph_mod.GraphMetricKind.hits_authority, cfg.metric_configs[2].kind);
+    try std.testing.expectEqualStrings("custom_authority", cfg.metric_configs[2].name);
+}
+
 test "graph config parses artifact source and shorthand asset enrichment" {
     const alloc = std.testing.allocator;
     var cfg = try parseGraphConfig(alloc,
@@ -13020,6 +14383,333 @@ test "graph config validates document field source shape" {
     try std.testing.expectError(error.InvalidIndexConfig, parseGraphConfig(alloc,
         \\{"source":{"kind":"document_field","field":"links"}}
     ));
+}
+
+test "index manager algebraic schema reload preserves HLL cardinalities" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "hll-reload");
+    defer cleanupIndexManagerDir(path_z);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const config_json =
+        \\{
+        \\  "version": 1,
+        \\  "table": "docs",
+        \\  "group_fields": [{"name":"region","path":"region","type":"string"},{"name":"customer","path":"customer","type":"string"}],
+        \\  "hll_cardinalities": [{"name":"customers_by_region","group_by":["region"],"value_field":"customer","precision":12}]
+        \\}
+    ;
+    var index = try algebraic_mod.index.Index.open(alloc, "alg", config_json);
+    var index_owned = true;
+    errdefer if (index_owned) index.close();
+
+    const apply_mutex = try manager.allocIndexApplyMutex();
+    var apply_mutex_owned = true;
+    errdefer if (apply_mutex_owned) manager.destroyIndexApplyMutex(apply_mutex);
+    const rebuild_root_path = try manager.indexPath("alg");
+    var rebuild_root_path_owned = true;
+    errdefer if (rebuild_root_path_owned) alloc.free(rebuild_root_path);
+
+    var entry = IndexManager.AlgebraicIndex{
+        .apply_mutex = apply_mutex,
+        .config = try types.IndexConfig.clone(alloc, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_json,
+        }),
+        .rebuild_root_path = rebuild_root_path,
+        .index = index,
+    };
+    apply_mutex_owned = false;
+    rebuild_root_path_owned = false;
+    index_owned = false;
+    var entry_owned = true;
+    errdefer if (entry_owned) manager.freeAlgebraicIndexEntry(&entry);
+
+    try manager.algebraic_indexes.append(alloc, entry);
+    entry_owned = false;
+
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}}}}},"dynamic_templates":[{"name":"ext","match":"ext_*","mapping":{"type":"numeric"}}]}
+    ;
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
+
+    const reloaded = manager.algebraic_indexes.items[0].index.config();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.hll_cardinalities.len);
+    try std.testing.expectEqualStrings("customers_by_region", reloaded.hll_cardinalities[0].name);
+    try std.testing.expectEqualStrings("customer", reloaded.hll_cardinalities[0].value_field);
+    try std.testing.expectEqual(@as(u8, 12), reloaded.hll_cardinalities[0].precision);
+    try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+    try std.testing.expect(!reloaded.dynamic_rules_backfill_pending);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"hll_cardinalities\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+}
+
+test "index manager algebraic schema reload marks changed json subdocument domains pending" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "json-domain-reload");
+    defer cleanupIndexManagerDir(path_z);
+
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+
+    const schema_v1 =
+        \\{"version":2,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"numeric"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const schema_v2 =
+        \\{"version":3,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"plan":{"type":"keyword"},"score":{"type":"keyword"}},"additionalProperties":true}}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "rows", schema_v1);
+    defer alloc.free(config_json);
+
+    var index = try algebraic_mod.index.Index.open(alloc, "alg", config_json);
+    var index_owned = true;
+    errdefer if (index_owned) index.close();
+
+    const apply_mutex = try manager.allocIndexApplyMutex();
+    var apply_mutex_owned = true;
+    errdefer if (apply_mutex_owned) manager.destroyIndexApplyMutex(apply_mutex);
+    const rebuild_root_path = try manager.indexPath("alg");
+    var rebuild_root_path_owned = true;
+    errdefer if (rebuild_root_path_owned) alloc.free(rebuild_root_path);
+
+    var entry = IndexManager.AlgebraicIndex{
+        .apply_mutex = apply_mutex,
+        .config = try types.IndexConfig.clone(alloc, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_json,
+        }),
+        .rebuild_root_path = rebuild_root_path,
+        .index = index,
+    };
+    apply_mutex_owned = false;
+    rebuild_root_path_owned = false;
+    index_owned = false;
+    var entry_owned = true;
+    errdefer if (entry_owned) manager.freeAlgebraicIndexEntry(&entry);
+
+    try manager.algebraic_indexes.append(alloc, entry);
+    entry_owned = false;
+
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
+
+    const reloaded = manager.algebraic_indexes.items[0].index.config();
+    try std.testing.expectEqual(@as(usize, 1), reloaded.json_subdocument_domains.len);
+    try std.testing.expectEqualStrings("attrs", reloaded.json_subdocument_domains[0].path);
+    try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+    try std.testing.expectEqualStrings("current", reloaded.json_subdocument_domains[0].lifecycle_status);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"lifecycle_status\":\"rebuild_required\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, manager.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+}
+
+test "index manager algebraic schema reload rebuilds stale persisted rows" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-reload-rebuild");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+    defer alloc.free(config_json);
+
+    try manager.add(&store, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = config_json,
+    });
+
+    const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+    defer alloc.free(stored_key);
+    const doc_json = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}";
+    try store.put(stored_key, doc_json);
+    try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+        .documents = &.{.{ .key = "doc:1", .cleaned_value = doc_json }},
+    }, .{ .mode = .bulk_ingest });
+
+    try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
+
+    const reloaded = manager.algebraic_indexes.items[0].index.config();
+    try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+    try std.testing.expect(!reloaded.dynamic_rules_backfill_pending);
+    try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+    try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+}
+
+test "index manager algebraic schema reload resumes interrupted bounded rebuild" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-reload-resume-bounded");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+    defer manager.deinit();
+
+    const previous_batch_size = test_algebraic_backfill_batch_size;
+    const previous_abort = test_abort_algebraic_backfill_after_batches;
+    defer {
+        test_algebraic_backfill_batch_size = previous_batch_size;
+        test_abort_algebraic_backfill_after_batches = previous_abort;
+    }
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+    const config_json = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+    defer alloc.free(config_json);
+
+    try manager.add(&store, .{
+        .name = "alg",
+        .kind = .algebraic,
+        .config_json = config_json,
+    });
+
+    const docs = [_]struct { key: []const u8, value: []const u8 }{
+        .{ .key = "doc:1", .value = "{\"old_field\":\"legacy1\",\"new_field\":\"fresh1\"}" },
+        .{ .key = "doc:2", .value = "{\"old_field\":\"legacy2\",\"new_field\":\"fresh2\"}" },
+    };
+    for (docs) |doc| {
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, doc.key);
+        defer alloc.free(stored_key);
+        try store.put(stored_key, doc.value);
+    }
+    try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+        .documents = &.{
+            .{ .key = docs[0].key, .cleaned_value = docs[0].value },
+            .{ .key = docs[1].key, .cleaned_value = docs[1].value },
+        },
+    }, .{ .mode = .bulk_ingest });
+    try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+
+    try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    test_algebraic_backfill_batch_size = 1;
+    test_abort_algebraic_backfill_after_batches = 1;
+    try std.testing.expectError(error.TestInjectedBackfillFailure, manager.reloadAlgebraicSchemaConfigs(&store, schema_v2));
+
+    const rebuild_state = backfill_state_mod.RebuildState.init(manager.algebraic_indexes.items[0].rebuild_root_path);
+    const resume_key = try rebuild_state.check(alloc);
+    defer if (resume_key) |key| alloc.free(key);
+    try std.testing.expect(resume_key != null);
+    try std.testing.expectEqual(@as(usize, 1), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+
+    test_abort_algebraic_backfill_after_batches = null;
+    try manager.reloadAlgebraicSchemaConfigs(&store, schema_v2);
+
+    try std.testing.expectEqual(@as(usize, 0), try countDocFactScalarKeysContaining(alloc, &store, "old_field"));
+    try std.testing.expectEqual(@as(usize, 2), try countDocFactScalarKeysContaining(alloc, &store, "new_field"));
+    const cleared_resume_key = try rebuild_state.check(alloc);
+    defer if (cleared_resume_key) |key| alloc.free(key);
+    try std.testing.expect(cleared_resume_key == null);
+}
+
+test "index manager writable open resumes pending algebraic schema rebuild" {
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path_z = indexManagerTmpPathWithSuffix(&path_buf, "schema-open-resume");
+    defer cleanupIndexManagerDir(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    {
+        var manager = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer manager.deinit();
+
+        const schema_v1 =
+            \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+        ;
+        const schema_v2 =
+            \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+        ;
+        const config_v1 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v1);
+        defer alloc.free(config_v1);
+        try manager.add(&store, .{
+            .name = "alg",
+            .kind = .algebraic,
+            .config_json = config_v1,
+        });
+
+        const stored_key = try internal_keys.documentKeyAlloc(alloc, "doc:1");
+        defer alloc.free(stored_key);
+        const doc_json = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}";
+        try store.put(stored_key, doc_json);
+        try manager.applyAlgebraicBatchByNameWithOptions(&store, "alg", .{
+            .documents = &.{.{ .key = "doc:1", .cleaned_value = doc_json }},
+        }, .{ .mode = .bulk_ingest });
+        try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+
+        const config_v2 = try algebraic_mod.schema_capability.configJsonFromSchemaJsonAlloc(alloc, "docs", schema_v2);
+        defer alloc.free(config_v2);
+        var parsed = try std.json.parseFromSlice(algebraic_mod.index.Config, alloc, config_v2, .{ .allocate = .alloc_always });
+        defer parsed.deinit();
+        parsed.value.capability_lifecycle_status = "rebuild_required";
+        const pending_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+        defer alloc.free(pending_json);
+        try manager.replaceAlgebraicConfigJson(&manager.algebraic_indexes.items[0], pending_json);
+        try manager.persistCatalog(&store);
+        try saveRuntimeSchemaJsonForIndexManagerTest(alloc, &store, schema_v2);
+    }
+
+    {
+        var reopened = try IndexManager.init(alloc, std.mem.span(path_z));
+        defer reopened.deinit();
+        try reopened.load(&store);
+
+        const reloaded = reopened.algebraic_indexes.items[0].index.config();
+        try std.testing.expectEqualStrings("current", reloaded.capability_lifecycle_status);
+        try std.testing.expect(!try storeHasDocFactScalarKeyContaining(alloc, &store, "old_field"));
+        try std.testing.expect(try storeHasDocFactScalarKeyContaining(alloc, &store, "new_field"));
+        try std.testing.expect(std.mem.indexOf(u8, reopened.algebraic_indexes.items[0].config.config_json, "\"capability_lifecycle_status\":\"rebuild_required\"") == null);
+    }
+}
+
+fn saveRuntimeSchemaJsonForIndexManagerTest(alloc: Allocator, store: *docstore_mod.DocStore, schema_json: []const u8) !void {
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try schema_mod.saveSchema(store, alloc, runtime_schema);
+}
+
+pub fn storeHasDocFactScalarKeyContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !bool {
+    return (try countDocFactScalarKeysContaining(alloc, store, needle)) > 0;
+}
+
+fn countDocFactScalarKeysContaining(alloc: Allocator, store: *docstore_mod.DocStore, needle: []const u8) !usize {
+    const rows = try store.scanRange(alloc, "", "");
+    defer docstore_mod.DocStore.freeResults(alloc, rows);
+    var count: usize = 0;
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
+            std.mem.indexOf(u8, row.key, needle) != null) count += 1;
+    }
+    return count;
 }
 
 fn parseMetric(raw: []const u8) !vector_mod.DistanceMetric {
@@ -13301,7 +14991,7 @@ test "dense metadata lookups read legacy textual rows" {
     try batch.commit();
 }
 
-fn deterministicDenseVectorId(doc_key: []const u8) u64 {
+pub fn deterministicDenseVectorId(doc_key: []const u8) u64 {
     const id = std.hash.XxHash64.hash(0, doc_key);
     return if (id == 0) 1 else id;
 }
@@ -17085,15 +18775,19 @@ test "dense artifact preload batches sorted reads through getManySorted" {
     try std.testing.expectEqualSlices(f32, &[_]f32{ 1, 2 }, out_vectors[1].?);
 }
 
-fn stressEnvUsize(name: [*:0]const u8, default_value: usize) usize {
+pub fn stressEnvUsize(name: [*:0]const u8, default_value: usize) usize {
     const raw = getenv(name) orelse return default_value;
     return std.fmt.parseInt(usize, std.mem.span(raw), 10) catch default_value;
 }
 
-fn fillStressDenseVector(vector: []f32, doc_index: usize) void {
+pub fn stressDenseValue(doc_index: usize, dim_index: usize) f32 {
+    const raw = (doc_index * 131 + dim_index * 17) % 2048;
+    return @as(f32, @floatFromInt(raw)) / 1024.0 - 1.0;
+}
+
+pub fn fillStressDenseVector(vector: []f32, doc_index: usize) void {
     for (vector, 0..) |*slot, dim_index| {
-        const raw = (doc_index * 131 + dim_index * 17) % 2048;
-        slot.* = @as(f32, @floatFromInt(raw)) / 1024.0 - 1.0;
+        slot.* = stressDenseValue(doc_index, dim_index);
     }
 }
 

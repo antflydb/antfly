@@ -108,6 +108,12 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
             const entry = it.next() orelse return error.InvalidArgument;
             break :blk entry.key_ptr.*;
         }
+        if (filter_query.object.get("array_any")) |array_any| {
+            break :blk (try extractFieldJsonValue(array_any)).field;
+        }
+        if (filter_query.object.get("json_contains")) |json_contains| {
+            break :blk (try extractFieldJsonValue(json_contains)).field;
+        }
         if (filter_query.object.get("match")) |match| {
             if (match != .object or match.object.count() != 1) return error.InvalidArgument;
             var it = match.object.iterator();
@@ -177,6 +183,14 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
         }
         return false;
     }
+    if (filter_query.object.get("array_any")) |array_any| {
+        const parsed = try extractFieldJsonValue(array_any);
+        return jsonValuesContainArrayAny(values.items, parsed.value);
+    }
+    if (filter_query.object.get("json_contains")) |json_contains| {
+        const parsed = try extractFieldJsonValue(json_contains);
+        return jsonValuesContainJsonContaining(values.items, parsed.value);
+    }
     if (filter_query.object.get("match")) |match| {
         var it = match.object.iterator();
         const entry = it.next() orelse return error.InvalidArgument;
@@ -209,6 +223,25 @@ pub fn jsonDocMatchesPatternFilter(alloc: Allocator, key: []const u8, doc: std.j
     if (filter_query.object.get("numeric_range")) |range_query| return try jsonValuesContainNumericRange(values.items, range_query);
     if (filter_query.object.get("date_range")) |range_query| return try jsonValuesContainDateRange(values.items, range_query);
     return error.InvalidArgument;
+}
+
+const FieldJsonValue = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+fn extractFieldJsonValue(value: std.json.Value) !FieldJsonValue {
+    if (value != .object) return error.InvalidArgument;
+    const field_value = value.object.get("field") orelse value.object.get("path");
+    if (field_value) |field| {
+        if (field != .string) return error.InvalidArgument;
+        const raw_value = value.object.get("value") orelse return error.InvalidArgument;
+        return .{ .field = field.string, .value = raw_value };
+    }
+    if (value.object.count() != 1) return error.InvalidArgument;
+    var it = value.object.iterator();
+    const entry = it.next() orelse return error.InvalidArgument;
+    return .{ .field = entry.key_ptr.*, .value = entry.value_ptr.* };
 }
 
 fn docIdMatchesPatternKey(key: []const u8, doc_id: std.json.Value) !bool {
@@ -264,6 +297,97 @@ fn jsonValuesContainTerm(values: []const std.json.Value, term: []const u8) bool 
         else => {},
     };
     return false;
+}
+
+fn jsonValuesContainArrayAny(values: []const std.json.Value, expected: std.json.Value) bool {
+    for (values) |value| {
+        switch (value) {
+            .array => |array| {
+                for (array.items) |item| {
+                    if (jsonValuesEqual(item, expected)) return true;
+                }
+            },
+            else => if (jsonValuesEqual(value, expected)) return true,
+        }
+    }
+    return false;
+}
+
+fn jsonValuesContainJsonContaining(values: []const std.json.Value, expected: std.json.Value) bool {
+    for (values) |value| {
+        if (jsonValueContains(value, expected)) return true;
+    }
+    return false;
+}
+
+fn jsonValueContains(container: std.json.Value, expected: std.json.Value) bool {
+    return switch (expected) {
+        .object => |expected_object| blk: {
+            if (container != .object) break :blk false;
+            for (expected_object.keys(), expected_object.values()) |key, expected_value| {
+                const actual_value = container.object.get(key) orelse break :blk false;
+                if (!jsonValueContains(actual_value, expected_value)) break :blk false;
+            }
+            break :blk true;
+        },
+        .array => |expected_array| blk: {
+            if (container != .array) break :blk false;
+            for (expected_array.items) |expected_item| {
+                var matched = false;
+                for (container.array.items) |actual_item| {
+                    if (jsonValueContains(actual_item, expected_item)) {
+                        matched = true;
+                        break;
+                    }
+                }
+                if (!matched) break :blk false;
+            }
+            break :blk true;
+        },
+        else => jsonValuesEqual(container, expected),
+    };
+}
+
+fn jsonValuesEqual(lhs: std.json.Value, rhs: std.json.Value) bool {
+    return switch (lhs) {
+        .null => rhs == .null,
+        .bool => |value| rhs == .bool and rhs.bool == value,
+        .integer => |value| switch (rhs) {
+            .integer => |other| other == value,
+            .float => |other| @as(f64, @floatFromInt(value)) == other,
+            else => false,
+        },
+        .float => |value| switch (rhs) {
+            .integer => |other| value == @as(f64, @floatFromInt(other)),
+            .float => |other| other == value,
+            else => false,
+        },
+        .number_string => |value| switch (rhs) {
+            .number_string => |other| std.mem.eql(u8, value, other),
+            .string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .string => |value| switch (rhs) {
+            .string => |other| std.mem.eql(u8, value, other),
+            .number_string => |other| std.mem.eql(u8, value, other),
+            else => false,
+        },
+        .array => |array| blk: {
+            if (rhs != .array or array.items.len != rhs.array.items.len) break :blk false;
+            for (array.items, rhs.array.items) |lhs_item, rhs_item| {
+                if (!jsonValuesEqual(lhs_item, rhs_item)) break :blk false;
+            }
+            break :blk true;
+        },
+        .object => |object| blk: {
+            if (rhs != .object or object.count() != rhs.object.count()) break :blk false;
+            for (object.keys(), object.values()) |key, lhs_value| {
+                const rhs_value = rhs.object.get(key) orelse break :blk false;
+                if (!jsonValuesEqual(lhs_value, rhs_value)) break :blk false;
+            }
+            break :blk true;
+        },
+    };
 }
 
 fn jsonValuesContainMatch(values: []const std.json.Value, text: []const u8) bool {
@@ -587,6 +711,36 @@ test "stored doc matches terms filter against array values" {
         "doc:silver",
         "{\"acl\":{\"roles\":[\"group:sales\"]}}",
         "{\"terms\":{\"acl.roles\":[\"role:tenant_reader\",\"group:eng\"]}}",
+    )));
+}
+
+test "stored doc matches typed array and json containment filters" {
+    const stored =
+        \\{"tags":["hot","ready"],"payload":{"status":"open","meta":{"priority":2,"owner":"alice"},"labels":["ready","queued"]}}
+    ;
+    try std.testing.expect(try storedDocMatchesPatternFilter(
+        std.testing.allocator,
+        "doc:gold",
+        stored,
+        "{\"array_any\":{\"field\":\"tags\",\"value\":\"hot\"}}",
+    ));
+    try std.testing.expect(!(try storedDocMatchesPatternFilter(
+        std.testing.allocator,
+        "doc:gold",
+        stored,
+        "{\"array_any\":{\"field\":\"tags\",\"value\":\"cold\"}}",
+    )));
+    try std.testing.expect(try storedDocMatchesPatternFilter(
+        std.testing.allocator,
+        "doc:gold",
+        stored,
+        "{\"json_contains\":{\"field\":\"payload\",\"value\":{\"status\":\"open\",\"meta\":{\"priority\":2},\"labels\":[\"ready\"]}}}",
+    ));
+    try std.testing.expect(!(try storedDocMatchesPatternFilter(
+        std.testing.allocator,
+        "doc:gold",
+        stored,
+        "{\"json_contains\":{\"field\":\"payload\",\"value\":{\"meta\":{\"priority\":3}}}}",
     )));
 }
 

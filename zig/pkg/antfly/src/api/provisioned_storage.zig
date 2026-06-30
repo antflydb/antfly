@@ -22,7 +22,7 @@ const raft_mod = @import("../raft/mod.zig");
 const resource_manager_mod = @import("../storage/resource_manager.zig");
 const runtime_status = @import("runtime_status.zig");
 const scraping = @import("antfly_scraping");
-const table_catalog = @import("table_catalog.zig");
+const table_catalog = @import("../metadata/catalog/routing.zig");
 const table_reads = @import("table_reads.zig");
 const table_writes = @import("table_writes.zig");
 

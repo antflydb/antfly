@@ -1426,17 +1426,15 @@ benchmark-wide performance evidence summary for dataset, query, correctness, col
 mixed-role benchmark root-cardinality comparisons constrain algebraic sidecar reads by primary document role so derived customer/profile facts do not broaden doc-scan/full-text order-only baselines
 algebraic-summary performance guardrail thresholds for coverage counts, cold/warm reads, fanout, constrained queries, wide-key composite queries, stats/cardinality/range/histogram queries, correctness failures, query latency, byte cost, symbol/support bytes, accumulator flushes, LSM flush/write-pressure compaction counts, public-query RSS, and churn cost
 algebraic-summary baseline-file comparison ratios for stable local performance guardrails
-`algebraic-performance-guardrail` build step with a checked-in JSONL fixture for coverage and baseline-ratio verifier regressions
-`algebraic-planner-ownership-guardrail` build step under `tools/guardrails/` that rejects production raw tensor-program construction outside the algebraic planner/IR layer
-`algebraic-archive-guardrail` build step that verifies archived production-hardening run directories include environment notes, raw/summary JSONL, threshold flags, optional baseline comparison, and non-smoke provenance
-`algebraic-roadmap-guardrail` build step that combines CI-safe algebraic performance, planner-ownership, and archive-evidence checks
-`scripts/run_algebraic_production_hardening.sh` runner for archived LSM analytics, adaptive coverage, cold/warm read coverage, graph traversal, public query no-schema/schema/algebraic comparisons, summary generation, threshold enforcement, optional baseline-ratio checks, bounded cardinality and per-stage sizing/churn knobs, query-shape coverage thresholds for cold/warm/constrained/wide/stats/cardinality/range/histogram records, path-promotion FST rebuild thresholds, public-query mode selection through `ALGEBRAIC_HARDENING_PUBLIC_MODE`, optional public-query symbolic-profile enforcement through `ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`, optional LSM bulk-ingest stress through `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` across LSM analytics and adaptive coverage stages, LSM bulk finish knobs for flush, compact, deferred-L0 targets, and bounded foreground compaction budgets, and optional broad unit-test evidence
+`algebraic-guardrail` build step combines the CI-safe algebraic summary fixture, planner-ownership policy check, and archived production-hardening evidence fixture
 LSM bulk-session finish direct-ingests the final mutable state as a sorted run when direct bulk ingest is enabled and no immutable flush is pending, so algebraic bulk sidecars avoid a final normal flush and archived runs can guard `total_lsm_sorted_ingest_runs`
 algebraic bulk-ingest sessions defer promoted path dictionary FST rebuilds across all flushed coalescer batches and rebuild each dirty promoted dictionary once at DB bulk-session finish, before the primary store publishes the final sorted run
-`scripts/run_algebraic_integration_matrix.sh` runner for archived enabled/disabled integration evidence across roadmap guardrails, public-query default no-schema, schema-only, schema-plus-algebraic, focused algebraic DB tests, provisioned distributed non-algebraic fallback coverage, optional broad unit tests, and optional selected e2e tests
 durable planner default policy remains opt-in and conservative until LSM guardrail evidence covers latency, bytes, write cost, churn, cold reads, fanout, and constrained queries
 schema capability fingerprints, skipped-unbounded-field metadata, and debug lifecycle classification
 schema-derived v2 configs with declared laws and adaptive defaults
+runtime-adaptive dynamic templates: bounded table-level dynamic templates (keyword/numeric/boolean/datetime) compile into capability `dynamic_field_rules` and project template-matched fields into typed docfacts at ingest, so template changes take effect for new writes without a schema version bump or reindex; unbounded text templates stay on the schemaless path-fact path (cardinality guard), and template-only updates refresh both the durable config and live indexes in place (`Index.reloadConfigJson`)
+relational `json` columns compile into scoped JSON-subdocument domains: embedded schemas and column-local dynamic templates emit prefixed capability fields (`attrs.plan`, `attrs.score`) plus a per-column capability fingerprint, algebraic docfact projection serves aggregations over those paths from the relational row-derived document body, and JSON-domain fingerprint changes mark that domain `rebuild_required` so field resolution withholds stale subdocument facts until rebuild
+relational column `indexed: false` suppresses only relational column-major predicate scan entries; embedded JSON algebraic/full-text projection still follows the JSON column's declared embedded schema and dynamic templates
 public algebraic index requests constrained to schema-derived capability sidecars with internal materialization fields stripped/rejected
 canonical-token shard merge keys for distributed symbol semantics
 distributed partial merge helpers that combine shard results by canonical axis and law
@@ -1581,10 +1579,7 @@ public query shape exposes dense profile counters yet.
 Performance evidence guardrail:
 
 ```sh
-zig build algebraic-performance-guardrail
-zig build algebraic-planner-ownership-guardrail
-zig build algebraic-archive-guardrail
-zig build algebraic-roadmap-guardrail
+zig build algebraic-guardrail
 
 zig build algebraic-summary -- --input /tmp/algebraic-combined.jsonl \
   --baseline /tmp/algebraic-baseline-summary.jsonl \
@@ -1618,19 +1613,10 @@ enough tolerance to catch regressions without pinning hardware noise. The
 optional `--baseline` file should contain a prior `performance_evidence_summary`
 event from `algebraic-summary`.
 
-Production-hardening archives can be checked independently:
-
-```sh
-zig build algebraic-archive-guardrail -- \
-  --archive bench/results/algebraic-production-hardening/20260517T000000Z \
-  --require-thresholds \
-  --require-baseline \
-  --require-non-smoke
-```
-
-Use `--require-thresholds` once a run is meant to count as production evidence,
-`--require-baseline` once variance has been established from a prior summary,
-and `--require-non-smoke` for representative archived runs.
+The build guardrail is fixture-based and CI-safe. Production-hardening evidence
+is generated directly with `algebraic-bench`, public-query guardrail runs, and
+`algebraic-summary`; keep the raw JSONL, combined summary, threshold flags,
+baseline summary, and hardware/environment notes with the archived run.
 
 Bounded graph traversal smoke:
 
@@ -1723,7 +1709,7 @@ proved exact.
 ### Public Query Contract
 
 Public search requests now have a canonical `query` field for structured query
-trees. Compatibility request fields are normalized into that tree before
+trees. Public shorthand request fields are normalized into that tree before
 algebraic, full-text, vector, graph, and join planning: `full_text_search`
 becomes scoring `bool.must`, `filter_query` becomes non-scoring `bool.filter`,
 and `exclusion_query` becomes `bool.must_not`.
@@ -1791,6 +1777,13 @@ Full-text remains responsible for analyzer-specific ranking behavior such as
 BM25, phrase/proximity, highlighting, and analyzer state. Algebraic consumes exact
 candidate tensors for filters, joins, vector pruning, and aggregate folds.
 
+For relational tables, algebraic remains a derived index over the relational base
+store. Fact projection, materialization maintenance, replay, and backfill hydrate
+documents from committed relational base rows when they need a document body;
+they do not read stale generic document KV values or derived text segment
+columns as authoritative relational data. See [RELATIONAL.md](RELATIONAL.md) for
+the one-store relational storage contract.
+
 ### Vector And Graph Integration
 
 Supported algebraic `docfact` and `pathfact` filters can be resolved into native
@@ -1828,7 +1821,7 @@ using `materialized_expr` as the durable tensor-cache row name because that is a
 physical implementation detail, not a user-facing lifecycle API.
 
 The stable public query surface is the normalized structured `query` tree.
-Compatibility shorthands normalize into that tree at the API boundary. Typed
+Public shorthands normalize into that tree at the API boundary. Typed
 terms, path aliases, `terms`, and `exists` are the algebraic filter surface;
 query strings remain a full-text escape hatch rather than the algebraic planning
 contract.
@@ -1852,7 +1845,7 @@ Fine-grained records such as `AlgebraicCapabilityStats`,
 `AlgebraicAdaptiveCandidateStatus`, and
 `AlgebraicAdaptiveCandidateDecisionStatus` are useful internal/debug data, but
 they should not be stable public OpenAPI schemas. If operators need them, add an
-explicit diagnostics/admin surface with separate compatibility expectations, or
+explicit diagnostics/admin surface with separate stability expectations, or
 emit them through benchmark/debug JSONL where the shape can evolve.
 
 So the answer to whether the public API needs every algebraic status type is no.
@@ -1863,7 +1856,7 @@ or diagnostics data. They are still important for benchmarks, debug endpoints,
 and internal recovery decisions, but making each one a public schema would lock
 the storage and adaptive policy model too early.
 
-This is the compatibility rule for the public API:
+This is the public/private boundary for the API:
 
 ```text
 public:   AlgebraicIndexStats
@@ -1904,7 +1897,7 @@ Detailed decision history, candidate scoring inputs, policy-drift records,
 canonical recommendation hashes, dictionary ownership rows, error document keys,
 worker sequence cursors, and tensor-program proof internals belong in
 debug/admin diagnostics or benchmark JSONL, where they can evolve without
-becoming a broad public compatibility burden.
+becoming a broad public stability burden.
 
 ### Coverage And Selection
 
@@ -1932,20 +1925,6 @@ they claim instead of relying on the `smoke=0` label alone.
 
 Current local non-smoke archive evidence:
 
-```sh
-zig build algebraic-archive-guardrail -- \
-  --archive bench/results/algebraic-production-hardening/interactive-current-10k-post-resource-dist-envelope \
-  --require-thresholds \
-  --require-non-smoke \
-  --min-docs 10000 \
-  --min-repeats 2 \
-  --min-churn-ops 100 \
-  --min-public-docs 1000 \
-  --min-graph-docs 1000 \
-  --min-adaptive-docs 1000 \
-  --min-cold-docs 500
-```
-
 This thresholded archive passes the verifier and covers 23 LSM dataset cases,
 185 LSM query records, 63 algebraic query records, 61 doc-scan query records,
 61 full-text query records, cold/warm reads, constrained rollups, wide keys,
@@ -1961,11 +1940,11 @@ evidence for the current implementation state, not release thresholds; adaptive
 warmup/churn cost and public-query overhead remain explicit optimization
 targets.
 
-`zig build algebraic-planner-ownership-guardrail` is a repo policy check under
-`tools/guardrails/`, not a benchmark. It enforces that production API, graph,
-and storage DB code do not construct raw tensor programs outside the algebraic
-planner/IR layer. Test blocks may still build explicit programs to exercise
-protocol validation and executor rejection behavior.
+`zig build algebraic-guardrail` includes a repo policy check under
+`tools/guardrails/` that enforces that production API, graph, and storage DB
+code do not construct raw tensor programs outside the algebraic planner/IR
+layer. Test blocks may still build explicit programs to exercise protocol
+validation and executor rejection behavior.
 
 Failure-injection coverage should target stale lifecycle state, missing or
 conflicting dictionary ownership, adaptive backfill interruption, distributed
@@ -1979,10 +1958,38 @@ fields. Schemaless `pathfact`, `path_lookup`, and `path_profile` rows are the
 discovery substrate for late-typed promotion. Mixed-kind paths require
 kind-qualified plans, explicit coercion policy, or fallback.
 
-Schema lifecycle drift marks affected algebraic capability stale or
-rebuild-required. Added compatible fields can start from the change point plus
-optional backfill; type, analyzer, coercion, or expression changes require
-readiness gating before the planner can select algebraic execution.
+Schema lifecycle drift marks the algebraic capability stale or rebuild-required
+while migration is in progress. Durable regeneration records
+`capability_lifecycle_status: "rebuild_required"` for crash safety. The local
+table-schema apply path persists that pending algebraic state before durably
+exposing the new runtime schema. The runtime schema and the local schema JSON
+mirror used by public write validation commit in the same transaction, and the
+sidecar rebuild runs after that schema save. Schema application is a DB-level
+structural mutation: it is serialized with normal apply work before staging the
+pending algebraic config, saving the runtime schema, and completing the sidecar
+rebuild. Reopen completion is schema-version gated: if a process dies after the
+pending catalog write but before the runtime schema save, writable reopen leaves
+the algebraic capability pending instead of publishing sidecar facts for a
+schema version the table has not durably adopted.
+Schema-versioned pending capabilities also stay pending when no durable runtime
+schema exists yet. Once the durable schema version matches, the index manager
+replays committed base rows through the refreshed config using bounded cursor
+batches and a durable `rebuild.state` cursor. A crash or injected failure resumes
+from the last applied base-row key instead of materializing the whole table range
+in memory or restarting from zero. Only after replay, bulk-ingest finish, and
+catalog persistence succeed does it clear the rebuild state and persist
+`capability_lifecycle_status: "current"`. While pending, the planner declines
+schema-derived algebraic execution, favoring correct scan fallback over reading
+facts that only cover the post-change subset.
+
+Relational embedded JSON domains apply that lifecycle per column path. Durable
+schema regeneration and local schema reload preserve user-owned knobs, compare
+each `json_subdocument_domains` fingerprint, and mark changed domains
+`lifecycle_status: "rebuild_required"` until local replay has reprojected the
+committed relational rows. `Index.fieldConfig` declines both static and dynamic
+fields under that JSON path while the domain is pending, so queries either fall
+back or report pending capability instead of reading stale facts. Fields outside
+the pending JSON column remain eligible for algebraic execution.
 
 ### Adaptive Lifecycle
 
@@ -2243,41 +2250,29 @@ above and remove the temporary roadmap item.
    summaries, record hardware/environment notes, and set regression thresholds
    for latency, bytes, symbol/support-row growth, accumulator flushes, public
    query RSS, write cost, churn, cold/warm reads, fanout, constrained queries,
-   and public query behavior. Use
-   `scripts/run_algebraic_production_hardening.sh` as the canonical local runner
-   so every archived run includes the same raw JSONL, combined summary, and
-   environment metadata. Public-query archive comparisons default to
-   `ALGEBRAIC_HARDENING_PUBLIC_MODE=handler`, which exercises the public query
-   handler and planner without a TCP listener; use
-   `ALGEBRAIC_HARDENING_PUBLIC_MODE=local` or `swarm` for transport/server
-   overhead runs. Symbolic profile enforcement is a separate opt-in
-   (`ALGEBRAIC_HARDENING_PUBLIC_REQUIRE_SYMBOLIC_PROFILE=1`) for archives that
-   specifically validate vector-pruning profile counters. Keep the default
-   combined run direct unless the run is specifically validating LSM bulk ingest; set
-   `ALGEBRAIC_HARDENING_LSM_BULK_INGEST=1` for that stress path and archive it
-   separately. Set `ALGEBRAIC_HARDENING_BASELINE` plus threshold env vars once
-   representative runs establish acceptable variance, so production archives
-   fail closed on correctness, coverage, latency, byte, and churn regressions.
-   Validate any archive used as evidence with
-   `zig build algebraic-archive-guardrail -- --archive <dir>
-   --require-thresholds --require-baseline --require-non-smoke`.
+   and public query behavior. Use direct `algebraic-bench`,
+   `public-query-guardrail`, and `algebraic-summary` commands for archive
+   generation so the public build surface stays focused on
+   `zig build algebraic-guardrail`. Public-query archive comparisons should use
+   handler mode by default, which exercises the public query handler and planner
+   without a TCP listener; use local or swarm mode only for transport/server
+   overhead runs. Symbolic profile enforcement is a separate opt-in for archives
+   that specifically validate vector-pruning profile counters. Keep the default
+   combined run direct unless the run is specifically validating LSM bulk
+   ingest; archive that stress path separately. Set a baseline summary plus
+   threshold flags once representative runs establish acceptable variance, so
+   production archives fail closed on correctness, coverage, latency, byte, and
+   churn regressions.
 
 2. Prove full-suite test health.
    Run the broad repo test/build matrix with algebraic enabled and disabled.
-   Separate unrelated existing failures from algebraic regressions, then keep a
-   focused algebraic CI path plus a periodic broader integration path. Use
-   `scripts/run_algebraic_integration_matrix.sh` as the local evidence runner:
-   its default lanes cover the disabled/default public-query path, schema-only
-   path, schema-plus-algebraic path, focused algebraic DB tests, and a
-   provisioned distributed fallback test whose name intentionally does not match
-   the broad `--test-filter algebraic` lane. Set
-   `ALGEBRAIC_MATRIX_WARM_BUILDS=0` only when the build cache is already known
-   warm; the default warm-build pass keeps archived lanes from failing during
-   first-compile setup rather than actual algebraic behavior. Set
-   `ALGEBRAIC_MATRIX_RUN_UNIT_TEST=1` and `ALGEBRAIC_MATRIX_RUN_E2E=1` for the
-   broader periodic matrix, and archive the resulting `environment.txt`,
-   `warm-builds.txt`, `commands.txt`, `status.tsv`, and per-lane stdout/stderr
-   artifacts.
+   Separate unrelated existing failures from algebraic regressions, then keep
+   `zig build algebraic-guardrail` as the focused CI-safe path and use normal
+   build/test targets for broader periodic evidence. The periodic matrix should
+   still cover default public-query behavior, schema-only behavior,
+   schema-plus-algebraic behavior, focused algebraic DB tests, and provisioned
+   distributed fallback coverage whose name intentionally does not match the
+   broad `--test-filter algebraic` lane.
 
 3. Harden crash, recovery, and rebuild behavior.
    Add failure-injection coverage for interrupted adaptive backfill,
@@ -2322,7 +2317,7 @@ above and remove the temporary roadmap item.
    active-progress facts into `AlgebraicIndexStats`. If detailed
    adaptive/capability diagnostics are needed, expose them separately from normal
    index status and keep the default OpenAPI schema compact. Treat additions to
-   `AlgebraicIndexStats` as a compatibility-budget decision: prefer coarse
+   `AlgebraicIndexStats` as a public API stability-budget decision: prefer coarse
    counters and latest operator-relevant reasons, and keep candidate lists,
    proof objects, expression ids, dictionary registries, policy-scoring inputs,
    exact error document keys, decision-history counts, policy-drift counts,
@@ -2341,3 +2336,70 @@ manual user-facing materialization lifecycle or explicit materialization definit
 best-effort approximate MIN/MAX
 using the algebraic sidecar when status indicates incomplete derived state
 ```
+
+## Approximate cardinality (HyperLogLog)
+
+An index can materialize approximate distinct-counts so a `cardinality`
+aggregation is answered from a per-group sketch instead of scanning and
+deduplicating every value. Configure it with `hll_cardinalities`:
+
+```json
+{
+  "hll_cardinalities": [
+    {"name": "customers_by_region", "group_by": ["region"],
+     "value_field": "customer", "precision": 14}
+  ]
+}
+```
+
+`group_by` are the bucket axes, `value_field` is the field whose distinct values
+are counted, and `precision` (4–18, default 14) sizes each sketch at
+`2^precision` bytes and sets its accuracy.
+
+### Result contract
+
+Every `cardinality` result is self-describing, so a client can always tell an
+estimate from an exact count and reason about the error budget:
+
+```json
+{"value": 4044, "approximate": true, "relative_error": 0.0081}   // from a sketch
+{"value": 4096, "approximate": false}                            // exact distinct scan
+```
+
+`relative_error` is the HyperLogLog standard error of the sketch that produced
+the value, `1.04 / sqrt(2^precision)` — about 1.6% at p=12 and 0.8% at p=14. It
+is present only when `approximate` is true.
+
+Queries choose the exact/approximate contract with `mode` on a `cardinality`
+aggregation:
+
+- `auto` (default): use a matching current sketch when one applies; otherwise
+  fall back to an exact distinct scan.
+- `exact`: always run the exact distinct scan and return `approximate: false`.
+- `approximate`: require a matching current sketch. If no sketch applies, the
+  query fails instead of silently scanning.
+
+### Selection and maintenance
+
+The planner answers a `cardinality` from a matching sketch automatically when
+the query has no constraints and no MVCC read generation (sketches are
+maintained unconstrained and without per-generation visibility), a sketch's
+`group_by`/`value_field` match the query, and that materialization is not
+mid-rebuild; otherwise it falls back to the exact distinct scan (which reports
+`approximate: false`). Deletes and overwrites mark the affected groups dirty and
+rebuild only those groups' sketches in the background.
+
+`hll_cardinalities` is user-owned algebraic index configuration. Schema-derived
+regeneration and live schema reload preserve it alongside the other runtime
+knobs, so dynamic-template or schema updates do not drop configured sketches.
+
+Cardinality sketches can also be promoted adaptively. Repeated cardinality
+queries are observed in the same adaptive-materialization stream; once a
+leader-gated candidate crosses the promotion threshold, the index records an HLL
+configuration for that shape, backfills the sketch, and then maintains it with
+the same dirty-group rebuild path used by static `hll_cardinalities`. Adaptive
+HLL promotions are derived runtime state, not user configuration. A destructive
+schema sidecar rebuild clears persisted adaptive HLL markers together with the
+old algebraic keyspace and resets the in-memory HLL registry back to static
+`hll_cardinalities`; recurring queries can promote the adaptive sketches again
+under the refreshed schema.

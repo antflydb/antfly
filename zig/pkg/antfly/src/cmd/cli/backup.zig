@@ -397,7 +397,7 @@ fn validatePortableOutputFile(allocator: std.mem.Allocator, io: std.Io, path: []
     const body = try readOutputFileAlloc(allocator, io, path, lite_restore_staging.max_afb_file_bytes);
     defer allocator.free(body);
     if (body.len == 0) return error.EmptyPortableOutput;
-    try portable_backup.validatePortable(allocator, body);
+    try portable_backup.validatePortableDb(allocator, body);
 }
 
 fn readOutputFileAlloc(allocator: std.mem.Allocator, io: std.Io, path: []const u8, max_bytes: usize) ![]u8 {
@@ -630,11 +630,11 @@ test "restore input plan stages aflite as portable table restore" {
     defer allocator.free(afb_path);
     const portable = try std.Io.Dir.cwd().readFileAlloc(io, afb_path, allocator, .limited(lite_restore_staging.max_afb_file_bytes));
     defer allocator.free(portable);
-    try portable_backup.validatePortable(allocator, portable);
+    try portable_backup.validatePortableDb(allocator, portable);
 
     var restored = try antfly.db.DB.open(allocator, restored_path, .{});
     defer restored.close();
-    try portable_backup.importPortable(allocator, restored.core.store, portable);
+    try portable_backup.importPortableDb(allocator, &restored, portable);
     const value = (try restored.get(allocator, "doc:restore-input")) orelse return error.TestExpectedEqual;
     defer allocator.free(value);
     try std.testing.expect(std.mem.indexOf(u8, value, "restore input document") != null);

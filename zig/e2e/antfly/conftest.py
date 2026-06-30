@@ -441,8 +441,16 @@ def _legacy_stateful_command(binary: str, *, host: str, port: int, root: Path) -
     ]
 
 
-def _swarm_stateful_command(binary: str, *, host: str, port: int, root: Path) -> list[str]:
-    return [
+def _swarm_stateful_command(
+    binary: str,
+    *,
+    host: str,
+    port: int,
+    root: Path,
+    pgwire_port: int | None = None,
+    auth_enabled: bool = False,
+) -> list[str]:
+    command = [
         binary,
         "swarm",
         "--config",
@@ -462,10 +470,23 @@ def _swarm_stateful_command(binary: str, *, host: str, port: int, root: Path) ->
         "--snapshot-root-dir",
         str(root / "snapshots"),
     ]
+    if auth_enabled:
+        command.extend(["--auth", "true"])
+    if pgwire_port is not None:
+        command.extend(["--pgwire-host", host, "--pgwire-port", str(pgwire_port)])
+    return command
 
 
-def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int, root: Path) -> list[str]:
-    return [
+def _metadata_command(
+    binary: str,
+    *,
+    host: str,
+    raft_port: int,
+    admin_port: int,
+    root: Path,
+    pgwire_port: int | None = None,
+) -> list[str]:
+    command = [
         binary,
         "metadata",
         "--raft-host",
@@ -487,6 +508,9 @@ def _metadata_command(binary: str, *, host: str, raft_port: int, admin_port: int
         "--snapshot-root-dir",
         str(root / "metadata-snapshots"),
     ]
+    if pgwire_port is not None:
+        command.extend(["--pgwire-host", host, "--pgwire-port", str(pgwire_port)])
+    return command
 
 
 def _data_command(
@@ -656,11 +680,14 @@ class StatefulAntflyServer:
 
 
 class SwarmAntflyServer:
-    def __init__(self, binary: str, host: str, port: int):
+    def __init__(self, binary: str, host: str, port: int, *, pgwire_port: int | None = None, auth_enabled: bool = False):
         self.binary = binary
         self.host = host
         self.port = port
+        self.pgwire_port = pgwire_port
+        self.auth_enabled = auth_enabled
         self.url = f"http://{host}:{port}"
+        self.pgwire_url = f"http://{host}:{pgwire_port}" if pgwire_port is not None else None
         self.api_url = antfly_public_api_url(self.url, binary=binary)
         self.tempdir = tempfile.TemporaryDirectory(prefix="antfly-zig-swarm-e2e-")
         self.root = Path(self.tempdir.name)
@@ -673,12 +700,23 @@ class SwarmAntflyServer:
     def _start_process(self, *, truncate_logs: bool) -> None:
         if truncate_logs:
             self.log_file = self.log_path.open("w")
-        command = _swarm_stateful_command(self.binary, host=self.host, port=self.port, root=self.root)
+        command = _swarm_stateful_command(
+            self.binary,
+            host=self.host,
+            port=self.port,
+            root=self.root,
+            pgwire_port=self.pgwire_port,
+            auth_enabled=self.auth_enabled,
+        )
         self.proc = subprocess.Popen(command, stdout=self.log_file, stderr=subprocess.STDOUT, cwd=self.root)
-        if not wait_for_server(self.api_url):
+        if not wait_for_server(self.api_url, allow_unauthorized=self.auth_enabled):
             self.stop()
             out = _read_log_tail(self.log_path)
             raise RuntimeError(f"Swarm API server failed to start at {self.api_url}\n{out}")
+        if self.pgwire_url is not None and not wait_for_listener(self.pgwire_url):
+            self.stop()
+            out = _read_log_tail(self.log_path)
+            raise RuntimeError(f"Swarm pgwire listener failed to start at {self.pgwire_url}\n{out}")
         self.metadata_admin_url = self._poll_metadata_admin_url()
 
     def _poll_metadata_admin_url(self) -> str:
@@ -1446,7 +1484,7 @@ def serverless_api(serverless_runtime):
                 payload["transforms"] = transforms
             if sync_level is not None:
                 payload["sync_level"] = sync_level
-            timeout = 60 if sync_level in {"full_text", "enrichments", "aknn", "full_index"} else 10
+            timeout = 60 if sync_level in {"query", "enrichments", "full_index"} else 10
             return self._check(self.s.post(f"{self.url}/tables/{table_name}/batch", json=payload, timeout=timeout))
 
         def query_published(self, table_name: str) -> dict:
@@ -1704,10 +1742,22 @@ def stateful_api():
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def create_table(self, table_name: str, *, num_shards: int = 1, description: str | None = None) -> dict:
+        def create_table(
+            self,
+            table_name: str,
+            *,
+            num_shards: int = 1,
+            description: str | None = None,
+            schema: dict | None = None,
+            typed_paths: dict | None = None,
+        ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
             if description is not None:
                 payload["description"] = description
+            if schema is not None:
+                payload["schema"] = schema
+            if typed_paths is not None:
+                payload["typed_paths"] = typed_paths
             deadline = time.monotonic() + 5.0
             while True:
                 try:
@@ -2155,10 +2205,19 @@ def backup_api():
             except requests.RequestException as err:
                 self._raise_request_error(err)
 
-        def create_table(self, table_name: str, *, num_shards: int = 1, description: str | None = None) -> dict:
+        def create_table(
+            self,
+            table_name: str,
+            *,
+            num_shards: int = 1,
+            description: str | None = None,
+            schema: dict | None = None,
+        ) -> dict:
             payload: dict[str, object] = {"num_shards": num_shards}
             if description is not None:
                 payload["description"] = description
+            if schema is not None:
+                payload["schema"] = schema
             deadline = time.monotonic() + 5.0
             while True:
                 try:

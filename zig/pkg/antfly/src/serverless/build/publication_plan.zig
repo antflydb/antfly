@@ -18,6 +18,35 @@ const catalog_types = @import("../catalog/types.zig");
 const builder_mod = @import("builder.zig");
 const search_sources = @import("../search_sources.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
+const schema_mod = @import("../../schema/mod.zig");
+const storage_schema = @import("../../storage/schema.zig");
+const external_binding = @import("../external_source/catalog_binding.zig");
+const external_source_manifest = @import("external_source_manifest.zig");
+const external_source_plan_resolver_api = @import("external_source_plan_resolver_api.zig");
+const manifest_base_source = @import("../manifest/base_source.zig");
+
+pub const OwnedExternalTableBinding = struct {
+    binding: external_binding.Binding,
+    table_id: []u8,
+    source_uri: []u8,
+    credential_ref_id: ?[]u8 = null,
+    credential_scope: ?[]u8 = null,
+    snapshot_value: ?[]u8 = null,
+    schema_fingerprint: []u8,
+
+    pub fn deinit(self: *OwnedExternalTableBinding, alloc: Allocator) void {
+        alloc.free(self.table_id);
+        alloc.free(self.source_uri);
+        if (self.credential_ref_id) |value| alloc.free(value);
+        if (self.credential_scope) |value| alloc.free(value);
+        if (self.snapshot_value) |value| alloc.free(value);
+        alloc.free(self.schema_fingerprint);
+        self.* = undefined;
+    }
+};
+
+pub const ExternalSourcePlanResolveRequest = external_source_plan_resolver_api.ResolveRequest;
+pub const ExternalSourcePlanResolver = external_source_plan_resolver_api.Resolver;
 
 pub const ArtifactAction = enum {
     reuse,
@@ -103,19 +132,37 @@ pub const TableDefinitionSnapshot = struct {
     schema_json: []u8 = &.{},
     read_schema_json: []u8 = &.{},
     indexes_json: []u8 = &.{},
+    base_source: ?manifest_base_source.BaseSourceDescriptor = null,
 
     pub fn deinit(self: *TableDefinitionSnapshot, alloc: Allocator) void {
         if (self.schema_json.len > 0) alloc.free(self.schema_json);
         if (self.read_schema_json.len > 0) alloc.free(self.read_schema_json);
         if (self.indexes_json.len > 0) alloc.free(self.indexes_json);
+        if (self.base_source) |*descriptor| manifest_base_source.freeOwnedDescriptor(alloc, descriptor);
         self.* = undefined;
     }
 };
+
+pub fn tableDefinitionSnapshotAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+    read_schema_json: []const u8,
+    indexes_json: []const u8,
+) !TableDefinitionSnapshot {
+    var snapshot = TableDefinitionSnapshot{};
+    errdefer snapshot.deinit(alloc);
+    snapshot.schema_json = try alloc.dupe(u8, schema_json);
+    snapshot.read_schema_json = try alloc.dupe(u8, read_schema_json);
+    snapshot.indexes_json = try alloc.dupe(u8, indexes_json);
+    snapshot.base_source = try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc, schema_json);
+    return snapshot;
+}
 
 pub const TablePublicationPlan = struct {
     targets: builder_mod.Builder.PublicationTargets,
     policy: catalog_types.NamespacePolicy = .{},
     table_definition: TableDefinitionSnapshot = .{},
+    external_source_plan: ?external_source_manifest.Plan = null,
     metadata_republish: MetadataRepublishReasons = .{},
     artifact_actions: ArtifactActions = .{},
     full_text_index_actions: []FullTextIndexAction = &.{},
@@ -127,6 +174,7 @@ pub const TablePublicationPlan = struct {
     pub fn deinit(self: *TablePublicationPlan, alloc: Allocator) void {
         search_sources.deinitPublishedSearchSources(alloc, &self.targets.published_search_sources);
         self.table_definition.deinit(alloc);
+        if (self.external_source_plan) |*plan| plan.deinit(alloc);
         for (self.full_text_index_actions) |*entry| entry.deinit(alloc);
         if (self.full_text_index_actions.len > 0) alloc.free(self.full_text_index_actions);
         for (self.vector_index_actions) |*entry| entry.deinit(alloc);
@@ -186,6 +234,79 @@ pub fn collapseNamedArtifactAction(
     return if (artifact_present) .drop else .drop;
 }
 
+pub fn pinnedExternalBaseSourceFromSchemaJsonAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+) !?manifest_base_source.BaseSourceDescriptor {
+    var owned_binding = (try externalBindingFromSchemaJsonAlloc(alloc, schema_json)) orelse return null;
+    defer owned_binding.deinit(alloc);
+    const binding = owned_binding.binding;
+    try binding.validateReadOnlyMvp();
+    const pinned_snapshot_id = binding.snapshot_mode.pinnedSnapshotId() orelse return null;
+    const descriptor = try binding.toManifestBaseSource(pinned_snapshot_id, null);
+    return try manifest_base_source.cloneDescriptorAlloc(alloc, descriptor);
+}
+
+pub fn externalBindingFromSchemaJsonAlloc(
+    alloc: Allocator,
+    schema_json: []const u8,
+) !?OwnedExternalTableBinding {
+    if (schema_json.len == 0) return null;
+
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const source = runtime_schema.external_base_source orelse return null;
+    const table_id = try alloc.dupe(u8, source.table_id);
+    errdefer alloc.free(table_id);
+    const source_uri = try alloc.dupe(u8, source.source_uri);
+    errdefer alloc.free(source_uri);
+    const credential_ref_id = if (source.credential_ref) |credential| try alloc.dupe(u8, credential.ref_id) else null;
+    errdefer if (credential_ref_id) |value| alloc.free(value);
+    const credential_scope = if (source.credential_ref) |credential| try alloc.dupe(u8, credential.scope) else null;
+    errdefer if (credential_scope) |value| alloc.free(value);
+    const snapshot_value = switch (source.snapshot_mode) {
+        .current => null,
+        .snapshot_id => |snapshot_id| try alloc.dupe(u8, snapshot_id),
+        .object_version_digest => |digest| try alloc.dupe(u8, digest),
+    };
+    errdefer if (snapshot_value) |value| alloc.free(value);
+    const schema_fingerprint = try alloc.dupe(u8, source.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+
+    const borrowed_binding = external_binding.bindingFromRuntimeExternalBaseSource(source);
+    const binding = external_binding.Binding{
+        .table_id = table_id,
+        .format = borrowed_binding.format,
+        .source_uri = source_uri,
+        .credential_ref = if (credential_ref_id) |ref_id| .{
+            .ref_id = ref_id,
+            .scope = credential_scope orelse &.{},
+        } else null,
+        .snapshot_mode = switch (source.snapshot_mode) {
+            .current => .current,
+            .snapshot_id => .{ .snapshot_id = snapshot_value.? },
+            .object_version_digest => .{ .object_version_digest = snapshot_value.? },
+        },
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = borrowed_binding.write_policy,
+    };
+    try binding.validateReadOnlyMvp();
+
+    return .{
+        .binding = binding,
+        .table_id = table_id,
+        .source_uri = source_uri,
+        .credential_ref_id = credential_ref_id,
+        .credential_scope = credential_scope,
+        .snapshot_value = snapshot_value,
+        .schema_fingerprint = schema_fingerprint,
+    };
+}
+
 test "metadata republish reasons report when any flag is set" {
     try std.testing.expect(!(MetadataRepublishReasons{}).any());
     try std.testing.expect((MetadataRepublishReasons{ .published_search_sources_changed = true }).any());
@@ -233,6 +354,46 @@ test "publication plan republish follows explicit metadata reasons" {
 test "table definition snapshot deinit handles empty fields" {
     var snapshot = TableDefinitionSnapshot{};
     snapshot.deinit(std.testing.allocator);
+}
+
+test "table definition snapshot owns pinned external base source" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":{"mode":"object_version_digest","digest":"sha256:objects"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var snapshot = try tableDefinitionSnapshotAlloc(
+        alloc,
+        schema_json,
+        "",
+        "{}",
+    );
+    defer snapshot.deinit(alloc);
+
+    try std.testing.expect(snapshot.base_source != null);
+    try std.testing.expectEqual(manifest_base_source.BaseSourceKind.external_parquet, std.meta.activeTag(snapshot.base_source.?));
+    try std.testing.expectEqualStrings("sha256:objects", snapshot.base_source.?.external_parquet.snapshot_id);
+}
+
+test "publication plan derives pinned external lake base source from schema" {
+    const alloc = std.testing.allocator;
+    var descriptor = (try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc,
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","credentials":{"ref":"prod-lake-read","scope":"events"},"snapshot":{"mode":"snapshot_id","id":"iceberg-123"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    )).?;
+    defer manifest_base_source.freeOwnedDescriptor(alloc, &descriptor);
+
+    try std.testing.expectEqual(manifest_base_source.BaseSourceKind.external_iceberg, std.meta.activeTag(descriptor));
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/events", descriptor.external_iceberg.source_uri);
+    try std.testing.expectEqualStrings("iceberg-123", descriptor.external_iceberg.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", descriptor.external_iceberg.schema_fingerprint);
+    try std.testing.expectEqual(@as(?[]const u8, null), descriptor.external_iceberg.file_inventory_artifact);
+}
+
+test "publication plan leaves current external lake base source unpinned" {
+    const alloc = std.testing.allocator;
+    const descriptor = try pinnedExternalBaseSourceFromSchemaJsonAlloc(alloc,
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"parquet","uri":"s3://bucket/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    try std.testing.expectEqual(@as(?manifest_base_source.BaseSourceDescriptor, null), descriptor);
 }
 
 test "collapse full text artifact action uses per-index actions when present" {

@@ -23,6 +23,53 @@ GO_SUBMODULES := \
 	./go/pkg/genkit/openrouter \
 	./go/pkg/memoryaf
 
+GO_GENERATED_CHECK_PATHS := \
+	openapi.yaml \
+	go/pkg/antfly/lib/ai/eval/openapi.gen.go \
+	go/pkg/antfly/lib/ai/openapi.gen.go \
+	go/pkg/antfly/lib/audio/openapi.gen.go \
+	go/pkg/antfly/lib/chunking/openapi.gen.go \
+	go/pkg/antfly/lib/embeddings/openapi.gen.go \
+	go/pkg/antfly/lib/middleware/openapi.gen.go \
+	go/pkg/antfly/lib/reranking/openapi.gen.go \
+	go/pkg/antfly/lib/schema/openapi.gen.go \
+	go/pkg/antfly/lib/vector/quantize/quantize.pb.go \
+	go/pkg/antfly/lib/vector/vector.pb.go \
+	go/pkg/antfly/lib/websearch/openapi.gen.go \
+	go/pkg/antfly/src/common/common.pb.go \
+	go/pkg/antfly/src/common/config.gen.go \
+	go/pkg/antfly/src/common/transaction.pb.go \
+	go/pkg/antfly/src/metadata/api.gen.go \
+	go/pkg/antfly/src/raft/afraft.pb.go \
+	go/pkg/antfly/src/store/db/indexes/openapi.gen.go \
+	go/pkg/antfly/src/store/db/ops.pb.go \
+	go/pkg/antfly/src/store/db/types.pb.go \
+	go/pkg/antfly/src/store/store.pb.go \
+	go/pkg/antfly/src/usermgr/api.gen.go \
+	go/pkg/generating/openapi.gen.go \
+	go/pkg/libaf/chunking/openapi.gen.go \
+	go/pkg/libaf/logging/config.gen.go \
+	go/pkg/libaf/s3/openapi.gen.go \
+	go/pkg/libaf/scraping/openapi.gen.go \
+	go/pkg/operator/api/antfly/v1/zz_generated.deepcopy.go \
+	go/pkg/operator/api/inference/v1alpha1/zz_generated.deepcopy.go \
+	go/pkg/operator/manifests/crd.go \
+	go/pkg/operator/manifests/crd \
+	go/pkg/operator/manifests/doc.go \
+	go/pkg/operator/manifests/rbac.go \
+	go/pkg/operator/manifests/rbac \
+	go/pkg/sdk/oapi/client.gen.go \
+	go/pkg/sdk/oapi/validate.go \
+	go/pkg/sdk/query/query.gen.go \
+	go/pkg/termite/api.gen.go
+
+TS_GENERATED_CHECK_PATHS := \
+	ts/packages/sdk/src/public-api.d.ts \
+	ts/packages/sdk/src/query.d.ts
+
+PY_GENERATED_CHECK_PATHS := \
+	py/packages/sdk/src/antfly/client_generated
+
 # ====================================================================================
 # General Commands
 # ====================================================================================
@@ -37,11 +84,13 @@ help:
 	@echo "  build-antfarm      Build the antfarm frontend (React admin UI)"
 	@echo "  build-docs         Join OpenAPI specifications"
 	@echo "  generate           Generate Zig OpenAPI modules, Go code, client SDKs, and website documentation"
+	@echo "  generated-check    Verify checked-in generated sources are current"
 	@echo "  lint               Run golangci-lint with auto-fix"
 	@echo "  tidy               Run go mod tidy across root and Go submodules"
 	@echo "  tidy-check         Verify go.mod/go.sum are tidy across root and Go submodules"
 	@echo "  zig-build          Build the migrated Zig runtime"
 	@echo "  zig-test           Run the migrated Zig test aggregate"
+	@echo "  zig-db-temporal-test  Run focused application-time temporal table storage tests"
 	@echo "  zig-generate       Regenerate migrated Zig generated sources"
 	@echo "  zig-openapi-generate  Regenerate migrated Zig OpenAPI modules"
 	@echo "  zig-generated-check  Verify migrated Zig generated sources"
@@ -86,8 +135,8 @@ help:
 # Build and Generation Commands
 # ====================================================================================
 
-.PHONY: build build-go build-docs generate lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
-.PHONY: zig-build zig-test zig-unit-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
+.PHONY: build build-go build-docs generate generated-check go-generated-check ts-generated-check py-generated-check lint license-headers license-check update-deps tidy tidy-check install-git-hooks build-antfarm sim-validate sim-validate-repo sim-soak
+.PHONY: zig-build zig-test zig-unit-test zig-sql-api-parity-test zig-db-temporal-test zig-generate zig-openapi-generate zig-generated-check zig-openapi-check zig-snowball-check zig-license-headers zig-license-check zig-tla-check
 
 build-antfarm: build-antfarm-main
 
@@ -118,6 +167,39 @@ generate: build-docs tidy
 	cd ts && pnpm --filter @antfly/sdk generate
 	$(MAKE) -C ./py/packages/sdk generate
 
+generated-check: zig-generated-check go-generated-check ts-generated-check py-generated-check
+
+go-generated-check: build-docs
+	(cd $(ANTFLY_GO_MODULE) && $(GO) generate ./...)
+	@for mod in $(GO_SUBMODULES); do \
+		echo "==> Checking generated Go sources in $$mod"; \
+		(cd $$mod && $(GO) generate ./...) || exit 1; \
+	done
+	@status="$$(git status --porcelain -- $(GO_GENERATED_CHECK_PATHS))"; \
+	if [ -n "$$status" ]; then \
+		echo "$$status"; \
+		git diff -- $(GO_GENERATED_CHECK_PATHS); \
+		exit 1; \
+	fi
+
+ts-generated-check:
+	cd ts && pnpm --filter @antfly/sdk generate
+	@status="$$(git status --porcelain -- $(TS_GENERATED_CHECK_PATHS))"; \
+	if [ -n "$$status" ]; then \
+		echo "$$status"; \
+		git diff -- $(TS_GENERATED_CHECK_PATHS); \
+		exit 1; \
+	fi
+
+py-generated-check:
+	$(MAKE) -C ./py/packages/sdk generate
+	@status="$$(git status --porcelain -- $(PY_GENERATED_CHECK_PATHS))"; \
+	if [ -n "$$status" ]; then \
+		echo "$$status"; \
+		git diff -- $(PY_GENERATED_CHECK_PATHS); \
+		exit 1; \
+	fi
+
 license-headers: ## Add first-party license headers.
 	$(SCRIPTS_PY) scripts/license_headers.py
 
@@ -132,6 +214,12 @@ zig-test:
 
 zig-unit-test:
 	$(ZIG_MAKE) unit-test
+
+zig-sql-api-parity-test:
+	$(ZIG_MAKE) sql-api-parity-test
+
+zig-db-temporal-test:
+	$(ZIG_MAKE) db-temporal-test
 
 zig-generate:
 	$(ZIG_MAKE) generate

@@ -21,6 +21,7 @@ const raft_engine = @import("raft_engine");
 const platform = @import("antfly_platform");
 const tracing = @import("../tracing/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
+const metadata_table_manager = @import("table_manager.zig");
 const platform_time = @import("../platform/time.zig");
 
 const setup_io_thread_stack_size = 1 * 1024 * 1024;
@@ -61,6 +62,8 @@ const CliConfig = struct {
     raft_port: ?u16 = null,
     api_host: ?[]const u8 = null,
     api_port: ?u16 = null,
+    pgwire_host: ?[]const u8 = null,
+    pgwire_port: ?u16 = null,
     cluster_json: ?[]const u8 = null,
     join: bool = false,
     health_enabled: ?bool = null,
@@ -551,6 +554,7 @@ pub const Server = struct {
 
         try self.server.svc.raft.submitBatch(updates.items);
         _ = try self.server.svc.syncPending();
+        try self.bootstrapPublicApiPrerequisites(local_node_id);
     }
 
     pub fn bootstrapLocal(self: *Server, metadata_group_id: u64, local_node_id: u64) !void {
@@ -574,6 +578,50 @@ pub const Server = struct {
             .local_node_id = local_node_id,
             .bootstrap_mode = .persisted,
         });
+        try self.server.runRound();
+        self.refreshMetadataRaftStorageDiagnostics();
+        try self.server.campaignMetadataGroup();
+        try self.server.svc.raft.submit(.{
+            .replica_intent = .{
+                .upsert = .{
+                    .record = .{
+                        .group_id = metadata_group_id,
+                        .replica_id = 1,
+                        .local_node_id = local_node_id,
+                        .bootstrap_mode = .persisted,
+                    },
+                    .peer_node_ids = &.{},
+                },
+            },
+        });
+        try self.bootstrapPublicApiPrerequisites(local_node_id);
+    }
+
+    fn bootstrapPublicApiPrerequisites(self: *Server, local_node_id: u64) !void {
+        const default_database_id = metadata_table_manager.deriveDatabaseId(metadata_table_manager.default_database_name);
+        try self.server.svc.upsertDatabase(.{
+            .database_id = default_database_id,
+            .name = metadata_table_manager.default_database_name,
+        });
+        try self.server.svc.upsertNamespace(.{
+            .namespace_id = metadata_table_manager.deriveNamespaceId(default_database_id, metadata_table_manager.default_namespace_name),
+            .database_id = default_database_id,
+            .name = metadata_table_manager.default_namespace_name,
+        });
+        try self.server.svc.registerNode(.{
+            .node_id = local_node_id,
+            .role = "metadata",
+        });
+        try self.server.svc.upsertStore(.{
+            .store_id = local_node_id,
+            .node_id = local_node_id,
+            .role = "data",
+            .live = true,
+            .capacity_bytes = 1024 * 1024 * 1024,
+            .available_bytes = 1024 * 1024 * 1024,
+        });
+        _ = try self.server.svc.syncPending();
+        try self.server.runRound();
     }
 
     pub fn runRound(self: *Server) !void {
@@ -857,6 +905,13 @@ pub fn runFromIterator(
     if (synced_extension_packages > 0) {
         std.log.info("metadata synced extension package store path={s} packages={d}", .{ resolved.extension_package_store_dir, synced_extension_packages });
     }
+    try server.server.public_api_surface.startPgwireOptional(.{
+        .bind_host = cli.pgwire_host,
+        .default_bind_host = admin_listener.bind_host,
+        .bind_port = cli.pgwire_port,
+        .auth_enabled = effective_auth_enabled,
+        .auth_error_message = "metadata pgwire listener does not support auth yet; disable public API auth/trusted principal or omit --pgwire-port",
+    });
 
     const base_uri = try server.baseUri(alloc);
     defer alloc.free(base_uri);
@@ -951,6 +1006,14 @@ fn parseCli(args: *std.process.Args.Iterator) !CliConfig {
         }
         if (std.mem.eql(u8, arg, "--api-port")) {
             cfg.api_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-host")) {
+            cfg.pgwire_host = args.next() orelse return error.InvalidArguments;
+            continue;
+        }
+        if (std.mem.eql(u8, arg, "--pgwire-port")) {
+            cfg.pgwire_port = try std.fmt.parseInt(u16, args.next() orelse return error.InvalidArguments, 10);
             continue;
         }
         if (std.mem.eql(u8, arg, "--cluster")) {
@@ -1348,6 +1411,8 @@ fn printUsage(argv0: []const u8) void {
         \\  --raft-port <port>             Metadata raft bind port (default: 0)
         \\  --api-host <host>              Metadata admin API bind host (default: raft host)
         \\  --api-port <port>              Metadata admin API bind port (default: 0)
+        \\  --pgwire-host <host>           Pgwire bind host (default: --api-host)
+        \\  --pgwire-port <port>           Enable pgwire TCP listener on this port
         \\  --cluster <json>               Metadata raft peer URLs, e.g. {{"1":"http://127.0.0.1:9017"}}
         \\  --join                         Join an existing metadata cluster (not yet supported)
         \\  --health <true|false>          Enable health/metrics server (default: true)
@@ -1682,26 +1747,35 @@ test "metadata runtime memory soak diagnostic" {
         const table_id = 1000 + @as(u64, @intCast(table_idx));
         const table_name = try std.fmt.allocPrint(soak_alloc, "docs_{}", .{table_idx});
         defer soak_alloc.free(table_name);
-        try svc.upsertTable(.{
+        const table = metadata_table_manager.TableRecord{
             .table_id = table_id,
             .name = table_name,
             .desired_replica_count = 3,
             .min_ranges = @intCast(ranges_per_table),
-        });
+        };
+        const ranges = try soak_alloc.alloc(metadata_table_manager.RangeRecord, ranges_per_table);
+        defer soak_alloc.free(ranges);
+        var populated_ranges: usize = 0;
+        errdefer for (ranges[0..populated_ranges]) |record| metadata_table_manager.freeRange(soak_alloc, record);
         var range_idx: usize = 0;
         while (range_idx < ranges_per_table) : (range_idx += 1) {
             const start_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:a", .{range_idx});
-            defer soak_alloc.free(start_key);
+            errdefer soak_alloc.free(start_key);
             const end_key = try std.fmt.allocPrint(soak_alloc, "doc:{d:0>4}:z", .{range_idx});
-            defer soak_alloc.free(end_key);
-            try svc.upsertRange(.{
+            errdefer soak_alloc.free(end_key);
+            ranges[range_idx] = .{
                 .group_id = table_id * 1000 + @as(u64, @intCast(range_idx + 1)),
                 .range_id = @intCast(range_idx + 1),
                 .table_id = table_id,
                 .start_key = start_key,
                 .end_key = end_key,
-            });
+            };
+            populated_ranges += 1;
         }
+        defer for (ranges) |record| metadata_table_manager.freeRange(soak_alloc, record);
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(soak_alloc);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(svc, table, ranges);
         try svc.upsertReplicationSourceStatus(.{
             .table_id = table_id,
             .source_ordinal = 0,
@@ -1893,10 +1967,18 @@ test "metadata runtime preserves projected tables across restart" {
         try server.start();
         try server.bootstrapLocal(group_ids.main_metadata_group_id, 1);
 
-        try server.metadataHttpService().upsertTable(.{
+        const table = metadata_table_manager.TableRecord{
             .table_id = 77,
             .name = "docs",
-        });
+        };
+        const ranges = try antfly.metadata.catalog.table_ddl.deriveInitialRanges(std.testing.allocator, table);
+        defer {
+            for (ranges) |record| metadata_table_manager.freeRange(std.testing.allocator, record);
+            std.testing.allocator.free(ranges);
+        }
+        var workflow = antfly.metadata_table_workflow.TableWorkflow.init(std.testing.allocator);
+        defer workflow.deinit();
+        _ = try workflow.createTableWithRanges(server.metadataHttpService(), table, ranges);
 
         var rounds: usize = 0;
         while (rounds < 8) : (rounds += 1) try server.runRound();
@@ -1974,4 +2056,19 @@ test "metadata runtime bootstrapLocal skips local replica-root reconcile on the 
         try server.runRound();
     }
     try std.testing.expect(hook_ctx.runs > 0);
+
+    const metadata_status = server.server.svc.raft.host.status(group_ids.main_metadata_group_id);
+    try std.testing.expect(metadata_status == .active or metadata_status == .quiesced);
+
+    var snapshot = try server.metadataHttpService().adminSnapshot();
+    defer server.metadataHttpService().freeAdminSnapshot(&snapshot);
+    const default_database_id = metadata_table_manager.deriveDatabaseId(metadata_table_manager.default_database_name);
+    var found_default_database = false;
+    for (snapshot.databases) |database| {
+        if (database.database_id == default_database_id and std.mem.eql(u8, database.name, metadata_table_manager.default_database_name)) {
+            found_default_database = true;
+            break;
+        }
+    }
+    try std.testing.expect(found_default_database);
 }

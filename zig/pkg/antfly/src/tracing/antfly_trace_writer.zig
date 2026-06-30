@@ -71,7 +71,8 @@ pub const AntflyNdjsonTraceWriter = struct {
         try w.writeAll("{\"tag\":\"antfly-trace\",\"event\":{");
 
         // name
-        try w.print("\"name\":\"{s}\"", .{event.name});
+        try w.writeAll("\"name\":");
+        try writeJsonString(w, event.name);
 
         // txnId (hex)
         try w.writeAll(",\"txnId\":\"");
@@ -79,7 +80,8 @@ pub const AntflyNdjsonTraceWriter = struct {
         try w.writeAll("\"");
 
         // shardId (always present, may be empty)
-        try w.print(",\"shardId\":\"{s}\"", .{event.shard_id});
+        try w.writeAll(",\"shardId\":");
+        try writeJsonString(w, event.shard_id);
 
         // state object — always emit for write-intent events so TLA+ spec
         // can access fields unconditionally; for other events, only when non-empty
@@ -117,7 +119,8 @@ pub const AntflyNdjsonTraceWriter = struct {
             }
             if (event.reason) |reason| {
                 if (!first) try w.writeAll(",");
-                try w.print("\"reason\":\"{s}\"", .{reason});
+                try w.writeAll("\"reason\":");
+                try writeJsonString(w, reason);
             }
 
             try w.writeAll("}");
@@ -137,19 +140,27 @@ fn writeStringArray(w: *std.Io.Writer, items: []const []const u8) !void {
     try w.writeAll("[");
     for (items, 0..) |item, i| {
         if (i > 0) try w.writeAll(",");
-        try w.writeAll("\"");
-        // Escape JSON special characters
-        for (item) |c| {
-            switch (c) {
-                '"' => try w.writeAll("\\\""),
-                '\\' => try w.writeAll("\\\\"),
-                '\n' => try w.writeAll("\\n"),
-                else => try w.writeByte(c),
-            }
-        }
-        try w.writeAll("\"");
+        try writeJsonString(w, item);
     }
     try w.writeAll("]");
+}
+
+fn writeJsonString(w: *std.Io.Writer, value: []const u8) !void {
+    try w.writeAll("\"");
+    for (value) |c| {
+        switch (c) {
+            '"' => try w.writeAll("\\\""),
+            '\\' => try w.writeAll("\\\\"),
+            '\n' => try w.writeAll("\\n"),
+            '\r' => try w.writeAll("\\r"),
+            '\t' => try w.writeAll("\\t"),
+            0x00...0x08, 0x0b, 0x0c, 0x0e...0x1f, 0x7f...0xff => {
+                try w.print("\\u{x:0>4}", .{c});
+            },
+            else => try w.writeByte(c),
+        }
+    }
+    try w.writeAll("\"");
 }
 
 test "antfly trace writer emits valid ndjson" {
@@ -160,7 +171,7 @@ test "antfly trace writer emits valid ndjson" {
         .writer = &out.writer,
     };
 
-    const keys = [_][]const u8{ "key1", "key2" };
+    const keys = [_][]const u8{ "key1", "key\x00\t\r\n\"\\\xff2" };
     const event = AntflyTracingEvent{
         .name = "WriteIntentOnShard",
         .txn_id = [_]u8{0x55} ** 16,
@@ -175,5 +186,8 @@ test "antfly trace writer emits valid ndjson" {
     try std.testing.expect(std.mem.indexOf(u8, output, "\"tag\":\"antfly-trace\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"name\":\"WriteIntentOnShard\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "\"shardId\":\"42\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, output, "\"writeKeys\":[\"key1\",\"key2\"]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "\"writeKeys\":[\"key1\",\"key\\u0000\\t\\r\\n\\\"\\\\\\u00ff2\"]") != null);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, output, .{});
+    defer parsed.deinit();
 }

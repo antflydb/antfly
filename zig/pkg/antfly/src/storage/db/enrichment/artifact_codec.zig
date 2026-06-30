@@ -352,6 +352,42 @@ pub fn sourceHash(data: []const u8) !?u64 {
     return header.source_hash;
 }
 
+pub fn expectDenseEmbeddingValue(alloc: Allocator, value: []const u8, expected_source_hash: ?u64, expected_dims: usize) !void {
+    const header = try decodeHeader(value);
+    try std.testing.expectEqual(codec_version, header.version);
+    try std.testing.expectEqual(Kind.dense_embedding, header.kind);
+    try std.testing.expectEqual(expected_source_hash != null, header.flags.has_source_hash);
+    if (expected_source_hash) |hash| try std.testing.expectEqual(hash, header.source_hash);
+
+    const vector = try decodeDenseEmbeddingAlloc(alloc, value);
+    defer alloc.free(vector);
+    try std.testing.expectEqual(expected_dims, vector.len);
+}
+
+pub fn expectDenseEmbeddingWithSourceHash(alloc: Allocator, value: []const u8, expected_dims: usize) !void {
+    const header = try decodeHeader(value);
+    try std.testing.expectEqual(codec_version, header.version);
+    try std.testing.expectEqual(Kind.dense_embedding, header.kind);
+    try std.testing.expect(header.flags.has_source_hash);
+
+    const vector = try decodeDenseEmbeddingAlloc(alloc, value);
+    defer alloc.free(vector);
+    try std.testing.expectEqual(expected_dims, vector.len);
+}
+
+pub fn expectSparseEmbeddingValue(alloc: Allocator, value: []const u8, expected_source_hash: ?u64, expected_count: usize) !void {
+    const header = try decodeHeader(value);
+    try std.testing.expectEqual(codec_version, header.version);
+    try std.testing.expectEqual(Kind.sparse_embedding, header.kind);
+    try std.testing.expectEqual(expected_source_hash != null, header.flags.has_source_hash);
+    if (expected_source_hash) |hash| try std.testing.expectEqual(hash, header.source_hash);
+
+    var sparse = try decodeSparseEmbeddingAlloc(alloc, value);
+    defer sparse.deinit(alloc);
+    try std.testing.expectEqual(expected_count, sparse.indices.len);
+    try std.testing.expectEqual(expected_count, sparse.values.len);
+}
+
 fn writeHeader(dst: []u8, header: Header) void {
     std.debug.assert(dst.len == header_len);
     @memcpy(dst[0..magic.len], &magic);
@@ -379,6 +415,8 @@ test "artifact codec encodes dense embedding with version and source hash" {
     try std.testing.expect(header.flags.has_source_hash);
     try std.testing.expectEqual(hash, header.source_hash);
     try std.testing.expectEqual(@as(?u64, hash), try sourceHash(encoded));
+    try expectDenseEmbeddingValue(alloc, encoded, hash, 3);
+    try expectDenseEmbeddingWithSourceHash(alloc, encoded, 3);
 
     const decoded = try decodeDenseEmbeddingAlloc(alloc, encoded);
     defer alloc.free(decoded);
@@ -431,6 +469,7 @@ test "artifact codec encodes sparse embedding with version and source hash" {
     try std.testing.expect(header.flags.has_source_hash);
     try std.testing.expectEqual(hash, header.source_hash);
     try std.testing.expectEqual(@as(?u64, hash), try sourceHash(encoded));
+    try expectSparseEmbeddingValue(alloc, encoded, hash, 2);
     try std.testing.expectEqual(@as(u32, 2), std.mem.readInt(u32, encoded[header_len..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 3), std.mem.readInt(u32, encoded[header_len + 4 ..][0..4], .little));
     try std.testing.expectEqual(@as(u32, 9), std.mem.readInt(u32, encoded[header_len + 8 ..][0..4], .little));

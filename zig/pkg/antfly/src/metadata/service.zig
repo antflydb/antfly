@@ -34,16 +34,18 @@ const platform_clock = @import("../platform/clock.zig");
 const process_memory_mod = @import("../platform/process_memory.zig");
 const platform_time = @import("../platform/time.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
+const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const transition_state = @import("transition_state.zig");
 const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_service = @import("../raft/service.zig");
-const raft_state_machine = @import("../raft/state_machine/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
-const api_table_catalog = @import("../api/table_catalog.zig");
+const sql_schema_mutation = @import("../sql/schema_mutation.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
+const catalog_source = @import("catalog/source.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const backfill_state_mod = @import("../storage/db/backfill_state.zig");
@@ -51,9 +53,16 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 
 const cdc_replication_round_interval_ms: u64 = 1_000;
+pub const default_fk_schema_controller_worker_id = "metadata-fk-schema-controller";
+pub const default_unique_schema_controller_worker_id = "metadata-unique-schema-controller";
 pub const metadata_run_round_slow_threshold_ns: u64 = std.time.ns_per_s;
 const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
 const metadata_run_round_trace_max_phases: usize = 32;
+const sequence_allocation_max_attempts: usize = 32;
+const sequence_allocation_retry_wait_ns: u64 = 50 * std.time.ns_per_ms;
+const sequence_reset_max_attempts: usize = 32;
+const sequence_reset_retry_wait_ns: u64 = 50 * std.time.ns_per_ms;
+var sequence_allocation_id_counter: std.atomic.Value(u64) = .init(1);
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
 const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
@@ -168,6 +177,228 @@ const MetadataRaftDiagnosticsSnapshot = struct {
     election_elapsed: u64 = 0,
     last_runtime_round: ?raft_engine.runtime.multi_raft.HostRound = null,
 };
+
+fn freshSequenceAllocationId() u128 {
+    const counter = sequence_allocation_id_counter.fetchAdd(1, .monotonic) | 1;
+    const timestamp = platform_time.monotonicNs();
+    return (@as(u128, timestamp) << 64) | @as(u128, counter);
+}
+
+fn findSequenceRecord(
+    records: []const metadata_table_manager.SequenceRecord,
+    sequence_id: u64,
+) ?metadata_table_manager.SequenceRecord {
+    for (records) |record| {
+        if (record.sequence_id == sequence_id) return record;
+    }
+    return null;
+}
+
+fn resetIdentityAllocatorsForTableEmptyingBarrierWithCas(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+) !void {
+    for (0..sequence_reset_max_attempts) |_| {
+        var snapshot = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&snapshot);
+
+        const targets = try tableEmptyingIdentityAllocatorResetTargetsFromSnapshotAlloc(alloc, snapshot, request);
+        defer alloc.free(targets);
+        if (targets.len == 0) return;
+
+        var needs_reset = false;
+        const observed = service.captureLifecycleSignal(null);
+        for (targets) |target| {
+            const record = findSequenceRecord(snapshot.sequences, target.sequence_id) orelse return error.SequenceNotFound;
+            if (record.last_value == target.reset_last_value and record.last_allocation_id == 0) continue;
+            needs_reset = true;
+            try service.proposeTransitionCommand(.{ .compare_and_swap_sequence = .{
+                .sequence_id = target.sequence_id,
+                .expected_last_value = record.last_value,
+                .next_last_value = target.reset_last_value,
+                .allocation_id = 0,
+            } });
+        }
+        if (!needs_reset) return;
+        service.waitForLifecycleSignal(observed, sequence_reset_retry_wait_ns);
+
+        var after = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&after);
+        const after_targets = try tableEmptyingIdentityAllocatorResetTargetsFromSnapshotAlloc(alloc, after, request);
+        defer alloc.free(after_targets);
+        var all_reset = true;
+        for (after_targets) |target| {
+            const record = findSequenceRecord(after.sequences, target.sequence_id) orelse return error.SequenceNotFound;
+            if (record.last_value != target.reset_last_value or record.last_allocation_id != 0) {
+                all_reset = false;
+                break;
+            }
+        }
+        if (all_reset) return;
+    }
+    return error.SequenceAllocationConflict;
+}
+
+test "metadata service table-emptying identity reset clears durable allocation marker" {
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}},"owned_id":{"type":"numeric"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json);
+    const default_sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "usage_id_seq");
+    const owned_sequence_id = metadata_table_manager.deriveSequenceId("tenant", "billing", "usage_owned_id_seq");
+
+    const FakeService = struct {
+        alloc: std.mem.Allocator,
+        tables: [1]metadata_table_manager.TableRecord,
+        ranges: [1]metadata_table_manager.RangeRecord,
+        sequences: [2]metadata_table_manager.SequenceRecord,
+        jobs: [1]metadata_table_manager.TableEmptyingJobRecord,
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = self.ranges[0..],
+                .sequences = self.sequences[0..],
+                .table_emptying_jobs = self.jobs[0..],
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn captureLifecycleSignal(_: *@This(), _: ?[]const u8) void {}
+
+        fn waitForLifecycleSignal(_: *@This(), _: void, _: u64) void {}
+
+        fn proposeTransitionCommand(self: *@This(), command: metadata_storage.TransitionCommand) !void {
+            switch (command) {
+                .compare_and_swap_sequence => |request| {
+                    for (&self.sequences) |*sequence| {
+                        if (sequence.sequence_id != request.sequence_id) continue;
+                        if (sequence.last_value != request.expected_last_value) return;
+                        sequence.last_value = request.next_last_value;
+                        sequence.last_allocation_id = request.allocation_id;
+                        return;
+                    }
+                    return error.SequenceNotFound;
+                },
+                else => return error.UnsupportedOperation,
+            }
+        }
+    };
+
+    var service = FakeService{
+        .alloc = std.testing.allocator,
+        .tables = .{.{
+            .table_id = 7,
+            .name = "usage_records",
+            .database_name = "tenant",
+            .namespace_name = "billing",
+            .schema_json = schema_json,
+            .data_generation = 4,
+        }},
+        .ranges = .{.{
+            .group_id = 9001,
+            .range_id = 9101,
+            .table_id = 7,
+            .start_key = "",
+            .end_key = null,
+        }},
+        .sequences = .{
+            .{
+                .sequence_id = default_sequence_id,
+                .name = "usage_id_seq",
+                .database_name = "tenant",
+                .namespace_name = "billing",
+                .options_json = "{\"start_with\":10,\"increment_by\":5}",
+                .last_value = 100,
+                .last_allocation_id = 1234,
+            },
+            .{
+                .sequence_id = owned_sequence_id,
+                .name = "usage_owned_id_seq",
+                .database_name = "tenant",
+                .namespace_name = "billing",
+                .options_json = "{\"start_with\":50,\"increment_by\":10,\"owned_by\":{\"table_name\":\"usage_records\",\"column_name\":\"owned_id\"}}",
+                .last_value = 200,
+                .last_allocation_id = 5678,
+            },
+        },
+        .jobs = .{.{
+            .job_id = 7101,
+            .table_id = 7,
+            .group_id = 9001,
+            .schema_generation = schema_generation,
+            .data_generation = 4,
+            .barrier_id = 77,
+            .state = metadata_table_manager.table_emptying_ready,
+            .affected_table_ids = &.{7},
+            .restart_identity = true,
+        }},
+    };
+
+    try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(&service, std.testing.allocator, .{
+        .barrier_id = 77,
+        .affected_table_ids = &.{7},
+        .job_ids = &.{7101},
+    });
+
+    try std.testing.expectEqual(@as(i64, 5), service.sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[0].last_allocation_id);
+    try std.testing.expectEqual(@as(i64, 40), service.sequences[1].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[1].last_allocation_id);
+
+    service.sequences[0].last_allocation_id = 9001;
+    service.sequences[1].last_allocation_id = 9002;
+    try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(&service, std.testing.allocator, .{
+        .barrier_id = 77,
+        .affected_table_ids = &.{7},
+        .job_ids = &.{7101},
+    });
+    try std.testing.expectEqual(@as(i64, 5), service.sequences[0].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[0].last_allocation_id);
+    try std.testing.expectEqual(@as(i64, 40), service.sequences[1].last_value);
+    try std.testing.expectEqual(@as(u128, 0), service.sequences[1].last_allocation_id);
+}
+
+fn allocateSequenceValueWithCas(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    database_name: []const u8,
+    namespace_name: []const u8,
+    sequence_name: []const u8,
+) !i64 {
+    const sequence_id = metadata_table_manager.deriveSequenceId(database_name, namespace_name, sequence_name);
+    const allocation_id = freshSequenceAllocationId();
+    for (0..sequence_allocation_max_attempts) |_| {
+        var snapshot = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&snapshot);
+        const record = findSequenceRecord(snapshot.sequences, sequence_id) orelse return error.SequenceNotFound;
+        const expected_last_value = record.last_value;
+        const next_value = try metadata_table_manager.sequenceNextValueFromRecord(alloc, record);
+        const observed = service.captureLifecycleSignal(null);
+        try service.proposeTransitionCommand(.{ .compare_and_swap_sequence = .{
+            .sequence_id = sequence_id,
+            .expected_last_value = expected_last_value,
+            .next_last_value = next_value,
+            .allocation_id = allocation_id,
+        } });
+        service.waitForLifecycleSignal(observed, sequence_allocation_retry_wait_ns);
+
+        var after = try service.adminSnapshot();
+        defer service.freeAdminSnapshot(&after);
+        const after_record = findSequenceRecord(after.sequences, sequence_id) orelse return error.SequenceNotFound;
+        if (after_record.last_value == next_value and after_record.last_allocation_id == allocation_id) return next_value;
+    }
+    return error.SequenceAllocationConflict;
+}
 
 const MetadataRunRoundTrace = struct {
     const Phase = struct {
@@ -412,10 +643,394 @@ pub const MetadataServiceConfig = struct {
     },
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
+    foreign_key_schema_controller: ForeignKeySchemaControllerConfig = .{},
+    unique_constraint_schema_controller: UniqueConstraintSchemaControllerConfig = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
     secret_store: ?*common_secrets.FileStore = null,
 };
+
+pub const ForeignKeySchemaControllerConfig = struct {
+    enabled: bool = true,
+    worker_id: []const u8 = default_fk_schema_controller_worker_id,
+    lease_ms: u64 = 60_000,
+    max_tables: usize = 4,
+    max_jobs: usize = 16,
+    max_action_jobs: usize = 16,
+    max_work_units_per_table: usize = 1,
+    action_job_page_limit: usize = 1024,
+    violation_limit: usize = 100,
+    max_followup_rounds: usize = 4,
+
+    fn toMaintenanceOptions(self: ForeignKeySchemaControllerConfig) api_table_writes.ForeignKeyIntegritySchemaControllerOptions {
+        return .{
+            .action = .repair,
+            .worker_id = self.worker_id,
+            .lease_ms = self.lease_ms,
+            .max_tables = self.max_tables,
+            .max_jobs = self.max_jobs,
+            .max_action_jobs = self.max_action_jobs,
+            .max_work_units_per_table = self.max_work_units_per_table,
+            .action_job_page_limit = self.action_job_page_limit,
+            .violation_limit = self.violation_limit,
+        };
+    }
+};
+
+pub const UniqueConstraintSchemaControllerConfig = struct {
+    enabled: bool = true,
+    worker_id: []const u8 = default_unique_schema_controller_worker_id,
+    max_tables: usize = 4,
+    max_followup_rounds: usize = 4,
+
+    fn toMaintenanceOptions(self: UniqueConstraintSchemaControllerConfig) api_table_writes.UniqueConstraintIntegritySchemaControllerOptions {
+        return .{
+            .action = .repair,
+            .worker_id = self.worker_id,
+            .max_tables = self.max_tables,
+        };
+    }
+};
+
+const ForeignKeySchemaControllerRuntimeStatus = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    counters: metadata_api.ForeignKeySchemaControllerStatus = .{},
+    last_failed_action_schedule_id_buf: [128]u8 = undefined,
+    last_failed_action_schedule_action_job_id_buf: [128]u8 = undefined,
+    last_failed_action_schedule_action_buf: [32]u8 = undefined,
+    last_failed_action_schedule_status_buf: [64]u8 = undefined,
+    last_failed_action_schedule_error_buf: [128]u8 = undefined,
+    last_failed_action_schedule_constraint_name_buf: [128]u8 = undefined,
+    last_failed_action_schedule_parent_table_buf: [128]u8 = undefined,
+    last_failed_action_schedule_parent_key_buf: [128]u8 = undefined,
+    last_failed_action_job_id_buf: [128]u8 = undefined,
+    last_failed_action_job_action_buf: [32]u8 = undefined,
+    last_failed_action_job_status_buf: [64]u8 = undefined,
+    last_failed_action_job_error_buf: [128]u8 = undefined,
+    last_failed_action_job_constraint_name_buf: [128]u8 = undefined,
+    last_failed_action_job_parent_table_buf: [128]u8 = undefined,
+    last_failed_action_job_parent_key_buf: [128]u8 = undefined,
+    last_failed_action_job_next_child_table_buf: [128]u8 = undefined,
+    last_failed_action_job_next_child_key_buf: [128]u8 = undefined,
+    last_terminal_invalid_table_name_buf: [128]u8 = undefined,
+    last_terminal_invalid_constraint_name_buf: [128]u8 = undefined,
+    last_terminal_invalid_job_id_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_kind_buf: [32]u8 = undefined,
+    last_terminal_invalid_violation_child_table_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_child_key_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_parent_table_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_parent_key_buf: [128]u8 = undefined,
+    last_terminal_invalid_violation_observed_parent_key_buf: [128]u8 = undefined,
+
+    fn snapshot(self: *ForeignKeySchemaControllerRuntimeStatus, config: ForeignKeySchemaControllerConfig) metadata_api.ForeignKeySchemaControllerStatus {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var out = self.counters;
+        out.enabled = config.enabled;
+        out.worker_id = config.worker_id;
+        return out;
+    }
+
+    fn recordSummary(
+        self: *ForeignKeySchemaControllerRuntimeStatus,
+        config: ForeignKeySchemaControllerConfig,
+        summary: api_table_writes.ForeignKeyIntegritySchemaControllerResult,
+    ) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.counters.enabled = config.enabled;
+        self.counters.worker_id = config.worker_id;
+        self.counters.rounds_total +%= 1;
+        self.counters.tables_scanned_total +%= summary.tables_scanned;
+        self.counters.tables_with_pending_constraints_total +%= summary.tables_with_pending_constraints;
+        self.counters.tables_executed_total +%= summary.tables_executed;
+        self.counters.jobs_scanned_total +%= summary.jobs_scanned;
+        self.counters.jobs_executed_total +%= summary.jobs_executed;
+        self.counters.action_schedules_scanned_total +%= summary.action_schedules_scanned;
+        self.counters.action_schedules_executed_total +%= summary.action_schedules_executed;
+        self.counters.action_schedules_invalid_total +%= summary.action_schedules_invalid;
+        self.counters.action_jobs_scanned_total +%= summary.action_jobs_scanned;
+        self.counters.action_jobs_executed_total +%= summary.action_jobs_executed;
+        self.counters.action_jobs_invalid_total +%= summary.action_jobs_invalid;
+        self.counters.claim_attempts_total +%= summary.claim_attempts;
+        self.counters.terminal_valid_results_total +%= summary.terminal_valid_results;
+        self.counters.terminal_invalid_results_total +%= summary.terminal_invalid_results;
+        self.counters.last_run_at_ms = nowMs();
+        self.counters.last_tables_scanned = summary.tables_scanned;
+        self.counters.last_tables_with_pending_constraints = summary.tables_with_pending_constraints;
+        self.counters.last_tables_executed = summary.tables_executed;
+        self.counters.last_jobs_scanned = summary.jobs_scanned;
+        self.counters.last_jobs_executed = summary.jobs_executed;
+        self.counters.last_action_schedules_scanned = summary.action_schedules_scanned;
+        self.counters.last_action_schedules_executed = summary.action_schedules_executed;
+        self.counters.last_action_schedules_invalid = summary.action_schedules_invalid;
+        self.counters.last_failed_action_schedule_group_id = 0;
+        self.counters.last_failed_action_schedule_id = "";
+        self.counters.last_failed_action_schedule_action_job_id = "";
+        self.counters.last_failed_action_schedule_action = "";
+        self.counters.last_failed_action_schedule_status = "";
+        self.counters.last_failed_action_schedule_error = "";
+        self.counters.last_failed_action_schedule_constraint_name = "";
+        self.counters.last_failed_action_schedule_parent_table = "";
+        self.counters.last_failed_action_schedule_parent_key = "";
+        self.counters.last_failed_action_schedule_scheduled_groups = 0;
+        self.counters.last_failed_action_schedule_cascade_depth = 0;
+        self.counters.last_failed_action_schedule_cascade_max_depth = 0;
+        self.counters.last_failed_action_schedule_requeue_count = 0;
+        self.counters.last_failed_action_schedule_last_requeued_at_ns = null;
+        self.counters.last_action_jobs_scanned = summary.action_jobs_scanned;
+        self.counters.last_action_jobs_executed = summary.action_jobs_executed;
+        self.counters.last_action_jobs_invalid = summary.action_jobs_invalid;
+        self.counters.last_action_jobs_completed = 0;
+        self.counters.last_action_jobs_failed = 0;
+        self.counters.last_action_jobs_depth_limit_failed = 0;
+        self.counters.last_action_job_applied_children = 0;
+        self.counters.last_failed_action_job_group_id = 0;
+        self.counters.last_failed_action_job_id = "";
+        self.counters.last_failed_action_job_action = "";
+        self.counters.last_failed_action_job_status = "";
+        self.counters.last_failed_action_job_error = "";
+        self.counters.last_failed_action_job_constraint_name = "";
+        self.counters.last_failed_action_job_parent_table = "";
+        self.counters.last_failed_action_job_parent_key = "";
+        self.counters.last_failed_action_job_next_child_table = "";
+        self.counters.last_failed_action_job_next_child_key = "";
+        self.counters.last_failed_action_job_attempts = 0;
+        self.counters.last_failed_action_job_applied_children = 0;
+        self.counters.last_failed_action_job_failure_count = 0;
+        self.counters.last_failed_action_job_first_failed_at_ns = 0;
+        self.counters.last_failed_action_job_last_failed_at_ns = 0;
+        self.counters.last_failed_action_job_requeue_count = 0;
+        self.counters.last_failed_action_job_last_requeued_at_ns = 0;
+        self.counters.last_failed_action_job_cascade_depth = 0;
+        self.counters.last_failed_action_job_cascade_max_depth = 0;
+        self.counters.last_failed_action_job_depth_limit_exhausted = false;
+        self.counters.last_terminal_invalid_table_name = "";
+        self.counters.last_terminal_invalid_constraint_name = "";
+        self.counters.last_terminal_invalid_job_id = "";
+        self.counters.last_terminal_invalid_diagnostic_passes = 0;
+        self.counters.last_terminal_invalid_violating_passes = 0;
+        self.counters.last_terminal_invalid_first_violation_at_ns = 0;
+        self.counters.last_terminal_invalid_last_violation_at_ns = 0;
+        self.counters.last_terminal_invalid_missing_parent_rows = 0;
+        self.counters.last_terminal_invalid_missing_ref_rows = 0;
+        self.counters.last_terminal_invalid_stale_ref_rows = 0;
+        self.counters.last_terminal_invalid_missing_parent_violations = 0;
+        self.counters.last_terminal_invalid_missing_ref_violations = 0;
+        self.counters.last_terminal_invalid_stale_ref_violations = 0;
+        self.counters.last_terminal_invalid_violation_sample_count = 0;
+        self.counters.last_terminal_invalid_violations_truncated = false;
+        self.counters.last_terminal_invalid_violation_group_id = 0;
+        self.counters.last_terminal_invalid_violation_kind = "";
+        self.counters.last_terminal_invalid_violation_child_table = "";
+        self.counters.last_terminal_invalid_violation_child_key = "";
+        self.counters.last_terminal_invalid_violation_parent_table = "";
+        self.counters.last_terminal_invalid_violation_parent_key = "";
+        self.counters.last_terminal_invalid_violation_observed_parent_key = "";
+        for (summary.action_schedules) |schedule| {
+            if (schedule.last_error == null and !std.mem.eql(u8, schedule.status, "invalid")) continue;
+            const error_text = schedule.last_error orelse schedule.status;
+            self.counters.last_failed_action_schedule_group_id = schedule.group_id;
+            self.counters.last_failed_action_schedule_id = copyForeignKeyStatusText(&self.last_failed_action_schedule_id_buf, schedule.schedule_id);
+            self.counters.last_failed_action_schedule_action_job_id = copyForeignKeyStatusText(&self.last_failed_action_schedule_action_job_id_buf, schedule.action_job_id);
+            self.counters.last_failed_action_schedule_action = copyForeignKeyStatusText(&self.last_failed_action_schedule_action_buf, schedule.action);
+            self.counters.last_failed_action_schedule_status = copyForeignKeyStatusText(&self.last_failed_action_schedule_status_buf, schedule.status);
+            self.counters.last_failed_action_schedule_error = copyForeignKeyStatusText(&self.last_failed_action_schedule_error_buf, error_text);
+            self.counters.last_failed_action_schedule_constraint_name = copyForeignKeyStatusText(&self.last_failed_action_schedule_constraint_name_buf, schedule.constraint_name);
+            self.counters.last_failed_action_schedule_parent_table = copyForeignKeyStatusText(&self.last_failed_action_schedule_parent_table_buf, schedule.parent_table);
+            self.counters.last_failed_action_schedule_parent_key = copyForeignKeyStatusText(&self.last_failed_action_schedule_parent_key_buf, schedule.parent_key);
+            self.counters.last_failed_action_schedule_scheduled_groups = schedule.scheduled_groups;
+            self.counters.last_failed_action_schedule_cascade_depth = schedule.cascade_depth;
+            self.counters.last_failed_action_schedule_cascade_max_depth = schedule.cascade_max_depth;
+            self.counters.last_failed_action_schedule_requeue_count = schedule.requeue_count;
+            self.counters.last_failed_action_schedule_last_requeued_at_ns = schedule.last_requeued_at_ns;
+        }
+        for (summary.action_jobs) |job| {
+            if (job.completed) self.counters.last_action_jobs_completed += 1;
+            self.counters.last_action_job_applied_children +%= job.applied_children;
+            if (job.last_error == null and !std.mem.eql(u8, job.status, "invalid")) continue;
+            self.counters.last_action_jobs_failed += 1;
+            const error_text = job.last_error orelse job.status;
+            if (std.mem.eql(u8, error_text, "ForeignKeyCascadeDepthLimit")) {
+                self.counters.last_action_jobs_depth_limit_failed += 1;
+            }
+            self.counters.last_failed_action_job_group_id = job.group_id;
+            self.counters.last_failed_action_job_id = copyForeignKeyStatusText(&self.last_failed_action_job_id_buf, job.job_id);
+            self.counters.last_failed_action_job_action = copyForeignKeyStatusText(&self.last_failed_action_job_action_buf, job.action);
+            self.counters.last_failed_action_job_status = copyForeignKeyStatusText(&self.last_failed_action_job_status_buf, job.status);
+            self.counters.last_failed_action_job_error = copyForeignKeyStatusText(&self.last_failed_action_job_error_buf, error_text);
+            self.counters.last_failed_action_job_constraint_name = copyForeignKeyStatusText(&self.last_failed_action_job_constraint_name_buf, job.constraint_name);
+            self.counters.last_failed_action_job_parent_table = copyForeignKeyStatusText(&self.last_failed_action_job_parent_table_buf, job.parent_table);
+            self.counters.last_failed_action_job_parent_key = copyForeignKeyStatusText(&self.last_failed_action_job_parent_key_buf, job.parent_key);
+            self.counters.last_failed_action_job_next_child_table = copyForeignKeyStatusText(&self.last_failed_action_job_next_child_table_buf, job.next_child_table orelse "");
+            self.counters.last_failed_action_job_next_child_key = copyForeignKeyStatusText(&self.last_failed_action_job_next_child_key_buf, job.next_child_key orelse "");
+            self.counters.last_failed_action_job_attempts = job.attempts;
+            self.counters.last_failed_action_job_applied_children = job.applied_children;
+            self.counters.last_failed_action_job_failure_count = job.failure_count;
+            self.counters.last_failed_action_job_first_failed_at_ns = job.first_failed_at_ns orelse 0;
+            self.counters.last_failed_action_job_last_failed_at_ns = job.last_failed_at_ns orelse 0;
+            self.counters.last_failed_action_job_requeue_count = job.requeue_count;
+            self.counters.last_failed_action_job_last_requeued_at_ns = job.last_requeued_at_ns orelse 0;
+            self.counters.last_failed_action_job_cascade_depth = job.cascade_depth;
+            self.counters.last_failed_action_job_cascade_max_depth = job.cascade_max_depth;
+            self.counters.last_failed_action_job_depth_limit_exhausted = std.mem.eql(u8, error_text, "ForeignKeyCascadeDepthLimit");
+        }
+        self.counters.action_jobs_failed_total +%= self.counters.last_action_jobs_failed;
+        self.counters.action_jobs_depth_limit_failed_total +%= self.counters.last_action_jobs_depth_limit_failed;
+        self.counters.last_claim_attempts = summary.claim_attempts;
+        self.counters.last_terminal_valid_results = summary.terminal_valid_results;
+        self.counters.last_terminal_invalid_results = summary.terminal_invalid_results;
+        self.counters.last_complete = summary.complete;
+        self.counters.last_valid = summary.valid;
+        self.counters.last_scanned_child_rows = 0;
+        self.counters.last_referenced_child_rows = 0;
+        self.counters.last_scanned_ref_rows = 0;
+        self.counters.last_missing_parent_rows = 0;
+        self.counters.last_missing_ref_rows = 0;
+        self.counters.last_stale_ref_rows = 0;
+        self.counters.last_repaired_ref_rows = 0;
+        self.counters.last_deleted_stale_ref_rows = 0;
+        for (summary.results) |entry| {
+            const report = entry.result.report;
+            self.counters.scanned_child_rows_total +%= report.scanned_child_rows;
+            self.counters.referenced_child_rows_total +%= report.referenced_child_rows;
+            self.counters.scanned_ref_rows_total +%= report.scanned_ref_rows;
+            self.counters.missing_parent_rows_total +%= report.missing_parent_rows;
+            self.counters.missing_ref_rows_total +%= report.missing_ref_rows;
+            self.counters.stale_ref_rows_total +%= report.stale_ref_rows;
+            self.counters.repaired_ref_rows_total +%= report.repaired_ref_rows;
+            self.counters.deleted_stale_ref_rows_total +%= report.deleted_stale_ref_rows;
+            self.counters.last_scanned_child_rows +%= report.scanned_child_rows;
+            self.counters.last_referenced_child_rows +%= report.referenced_child_rows;
+            self.counters.last_scanned_ref_rows +%= report.scanned_ref_rows;
+            self.counters.last_missing_parent_rows +%= report.missing_parent_rows;
+            self.counters.last_missing_ref_rows +%= report.missing_ref_rows;
+            self.counters.last_stale_ref_rows +%= report.stale_ref_rows;
+            self.counters.last_repaired_ref_rows +%= report.repaired_ref_rows;
+            self.counters.last_deleted_stale_ref_rows +%= report.deleted_stale_ref_rows;
+            if (isTerminalInvalidForeignKeySchemaControllerResult(entry.result)) {
+                const terminal_report = foreignKeyIntegrityTerminalDiagnosticReport(entry.result);
+                self.counters.terminal_invalid_missing_parent_rows_total +%= terminal_report.missing_parent_rows;
+                self.counters.terminal_invalid_missing_ref_rows_total +%= terminal_report.missing_ref_rows;
+                self.counters.terminal_invalid_stale_ref_rows_total +%= terminal_report.stale_ref_rows;
+                self.counters.terminal_invalid_violation_samples_total +%= entry.result.violations.len;
+                if (entry.result.violations_truncated) self.counters.terminal_invalid_violations_truncated_total +%= 1;
+                const missing_parent_violations = terminal_report.missing_parent_rows;
+                const missing_ref_violations = terminal_report.missing_ref_rows;
+                const stale_ref_violations = terminal_report.stale_ref_rows;
+                self.counters.terminal_invalid_missing_parent_violations_total +%= missing_parent_violations;
+                self.counters.terminal_invalid_missing_ref_violations_total +%= missing_ref_violations;
+                self.counters.terminal_invalid_stale_ref_violations_total +%= stale_ref_violations;
+                self.counters.last_terminal_invalid_table_name = copyForeignKeyStatusText(&self.last_terminal_invalid_table_name_buf, entry.table_name);
+                self.counters.last_terminal_invalid_constraint_name = copyForeignKeyStatusText(&self.last_terminal_invalid_constraint_name_buf, foreignKeyIntegrityResultConstraintName(entry.result) orelse "");
+                self.counters.last_terminal_invalid_job_id = copyForeignKeyStatusText(&self.last_terminal_invalid_job_id_buf, entry.result.job_id orelse "");
+                if (foreignKeyIntegrityResultJobStatus(entry.result)) |job| {
+                    self.counters.last_terminal_invalid_diagnostic_passes = job.diagnostic_passes;
+                    self.counters.last_terminal_invalid_violating_passes = job.violating_passes;
+                    self.counters.last_terminal_invalid_first_violation_at_ns = job.first_violation_at_ns orelse 0;
+                    self.counters.last_terminal_invalid_last_violation_at_ns = job.last_violation_at_ns orelse 0;
+                }
+                self.counters.last_terminal_invalid_missing_parent_rows = terminal_report.missing_parent_rows;
+                self.counters.last_terminal_invalid_missing_ref_rows = terminal_report.missing_ref_rows;
+                self.counters.last_terminal_invalid_stale_ref_rows = terminal_report.stale_ref_rows;
+                self.counters.last_terminal_invalid_missing_parent_violations = missing_parent_violations;
+                self.counters.last_terminal_invalid_missing_ref_violations = missing_ref_violations;
+                self.counters.last_terminal_invalid_stale_ref_violations = stale_ref_violations;
+                self.counters.last_terminal_invalid_violation_sample_count = entry.result.violations.len;
+                self.counters.last_terminal_invalid_violations_truncated = entry.result.violations_truncated;
+                if (entry.result.violations.len > 0) {
+                    const violation = entry.result.violations[0];
+                    self.counters.last_terminal_invalid_violation_group_id = violation.group_id;
+                    self.counters.last_terminal_invalid_violation_kind = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_kind_buf, @tagName(violation.kind));
+                    self.counters.last_terminal_invalid_violation_child_table = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_child_table_buf, violation.child_table);
+                    self.counters.last_terminal_invalid_violation_child_key = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_child_key_buf, violation.child_key);
+                    self.counters.last_terminal_invalid_violation_parent_table = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_parent_table_buf, violation.parent_table);
+                    self.counters.last_terminal_invalid_violation_parent_key = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_parent_key_buf, violation.parent_key);
+                    self.counters.last_terminal_invalid_violation_observed_parent_key = copyForeignKeyStatusText(&self.last_terminal_invalid_violation_observed_parent_key_buf, violation.observed_parent_key orelse "");
+                }
+            }
+        }
+    }
+};
+
+const UniqueConstraintSchemaControllerRuntimeStatus = struct {
+    mutex: std.atomic.Mutex = .unlocked,
+    counters: metadata_api.UniqueConstraintSchemaControllerStatus = .{},
+    last_terminal_invalid_table_name_buf: [128]u8 = undefined,
+    last_terminal_invalid_constraint_name_buf: [128]u8 = undefined,
+
+    fn snapshot(self: *UniqueConstraintSchemaControllerRuntimeStatus, config: UniqueConstraintSchemaControllerConfig) metadata_api.UniqueConstraintSchemaControllerStatus {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        var out = self.counters;
+        out.enabled = config.enabled;
+        out.worker_id = config.worker_id;
+        return out;
+    }
+
+    fn recordSummary(
+        self: *UniqueConstraintSchemaControllerRuntimeStatus,
+        config: UniqueConstraintSchemaControllerConfig,
+        summary: api_table_writes.UniqueConstraintIntegritySchemaControllerResult,
+    ) void {
+        while (!self.mutex.tryLock()) std.atomic.spinLoopHint();
+        defer self.mutex.unlock();
+        self.counters.enabled = config.enabled;
+        self.counters.worker_id = config.worker_id;
+        self.counters.rounds_total +%= 1;
+        self.counters.tables_scanned_total +%= summary.tables_scanned;
+        self.counters.tables_with_pending_constraints_total +%= summary.tables_with_pending_constraints;
+        self.counters.tables_executed_total +%= summary.tables_executed;
+        self.counters.terminal_valid_results_total +%= summary.terminal_valid_results;
+        self.counters.terminal_invalid_results_total +%= summary.terminal_invalid_results;
+        self.counters.last_run_at_ms = nowMs();
+        self.counters.last_tables_scanned = summary.tables_scanned;
+        self.counters.last_tables_with_pending_constraints = summary.tables_with_pending_constraints;
+        self.counters.last_tables_executed = summary.tables_executed;
+        self.counters.last_terminal_valid_results = summary.terminal_valid_results;
+        self.counters.last_terminal_invalid_results = summary.terminal_invalid_results;
+        self.counters.last_complete = summary.complete;
+        self.counters.last_valid = summary.valid;
+        self.counters.last_terminal_invalid_table_name = "";
+        self.counters.last_terminal_invalid_constraint_name = "";
+        self.counters.last_missing_unique_rows = 0;
+        self.counters.last_duplicate_unique_rows = 0;
+        self.counters.last_stale_unique_rows = 0;
+        self.counters.last_repaired_unique_rows = 0;
+        self.counters.last_deleted_stale_unique_rows = 0;
+
+        for (summary.results) |entry| {
+            self.counters.missing_unique_rows_total +%= entry.result.report.missing_unique_rows;
+            self.counters.duplicate_unique_rows_total +%= entry.result.report.duplicate_unique_rows;
+            self.counters.stale_unique_rows_total +%= entry.result.report.stale_unique_rows;
+            self.counters.repaired_unique_rows_total +%= entry.result.report.repaired_unique_rows;
+            self.counters.deleted_stale_unique_rows_total +%= entry.result.report.deleted_stale_unique_rows;
+            if (entry.result.complete and !entry.result.valid) {
+                self.counters.last_terminal_invalid_table_name = copyForeignKeyStatusText(&self.last_terminal_invalid_table_name_buf, entry.table_name);
+                self.counters.last_terminal_invalid_constraint_name = copyForeignKeyStatusText(&self.last_terminal_invalid_constraint_name_buf, entry.constraint_name);
+                self.counters.last_missing_unique_rows = entry.result.report.missing_unique_rows;
+                self.counters.last_duplicate_unique_rows = entry.result.report.duplicate_unique_rows;
+                self.counters.last_stale_unique_rows = entry.result.report.stale_unique_rows;
+                self.counters.last_repaired_unique_rows = entry.result.report.repaired_unique_rows;
+                self.counters.last_deleted_stale_unique_rows = entry.result.report.deleted_stale_unique_rows;
+            }
+        }
+    }
+};
+
+fn foreignKeySchemaControllerFollowupBudget(config: ForeignKeySchemaControllerConfig) usize {
+    return @max(@as(usize, 1), config.max_followup_rounds);
+}
+
+fn uniqueConstraintSchemaControllerFollowupBudget(config: UniqueConstraintSchemaControllerConfig) usize {
+    return @max(@as(usize, 1), config.max_followup_rounds);
+}
+
+fn copyForeignKeyStatusText(buf: []u8, text: []const u8) []const u8 {
+    const len = @min(buf.len, text.len);
+    @memcpy(buf[0..len], text[0..len]);
+    return buf[0..len];
+}
 
 pub const MetadataOrchestrationUrl = struct {
     node_id: u64,
@@ -616,8 +1231,17 @@ const LocalProjectionInputs = struct {
 };
 
 const ProjectedCoreSnapshot = struct {
+    databases: []metadata_table_manager.DatabaseRecord = &.{},
+    namespaces: []metadata_table_manager.NamespaceRecord = &.{},
+    tablespaces: []metadata_table_manager.TablespaceRecord = &.{},
+    sequences: []metadata_table_manager.SequenceRecord = &.{},
     tables: []metadata_table_manager.TableRecord = &.{},
     ranges: []metadata_table_manager.RangeRecord = &.{},
+    foreign_key_ref_ranges: []metadata_table_manager.ForeignKeyReferenceRangeRecord = &.{},
+    unique_constraint_ranges: []metadata_table_manager.UniqueConstraintRangeRecord = &.{},
+    secondary_index_rebuild_ranges: []metadata_table_manager.SecondaryIndexRebuildRangeRecord = &.{},
+    schema_rewrite_jobs: []metadata_table_manager.SchemaRewriteJobRecord = &.{},
+    table_emptying_jobs: []metadata_table_manager.TableEmptyingJobRecord = &.{},
     stores: []metadata_table_manager.StoreRecord = &.{},
     placement_intents: []raft_reconciler.PlacementIntent = &.{},
     shuffle_join_leases: []metadata_table_manager.ShuffleJoinLeaseRecord = &.{},
@@ -628,10 +1252,28 @@ const ProjectedCoreSnapshot = struct {
     merge_transitions: []transition_state.MergeTransitionRecord = &.{},
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.databases) |record| metadata_table_manager.freeDatabase(alloc, record);
+        if (self.databases.len > 0) alloc.free(self.databases);
+        for (self.namespaces) |record| metadata_table_manager.freeNamespace(alloc, record);
+        if (self.namespaces.len > 0) alloc.free(self.namespaces);
+        for (self.tablespaces) |record| metadata_table_manager.freeTablespace(alloc, record);
+        if (self.tablespaces.len > 0) alloc.free(self.tablespaces);
+        for (self.sequences) |record| metadata_table_manager.freeSequence(alloc, record);
+        if (self.sequences.len > 0) alloc.free(self.sequences);
         for (self.tables) |record| metadata_table_manager.freeTable(alloc, record);
         if (self.tables.len > 0) alloc.free(self.tables);
         for (self.ranges) |record| metadata_table_manager.freeRange(alloc, record);
         if (self.ranges.len > 0) alloc.free(self.ranges);
+        for (self.foreign_key_ref_ranges) |record| metadata_table_manager.freeForeignKeyReferenceRange(alloc, record);
+        if (self.foreign_key_ref_ranges.len > 0) alloc.free(self.foreign_key_ref_ranges);
+        for (self.unique_constraint_ranges) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
+        if (self.unique_constraint_ranges.len > 0) alloc.free(self.unique_constraint_ranges);
+        for (self.secondary_index_rebuild_ranges) |record| metadata_table_manager.freeSecondaryIndexRebuildRange(alloc, record);
+        if (self.secondary_index_rebuild_ranges.len > 0) alloc.free(self.secondary_index_rebuild_ranges);
+        for (self.schema_rewrite_jobs) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+        if (self.schema_rewrite_jobs.len > 0) alloc.free(self.schema_rewrite_jobs);
+        for (self.table_emptying_jobs) |record| metadata_table_manager.freeTableEmptyingJob(alloc, record);
+        if (self.table_emptying_jobs.len > 0) alloc.free(self.table_emptying_jobs);
         for (self.stores) |record| metadata_table_manager.freeStore(alloc, record);
         if (self.stores.len > 0) alloc.free(self.stores);
         for (self.placement_intents) |intent| alloc.free(intent.peer_node_ids);
@@ -652,6 +1294,9 @@ const ProjectedCoreSnapshot = struct {
     fn diagnostics(self: *const @This()) ProjectedCoreSnapshotDiagnostics {
         var out = ProjectedCoreSnapshotDiagnostics{
             .cached = true,
+            .databases = self.databases.len,
+            .namespaces = self.namespaces.len,
+            .tablespaces = self.tablespaces.len,
             .tables = self.tables.len,
             .ranges = self.ranges.len,
             .stores = self.stores.len,
@@ -664,7 +1309,10 @@ const ProjectedCoreSnapshot = struct {
             .replication_source_statuses = self.replication_source_statuses.len,
             .split_transitions = self.split_transitions.len,
             .merge_transitions = self.merge_transitions.len,
-            .estimated_bytes = @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
+            .estimated_bytes = @sizeOf(metadata_table_manager.DatabaseRecord) * self.databases.len +
+                @sizeOf(metadata_table_manager.NamespaceRecord) * self.namespaces.len +
+                @sizeOf(metadata_table_manager.TablespaceRecord) * self.tablespaces.len +
+                @sizeOf(metadata_table_manager.TableRecord) * self.tables.len +
                 @sizeOf(metadata_table_manager.RangeRecord) * self.ranges.len +
                 @sizeOf(metadata_table_manager.StoreRecord) * self.stores.len +
                 @sizeOf(raft_reconciler.PlacementIntent) * self.placement_intents.len +
@@ -675,6 +1323,9 @@ const ProjectedCoreSnapshot = struct {
                 @sizeOf(transition_state.SplitTransitionRecord) * self.split_transitions.len +
                 @sizeOf(transition_state.MergeTransitionRecord) * self.merge_transitions.len,
         };
+        for (self.databases) |record| out.estimated_bytes += record.name.len + record.settings_json.len;
+        for (self.namespaces) |record| out.estimated_bytes += record.name.len;
+        for (self.tablespaces) |record| out.estimated_bytes += record.name.len + record.location_json.len + record.placement_policy_json.len;
         for (self.tables) |record| {
             out.estimated_bytes += record.name.len + record.description.len + record.schema_json.len +
                 record.read_schema_json.len + record.indexes_json.len + record.replication_sources_json.len +
@@ -732,6 +1383,9 @@ const ProjectedCoreSnapshotCache = struct {
 
 const ProjectedCoreSnapshotDiagnostics = struct {
     cached: bool = false,
+    databases: usize = 0,
+    namespaces: usize = 0,
+    tablespaces: usize = 0,
     tables: usize = 0,
     ranges: usize = 0,
     stores: usize = 0,
@@ -883,6 +1537,74 @@ fn cloneProjectedTablesOwned(
     return out;
 }
 
+fn cloneProjectedDatabasesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.DatabaseRecord,
+) ![]metadata_table_manager.DatabaseRecord {
+    const out = try alloc.alloc(metadata_table_manager.DatabaseRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeDatabase(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneDatabase(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedNamespacesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.NamespaceRecord,
+) ![]metadata_table_manager.NamespaceRecord {
+    const out = try alloc.alloc(metadata_table_manager.NamespaceRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeNamespace(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneNamespace(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedTablespacesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.TablespaceRecord,
+) ![]metadata_table_manager.TablespaceRecord {
+    const out = try alloc.alloc(metadata_table_manager.TablespaceRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeTablespace(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneTablespace(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedSequencesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.SequenceRecord,
+) ![]metadata_table_manager.SequenceRecord {
+    const out = try alloc.alloc(metadata_table_manager.SequenceRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeSequence(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneSequence(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
 fn cloneProjectedRangesOwned(
     alloc: std.mem.Allocator,
     records: []const metadata_table_manager.RangeRecord,
@@ -895,6 +1617,91 @@ fn cloneProjectedRangesOwned(
     }
     for (records, 0..) |record, i| {
         out[i] = try metadata_table_manager.cloneRange(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedForeignKeyReferenceRangesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.ForeignKeyReferenceRangeRecord,
+) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+    const out = try alloc.alloc(metadata_table_manager.ForeignKeyReferenceRangeRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeForeignKeyReferenceRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneForeignKeyReferenceRange(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedUniqueConstraintRangesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.UniqueConstraintRangeRecord,
+) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+    const out = try alloc.alloc(metadata_table_manager.UniqueConstraintRangeRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeUniqueConstraintRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneUniqueConstraintRange(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedSecondaryIndexRebuildRangesOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.SecondaryIndexRebuildRangeRecord,
+) ![]metadata_table_manager.SecondaryIndexRebuildRangeRecord {
+    const out = try alloc.alloc(metadata_table_manager.SecondaryIndexRebuildRangeRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeSecondaryIndexRebuildRange(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneSecondaryIndexRebuildRange(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedSchemaRewriteJobsOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.SchemaRewriteJobRecord,
+) ![]metadata_table_manager.SchemaRewriteJobRecord {
+    const out = try alloc.alloc(metadata_table_manager.SchemaRewriteJobRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeSchemaRewriteJob(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneSchemaRewriteJob(alloc, record);
+        cloned = i + 1;
+    }
+    return out;
+}
+
+fn cloneProjectedTableEmptyingJobsOwned(
+    alloc: std.mem.Allocator,
+    records: []const metadata_table_manager.TableEmptyingJobRecord,
+) ![]metadata_table_manager.TableEmptyingJobRecord {
+    const out = try alloc.alloc(metadata_table_manager.TableEmptyingJobRecord, records.len);
+    var cloned: usize = 0;
+    errdefer {
+        for (out[0..cloned]) |record| metadata_table_manager.freeTableEmptyingJob(alloc, record);
+        alloc.free(out);
+    }
+    for (records, 0..) |record, i| {
+        out[i] = try metadata_table_manager.cloneTableEmptyingJob(alloc, record);
         cloned = i + 1;
     }
     return out;
@@ -915,6 +1722,26 @@ fn cloneProjectedStoresOwned(
         cloned = i + 1;
     }
     return out;
+}
+
+fn tableEmptyingIdentityAllocatorResetTargetsFromSnapshotAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: metadata_api.AdminSnapshot,
+    request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest,
+) ![]metadata_table_manager.SequenceIdentityAllocatorReset {
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    _ = try manager.replaceProjectedTopologyWithDerivedWork(
+        snapshot.tables,
+        snapshot.ranges,
+        snapshot.foreign_key_ref_ranges,
+        snapshot.unique_constraint_ranges,
+        snapshot.secondary_index_rebuild_ranges,
+        snapshot.schema_rewrite_jobs,
+        snapshot.table_emptying_jobs,
+    );
+    for (snapshot.sequences) |record| try manager.upsertSequence(record);
+    return try manager.tableEmptyingIdentityAllocatorResetTargetsAlloc(alloc, request);
 }
 
 fn cloneProjectedShuffleJoinLeasesOwned(
@@ -1142,6 +1969,10 @@ pub const MetadataService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    foreign_key_schema_controller: ForeignKeySchemaControllerConfig,
+    foreign_key_schema_controller_status: ForeignKeySchemaControllerRuntimeStatus = .{},
+    unique_constraint_schema_controller: UniqueConstraintSchemaControllerConfig,
+    unique_constraint_schema_controller_status: UniqueConstraintSchemaControllerRuntimeStatus = .{},
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
@@ -1149,6 +1980,10 @@ pub const MetadataService = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     raft: raft_service.ManagedHostService,
+
+    pub fn catalogSource(self: *MetadataService) catalog_source.CatalogSource {
+        return catalogSourceForMetadataService(MetadataService, self);
+    }
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -1178,6 +2013,8 @@ pub const MetadataService = struct {
             .lifecycle_signal = LifecycleSignal.init(alloc),
             .backend_runtime = cfg.backend_runtime,
             .secret_store = cfg.secret_store,
+            .foreign_key_schema_controller = cfg.foreign_key_schema_controller,
+            .unique_constraint_schema_controller = cfg.unique_constraint_schema_controller,
             .raft = try raft_service.ManagedHostService.init(alloc, host_cfg, deps.host, cfg.raft, deps.raft),
         };
         errdefer service.deinit();
@@ -1273,7 +2110,7 @@ pub const MetadataService = struct {
     fn metadataServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .schema_rewrite_job, .table_emptying_job, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
             .reconcile_lease => _ = self.reconcile_lease_epoch.fetchAdd(1, .monotonic),
             .split_transition, .merge_transition => _ = self.transition_epoch.fetchAdd(1, .monotonic),
@@ -1408,6 +2245,69 @@ pub const MetadataService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: *MetadataService,
+        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_update_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: *MetadataService,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_batch_update_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: *MetadataService,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_drop_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn upsertDatabase(self: *MetadataService, record: metadata_table_manager.DatabaseRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_database = record });
+    }
+
+    pub fn removeDatabase(self: *MetadataService, database_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_database = .{ .database_id = database_id } });
+    }
+
+    pub fn upsertNamespace(self: *MetadataService, record: metadata_table_manager.NamespaceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_namespace = record });
+    }
+
+    pub fn removeNamespace(self: *MetadataService, namespace_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_namespace = .{ .namespace_id = namespace_id } });
+    }
+
+    pub fn upsertTablespace(self: *MetadataService, record: metadata_table_manager.TablespaceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_tablespace = record });
+    }
+
+    pub fn removeTablespace(self: *MetadataService, tablespace_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_tablespace = .{ .tablespace_id = tablespace_id } });
+    }
+
+    pub fn upsertSequence(self: *MetadataService, record: metadata_table_manager.SequenceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_sequence = record });
+    }
+
+    pub fn removeSequence(self: *MetadataService, sequence_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_sequence = .{ .sequence_id = sequence_id } });
+    }
+
+    pub fn allocateSequenceValue(
+        self: *MetadataService,
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) !i64 {
+        return try allocateSequenceValueWithCas(self, alloc, database_name, namespace_name, sequence_name);
+    }
+
     pub fn removeTable(self: *MetadataService, table_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
     }
@@ -1452,6 +2352,177 @@ pub const MetadataService = struct {
 
     pub fn removeRange(self: *MetadataService, group_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
+    }
+
+    pub fn upsertForeignKeyReferenceRange(self: *MetadataService, record: metadata_table_manager.ForeignKeyReferenceRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_foreign_key_ref_range = record });
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *MetadataService,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_foreign_key_ref_range = .{
+            .child_table_id = child_table_id,
+            .constraint_name = constraint_name,
+            .parent_table_id = parent_table_id,
+            .start_parent_key = start_parent_key,
+        } });
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_split = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_split = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *MetadataService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *MetadataService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *MetadataService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn upsertUniqueConstraintRange(self: *MetadataService, record: metadata_table_manager.UniqueConstraintRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_unique_constraint_range = record });
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *MetadataService,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_unique_constraint_range = .{
+            .table_id = table_id,
+            .constraint_name = constraint_name,
+            .start_encoded_value = start_encoded_value,
+        } });
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_split = request });
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_split = request });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_merge = request });
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: *MetadataService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_merge = request });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: *MetadataService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: *MetadataService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn upsertSecondaryIndexRebuildRange(self: *MetadataService, record: metadata_table_manager.SecondaryIndexRebuildRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_secondary_index_rebuild_range = record });
+    }
+
+    pub fn removeSecondaryIndexRebuildRange(
+        self: *MetadataService,
+        table_id: u64,
+        index_name: []const u8,
+        index_generation: u64,
+        start_row_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_secondary_index_rebuild_range = .{
+            .table_id = table_id,
+            .index_name = index_name,
+            .index_generation = index_generation,
+            .start_row_key = start_row_key,
+        } });
+    }
+
+    pub fn beginSecondaryIndexRebuildRange(self: *MetadataService, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_secondary_index_rebuild_range = request });
+    }
+
+    pub fn finishSecondaryIndexRebuildRange(self: *MetadataService, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_secondary_index_rebuild_range = request });
+    }
+
+    pub fn invalidateSecondaryIndexRebuildRange(self: *MetadataService, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_secondary_index_rebuild_range = request });
+    }
+
+    pub fn upsertSchemaRewriteJob(self: *MetadataService, record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_schema_rewrite_job = record });
+    }
+
+    pub fn removeSchemaRewriteJob(self: *MetadataService, job_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_schema_rewrite_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_schema_rewrite_job = request });
+    }
+
+    pub fn finishSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_schema_rewrite_job = request });
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *MetadataService, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
+    }
+
+    pub fn upsertTableEmptyingJob(self: *MetadataService, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_table_emptying_job = record });
+    }
+
+    pub fn removeTableEmptyingJob(self: *MetadataService, job_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_table_emptying_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_table_emptying_job = request });
+    }
+
+    pub fn finishTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_table_emptying_job = request });
+    }
+
+    pub fn invalidateTableEmptyingJob(self: *MetadataService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *MetadataService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        try self.proposeTransitionCommand(.{ .promote_table_emptying_barrier = request });
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *MetadataService, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+        try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(self, self.alloc, request);
+    }
+
+    pub fn promoteSecondaryIndexReady(self: *MetadataService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
+        try self.proposeTransitionCommand(.{ .promote_secondary_index_ready = request });
+    }
+
+    pub fn compareAndSwapTableSchema(self: *MetadataService, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
+        try self.proposeTransitionCommand(.{ .compare_and_swap_table_schema = request });
     }
 
     pub fn removeSplitTransition(self: *MetadataService, transition_id: u64) !void {
@@ -1528,6 +2599,28 @@ pub const MetadataService = struct {
             else => return err,
         };
         try self.completeRestoreIntentsIfReady();
+        self.runForeignKeySchemaControllerMaintenanceRound() catch |err| switch (err) {
+            error.TableNotFound,
+            error.ForeignKeyNotFound,
+            error.InvalidSchemaUpdateRequest,
+            error.FileNotFound,
+            error.WriterLocked,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => std.log.warn("metadata fk schema-controller round skipped: {s}", .{@errorName(err)}),
+            else => return err,
+        };
+        self.runUniqueConstraintSchemaControllerMaintenanceRound() catch |err| switch (err) {
+            error.TableNotFound,
+            error.UniqueConstraintNotFound,
+            error.InvalidSchemaUpdateRequest,
+            error.FileNotFound,
+            error.WriterLocked,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => std.log.warn("metadata unique schema-controller round skipped: {s}", .{@errorName(err)}),
+            else => return err,
+        };
         try self.runLifecycleReconcileHookIfRequested();
     }
 
@@ -1592,11 +2685,17 @@ pub const MetadataService = struct {
 
     pub fn applyReconciliationPlan(self: *MetadataService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
-        for (plan.table_upserts) |record| try self.upsertTable(record);
+        for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
         for (plan.range_upserts) |record| try self.upsertRange(record);
+        for (plan.foreign_key_ref_range_upserts) |record| try self.upsertForeignKeyReferenceRange(record);
+        for (plan.unique_constraint_range_upserts) |record| try self.upsertUniqueConstraintRange(record);
+        for (plan.secondary_index_rebuild_range_upserts) |record| try self.upsertSecondaryIndexRebuildRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
         for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.foreign_key_ref_range_removals) |record| try self.removeForeignKeyReferenceRange(record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        for (plan.unique_constraint_range_removals) |record| try self.removeUniqueConstraintRange(record.table_id, record.constraint_name, record.start_encoded_value);
+        for (plan.secondary_index_rebuild_range_removals) |record| try self.removeSecondaryIndexRebuildRange(record.table_id, record.index_name, record.index_generation, record.start_row_key);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -1650,6 +2749,22 @@ pub const MetadataService = struct {
         return current_status;
     }
 
+    pub fn foreignKeySchemaControllerStatus(self: *MetadataService) metadata_api.ForeignKeySchemaControllerStatus {
+        return self.foreign_key_schema_controller_status.snapshot(self.foreign_key_schema_controller);
+    }
+
+    pub fn uniqueConstraintSchemaControllerStatus(self: *MetadataService) metadata_api.UniqueConstraintSchemaControllerStatus {
+        return self.unique_constraint_schema_controller_status.snapshot(self.unique_constraint_schema_controller);
+    }
+
+    fn recordForeignKeySchemaControllerMaintenanceSummary(self: *MetadataService, summary: api_table_writes.ForeignKeyIntegritySchemaControllerResult) void {
+        self.foreign_key_schema_controller_status.recordSummary(self.foreign_key_schema_controller, summary);
+    }
+
+    fn recordUniqueConstraintSchemaControllerMaintenanceSummary(self: *MetadataService, summary: api_table_writes.UniqueConstraintIntegritySchemaControllerResult) void {
+        self.unique_constraint_schema_controller_status.recordSummary(self.unique_constraint_schema_controller, summary);
+    }
+
     pub fn metadataStatus(self: *MetadataService) !MetadataStatus {
         var current_status = try snapshotStatusWithOptions(self.alloc, self.metadata_group_id, self, self.metrics(), .{
             .include_reconciliation_planning = true,
@@ -1692,6 +2807,46 @@ pub const MetadataService = struct {
     pub fn listProjectedTables(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableRecord {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         return try store.listTables(alloc, self.metadata_group_id);
+    }
+
+    pub fn listProjectedDatabases(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.DatabaseRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listDatabases(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedDatabases(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.DatabaseRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeDatabases(alloc, records);
+    }
+
+    pub fn listProjectedNamespaces(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.NamespaceRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listNamespaces(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedNamespaces(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.NamespaceRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeNamespaces(alloc, records);
+    }
+
+    pub fn listProjectedTablespaces(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.TablespaceRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listTablespaces(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedTablespaces(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TablespaceRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeTablespaces(alloc, records);
+    }
+
+    pub fn listProjectedSequences(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.SequenceRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listSequences(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedSequences(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.SequenceRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSequences(alloc, records);
     }
 
     pub fn freeProjectedTables(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
@@ -1795,6 +2950,56 @@ pub const MetadataService = struct {
     pub fn freeProjectedRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeRanges(alloc, records);
+    }
+
+    pub fn listProjectedForeignKeyReferenceRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listForeignKeyReferenceRanges(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedForeignKeyReferenceRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeForeignKeyReferenceRanges(alloc, records);
+    }
+
+    pub fn listProjectedUniqueConstraintRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listUniqueConstraintRanges(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedUniqueConstraintRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.UniqueConstraintRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeUniqueConstraintRanges(alloc, records);
+    }
+
+    pub fn listProjectedSecondaryIndexRebuildRanges(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.SecondaryIndexRebuildRangeRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listSecondaryIndexRebuildRanges(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedSecondaryIndexRebuildRanges(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.SecondaryIndexRebuildRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSecondaryIndexRebuildRanges(alloc, records);
+    }
+
+    pub fn listProjectedSchemaRewriteJobs(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listSchemaRewriteJobs(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedSchemaRewriteJobs(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSchemaRewriteJobs(alloc, records);
+    }
+
+    pub fn listProjectedTableEmptyingJobs(self: *MetadataService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableEmptyingJobRecord {
+        const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        return try store.listTableEmptyingJobs(alloc, self.metadata_group_id);
+    }
+
+    pub fn freeProjectedTableEmptyingJobs(self: *MetadataService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableEmptyingJobRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeTableEmptyingJobs(alloc, records);
     }
 
     pub fn listProjectedPlacementIntents(self: *MetadataService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
@@ -2195,7 +3400,7 @@ pub const MetadataService = struct {
 
         var write_source = api_table_writes.ProvisionedTableWriteSource.init(
             replica_root_dir,
-            api_table_catalog.CatalogSource.fromMetadataService(self),
+            self.catalogSource(),
         );
         write_source.backend_runtime = try self.ensureBackendRuntime();
         _ = write_source.withSecretStore(self.secret_store);
@@ -2296,6 +3501,42 @@ pub const MetadataService = struct {
             );
         }
     }
+
+    fn runForeignKeySchemaControllerMaintenanceRound(self: *MetadataService) !void {
+        if (!self.foreign_key_schema_controller.enabled) return;
+        const replica_root_dir = self.replica_root_dir orelse return;
+        if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
+        var write_source = api_table_writes.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            self.catalogSource(),
+        );
+        defer write_source.deinit();
+        write_source.backend_runtime = try self.ensureBackendRuntime();
+        _ = write_source.withSecretStore(self.secret_store);
+        for (0..foreignKeySchemaControllerFollowupBudget(self.foreign_key_schema_controller)) |_| {
+            const round_status = try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+            if (round_status != .incomplete) break;
+            self.lifecycle_signal.notify(null);
+        }
+    }
+
+    fn runUniqueConstraintSchemaControllerMaintenanceRound(self: *MetadataService) !void {
+        if (!self.unique_constraint_schema_controller.enabled) return;
+        const replica_root_dir = self.replica_root_dir orelse return;
+        if (!self.raft.host.host.isLocalLeader(self.metadata_group_id)) return;
+        var write_source = api_table_writes.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            self.catalogSource(),
+        );
+        defer write_source.deinit();
+        write_source.backend_runtime = try self.ensureBackendRuntime();
+        _ = write_source.withSecretStore(self.secret_store);
+        for (0..uniqueConstraintSchemaControllerFollowupBudget(self.unique_constraint_schema_controller)) |_| {
+            const round_status = try runUniqueConstraintSchemaControllerMaintenanceForService(self, write_source.source(), self.unique_constraint_schema_controller);
+            if (round_status != .incomplete) break;
+            self.lifecycle_signal.notify(null);
+        }
+    }
 };
 
 pub const MetadataHttpService = struct {
@@ -2347,6 +3588,10 @@ pub const MetadataHttpService = struct {
     cdc_backfill_registry: foreign_mod.Registry = .{},
     cdc_next_round_at_ms: u64 = 0,
     secret_store: ?*common_secrets.FileStore = null,
+    foreign_key_schema_controller: ForeignKeySchemaControllerConfig,
+    foreign_key_schema_controller_status: ForeignKeySchemaControllerRuntimeStatus = .{},
+    unique_constraint_schema_controller: UniqueConstraintSchemaControllerConfig,
+    unique_constraint_schema_controller_status: UniqueConstraintSchemaControllerRuntimeStatus = .{},
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
@@ -2356,6 +3601,10 @@ pub const MetadataHttpService = struct {
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
     json_response_peak_bytes: std.atomic.Value(u64) = .init(0),
     raft: raft_service.ManagedHttpHostService,
+
+    pub fn catalogSource(self: *MetadataHttpService) catalog_source.CatalogSource {
+        return catalogSourceForMetadataService(MetadataHttpService, self);
+    }
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -2403,6 +3652,8 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
+            .foreign_key_schema_controller = cfg.foreign_key_schema_controller,
+            .unique_constraint_schema_controller = cfg.unique_constraint_schema_controller,
             .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
@@ -2511,7 +3762,7 @@ pub const MetadataHttpService = struct {
     fn metadataHttpServiceProjectionSignal(ptr: *anyopaque, signal: metadata_storage.raft_apply_store.ProjectionSignal) void {
         const self: *MetadataHttpService = @ptrCast(@alignCast(ptr));
         switch (signal.kind) {
-            .table, .range, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
+            .table, .range, .foreign_key_ref_range, .unique_constraint_range, .secondary_index_rebuild_range, .schema_rewrite_job, .table_emptying_job, .store, .shuffle_join_lease => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .schema_progress => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .restore_progress, .replication_source_status => _ = self.projection_epoch.fetchAdd(1, .monotonic),
             .placement_intent => _ = self.placement_epoch.fetchAdd(1, .monotonic),
@@ -2709,6 +3960,69 @@ pub const MetadataHttpService = struct {
         try self.proposeTransitionCommand(.{ .upsert_table = record });
     }
 
+    pub fn applyTableCatalogUpdateWithSchemaRewriteJobs(
+        self: *MetadataHttpService,
+        request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_update_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(
+        self: *MetadataHttpService,
+        request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_batch_update_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn applyTableCatalogDropWithSchemaRewriteJobs(
+        self: *MetadataHttpService,
+        request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .apply_table_catalog_drop_with_schema_rewrite_jobs = request });
+    }
+
+    pub fn upsertDatabase(self: *MetadataHttpService, record: metadata_table_manager.DatabaseRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_database = record });
+    }
+
+    pub fn removeDatabase(self: *MetadataHttpService, database_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_database = .{ .database_id = database_id } });
+    }
+
+    pub fn upsertNamespace(self: *MetadataHttpService, record: metadata_table_manager.NamespaceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_namespace = record });
+    }
+
+    pub fn removeNamespace(self: *MetadataHttpService, namespace_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_namespace = .{ .namespace_id = namespace_id } });
+    }
+
+    pub fn upsertTablespace(self: *MetadataHttpService, record: metadata_table_manager.TablespaceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_tablespace = record });
+    }
+
+    pub fn removeTablespace(self: *MetadataHttpService, tablespace_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_tablespace = .{ .tablespace_id = tablespace_id } });
+    }
+
+    pub fn upsertSequence(self: *MetadataHttpService, record: metadata_table_manager.SequenceRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_sequence = record });
+    }
+
+    pub fn removeSequence(self: *MetadataHttpService, sequence_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_sequence = .{ .sequence_id = sequence_id } });
+    }
+
+    pub fn allocateSequenceValue(
+        self: *MetadataHttpService,
+        alloc: std.mem.Allocator,
+        database_name: []const u8,
+        namespace_name: []const u8,
+        sequence_name: []const u8,
+    ) !i64 {
+        return try allocateSequenceValueWithCas(self, alloc, database_name, namespace_name, sequence_name);
+    }
+
     pub fn removeTable(self: *MetadataHttpService, table_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_table = .{ .table_id = table_id } });
     }
@@ -2753,6 +4067,177 @@ pub const MetadataHttpService = struct {
 
     pub fn removeRange(self: *MetadataHttpService, group_id: u64) !void {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
+    }
+
+    pub fn upsertForeignKeyReferenceRange(self: *MetadataHttpService, record: metadata_table_manager.ForeignKeyReferenceRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_foreign_key_ref_range = record });
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *MetadataHttpService,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_foreign_key_ref_range = .{
+            .child_table_id = child_table_id,
+            .constraint_name = constraint_name,
+            .parent_table_id = parent_table_id,
+            .start_parent_key = start_parent_key,
+        } });
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_split = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_split = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn upsertUniqueConstraintRange(self: *MetadataHttpService, record: metadata_table_manager.UniqueConstraintRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_unique_constraint_range = record });
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *MetadataHttpService,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_unique_constraint_range = .{
+            .table_id = table_id,
+            .constraint_name = constraint_name,
+            .start_encoded_value = start_encoded_value,
+        } });
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_split = request });
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_split = request });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_merge = request });
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: *MetadataHttpService, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_merge = request });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: *MetadataHttpService, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn upsertSecondaryIndexRebuildRange(self: *MetadataHttpService, record: metadata_table_manager.SecondaryIndexRebuildRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_secondary_index_rebuild_range = record });
+    }
+
+    pub fn removeSecondaryIndexRebuildRange(
+        self: *MetadataHttpService,
+        table_id: u64,
+        index_name: []const u8,
+        index_generation: u64,
+        start_row_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_secondary_index_rebuild_range = .{
+            .table_id = table_id,
+            .index_name = index_name,
+            .index_generation = index_generation,
+            .start_row_key = start_row_key,
+        } });
+    }
+
+    pub fn beginSecondaryIndexRebuildRange(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_secondary_index_rebuild_range = request });
+    }
+
+    pub fn finishSecondaryIndexRebuildRange(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_secondary_index_rebuild_range = request });
+    }
+
+    pub fn invalidateSecondaryIndexRebuildRange(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_secondary_index_rebuild_range = request });
+    }
+
+    pub fn upsertSchemaRewriteJob(self: *MetadataHttpService, record: metadata_table_manager.SchemaRewriteJobRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_schema_rewrite_job = record });
+    }
+
+    pub fn removeSchemaRewriteJob(self: *MetadataHttpService, job_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_schema_rewrite_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_schema_rewrite_job = request });
+    }
+
+    pub fn finishSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_schema_rewrite_job = request });
+    }
+
+    pub fn invalidateSchemaRewriteJob(self: *MetadataHttpService, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_schema_rewrite_job = request });
+    }
+
+    pub fn upsertTableEmptyingJob(self: *MetadataHttpService, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_table_emptying_job = record });
+    }
+
+    pub fn removeTableEmptyingJob(self: *MetadataHttpService, job_id: u64) !void {
+        try self.proposeTransitionCommand(.{ .remove_table_emptying_job = .{ .job_id = job_id } });
+    }
+
+    pub fn beginTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_table_emptying_job = request });
+    }
+
+    pub fn finishTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_table_emptying_job = request });
+    }
+
+    pub fn invalidateTableEmptyingJob(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+        try self.proposeTransitionCommand(.{ .invalidate_table_emptying_job = request });
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        try self.proposeTransitionCommand(.{ .promote_table_emptying_barrier = request });
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *MetadataHttpService, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+        try resetIdentityAllocatorsForTableEmptyingBarrierWithCas(self, self.alloc, request);
+    }
+
+    pub fn promoteSecondaryIndexReady(self: *MetadataHttpService, request: metadata_table_manager.SecondaryIndexReadyPromotionRequest) !void {
+        try self.proposeTransitionCommand(.{ .promote_secondary_index_ready = request });
+    }
+
+    pub fn compareAndSwapTableSchema(self: *MetadataHttpService, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
+        try self.proposeTransitionCommand(.{ .compare_and_swap_table_schema = request });
     }
 
     pub fn removeSplitTransition(self: *MetadataHttpService, transition_id: u64) !void {
@@ -2821,7 +4306,6 @@ pub const MetadataHttpService = struct {
             run_round_trace.recordSince("lifecycle_signal_notify", lifecycle_signal_phase_start_ns);
         }
         phase_start_ns = platform_time.monotonicNs();
-        var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         self.lockRuntime();
         {
             defer self.unlockRuntime();
@@ -2830,11 +4314,9 @@ pub const MetadataHttpService = struct {
             } else {
                 try self.raft.runRaftRoundOnly();
             }
-            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
         }
         self.refreshProbeReady();
         run_round_trace.recordSince("raft_round", phase_start_ns);
-        if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
@@ -2892,6 +4374,9 @@ pub const MetadataHttpService = struct {
         try self.refreshLocalTransitions(&local_transition_inputs);
         run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
+        _ = try self.raft.stepTransitions();
+        run_round_trace.recordSince("step_transitions", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
@@ -2903,6 +4388,32 @@ pub const MetadataHttpService = struct {
         phase_start_ns = platform_time.monotonicNs();
         try self.runReplicationBackfillRound();
         run_round_trace.recordSince("run_replication_backfill", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        self.runForeignKeySchemaControllerMaintenanceRound() catch |err| switch (err) {
+            error.TableNotFound,
+            error.ForeignKeyNotFound,
+            error.InvalidSchemaUpdateRequest,
+            error.FileNotFound,
+            error.WriterLocked,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => std.log.warn("metadata http fk schema-controller round skipped: {s}", .{@errorName(err)}),
+            else => return err,
+        };
+        run_round_trace.recordSince("run_fk_schema_controller", phase_start_ns);
+        phase_start_ns = platform_time.monotonicNs();
+        self.runUniqueConstraintSchemaControllerMaintenanceRound() catch |err| switch (err) {
+            error.TableNotFound,
+            error.UniqueConstraintNotFound,
+            error.InvalidSchemaUpdateRequest,
+            error.FileNotFound,
+            error.WriterLocked,
+            error.LmdbUnexpected,
+            error.Corrupted,
+            => std.log.warn("metadata http unique schema-controller round skipped: {s}", .{@errorName(err)}),
+            else => return err,
+        };
+        run_round_trace.recordSince("run_unique_schema_controller", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.runLifecycleReconcileHookIfRequested();
         run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
@@ -2927,6 +4438,7 @@ pub const MetadataHttpService = struct {
         try self.ensureLifecycleListenerRegistered();
         defer self.refreshMetadataStatusCacheIfDue();
         defer self.lifecycle_signal.notify(null);
+        var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         self.lockRuntime();
         {
             defer self.unlockRuntime();
@@ -2935,7 +4447,9 @@ pub const MetadataHttpService = struct {
             } else {
                 try self.raft.runRaftRoundOnly();
             }
+            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
         }
+        if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
         const has_reconcile_lease = try self.ensureReconcileLease();
@@ -3009,11 +4523,17 @@ pub const MetadataHttpService = struct {
 
     pub fn applyReconciliationPlan(self: *MetadataHttpService, plan: *const metadata_reconciler.ReconciliationPlan) !void {
         for (plan.placement_upserts) |intent| try self.upsertReplicaIntent(intent);
-        for (plan.table_upserts) |record| try self.upsertTable(record);
+        for (plan.table_upserts) |record| try self.applyTableCatalogUpdateWithSchemaRewriteJobs(.{ .table = record });
         for (plan.range_upserts) |record| try self.upsertRange(record);
+        for (plan.foreign_key_ref_range_upserts) |record| try self.upsertForeignKeyReferenceRange(record);
+        for (plan.unique_constraint_range_upserts) |record| try self.upsertUniqueConstraintRange(record);
+        for (plan.secondary_index_rebuild_range_upserts) |record| try self.upsertSecondaryIndexRebuildRange(record);
         for (plan.split_upserts) |record| try self.upsertSplitTransition(record);
         for (plan.merge_upserts) |record| try self.upsertMergeTransition(record);
         for (plan.placement_removals) |record| try self.removeReplicaIntent(record.group_id, record.local_node_id);
+        for (plan.foreign_key_ref_range_removals) |record| try self.removeForeignKeyReferenceRange(record.child_table_id, record.constraint_name, record.parent_table_id, record.start_parent_key);
+        for (plan.unique_constraint_range_removals) |record| try self.removeUniqueConstraintRange(record.table_id, record.constraint_name, record.start_encoded_value);
+        for (plan.secondary_index_rebuild_range_removals) |record| try self.removeSecondaryIndexRebuildRange(record.table_id, record.index_name, record.index_generation, record.start_row_key);
         for (plan.table_removals) |table_id| try self.removeTable(table_id);
         for (plan.range_removals) |group_id| try self.removeRange(group_id);
         for (plan.split_removals) |transition_id| try self.removeSplitTransition(transition_id);
@@ -3110,6 +4630,22 @@ pub const MetadataHttpService = struct {
         current_status.metrics = self.metrics();
         self.storeMetadataStatusCache(current_status, now_ms + metadata_status_cache_refresh_interval_ms);
         return current_status;
+    }
+
+    pub fn foreignKeySchemaControllerStatus(self: *MetadataHttpService) metadata_api.ForeignKeySchemaControllerStatus {
+        return self.foreign_key_schema_controller_status.snapshot(self.foreign_key_schema_controller);
+    }
+
+    pub fn uniqueConstraintSchemaControllerStatus(self: *MetadataHttpService) metadata_api.UniqueConstraintSchemaControllerStatus {
+        return self.unique_constraint_schema_controller_status.snapshot(self.unique_constraint_schema_controller);
+    }
+
+    fn recordForeignKeySchemaControllerMaintenanceSummary(self: *MetadataHttpService, summary: api_table_writes.ForeignKeyIntegritySchemaControllerResult) void {
+        self.foreign_key_schema_controller_status.recordSummary(self.foreign_key_schema_controller, summary);
+    }
+
+    fn recordUniqueConstraintSchemaControllerMaintenanceSummary(self: *MetadataHttpService, summary: api_table_writes.UniqueConstraintIntegritySchemaControllerResult) void {
+        self.unique_constraint_schema_controller_status.recordSummary(self.unique_constraint_schema_controller, summary);
     }
 
     pub fn recordJsonResponseAllocation(self: *MetadataHttpService, bytes: usize) void {
@@ -3333,8 +4869,17 @@ pub const MetadataHttpService = struct {
         errdefer self.unlockRuntime();
         const core = try self.projectedCoreSnapshotLocked();
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
+        snapshot.databases = try cloneProjectedDatabasesOwned(self.alloc, core.databases);
+        snapshot.namespaces = try cloneProjectedNamespacesOwned(self.alloc, core.namespaces);
+        snapshot.tablespaces = try cloneProjectedTablespacesOwned(self.alloc, core.tablespaces);
+        snapshot.sequences = try cloneProjectedSequencesOwned(self.alloc, core.sequences);
         snapshot.tables = try cloneProjectedTablesOwned(self.alloc, core.tables);
         snapshot.ranges = try cloneProjectedRangesOwned(self.alloc, core.ranges);
+        snapshot.foreign_key_ref_ranges = try cloneProjectedForeignKeyReferenceRangesOwned(self.alloc, core.foreign_key_ref_ranges);
+        snapshot.unique_constraint_ranges = try cloneProjectedUniqueConstraintRangesOwned(self.alloc, core.unique_constraint_ranges);
+        snapshot.secondary_index_rebuild_ranges = try cloneProjectedSecondaryIndexRebuildRangesOwned(self.alloc, core.secondary_index_rebuild_ranges);
+        snapshot.schema_rewrite_jobs = try cloneProjectedSchemaRewriteJobsOwned(self.alloc, core.schema_rewrite_jobs);
+        snapshot.table_emptying_jobs = try cloneProjectedTableEmptyingJobsOwned(self.alloc, core.table_emptying_jobs);
         snapshot.nodes = try store.listNodes(self.alloc, self.metadata_group_id);
         snapshot.stores = try cloneProjectedStoresOwned(self.alloc, core.stores);
         snapshot.placement_intents = try cloneProjectedPlacementIntentsOwned(self.alloc, core.placement_intents);
@@ -3407,8 +4952,17 @@ pub const MetadataHttpService = struct {
         const store = self.projectedStore() orelse return error.MissingMetadataStore;
         var snapshot: ProjectedCoreSnapshot = .{};
         errdefer snapshot.deinit(self.alloc);
+        snapshot.databases = try store.listDatabases(self.alloc, self.metadata_group_id);
+        snapshot.namespaces = try store.listNamespaces(self.alloc, self.metadata_group_id);
+        snapshot.tablespaces = try store.listTablespaces(self.alloc, self.metadata_group_id);
+        snapshot.sequences = try store.listSequences(self.alloc, self.metadata_group_id);
         snapshot.tables = try store.listTables(self.alloc, self.metadata_group_id);
         snapshot.ranges = try store.listRanges(self.alloc, self.metadata_group_id);
+        snapshot.foreign_key_ref_ranges = try store.listForeignKeyReferenceRanges(self.alloc, self.metadata_group_id);
+        snapshot.unique_constraint_ranges = try store.listUniqueConstraintRanges(self.alloc, self.metadata_group_id);
+        snapshot.secondary_index_rebuild_ranges = try store.listSecondaryIndexRebuildRanges(self.alloc, self.metadata_group_id);
+        snapshot.schema_rewrite_jobs = try store.listSchemaRewriteJobs(self.alloc, self.metadata_group_id);
+        snapshot.table_emptying_jobs = try store.listTableEmptyingJobs(self.alloc, self.metadata_group_id);
         snapshot.stores = try store.listStores(self.alloc, self.metadata_group_id);
         snapshot.placement_intents = try store.listPlacementIntents(self.alloc, self.metadata_group_id);
         snapshot.shuffle_join_leases = try store.listShuffleJoinLeases(self.alloc, self.metadata_group_id);
@@ -3468,6 +5022,54 @@ pub const MetadataHttpService = struct {
         defer self.unlockRuntime();
         const snapshot = try self.projectedCoreSnapshotLocked();
         return try cloneProjectedTablesOwned(alloc, snapshot.tables);
+    }
+
+    pub fn listProjectedDatabases(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.DatabaseRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedDatabasesOwned(alloc, snapshot.databases);
+    }
+
+    pub fn freeProjectedDatabases(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.DatabaseRecord) void {
+        for (records) |record| metadata_table_manager.freeDatabase(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listProjectedNamespaces(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.NamespaceRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedNamespacesOwned(alloc, snapshot.namespaces);
+    }
+
+    pub fn freeProjectedNamespaces(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.NamespaceRecord) void {
+        for (records) |record| metadata_table_manager.freeNamespace(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listProjectedTablespaces(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TablespaceRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedTablespacesOwned(alloc, snapshot.tablespaces);
+    }
+
+    pub fn freeProjectedTablespaces(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.TablespaceRecord) void {
+        for (records) |record| metadata_table_manager.freeTablespace(alloc, record);
+        alloc.free(records);
+    }
+
+    pub fn listProjectedSequences(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.SequenceRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedSequencesOwned(alloc, snapshot.sequences);
+    }
+
+    pub fn freeProjectedSequences(_: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.SequenceRecord) void {
+        for (records) |record| metadata_table_manager.freeSequence(alloc, record);
+        alloc.free(records);
     }
 
     pub fn freeProjectedTables(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableRecord) void {
@@ -3591,6 +5193,66 @@ pub const MetadataHttpService = struct {
     pub fn freeProjectedRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.RangeRecord) void {
         const store = self.projectedStore() orelse return;
         store.freeRanges(alloc, records);
+    }
+
+    pub fn listProjectedForeignKeyReferenceRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedForeignKeyReferenceRangesOwned(alloc, snapshot.foreign_key_ref_ranges);
+    }
+
+    pub fn freeProjectedForeignKeyReferenceRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeForeignKeyReferenceRanges(alloc, records);
+    }
+
+    pub fn listProjectedUniqueConstraintRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedUniqueConstraintRangesOwned(alloc, snapshot.unique_constraint_ranges);
+    }
+
+    pub fn freeProjectedUniqueConstraintRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.UniqueConstraintRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeUniqueConstraintRanges(alloc, records);
+    }
+
+    pub fn listProjectedSecondaryIndexRebuildRanges(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.SecondaryIndexRebuildRangeRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedSecondaryIndexRebuildRangesOwned(alloc, snapshot.secondary_index_rebuild_ranges);
+    }
+
+    pub fn freeProjectedSecondaryIndexRebuildRanges(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.SecondaryIndexRebuildRangeRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSecondaryIndexRebuildRanges(alloc, records);
+    }
+
+    pub fn listProjectedSchemaRewriteJobs(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.SchemaRewriteJobRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedSchemaRewriteJobsOwned(alloc, snapshot.schema_rewrite_jobs);
+    }
+
+    pub fn freeProjectedSchemaRewriteJobs(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.SchemaRewriteJobRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeSchemaRewriteJobs(alloc, records);
+    }
+
+    pub fn listProjectedTableEmptyingJobs(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]metadata_table_manager.TableEmptyingJobRecord {
+        self.lockRuntime();
+        defer self.unlockRuntime();
+        const snapshot = try self.projectedCoreSnapshotLocked();
+        return try cloneProjectedTableEmptyingJobsOwned(alloc, snapshot.table_emptying_jobs);
+    }
+
+    pub fn freeProjectedTableEmptyingJobs(self: *MetadataHttpService, alloc: std.mem.Allocator, records: []metadata_table_manager.TableEmptyingJobRecord) void {
+        const store = self.projectedStore() orelse return;
+        store.freeTableEmptyingJobs(alloc, records);
     }
 
     pub fn listProjectedPlacementIntents(self: *MetadataHttpService, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
@@ -4068,7 +5730,7 @@ pub const MetadataHttpService = struct {
         if (now_ms < self.cdc_next_round_at_ms) return;
         self.cdc_next_round_at_ms = now_ms + cdc_replication_round_interval_ms;
 
-        const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(self);
+        const catalog = self.catalogSource();
         var cdc_group_router = api_table_router.CatalogBackedGroupRouter.init(
             catalog,
             // CDC is metadata-owned but data-applied; force the routed API path even
@@ -4184,6 +5846,48 @@ pub const MetadataHttpService = struct {
             );
         }
     }
+
+    fn runForeignKeySchemaControllerMaintenanceRound(self: *MetadataHttpService) !void {
+        if (!self.foreign_key_schema_controller.enabled) return;
+        const replica_root_dir = self.replica_root_dir orelse return;
+        if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
+        const catalog = self.catalogSource();
+        var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
+            replica_root_dir,
+            catalog,
+            group_router.router(),
+            self.raft.host.http_host.request_executor,
+        );
+        _ = write_source.withBackendRuntime(try self.ensureBackendRuntime());
+        _ = write_source.withSecretStore(self.secret_store);
+        for (0..foreignKeySchemaControllerFollowupBudget(self.foreign_key_schema_controller)) |_| {
+            const round_status = try runForeignKeySchemaControllerMaintenanceForService(self, write_source.source(), self.foreign_key_schema_controller);
+            if (round_status != .incomplete) break;
+            self.lifecycle_signal.notify(null);
+        }
+    }
+
+    fn runUniqueConstraintSchemaControllerMaintenanceRound(self: *MetadataHttpService) !void {
+        if (!self.unique_constraint_schema_controller.enabled) return;
+        const replica_root_dir = self.replica_root_dir orelse return;
+        if (!self.raft.host.http_host.host.isLocalLeader(self.metadata_group_id)) return;
+        const catalog = self.catalogSource();
+        var group_router = api_table_router.CatalogBackedGroupRouter.init(catalog, 0);
+        var write_source = api_table_writes.HostedProvisionedTableWriteSource.init(
+            replica_root_dir,
+            catalog,
+            group_router.router(),
+            self.raft.host.http_host.request_executor,
+        );
+        _ = write_source.withBackendRuntime(try self.ensureBackendRuntime());
+        _ = write_source.withSecretStore(self.secret_store);
+        for (0..uniqueConstraintSchemaControllerFollowupBudget(self.unique_constraint_schema_controller)) |_| {
+            const round_status = try runUniqueConstraintSchemaControllerMaintenanceForService(self, write_source.source(), self.unique_constraint_schema_controller);
+            if (round_status != .incomplete) break;
+            self.lifecycle_signal.notify(null);
+        }
+    }
 };
 
 fn syncLocalSchemaProgress(
@@ -4210,6 +5914,1159 @@ fn runReplicationBackfillIfLeaseHeld(service: anytype) !bool {
     if (!has_reconcile_lease) return false;
     try service.runReplicationBackfillRound();
     return true;
+}
+
+fn foreignKeyIntegrityResultConstraintName(result: api_table_writes.ForeignKeyIntegrityResult) ?[]const u8 {
+    for (result.work_units) |unit| {
+        if (unit.constraint_name) |constraint_name| return constraint_name;
+    }
+    for (result.work_statuses) |status| {
+        if (status.constraint_name) |constraint_name| return constraint_name;
+    }
+    return null;
+}
+
+fn foreignKeyIntegrityResultJobStatus(result: api_table_writes.ForeignKeyIntegrityResult) ?api_table_writes.ForeignKeyIntegrityJobStatus {
+    if (result.job_id) |job_id| {
+        for (result.jobs) |job| {
+            if (std.mem.eql(u8, job.job_id, job_id)) return job;
+        }
+    }
+    return if (result.jobs.len == 1) result.jobs[0] else null;
+}
+
+fn foreignKeyIntegrityTerminalDiagnosticReport(result: api_table_writes.ForeignKeyIntegrityResult) db_mod.relational_store.ForeignKeyIntegrityReport {
+    if (foreignKeyIntegrityResultJobStatus(result)) |job| {
+        return job.aggregate_report;
+    }
+    return result.report;
+}
+
+fn shouldPromoteForeignKeySchemaControllerResult(result: api_table_writes.ForeignKeyIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and result.valid,
+        else => false,
+    };
+}
+
+fn isTerminalInvalidForeignKeySchemaControllerResult(result: api_table_writes.ForeignKeyIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and !result.valid,
+        else => false,
+    };
+}
+
+fn catalogSourceForMetadataService(comptime Service: type, svc: *Service) catalog_source.CatalogSource {
+    return .{
+        .ptr = svc,
+        .vtable = &comptime catalogSourceVTable(Service),
+    };
+}
+
+fn catalogSourceVTable(comptime Service: type) catalog_source.CatalogSource.VTable {
+    const Gen = struct {
+        fn service(ptr: *anyopaque) *Service {
+            return @ptrCast(@alignCast(ptr));
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            return try service(ptr).adminSnapshot();
+        }
+
+        fn freeAdminSnapshot(ptr: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            service(ptr).freeAdminSnapshot(snapshot);
+        }
+
+        fn beginSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeBeginRequest) !void {
+            return try service(ptr).beginSecondaryIndexRebuildRange(request);
+        }
+
+        fn finishSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeFinishRequest) !void {
+            return try service(ptr).finishSecondaryIndexRebuildRange(request);
+        }
+
+        fn invalidateSecondaryIndexRebuildRange(ptr: *anyopaque, request: metadata_table_manager.SecondaryIndexRebuildRangeInvalidateRequest) !void {
+            return try service(ptr).invalidateSecondaryIndexRebuildRange(request);
+        }
+
+        fn beginSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobBeginRequest) !void {
+            return try service(ptr).beginSchemaRewriteJob(request);
+        }
+
+        fn finishSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobFinishRequest) !void {
+            return try service(ptr).finishSchemaRewriteJob(request);
+        }
+
+        fn invalidateSchemaRewriteJob(ptr: *anyopaque, request: metadata_table_manager.SchemaRewriteJobInvalidateRequest) !void {
+            return try service(ptr).invalidateSchemaRewriteJob(request);
+        }
+
+        fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
+            return try service(ptr).upsertTableEmptyingJob(record);
+        }
+
+        fn upsertTable(ptr: *anyopaque, record: metadata_table_manager.TableRecord) !void {
+            return try service(ptr).upsertTable(record);
+        }
+
+        fn applyTableCatalogUpdateWithSchemaRewriteJobs(ptr: *anyopaque, request: metadata_table_manager.TableCatalogUpdateWithSchemaRewriteJobsRequest) !void {
+            return try service(ptr).applyTableCatalogUpdateWithSchemaRewriteJobs(request);
+        }
+
+        fn applyTableCatalogBatchUpdateWithSchemaRewriteJobs(ptr: *anyopaque, request: metadata_table_manager.TableCatalogBatchUpdateWithSchemaRewriteJobsRequest) !void {
+            if (comptime @hasDecl(Service, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs")) {
+                return try service(ptr).applyTableCatalogBatchUpdateWithSchemaRewriteJobs(request);
+            }
+            return error.UnsupportedOperation;
+        }
+
+        fn applyTableCatalogDropWithSchemaRewriteJobs(ptr: *anyopaque, request: metadata_table_manager.TableCatalogDropWithSchemaRewriteJobsRequest) !void {
+            if (comptime @hasDecl(Service, "applyTableCatalogDropWithSchemaRewriteJobs")) {
+                return try service(ptr).applyTableCatalogDropWithSchemaRewriteJobs(request);
+            }
+            return error.UnsupportedOperation;
+        }
+
+        fn removeTableEmptyingJob(ptr: *anyopaque, job_id: u64) !void {
+            return try service(ptr).removeTableEmptyingJob(job_id);
+        }
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            return try service(ptr).beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            return try service(ptr).finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            return try service(ptr).invalidateTableEmptyingJob(request);
+        }
+
+        fn promoteTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+            return try service(ptr).promoteTableEmptyingBarrier(request);
+        }
+
+        fn resetIdentityAllocatorsForTableEmptyingBarrier(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+            if (comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier")) {
+                return try service(ptr).resetIdentityAllocatorsForTableEmptyingBarrier(request);
+            }
+            return error.UnsupportedOperation;
+        }
+
+        fn supportsIdentityAllocatorResetForTableEmptyingBarrier(_: *anyopaque) bool {
+            return comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier");
+        }
+
+        fn promoteSecondaryIndexReady(
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+            index_name: []const u8,
+            expected_generation: u64,
+        ) !bool {
+            return try promoteSecondaryIndexReadyOnMetadataService(service(ptr), alloc, table_name, index_name, expected_generation);
+        }
+
+        fn compareAndSwapTableSchema(ptr: *anyopaque, request: metadata_table_manager.TableSchemaCompareAndSwapRequest) !void {
+            return try service(ptr).compareAndSwapTableSchema(request);
+        }
+    };
+
+    return .{
+        .admin_snapshot = Gen.adminSnapshot,
+        .free_admin_snapshot = Gen.freeAdminSnapshot,
+        .begin_secondary_index_rebuild_range = Gen.beginSecondaryIndexRebuildRange,
+        .finish_secondary_index_rebuild_range = Gen.finishSecondaryIndexRebuildRange,
+        .invalidate_secondary_index_rebuild_range = Gen.invalidateSecondaryIndexRebuildRange,
+        .begin_schema_rewrite_job = Gen.beginSchemaRewriteJob,
+        .finish_schema_rewrite_job = Gen.finishSchemaRewriteJob,
+        .invalidate_schema_rewrite_job = Gen.invalidateSchemaRewriteJob,
+        .upsert_table_emptying_job = Gen.upsertTableEmptyingJob,
+        .upsert_table = Gen.upsertTable,
+        .apply_table_catalog_update_with_schema_rewrite_jobs = Gen.applyTableCatalogUpdateWithSchemaRewriteJobs,
+        .apply_table_catalog_batch_update_with_schema_rewrite_jobs = if (comptime @hasDecl(Service, "applyTableCatalogBatchUpdateWithSchemaRewriteJobs")) Gen.applyTableCatalogBatchUpdateWithSchemaRewriteJobs else null,
+        .apply_table_catalog_drop_with_schema_rewrite_jobs = if (comptime @hasDecl(Service, "applyTableCatalogDropWithSchemaRewriteJobs")) Gen.applyTableCatalogDropWithSchemaRewriteJobs else null,
+        .remove_table_emptying_job = Gen.removeTableEmptyingJob,
+        .begin_table_emptying_job = Gen.beginTableEmptyingJob,
+        .finish_table_emptying_job = Gen.finishTableEmptyingJob,
+        .invalidate_table_emptying_job = Gen.invalidateTableEmptyingJob,
+        .promote_table_emptying_barrier = Gen.promoteTableEmptyingBarrier,
+        .reset_identity_allocators_for_table_emptying_barrier = if (comptime @hasDecl(Service, "resetIdentityAllocatorsForTableEmptyingBarrier")) Gen.resetIdentityAllocatorsForTableEmptyingBarrier else null,
+        .supports_identity_allocator_reset_for_table_emptying_barrier = Gen.supportsIdentityAllocatorResetForTableEmptyingBarrier,
+        .promote_secondary_index_ready = Gen.promoteSecondaryIndexReady,
+        .compare_and_swap_table_schema = Gen.compareAndSwapTableSchema,
+    };
+}
+
+fn promoteSecondaryIndexReadyOnMetadataService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    index_name: []const u8,
+    expected_generation: u64,
+) !bool {
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = sql_schema_mutation.schemaWithSecondaryIndexReadyAlloc(
+        alloc,
+        table.schema_json,
+        index_name,
+        expected_generation,
+    ) catch |err| switch (err) {
+        error.SecondaryIndexNotBuilding,
+        error.SecondaryIndexGenerationMismatch,
+        error.SecondaryIndexNotFound,
+        => return false,
+        else => return err,
+    };
+    defer alloc.free(schema_json);
+    const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(alloc, updated);
+    try service.promoteSecondaryIndexReady(.{
+        .table_id = table.table_id,
+        .index_name = index_name,
+        .expected_index_generation = expected_generation,
+        .expected_schema_json = table.schema_json,
+        .promoted_table = updated,
+    });
+    return true;
+}
+
+fn findTableRecordByName(snapshot: *const metadata_api.AdminSnapshot, table_name: []const u8) ?*const metadata_table_manager.TableRecord {
+    for (snapshot.tables) |*table| {
+        if (std.mem.eql(u8, table.name, table_name)) return table;
+    }
+    return null;
+}
+
+const foreign_key_validation_metadata_sample_limit: usize = 8;
+
+fn foreignKeyViolationMetadataObjectAlloc(
+    json_alloc: std.mem.Allocator,
+    violation: api_table_writes.ForeignKeyIntegrityViolation,
+) !std.json.ObjectMap {
+    var object = std.json.ObjectMap.empty;
+    try object.put(json_alloc, try json_alloc.dupe(u8, "group_id"), .{ .integer = @intCast(violation.group_id) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "kind"), .{ .string = try json_alloc.dupe(u8, @tagName(violation.kind)) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "constraint_name"), .{ .string = try json_alloc.dupe(u8, violation.constraint_name) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "child_table"), .{ .string = try json_alloc.dupe(u8, violation.child_table) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "child_key"), .{ .string = try json_alloc.dupe(u8, violation.child_key) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "parent_table"), .{ .string = try json_alloc.dupe(u8, violation.parent_table) });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "parent_key"), .{ .string = try json_alloc.dupe(u8, violation.parent_key) });
+    if (violation.parent_values.len > 0) {
+        try object.put(
+            json_alloc,
+            try json_alloc.dupe(u8, "parent_values"),
+            .{ .array = try foreignKeyTupleValuesMetadataArrayAlloc(json_alloc, violation.parent_values) },
+        );
+    }
+    if (violation.observed_parent_key) |observed| {
+        try object.put(json_alloc, try json_alloc.dupe(u8, "observed_parent_key"), .{ .string = try json_alloc.dupe(u8, observed) });
+    }
+    if (violation.observed_parent_values.len > 0) {
+        try object.put(
+            json_alloc,
+            try json_alloc.dupe(u8, "observed_parent_values"),
+            .{ .array = try foreignKeyTupleValuesMetadataArrayAlloc(json_alloc, violation.observed_parent_values) },
+        );
+    }
+    return object;
+}
+
+fn foreignKeyTupleValuesMetadataArrayAlloc(
+    json_alloc: std.mem.Allocator,
+    values: []const api_table_writes.ForeignKeyIntegrityTupleValue,
+) !std.json.Array {
+    var out = std.json.Array.init(json_alloc);
+    for (values) |value| {
+        var object = std.json.ObjectMap.empty;
+        try object.put(json_alloc, try json_alloc.dupe(u8, "column"), .{ .string = try json_alloc.dupe(u8, value.column) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "value"), .{ .string = try json_alloc.dupe(u8, value.value) });
+        try out.append(.{ .object = object });
+    }
+    return out;
+}
+
+fn foreignKeyViolationKindCountsMetadataObjectAlloc(
+    json_alloc: std.mem.Allocator,
+    violations: []const api_table_writes.ForeignKeyIntegrityViolation,
+) !std.json.ObjectMap {
+    var missing_parent: i64 = 0;
+    var missing_ref: i64 = 0;
+    var stale_ref: i64 = 0;
+    for (violations) |violation| switch (violation.kind) {
+        .missing_parent => missing_parent += 1,
+        .missing_ref => missing_ref += 1,
+        .stale_ref => stale_ref += 1,
+    };
+
+    var object = std.json.ObjectMap.empty;
+    try object.put(json_alloc, try json_alloc.dupe(u8, "missing_parent"), .{ .integer = missing_parent });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "missing_ref"), .{ .integer = missing_ref });
+    try object.put(json_alloc, try json_alloc.dupe(u8, "stale_ref"), .{ .integer = stale_ref });
+    return object;
+}
+
+fn foreignKeyValidationMetadataAlloc(
+    alloc: std.mem.Allocator,
+    current_json: []const u8,
+    constraint_name: []const u8,
+    result: ?api_table_writes.ForeignKeyIntegrityResult,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, if (current_json.len > 0) current_json else "{}", .{});
+    defer parsed.deinit();
+    const json_alloc = parsed.arena.allocator();
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidMetadataTransitionEncoding,
+    };
+    const foreign_keys_value = root.get("foreign_keys") orelse blk: {
+        const object = std.json.ObjectMap.empty;
+        try root.put(json_alloc, try json_alloc.dupe(u8, "foreign_keys"), .{ .object = object });
+        break :blk root.get("foreign_keys").?;
+    };
+    if (foreign_keys_value != .object) return error.InvalidMetadataTransitionEncoding;
+    const foreign_keys = root.getPtr("foreign_keys").?;
+    if (foreign_keys.* != .object) return error.InvalidMetadataTransitionEncoding;
+
+    if (result) |entry| {
+        var object = std.json.ObjectMap.empty;
+        try object.put(json_alloc, try json_alloc.dupe(u8, "validation_state"), .{ .string = try json_alloc.dupe(u8, "invalid") });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "action"), .{ .string = try json_alloc.dupe(u8, @tagName(entry.action)) });
+        if (entry.job_id) |job_id| {
+            try object.put(json_alloc, try json_alloc.dupe(u8, "job_id"), .{ .string = try json_alloc.dupe(u8, job_id) });
+        }
+        try object.put(json_alloc, try json_alloc.dupe(u8, "updated_at_ms"), .{ .integer = @intCast(nowMs()) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "complete"), .{ .bool = entry.complete });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "valid"), .{ .bool = entry.valid });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "missing_parent_rows"), .{ .integer = @intCast(entry.report.missing_parent_rows) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "missing_ref_rows"), .{ .integer = @intCast(entry.report.missing_ref_rows) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "stale_ref_rows"), .{ .integer = @intCast(entry.report.stale_ref_rows) });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "violations_truncated"), .{ .bool = entry.violations_truncated });
+        try object.put(json_alloc, try json_alloc.dupe(u8, "violation_sample_count"), .{ .integer = @intCast(entry.violations.len) });
+        if (entry.violations.len > 0) {
+            try object.put(
+                json_alloc,
+                try json_alloc.dupe(u8, "violation_kind_counts"),
+                .{ .object = try foreignKeyViolationKindCountsMetadataObjectAlloc(json_alloc, entry.violations) },
+            );
+            var samples = std.json.Array.init(json_alloc);
+            const limit = @min(entry.violations.len, foreign_key_validation_metadata_sample_limit);
+            for (entry.violations[0..limit]) |violation| {
+                try samples.append(.{ .object = try foreignKeyViolationMetadataObjectAlloc(json_alloc, violation) });
+            }
+            try object.put(json_alloc, try json_alloc.dupe(u8, "violation_samples"), .{ .array = samples });
+            try object.put(
+                json_alloc,
+                try json_alloc.dupe(u8, "metadata_violation_samples_truncated"),
+                .{ .bool = entry.violations.len > foreign_key_validation_metadata_sample_limit },
+            );
+            try object.put(json_alloc, try json_alloc.dupe(u8, "first_violation"), .{ .object = try foreignKeyViolationMetadataObjectAlloc(json_alloc, entry.violations[0]) });
+        }
+        _ = foreign_keys.object.fetchSwapRemove(constraint_name);
+        try foreign_keys.object.put(json_alloc, try json_alloc.dupe(u8, constraint_name), .{ .object = object });
+    } else {
+        _ = foreign_keys.object.fetchSwapRemove(constraint_name);
+    }
+
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+}
+
+fn tableWithForeignKeyValidationMetadataAlloc(
+    alloc: std.mem.Allocator,
+    table: metadata_table_manager.TableRecord,
+    constraint_name: []const u8,
+    result: ?api_table_writes.ForeignKeyIntegrityResult,
+) !metadata_table_manager.TableRecord {
+    var updated = try metadata_table_manager.cloneTable(alloc, table);
+    errdefer metadata_table_manager.freeTable(alloc, updated);
+    const validation_json = try foreignKeyValidationMetadataAlloc(alloc, table.foreign_key_validation_json, constraint_name, result);
+    errdefer alloc.free(validation_json);
+    alloc.free(updated.foreign_key_validation_json);
+    updated.foreign_key_validation_json = validation_json;
+    return updated;
+}
+
+fn promoteForeignKeySchemaControllerResult(
+    service: anytype,
+    table_name: []const u8,
+    result: api_table_writes.ForeignKeyIntegrityResult,
+) !void {
+    if (!shouldPromoteForeignKeySchemaControllerResult(result)) return;
+    const constraint_name = foreignKeyIntegrityResultConstraintName(result) orelse return;
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = try sql_schema_mutation.schemaWithForeignKeyValidationStateAlloc(
+        service.alloc,
+        table.schema_json,
+        constraint_name,
+        .enforced,
+    );
+    defer service.alloc.free(schema_json);
+    const schema_updated = try catalog_table_ddl.applySchemaUpdateRecord(service.alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(service.alloc, schema_updated);
+    const metadata_updated = try tableWithForeignKeyValidationMetadataAlloc(service.alloc, schema_updated, constraint_name, null);
+    defer metadata_table_manager.freeTable(service.alloc, metadata_updated);
+    try service.upsertTable(metadata_updated);
+}
+
+fn recordInvalidForeignKeySchemaControllerResult(
+    service: anytype,
+    table_name: []const u8,
+    result: api_table_writes.ForeignKeyIntegrityResult,
+) !void {
+    if (!isTerminalInvalidForeignKeySchemaControllerResult(result)) return;
+    const constraint_name = foreignKeyIntegrityResultConstraintName(result) orelse return;
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const updated = try tableWithForeignKeyValidationMetadataAlloc(service.alloc, table.*, constraint_name, result);
+    defer metadata_table_manager.freeTable(service.alloc, updated);
+    try service.upsertTable(updated);
+}
+
+fn shouldPromoteUniqueConstraintSchemaControllerResult(result: api_table_writes.UniqueConstraintIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and result.valid,
+        else => false,
+    };
+}
+
+fn isTerminalInvalidUniqueConstraintSchemaControllerResult(result: api_table_writes.UniqueConstraintIntegrityResult) bool {
+    return switch (result.action) {
+        .validate, .repair => result.complete and !result.valid,
+        else => false,
+    };
+}
+
+fn promoteUniqueConstraintSchemaControllerResult(
+    service: anytype,
+    table_name: []const u8,
+    constraint_name: []const u8,
+    result: api_table_writes.UniqueConstraintIntegrityResult,
+) !void {
+    if (!shouldPromoteUniqueConstraintSchemaControllerResult(result)) return;
+    var snapshot = try service.adminSnapshot();
+    defer service.freeAdminSnapshot(&snapshot);
+    const table = findTableRecordByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const schema_json = try sql_schema_mutation.schemaWithUniqueConstraintValidationStateAlloc(
+        service.alloc,
+        table.schema_json,
+        constraint_name,
+        .enforced,
+    );
+    defer service.alloc.free(schema_json);
+    const schema_updated = try catalog_table_ddl.applySchemaUpdateRecord(service.alloc, table, schema_json);
+    defer metadata_table_manager.freeTable(service.alloc, schema_updated);
+    try service.upsertTable(schema_updated);
+}
+
+const ForeignKeySchemaControllerRoundStatus = enum {
+    no_source,
+    complete,
+    incomplete,
+};
+
+const UniqueConstraintSchemaControllerRoundStatus = enum {
+    no_source,
+    complete,
+    incomplete,
+};
+
+fn runForeignKeySchemaControllerMaintenanceForService(
+    service: anytype,
+    write_source: api_table_writes.TableWriteSource,
+    config: ForeignKeySchemaControllerConfig,
+) !ForeignKeySchemaControllerRoundStatus {
+    var summary = (try write_source.foreignKeyIntegritySchemaControllerMaintenancePass(service.alloc, config.toMaintenanceOptions())) orelse return .no_source;
+    defer summary.deinit(service.alloc);
+    if (@hasDecl(@TypeOf(service.*), "recordForeignKeySchemaControllerMaintenanceSummary")) {
+        service.recordForeignKeySchemaControllerMaintenanceSummary(summary);
+    }
+
+    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.jobs_executed > 0 or summary.action_schedules_executed > 0 or summary.action_schedules_invalid > 0 or summary.action_jobs_executed > 0 or summary.action_jobs_invalid > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
+        std.log.info(
+            "metadata fk schema-controller round worker_id={s} scanned={d} pending={d} executed={d} jobs_scanned={d} jobs_executed={d} action_schedules_scanned={d} action_schedules_executed={d} action_schedules_invalid={d} action_jobs_scanned={d} action_jobs_executed={d} action_jobs_invalid={d} claims={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
+            .{
+                config.worker_id,
+                summary.tables_scanned,
+                summary.tables_with_pending_constraints,
+                summary.tables_executed,
+                summary.jobs_scanned,
+                summary.jobs_executed,
+                summary.action_schedules_scanned,
+                summary.action_schedules_executed,
+                summary.action_schedules_invalid,
+                summary.action_jobs_scanned,
+                summary.action_jobs_executed,
+                summary.action_jobs_invalid,
+                summary.claim_attempts,
+                summary.terminal_valid_results,
+                summary.terminal_invalid_results,
+                summary.complete,
+                summary.valid,
+            },
+        );
+    }
+
+    for (summary.results) |entry| {
+        if (!entry.schema_adoption) continue;
+        if (isTerminalInvalidForeignKeySchemaControllerResult(entry.result)) {
+            std.log.warn(
+                "metadata fk schema-controller terminal invalid table={s} constraint={s} job_id={s} missing_parent_rows={d} missing_ref_rows={d}",
+                .{
+                    entry.table_name,
+                    foreignKeyIntegrityResultConstraintName(entry.result) orelse "",
+                    entry.result.job_id orelse "",
+                    entry.result.report.missing_parent_rows,
+                    entry.result.report.missing_ref_rows,
+                },
+            );
+            try recordInvalidForeignKeySchemaControllerResult(service, entry.table_name, entry.result);
+            continue;
+        }
+        try promoteForeignKeySchemaControllerResult(service, entry.table_name, entry.result);
+    }
+    return if (summary.complete) .complete else .incomplete;
+}
+
+fn runUniqueConstraintSchemaControllerMaintenanceForService(
+    service: anytype,
+    write_source: api_table_writes.TableWriteSource,
+    config: UniqueConstraintSchemaControllerConfig,
+) !UniqueConstraintSchemaControllerRoundStatus {
+    var summary = (try write_source.uniqueConstraintIntegritySchemaControllerMaintenancePass(service.alloc, config.toMaintenanceOptions())) orelse return .no_source;
+    defer summary.deinit(service.alloc);
+    if (@hasDecl(@TypeOf(service.*), "recordUniqueConstraintSchemaControllerMaintenanceSummary")) {
+        service.recordUniqueConstraintSchemaControllerMaintenanceSummary(summary);
+    }
+
+    if (summary.tables_with_pending_constraints > 0 or summary.tables_executed > 0 or summary.terminal_valid_results > 0 or summary.terminal_invalid_results > 0) {
+        std.log.info(
+            "metadata unique schema-controller round worker_id={s} scanned={d} pending={d} executed={d} terminal_valid={d} terminal_invalid={d} complete={any} valid={any}",
+            .{
+                config.worker_id,
+                summary.tables_scanned,
+                summary.tables_with_pending_constraints,
+                summary.tables_executed,
+                summary.terminal_valid_results,
+                summary.terminal_invalid_results,
+                summary.complete,
+                summary.valid,
+            },
+        );
+    }
+
+    for (summary.results) |entry| {
+        if (!entry.schema_adoption) continue;
+        if (isTerminalInvalidUniqueConstraintSchemaControllerResult(entry.result)) {
+            std.log.warn(
+                "metadata unique schema-controller terminal invalid table={s} constraint={s} missing_unique_rows={d} duplicate_unique_rows={d} stale_unique_rows={d}",
+                .{
+                    entry.table_name,
+                    entry.constraint_name,
+                    entry.result.report.missing_unique_rows,
+                    entry.result.report.duplicate_unique_rows,
+                    entry.result.report.stale_unique_rows,
+                },
+            );
+            continue;
+        }
+        try promoteUniqueConstraintSchemaControllerResult(service, entry.table_name, entry.constraint_name, entry.result);
+    }
+    return if (summary.complete) .complete else .incomplete;
+}
+
+test "metadata unique schema controller config records bounded maintenance status" {
+    const cfg = UniqueConstraintSchemaControllerConfig{
+        .enabled = true,
+        .worker_id = "metadata-unique-test-worker",
+        .max_tables = 7,
+        .max_followup_rounds = 9,
+    };
+    const options = cfg.toMaintenanceOptions();
+    try std.testing.expectEqual(api_table_writes.UniqueConstraintIntegrityAction.repair, options.action);
+    try std.testing.expectEqualStrings("metadata-unique-test-worker", options.worker_id);
+    try std.testing.expectEqual(@as(usize, 7), options.max_tables);
+    try std.testing.expectEqual(@as(usize, 9), uniqueConstraintSchemaControllerFollowupBudget(cfg));
+
+    var runtime_status = UniqueConstraintSchemaControllerRuntimeStatus{};
+    var results = [_]api_table_writes.UniqueConstraintIntegritySchemaControllerTableResult{.{
+        .table_name = try std.testing.allocator.dupe(u8, "users"),
+        .constraint_name = try std.testing.allocator.dupe(u8, "users_email_key"),
+        .schema_adoption = true,
+        .result = .{
+            .action = .repair,
+            .complete = true,
+            .valid = false,
+            .report = .{
+                .missing_unique_rows = 1,
+                .duplicate_unique_rows = 2,
+                .stale_unique_rows = 3,
+                .repaired_unique_rows = 4,
+                .deleted_stale_unique_rows = 5,
+            },
+            .groups = &.{},
+        },
+    }};
+    defer results[0].deinit(std.testing.allocator);
+    runtime_status.recordSummary(cfg, .{
+        .tables_scanned = 3,
+        .tables_with_pending_constraints = 1,
+        .tables_executed = 1,
+        .terminal_invalid_results = 1,
+        .complete = true,
+        .valid = false,
+        .results = results[0..],
+    });
+
+    const status = runtime_status.snapshot(cfg);
+    try std.testing.expect(status.enabled);
+    try std.testing.expectEqualStrings("metadata-unique-test-worker", status.worker_id);
+    try std.testing.expectEqual(@as(u64, 1), status.rounds_total);
+    try std.testing.expectEqual(@as(u64, 2), status.duplicate_unique_rows_total);
+    try std.testing.expectEqualStrings("users", status.last_terminal_invalid_table_name);
+    try std.testing.expectEqualStrings("users_email_key", status.last_terminal_invalid_constraint_name);
+    try std.testing.expectEqual(@as(u64, 2), status.last_duplicate_unique_rows);
+
+    const defaults = (UniqueConstraintSchemaControllerConfig{}).toMaintenanceOptions();
+    try std.testing.expectEqualStrings(default_unique_schema_controller_worker_id, defaults.worker_id);
+    try std.testing.expectEqual(@as(usize, 4), uniqueConstraintSchemaControllerFollowupBudget(.{}));
+    try std.testing.expectEqual(@as(usize, 1), uniqueConstraintSchemaControllerFollowupBudget(.{ .max_followup_rounds = 0 }));
+}
+
+test "metadata fk schema controller config builds bounded maintenance options" {
+    const cfg = ForeignKeySchemaControllerConfig{
+        .enabled = true,
+        .worker_id = "metadata-fk-test-worker",
+        .lease_ms = 1234,
+        .max_tables = 7,
+        .max_jobs = 11,
+        .max_action_jobs = 13,
+        .max_work_units_per_table = 3,
+        .action_job_page_limit = 5,
+        .violation_limit = 42,
+        .max_followup_rounds = 9,
+    };
+    const options = cfg.toMaintenanceOptions();
+    try std.testing.expectEqual(api_table_writes.ForeignKeyIntegrityAction.repair, options.action);
+    try std.testing.expectEqualStrings("metadata-fk-test-worker", options.worker_id);
+    try std.testing.expectEqual(@as(u64, 1234), options.lease_ms);
+    try std.testing.expectEqual(@as(usize, 7), options.max_tables);
+    try std.testing.expectEqual(@as(usize, 11), options.max_jobs);
+    try std.testing.expectEqual(@as(usize, 13), options.max_action_jobs);
+    try std.testing.expectEqual(@as(usize, 3), options.max_work_units_per_table);
+    try std.testing.expectEqual(@as(usize, 5), options.action_job_page_limit);
+    try std.testing.expectEqual(@as(usize, 42), options.violation_limit);
+    try std.testing.expectEqual(@as(usize, 9), foreignKeySchemaControllerFollowupBudget(cfg));
+
+    const defaults = (ForeignKeySchemaControllerConfig{}).toMaintenanceOptions();
+    try std.testing.expectEqualStrings(default_fk_schema_controller_worker_id, defaults.worker_id);
+    try std.testing.expectEqual(@as(u64, 60_000), defaults.lease_ms);
+    try std.testing.expectEqual(@as(usize, 4), defaults.max_tables);
+    try std.testing.expectEqual(@as(usize, 16), defaults.max_jobs);
+    try std.testing.expectEqual(@as(usize, 16), defaults.max_action_jobs);
+    try std.testing.expectEqual(@as(usize, 1), defaults.max_work_units_per_table);
+    try std.testing.expectEqual(@as(usize, 1024), defaults.action_job_page_limit);
+    try std.testing.expectEqual(@as(usize, 100), defaults.violation_limit);
+    try std.testing.expectEqual(@as(usize, 4), foreignKeySchemaControllerFollowupBudget(.{}));
+    try std.testing.expectEqual(@as(usize, 1), foreignKeySchemaControllerFollowupBudget(.{ .max_followup_rounds = 0 }));
+
+    var failed_action_jobs = [_]api_table_writes.ForeignKeyActionJobStatus{ .{
+        .group_id = 7,
+        .job_id = @constCast("fk-action:cascade:failed"),
+        .action = @constCast("cascade"),
+        .worker_id = @constCast("metadata-fk-test-worker"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:hot"),
+        .page_limit = 16,
+        .status = @constCast("invalid"),
+        .created_at_ns = 1,
+        .updated_at_ns = 2,
+        .attempts = 1,
+        .applied_children = 3,
+        .failure_count = 2,
+        .first_failed_at_ns = 100,
+        .last_failed_at_ns = 300,
+        .requeue_count = 1,
+        .last_requeued_at_ns = 200,
+        .cascade_depth = 64,
+        .cascade_max_depth = 64,
+        .next_child_table = @constCast("row"),
+        .next_child_key = @constCast("order:cursor"),
+        .last_error = @constCast("ForeignKeyCascadeDepthLimit"),
+    }, .{
+        .group_id = 8,
+        .job_id = @constCast("fk-action:set-null:complete"),
+        .action = @constCast("set_null"),
+        .worker_id = @constCast("metadata-fk-test-worker"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:wide"),
+        .page_limit = 16,
+        .status = @constCast("complete"),
+        .created_at_ns = 1,
+        .updated_at_ns = 3,
+        .attempts = 2,
+        .completed = true,
+        .applied_children = 11,
+    } };
+    var failed_action_schedules = [_]api_table_writes.ForeignKeyActionScheduleStatus{.{
+        .group_id = 6,
+        .schedule_id = @constCast("fk-action-schedule:cascade:failed"),
+        .action_job_id = @constCast("fk-action:cascade:failed"),
+        .action = @constCast("cascade"),
+        .worker_id = @constCast("metadata-fk-test-worker"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:hot"),
+        .page_limit = 16,
+        .status = @constCast("invalid"),
+        .created_at_ns = 1,
+        .updated_at_ns = 2,
+        .completed = false,
+        .scheduled_groups = 0,
+        .cascade_depth = 3,
+        .cascade_max_depth = 64,
+        .requeue_count = 2,
+        .last_requeued_at_ns = 99,
+        .last_error = @constCast("NoForeignKeyActionOwnerGroups"),
+    }};
+    var terminal_invalid_work_units = [_]api_table_writes.ForeignKeyIntegrityWorkUnit{.{
+        .group_id = 9,
+        .phase = @constCast("child_range"),
+        .planned_action = @constCast("validate"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .lower_doc_key = @constCast(""),
+        .upper_doc_key = @constCast(""),
+    }};
+    var terminal_invalid_violations = [_]api_table_writes.ForeignKeyIntegrityViolation{.{
+        .group_id = 9,
+        .kind = .missing_parent,
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .child_table = @constCast("row"),
+        .child_key = @constCast("order:invalid"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:missing"),
+    }};
+    var terminal_invalid_jobs = [_]api_table_writes.ForeignKeyIntegrityJobStatus{.{
+        .group_id = 9,
+        .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey"),
+        .table_name = @constCast("orders"),
+        .action = @constCast("validate"),
+        .worker_id = @constCast("worker:fk"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .lower_doc_key = @constCast(""),
+        .upper_doc_key = @constCast(""),
+        .lease_ms = 60_000,
+        .max_work_units = 4,
+        .status = @constCast("invalid"),
+        .created_at_ns = 10,
+        .updated_at_ns = 40,
+        .completed = true,
+        .valid = false,
+        .diagnostic_passes = 3,
+        .violating_passes = 2,
+        .aggregate_report = .{
+            .missing_parent_rows = 8,
+            .missing_ref_rows = 4,
+            .stale_ref_rows = 2,
+        },
+        .first_violation_at_ns = 20,
+        .last_violation_at_ns = 40,
+    }};
+    var terminal_invalid_results = [_]api_table_writes.ForeignKeyIntegritySchemaControllerTableResult{.{
+        .table_name = @constCast("orders"),
+        .schema_adoption = true,
+        .result = .{
+            .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey"),
+            .action = .validate,
+            .valid = false,
+            .complete = true,
+            .violation_limit = 1,
+            .violations_truncated = true,
+            .report = .{
+                .missing_parent_rows = 4,
+                .missing_ref_rows = 2,
+                .stale_ref_rows = 1,
+            },
+            .groups = &.{},
+            .work_units = terminal_invalid_work_units[0..],
+            .jobs = terminal_invalid_jobs[0..],
+            .violations = terminal_invalid_violations[0..],
+        },
+    }};
+    var runtime_status = ForeignKeySchemaControllerRuntimeStatus{};
+    runtime_status.recordSummary(cfg, .{
+        .tables_scanned = 9,
+        .tables_with_pending_constraints = 5,
+        .tables_executed = 3,
+        .action_schedules_scanned = 6,
+        .action_schedules_executed = 4,
+        .action_schedules_invalid = 2,
+        .action_jobs_scanned = 8,
+        .action_jobs_executed = 7,
+        .action_jobs_invalid = 1,
+        .results = terminal_invalid_results[0..],
+        .action_schedules = failed_action_schedules[0..],
+        .action_jobs = failed_action_jobs[0..],
+        .claim_attempts = 2,
+        .terminal_valid_results = 1,
+        .terminal_invalid_results = 1,
+        .complete = false,
+        .valid = false,
+    });
+    const status = runtime_status.snapshot(cfg);
+    try std.testing.expect(status.enabled);
+    try std.testing.expectEqualStrings("metadata-fk-test-worker", status.worker_id);
+    try std.testing.expectEqual(@as(u64, 1), status.rounds_total);
+    try std.testing.expectEqual(@as(u64, 9), status.tables_scanned_total);
+    try std.testing.expectEqual(@as(u64, 5), status.tables_with_pending_constraints_total);
+    try std.testing.expectEqual(@as(u64, 3), status.tables_executed_total);
+    try std.testing.expectEqual(@as(u64, 6), status.action_schedules_scanned_total);
+    try std.testing.expectEqual(@as(u64, 4), status.action_schedules_executed_total);
+    try std.testing.expectEqual(@as(u64, 2), status.action_schedules_invalid_total);
+    try std.testing.expectEqual(@as(u64, 8), status.action_jobs_scanned_total);
+    try std.testing.expectEqual(@as(u64, 7), status.action_jobs_executed_total);
+    try std.testing.expectEqual(@as(u64, 1), status.action_jobs_invalid_total);
+    try std.testing.expectEqual(@as(u64, 1), status.action_jobs_failed_total);
+    try std.testing.expectEqual(@as(u64, 1), status.action_jobs_depth_limit_failed_total);
+    try std.testing.expectEqual(@as(u64, 2), status.claim_attempts_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_valid_results_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_results_total);
+    try std.testing.expectEqual(@as(usize, 9), status.last_tables_scanned);
+    try std.testing.expectEqual(@as(usize, 5), status.last_tables_with_pending_constraints);
+    try std.testing.expectEqual(@as(usize, 3), status.last_tables_executed);
+    try std.testing.expectEqual(@as(usize, 6), status.last_action_schedules_scanned);
+    try std.testing.expectEqual(@as(usize, 4), status.last_action_schedules_executed);
+    try std.testing.expectEqual(@as(usize, 2), status.last_action_schedules_invalid);
+    try std.testing.expectEqual(@as(u64, 6), status.last_failed_action_schedule_group_id);
+    try std.testing.expectEqualStrings("fk-action-schedule:cascade:failed", status.last_failed_action_schedule_id);
+    try std.testing.expectEqualStrings("fk-action:cascade:failed", status.last_failed_action_schedule_action_job_id);
+    try std.testing.expectEqualStrings("cascade", status.last_failed_action_schedule_action);
+    try std.testing.expectEqualStrings("invalid", status.last_failed_action_schedule_status);
+    try std.testing.expectEqualStrings("NoForeignKeyActionOwnerGroups", status.last_failed_action_schedule_error);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status.last_failed_action_schedule_constraint_name);
+    try std.testing.expectEqualStrings("customers", status.last_failed_action_schedule_parent_table);
+    try std.testing.expectEqualStrings("customer:hot", status.last_failed_action_schedule_parent_key);
+    try std.testing.expectEqual(@as(u64, 0), status.last_failed_action_schedule_scheduled_groups);
+    try std.testing.expectEqual(@as(u32, 3), status.last_failed_action_schedule_cascade_depth);
+    try std.testing.expectEqual(@as(u32, 64), status.last_failed_action_schedule_cascade_max_depth);
+    try std.testing.expectEqual(@as(u64, 2), status.last_failed_action_schedule_requeue_count);
+    try std.testing.expectEqual(@as(u64, 99), status.last_failed_action_schedule_last_requeued_at_ns.?);
+    try std.testing.expectEqual(@as(usize, 8), status.last_action_jobs_scanned);
+    try std.testing.expectEqual(@as(usize, 7), status.last_action_jobs_executed);
+    try std.testing.expectEqual(@as(usize, 1), status.last_action_jobs_invalid);
+    try std.testing.expectEqual(@as(usize, 1), status.last_action_jobs_completed);
+    try std.testing.expectEqual(@as(usize, 1), status.last_action_jobs_failed);
+    try std.testing.expectEqual(@as(usize, 1), status.last_action_jobs_depth_limit_failed);
+    try std.testing.expectEqual(@as(u64, 14), status.last_action_job_applied_children);
+    try std.testing.expectEqual(@as(u64, 7), status.last_failed_action_job_group_id);
+    try std.testing.expectEqualStrings("fk-action:cascade:failed", status.last_failed_action_job_id);
+    try std.testing.expectEqualStrings("cascade", status.last_failed_action_job_action);
+    try std.testing.expectEqualStrings("invalid", status.last_failed_action_job_status);
+    try std.testing.expectEqualStrings("ForeignKeyCascadeDepthLimit", status.last_failed_action_job_error);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status.last_failed_action_job_constraint_name);
+    try std.testing.expectEqualStrings("customers", status.last_failed_action_job_parent_table);
+    try std.testing.expectEqualStrings("customer:hot", status.last_failed_action_job_parent_key);
+    try std.testing.expectEqualStrings("row", status.last_failed_action_job_next_child_table);
+    try std.testing.expectEqualStrings("order:cursor", status.last_failed_action_job_next_child_key);
+    try std.testing.expectEqual(@as(u32, 1), status.last_failed_action_job_attempts);
+    try std.testing.expectEqual(@as(u64, 3), status.last_failed_action_job_applied_children);
+    try std.testing.expectEqual(@as(u64, 2), status.last_failed_action_job_failure_count);
+    try std.testing.expectEqual(@as(u64, 100), status.last_failed_action_job_first_failed_at_ns);
+    try std.testing.expectEqual(@as(u64, 300), status.last_failed_action_job_last_failed_at_ns);
+    try std.testing.expectEqual(@as(u64, 1), status.last_failed_action_job_requeue_count);
+    try std.testing.expectEqual(@as(u64, 200), status.last_failed_action_job_last_requeued_at_ns);
+    try std.testing.expectEqual(@as(u32, 64), status.last_failed_action_job_cascade_depth);
+    try std.testing.expectEqual(@as(u32, 64), status.last_failed_action_job_cascade_max_depth);
+    try std.testing.expect(status.last_failed_action_job_depth_limit_exhausted);
+    try std.testing.expectEqualStrings("orders", status.last_terminal_invalid_table_name);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status.last_terminal_invalid_constraint_name);
+    try std.testing.expectEqualStrings("fk-integrity:orders:orders_customer_id_fkey", status.last_terminal_invalid_job_id);
+    try std.testing.expectEqual(@as(u64, 3), status.last_terminal_invalid_diagnostic_passes);
+    try std.testing.expectEqual(@as(u64, 2), status.last_terminal_invalid_violating_passes);
+    try std.testing.expectEqual(@as(u64, 20), status.last_terminal_invalid_first_violation_at_ns);
+    try std.testing.expectEqual(@as(u64, 40), status.last_terminal_invalid_last_violation_at_ns);
+    try std.testing.expectEqual(@as(u64, 8), status.last_terminal_invalid_missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 4), status.last_terminal_invalid_missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), status.last_terminal_invalid_stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 8), status.last_terminal_invalid_missing_parent_violations);
+    try std.testing.expectEqual(@as(u64, 4), status.last_terminal_invalid_missing_ref_violations);
+    try std.testing.expectEqual(@as(u64, 2), status.last_terminal_invalid_stale_ref_violations);
+    try std.testing.expectEqual(@as(usize, 1), status.last_terminal_invalid_violation_sample_count);
+    try std.testing.expect(status.last_terminal_invalid_violations_truncated);
+    try std.testing.expectEqual(@as(u64, 9), status.last_terminal_invalid_violation_group_id);
+    try std.testing.expectEqualStrings("missing_parent", status.last_terminal_invalid_violation_kind);
+    try std.testing.expectEqualStrings("row", status.last_terminal_invalid_violation_child_table);
+    try std.testing.expectEqualStrings("order:invalid", status.last_terminal_invalid_violation_child_key);
+    try std.testing.expectEqualStrings("customers", status.last_terminal_invalid_violation_parent_table);
+    try std.testing.expectEqualStrings("customer:missing", status.last_terminal_invalid_violation_parent_key);
+    try std.testing.expectEqualStrings("", status.last_terminal_invalid_violation_observed_parent_key);
+    try std.testing.expectEqual(@as(usize, 2), status.last_claim_attempts);
+    try std.testing.expectEqual(@as(usize, 1), status.last_terminal_valid_results);
+    try std.testing.expectEqual(@as(usize, 1), status.last_terminal_invalid_results);
+    try std.testing.expect(!status.last_complete);
+    try std.testing.expect(!status.last_valid);
+    try std.testing.expectEqual(@as(u64, 8), status.terminal_invalid_missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 4), status.terminal_invalid_missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 2), status.terminal_invalid_stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_violation_samples_total);
+    try std.testing.expectEqual(@as(u64, 1), status.terminal_invalid_violations_truncated_total);
+    try std.testing.expectEqual(@as(u64, 8), status.terminal_invalid_missing_parent_violations_total);
+    try std.testing.expectEqual(@as(u64, 4), status.terminal_invalid_missing_ref_violations_total);
+    try std.testing.expectEqual(@as(u64, 2), status.terminal_invalid_stale_ref_violations_total);
+
+    var second_terminal_invalid_violations = [_]api_table_writes.ForeignKeyIntegrityViolation{ .{
+        .group_id = 10,
+        .kind = .missing_ref,
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .child_table = @constCast("row"),
+        .child_key = @constCast("order:missing-ref"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:expected"),
+    }, .{
+        .group_id = 11,
+        .kind = .stale_ref,
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .child_table = @constCast("row"),
+        .child_key = @constCast("order:stale-ref"),
+        .parent_table = @constCast("customers"),
+        .parent_key = @constCast("customer:stale"),
+        .observed_parent_key = @constCast("customer:actual"),
+    } };
+    var second_terminal_invalid_results = [_]api_table_writes.ForeignKeyIntegritySchemaControllerTableResult{.{
+        .table_name = @constCast("orders"),
+        .schema_adoption = true,
+        .result = .{
+            .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey:second"),
+            .action = .validate,
+            .valid = false,
+            .complete = true,
+            .violation_limit = 2,
+            .violations_truncated = false,
+            .report = .{
+                .missing_ref_rows = 5,
+                .stale_ref_rows = 6,
+            },
+            .groups = &.{},
+            .work_units = &.{},
+            .violations = second_terminal_invalid_violations[0..],
+        },
+    }};
+    runtime_status.recordSummary(cfg, .{
+        .results = second_terminal_invalid_results[0..],
+        .terminal_invalid_results = 1,
+        .complete = true,
+        .valid = false,
+    });
+    const status_after_second_pass = runtime_status.snapshot(cfg);
+    try std.testing.expectEqual(@as(u64, 2), status_after_second_pass.terminal_invalid_results_total);
+    try std.testing.expectEqual(@as(u64, 8), status_after_second_pass.terminal_invalid_missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 9), status_after_second_pass.terminal_invalid_missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 8), status_after_second_pass.terminal_invalid_stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 3), status_after_second_pass.terminal_invalid_violation_samples_total);
+    try std.testing.expectEqual(@as(u64, 1), status_after_second_pass.terminal_invalid_violations_truncated_total);
+    try std.testing.expectEqual(@as(u64, 8), status_after_second_pass.terminal_invalid_missing_parent_violations_total);
+    try std.testing.expectEqual(@as(u64, 9), status_after_second_pass.terminal_invalid_missing_ref_violations_total);
+    try std.testing.expectEqual(@as(u64, 8), status_after_second_pass.terminal_invalid_stale_ref_violations_total);
+    try std.testing.expectEqual(@as(u64, 0), status_after_second_pass.last_terminal_invalid_missing_parent_violations);
+    try std.testing.expectEqual(@as(u64, 5), status_after_second_pass.last_terminal_invalid_missing_ref_violations);
+    try std.testing.expectEqual(@as(u64, 6), status_after_second_pass.last_terminal_invalid_stale_ref_violations);
+    try std.testing.expectEqualStrings("fk-integrity:orders:orders_customer_id_fkey:second", status_after_second_pass.last_terminal_invalid_job_id);
+    try std.testing.expectEqualStrings("missing_ref", status_after_second_pass.last_terminal_invalid_violation_kind);
+
+    var invalid_work_units = [_]api_table_writes.ForeignKeyIntegrityWorkUnit{.{
+        .group_id = 7,
+        .phase = @constCast("child_range"),
+        .planned_action = @constCast("validate"),
+        .constraint_name = @constCast("orders_customer_id_fkey"),
+        .lower_doc_key = @constCast(""),
+        .upper_doc_key = @constCast(""),
+    }};
+    var missing_parent_values = [_]api_table_writes.ForeignKeyIntegrityTupleValue{.{
+        .column = @constCast("email"),
+        .value = @constCast("missing@example.test"),
+    }};
+    var observed_parent_values = [_]api_table_writes.ForeignKeyIntegrityTupleValue{.{
+        .column = @constCast("email"),
+        .value = @constCast("actual@example.test"),
+    }};
+    var invalid_violations = [_]api_table_writes.ForeignKeyIntegrityViolation{
+        .{
+            .group_id = 7,
+            .kind = .missing_parent,
+            .constraint_name = @constCast("orders_customer_id_fkey"),
+            .child_table = @constCast("row"),
+            .child_key = @constCast("order:broken"),
+            .parent_table = @constCast("customers"),
+            .parent_key = @constCast("customer:missing"),
+            .parent_values = missing_parent_values[0..],
+        },
+        .{
+            .group_id = 8,
+            .kind = .missing_ref,
+            .constraint_name = @constCast("orders_customer_id_fkey"),
+            .child_table = @constCast("row"),
+            .child_key = @constCast("order:missing-ref"),
+            .parent_table = @constCast("customers"),
+            .parent_key = @constCast("customer:missing-ref"),
+        },
+        .{
+            .group_id = 9,
+            .kind = .stale_ref,
+            .constraint_name = @constCast("orders_customer_id_fkey"),
+            .child_table = @constCast("row"),
+            .child_key = @constCast("order:stale"),
+            .parent_table = @constCast("customers"),
+            .parent_key = @constCast("customer:old"),
+            .observed_parent_key = @constCast("customer:actual"),
+            .observed_parent_values = observed_parent_values[0..],
+        },
+    };
+    const invalid_result: api_table_writes.ForeignKeyIntegrityResult = .{
+        .action = .validate,
+        .job_id = @constCast("fk-integrity:orders:orders_customer_id_fkey"),
+        .complete = true,
+        .valid = false,
+        .violation_limit = 100,
+        .report = .{
+            .missing_parent_rows = 2,
+            .missing_ref_rows = 1,
+            .stale_ref_rows = 3,
+        },
+        .groups = &.{},
+        .violations = invalid_violations[0..],
+        .work_units = invalid_work_units[0..],
+        .violations_truncated = true,
+    };
+    var invalid_table_results = [_]api_table_writes.ForeignKeyIntegritySchemaControllerTableResult{.{
+        .table_name = @constCast("orders"),
+        .result = invalid_result,
+    }};
+    runtime_status.recordSummary(cfg, .{
+        .tables_scanned = 1,
+        .tables_with_pending_constraints = 1,
+        .tables_executed = 1,
+        .claim_attempts = 1,
+        .terminal_invalid_results = 1,
+        .complete = true,
+        .valid = false,
+        .results = invalid_table_results[0..],
+    });
+    const status_with_report = runtime_status.snapshot(cfg);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.rounds_total);
+    try std.testing.expectEqual(@as(u64, 6), status_with_report.missing_parent_rows_total);
+    try std.testing.expectEqual(@as(u64, 8), status_with_report.missing_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 10), status_with_report.stale_ref_rows_total);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.last_missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), status_with_report.last_missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.last_stale_ref_rows);
+    try std.testing.expectEqualStrings("orders", status_with_report.last_terminal_invalid_table_name);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", status_with_report.last_terminal_invalid_constraint_name);
+    try std.testing.expectEqualStrings("fk-integrity:orders:orders_customer_id_fkey", status_with_report.last_terminal_invalid_job_id);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.last_terminal_invalid_missing_parent_rows);
+    try std.testing.expectEqual(@as(u64, 1), status_with_report.last_terminal_invalid_missing_ref_rows);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.last_terminal_invalid_stale_ref_rows);
+    try std.testing.expectEqual(@as(u64, 2), status_with_report.last_terminal_invalid_missing_parent_violations);
+    try std.testing.expectEqual(@as(u64, 1), status_with_report.last_terminal_invalid_missing_ref_violations);
+    try std.testing.expectEqual(@as(u64, 3), status_with_report.last_terminal_invalid_stale_ref_violations);
+    try std.testing.expectEqual(@as(usize, 3), status_with_report.last_terminal_invalid_violation_sample_count);
+    try std.testing.expect(status_with_report.last_terminal_invalid_violations_truncated);
+    try std.testing.expectEqual(@as(u64, 7), status_with_report.last_terminal_invalid_violation_group_id);
+    try std.testing.expectEqualStrings("missing_parent", status_with_report.last_terminal_invalid_violation_kind);
+    try std.testing.expectEqualStrings("row", status_with_report.last_terminal_invalid_violation_child_table);
+    try std.testing.expectEqualStrings("order:broken", status_with_report.last_terminal_invalid_violation_child_key);
+    try std.testing.expectEqualStrings("customers", status_with_report.last_terminal_invalid_violation_parent_table);
+    try std.testing.expectEqualStrings("customer:missing", status_with_report.last_terminal_invalid_violation_parent_key);
+    try std.testing.expectEqualStrings("", status_with_report.last_terminal_invalid_violation_observed_parent_key);
+
+    const invalid_json = try foreignKeyValidationMetadataAlloc(std.testing.allocator, "{}", "orders_customer_id_fkey", invalid_result);
+    defer std.testing.allocator.free(invalid_json);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"orders_customer_id_fkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"validation_state\":\"invalid\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"job_id\":\"fk-integrity:orders:orders_customer_id_fkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_parent_rows\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"violation_sample_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"violation_kind_counts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_parent\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"missing_ref\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"stale_ref\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"violation_samples\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"metadata_violation_samples_truncated\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"first_violation\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"child_key\":\"order:broken\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"parent_key\":\"customer:missing\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"parent_values\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "missing@example.test") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"child_key\":\"order:missing-ref\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "\"observed_parent_key\":\"customer:actual\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, invalid_json, "actual@example.test") != null);
+
+    const cleared_json = try foreignKeyValidationMetadataAlloc(std.testing.allocator, invalid_json, "orders_customer_id_fkey", null);
+    defer std.testing.allocator.free(cleared_json);
+    try std.testing.expect(std.mem.indexOf(u8, cleared_json, "\"orders_customer_id_fkey\"") == null);
+
+    const FakeMetadataService = struct {
+        alloc: std.mem.Allocator,
+        table: metadata_table_manager.TableRecord,
+        upserted: ?metadata_table_manager.TableRecord = null,
+
+        fn deinit(self: *@This()) void {
+            if (self.upserted) |record| {
+                metadata_table_manager.freeTable(self.alloc, record);
+            }
+        }
+
+        fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+            const tables = try self.alloc.alloc(metadata_table_manager.TableRecord, 1);
+            errdefer self.alloc.free(tables);
+            tables[0] = try metadata_table_manager.cloneTable(self.alloc, self.table);
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = tables,
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+            for (snapshot.tables) |table| {
+                metadata_table_manager.freeTable(self.alloc, table);
+            }
+            if (snapshot.tables.len > 0) self.alloc.free(snapshot.tables);
+            snapshot.* = undefined;
+        }
+
+        fn upsertTable(self: *@This(), record: metadata_table_manager.TableRecord) !void {
+            if (self.upserted) |old| {
+                metadata_table_manager.freeTable(self.alloc, old);
+                self.upserted = null;
+            }
+            self.upserted = try metadata_table_manager.cloneTable(self.alloc, record);
+        }
+    };
+
+    var fake_service = FakeMetadataService{
+        .alloc = std.testing.allocator,
+        .table = .{
+            .table_id = 10,
+            .name = "orders",
+            .schema_json = "{\"version\":1}",
+        },
+    };
+    defer fake_service.deinit();
+    try recordInvalidForeignKeySchemaControllerResult(&fake_service, "orders", invalid_result);
+    try std.testing.expect(fake_service.upserted != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_service.upserted.?.foreign_key_validation_json, "\"orders_customer_id_fkey\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, fake_service.upserted.?.foreign_key_validation_json, "\"validation_state\":\"invalid\"") != null);
 }
 
 fn syncLocalRestoreProgress(
@@ -5926,10 +8783,53 @@ pub fn snapshotStatusWithOptions(
         service.getProjectedReconcileLease() catch null
     else
         null;
+    const foreign_key_schema_controller_status = if (@hasDecl(SourceDeclType, "foreignKeySchemaControllerStatus"))
+        service.foreignKeySchemaControllerStatus()
+    else
+        metadata_api.ForeignKeySchemaControllerStatus{};
+    const unique_constraint_schema_controller_status = if (@hasDecl(SourceDeclType, "uniqueConstraintSchemaControllerStatus"))
+        service.uniqueConstraintSchemaControllerStatus()
+    else
+        metadata_api.UniqueConstraintSchemaControllerStatus{};
     const projected_tables = try service.listProjectedTables(alloc);
     defer service.freeProjectedTables(alloc, projected_tables);
     const projected_ranges = try service.listProjectedRanges(alloc);
     defer service.freeProjectedRanges(alloc, projected_ranges);
+    const projected_foreign_key_ref_ranges = if (@hasDecl(SourceDeclType, "listProjectedForeignKeyReferenceRanges"))
+        try service.listProjectedForeignKeyReferenceRanges(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedForeignKeyReferenceRanges") and projected_foreign_key_ref_ranges.len > 0) {
+        service.freeProjectedForeignKeyReferenceRanges(alloc, projected_foreign_key_ref_ranges);
+    };
+    const projected_unique_constraint_ranges = if (@hasDecl(SourceDeclType, "listProjectedUniqueConstraintRanges"))
+        try service.listProjectedUniqueConstraintRanges(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedUniqueConstraintRanges") and projected_unique_constraint_ranges.len > 0) {
+        service.freeProjectedUniqueConstraintRanges(alloc, projected_unique_constraint_ranges);
+    };
+    const projected_secondary_index_rebuild_ranges = if (@hasDecl(SourceDeclType, "listProjectedSecondaryIndexRebuildRanges"))
+        try service.listProjectedSecondaryIndexRebuildRanges(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedSecondaryIndexRebuildRanges") and projected_secondary_index_rebuild_ranges.len > 0) {
+        service.freeProjectedSecondaryIndexRebuildRanges(alloc, projected_secondary_index_rebuild_ranges);
+    };
+    const projected_schema_rewrite_jobs = if (@hasDecl(SourceDeclType, "listProjectedSchemaRewriteJobs"))
+        try service.listProjectedSchemaRewriteJobs(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedSchemaRewriteJobs") and projected_schema_rewrite_jobs.len > 0) {
+        service.freeProjectedSchemaRewriteJobs(alloc, projected_schema_rewrite_jobs);
+    };
+    const projected_table_emptying_jobs = if (@hasDecl(SourceDeclType, "listProjectedTableEmptyingJobs"))
+        try service.listProjectedTableEmptyingJobs(alloc)
+    else
+        &.{};
+    defer if (@hasDecl(SourceDeclType, "freeProjectedTableEmptyingJobs") and projected_table_emptying_jobs.len > 0) {
+        service.freeProjectedTableEmptyingJobs(alloc, projected_table_emptying_jobs);
+    };
     const projected_stores = try service.listProjectedStores(alloc);
     defer service.freeProjectedStores(alloc, projected_stores);
     const projected_placement_intents = try service.listProjectedPlacementIntents(alloc);
@@ -6187,6 +9087,8 @@ pub fn snapshotStatusWithOptions(
         .metadata_raft_transport_served_groups = metadata_raft.transport_served_groups,
         .metadata_raft_transport_pending_retries = metadata_raft.transport_pending_retries,
         .metrics = metrics,
+        .foreign_key_schema_controller = foreign_key_schema_controller_status,
+        .unique_constraint_schema_controller = unique_constraint_schema_controller_status,
         .reconcile_lease_enabled = lease_stats.enabled,
         .reconcile_lease_owner_node_id = if (projected_reconcile_lease) |record| record.owner_node_id else lease_stats.owner_node_id,
         .reconcile_lease_expires_at_ms = if (projected_reconcile_lease) |record| record.expires_at_ms else lease_stats.expires_at_ms,
@@ -6233,6 +9135,11 @@ pub fn snapshotStatusWithOptions(
         .projected_extension_members = projected_extension_members.len,
         .projected_extension_dependencies = projected_extension_dependencies.len,
         .projected_ranges = projected_ranges.len,
+        .projected_foreign_key_ref_ranges = projected_foreign_key_ref_ranges.len,
+        .projected_unique_constraint_ranges = projected_unique_constraint_ranges.len,
+        .projected_secondary_index_rebuild_ranges = projected_secondary_index_rebuild_ranges.len,
+        .projected_schema_rewrite_jobs = projected_schema_rewrite_jobs.len,
+        .projected_table_emptying_jobs = projected_table_emptying_jobs.len,
         .projected_stores = projected_stores.len,
         .projected_placement_intents = projected_placement_intents.len,
         .projected_snapshot_bootstrap_intents = projected_snapshot_bootstrap_intents,
@@ -9910,4 +12817,78 @@ test "metadata service local replica root reconcile permit hook defers reconcile
     svc.last_local_table_provisioning_refresh_at_ms = 0;
     try runServiceRounds(&svc, 8);
     try std.testing.expect(capture.calls >= 1);
+}
+
+test "metadata service secondary index promotion command uses schema compare and swap" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-service-secondary-index-promotion-cas", .{tmp.sub_path});
+    defer std.testing.allocator.free(root);
+
+    const building_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"building","x-antfly-index-generation":42}}}}}}
+    ;
+    const stale_ready_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"bad-ready","x-antfly-index-generation":42}}}}}}
+    ;
+    const ready_schema =
+        \\{"version":0,"document_schemas":{"row":{"schema":{"type":"object","properties":{"status":{"type":"string","x-antfly-index":true,"x-antfly-index-lifecycle":"ready","x-antfly-index-generation":42}}}}}}
+    ;
+
+    const table_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .upsert_table = .{
+            .table_id = 41,
+            .name = "orders",
+            .schema_json = building_schema,
+        },
+    });
+    defer std.testing.allocator.free(table_cmd);
+    const stale_promote_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .promote_secondary_index_ready = .{
+            .table_id = 41,
+            .index_name = "status",
+            .expected_index_generation = 42,
+            .expected_schema_json = "{\"stale\":true}",
+            .promoted_table = .{
+                .table_id = 41,
+                .name = "orders",
+                .schema_json = stale_ready_schema,
+            },
+        },
+    });
+    defer std.testing.allocator.free(stale_promote_cmd);
+    const ready_promote_cmd = try metadata_storage.encodeTransitionCommand(std.testing.allocator, .{
+        .promote_secondary_index_ready = .{
+            .table_id = 41,
+            .index_name = "status",
+            .expected_index_generation = 42,
+            .expected_schema_json = building_schema,
+            .promoted_table = .{
+                .table_id = 41,
+                .name = "orders",
+                .schema_json = ready_schema,
+            },
+        },
+    });
+    defer std.testing.allocator.free(ready_promote_cmd);
+
+    const encoded_entries = try raft_state_machine.encodeCommittedEntries(std.testing.allocator, &.{
+        .{ .term = 1, .index = 1, .entry_type = .normal, .data = table_cmd },
+        .{ .term = 1, .index = 2, .entry_type = .normal, .data = stale_promote_cmd },
+        .{ .term = 1, .index = 3, .entry_type = .normal, .data = ready_promote_cmd },
+    });
+    defer std.testing.allocator.free(encoded_entries);
+
+    var store = try metadata_storage.RaftApplyStore.init(std.testing.allocator, .{ .root_dir = root });
+    defer store.deinit();
+    try store.snapshotBuilder().applyBatch(.{
+        .group_id = 41,
+        .commit_index = 3,
+        .entries_bytes = encoded_entries,
+    });
+    const tables = try store.listTables(std.testing.allocator, 41);
+    defer store.freeTables(std.testing.allocator, tables);
+    try std.testing.expectEqual(@as(usize, 1), tables.len);
+    try std.testing.expectEqualStrings(ready_schema, tables[0].schema_json);
 }

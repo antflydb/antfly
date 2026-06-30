@@ -408,14 +408,6 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    const linalg_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-linalg-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/linalg_bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
     training_bench_exe.root_module.addImport("build_options", build_options_mod);
     training_bench_exe.root_module.addImport("ml", ml_mod);
     configureNativeTool(b, training_bench_exe, target, enable_system_blas, blas_root, enable_metal);
@@ -425,13 +417,6 @@ pub fn build(b: *std.Build) void {
     }
     const training_bench_step = b.step("bench-training", "Run the native training benchmark");
     training_bench_step.dependOn(&run_training_bench.step);
-    linalg_bench_exe.root_module.addImport("inference_linalg", inference_linalg_mod);
-    const run_linalg_bench = b.addRunArtifact(linalg_bench_exe);
-    if (b.args) |args| {
-        run_linalg_bench.addArgs(args);
-    }
-    const linalg_bench_step = b.step("bench-linalg", "Run the shared linalg benchmark");
-    linalg_bench_step.dependOn(&run_linalg_bench.step);
 
     const clipclap_bench_exe = b.addExecutable(.{
         .name = "antfly-inference-clipclap-kernels-bench",
@@ -591,24 +576,6 @@ pub fn build(b: *std.Build) void {
     const reranker_e2e_bench_step = b.step("bench-reranker-e2e", "Run real-bundle text reranker E2E benchmarks");
     reranker_e2e_bench_step.dependOn(&run_reranker_e2e_bench.step);
 
-    const audio_bench_exe = b.addExecutable(.{
-        .name = "antfly-inference-audio-bench",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("src/audio_bench.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    audio_bench_exe.root_module.addImport("build_options", build_options_mod);
-    audio_bench_exe.root_module.addImport("inference_audio", inference_audio_mod);
-    audio_bench_exe.root_module.link_libc = true;
-    const run_audio_bench = b.addRunArtifact(audio_bench_exe);
-    if (b.args) |args| {
-        run_audio_bench.addArgs(args);
-    }
-    const audio_bench_step = b.step("bench-audio", "Run the checked-in audio decode and synthesis benchmark");
-    audio_bench_step.dependOn(&run_audio_bench.step);
-
     // Tests
     const runtime_test_filter = b.option(bool, "runtime-test-filter", "Build unit tests with a simple runtime-filtering test runner") orelse false;
     const main_test_filters = if (runtime_test_filter) &.{} else selectTestFilters(b, &.{});
@@ -730,8 +697,8 @@ pub fn build(b: *std.Build) void {
     configureOnnxRuntime(b, wasm_compute_tests.root_module, enable_onnx, effective_onnx_root);
     wasm_compute_tests.root_module.link_libc = true;
     const run_wasm_compute_tests = b.addRunArtifact(wasm_compute_tests);
-    const test_wasm_compute_step = b.step("test-wasm-compute", "Run focused WasmCompute backend tests");
-    test_wasm_compute_step.dependOn(&run_wasm_compute_tests.step);
+    const wasm_compute_test_step = b.step("wasm-compute-test", "Run focused WasmCompute backend tests");
+    wasm_compute_test_step.dependOn(&run_wasm_compute_tests.step);
 
     // Tiny helper binary that exposes gguf.quant_codec.dequantizeToFloat32 to
     // out-of-process test harnesses (web/test-quant-kernels-webgpu.cjs).
@@ -785,12 +752,17 @@ pub fn build(b: *std.Build) void {
     configureOnnxRuntime(b, web_projector_tests.root_module, enable_onnx, effective_onnx_root);
     web_projector_tests.root_module.link_libc = true;
     const run_web_projector_tests = b.addRunArtifact(web_projector_tests);
-    const test_web_projector_step = b.step("test-web-projector", "Run focused web projector/runtime tests");
-    test_web_projector_step.dependOn(&run_web_projector_tests.step);
+    const web_projector_test_step = b.step("web-projector-test", "Run focused web projector/runtime tests");
+    web_projector_test_step.dependOn(&run_web_projector_tests.step);
 
     const run_webgpu_browser_smoke = b.addSystemCommand(&.{ "node", "web/test-webgpu-shader-smoke.mjs" });
-    const test_webgpu_browser_step = b.step("test-webgpu-browser", "Run Chromium WebGPU shader-family browser smoke");
-    test_webgpu_browser_step.dependOn(&run_webgpu_browser_smoke.step);
+    const webgpu_browser_test_step = b.step("webgpu-browser-test", "Run Chromium WebGPU shader-family browser smoke");
+    webgpu_browser_test_step.dependOn(&run_webgpu_browser_smoke.step);
+
+    const wasm_test_step = b.step("wasm-test", "Run Wasm and browser runtime tests");
+    wasm_test_step.dependOn(&run_wasm_compute_tests.step);
+    wasm_test_step.dependOn(&run_web_projector_tests.step);
+    wasm_test_step.dependOn(&run_webgpu_browser_smoke.step);
 
     const linalg_tests = b.addTest(.{
         .root_module = b.createModule(.{
@@ -800,7 +772,7 @@ pub fn build(b: *std.Build) void {
         }),
     });
     const run_linalg_tests = b.addRunArtifact(linalg_tests);
-    const linalg_test_step = b.step("test-linalg", "Run linalg tests");
+    const linalg_test_step = b.step("lib-linalg-test", "Run lib/linalg tests");
     linalg_test_step.dependOn(&run_linalg_tests.step);
 
     // Tokenizer-only tests
@@ -813,7 +785,7 @@ pub fn build(b: *std.Build) void {
     });
     tok_tests.root_module.addImport("sentencepiece_proto", sentencepiece_proto_mod);
     const run_tok_tests = b.addRunArtifact(tok_tests);
-    const tok_test_step = b.step("test-tokenizer", "Run tokenizer tests");
+    const tok_test_step = b.step("lib-tokenizer-test", "Run lib/tokenizer tests");
     tok_test_step.dependOn(&run_tok_tests.step);
 
     const audio_tests = b.addTest(.{
@@ -827,7 +799,7 @@ pub fn build(b: *std.Build) void {
     audio_tests.root_module.addImport("inference_audio", inference_audio_mod);
     audio_tests.root_module.link_libc = true;
     const run_audio_tests = b.addRunArtifact(audio_tests);
-    const audio_test_step = b.step("test-audio", "Run shared audio tests");
+    const audio_test_step = b.step("lib-audio-test", "Run lib/audio tests");
     audio_test_step.dependOn(&run_audio_tests.step);
 
     const audio_open_corpus = b.addExecutable(.{
@@ -897,7 +869,7 @@ pub fn build(b: *std.Build) void {
     const audio_misc_corpora_e2e_run_step = b.step("audio-misc-corpora-e2e-run", "Run the lib/audio external MP3/AAC/MP4 corpora e2e runner");
     audio_misc_corpora_e2e_run_step.dependOn(&run_audio_misc_corpora_e2e.step);
 
-    const audio_module_test_step = b.step("test-audio-internals", "Run selected stable internal audio module tests");
+    const audio_module_test_step = audio_test_step;
     const audio_module_test_filters = [_][]const u8{
         "decode synthetic channel-pair parses tns data before gain-control flag",
         "parse adts header rejects nonzero layer bits",
@@ -1211,7 +1183,7 @@ pub fn build(b: *std.Build) void {
     chunker_tests.root_module.addImport("antfly_image", antfly_image_mod);
     chunker_tests.root_module.link_libc = true;
     const run_chunker_tests = b.addRunArtifact(chunker_tests);
-    const chunker_test_step = b.step("test-chunker", "Run chunker tests");
+    const chunker_test_step = b.step("lib-chunker-test", "Run lib/chunker tests");
     chunker_test_step.dependOn(&run_chunker_tests.step);
 
     // ONNX graph converter tests
@@ -1225,7 +1197,7 @@ pub fn build(b: *std.Build) void {
     onnx_graph_tests.root_module.addImport("protobuf", protobuf_mod);
     onnx_graph_tests.root_module.addImport("ml", ml_mod);
     const run_onnx_graph_tests = b.addRunArtifact(onnx_graph_tests);
-    const onnx_graph_test_step = b.step("test-onnx-graph", "Run ONNX graph converter tests");
+    const onnx_graph_test_step = b.step("lib-onnx-test", "Run lib/onnx graph converter tests");
     onnx_graph_test_step.dependOn(&run_onnx_graph_tests.step);
 
     // WASM library target for browser inference

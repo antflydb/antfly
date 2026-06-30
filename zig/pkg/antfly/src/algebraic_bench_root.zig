@@ -20,7 +20,7 @@ pub const lsm_backend = @import("storage/lsm_backend/mod.zig");
 pub const paths = @import("graph/paths.zig");
 
 pub const db = struct {
-    pub const DB = @import("storage/db/db.zig").DB;
+    pub const DB = @import("storage/db/mod.zig").DB;
     pub const IndexManager = @import("storage/db/catalog/index_manager.zig").IndexManager;
     pub const aggregations = @import("storage/db/aggregations.zig");
     pub const algebraic = @import("storage/db/algebraic/mod.zig");

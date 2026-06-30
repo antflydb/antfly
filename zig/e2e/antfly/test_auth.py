@@ -632,3 +632,102 @@ def test_stateful_auth_enforces_row_filters_on_lookup_and_scan(stateful_auth_api
     assert [entry["key"] for entry in scan_result] == ["doc:gold"]
     assert scan_result[0]["tier"] == "gold"
     assert scan_result[0]["title"] == "gold doc"
+
+
+def test_stateful_auth_enforces_row_filters_on_document_sql(stateful_auth_api: AuthApi):
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth("admin", "admin")
+    stateful_auth_api.create_table(
+        "docs_sql",
+        {
+            "num_shards": 1,
+            "schema": {
+                "version": 1,
+                "storage_mode": "document",
+                "default_type": "doc",
+                "document_schemas": {
+                    "doc": {
+                        "schema": {
+                            "type": "object",
+                            "properties": {
+                                "title": {"type": "text"},
+                                "tier": {"type": "keyword"},
+                                "status": {"type": "keyword"},
+                            },
+                            "additionalProperties": True,
+                        }
+                    }
+                },
+            },
+        },
+    )
+    stateful_auth_api.batch_write(
+        "docs_sql",
+        {
+            "inserts": {
+                "doc:gold": {
+                    "title": "gold doc",
+                    "tier": "gold",
+                    "status": "active",
+                },
+                "doc:silver": {
+                    "title": "silver doc",
+                    "tier": "silver",
+                    "status": "active",
+                },
+            },
+            "sync_level": "full_index",
+        },
+    )
+    stateful_auth_api.post(
+        "/auth/v1/users/sql_reader",
+        {
+            "password": "reader",
+            "initial_policies": [
+                {
+                    "resource": "default",
+                    "resource_type": "database",
+                    "type": "admin",
+                }
+            ],
+        },
+    )
+    stateful_auth_api.put(
+        "/auth/v1/users/sql_reader/row-filters/docs_sql",
+        {"term": {"tier": "gold"}},
+    )
+
+    stateful_auth_api.s.headers["Authorization"] = _basic_auth("sql_reader", "reader")
+
+    visible_lookup = _wait_until(
+        lambda: stateful_auth_api.post(
+            "/db/v1/sql",
+            {"sql": "SELECT _id, tier FROM docs_sql WHERE _id = 'doc:gold';"},
+        )
+    )
+    assert visible_lookup["result"]["rows"] == [{"_id": "doc:gold", "tier": "gold"}]
+
+    hidden_lookup = stateful_auth_api.post(
+        "/db/v1/sql",
+        {"sql": "SELECT _id, tier FROM docs_sql WHERE _id = 'doc:silver';"},
+    )
+    assert hidden_lookup["result"]["rows"] == []
+
+    scan_rows = _wait_until(
+        lambda: stateful_auth_api.post(
+            "/db/v1/sql",
+            {
+                "sql": (
+                    "SELECT _id, tier FROM docs_sql "
+                    "ORDER BY _id ASC LIMIT 10;"
+                )
+            },
+        )
+    )
+    assert scan_rows["result"]["rows"] == [{"_id": "doc:gold", "tier": "gold"}]
+
+    counted = stateful_auth_api.post(
+        "/db/v1/sql",
+        {"sql": "SELECT count(*) AS row_count FROM docs_sql;"},
+    )
+    assert counted["statement_kind"] == "aggregate"
+    assert counted["result"]["rows"] == [{"row_count": 1}]

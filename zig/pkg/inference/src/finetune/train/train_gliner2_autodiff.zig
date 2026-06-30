@@ -771,3 +771,135 @@ fn printUsage() void {
         \\
     });
 }
+
+fn parseObjective(value: []const u8) !gliner2_autodiff.GlinerObjective {
+    if (std.mem.eql(u8, value, "token")) return .token;
+    if (std.mem.eql(u8, value, "span-start") or std.mem.eql(u8, value, "span_start")) return .span_start;
+    print("error: unsupported --objective '{s}' (expected token or span-start)\n", .{value});
+    return error.InvalidObjective;
+}
+
+fn parseSpanLoss(value: []const u8) !gliner2_autodiff.SpanStartLossKind {
+    if (std.mem.eql(u8, value, "bce") or std.mem.eql(u8, value, "binary-cross-entropy")) return .bce;
+    if (std.mem.eql(u8, value, "mse")) return .mse;
+    print("error: unsupported --span-loss '{s}' (expected bce or mse)\n", .{value});
+    return error.InvalidSpanLoss;
+}
+
+fn resolveSpanLabelPositiveWeights(
+    allocator: std.mem.Allocator,
+    csv: ?[]const u8,
+    entity_labels: []const []const u8,
+    default_weight: f32,
+) ![]f32 {
+    const weights = try allocator.alloc(f32, entity_labels.len);
+    errdefer allocator.free(weights);
+    @memset(weights, default_weight);
+    if (csv == null) return weights;
+
+    var seen = try allocator.alloc(bool, entity_labels.len);
+    defer allocator.free(seen);
+    @memset(seen, false);
+
+    var iter = std.mem.splitScalar(u8, csv.?, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        const eq_idx = std.mem.indexOfScalar(u8, item, '=') orelse return error.InvalidSpanLabelPositiveWeights;
+        const label = std.mem.trim(u8, item[0..eq_idx], " \t\r\n");
+        const value_text = std.mem.trim(u8, item[eq_idx + 1 ..], " \t\r\n");
+        if (label.len == 0 or value_text.len == 0) return error.InvalidSpanLabelPositiveWeights;
+        const label_idx = indexOfEntityLabel(entity_labels, label) orelse return error.UnknownSpanLabelPositiveWeight;
+        if (seen[label_idx]) return error.DuplicateSpanLabelPositiveWeight;
+        const weight = try std.fmt.parseFloat(f32, value_text);
+        if (!std.math.isFinite(weight) or weight <= 0.0) return error.InvalidSpanPositiveWeight;
+        weights[label_idx] = weight;
+        seen[label_idx] = true;
+    }
+    return weights;
+}
+
+fn parseEntityTypesCsvOwned(allocator: std.mem.Allocator, csv: []const u8) ![][]const u8 {
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (out.items) |item| allocator.free(item);
+        out.deinit(allocator);
+    }
+
+    var iter = std.mem.splitScalar(u8, csv, ',');
+    while (iter.next()) |raw| {
+        const item = std.mem.trim(u8, raw, " \t\r\n");
+        if (item.len == 0) continue;
+        for (out.items) |existing| {
+            if (std.mem.eql(u8, existing, item)) return error.DuplicateEntityType;
+        }
+        try out.append(allocator, try allocator.dupe(u8, item));
+    }
+    if (out.items.len == 0) return error.NoEntityTypesProvided;
+    return out.toOwnedSlice(allocator);
+}
+
+fn indexOfEntityLabel(entity_labels: []const []const u8, label: []const u8) ?usize {
+    for (entity_labels, 0..) |candidate, idx| {
+        if (std.mem.eql(u8, candidate, label)) return idx;
+    }
+    return null;
+}
+
+fn spanLossName(loss: gliner2_autodiff.SpanStartLossKind) []const u8 {
+    return switch (loss) {
+        .bce => "bce",
+        .mse => "mse",
+    };
+}
+
+fn objectiveName(objective: gliner2_autodiff.GlinerObjective) []const u8 {
+    return switch (objective) {
+        .token => "token",
+        .span_start => "span-start",
+    };
+}
+
+fn envFlag(name: [:0]const u8) bool {
+    const value = std.c.getenv(name) orelse return false;
+    const slice = std.mem.span(value);
+    return std.mem.eql(u8, slice, "1") or
+        std.ascii.eqlIgnoreCase(slice, "true") or
+        std.ascii.eqlIgnoreCase(slice, "yes") or
+        std.ascii.eqlIgnoreCase(slice, "on");
+}
+
+test "resolveSpanLabelPositiveWeights applies defaults and overrides" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{ "location", "organization", "person" };
+    const weights = try resolveSpanLabelPositiveWeights(allocator, "organization=96,person=48", labels[0..], 32.0);
+    defer allocator.free(weights);
+
+    try std.testing.expectEqual(@as(usize, 3), weights.len);
+    try std.testing.expectEqual(@as(f32, 32.0), weights[0]);
+    try std.testing.expectEqual(@as(f32, 96.0), weights[1]);
+    try std.testing.expectEqual(@as(f32, 48.0), weights[2]);
+}
+
+test "resolveSpanLabelPositiveWeights rejects unknown labels" {
+    const allocator = std.testing.allocator;
+    const labels = [_][]const u8{ "location", "organization", "person" };
+    try std.testing.expectError(
+        error.UnknownSpanLabelPositiveWeight,
+        resolveSpanLabelPositiveWeights(allocator, "product=96", labels[0..], 32.0),
+    );
+}
+
+test "parseEntityTypesCsvOwned preserves caller order" {
+    const allocator = std.testing.allocator;
+    const labels = try parseEntityTypesCsvOwned(allocator, "person, organization,location");
+    defer {
+        for (labels) |label| allocator.free(label);
+        allocator.free(labels);
+    }
+
+    try std.testing.expectEqual(@as(usize, 3), labels.len);
+    try std.testing.expectEqualStrings("person", labels[0]);
+    try std.testing.expectEqualStrings("organization", labels[1]);
+    try std.testing.expectEqualStrings("location", labels[2]);
+}

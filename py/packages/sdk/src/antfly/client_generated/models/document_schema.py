@@ -23,6 +23,10 @@ class DocumentSchema:
         description (str | Unset): A description of the document type.
         schema (DocumentSchemaSchema | Unset): A valid JSON Schema defining the document's structure.
             This is used to infer indexing rules and field types.
+            Relational-mode scalar properties may include optional
+            `collation` metadata. The metadata is preserved in the
+            durable relational column catalog and reported on result
+            schemas for source-backed text/keyword fields.
     """
 
     description: str | Unset = UNSET

@@ -167,6 +167,8 @@ pub const SearchQuery = union(enum) {
     prefix: PrefixQuery,
     wildcard: WildcardQuery,
     regexp: RegexpQuery,
+    array_any: ArrayAnyQuery,
+    json_contains: JsonContainsQuery,
     bool_query: BoolQuery,
     match_all: void,
     knn: KNNQuery,
@@ -223,7 +225,18 @@ pub const MatchQuery = struct {
 pub const TermQuery = struct {
     field: []const u8,
     term: []const u8,
+    collation: ?[]const u8 = null,
     boost: f32 = 1.0,
+};
+
+pub const ArrayAnyQuery = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+pub const JsonContainsQuery = struct {
+    field: []const u8,
+    value: std.json.Value,
 };
 
 pub const FuzzyQuery = struct {
@@ -307,6 +320,7 @@ pub const TermRangeQuery = struct {
     max: ?[]const u8 = null,
     inclusive_min: bool = true,
     inclusive_max: bool = false,
+    collation: ?[]const u8 = null,
     boost: f32 = 1.0,
 };
 
@@ -494,6 +508,8 @@ pub fn execute(
         .prefix => |pq| try executePrefix(alloc, snap, pq, request),
         .wildcard => |wq| try executeWildcard(alloc, snap, wq, request),
         .regexp => |rq| try executeRegexp(alloc, snap, rq, request),
+        .array_any => return error.InvalidArgument,
+        .json_contains => return error.InvalidArgument,
         .match_all => try executeMatchAll(alloc, snap, request),
         .bool_query => |bq| try executeBool(alloc, snap, bq, request),
         .knn => |kq| try executeKNN(alloc, snap, kq, request),
@@ -517,10 +533,23 @@ pub fn executeCountCandidates(
     snap: *const index_mod.IndexSnapshot,
     query: SearchQuery,
 ) !SearchResult {
+    return try executeCountCandidatesRelational(alloc, snap, query, &.{});
+}
+
+/// As `executeCountCandidates`, but routes exact `.term` predicates on declared
+/// relational keyword columns to a columnar `typed_term` scan (see
+/// `searchQueryToFilterArenaRelational`). `keyword_columns` empty = document-mode
+/// behavior, unchanged.
+pub fn executeCountCandidatesRelational(
+    alloc: Allocator,
+    snap: *const index_mod.IndexSnapshot,
+    query: SearchQuery,
+    keyword_columns: []const []const u8,
+) !SearchResult {
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
 
-    const filter = try searchQueryToFilterArena(arena.allocator(), query);
+    const filter = try searchQueryToFilterArenaRelational(arena.allocator(), query, keyword_columns);
     const doc_ids = try snap.executeFilter(alloc, filter);
     defer alloc.free(doc_ids);
 
@@ -1726,6 +1755,29 @@ fn executeBool(
 }
 
 pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!query_mod.Filter {
+    return try searchQueryToFilterArenaRelational(alloc, sq, &.{});
+}
+
+/// True if `field` is one of the relational keyword columns eligible for a
+/// columnar equality scan.
+fn isKeywordColumn(keyword_columns: []const []const u8, field: []const u8) bool {
+    for (keyword_columns) |name| {
+        if (std.mem.eql(u8, name, field)) return true;
+    }
+    return false;
+}
+
+/// Compile a `SearchQuery` to an executable `Filter`. `keyword_columns` lists
+/// the relational keyword columns whose declared typed column is the
+/// authoritative store; an exact `.term` predicate on such a column is routed to
+/// a columnar `typed_term` scan instead of the analyzed inverted index (which
+/// may have tokenized the value away). Empty slice = no relational routing
+/// (document-mode behavior, unchanged).
+pub fn searchQueryToFilterArenaRelational(
+    alloc: Allocator,
+    sq: SearchQuery,
+    keyword_columns: []const []const u8,
+) anyerror!query_mod.Filter {
     return switch (sq) {
         .match_none => .{ .match_none = {} },
         .match_all => .{ .match_all = {} },
@@ -1743,7 +1795,10 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
             .max_edits = pq.max_edits,
             .auto_fuzzy = pq.auto_fuzzy,
         } },
-        .term => |tq| .{ .term = .{ .field = tq.field, .term = tq.term } },
+        .term => |tq| if (isKeywordColumn(keyword_columns, tq.field))
+            .{ .typed_term = .{ .field = tq.field, .value = tq.term } }
+        else
+            .{ .term = .{ .field = tq.field, .term = tq.term } },
         .fuzzy => |fq| .{ .fuzzy = .{
             .field = fq.field,
             .term = fq.term,
@@ -1822,9 +1877,9 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
         .wildcard => |wq| .{ .wildcard = .{ .field = wq.field, .pattern = wq.pattern } },
         .regexp => |rq| .{ .regexp = .{ .field = rq.field, .pattern = rq.pattern } },
         .bool_query => |bq| blk: {
-            const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must);
-            const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should);
-            const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not);
+            const must = try searchQuerySliceToFilterSliceArena(alloc, bq.must, keyword_columns);
+            const should = try searchQuerySliceToFilterSliceArena(alloc, bq.should, keyword_columns);
+            const must_not = try searchQuerySliceToFilterSliceArena(alloc, bq.must_not, keyword_columns);
             const effective_min_should: u32 = if (should.len > 0 and bq.min_should == 0 and must.len == 0) 1 else bq.min_should;
             break :blk .{ .bool_filter = .{
                 .must = must,
@@ -1837,11 +1892,11 @@ pub fn searchQueryToFilterArena(alloc: Allocator, sq: SearchQuery) anyerror!quer
     };
 }
 
-fn searchQuerySliceToFilterSliceArena(alloc: Allocator, items: []const SearchQuery) anyerror![]query_mod.Filter {
+fn searchQuerySliceToFilterSliceArena(alloc: Allocator, items: []const SearchQuery, keyword_columns: []const []const u8) anyerror![]query_mod.Filter {
     if (items.len == 0) return &.{};
     var out = try alloc.alloc(query_mod.Filter, items.len);
     for (items, 0..) |item, i| {
-        out[i] = try searchQueryToFilterArena(alloc, item);
+        out[i] = try searchQueryToFilterArenaRelational(alloc, item, keyword_columns);
     }
     return out;
 }
@@ -2028,6 +2083,8 @@ fn queryToFilter(alloc: Allocator, sq: SearchQuery) !OwnedFilter {
             .filter_slice = &.{},
         },
         .bool_query => .{ .filter = .{ .match_all = {} }, .duped_terms = &.{}, .filter_slice = &.{} },
+        .array_any => return error.InvalidArgument,
+        .json_contains => return error.InvalidArgument,
         .knn => .{ .filter = .{ .match_all = {} }, .duped_terms = &.{}, .filter_slice = &.{} },
         .hybrid => .{ .filter = .{ .match_all = {} }, .duped_terms = &.{}, .filter_slice = &.{} },
     };

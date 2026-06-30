@@ -371,10 +371,6 @@ pub const Builder = struct {
         if (smaller.dimensions.len == 0) {
             return self.broadcast(id, &.{}, larger);
         }
-        if (shapeIsAllUnitDims(smaller)) {
-            const scalar = try self.reshape(id, Shape.scalar(smaller.element_type));
-            return self.broadcast(scalar, &.{}, larger);
-        }
         var dims: [8]i64 = undefined;
         var used: [8]bool = .{false} ** 8;
         const offset = larger.dimensions.len - smaller.dimensions.len;
@@ -407,7 +403,13 @@ pub const Builder = struct {
                     }
                 }
             }
-            const larger_idx = matched orelse return error.UnsupportedShape;
+            const larger_idx = matched orelse {
+                if (shapeIsAllUnitDims(smaller)) {
+                    const scalar = try self.reshape(id, Shape.scalar(smaller.element_type));
+                    return self.broadcast(scalar, &.{}, larger);
+                }
+                return error.UnsupportedShape;
+            };
             dims[i] = @intCast(larger_idx);
             used[larger_idx] = true;
         }
@@ -825,7 +827,7 @@ fn buildTupleShapeProto(alloc: Allocator, shapes: []const Shape) !xla.ShapeProto
     var proto: xla.ShapeProto = .{};
     errdefer proto.deinit(alloc);
 
-    proto.element_type = .tuple;
+    proto.element_type = .TUPLE;
     const children = try alloc.alloc(xla.ShapeProto, shapes.len);
     var written: usize = 0;
     errdefer {

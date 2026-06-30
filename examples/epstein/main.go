@@ -304,16 +304,14 @@ func parseSyncLevelFlag(value string) (antfly.SyncLevel, error) {
 		return antfly.SyncLevelPropose, nil
 	case "write":
 		return antfly.SyncLevelWrite, nil
-	case "full_text":
-		return antfly.SyncLevelFullText, nil
-	case "aknn", "embeddings":
-		return antfly.SyncLevelAknn, nil
+	case "query":
+		return antfly.SyncLevelQuery, nil
 	case "full_index":
 		return antfly.SyncLevelFullIndex, nil
 	case "enrichments":
 		return antfly.SyncLevelEnrichments, nil
 	default:
-		return "", fmt.Errorf("invalid --sync-level %q (expected write, full_text, aknn, full_index, enrichments, or propose)", value)
+		return "", fmt.Errorf("invalid --sync-level %q (expected propose, write, query, enrichments, or full_index)", value)
 	}
 }
 
@@ -1451,7 +1449,7 @@ func loadCmd(args []string) error {
 	numShards := fs.Int("num-shards", 1, "Number of shards for new table")
 	batchSize := fs.Int("batch-size", 25, "Linear merge batch size")
 	limitRecords := fs.Int("limit-records", 0, "Maximum records to load (0 = all)")
-	syncLevelFlag := fs.String("sync-level", "write", "Merge sync level: write, full_text, aknn, full_index, enrichments, or propose")
+	syncLevelFlag := fs.String("sync-level", "write", "Merge sync level: propose, write, query, enrichments, or full_index")
 	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model to use")
 	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens for chunking")
@@ -1565,7 +1563,7 @@ func syncCmd(args []string) error {
 	createTable := fs.Bool("create-table", false, "Create table if needed")
 	numShards := fs.Int("num-shards", 1, "Number of shards")
 	batchSize := fs.Int("batch-size", 25, "Batch size")
-	syncLevelFlag := fs.String("sync-level", "write", "Merge sync level: write, full_text, aknn, full_index, enrichments, or propose")
+	syncLevelFlag := fs.String("sync-level", "write", "Merge sync level: propose, write, query, enrichments, or full_index")
 	embeddingModel := fs.String("embedding-model", DefaultEmbeddingModel, "Embedding model")
 	chunkerModel := fs.String("chunker-model", DefaultChunkerModel, "Chunker model")
 	targetTokens := fs.Int("target-tokens", 512, "Target tokens")

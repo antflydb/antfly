@@ -87,8 +87,8 @@ def sync_detailed(
     Args:
         user_name (str):  Example: johndoe.
         resource (str):  Example: orders_table.
-        resource_type (ResourceType): Type of the resource, e.g., table, user, or global ('*').
-            Example: table.
+        resource_type (ResourceType): Type of the resource, e.g., database, namespace, table,
+            tablespace, user, or global ('*'). Example: table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -125,8 +125,8 @@ def sync(
     Args:
         user_name (str):  Example: johndoe.
         resource (str):  Example: orders_table.
-        resource_type (ResourceType): Type of the resource, e.g., table, user, or global ('*').
-            Example: table.
+        resource_type (ResourceType): Type of the resource, e.g., database, namespace, table,
+            tablespace, user, or global ('*'). Example: table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -158,8 +158,8 @@ async def asyncio_detailed(
     Args:
         user_name (str):  Example: johndoe.
         resource (str):  Example: orders_table.
-        resource_type (ResourceType): Type of the resource, e.g., table, user, or global ('*').
-            Example: table.
+        resource_type (ResourceType): Type of the resource, e.g., database, namespace, table,
+            tablespace, user, or global ('*'). Example: table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.
@@ -194,8 +194,8 @@ async def asyncio(
     Args:
         user_name (str):  Example: johndoe.
         resource (str):  Example: orders_table.
-        resource_type (ResourceType): Type of the resource, e.g., table, user, or global ('*').
-            Example: table.
+        resource_type (ResourceType): Type of the resource, e.g., database, namespace, table,
+            tablespace, user, or global ('*'). Example: table.
 
     Raises:
         errors.UnexpectedStatus: If the server returns an undocumented status code and Client.raise_on_unexpected_status is True.

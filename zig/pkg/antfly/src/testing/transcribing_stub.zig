@@ -35,6 +35,10 @@ pub const Config = struct {
     use_enhanced: ?bool = null,
     api_url: ?[]u8 = null,
     provider: Provider = .antfly,
+
+    pub fn resolvedUrl(self: Config) ?[]const u8 {
+        return self.base_url orelse self.api_url;
+    }
 };
 
 pub const Request = struct {

@@ -23,11 +23,11 @@ const foreign_sources_api = @import("../../api/foreign_sources.zig");
 const join_model = @import("../../api/join_model.zig");
 const query_api = @import("../../api/query.zig");
 const public_graph_query = @import("../../api/public_graph_query.zig");
-const public_search_request = @import("../../api/public_search_request.zig");
-const public_text_query = @import("../../api/public_text_query.zig");
+const public_search_request = @import("../../query/public_search_request.zig");
+const public_text_query = @import("../../query/public_text_query.zig");
 const public_table_http = @import("../../api/public_table_http.zig");
 const table_contract = @import("../../api/table_contract.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const table_writes = @import("../../api/table_writes.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const shared_vector = @import("antfly_vector").vector;
@@ -64,7 +64,7 @@ const platform_time = @import("../../platform/time.zig");
 const graph_segment_mod = @import("../graph_segment/mod.zig");
 const foreign_mod = @import("../../foreign/mod.zig");
 const query_execution = @import("query_execution.zig");
-const json_helpers = @import("../../api/json_helpers.zig");
+const json_helpers = @import("../../common/json_helpers.zig");
 const ParsedJsonPathValue = json_helpers.ParsedJsonPathValue;
 const parseJsonValueAlloc = json_helpers.parseJsonValueAlloc;
 const parseJsonObjectAlloc = json_helpers.parseJsonObjectAlloc;
@@ -638,8 +638,11 @@ pub const HttpHandler = struct {
         var req = parseEnsureTableRequest(self.alloc, body) catch return try textResponse(self.alloc, 400, "invalid table request");
         defer req.deinit(self.alloc);
         const policy = req.policy orelse catalog_mod.NamespacePolicy{};
-        const indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
-        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, indexes_json) catch |err| switch (err) {
+        const raw_indexes_json = req.indexes_json orelse tables_api.default_indexes_json;
+        const schema_json = req.schema_json orelse "";
+        const indexes_json = try tables_api.prepareTableIndexesForSchemaAlloc(self.alloc, table_name, raw_indexes_json, schema_json);
+        defer self.alloc.free(indexes_json);
+        tables_api.validatePublicAlgebraicIndexesJson(self.alloc, raw_indexes_json) catch |err| switch (err) {
             error.InvalidCreateTableRequest => return try textResponse(self.alloc, 400, "unsupported table index configuration"),
             else => return err,
         };
@@ -6016,7 +6019,7 @@ test "typed index status response rejects extended variant fields but raw json p
     ;
 
     try std.testing.expectError(
-        error.UnknownField,
+        error.MissingField,
         typedJsonResponse(metadata_openapi.IndexStatus, alloc, 200, body),
     );
 
@@ -7970,7 +7973,8 @@ test "http handler create index expands schema-derived algebraic config" {
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"group_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"measure_fields\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"time_fields\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"materializations\":[]") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"materializations\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"materializations\":[]") == null);
     try std.testing.expect(std.mem.indexOf(u8, table.indexes_json, "\"sum_by_customer\"") == null);
 
     var detail = try handler.handle(.{
@@ -8865,7 +8869,7 @@ test "http handler honors public serverless sync levels on table batch writes" {
         .method = .post,
         .path = "/tables/docs/batch",
         .body =
-        \\{"inserts":{"doc:a":{"body":"alpha sync level"}},"sync_level":"full_text"}
+        \\{"inserts":{"doc:a":{"body":"alpha sync level"}},"sync_level":"query"}
         ,
     });
     defer full_text_batch.deinit(alloc);

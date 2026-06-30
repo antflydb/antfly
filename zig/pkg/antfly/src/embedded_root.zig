@@ -21,7 +21,7 @@ pub const lite_backend = lite.backend;
 pub const lite_native = lite.native;
 pub const host_environment = @import("storage/host_environment.zig");
 pub const object_storage = @import("storage/object_storage.zig");
-pub const db = @import("storage/db/db.zig");
+pub const db = @import("storage/db/mod.zig");
 pub const db_core = @import("storage/db/core.zig");
 pub const db_types = @import("storage/db/types.zig");
 pub const template_remote_host = @import("storage/db/template_remote_host.zig");
@@ -33,7 +33,7 @@ pub const transaction_runtime = @import("storage/db/maintenance/transaction_runt
 pub const schema = @import("storage/schema.zig");
 pub const batch = @import("api/batch.zig");
 pub const query = @import("api/query.zig");
-pub const query_contract = @import("api/query_contract.zig");
+pub const query_contract = @import("query/contract.zig");
 pub const backup_codec = @import("storage/backup_codec.zig");
 pub const portable_backup = @import("storage/portable_backup.zig");
 

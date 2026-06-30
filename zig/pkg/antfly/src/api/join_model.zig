@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("../common/json_helpers.zig");
 
 pub const Allocator = std.mem.Allocator;
 pub const join_broadcast_threshold_bytes: u64 = 10 * 1024 * 1024;

@@ -15,7 +15,7 @@
 const std = @import("std");
 const extension_domain = @import("mod.zig");
 const indexes_api = @import("../api/indexes.zig");
-const tables_api = @import("../api/tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_storage = @import("../metadata/storage/mod.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
@@ -25,6 +25,16 @@ pub fn installOnService(
     service: anytype,
     alloc: std.mem.Allocator,
     extension_name: []const u8,
+    request: extension_domain.InstallExtensionRequest,
+) !extension_domain.InstalledExtension {
+    return try installPackageOnService(service, alloc, extension_name, extension_name, request);
+}
+
+pub fn installPackageOnService(
+    service: anytype,
+    alloc: std.mem.Allocator,
+    extension_name: []const u8,
+    package_name: []const u8,
     request: extension_domain.InstallExtensionRequest,
 ) !extension_domain.InstalledExtension {
     var snapshot = try service.adminSnapshot();
@@ -37,7 +47,7 @@ pub fn installOnService(
     var persisted_request = request;
     persisted_request.dry_run = false;
     const installed_at_ms: i64 = @intCast(@divTrunc(platform_time.realtimeNs(), std.time.ns_per_ms));
-    var installed = try catalog.installManifestOnly(extension_name, extension_name, persisted_request, installed_at_ms);
+    var installed = try catalog.installManifestOnly(extension_name, package_name, persisted_request, installed_at_ms);
     errdefer installed.deinitOwned(alloc);
 
     if (!request.dry_run) {

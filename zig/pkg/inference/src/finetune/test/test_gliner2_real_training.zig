@@ -34,7 +34,7 @@
 //
 // NOTE: This test requires the full build module graph (`ml`, BLAS linkage).
 // It will NOT compile standalone via `zig test`. Run via:
-//   zig build test-gliner2-real-training
+//   zig build gliner2-real-training-test
 // with the environment variables above when you want the real-model gate.
 
 const std = @import("std");

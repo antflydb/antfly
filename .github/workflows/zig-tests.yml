@@ -8,7 +8,6 @@ on:
   merge_group:
     types: [checks_requested]
   schedule:
-    - cron: "0 8 * * *"
     - cron: "0 3 * * 0"
   workflow_dispatch:
 
@@ -174,6 +173,14 @@ jobs:
 
       - name: Check generated sources
         run: make zig-generated-check
+
+      - name: Run SQL/API typed-plan parity gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-sql-api-parity-test
+
+      - name: Run application-time temporal table gate
+        if: needs.changes.outputs.zig_tests == 'true'
+        run: make zig-db-temporal-test
 
       - name: Run hermetic Antfly unit tests
         if: needs.changes.outputs.zig_tests == 'true'
@@ -407,7 +414,7 @@ jobs:
         run: make tla-trace-txn TRACE_FILES=/tmp/txn-trace.ndjson
 
   full-default:
-    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: github.event_name == 'merge_group' || (github.event_name == 'push' && github.ref == 'refs/heads/main') || github.event_name == 'workflow_dispatch'
     runs-on: arc-antfly-heavy
     timeout-minutes: 60
     env:
@@ -451,6 +458,12 @@ jobs:
           jobs=$(nproc)
           if [ "$jobs" -gt 8 ]; then jobs=8; fi
           echo "list=0-$((jobs - 1))" >> "$GITHUB_OUTPUT"
+
+      - name: Run SQL/API typed-plan parity gate
+        run: make zig-sql-api-parity-test
+
+      - name: Run application-time temporal table gate
+        run: make zig-db-temporal-test
 
       - name: Run full Zig unit tests
         run: taskset -c ${{ steps.cpus.outputs.list }} make zig-unit-test
@@ -544,7 +557,7 @@ jobs:
 
   e2e-full:
     needs: changes
-    if: github.event_name == 'workflow_dispatch' || github.event.schedule == '0 8 * * *'
+    if: github.event_name == 'workflow_dispatch'
     runs-on: arc-antfly-heavy
     timeout-minutes: 90
     env:
@@ -618,7 +631,6 @@ jobs:
         env:
           ANTFLY_BIN: ./zig-out/bin/antfly
           ANTFLY_LSM_OPEN_DEBUG: "1"
-          ANTFLY_FS_PATH_DEBUG: "1"
         run: |
           chmod +x ./zig-out/bin/antfly
           uv run --project e2e/antfly pytest -q -x e2e/antfly

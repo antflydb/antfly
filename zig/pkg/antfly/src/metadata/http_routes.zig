@@ -46,6 +46,12 @@ pub const Routes = struct {
     pub const internal_table_reseed_exact_cutover_suffix = "/reseed-exact-cutover";
     pub const internal_split_suffix = "/split";
     pub const internal_merge_suffix = "/merge";
+    pub const internal_fk_ref_rebuild_begin_suffix = "/foreign-key-ref-ranges/rebuild/begin";
+    pub const internal_fk_ref_rebuild_finish_suffix = "/foreign-key-ref-ranges/rebuild/finish";
+    pub const internal_fk_ref_split_begin_suffix = "/foreign-key-ref-ranges/split/begin";
+    pub const internal_fk_ref_split_finish_suffix = "/foreign-key-ref-ranges/split/finish";
+    pub const internal_fk_ref_merge_begin_suffix = "/foreign-key-ref-ranges/merge/begin";
+    pub const internal_fk_ref_merge_finish_suffix = "/foreign-key-ref-ranges/merge/finish";
 
     pub const InternalTablePath = struct {
         table_name: []const u8,
@@ -120,6 +126,30 @@ pub const Routes = struct {
 
     pub fn matchInternalTableMerge(path: []const u8) ?InternalTablePath {
         return matchInternalTablePath(path, internal_merge_suffix);
+    }
+
+    pub fn matchInternalForeignKeyReferenceRangeRebuildBegin(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_fk_ref_rebuild_begin_suffix);
+    }
+
+    pub fn matchInternalForeignKeyReferenceRangeRebuildFinish(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_fk_ref_rebuild_finish_suffix);
+    }
+
+    pub fn matchInternalForeignKeyReferenceRangeSplitBegin(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_fk_ref_split_begin_suffix);
+    }
+
+    pub fn matchInternalForeignKeyReferenceRangeSplitFinish(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_fk_ref_split_finish_suffix);
+    }
+
+    pub fn matchInternalForeignKeyReferenceRangeMergeBegin(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_fk_ref_merge_begin_suffix);
+    }
+
+    pub fn matchInternalForeignKeyReferenceRangeMergeFinish(path: []const u8) ?InternalTablePath {
+        return matchInternalTablePath(path, internal_fk_ref_merge_finish_suffix);
     }
 
     pub fn matchInternalTable(path: []const u8) ?InternalTablePath {
@@ -250,5 +280,8 @@ test "metadata routes match dynamic paths" {
     try std.testing.expectEqual(@as(u32, 3), source.source_ordinal);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTableSplit("/internal/v1/tables/docs/split").?.table_name);
     try std.testing.expectEqualStrings("docs", Routes.matchInternalTableMerge("/internal/v1/tables/docs/merge").?.table_name);
+    try std.testing.expectEqualStrings("docs", Routes.matchInternalForeignKeyReferenceRangeRebuildBegin("/internal/v1/tables/docs/foreign-key-ref-ranges/rebuild/begin").?.table_name);
+    try std.testing.expectEqualStrings("docs", Routes.matchInternalForeignKeyReferenceRangeSplitFinish("/internal/v1/tables/docs/foreign-key-ref-ranges/split/finish").?.table_name);
+    try std.testing.expectEqualStrings("docs", Routes.matchInternalForeignKeyReferenceRangeMergeBegin("/internal/v1/tables/docs/foreign-key-ref-ranges/merge/begin").?.table_name);
     try std.testing.expect(Routes.matchTableRanges("/metadata/v1/tables/nope/ranges") == null);
 }

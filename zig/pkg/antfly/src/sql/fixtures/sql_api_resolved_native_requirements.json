@@ -1,0 +1,184 @@
+{
+  "resolution_format": 1,
+  "resolved": [
+    {
+      "reason": "bulk_io_plan",
+      "coverage": [
+        "ddl_copy_binary_execution_contract",
+        "ddl_copy_file_endpoint",
+        "ddl_copy_from_execution_contract",
+        "ddl_copy_from_text_execution_contract",
+        "ddl_copy_program_endpoint",
+        "ddl_copy_to_execution_contract",
+        "ddl_copy_to_text_execution_contract",
+        "ddl_copy_where_expression",
+        "unsupported_ddl_copy_unsupported_options",
+        "unsupported_ddl_copy_wrong_stream_endpoint"
+      ]
+    },
+    {
+      "reason": "cte_mutation_source_plan",
+      "coverage": [
+        "merge_mutation_data_modifying_cte"
+      ]
+    },
+    {
+      "reason": "duplicate_conflict_update_target",
+      "coverage": [
+        "invalid_duplicate_conflict_update_target"
+      ]
+    },
+    {
+      "reason": "duplicate_row_batch_target",
+      "coverage": [
+        "invalid_duplicate_row_batch_target"
+      ]
+    },
+    {
+      "reason": "duplicate_update_target",
+      "coverage": [
+        "invalid_duplicate_update_target"
+      ]
+    },
+    {
+      "reason": "enforced_unique_conflict_target",
+      "coverage": [
+        "schema_additive_unique_conflict_target",
+        "schema_expression_unique_conflict_target",
+        "schema_mixed_expression_unique_conflict_target",
+        "schema_partial_unique_conflict_target",
+        "schema_unique_conflict_target"
+      ]
+    },
+    {
+      "reason": "invalid_expression_conflict_target",
+      "coverage": [
+        "invalid_expression_conflict_target"
+      ]
+    },
+    {
+      "reason": "invalid_named_conflict_target",
+      "coverage": [
+        "invalid_named_conflict_target"
+      ]
+    },
+    {
+      "reason": "multi_output_subquery_delete_selector",
+      "coverage": [
+        "invalid_delete_multi_output_subquery_selector"
+      ]
+    },
+    {
+      "reason": "multi_output_subquery_update_selector",
+      "coverage": [
+        "invalid_update_multi_output_subquery_selector"
+      ]
+    },
+    {
+      "reason": "multi_table_generation_barrier",
+      "coverage": [
+        "truncate_cascade_generation_barrier",
+        "truncate_multi_table_generation_barrier"
+      ]
+    },
+    {
+      "reason": "prepared_transaction_plan",
+      "coverage": [
+        "ddl_prepared_transaction_commit",
+        "ddl_prepared_transaction_prepare",
+        "ddl_prepared_transaction_recovery_contract",
+        "ddl_prepared_transaction_rollback"
+      ]
+    },
+    {
+      "reason": "recursive_cte_stream_plan",
+      "coverage": [
+        "read_recursive_cte_stream_plan"
+      ]
+    },
+    {
+      "reason": "role_setting_plan",
+      "coverage": [
+        "ddl_role_alter_runtime_reset",
+        "ddl_role_alter_runtime_setting"
+      ]
+    },
+    {
+      "reason": "routine_body_plan",
+      "coverage": [
+        "ddl_function_trigger_perform_body",
+        "ddl_procedure_noop_body",
+        "ddl_procedure_perform_body"
+      ]
+    },
+    {
+      "reason": "routine_option_plan",
+      "coverage": [
+        "ddl_function_setting",
+        "ddl_function_support",
+        "ddl_function_transform"
+      ]
+    },
+    {
+      "reason": "row_lock_mode_plan",
+      "coverage": [
+        "invalid_read_row_lock_target",
+        "invalid_update_joined_source_row_lock_target",
+        "invalid_update_source_row_lock_mode",
+        "invalid_update_source_row_lock_target",
+        "query_row_lock_no_key_update",
+        "read_row_lock_key_share",
+        "read_row_lock_nowait",
+        "read_row_lock_share",
+        "update_source_claim_no_key_update",
+        "update_source_claim_nowait",
+        "update_source_claim_skip_locked"
+      ]
+    },
+    {
+      "reason": "row_rewrite_expression_plan",
+      "coverage": [
+        "ddl_alter_column_rewrite_expression"
+      ]
+    },
+    {
+      "reason": "set_operation_output_shape",
+      "coverage": [
+        "read_set_operation_cross_table_source_schema_classifier",
+        "read_set_operation_order_limit",
+        "unsupported_read_set_operation_output_shape"
+      ]
+    },
+    {
+      "reason": "set_operation_plan",
+      "coverage": [
+        "read_set_operation_cross_table_source_schema_classifier",
+        "read_set_operation_order_limit",
+        "set_operation_fetch_tail"
+      ]
+    },
+    {
+      "reason": "set_operation_source_schema",
+      "coverage": [
+        "read_set_operation_cross_table_source_schema",
+        "read_set_operation_cross_table_source_schema_classifier"
+      ]
+    },
+    {
+      "reason": "system_time_temporal_table",
+      "coverage": [
+        "ddl_system_versioned_table",
+        "schema_system_versioned_table"
+      ]
+    },
+    {
+      "reason": "temporal_fk_action",
+      "coverage": [
+        "ddl_temporal_fk_delete_cascade_action",
+        "ddl_temporal_fk_delete_set_null_action",
+        "ddl_temporal_fk_update_cascade_action",
+        "schema_temporal_fk_ddl"
+      ]
+    }
+  ]
+}

@@ -12,6 +12,7 @@ from ..types import UNSET, Unset
 if TYPE_CHECKING:
     from ..models.graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
     from ..models.graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+    from ..models.graph_metric_runtime_stats import GraphMetricRuntimeStats
 
 
 T = TypeVar("T", bound="GraphIndexStats")
@@ -31,6 +32,8 @@ class GraphIndexStats:
         backfill_items_processed (int | Unset): Number of edges indexed during current rebuild
         algebraic_graph (GraphIndexStatsAlgebraicGraph | Unset): Algebraic graph execution health for bounded semiring
             traversal.
+        graph_metric_runtime (GraphMetricRuntimeStats | Unset): Summarized graph metric maintenance runtime state.
+            Identity fields are stable hashes, not raw process or owner identifiers.
     """
 
     index_type: GraphIndexStatsIndexType
@@ -41,6 +44,7 @@ class GraphIndexStats:
     backfill_progress: float | Unset = UNSET
     backfill_items_processed: int | Unset = UNSET
     algebraic_graph: GraphIndexStatsAlgebraicGraph | Unset = UNSET
+    graph_metric_runtime: GraphMetricRuntimeStats | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -64,6 +68,10 @@ class GraphIndexStats:
         if not isinstance(self.algebraic_graph, Unset):
             algebraic_graph = self.algebraic_graph.to_dict()
 
+        graph_metric_runtime: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.graph_metric_runtime, Unset):
+            graph_metric_runtime = self.graph_metric_runtime.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -85,6 +93,8 @@ class GraphIndexStats:
             field_dict["backfill_items_processed"] = backfill_items_processed
         if algebraic_graph is not UNSET:
             field_dict["algebraic_graph"] = algebraic_graph
+        if graph_metric_runtime is not UNSET:
+            field_dict["graph_metric_runtime"] = graph_metric_runtime
 
         return field_dict
 
@@ -92,6 +102,7 @@ class GraphIndexStats:
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
         from ..models.graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
         from ..models.graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
+        from ..models.graph_metric_runtime_stats import GraphMetricRuntimeStats
 
         d = dict(src_dict)
         index_type = GraphIndexStatsIndexType(d.pop("index_type"))
@@ -120,6 +131,13 @@ class GraphIndexStats:
         else:
             algebraic_graph = GraphIndexStatsAlgebraicGraph.from_dict(_algebraic_graph)
 
+        _graph_metric_runtime = d.pop("graph_metric_runtime", UNSET)
+        graph_metric_runtime: GraphMetricRuntimeStats | Unset
+        if isinstance(_graph_metric_runtime, Unset):
+            graph_metric_runtime = UNSET
+        else:
+            graph_metric_runtime = GraphMetricRuntimeStats.from_dict(_graph_metric_runtime)
+
         graph_index_stats = cls(
             index_type=index_type,
             error=error,
@@ -129,6 +147,7 @@ class GraphIndexStats:
             backfill_progress=backfill_progress,
             backfill_items_processed=backfill_items_processed,
             algebraic_graph=algebraic_graph,
+            graph_metric_runtime=graph_metric_runtime,
         )
 
         graph_index_stats.additional_properties = d

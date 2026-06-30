@@ -211,38 +211,38 @@ pub const DisjunctionQuery = struct {
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
     match_query: *MatchQuery,
-    boolean_query: *BooleanQuery,
     numeric_range_query: *NumericRangeQuery,
     term_range_query: *TermRangeQuery,
+    boolean_query: *BooleanQuery,
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
-    disjunction_query: *DisjunctionQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     geo_distance_query: *GeoDistanceQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
-    conjunction_query: *ConjunctionQuery,
-    doc_id_query: *DocIdQuery,
+    disjunction_query: *DisjunctionQuery,
     geo_bounding_polygon_query: *GeoBoundingPolygonQuery,
     geo_shape_query: *GeoShapeQuery,
     ip_range_query: *IPRangeQuery,
-    match_all_query: *MatchAllQuery,
-    match_none_query: *MatchNoneQuery,
-    multi_match_query: *MultiMatchQuery,
     prefix_query: *PrefixQuery,
-    query_string_query: *QueryStringQuery,
     regexp_query: *RegexpQuery,
     term_query: *TermQuery,
     wildcard_query: *WildcardQuery,
+    conjunction_query: *ConjunctionQuery,
+    doc_id_query: *DocIdQuery,
+    match_all_query: *MatchAllQuery,
+    match_none_query: *MatchNoneQuery,
+    multi_match_query: *MultiMatchQuery,
+    query_string_query: *QueryStringQuery,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -260,18 +260,38 @@ pub const Query = union(enum) {
             "end",
             "inclusive_start",
             "inclusive_end",
+            "field",
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "match",
+            "field",
             "analyzer",
             "prefix_length",
             "fuzziness",
             "operator",
         })) {
             if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+            "field",
+        })) {
+            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+            "field",
+        })) {
+            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "must",
@@ -282,34 +302,54 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(BooleanQuery, allocator, source, options)) |parsed| return .{ .boolean_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "min",
-            "max",
-            "inclusive_min",
-            "inclusive_max",
-        })) {
-            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "min",
-            "max",
-            "inclusive_min",
-            "inclusive_max",
-        })) {
-            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "term",
             "prefix_length",
             "fuzziness",
+            "field",
         })) {
             if (try parseStructuralVariant(FuzzyQuery, allocator, source, options)) |parsed| return .{ .fuzzy_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "match_phrase",
+            "field",
             "analyzer",
             "fuzziness",
         })) {
             if (try parseStructuralVariant(MatchPhraseQuery, allocator, source, options)) |parsed| return .{ .match_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "top_left",
+            "bottom_right",
+            "field",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "location",
+            "distance",
+            "field",
+        })) {
+            if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "field",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(MultiPhraseQuery, allocator, source, options)) |parsed| return .{ .multi_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "field",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool",
+            "field",
+        })) {
+            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "disjuncts",
@@ -318,33 +358,46 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "top_left",
-            "bottom_right",
+            "polygon_points",
+            "field",
         })) {
-            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+            if (try parseStructuralVariant(GeoBoundingPolygonQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_polygon_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "location",
-            "distance",
+            "geometry",
+            "field",
         })) {
-            if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+            if (try parseStructuralVariant(GeoShapeQuery, allocator, source, options)) |parsed| return .{ .geo_shape_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "terms",
-            "fuzziness",
+            "cidr",
+            "field",
         })) {
-            if (try parseStructuralVariant(MultiPhraseQuery, allocator, source, options)) |parsed| return .{ .multi_phrase_query = parsed };
+            if (try parseStructuralVariant(IPRangeQuery, allocator, source, options)) |parsed| return .{ .ip_range_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "terms",
-            "fuzziness",
+            "prefix",
+            "field",
         })) {
-            if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "bool",
+            "regexp",
+            "field",
         })) {
-            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
+            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+            "field",
+        })) {
+            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "wildcard",
+            "field",
+        })) {
+            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "conjuncts",
@@ -355,21 +408,6 @@ pub const Query = union(enum) {
             "ids",
         })) {
             if (try parseStructuralVariant(DocIdQuery, allocator, source, options)) |parsed| return .{ .doc_id_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "polygon_points",
-        })) {
-            if (try parseStructuralVariant(GeoBoundingPolygonQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_polygon_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "geometry",
-        })) {
-            if (try parseStructuralVariant(GeoShapeQuery, allocator, source, options)) |parsed| return .{ .geo_shape_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "cidr",
-        })) {
-            if (try parseStructuralVariant(IPRangeQuery, allocator, source, options)) |parsed| return .{ .ip_range_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "match_all",
@@ -387,61 +425,46 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MultiMatchQuery, allocator, source, options)) |parsed| return .{ .multi_match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "prefix",
-        })) {
-            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "query",
         })) {
             if (try parseStructuralVariant(QueryStringQuery, allocator, source, options)) |parsed| return .{ .query_string_query = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "regexp",
-        })) {
-            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "term",
-        })) {
-            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "wildcard",
-        })) {
-            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
-        }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
             .match_query => |v| try jw.write(v.*),
-            .boolean_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
             .term_range_query => |v| try jw.write(v.*),
+            .boolean_query => |v| try jw.write(v.*),
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
-            .disjunction_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
-            .conjunction_query => |v| try jw.write(v.*),
-            .doc_id_query => |v| try jw.write(v.*),
+            .disjunction_query => |v| try jw.write(v.*),
             .geo_bounding_polygon_query => |v| try jw.write(v.*),
             .geo_shape_query => |v| try jw.write(v.*),
             .ip_range_query => |v| try jw.write(v.*),
-            .match_all_query => |v| try jw.write(v.*),
-            .match_none_query => |v| try jw.write(v.*),
-            .multi_match_query => |v| try jw.write(v.*),
             .prefix_query => |v| try jw.write(v.*),
-            .query_string_query => |v| try jw.write(v.*),
             .regexp_query => |v| try jw.write(v.*),
             .term_query => |v| try jw.write(v.*),
             .wildcard_query => |v| try jw.write(v.*),
+            .conjunction_query => |v| try jw.write(v.*),
+            .doc_id_query => |v| try jw.write(v.*),
+            .match_all_query => |v| try jw.write(v.*),
+            .match_none_query => |v| try jw.write(v.*),
+            .multi_match_query => |v| try jw.write(v.*),
+            .query_string_query => |v| try jw.write(v.*),
         }
     }
 };

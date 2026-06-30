@@ -16,15 +16,16 @@ const std = @import("std");
 const metadata_mod = @import("mod.zig");
 const service = @import("service.zig");
 const transition_state = @import("transition_state.zig");
+const table_manager = @import("table_manager.zig");
+const table_workflow = @import("table_workflow.zig");
 const metadata_storage = @import("storage/mod.zig");
 const metadata_http_server = @import("http_server.zig");
-const public_api_http_server = @import("../api/http_server.zig");
-const api_table_catalog = @import("../api/table_catalog.zig");
-const api_table_reads = @import("../api/table_reads.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
+const public_api_http_routes = @import("../api/http_routes.zig");
+const public_api_runtime = @import("../api/public_runtime.zig");
 const api_table_router = @import("../api/table_router.zig");
 const api_table_writes = @import("../api/table_writes.zig");
 const http_common = @import("../raft/transport/http_common.zig");
-const raft = @import("../raft/mod.zig");
 const raft_host = @import("../raft/host.zig");
 const raft_managed_host = @import("../raft/managed_host.zig");
 const raft_hosted_shard_ops = @import("../raft/hosted_shard_ops.zig");
@@ -36,7 +37,7 @@ pub const MetadataServerConfig = struct {
     http: raft_managed_host.ManagedHttpHostConfig,
     service: service.MetadataServiceConfig = .{},
     admin_listener: ?raft_transport.StdHttpListenerConfig = null,
-    api_server_cfg: public_api_http_server.ApiHttpServerConfig = .{},
+    api_server_cfg: public_api_runtime.ApiHttpServerConfig = .{},
     reconciler_config: metadata_mod.Reconciler.Config = .{},
 };
 
@@ -51,10 +52,7 @@ pub const MetadataServer = struct {
     owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null,
     owned_hosted_shard_db: ?*raft_hosted_shard_ops.HostedShardDbAdapter = null,
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
-    owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
-    owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
-    owned_public_forwarder: ?*MetadataPublicApiForwarder = null,
-    owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null,
+    public_api_surface: public_api_runtime.PublicApiSurface,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
 
@@ -78,7 +76,7 @@ pub const MetadataServer = struct {
             const hosted_ops = try alloc.create(raft_hosted_shard_ops.HostedShardOperationAdapter);
             hosted_ops.* = raft_hosted_shard_ops.HostedShardOperationAdapter.initWithRouters(
                 alloc,
-                api_table_catalog.CatalogSource.fromMetadataHttpService(svc),
+                svc.catalogSource(),
                 metadataStoreGroupRouter(svc),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
@@ -92,7 +90,7 @@ pub const MetadataServer = struct {
             const hosted_db = try alloc.create(raft_hosted_shard_ops.HostedShardDbAdapter);
             hosted_db.* = raft_hosted_shard_ops.HostedShardDbAdapter.init(
                 alloc,
-                api_table_catalog.CatalogSource.fromMetadataHttpService(svc),
+                svc.catalogSource(),
                 metadataDataBearingStoreGroupRouter(svc),
                 svc.raft.host.http_host.request_executor,
                 local_db,
@@ -103,17 +101,8 @@ pub const MetadataServer = struct {
 
         var owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null;
         errdefer if (owned_admin_http_server) |admin_http_server| alloc.destroy(admin_http_server);
-        var owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null;
-        errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
-        var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
-        errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
-        var owned_public_forwarder: ?*MetadataPublicApiForwarder = null;
-        errdefer if (owned_public_forwarder) |forwarder| alloc.destroy(forwarder);
-        var owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null;
-        errdefer if (owned_public_http_server) |public_http_server| {
-            public_http_server.deinit();
-            alloc.destroy(public_http_server);
-        };
+        var public_api_surface = public_api_runtime.PublicApiSurface.empty(alloc);
+        errdefer public_api_surface.deinit();
         var owned_admin_mux: ?*MetadataAdminMux = null;
         errdefer if (owned_admin_mux) |mux| alloc.destroy(mux);
         var owned_admin_listener: ?*raft_transport.StdHttpListener = null;
@@ -131,54 +120,28 @@ pub const MetadataServer = struct {
             );
             owned_admin_http_server = admin_http_server;
 
-            const catalog = api_table_catalog.CatalogSource.fromMetadataHttpService(svc);
             const data_router = metadataDataBearingStoreGroupRouter(svc);
             const replica_root_dir = svc.replica_root_dir orelse "";
-
-            const public_read_source = try alloc.create(api_table_reads.HostedProvisionedTableReadSource);
-            public_read_source.* = api_table_reads.HostedProvisionedTableReadSource.init(
-                replica_root_dir,
-                catalog,
-                raft.read_gate.noopReadableLeaseRequester(),
-                data_router,
-                svc.raft.host.http_host.request_executor,
-            );
-            owned_public_read_source = public_read_source;
-
-            const public_write_source = try alloc.create(api_table_writes.HostedProvisionedTableWriteSource);
-            public_write_source.* = api_table_writes.HostedProvisionedTableWriteSource.init(
-                replica_root_dir,
-                catalog,
-                data_router,
-                svc.raft.host.http_host.request_executor,
-            );
-            _ = public_write_source.withSecretStore(cfg.api_server_cfg.secret_store);
-            _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
-            owned_public_write_source = public_write_source;
-
-            const public_forwarder = try alloc.create(MetadataPublicApiForwarder);
-            public_forwarder.* = .{ .svc = svc };
-            owned_public_forwarder = public_forwarder;
 
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
-            api_server_cfg.metadata_mutation_forwarder = public_forwarder.forwarder();
-
-            const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
-            public_http_server.* = public_api_http_server.ApiHttpServer.init(
+            public_api_surface = try public_api_runtime.PublicApiSurface.initForMetadataService(
                 alloc,
-                api_server_cfg,
-                public_api_http_server.StatusSource.fromMetadataHttpService(svc),
-                public_read_source.source(),
-                public_write_source.source(),
+                .{
+                    .svc = svc,
+                    .api_server_cfg = api_server_cfg,
+                    .replica_root_dir = replica_root_dir,
+                    .data_router = data_router,
+                    .request_executor = svc.raft.host.http_host.request_executor,
+                    .backend_runtime = try svc.ensureBackendRuntime(),
+                },
             );
-            owned_public_http_server = public_http_server;
 
             const mux = try alloc.create(MetadataAdminMux);
             mux.* = .{
                 .admin = admin_http_server,
-                .public_api = public_http_server,
+                .public_api = public_api_surface.requireApiServer(),
             };
             owned_admin_mux = mux;
 
@@ -197,10 +160,7 @@ pub const MetadataServer = struct {
             .owned_hosted_shard_ops = owned_hosted_shard_ops,
             .owned_hosted_shard_db = owned_hosted_shard_db,
             .owned_admin_http_server = owned_admin_http_server,
-            .owned_public_read_source = owned_public_read_source,
-            .owned_public_write_source = owned_public_write_source,
-            .owned_public_forwarder = owned_public_forwarder,
-            .owned_public_http_server = owned_public_http_server,
+            .public_api_surface = public_api_surface,
             .owned_admin_mux = owned_admin_mux,
             .owned_admin_listener = owned_admin_listener,
         };
@@ -214,19 +174,7 @@ pub const MetadataServer = struct {
         if (self.owned_admin_mux) |mux| {
             self.alloc.destroy(mux);
         }
-        if (self.owned_public_http_server) |public_http_server| {
-            public_http_server.deinit();
-            self.alloc.destroy(public_http_server);
-        }
-        if (self.owned_public_write_source) |write_source| {
-            self.alloc.destroy(write_source);
-        }
-        if (self.owned_public_forwarder) |forwarder| {
-            self.alloc.destroy(forwarder);
-        }
-        if (self.owned_public_read_source) |read_source| {
-            self.alloc.destroy(read_source);
-        }
+        self.public_api_surface.deinit();
         if (self.owned_admin_http_server) |admin_http_server| {
             self.alloc.destroy(admin_http_server);
         }
@@ -332,25 +280,9 @@ pub const MetadataServer = struct {
     }
 };
 
-const MetadataPublicApiForwarder = struct {
-    svc: *service.MetadataHttpService,
-
-    fn forwarder(self: *@This()) public_api_http_server.RequestForwarder {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .forward = forward },
-        };
-    }
-
-    fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.svc.forwardMetadataLeaderRequest(alloc, req);
-    }
-};
-
 const MetadataAdminMux = struct {
     admin: *metadata_http_server.MetadataHttpServer,
-    public_api: *public_api_http_server.ApiHttpServer,
+    public_api: *public_api_runtime.ApiHttpServer,
 
     fn executor(self: *MetadataAdminMux) http_common.RequestExecutor {
         return .{
@@ -366,9 +298,9 @@ const MetadataAdminMux = struct {
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {
-        return std.mem.eql(u8, uri, "/db/v1") or
-            std.mem.startsWith(u8, uri, "/db/v1/") or
-            std.mem.startsWith(u8, uri, "/db/v1?");
+        return std.mem.eql(u8, uri, public_api_http_routes.Routes.db_v1_prefix) or
+            std.mem.startsWith(u8, uri, public_api_http_routes.Routes.db_v1_prefix ++ "/") or
+            std.mem.startsWith(u8, uri, public_api_http_routes.Routes.db_v1_prefix ++ "?");
     }
 };
 
@@ -932,7 +864,16 @@ test "metadata server can expose admin listener endpoints" {
     });
     try server.svc.campaignMetadataGroup();
     try server.runRound();
-    try server.svc.upsertTable(.{ .table_id = 77, .name = "docs" });
+
+    const table = table_manager.TableRecord{ .table_id = 77, .name = "docs" };
+    const ranges = try catalog_table_ddl.deriveInitialRanges(std.testing.allocator, table);
+    defer {
+        for (ranges) |record| table_manager.freeRange(std.testing.allocator, record);
+        std.testing.allocator.free(ranges);
+    }
+    var workflow = table_workflow.TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    _ = try workflow.createTableWithRanges(server.svc, table, ranges);
 
     var rounds: usize = 0;
     while (rounds < 8) : (rounds += 1) try server.runRound();
@@ -1045,11 +986,12 @@ test "metadata admin mux routes public db v1 requests through public api server"
     });
     defer server.deinit();
 
-    try std.testing.expect(server.owned_public_http_server != null);
+    try std.testing.expect(server.public_api_surface.api_server != null);
     try std.testing.expect(server.owned_admin_mux != null);
-    try std.testing.expect(server.owned_public_http_server.?.cfg.auth_enabled);
-    try std.testing.expectEqualStrings("shared-secret", server.owned_public_http_server.?.cfg.trusted_principal_secret.?);
+    try std.testing.expect(server.public_api_surface.api_server.?.cfg.auth_enabled);
+    try std.testing.expectEqualStrings("shared-secret", server.public_api_surface.api_server.?.cfg.trusted_principal_secret.?);
     try std.testing.expect(MetadataAdminMux.isPublicApiRequest("/db/v1/status"));
+    try std.testing.expect(MetadataAdminMux.isPublicApiRequest("/db/v1/sql"));
 
     var response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
         .method = .GET,
@@ -1057,4 +999,13 @@ test "metadata admin mux routes public db v1 requests through public api server"
     });
     defer response.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 401), response.status);
+
+    var sql_response = try server.owned_admin_mux.?.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"SELECT 1;\"}",
+    });
+    defer sql_response.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u16, 401), sql_response.status);
 }

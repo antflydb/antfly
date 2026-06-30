@@ -393,9 +393,7 @@ func TestParseSyncLevelFlag(t *testing.T) {
 		want antfly.SyncLevel
 	}{
 		{in: "write", want: antfly.SyncLevelWrite},
-		{in: " full_text ", want: antfly.SyncLevelFullText},
-		{in: "aknn", want: antfly.SyncLevelAknn},
-		{in: "embeddings", want: antfly.SyncLevelAknn},
+		{in: " query ", want: antfly.SyncLevelQuery},
 		{in: "full_index", want: antfly.SyncLevelFullIndex},
 		{in: "enrichments", want: antfly.SyncLevelEnrichments},
 		{in: "propose", want: antfly.SyncLevelPropose},
@@ -413,6 +411,12 @@ func TestParseSyncLevelFlag(t *testing.T) {
 
 	if _, err := parseSyncLevelFlag("later"); err == nil {
 		t.Fatalf("parseSyncLevelFlag accepted invalid value")
+	}
+	if _, err := parseSyncLevelFlag("full_text"); err == nil {
+		t.Fatalf("parseSyncLevelFlag accepted old full_text value")
+	}
+	if _, err := parseSyncLevelFlag("aknn"); err == nil {
+		t.Fatalf("parseSyncLevelFlag accepted old aknn value")
 	}
 }
 

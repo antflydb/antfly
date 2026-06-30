@@ -32,6 +32,35 @@ Table-level dynamic templates may use:
 - `mapping.include_in_all`
 - `mapping.doc_values`
 
+Relational schemas are stricter. Top-level dynamic templates are rejected in
+`storage_mode: "relational"` because the row shape must stay closed. Flexible
+document-style indexing belongs behind an explicitly declared `json` column:
+
+```json
+{
+  "type": "json",
+  "schema": {
+    "type": "object",
+    "properties": {
+      "title": {"type": "text"},
+      "score": {"type": "numeric"}
+    },
+    "additionalProperties": true
+  },
+  "dynamic_templates": {
+    "metrics": {
+      "path_match": "metrics.*",
+      "mapping": {"type": "numeric", "doc_values": true}
+    }
+  }
+}
+```
+
+The embedded `schema` and `dynamic_templates` are scoped under the owning column
+path. For a column named `attrs`, the example above emits runtime paths such as
+`attrs.title`, `attrs.score`, and `attrs.metrics.latency`. Attaching embedded
+document config to a scalar or non-`json` relational field is invalid.
+
 ## Runtime Model
 
 The runtime schema is the source of truth for execution.
@@ -136,6 +165,176 @@ paths instead of falling back to field-name-only schema heuristics.
 
 The first debug surface for this compiled plan now hangs off the existing admin
 table and index detail routes via `?debug=runtime_schema`.
+
+## Dynamic Templates and the Algebraic Index
+
+Dynamic templates feed the algebraic sidecar as well as the full-text index, so
+a template-matched field is promoted into typed group/measure/time docfacts at
+ingest time — Elasticsearch-style runtime-adaptive mapping — without a schema
+version bump or a reindex.
+
+- `schema/mod.zig` compilation lowers each bounded template
+  (`keyword`/`link`/`numeric`/`boolean`/`datetime`) into a capability
+  `dynamic_field_rule`. A rule requires a name/path selector (`match` /
+  `path_match`). Unbounded templates (`text`/`html`/`search_as_you_type`),
+  selector-less templates, and `match_mapping_type`-only templates are
+  intentionally NOT promoted — they stay on the schemaless path-fact path. This
+  is the cardinality guard that keeps a broad `match: "*"` template from
+  exploding group-by cardinality, and it keeps ingest and query symmetric: a
+  `match_mapping_type`-only rule could be evaluated at ingest (a value is
+  present) but never at query time (no value), so it is excluded from both.
+  `index.zig:validateConfig` enforces the same selector requirement so a
+  hand-authored config cannot reintroduce the asymmetry.
+- At ingest, `storage/db/algebraic/index.zig` evaluates the rules against every
+  observed field not already covered by a static spec. Both ingest and query use
+  a single shared selector evaluator (`dynamicRuleSelectorMatches`, parameterized
+  by an optional value) reusing the same `globMatch` / `match_mapping_type`
+  semantics as the full-text resolver in `storage/schema.zig`, so the two can
+  never drift. Explicit schema fields always win over templates. The FIRST
+  selector-matching rule wins (Elasticsearch dynamic-template order): a value that
+  does not coerce under that rule's type simply yields no fact (exactly like a
+  static typed field given a non-coercible value) — ingest does not fall through
+  to a later overlapping rule of a different type.
+- The dynamic fact identity is the full dotted path (top-level templates have
+  path == field name). Numeric templates project group+measure, datetime
+  project group+time, keyword/boolean project group.
+- At query time the planner resolves a queried field against the same
+  `dynamic_field_rules` (`Index.fieldConfig`/`resolveField`), so group-by, sum,
+  and term aggregations over template-promoted fields route to the sidecar's
+  docfact fold scan. Resolution requires that all name/path-matching rules AGREE
+  on the scalar type: with one matching rule (or several that agree) query reads
+  the exact type ingest stored; if overlapping rules disagree, the field is
+  ambiguous and query declines (the aggregation falls back to a complete scan)
+  rather than reading a type that ingest may have stored differently per
+  document.
+
+Template-only updates propagate without a recreate on two levels:
+
+- the durable table `indexes_json` is regenerated on every schema update
+  (`api/tables.zig: regenerateAlgebraicIndexesFromSchemaAlloc`), which carries
+  forward user-tunable runtime knobs (adaptive policy, planner/result limits,
+  and configured HLL cardinalities) so a schema change does not reset tuning or
+  drop approximate-cardinality sketches; fresh opens, new replicas, and restarts
+  pick up the new rules; and
+- live indexes are refreshed and rebuilt in place
+  (`DB.reloadAlgebraicSchemaConfigs` → `IndexManager.reloadAlgebraicSchemaConfigs`)
+  so running writers apply the new rules after the local sidecar has been
+  reprojected from committed base rows.
+
+Capability changes (detected by a differing capability fingerprint) first set
+`capability_lifecycle_status: "rebuild_required"` on the algebraic config so a
+crash or reopen during migration falls back instead of reading schema-derived
+facts that may only cover the post-change subset. The local table-schema apply
+path is a structural mutation serialized with normal DB apply work. It stages
+that pending algebraic config before durably saving the runtime schema and the
+local schema JSON mirror in one transaction, then clears the algebraic sidecar
+and replays existing committed base rows through the refreshed config. Replay is
+bounded and resumable: the index manager scans base rows with a cursor, flushes
+bulk-ingest batches, and advances a durable `rebuild.state` cursor only after a
+batch has been applied. Pending rebuild completion is schema-version gated: a
+writable reopen only clears `rebuild_required` when the durable runtime schema
+version matches the pending algebraic capability version, and schema-versioned
+capabilities stay pending if no durable runtime schema has been adopted yet.
+After a successful replay and bulk-ingest finish, the catalog persists
+`capability_lifecycle_status: "current"` and clears the rebuild cursor.
+Dynamic-template changes also use the narrower `dynamic_rules_backfill_pending`
+diagnostic/field guard while the rebuild is pending. Tables created with a
+template (rather than updated) take the fingerprint-equality fast path and are
+never flagged.
+
+Relational `json` columns use the same shape at the column scope. Each embedded
+JSON domain is emitted as a `json_subdocument_domains` entry with the owning
+path and a capability fingerprint. Updating that column's embedded `schema` or
+column-local `dynamic_templates` marks the changed domain
+`lifecycle_status: "rebuild_required"` as a transition state. While pending,
+algebraic field resolution withholds static and dynamic facts below that JSON
+path, but unrelated top-level relational fields remain eligible for the sidecar.
+Local rebuild/backfill reprojects the JSON cell from the committed relational row
+and then marks the domain `current`; the schema update does not rewrite
+unchanged row values.
+
+Relational base-column changes are different: they change authoritative storage
+or secondary scan layout, not just derived interpretation. Schema updates
+therefore reject storage-mode switches and relational column-catalog changes
+(add/remove/rename/type/nullability/indexed) until an explicit row rewrite or
+secondary-index rebuild path is available. Derived-only changes below an
+existing `json` column remain valid because the base row still stores the same
+JSON cell.
+
+Relational schemas may also declare foreign keys with `foreign_keys`:
+
+```json
+{
+  "foreign_keys": [
+    {
+      "name": "orders_customer_id_fkey",
+      "columns": ["customer_id"],
+      "references": { "table": "customers", "columns": ["_id"] },
+      "on_delete": "restrict"
+    }
+  ]
+}
+```
+
+The supported shape is deliberately narrow: child columns must either reference
+the parent row document key with `references.columns: ["_id"]`, or reference an
+ordered parent column tuple backed by a declared `unique_constraints` entry.
+Unique-parent references use the same typed tuple encoder as the unique
+integrity row. Nullable child values mean "no reference"; for tuple references,
+any absent nullable component means no reference. `on_delete` supports
+`"restrict"`, bounded local `"set_null"`, and bounded local `"cascade"`;
+`"set_null"` requires every child FK column to be nullable and removes those
+columns from affected child rows during parent delete, while `"cascade"`
+recursively deletes affected child rows through the relational participant.
+Required child fields continue to be enforced by the row schema.
+The runtime schema persists the normalized FK catalog, including `timing` and
+`validation_state`. Public schema validation accepts `"immediate"` and local
+`"deferred"` timing with `"enforced"` or `"unvalidated"` validation state.
+`deferred` validates parent existence against the local participant's final
+staged state at commit and is not eligible for distributed/routed parent-check
+externalization yet. `unvalidated` foreign keys are catalog-only: they do not
+enforce writes or maintain reverse-reference rows until the same FK definition
+is applied later as `"enforced"`, which validates existing rows and builds the
+missing reverse-reference rows before the catalog flip. Job-owned
+`"validating"` and `"invalid"` states are reserved for distributed constraint
+jobs. The relational participant maintains reverse-reference rows
+transactionally with the child row once a FK is enforced.
+
+Relational schemas may also declare unique constraints with
+`unique_constraints`:
+
+```json
+{
+  "unique_constraints": [
+    { "name": "users_email_key", "columns": ["email"] },
+    { "name": "users_tenant_handle_key", "columns": ["tenant_id", "handle"] }
+  ]
+}
+```
+
+The supported unique shape is one or more ordered declared non-`json`
+relational columns. Multiple absent/null values are allowed because a row with
+any absent nullable component does not create a unique row. Present scalar
+tuples are encoded from typed relational cells and maintained as committed
+internal integrity rows in the same write participant as the base row. Duplicate
+tuples are rejected on insert, update, and transaction-intent commit.
+
+FK and unique catalog changes are storage-level constraint migrations, but the
+local same-table path supports additive/drop changes by constraint name when the
+relational base-column catalog is unchanged. Added unique constraints scan
+existing rows, reject duplicate present tuples, and install unique integrity
+rows before the schema is persisted. Added foreign keys validate every existing
+non-null child reference and install reverse-reference rows before the schema is
+persisted. Dropped constraint names remove their backing rows. Reusing an
+existing constraint name with different columns, target, or action is rejected;
+perform that as an explicit drop plus a new constraint name. Distributed
+validation-state jobs remain future work.
+
+Backup/restore follows that same boundary. Native backups preserve relational
+physical rows and secondary scan entries as a snapshot. Portable logical backups
+are not currently schema-aware for relational tables; they must either reject
+relational physical rows or, in a future implementation, materialize packed rows
+through the schema and restore through the relational write path.
 
 ## Related Docs
 

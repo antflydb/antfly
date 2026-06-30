@@ -1,0 +1,335 @@
+{
+  "edge_case_format": 1,
+  "cases": [
+    {
+      "name": "cte final join references missing cte output",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "expected_error_unsupported_sql_shape",
+        "point_lowerer_boundary"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "WITH membership AS (SELECT id FROM users) SELECT id FROM membership JOIN organizations ON membership.organization_id = organizations.id"
+    },
+    {
+      "name": "window read without window-plan lowering",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "expected_error_unsupported_sql_shape"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "SELECT row_number() OVER (ORDER BY id) FROM users"
+    },
+    {
+      "name": "aggregate duplicate group output name fails closed",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "aggregate_duplicate_output_name_rejection",
+        "expected_error_unsupported_sql_shape"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "SELECT organization_id, COUNT(*) AS organization_id FROM users GROUP BY organization_id ORDER BY organization_id"
+    },
+    {
+      "name": "direct left join rejected by point select lowerer",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "expected_error_unsupported_sql_shape",
+        "point_lowerer_boundary"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "SELECT id FROM users LEFT JOIN organizations ON users.organization_id = organizations.id"
+    },
+    {
+      "name": "malformed select placeholder suffix",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "expected_error_unsupported_sql_shape",
+        "malformed_placeholder_suffix"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "SELECT id FROM users WHERE id = $1abc"
+    },
+    {
+      "name": "commented select still lowers to typed predicate",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "preserved_comments_success",
+        "typed_select_predicate"
+      ],
+      "expected_table": "users",
+      "expected_predicates": 1,
+      "expected_first_predicate_field": "id",
+      "expected_first_predicate_value_json": "\"u1\"",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "/* route: typed plan */ SELECT /* projection */ id FROM users -- source table\nWHERE id = $1"
+    },
+    {
+      "name": "non-unique update remains unsupported by point lowerer",
+      "action": "update",
+      "coverage": [
+        "action_update",
+        "expected_error_unsupported_sql_shape",
+        "point_lowerer_boundary"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
+    },
+    {
+      "name": "non-unique update write plan requires row claim",
+      "action": "write_plan",
+      "coverage": [
+        "action_write_plan",
+        "expected_error_unsupported_rows_query",
+        "mutation_source_boundary"
+      ],
+      "expected_error": "unsupported_rows_query",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1'"
+    },
+    {
+      "name": "point update write plan requires resolver",
+      "action": "write_plan",
+      "coverage": [
+        "action_write_plan",
+        "expected_error_unsupported_rows_selector",
+        "point_lowerer_boundary"
+      ],
+      "expected_error": "unsupported_rows_selector",
+      "omit_resolver": true,
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE id = 'u1'"
+    },
+    {
+      "name": "malformed update placeholder suffix",
+      "action": "update",
+      "coverage": [
+        "action_update",
+        "expected_error_unsupported_sql_shape",
+        "malformed_placeholder_suffix"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE id = $1abc"
+    },
+    {
+      "name": "commented update still lowers to typed mutation",
+      "action": "update",
+      "coverage": [
+        "action_update",
+        "preserved_comments_success",
+        "typed_update_mutation"
+      ],
+      "expected_table": "users",
+      "expected_transformed": 1,
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "UPDATE /* target */ users SET organization_id = 'o2' /* patch */ WHERE id = $1 -- identity\n"
+    },
+    {
+      "name": "point update classifies as update",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_update"
+      ],
+      "expected_write_kind": "update",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE id = 'u1'"
+    },
+    {
+      "name": "claimed ordered update classifies as update source",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_update_source"
+      ],
+      "expected_write_kind": "update_source",
+      "sql": "UPDATE users SET organization_id = 'o2' WHERE organization_id = 'o1' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED"
+    },
+    {
+      "name": "cte semijoin update classifies as joined source update",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "cte_write_classification",
+        "write_kind_update_joined_source"
+      ],
+      "expected_write_kind": "update_joined_source",
+      "sql": "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "cte joined update classifies as joined source update",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "cte_write_classification",
+        "write_kind_update_joined_source"
+      ],
+      "expected_write_kind": "update_joined_source",
+      "sql": "WITH membership AS (SELECT id, organization_id FROM users) UPDATE users SET organization_id = membership.organization_id FROM membership WHERE users.id = membership.id"
+    },
+    {
+      "name": "cte update has no supported write-plan selector",
+      "action": "write_plan",
+      "coverage": [
+        "action_write_plan",
+        "cte_write_plan_rejection",
+        "expected_error_unsupported_rows_query"
+      ],
+      "expected_error": "unsupported_rows_query",
+      "sql": "WITH membership AS (SELECT id FROM users) UPDATE users SET organization_id = 'o2' WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "non-unique delete remains unsupported by point lowerer",
+      "action": "delete",
+      "coverage": [
+        "action_delete",
+        "expected_error_unsupported_sql_shape",
+        "point_lowerer_boundary"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "DELETE FROM users WHERE organization_id = 'o1'"
+    },
+    {
+      "name": "point delete classifies as delete",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_delete"
+      ],
+      "expected_write_kind": "delete",
+      "sql": "DELETE FROM users WHERE id = 'u1'"
+    },
+    {
+      "name": "claimed ordered delete classifies as delete source",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "write_kind_delete_source"
+      ],
+      "expected_write_kind": "delete_source",
+      "sql": "DELETE FROM users WHERE organization_id = 'o1' ORDER BY id LIMIT 5 FOR UPDATE SKIP LOCKED"
+    },
+    {
+      "name": "cte semijoin delete classifies as joined source delete",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "cte_write_classification",
+        "write_kind_delete_joined_source"
+      ],
+      "expected_write_kind": "delete_joined_source",
+      "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "cte joined delete classifies as joined source delete",
+      "action": "classify_write",
+      "coverage": [
+        "action_classify_write",
+        "cte_write_classification",
+        "write_kind_delete_joined_source"
+      ],
+      "expected_write_kind": "delete_joined_source",
+      "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users USING membership WHERE users.id = membership.id"
+    },
+    {
+      "name": "cte delete has no supported write-plan selector",
+      "action": "write_plan",
+      "coverage": [
+        "action_write_plan",
+        "cte_write_plan_rejection",
+        "expected_error_unsupported_rows_query"
+      ],
+      "expected_error": "unsupported_rows_query",
+      "sql": "WITH membership AS (SELECT id FROM users) DELETE FROM users WHERE id IN (SELECT id FROM membership)"
+    },
+    {
+      "name": "malformed insert placeholder suffix",
+      "action": "insert",
+      "coverage": [
+        "action_insert",
+        "expected_error_unsupported_sql_shape",
+        "malformed_placeholder_suffix"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "params": [
+        {
+          "string": "u1"
+        }
+      ],
+      "sql": "INSERT INTO users (id, organization_id) VALUES ($1abc, 'o1')"
+    },
+    {
+      "name": "commented insert still lowers to typed batch",
+      "action": "insert",
+      "coverage": [
+        "action_insert",
+        "preserved_comments_success",
+        "typed_insert_batch"
+      ],
+      "expected_table": "users",
+      "expected_inserted": 1,
+      "params": [
+        {
+          "string": "u2"
+        }
+      ],
+      "sql": "/* migration seed */ INSERT INTO users (id, organization_id) VALUES ($1, 'o1') -- final row"
+    },
+    {
+      "name": "expression conflict target rejected without catalog expression key",
+      "action": "insert",
+      "coverage": [
+        "action_insert",
+        "expected_error_invalid_sql_catalog",
+        "expression_conflict_target_rejection"
+      ],
+      "expected_error": "invalid_sql_catalog",
+      "sql": "INSERT INTO users (id, organization_id) VALUES ('u1', 'o1') ON CONFLICT (upper(organization_id)) DO NOTHING"
+    },
+    {
+      "name": "commented ddl still lowers create table",
+      "action": "ddl",
+      "coverage": [
+        "action_ddl",
+        "preserved_comments_success",
+        "typed_create_table_ddl"
+      ],
+      "expected_table": "users",
+      "expected_ddl_tag": "create_table",
+      "expected_if_not_exists": true,
+      "sql": "/* migration */ CREATE TABLE IF NOT EXISTS users (id text PRIMARY KEY) -- generated by adapter"
+    },
+    {
+      "name": "unterminated select comment is fail closed",
+      "action": "select",
+      "coverage": [
+        "action_select",
+        "expected_error_unsupported_sql_shape",
+        "fail_closed_unterminated_comment"
+      ],
+      "expected_error": "unsupported_sql_shape",
+      "sql": "SELECT id FROM users /* unterminated"
+    }
+  ]
+}

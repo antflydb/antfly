@@ -5,6 +5,15 @@ ZIG_BUILD_FLAGS ?=
 UV ?= uv
 SCRIPTS_PY := $(UV) run --project ../scripts --locked python
 INFERENCE_BIN ?= ./zig-out/bin/antfly
+SNOWBALL_REQUIRED_SOURCES := deps/snowball/zig/env.zig deps/snowball/compiler/analyser.c
+SNOWBALL_PRESENT_SOURCES := $(wildcard $(SNOWBALL_REQUIRED_SOURCES))
+ifeq ($(words $(SNOWBALL_PRESENT_SOURCES)),2)
+SNOWBALL_GENERATED_TARGETS := snowball-generate
+SNOWBALL_CHECK_TARGETS := snowball-check
+else
+SNOWBALL_GENERATED_TARGETS :=
+SNOWBALL_CHECK_TARGETS :=
+endif
 
 # ====================================================================================
 # Build
@@ -16,7 +25,7 @@ ONNXRUNTIME_VERSION ?= 1.24.3
 GENAI_VERSION ?= 0.12.1
 ONNXRUNTIME_STAMP := $(ONNXRUNTIME_ROOT)/.version-$(ONNXRUNTIME_VERSION)-$(GENAI_VERSION)
 
-.PHONY: build test unit-test download-onnx force-download-onnx clean-onnx
+.PHONY: build test unit-test sql-api-parity-test db-temporal-test download-onnx force-download-onnx clean-onnx
 
 $(ONNXRUNTIME_STAMP): $(INFERENCE_DIR)/scripts/download-onnxruntime.sh
 	@test -d $(INFERENCE_DIR) || (echo "ERROR: inference package not found at $(INFERENCE_DIR)" && exit 1)
@@ -39,6 +48,12 @@ test: ## Run the default Zig test aggregate.
 unit-test: ## Run hermetic Antfly unit tests.
 	$(ZIG) build unit-test
 
+sql-api-parity-test: ## Run SQL/API typed-plan parity corpus tests.
+	$(ZIG) build sql-api-parity-test
+
+db-temporal-test: ## Run focused application-time temporal table storage tests.
+	$(ZIG) build db-temporal-test
+
 clean-onnx: ## Remove downloaded ONNX Runtime files.
 	rm -rf $(ONNXRUNTIME_ROOT)
 
@@ -52,26 +67,30 @@ inference-e2e-models: ## Prefetch the curated inference E2E model set with `antf
 # TLA+ Verification Commands
 # ====================================================================================
 
-.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
+.PHONY: generate generated-check openapi-generate openapi-check snowball-generate snowball-check cabi-header-generate cabi-header-check sql-api-parity-fixture-promote sql-api-parity-fixture-check license-headers license-check tla-tools tla-check tla-check-txn tla-check-split tla-check-snap tla-check-lsm tla-trace-raft tla-trace-txn
 
-generate: openapi-generate snowball-generate cabi-header-generate ## Regenerate checked-in generated sources.
+generate: openapi-generate snowball-generate cabi-header-generate sql-api-parity-fixture-promote ## Regenerate checked-in generated sources.
 
-generated-check: openapi-check snowball-check cabi-header-check ## Check all checked-in generated sources are current.
+generated-check: openapi-check snowball-check cabi-header-check sql-api-parity-fixture-check ## Check all checked-in generated sources are current.
 
 openapi-generate:
 	$(SCRIPTS_PY) ../scripts/join_public_openapi.py openapi.yaml
 	$(ZIG) build regen-openapi
 
 openapi-check:
-	$(SCRIPTS_PY) ../scripts/join_public_openapi.py --compare openapi.yaml
-	$(ZIG) build regen-openapi
-	test -z "$$(git status --porcelain -- ../openapi.yaml pkg/antfly/src/openapi/generated pkg/inference/src/api/generated)"
+	$(ZIG) build openapi-check
 
 snowball-generate:
 	$(ZIG) build regen-snowball
 
 snowball-check:
 	$(ZIG) build check-snowball
+
+sql-api-parity-fixture-promote:
+	$(ZIG) build sql-api-parity-fixture-promote
+
+sql-api-parity-fixture-check:
+	$(ZIG) build sql-api-parity-fixture-check
 
 cabi-header-generate:
 	$(SCRIPTS_PY) ../scripts/packaging/sync_cabi_header.py

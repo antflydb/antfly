@@ -306,7 +306,7 @@ test "derived log propagates wal group commit settings" {
         fn wait(self: *@This(), total: usize) void {
             var registered = false;
             while (true) {
-                platform_sync.lockYielding(&self.mutex);
+                _ = platform_sync.lockAtomic(&self.mutex);
                 if (!registered) {
                     self.waiting += 1;
                     registered = true;
@@ -315,7 +315,7 @@ test "derived log propagates wal group commit settings" {
                 const ready = self.open;
                 self.mutex.unlock();
                 if (ready) return;
-                std.Thread.yield() catch {};
+                @import("antfly_platform").time.yieldBriefly();
             }
         }
     };

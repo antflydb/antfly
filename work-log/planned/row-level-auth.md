@@ -221,7 +221,7 @@ Allow user roles to carry row filters, so Basic auth (user/password) users also 
 
 ## Step 4: Proxy-Level Filter Injection
 
-Allow Colony's SaaS proxy to inject row filters per bearer token for tenant-scoped document filtering.
+Allow the SaaS proxy to inject row filters per bearer token for tenant-scoped document filtering.
 
 ### Files to modify
 

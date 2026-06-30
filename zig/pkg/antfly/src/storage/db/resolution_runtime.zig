@@ -25,11 +25,13 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const resolver_lib = @import("antfly_resolver");
 const matcher = @import("antfly_matcher");
 const resolver_catalog = @import("catalog/resolver_catalog.zig");
 const internal_keys = @import("../internal_keys.zig");
 const artifact_ids = @import("artifact_ids.zig");
+const artifact_replay = @import("artifact_replay.zig");
 const derived_types = @import("derived/derived_types.zig");
 const change_journal_mod = @import("derived/change_journal.zig");
 const replay_source_mod = @import("derived/replay_source.zig");
@@ -42,6 +44,8 @@ const types = @import("types.zig");
 
 const Allocator = std.mem.Allocator;
 const Io = std.Io;
+
+const TestHelpers = if (builtin.is_test) @import("test_support.zig") else struct {};
 
 pub const ResolverConfig = resolver_catalog.ResolverConfig;
 const SourceArtifactKind = resolver_catalog.ResolverSourceArtifactKind;
@@ -1785,13 +1789,7 @@ pub const ResolutionRuntime = struct {
 };
 
 fn lockMutex(mutex: *std.atomic.Mutex) void {
-    while (!mutex.tryLock()) {
-        if (builtin.single_threaded) {
-            std.atomic.spinLoopHint();
-            continue;
-        }
-        std.Thread.yield() catch {};
-    }
+    _ = platform.sync.lockAtomic(mutex);
 }
 
 const testing = std.testing;
@@ -3431,4 +3429,1313 @@ test "SourceCandidateProvider ann blocking links via cross-shard nearest neighbo
     // Linked by vector similarity across the shard boundary despite differing text.
     try testing.expectEqualStrings("match", ent.get("decision").?.string);
     try testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "db resolution runtime starts resolver replay workers only while resolver catalog is configured" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try std.testing.expect(db.resolution_runtime != null);
+    try std.testing.expect(db.promotion_runtime != null);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:no-resolver",
+            .value = "{\"title\":\"ordinary write\"}",
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    const no_resolver_pending = db.pendingWorkStats();
+    try std.testing.expect(!no_resolver_pending.resolution.enabled);
+    try std.testing.expect(!no_resolver_pending.resolution.catch_up_required);
+    try std.testing.expect(!no_resolver_pending.promotion.enabled);
+    try std.testing.expect(!no_resolver_pending.promotion.catch_up_required);
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+    try db.drainResolverBackfill();
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog.reresolve_resume_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolver_catalog.reresolve_repair_resume_key));
+
+    try db.addResolver(.{
+        .name = "kg_lifecycle",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_lifecycle_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try std.testing.expect(db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(db.promotion_runtime.?.worker_started.load(.acquire));
+
+    try std.testing.expect(try db.removeResolver("kg_lifecycle"));
+    try std.testing.expect(!db.resolution_runtime.?.worker_started.load(.acquire));
+    try std.testing.expect(!db.promotion_runtime.?.worker_started.load(.acquire));
+}
+
+test "db resolution runtime backfills a mention name embedding so ann/cosine resolution links end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var embedder = TestHelpers.FixedVectorEmbedder{};
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .resolution_embedder = embedder.interface() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // Resolver backfills a name embedding for each mention (no embedding in the
+    // extraction artifact), then prefix-blocks + cosine-scores against the entity.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    // An existing entity under a different key, carrying the matching vector.
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    // The mention had no embedding; the backfilled vector cosine-matched the
+    // entity, so it linked instead of minting a new key.
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "relations_graph", "doc:a", "mentions", .out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+}
+
+test "db resolution runtime resolves extracted entities into a resolution artifact end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // A graph index drives production of the relations_v1 asset (extraction)
+    // artifact; the resolver consumes the same artifact.
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(@as(i64, 1), parsed.value.object.get("config_generation").?.integer);
+    const entities = parsed.value.object.get("entities").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), entities.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", entities[0].object.get("doc_ref").?.object.get("key").?.string);
+    try std.testing.expectEqualStrings("org/antfly", entities[1].object.get("doc_ref").?.object.get("key").?.string);
+}
+
+test "db resolution runtime re-resolves the corpus when upsertResolver bumps the config generation" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    }
+
+    // Bump the resolver's config generation: the document was already ingested,
+    // so only the corpus backfill (triggered by upsertResolver) re-resolves it.
+    try db.upsertResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 2,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":2") != null);
+}
+
+test "db resolution runtime re-resolves existing corpus when upsertResolver inserts a new resolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const asset_raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(asset_raw);
+        try std.testing.expect(std.mem.indexOf(u8, asset_raw, "Ada Lovelace") != null);
+    }
+    const marker_key = try internal_keys.assetArtifactSourceIndexKeyAlloc(alloc, "relations_v1", "doc:a");
+    defer alloc.free(marker_key);
+    {
+        const marker_raw = try db.core.store.get(alloc, marker_key);
+        defer alloc.free(marker_raw);
+        try std.testing.expectEqualStrings(asset_key, marker_raw);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_inserted_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    try db.upsertResolver(.{
+        .name = "kg_inserted",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_inserted_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+}
+
+test "db resolution runtime drains pending resolver backfill when retrying a no-op upsertResolver" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_retry_v1");
+    defer alloc.free(resolution_key);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+
+    const cfg: index_manager_mod.ResolverConfig = .{
+        .name = "kg_retry",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_retry_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    };
+
+    {
+        TestHelpers.lockApply(&db);
+        defer db.core.unlockApply();
+        try std.testing.expectEqual(index_manager_mod.IndexManager.ResolverUpsertResult.inserted, try db.core.upsertResolver(cfg));
+    }
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expect(try db.resolution_runtime.?.hasReresolveBacklog());
+
+    // Retrying the same catalog config is a material no-op, but the durable
+    // dirty cursor from the first attempt must still be drained.
+    try db.upsertResolver(cfg);
+
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "\"config_generation\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    try std.testing.expect(!try db.resolution_runtime.?.hasReresolveBacklog());
+}
+
+test "db resolution runtime refuses resolver removal while resolution or promotion replay is pending" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_pending_remove",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_pending_remove_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+
+    // The default standalone DB has no entity sink and waits rather than
+    // advancing promotion replay. Removing the resolver here would otherwise
+    // erase the catalog signal that older retention logic used.
+    try std.testing.expectError(error.ResolverReplayPending, db.removeResolver("kg_pending_remove"));
+    try std.testing.expect(db.promotionStageStats().catch_up_required);
+}
+
+test "db resolution runtime promotes resolved entities into entity-document upserts end-to-end" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var sink = TestHelpers.FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .entity_sink = sink.sink() });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "relations_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]","format":"extraction_relation"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "knowledge_graph",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{
+            .{
+                .key = "doc:a",
+                .value =
+                \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+                ,
+            },
+        },
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const stats = try db.stats(alloc);
+    defer types.freeDBStats(alloc, stats);
+    try std.testing.expect(stats.resolution.enabled);
+    try std.testing.expect(stats.promotion.enabled);
+    try std.testing.expectEqual(stats.resolution.target_sequence, stats.resolution.applied_sequence);
+    try std.testing.expectEqual(stats.promotion.target_sequence, stats.promotion.applied_sequence);
+    try std.testing.expect(!stats.promotion.blocked);
+
+    // The promoter upserted a canonical entity document per resolved mention,
+    // keyed by the rendered canonical key, into the entity table.
+    const ada = sink.findKey("person/ada_lovelace") orelse return error.MissingAdaUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"canonical_name\":\"Ada Lovelace\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, ada, "\"entity_type\":\"person\"") != null);
+    const antfly = sink.findKey("org/antfly") orelse return error.MissingAntflyUpsert;
+    try std.testing.expect(std.mem.indexOf(u8, antfly, "\"canonical_name\":\"Antfly\"") != null);
+
+    // Replay is idempotent: draining again promotes nothing new.
+    const count_before = sink.upserts.items.len;
+    try db.runUntilIdle();
+    try std.testing.expectEqual(count_before, sink.upserts.items.len);
+}
+
+test "db resolution runtime graph replay blocks resolution artifact without resolver contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+    const index_ref = index_manager_mod.ManagedIndexRef{
+        .name = "prov_graph",
+        .kind = .graph,
+    };
+
+    try db.core.store.put(resolution_key, "{}");
+
+    try std.testing.expect(!db.derivedAsyncBatchAffectsManagedIndex(batch, index_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAffectsManagedIndexForReplay(batch, index_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, index_ref));
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        artifact_replay.materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
+    try db.core.store.delete(resolution_key);
+    try std.testing.expectError(
+        error.MissingResolverArtifactContract,
+        artifact_replay.materializeGraphSourceArtifactsForIndex(
+            alloc,
+            db.core.store,
+            db.core.index_manager,
+            &.{resolution_key},
+            "prov_graph",
+            .{ .require_resolution_contract = true },
+        ),
+    );
+
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try std.testing.expect(db.derivedAsyncBatchAffectsManagedIndex(batch, index_ref));
+    try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, index_ref));
+}
+
+test "db resolution runtime graph replay ignores resolution artifacts bound to another source contract" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{ .start_index_workers = false });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "graph_a",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_a","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_a","kind":"asset","field":"relations_a","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addIndex(.{
+        .name = "graph_b",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_b","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_b","kind":"asset","field":"relations_b","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg_b",
+        .table = "entities",
+        .source_artifact = "relations_b",
+        .resolution_artifact = "resolution_b",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_b");
+    defer alloc.free(resolution_key);
+    const batch = derived_types.DerivedBatch{
+        .sequence = 1,
+        .changed_artifact_keys = &.{resolution_key},
+    };
+
+    const graph_a = index_manager_mod.ManagedIndexRef{ .name = "graph_a", .kind = .graph };
+    try std.testing.expect(!db.derivedAsyncBatchAffectsManagedIndex(batch, graph_a));
+    try std.testing.expect(!try db.derivedAsyncBatchAffectsManagedIndexForReplay(batch, graph_a));
+    try std.testing.expect(!try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, graph_a));
+
+    const graph_b = index_manager_mod.ManagedIndexRef{ .name = "graph_b", .kind = .graph };
+    try std.testing.expect(db.derivedAsyncBatchAffectsManagedIndex(batch, graph_b));
+    try std.testing.expect(try db.derivedAsyncBatchAffectsManagedIndexForReplay(batch, graph_b));
+    try std.testing.expect(try db.derivedAsyncBatchAdvancesManagedIndexApplyStateForReplay(batch, graph_b));
+}
+
+test "db resolution runtime materializes doc->entity mention edges as provenance and clears them on delete" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    // The graph index materializes the relations_v1 extraction asset and, with
+    // mention_edge_type set, emits doc->entity provenance edges from the durable
+    // resolution artifact.
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"},{"id":"e1","label":"org","text":"Antfly"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"decision\":\"new\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "org/antfly") != null);
+    }
+
+    const ada_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(ada_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, ada_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "\"target_table\":\"entities\"") != null);
+    }
+
+    // Outbound: doc:a mentions both canonical entities.
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 2), out.len);
+        // Each mention edge records the resolved DocRef target table so the
+        // endpoint can be hydrated cross-table.
+        for (out) |edge| {
+            try std.testing.expect(std.mem.indexOf(u8, edge.metadata, "\"target_table\":\"entities\"") != null);
+        }
+    }
+    // Inbound provenance: "which documents mention this entity" == inbound edges.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+        try std.testing.expectEqualStrings("doc:a", inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_lovelace", inbound[0].target);
+    }
+
+    // Deleting the source document clears its mention edges (delete-on-source-delete).
+    try db.batch(.{ .deletes = &.{"doc:a"}, .sync_level = .enrichments });
+    try db.runUntilIdle();
+    {
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+    }
+}
+
+test "db resolution runtime resolver removal retires resolution artifacts and mention graph state" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var sink = TestHelpers.FakePromotionSink{ .alloc = alloc };
+    defer sink.deinit();
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+        .start_index_workers = false,
+        .entity_sink = sink.sink(),
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    {
+        const raw = try db.core.store.get(alloc, resolution_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "person/ada_lovelace") != null);
+    }
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    {
+        const raw = try db.core.store.get(alloc, graph_edge_key);
+        defer alloc.free(raw);
+        try std.testing.expect(raw.len > 0);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    try std.testing.expect(try db.removeResolver("kg"));
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 0), resolvers.len);
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, resolution_key));
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, graph_edge_key));
+    {
+        const raw = try db.core.store.get(alloc, asset_key);
+        defer alloc.free(raw);
+        try std.testing.expect(std.mem.indexOf(u8, raw, "Ada Lovelace") != null);
+    }
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 0), inbound.len);
+        const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
+        try std.testing.expectEqual(@as(usize, 0), out.len);
+    }
+}
+
+test "db resolution runtime does not materialize review-band resolution as canonical mention edges" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
+        .executor = .{ .backend = .manual },
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "name", "left": "canonical_text", "right": "canonical_name",
+        \\  "levels": [
+        \\    { "when": "exact", "weight": 8.0 },
+        \\    { "when": "jaro_winkler > 0.92", "weight": 5.0 },
+        \\    { "when": "jaro_winkler > 0.85", "weight": 2.0 },
+        \\    { "else": true, "weight": -6.0 }
+        \\  ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9, "review": 0.6 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const existing_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovlace");
+    defer alloc.free(existing_key);
+    try db.core.store.put(existing_key,
+        \\{"canonical_name":"Ada Lovlace","label":"person"}
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("review", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 0), out.len);
+
+    _ = try db.recordReviewDecision("doc:a", "relations_v1", "resolution_v1", "e0", .match, "entities", "person/ada_lovelace");
+    try db.runUntilIdle();
+
+    const curated_raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(curated_raw);
+    var curated = try std.json.parseFromSlice(std.json.Value, alloc, curated_raw, .{});
+    defer curated.deinit();
+    const curated_ent = curated.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", curated_ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_ent.get("doc_ref").?.object.get("key").?.string);
+
+    const curated_edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, curated_edges);
+    try std.testing.expectEqual(@as(usize, 1), curated_edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", curated_edges[0].target);
+}
+
+test "db resolution runtime mention edge weight is fused from extractor trust and mention confidence" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    // A resolver declaring noisy_or fusion: this extractor is trusted 0.9, no
+    // graph prior. The mention asserts confidence 0.8, so the edge weight is
+    // fuse(noisy_or, [{0.8, 0.9}], prior=0, prior_weight=0) = 1-(1-0.72) = 0.72.
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .fusion_combine = "noisy_or",
+        .fusion_trust = 0.9,
+        .config_generation = 1,
+    });
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace","confidence":0.8}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const out = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, out);
+    try std.testing.expectEqual(@as(usize, 1), out.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", out[0].target);
+    // Calibrated weight, not the legacy 1.0.
+    try std.testing.expectApproxEqAbs(@as(f64, 0.72), out[0].weight, 1e-9);
+}
+
+test "db resolution runtime rewriteEntityEdges repoints provenance edges to a merge survivor" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    // The mention edge points at the resolved DocRef from the resolution artifact.
+    {
+        const inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, inbound);
+        try std.testing.expectEqual(@as(usize, 1), inbound.len);
+    }
+
+    // Merge person/ada_lovelace into a canonical survivor: rewrite its edges.
+    const rewritten = try db.rewriteEntityEdges(alloc, "prov_graph", "person/ada_lovelace", "person/ada_canonical");
+    try std.testing.expectEqual(@as(usize, 1), rewritten);
+    try db.runUntilIdle();
+
+    // Inbound edges moved from the merged-away key to the survivor.
+    {
+        const old_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_lovelace", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, old_inbound);
+        try std.testing.expectEqual(@as(usize, 0), old_inbound.len);
+
+        const new_inbound = try db.getEdges(alloc, "prov_graph", "person/ada_canonical", "mentions", .in);
+        defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, new_inbound);
+        try std.testing.expectEqual(@as(usize, 1), new_inbound.len);
+        try std.testing.expectEqualStrings("doc:a", new_inbound[0].source);
+        try std.testing.expectEqualStrings("person/ada_canonical", new_inbound[0].target);
+    }
+}
+
+test "db resolution runtime graph hydration fails closed for a not-yet-promoted entity node" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","mention_edge_type":"mentions",
+        \\    "format":"extraction_relation","path":"$.relations[*]"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"relations","content_type":"application/json"}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .config_generation = 1,
+    });
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value =
+            \\{"relations":{"entities":[{"id":"e0","label":"person","text":"Ada Lovelace"}]}}
+            ,
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+
+    const mention_query = @import("../../graph/query.zig").GraphQuery{
+        .query_type = .neighbors,
+        .index_name = "prov_graph",
+        .start_nodes = .{ .keys = &.{"doc:a"} },
+        .params = .{ .edge_types = &.{"mentions"}, .direction = .out, .max_depth = 1 },
+        .include_documents = true,
+    };
+
+    // The mention edge points at person/ada_lovelace, but that entity document
+    // has not been promoted into this store: the node is returned as a graph
+    // result with its key, hydrated to nothing (fail closed), never fabricated.
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        try std.testing.expectEqual(@as(usize, 1), result.graph_results.len);
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data == null);
+
+        // The reached node records its home table (from the mention edge's
+        // `target_table` metadata) so the api can route hydration to the
+        // entities table instead of failing closed against the query table.
+        const nodes = result.graph_results[0].nodes;
+        try std.testing.expectEqual(@as(usize, 1), nodes.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", nodes[0].key);
+        try std.testing.expect(nodes[0].table != null);
+        try std.testing.expectEqualStrings("entities", nodes[0].table.?);
+    }
+
+    // Once the entity document exists (promoter wrote it; here co-located for the
+    // single-store test), the same node hydrates instead of failing closed.
+    try db.batch(.{
+        .writes = &.{.{ .key = "person/ada_lovelace", .value =
+        \\{"entity_type":"person","canonical_name":"Ada Lovelace"}
+        }},
+        .sync_level = .write,
+    });
+    try db.runUntilIdle();
+    {
+        var result = try db.search(alloc, .{ .graph_queries = &.{.{ .name = "m", .query = mention_query }} });
+        defer result.deinit();
+        const hits = result.graph_results[0].hits;
+        try std.testing.expectEqual(@as(usize, 1), hits.len);
+        try std.testing.expectEqualStrings("person/ada_lovelace", hits[0].id);
+        try std.testing.expect(hits[0].stored_data != null);
+        try std.testing.expect(std.mem.indexOf(u8, hits[0].stored_data.?, "Ada Lovelace") != null);
+    }
+}
+
+test "db resolution runtime resolver catalog persists across reopen" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    {
+        var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "{{ lower _entity.label }}/{{ slug _entity.canonical_text }}",
+            .config_generation = 3,
+        });
+        try std.testing.expectError(error.ResolverAlreadyExists, db.addResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactAlreadyExists, db.addResolver(.{
+            .name = "duplicate_output",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverSourceArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "other_v1",
+            .resolution_artifact = "resolution_v1",
+            .key_template = "x",
+        }));
+        try std.testing.expectError(error.ResolverArtifactImmutable, db.upsertResolver(.{
+            .name = "knowledge_graph",
+            .table = "entities",
+            .source_artifact = "relations_v1",
+            .resolution_artifact = "other_resolution_v1",
+            .key_template = "x",
+        }));
+    }
+
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const resolvers = try db.listResolvers(alloc);
+    defer {
+        for (resolvers) |*r| r.deinit(alloc);
+        alloc.free(resolvers);
+    }
+    try std.testing.expectEqual(@as(usize, 1), resolvers.len);
+    try std.testing.expectEqualStrings("knowledge_graph", resolvers[0].name);
+    try std.testing.expectEqualStrings("entities", resolvers[0].table);
+    try std.testing.expectEqual(@as(u64, 3), resolvers[0].config_generation);
+
+    try std.testing.expect(try db.removeResolver("knowledge_graph"));
+    const after = try db.listResolvers(alloc);
+    defer alloc.free(after);
+    try std.testing.expectEqual(@as(usize, 0), after.len);
+}
+
+test "db resolution runtime async asset producer mention edges come from resolution artifacts" {
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var fake = TestHelpers.TestAssetProducer{
+        .extractor_output =
+        \\{"entities":[{"id":"e0","label":"person","text":"A. Lovelace"}],"relations":[]}
+        ,
+    };
+    var embedder = TestHelpers.FixedVectorEmbedder{};
+    var db = try @import("mod.zig").DB.open(alloc, std.mem.span(path), .{
+        .enrichment = .{
+            .owner_id = "worker-a",
+            .asset_producer = fake.producer(),
+        },
+        .resolution_embedder = embedder.interface(),
+    });
+    defer db.close();
+
+    try db.addIndex(.{
+        .name = "prov_graph",
+        .kind = .graph,
+        .config_json =
+        \\{
+        \\  "source":{"kind":"artifact","artifact":"relations_v1","path":"$.relations[*]",
+        \\    "format":"extraction_relation","mention_edge_type":"mentions"},
+        \\  "artifact":{"name":"relations_v1","kind":"asset","field":"body","content_type":"application/json","producer_json":{"type":"extractor","config":{"provider":"mock"}}}
+        \\}
+        ,
+    });
+    try db.addResolver(.{
+        .name = "kg",
+        .table = "entities",
+        .source_artifact = "relations_v1",
+        .resolution_artifact = "resolution_v1",
+        .key_template = "{{ lower _entity.label }}/{{ slug _entity.text }}",
+        .candidate_search = "prefix",
+        .name_embedding = "name",
+        .name_embedding_dims = 4,
+        .scorer_json =
+        \\{ "comparisons": [ { "name": "emb", "left": "name_embedding", "right": "name_embedding",
+        \\  "levels": [ { "when": "cosine > 0.9", "weight": 8.0 }, { "else": true, "weight": -6.0 } ] } ],
+        \\  "combine": { "bias": -3.0 }, "decision": { "match": 0.9 } }
+        ,
+        .config_generation = 1,
+    });
+
+    const entity_doc_key = try internal_keys.documentKeyAlloc(alloc, "person/ada_lovelace");
+    defer alloc.free(entity_doc_key);
+    try db.core.store.put(entity_doc_key,
+        \\{ "canonical_name": "Ada Lovelace", "label": "person", "name_embedding": [1.0, 0.0, 0.0, 0.0] }
+    );
+
+    try db.batch(.{
+        .writes = &.{.{
+            .key = "doc:a",
+            .value = "{\"body\":\"Ada mention\"}",
+        }},
+        .sync_level = .enrichments,
+    });
+    try db.runUntilIdle();
+    try db.runUntilIdle();
+
+    try std.testing.expectEqual(@as(usize, 1), fake.extractor_calls);
+
+    const resolution_key = try internal_keys.resolutionArtifactKeyAlloc(alloc, "doc:a", "resolution_v1");
+    defer alloc.free(resolution_key);
+    const raw = try db.core.store.get(alloc, resolution_key);
+    defer alloc.free(raw);
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, raw, .{});
+    defer parsed.deinit();
+    const ent = parsed.value.object.get("entities").?.array.items[0].object;
+    try std.testing.expectEqualStrings("match", ent.get("decision").?.string);
+    try std.testing.expectEqualStrings("person/ada_lovelace", ent.get("doc_ref").?.object.get("key").?.string);
+
+    const edges = try db.getEdges(alloc, "prov_graph", "doc:a", "mentions", .out);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, edges);
+    try std.testing.expectEqual(@as(usize, 1), edges.len);
+    try std.testing.expectEqualStrings("person/ada_lovelace", edges[0].target);
+    try std.testing.expect(std.mem.indexOf(u8, edges[0].metadata, "\"target_table\":\"entities\"") != null);
+
+    const deterministic_edges = try db.getEdges(alloc, "prov_graph", "person/a_lovelace", "mentions", .in);
+    defer @import("../../graph/graph.zig").GraphIndex.freeEdges(alloc, deterministic_edges);
+    try std.testing.expectEqual(@as(usize, 0), deterministic_edges.len);
+
+    const relation_state_key = try @import("internal.zig").graphAssetStateKeyAlloc(alloc, "doc:a", "prov_graph", "relations_v1");
+    defer alloc.free(relation_state_key);
+    try db.core.store.delete(relation_state_key);
+
+    const asset_key = try internal_keys.artifactNamedPrefixAlloc(alloc, "doc:a", "asset", "relations_v1");
+    defer alloc.free(asset_key);
+    const changed = try artifact_replay.materializeGraphSourceArtifactsForIndex(alloc, db.core.store, db.core.index_manager, &.{asset_key}, "prov_graph", .{});
+    defer artifact_replay.freeOwnedKeySlice(alloc, changed);
+
+    const graph_edge_key = try internal_keys.graphEdgeArtifactKeyAlloc(alloc, "doc:a", "prov_graph", "mentions", "person/ada_lovelace");
+    defer alloc.free(graph_edge_key);
+    const edge_raw = try db.core.store.get(alloc, graph_edge_key);
+    defer alloc.free(edge_raw);
 }

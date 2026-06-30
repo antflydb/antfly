@@ -18,6 +18,8 @@ const vector_codec = @import("antfly_vector").codec;
 const regex_mod = @import("antfly_regex");
 const introducer_mod = @import("../../introducer.zig");
 const segment_mod = @import("../../segment.zig");
+const typed_dv = @import("../../section/typed_doc_values.zig");
+const relational_row_codec = @import("algebraic/relational_row_codec.zig");
 const analysis_mod = @import("../../search/analysis.zig");
 const schema_api = @import("../../schema/mod.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -553,6 +555,10 @@ pub fn extractDenseVectorField(
     field_name: []const u8,
     dims: u32,
 ) !?[]f32 {
+    if (std.mem.indexOfScalar(u8, field_name, '.') != null) {
+        return try extractDenseVectorFieldByJsonPath(alloc, data, field_name, dims);
+    }
+
     var scanner = std.json.Scanner.initCompleteInput(alloc, data);
     defer scanner.deinit();
 
@@ -609,11 +615,31 @@ pub fn extractDenseVectorField(
     }
 }
 
+fn extractDenseVectorFieldByJsonPath(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+    dims: u32,
+) !?[]f32 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    const value = valueAtJsonPath(parsed.value, field_name) orelse return null;
+    if (value != .array and value != .string) return null;
+    const vector = try parseDenseEmbeddingValue(alloc, value);
+    errdefer alloc.free(vector);
+    if (vector.len != dims) return error.InvalidVectorDimensions;
+    return vector;
+}
+
 pub fn extractSparseVectorField(
     alloc: Allocator,
     data: []const u8,
     field_name: []const u8,
 ) !?SparseVectorData {
+    if (std.mem.indexOfScalar(u8, field_name, '.') != null) {
+        return try extractSparseVectorFieldByJsonPath(alloc, data, field_name);
+    }
+
     return extractSparseVectorFieldRawFast(alloc, data, field_name) catch |raw_err| switch (raw_err) {
         error.UnsupportedSparseFastPath => return extractSparseVectorFieldFast(alloc, data, field_name) catch |err| switch (err) {
             error.UnsupportedSparseFastPath => return extractSparseVectorFieldSlow(alloc, data, field_name),
@@ -621,6 +647,18 @@ pub fn extractSparseVectorField(
         },
         else => return raw_err,
     };
+}
+
+fn extractSparseVectorFieldByJsonPath(
+    alloc: Allocator,
+    data: []const u8,
+    field_name: []const u8,
+) !?SparseVectorData {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, data, .{});
+    defer parsed.deinit();
+    const value = valueAtJsonPath(parsed.value, field_name) orelse return null;
+    if (value != .object) return null;
+    return try parseSparseValue(alloc, value);
 }
 
 fn extractSparseVectorFieldRawFast(
@@ -1497,6 +1535,7 @@ fn extractTextFieldsFromValue(
         if (!runtimeHasSchemaDrivenText(runtime)) {
             return .{
                 .fields = try extractStringFieldsNoSchema(alloc, root.object),
+                .typed_fields = if (runtime.storage_mode == .relational) &.{} else null,
             };
         }
 
@@ -1515,10 +1554,238 @@ fn extractTextFieldsFromValue(
         return .{
             .fields = if (fields.items.len > 0) try alloc.dupe(introducer_mod.TextField, fields.items) else &.{},
             .infer_type_dynamic_paths = if (document_schema) |resolved| resolved.infer_type_dynamic_paths else &.{},
+            .typed_fields = if (runtime.storage_mode == .relational) &.{} else null,
         };
     }
 
     return try extractSchemaLessTextAndTypedFields(alloc, root.object, text_analysis);
+}
+
+/// Project a relational document's JSON into the serialized typed-row value
+/// stored under the relational base-row key (in place of a JSON blob). One cell
+/// per present column, in declared-column order, using the same physical
+/// encoding + coercion the former segment columns used. Absent nullable columns
+/// are skipped (NOT NULL is enforced upstream). Caller owns the returned bytes.
+pub fn buildRelationalRowValueAlloc(
+    alloc: Allocator,
+    doc_json: []const u8,
+    columns: []const runtime_schema.RelationalColumn,
+) ![]u8 {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
+    defer parsed.deinit();
+    return try buildRelationalRowValueFromValueAlloc(alloc, parsed.value, columns);
+}
+
+/// As `buildRelationalRowValueAlloc` but from an already-parsed JSON value.
+pub fn buildRelationalRowValueFromValueAlloc(
+    alloc: Allocator,
+    root: std.json.Value,
+    columns: []const runtime_schema.RelationalColumn,
+) ![]u8 {
+    var cells = std.ArrayListUnmanaged(relational_row_codec.Cell).empty;
+    defer cells.deinit(alloc);
+    // bytes_val coercion of structured values allocates canonical JSON; collect
+    // those buffers and free them after serialization (the codec copies bytes).
+    var owned = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned.items) |buf| alloc.free(buf);
+        owned.deinit(alloc);
+    }
+
+    for (columns) |column| {
+        const value_type = relationalStorageValueType(column.field_type);
+        const found = valueAtJsonPath(root, column.path) orelse {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        };
+        if (found == .null) {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        }
+        if (column.field_type == .array and found != .array) {
+            return error.InvalidBatchRequest;
+        }
+        if (column.field_type == .array) {
+            try validateRelationalArrayColumnValue(column, found);
+        }
+        const value = try coerceRelationalStorageValue(alloc, value_type, found) orelse {
+            if (column.nullable) continue;
+            return error.InvalidBatchRequest;
+        };
+        if (value_type == .bytes_val and found != .string) {
+            // coerceRelationalStorageValue allocated canonical JSON for a
+            // structured value; track it for cleanup.
+            try owned.append(alloc, @constCast(value.bytes_val));
+        }
+        try cells.append(alloc, .{
+            .path = column.path,
+            .value_type = value_type,
+            .is_json = column.field_type == .json or column.field_type == .array,
+            .value = value,
+        });
+    }
+
+    return try relational_row_codec.serialize(alloc, cells.items);
+}
+
+/// Reconstruct a relational document's canonical JSON from a serialized typed-row
+/// KV value. Schema-free: the row is self-describing. Caller owns the bytes.
+pub fn reconstructRelationalRowDocumentAlloc(alloc: Allocator, row_value: []const u8) ![]u8 {
+    var row = try relational_row_codec.deserialize(alloc, row_value);
+    defer row.deinit(alloc);
+    return try relational_row_codec.reconstructDocumentAlloc(alloc, row.cells);
+}
+
+/// Materialize a relational base-row value as canonical JSON. Unlike
+/// `materializeDocumentValueAlloc`, this is intentionally strict: relational
+/// mode has no supported generic JSON KV fallback, so a non-row value under the
+/// relational row keyspace is corrupt input and should fail at the read seam.
+pub fn materializeRelationalRowValueAlloc(alloc: Allocator, row_value: []const u8) ![]u8 {
+    return try relational_row_codec.reconstructValueAlloc(alloc, row_value);
+}
+
+/// As `materializeRelationalRowValueAlloc`, but takes ownership of `row_value`.
+pub fn materializeOwnedRelationalRowValueAlloc(alloc: Allocator, row_value: []u8) ![]u8 {
+    defer alloc.free(row_value);
+    return try materializeRelationalRowValueAlloc(alloc, row_value);
+}
+
+/// True if `value` is a serialized relational typed row (vs. a JSON blob).
+pub fn isRelationalRowValue(value: []const u8) bool {
+    return relational_row_codec.looksLikeRow(value);
+}
+
+/// Materialize a document-mode stored value as JSON. Relational row values use
+/// `materializeRelationalRowValueAlloc` at strict relational row-key read seams;
+/// this generic path intentionally does not reconstruct `AROW` values as a
+/// compatibility fallback.
+/// Caller owns the returned bytes.
+pub fn materializeDocumentValueAlloc(alloc: Allocator, value: []const u8) ![]u8 {
+    return try relational_row_codec.materializeDocumentValueAlloc(alloc, value);
+}
+
+/// As `materializeDocumentValueAlloc`, but takes ownership of `value`.
+pub fn materializeOwnedDocumentValueAlloc(alloc: Allocator, value: []u8) ![]u8 {
+    return try relational_row_codec.materializeOwnedDocumentValueAlloc(alloc, value);
+}
+
+/// typed_doc_values type used to persist a relational column for reconstruction.
+/// numeric/datetime/boolean/geopoint keep their scan-friendly encodings; every
+/// other declared type (keyword/text/link/html/search_as_you_type/blob/geoshape
+/// /json) is persisted as bytes_val.
+fn relationalStorageValueType(field_type: runtime_schema.AntflyType) typed_dv.ValueType {
+    return switch (field_type) {
+        .numeric => .f64_val,
+        .datetime => .u64_val,
+        .boolean => .bool_val,
+        .geopoint => .geo_point,
+        else => .bytes_val,
+    };
+}
+
+fn validateRelationalArrayColumnValue(column: runtime_schema.RelationalColumn, json_value: std.json.Value) !void {
+    const item_type = column.array_item_type orelse return;
+    if (json_value != .array) return error.InvalidBatchRequest;
+    for (json_value.array.items) |item| {
+        if (!relationalArrayItemValueMatches(item_type, item)) return error.InvalidBatchRequest;
+    }
+}
+
+fn relationalArrayItemValueMatches(item_type: runtime_schema.AntflyType, item: std.json.Value) bool {
+    return switch (item_type) {
+        .text, .keyword, .link, .html, .search_as_you_type, .blob, .geoshape => item == .string,
+        .numeric => jsonNumberValue(item) != null,
+        .datetime => coerceRelationalTypedValue(.u64_val, item) != null,
+        .boolean => item == .bool,
+        .geopoint => coerceRelationalTypedValue(.geo_point, item) != null,
+        .json => true,
+        .array => item == .array,
+        .embedding => false,
+    };
+}
+
+fn coerceRelationalStorageValue(alloc: Allocator, value_type: typed_dv.ValueType, json_value: std.json.Value) !?typed_dv.TypedValue {
+    if (value_type == .bytes_val) {
+        // Strings are stored verbatim; structured (object/array) and any other
+        // value is stored as its canonical JSON text. The writer dupes bytes,
+        // so a stringified buffer can be freed by the caller's arena.
+        switch (json_value) {
+            .string => |text| return .{ .bytes_val = text },
+            else => {
+                const encoded = try std.json.Stringify.valueAlloc(alloc, json_value, .{});
+                return .{ .bytes_val = encoded };
+            },
+        }
+    }
+    return coerceRelationalTypedValue(value_type, json_value);
+}
+
+fn relationalTypedValueType(field_type: runtime_schema.AntflyType) ?typed_dv.ValueType {
+    return switch (field_type) {
+        .numeric => .f64_val,
+        .datetime => .u64_val,
+        .boolean => .bool_val,
+        .geopoint => .geo_point,
+        else => null,
+    };
+}
+
+fn coerceRelationalTypedValue(value_type: typed_dv.ValueType, json_value: std.json.Value) ?typed_dv.TypedValue {
+    switch (value_type) {
+        .f64_val => switch (json_value) {
+            .float => |number| return .{ .f64_val = number },
+            .integer => |number| return .{ .f64_val = @floatFromInt(number) },
+            else => return null,
+        },
+        .u64_val => {
+            const number: i64 = switch (json_value) {
+                .integer => |value| value,
+                .string => |text| blk: {
+                    // Accept an epoch-ns integer-string, or an RFC3339 UTC
+                    // timestamp (parsed to the same epoch-ns the column stores).
+                    if (std.fmt.parseInt(i64, text, 10)) |epoch_ns| {
+                        break :blk epoch_ns;
+                    } else |_| {
+                        const ns = (introducer_mod.parseRfc3339ToNs(text) catch return null) orelse return null;
+                        break :blk @bitCast(ns);
+                    }
+                },
+                else => return null,
+            };
+            return .{ .u64_val = @bitCast(number) };
+        },
+        .bool_val => switch (json_value) {
+            .bool => |flag| return .{ .bool_val = flag },
+            else => return null,
+        },
+        .geo_point => {
+            if (json_value != .object) return null;
+            const lat = jsonNumberValue(json_value.object.get("lat") orelse return null) orelse return null;
+            const lon = jsonNumberValue(json_value.object.get("lon") orelse return null) orelse return null;
+            return .{ .geo_point = .{ .lat = lat, .lon = lon } };
+        },
+        else => return null,
+    }
+}
+
+fn jsonNumberValue(json_value: std.json.Value) ?f64 {
+    switch (json_value) {
+        .float => |number| return number,
+        .integer => |number| return @floatFromInt(number),
+        else => return null,
+    }
+}
+
+fn valueAtJsonPath(root: std.json.Value, path: []const u8) ?std.json.Value {
+    var current = root;
+    var it = std.mem.splitScalar(u8, path, '.');
+    while (it.next()) |segment| {
+        switch (current) {
+            .object => |object| current = object.get(segment) orelse return null,
+            else => return null,
+        }
+    }
+    return current;
 }
 
 fn runtimeHasSchemaDrivenText(schema: runtime_schema.TableSchema) bool {
@@ -2877,6 +3144,31 @@ test "document mapper emits schema-driven search_as_you_type variants" {
     try std.testing.expect((try reader.invertedIndex("name._index_prefix")) != null);
 }
 
+test "document mapper projects embedded relational json schema fields" {
+    const alloc = std.testing.allocator;
+    const text_analysis = introducer_mod.TextAnalysisConfig{};
+    var parsed = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true},"dynamic_templates":{"label":{"path_match":"labels.*","mapping":{"type":"keyword"}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    const segment = (try buildTextSegmentFromDocuments(alloc, &.{
+        .{ .key = "row:1", .value = "{\"id\":\"row:1\",\"attrs\":{\"title\":\"Alpha beta\",\"plan\":\"pro\",\"labels\":{\"color\":\"blue\"},\"notes\":\"hello world\"}}" },
+    }, text_analysis, schema)).?;
+    defer alloc.free(segment);
+
+    var reader = try @import("../../segment.zig").SegmentReader.init(alloc, segment);
+    defer reader.deinit();
+
+    try std.testing.expect((try reader.invertedIndex("attrs.title")) != null);
+    try std.testing.expect((try reader.invertedIndex("attrs.plan")) != null);
+    try std.testing.expect((try reader.invertedIndex("attrs.labels.color")) != null);
+    try std.testing.expect((try reader.invertedIndex("attrs.notes")) != null);
+    try std.testing.expect((try reader.invertedIndex("notes")) == null);
+}
+
 test "document mapper emits Go-style dynamic-template search_as_you_type field" {
     const alloc = std.testing.allocator;
     const text_analysis = introducer_mod.TextAnalysisConfig{};
@@ -3256,6 +3548,23 @@ test "document mapper dense extractor skips unrelated top-level values" {
     try std.testing.expectApproxEqAbs(@as(f32, 3.0), values[2], 0.0001);
 }
 
+test "document mapper extracts dense vector from dotted json field" {
+    const alloc = std.testing.allocator;
+
+    const values = (try extractDenseVectorField(alloc,
+        \\{"title":"alpha","attrs":{"embedding":[1,2.5,3],"nested":{"other":[0]}}}
+    , "attrs.embedding", 3)).?;
+    defer alloc.free(values);
+
+    try std.testing.expectEqual(@as(usize, 3), values.len);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), values[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 2.5), values[1], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 3.0), values[2], 0.0001);
+    try std.testing.expect((try extractDenseVectorField(alloc,
+        \\{"attrs":{"nested":{"embedding":[1,2,3]}}}
+    , "attrs.embedding", 3)) == null);
+}
+
 test "document mapper dense extractor returns null when field is absent" {
     const alloc = std.testing.allocator;
     try std.testing.expect((try extractDenseVectorField(alloc, "{\"title\":\"alpha\"}", "embedding", 3)) == null);
@@ -3265,6 +3574,21 @@ test "document mapper extracts sparse vector from configured field" {
     const alloc = std.testing.allocator;
 
     var vec = (try extractSparseVectorField(alloc, "{\"sparse\":{\"indices\":[1,5],\"values\":[0.25,0.75]}}", "sparse")).?;
+    defer vec.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), vec.indices.len);
+    try std.testing.expectEqual(@as(u32, 1), vec.indices[0]);
+    try std.testing.expectEqual(@as(u32, 5), vec.indices[1]);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.25), vec.values[0], 0.0001);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.75), vec.values[1], 0.0001);
+}
+
+test "document mapper extracts sparse vector from dotted json field" {
+    const alloc = std.testing.allocator;
+
+    var vec = (try extractSparseVectorField(alloc,
+        \\{"attrs":{"sparse":{"indices":[1,5],"values":[0.25,0.75]}}}
+    , "attrs.sparse")).?;
     defer vec.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 2), vec.indices.len);
@@ -3409,4 +3733,292 @@ test "document mapper extracts packed sparse embeddings from _embeddings" {
     try std.testing.expectEqual(@as(u32, 5), extracted.sparse_embeddings[0].indices[1]);
     try std.testing.expectApproxEqAbs(@as(f32, 0.5), extracted.sparse_embeddings[0].values[0], 0.0001);
     try std.testing.expectApproxEqAbs(@as(f32, 0.75), extracted.sparse_embeddings[0].values[1], 0.0001);
+}
+
+test "extractTextFieldsFromValue skips relational segment typed fields" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "title", .path = "title", .field_type = .text, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+
+    var doc = try std.json.parseFromSlice(std.json.Value, alloc,
+        \\{"title":"hello","amount":1.5,"ts":1000,"active":true,"payload":{"k":1}}
+    , .{});
+    defer doc.deinit();
+
+    const extracted = try extractTextFieldsFromValue(alloc, doc.value, .{}, schema, null);
+
+    try std.testing.expect(extracted.typed_fields != null);
+    try std.testing.expectEqual(@as(usize, 0), extracted.typed_fields.?.len);
+    try std.testing.expect(extracted.fields.len > 0);
+}
+
+test "relational text projection omits segment typed columns" {
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const alloc = arena_state.allocator();
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "title", .path = "title", .field_type = .text, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = false },
+    };
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &columns,
+    };
+
+    const doc_json = "{\"title\":\"hello world\",\"amount\":12.5,\"active\":true}";
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{});
+    defer parsed.deinit();
+    const stored_projection = try fullTextStoredProjection(alloc, parsed.value, doc_json, .{});
+    const source_docs = [_]TextProjectionSourceDoc{.{
+        .key = "doc:a",
+        .root = parsed.value,
+        .stored_data = stored_projection.stored_data,
+        .typed_source = stored_projection.typed_source,
+    }};
+    const projection = try buildTextProjectionBatchFromSource(alloc, &source_docs, .{}, schema, null);
+    try std.testing.expectEqual(@as(usize, 1), projection.docs.len);
+    try std.testing.expect(projection.docs[0].typed_fields != null);
+    try std.testing.expectEqual(@as(usize, 0), projection.docs[0].typed_fields.?.len);
+    try std.testing.expect(projection.docs[0].typed_source == null);
+
+    const seg_bytes = try introducer_mod.buildSegmentFromTextWithAnalysisOptions(
+        alloc,
+        projection.docs,
+        &analysis_mod.default_analyzer,
+        .{},
+        .{},
+    );
+    defer alloc.free(seg_bytes);
+
+    var reader = try segment_mod.SegmentReader.init(alloc, seg_bytes);
+    defer reader.deinit();
+
+    try std.testing.expect(reader.getSection("amount", .typed_doc_values) == null);
+    try std.testing.expect(reader.getSection("active", .typed_doc_values) == null);
+    const stored = (try reader.storedDocDecompressed(0)).?;
+    defer alloc.free(stored.data);
+    try std.testing.expectEqualStrings(doc_json, stored.data);
+}
+
+test "relational KV row value round-trips a document through project + reconstruct" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = true },
+        .{ .name = "active", .path = "active", .field_type = .boolean, .nullable = true },
+        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
+        .{ .name = "payload", .path = "payload", .field_type = .json, .nullable = true },
+        .{ .name = "tags", .path = "tags", .field_type = .array, .array_item_type = .keyword, .nullable = true },
+    };
+
+    // "note" absent -> omitted; payload is a structured json column; tags is a
+    // first-class relational array column stored as canonical bytes.
+    const doc_json =
+        \\{"id":"abc","amount":12.5,"ts":1000,"active":true,"payload":{"k":1},"tags":["hot","new"]}
+    ;
+
+    const row_value = try buildRelationalRowValueAlloc(alloc, doc_json, &columns);
+    defer alloc.free(row_value);
+    try std.testing.expect(isRelationalRowValue(row_value));
+    try std.testing.expect(!isRelationalRowValue(doc_json));
+
+    const rebuilt = try reconstructRelationalRowDocumentAlloc(alloc, row_value);
+    defer alloc.free(rebuilt);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+
+    try std.testing.expectEqual(@as(usize, 6), obj.count());
+    try std.testing.expectEqualStrings("abc", obj.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 1000), obj.get("ts").?.integer);
+    try std.testing.expect(obj.get("active").?.bool);
+    try std.testing.expect(obj.get("note") == null);
+    try std.testing.expectEqual(@as(i64, 1), obj.get("payload").?.object.get("k").?.integer);
+    try std.testing.expectEqual(@as(usize, 2), obj.get("tags").?.array.items.len);
+    try std.testing.expectEqualStrings("hot", obj.get("tags").?.array.items[0].string);
+    try std.testing.expectEqualStrings("new", obj.get("tags").?.array.items[1].string);
+    const amount = obj.get("amount").?;
+    const amount_num: f64 = switch (amount) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => unreachable,
+    };
+    try std.testing.expectEqual(@as(f64, 12.5), amount_num);
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5,\"tags\":\"hot\"}", &columns),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5,\"tags\":[\"hot\",1]}", &columns),
+    );
+}
+
+test "relational KV row value rejects missing required columns" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
+    };
+
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\"}", &columns),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":null}", &columns),
+    );
+    try std.testing.expectError(
+        error.InvalidBatchRequest,
+        buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":\"not-a-number\"}", &columns),
+    );
+
+    const row_value = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"abc\",\"amount\":12.5}", &columns);
+    defer alloc.free(row_value);
+    try std.testing.expect(isRelationalRowValue(row_value));
+}
+
+test "document materializer passes through blobs and leaves rows to relational seams" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    const doc_json = "{\"id\":\"abc\",\"amount\":12.5}";
+
+    // Typed rows are not a generic document-mode compatibility format. They
+    // reconstruct only through strict relational row-key seams.
+    const row_value = try buildRelationalRowValueAlloc(alloc, doc_json, &columns);
+    defer alloc.free(row_value);
+    const materialized = try materializeDocumentValueAlloc(alloc, row_value);
+    defer alloc.free(materialized);
+    try std.testing.expectEqualSlices(u8, row_value, materialized);
+
+    const relational = try materializeRelationalRowValueAlloc(alloc, row_value);
+    defer alloc.free(relational);
+    try std.testing.expectEqualStrings("{\"id\":\"abc\",\"amount\":12.5}", relational);
+
+    // Plain JSON blob (document mode) -> owned passthrough copy.
+    const blob = "{\"hello\":\"world\"}";
+    const passed = try materializeDocumentValueAlloc(alloc, blob);
+    defer alloc.free(passed);
+    try std.testing.expectEqualStrings(blob, passed);
+    try std.testing.expect(passed.ptr != blob.ptr);
+
+    // Owned variant returns the original document-mode allocation unchanged.
+    const row_owned = try buildRelationalRowValueAlloc(alloc, doc_json, &columns);
+    const row_back = try materializeOwnedDocumentValueAlloc(alloc, row_owned);
+    defer alloc.free(row_back);
+    try std.testing.expect(row_back.ptr == row_owned.ptr);
+
+    const blob_owned = try alloc.dupe(u8, blob);
+    const blob_back = try materializeOwnedDocumentValueAlloc(alloc, blob_owned);
+    defer alloc.free(blob_back);
+    try std.testing.expect(blob_back.ptr == blob_owned.ptr);
+}
+
+test "relational datetime column accepts RFC3339 strings and epoch integers" {
+    const alloc = std.testing.allocator;
+
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "ts", .path = "ts", .field_type = .datetime, .nullable = false },
+    };
+
+    // RFC3339 UTC string -> epoch ns (1970-01-01T00:00:01Z == 1e9 ns).
+    {
+        const row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"ts\":\"1970-01-01T00:00:01Z\"}", &columns);
+        defer alloc.free(row);
+        const json = try reconstructRelationalRowDocumentAlloc(alloc, row);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 1_000_000_000), parsed.value.object.get("ts").?.integer);
+    }
+
+    // Fractional seconds.
+    {
+        const row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"ts\":\"1970-01-01T00:00:00.5Z\"}", &columns);
+        defer alloc.free(row);
+        const json = try reconstructRelationalRowDocumentAlloc(alloc, row);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 500_000_000), parsed.value.object.get("ts").?.integer);
+    }
+
+    // Bare epoch-ns integer still works (unchanged behavior).
+    {
+        const row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"ts\":42}", &columns);
+        defer alloc.free(row);
+        const json = try reconstructRelationalRowDocumentAlloc(alloc, row);
+        defer alloc.free(json);
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(@as(i64, 42), parsed.value.object.get("ts").?.integer);
+    }
+}
+
+test "relational typed row reconstructs under additive schema change" {
+    // Schema evolution safety: a document stored as a typed row under an OLD
+    // column set must still reconstruct correctly after a new (nullable) column
+    // is added, because the row is self-describing. The new column is simply
+    // absent for the old document until it is rewritten.
+    const alloc = std.testing.allocator;
+
+    const old_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+    };
+    // Write a document under the old schema.
+    const row_value = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"a\",\"amount\":12.5}", &old_columns);
+    defer alloc.free(row_value);
+
+    // Schema evolves: a new nullable column "note" is added. Reads do not depend
+    // on the schema -- reconstruction is driven by the self-describing row -- so
+    // the old document still rebuilds to exactly its original fields.
+    const rebuilt = try reconstructRelationalRowDocumentAlloc(alloc, row_value);
+    defer alloc.free(rebuilt);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, rebuilt, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    try std.testing.expectEqual(@as(usize, 2), obj.count());
+    try std.testing.expectEqualStrings("a", obj.get("id").?.string);
+    try std.testing.expect(obj.get("note") == null);
+
+    // A document written AFTER the change carries the new column.
+    const new_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric, .nullable = false },
+        .{ .name = "note", .path = "note", .field_type = .keyword, .nullable = true },
+    };
+    const new_row = try buildRelationalRowValueAlloc(alloc, "{\"id\":\"b\",\"amount\":1.0,\"note\":\"hi\"}", &new_columns);
+    defer alloc.free(new_row);
+    const new_rebuilt = try reconstructRelationalRowDocumentAlloc(alloc, new_row);
+    defer alloc.free(new_rebuilt);
+    var new_parsed = try std.json.parseFromSlice(std.json.Value, alloc, new_rebuilt, .{});
+    defer new_parsed.deinit();
+    try std.testing.expectEqualStrings("hi", new_parsed.value.object.get("note").?.string);
 }

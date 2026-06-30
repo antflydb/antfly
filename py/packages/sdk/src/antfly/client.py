@@ -16,6 +16,8 @@ from antfly.client_generated.models import (
     BatchRequest,
     BatchRequestInserts,
     Error,
+    SqlStatementRequest,
+    SqlStatementResponse,
 )
 from antfly.client_generated.types import UNSET
 
@@ -212,6 +214,30 @@ class AntflyClient:
             AntflyException: If dropping table fails
         """
         self._request("DELETE", f"/db/v1/tables/{quote(name, safe='')}")
+
+    def execute_sql(
+        self,
+        sql: str,
+        session_id: int | None = None,
+        database: str | None = None,
+        namespace: str | None = None,
+        read_only: bool | None = None,
+    ) -> SqlStatementResponse:
+        """
+        Execute one SQL statement through Antfly's public SQL ingress.
+
+        Reuse the returned ``session_id`` on later calls when session state
+        must persist across statements.
+        """
+        request = SqlStatementRequest(
+            sql=sql,
+            session_id=UNSET if session_id is None else session_id,
+            database=UNSET if database is None else database,
+            namespace=UNSET if namespace is None else namespace,
+            read_only=UNSET if read_only is None else read_only,
+        )
+        response = self._request("POST", "/db/v1/sql", json=request.to_dict())
+        return SqlStatementResponse.from_dict(response)
 
     def get(self, table: str, key: str) -> dict[str, Any]:
         """

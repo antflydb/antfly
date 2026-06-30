@@ -1001,13 +1001,16 @@ test "cache pending load waiter survives finish removal" {
 
     var waiter = Waiter{};
     const thread = try std.Thread.spawn(.{}, Waiter.run, .{ &waiter, &cache });
-    sleepNs(10 * std.time.ns_per_ms);
+    const wait_deadline = platform.time.monotonicNs() + 5 * std.time.ns_per_s;
+    while (cache.snapshotStats().run_table_index.waits == 0 and platform.time.monotonicNs() < wait_deadline) {
+        sleepNs(std.time.ns_per_ms);
+    }
+    try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
     cache.finishLoad("run-1", 1, 1, .run_table_index);
     thread.join();
 
     if (waiter.err) |err| return err;
     try std.testing.expectEqual(@as(usize, 0), cache.pendingLoadCountForTests());
-    try std.testing.expect(cache.snapshotStats().run_table_index.waits > 0);
 }
 
 test "cache accounts table index prefix bloom filters" {

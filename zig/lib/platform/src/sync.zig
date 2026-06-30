@@ -31,6 +31,14 @@ const time = @import("time.zig");
 
 const spin_limit = 64;
 
+/// Try to acquire `mutex` once before falling back to `lockYielding`.
+/// Returns `true` when the fast uncontended attempt acquired the lock.
+pub fn lockAtomic(mutex: anytype) bool {
+    if (mutex.tryLock()) return true;
+    lockYielding(mutex);
+    return false;
+}
+
 /// Acquire `mutex` (any type exposing `tryLock`), spinning briefly and then
 /// releasing the CPU between attempts via `time.yieldBriefly`. On
 /// freestanding targets there is no scheduler to yield to, so this degrades
@@ -69,6 +77,12 @@ test "lockYielding acquires an uncontended mutex" {
     lockYielding(&mutex);
     defer mutex.unlock();
     try std.testing.expect(!mutex.tryLock());
+}
+
+test "lockAtomic reports uncontended acquisition" {
+    var mutex: std.atomic.Mutex = .unlocked;
+    try std.testing.expect(lockAtomic(&mutex));
+    mutex.unlock();
 }
 
 test "lockYielding acquires a mutex released by another thread" {

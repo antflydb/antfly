@@ -1,0 +1,272 @@
+{
+  "fixture_format": 1,
+  "residual_filter_cases": [
+    {
+      "name": "lower helper matches ASCII uppercase row value",
+      "document_json": "{\"status\":\"ACTIVE\"}",
+      "filter_json": "{\"text_lower_term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "lower helper does not lowercase expected literal",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"text_lower_term\":{\"path\":\"/status\",\"value\":\"ACTIVE\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "lower helper fails closed on non-ASCII row value",
+      "document_json": "{\"status\":\"CAF\u00c9\"}",
+      "filter_json": "{\"text_lower_term\":{\"path\":\"/status\",\"value\":\"cafe\"}}",
+      "expected": {"error": "UnsupportedSqlShape"}
+    },
+    {
+      "name": "upper helper matches ASCII lowercase row value",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"text_upper_term\":{\"path\":\"/status\",\"value\":\"ACTIVE\"}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "upper helper does not uppercase expected literal",
+      "document_json": "{\"status\":\"ACTIVE\"}",
+      "filter_json": "{\"text_upper_term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "upper helper fails closed on non-ASCII row value",
+      "document_json": "{\"status\":\"caf\u00e9\"}",
+      "filter_json": "{\"text_upper_term\":{\"path\":\"/status\",\"value\":\"CAFE\"}}",
+      "expected": {"error": "UnsupportedSqlShape"}
+    },
+    {
+      "name": "numeric abs range matches negative value against inclusive max",
+      "document_json": "{\"delta\":-12}",
+      "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"max\":12,\"inclusive_max\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "numeric abs range matches positive value against inclusive min",
+      "document_json": "{\"delta\":12}",
+      "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"min\":10,\"inclusive_min\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "numeric abs range honors exclusive max",
+      "document_json": "{\"delta\":-12}",
+      "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"max\":12,\"inclusive_max\":false}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "numeric abs range misses absent path",
+      "document_json": "{\"amount\":12}",
+      "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"max\":12,\"inclusive_max\":true}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "numeric abs range rejects non-numeric row value",
+      "document_json": "{\"delta\":\"large\"}",
+      "filter_json": "{\"numeric_abs_range\":{\"path\":\"/delta\",\"max\":12,\"inclusive_max\":true}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "date range matches inside UTC day",
+      "document_json": "{\"published_at\":\"2026-02-28T12:34:00Z\"}",
+      "filter_json": "{\"date_range\":{\"path\":\"/published_at\",\"start\":\"2026-02-28T00:00:00Z\",\"end\":\"2026-03-01T00:00:00Z\",\"inclusive_start\":true,\"inclusive_end\":false}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "date range excludes next UTC day boundary",
+      "document_json": "{\"published_at\":\"2026-03-01T00:00:00Z\"}",
+      "filter_json": "{\"date_range\":{\"path\":\"/published_at\",\"start\":\"2026-02-28T00:00:00Z\",\"end\":\"2026-03-01T00:00:00Z\",\"inclusive_start\":true,\"inclusive_end\":false}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "date range matches leap day lower bound",
+      "document_json": "{\"published_at\":\"2024-02-29T00:00:00Z\"}",
+      "filter_json": "{\"date_range\":{\"path\":\"/published_at\",\"start\":\"2024-02-29T00:00:00Z\",\"inclusive_start\":true}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "date range rejects numeric timestamp row value",
+      "document_json": "{\"published_at\":1709164800}",
+      "filter_json": "{\"date_range\":{\"path\":\"/published_at\",\"start\":\"2024-02-29T00:00:00Z\",\"inclusive_start\":true}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "unknown regex residual operator is invalid",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"regex\":{\"path\":\"/status\",\"pattern\":\"act.*\"}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "unknown script residual operator is invalid",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"script\":{\"source\":\"doc.status == 'active'\"}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "empty bool residual operator is invalid",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"bool\":{}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "malformed term residual operator is invalid",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"term\":{\"path\":\"/status\"}}",
+      "expected": {"error": "InvalidRowsRequest"}
+    },
+    {
+      "name": "bool must-not excludes matching term",
+      "document_json": "{\"status\":\"active\",\"region\":\"west\"}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/region\",\"value\":\"west\"}}],\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":\"archived\"}}]}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "bool must-not rejects matching exclusion",
+      "document_json": "{\"status\":\"archived\",\"region\":\"west\"}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/region\",\"value\":\"west\"}}],\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":\"archived\"}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "bool filter rejects nonmatching positive clause",
+      "document_json": "{\"status\":\"active\",\"region\":\"east\"}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"term\":{\"path\":\"/region\",\"value\":\"west\"}}],\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":\"archived\"}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "exclusion-only bool admits nonmatching row",
+      "document_json": "{\"status\":\"active\",\"region\":\"west\"}",
+      "filter_json": "{\"bool\":{\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":\"archived\"}}]}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "exclusion-only bool rejects matching row",
+      "document_json": "{\"status\":\"archived\",\"region\":\"west\"}",
+      "filter_json": "{\"bool\":{\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":\"archived\"}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "is-null residual rejects concrete value",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"bool\":{\"should\":[{\"term\":{\"path\":\"/status\",\"value\":null}},{\"bool\":{\"must_not\":[{\"exists\":{\"path\":\"/status\"}}]}}],\"minimum_should_match\":1}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "is-null residual matches JSON null",
+      "document_json": "{\"status\":null}",
+      "filter_json": "{\"bool\":{\"should\":[{\"term\":{\"path\":\"/status\",\"value\":null}},{\"bool\":{\"must_not\":[{\"exists\":{\"path\":\"/status\"}}]}}],\"minimum_should_match\":1}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "is-null residual matches missing path",
+      "document_json": "{}",
+      "filter_json": "{\"bool\":{\"should\":[{\"term\":{\"path\":\"/status\",\"value\":null}},{\"bool\":{\"must_not\":[{\"exists\":{\"path\":\"/status\"}}]}}],\"minimum_should_match\":1}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "is-not-null residual matches concrete value",
+      "document_json": "{\"status\":\"active\"}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"exists\":{\"path\":\"/status\"}}],\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":null}}]}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "is-not-null residual rejects JSON null",
+      "document_json": "{\"status\":null}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"exists\":{\"path\":\"/status\"}}],\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":null}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "is-not-null residual rejects missing path",
+      "document_json": "{}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"exists\":{\"path\":\"/status\"}}],\"must_not\":[{\"term\":{\"path\":\"/status\",\"value\":null}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "match-all residual admits row",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"match_all\":{}}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "match-none residual rejects row",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"match_none\":{}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "bool with match-none positive clause rejects row",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"bool\":{\"filter\":[{\"match_none\":{}},{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}]}}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "conjuncts residual matches all terms",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"conjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "conjuncts residual rejects inactive status",
+      "document_json": "{\"status\":\"inactive\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"conjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "conjuncts residual rejects different tenant",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-b\"}",
+      "filter_json": "{\"conjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": false}
+    },
+    {
+      "name": "disjuncts residual matches first term",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"disjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "disjuncts residual matches second term",
+      "document_json": "{\"status\":\"inactive\",\"tenant_id\":\"tenant-a\"}",
+      "filter_json": "{\"disjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "disjuncts residual matches active other tenant",
+      "document_json": "{\"status\":\"active\",\"tenant_id\":\"tenant-b\"}",
+      "filter_json": "{\"disjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": true}
+    },
+    {
+      "name": "disjuncts residual rejects when no term matches",
+      "document_json": "{\"status\":\"archived\",\"tenant_id\":\"tenant-b\"}",
+      "filter_json": "{\"disjuncts\":[{\"term\":{\"path\":\"/status\",\"value\":\"active\"}},{\"term\":{\"path\":\"/tenant_id\",\"value\":\"tenant-a\"}}]}",
+      "expected": {"matches": false}
+    }
+  ],
+  "unsupported_residual_expression_cases": [
+    {
+      "name": "arbitrary string length helper",
+      "sql": "SELECT _id FROM docs WHERE length(status) = 6 LIMIT 10",
+      "expected_error": "UnsupportedSqlShape"
+    },
+    {
+      "name": "case-fold helper with LIKE",
+      "sql": "SELECT _id FROM docs WHERE lower(status) LIKE 'act%' LIMIT 10",
+      "expected_error": "UnsupportedSqlShape"
+    },
+    {
+      "name": "numeric arithmetic expression",
+      "sql": "SELECT _id FROM docs WHERE amount + 1 > 10 LIMIT 10",
+      "expected_error": "UnsupportedSqlShape"
+    },
+    {
+      "name": "case-insensitive pattern predicate",
+      "sql": "SELECT _id FROM docs WHERE status ILIKE 'act%' LIMIT 10",
+      "expected_error": "UnsupportedSqlShape"
+    },
+    {
+      "name": "regex predicate",
+      "sql": "SELECT _id FROM docs WHERE status ~ 'act.*' LIMIT 10",
+      "expected_error": "UnsupportedSqlShape"
+    }
+  ]
+}

@@ -18,7 +18,7 @@ info:
     - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
     - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
     - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, query, enrichments, full_index)
 
     ### AI-Native Features
     - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
@@ -1433,6 +1433,77 @@ components:
   schemas:
     Error:
       $ref: "../auth/api.yaml#/components/schemas/Error"
+    SqlStatementRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Synchronous SQL statement request. `session_id` is optional on the first
+        request and should be reused from prior responses when SQL session state
+        must persist across requests.
+      properties:
+        sql:
+          type: string
+          minLength: 1
+          description: SQL statement text to execute.
+        session_id:
+          type: integer
+          format: int64
+          nullable: true
+          minimum: 1
+          description: Logical SQL session id returned by an earlier SQL response.
+        database:
+          type: string
+          nullable: true
+          description: Optional current database override for this request.
+        namespace:
+          type: string
+          nullable: true
+          description: Optional single search-path namespace override for this request.
+        read_only:
+          type: boolean
+          default: false
+          description: Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
+      required:
+        - sql
+    SqlStatementResponse:
+      type: object
+      additionalProperties: false
+      description: |
+        Synchronous SQL statement result metadata. Catalog/session/control
+        statements route through the typed DDL/session execution path. Read
+        statements lower through the same typed row-plan executor used by the
+        JSON relational rows APIs. Point write statements lower through the
+        typed row-batch mutation path, and insert-from-source statements lower
+        through the typed row-read plus row-batch mutation path.
+      properties:
+        kind:
+          type: string
+          enum:
+            - ddl
+            - read
+            - write
+        session_id:
+          type: integer
+          format: int64
+          minimum: 1
+        noop:
+          type: boolean
+        applied:
+          type: object
+          additionalProperties: true
+          description: Applied DDL/session result record.
+        statement_kind:
+          type: string
+          nullable: true
+          description: Lowered read or write statement family for data responses.
+        result:
+          type: object
+          additionalProperties: true
+          nullable: true
+          description: Typed relational row-plan, row-batch, or mutation-source response for data statements.
+      required:
+        - kind
+        - session_id
     SortDirection:
       $ref: "indexes.yaml#/components/schemas/SortDirection"
     SortField:
@@ -2503,19 +2574,17 @@ components:
       enum:
         - propose
         - write
-        - full_text
+        - query
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: |
         Synchronization level for batch operations:
         - "propose": Wait for Raft proposal acceptance (fastest, default)
         - "write": Wait for Pebble KV write
-        - "full_text": Wait for full-text index WAL write
+        - "query": Wait until affected documents are visible to query paths such as full-text search
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig: # Simplified from common.ShardInfo for brevity
       type: object
       required:
@@ -2587,6 +2656,24 @@ components:
               embedder:
                 provider: ollama
                 model: all-minilm
+        typed_paths:
+          type: object
+          description: |
+            Table-level typed document path metadata used by SQL planning for
+            JSON/path scalar comparison semantics. This is not a physical index
+            and does not imply indexed lookup, rebuild, catch-up, compaction, or
+            PostgreSQL `CREATE INDEX` behavior. Use real index definitions for
+            physical access paths.
+
+            Keys are scalar type names such as `keyword`, `numeric`, `boolean`,
+            or `datetime`; values are a path string or an array of path strings.
+          additionalProperties: true
+          example:
+            numeric:
+              - metrics.score
+            keyword:
+              - status
+              - metadata.plan
         schema: # Optional schema for the table
           description: |
             Optional schema definition specifying field types, primary key, and TTL configuration.
@@ -2620,6 +2707,12 @@ components:
             Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`).
             Each source uses `on_update`/`on_delete` transforms to control how PG events map to
             Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
+        tablespace_name:
+          type: string
+          description: |
+            Optional tablespace binding for the table. When set, the named tablespace must exist and
+            cannot be dropped while the table references it.
+          example: fastspace
     AntflyType:
       rules:
         no-unused-components: off
@@ -2638,6 +2731,9 @@ components:
           maxLength: 500
           description: Optional description of the table.
           example: "Table for user data"
+        tablespace_name:
+          type: string
+          description: Optional durable tablespace binding for this table.
         indexes:
           type: object
           additionalProperties:
@@ -2658,6 +2754,111 @@ components:
             $ref: "#/components/schemas/ReplicationSource"
           description: |
             PostgreSQL CDC replication sources configured for this table.
+    DatabaseCatalogRecord:
+      type: object
+      required:
+        - database_id
+        - name
+        - settings_json
+      description: Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+      properties:
+        database_id:
+          type: integer
+          format: uint64
+          description: Stable database catalog identifier.
+          example: 22
+        name:
+          type: string
+          description: Database name.
+          example: tenant_ops
+        settings_json:
+          type: string
+          description: JSON-encoded database settings owned by the catalog.
+          example: "{}"
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new namespace/table placement policy.
+          example: fastspace
+    NamespaceCatalogRecord:
+      type: object
+      required:
+        - namespace_id
+        - database_id
+        - database_name
+        - name
+      description: Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+      properties:
+        namespace_id:
+          type: integer
+          format: uint64
+          description: Stable namespace catalog identifier.
+          example: 222
+        database_id:
+          type: integer
+          format: uint64
+          description: Parent database identifier.
+          example: 22
+        database_name:
+          type: string
+          description: Parent database name.
+          example: tenant_ops
+        name:
+          type: string
+          description: Namespace name.
+          example: analytics
+        tablespace_name:
+          type: string
+          nullable: true
+          description: Optional durable tablespace binding inherited by new table placement policy in this namespace.
+          example: fastspace
+    CatalogTablespaceBindingRequest:
+      type: object
+      required:
+        - tablespace_name
+      properties:
+        tablespace_name:
+          type: string
+          description: Existing tablespace name to bind to the catalog object.
+          example: fastspace
+    TablespaceCatalogRecord:
+      type: object
+      required:
+        - tablespace_id
+        - name
+        - location_json
+        - placement_policy_json
+      description: Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.
+      properties:
+        tablespace_id:
+          type: integer
+          format: uint64
+          description: Stable tablespace catalog identifier.
+          example: 42
+        name:
+          type: string
+          description: Tablespace name.
+          example: fastspace
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. String locations are encoded as JSON strings.
+          example: "\"/var/lib/antfly/fastspace\""
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy reserved for native placement planning.
+          example: "{}"
+    CreateTablespaceRequest:
+      type: object
+      description: Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it.
+      properties:
+        location_json:
+          type: string
+          description: JSON-encoded location descriptor. Defaults to `null`.
+          example: "\"/var/lib/antfly/fastspace\""
+        placement_policy_json:
+          type: string
+          description: JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+          example: "{}"
     TableMigration:
       x-go-type-skip-optional-pointer: false
       type: object
@@ -2698,6 +2899,18 @@ components:
         - Bucketing: terms, range, date_range, histogram, date_histogram
         - Geo: geohash_grid, geo_distance
         - Analytics: significant_terms
+    CardinalityMode:
+      type: string
+      enum:
+        - auto
+        - exact
+        - approximate
+      description: |
+        Exact-vs-approximate selection for a cardinality aggregation:
+        - auto: use a materialized HyperLogLog sketch when one applies and is
+          current, else an exact distinct scan (default).
+        - exact: always compute an exact distinct count.
+        - approximate: require a matching sketch; error if none applies.
     AggregationRange:
       type: object
       required:
@@ -2828,6 +3041,15 @@ components:
         field:
           type: string
           description: Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
+        mode:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: "#/components/schemas/CardinalityMode"
+          description: >-
+            Selection mode for a cardinality aggregation. `auto` (default) uses a
+            materialized HyperLogLog sketch when one applies and is current, else
+            falls back to an exact distinct scan. `exact` always scans. `approximate`
+            requires a sketch and errors if none applies. Ignored for other types.
         fields:
           type: array
           items:
@@ -2962,6 +3184,22 @@ components:
           x-go-type: float64
           x-go-type-skip-optional-pointer: false
           description: Single value for metric aggregations (sum, avg, min, max, count, cardinality)
+        approximate:
+          type: boolean
+          x-go-type-skip-optional-pointer: false
+          description: >-
+            For cardinality aggregations, whether the value is an approximate
+            estimate from a HyperLogLog sketch (true) or an exact distinct count
+            (false). Absent for non-cardinality aggregations.
+        relative_error:
+          type: number
+          format: float
+          x-go-type: float64
+          x-go-type-skip-optional-pointer: false
+          description: >-
+            For an approximate cardinality value, the relative standard error of
+            the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate
+            is true.
         count:
           type: integer
           x-go-type-skip-optional-pointer: false
@@ -3028,6 +3266,13 @@ components:
           $ref: "indexes.yaml#/components/schemas/IndexConfig"
         status:
           $ref: "indexes.yaml#/components/schemas/IndexStats"
+    GraphMetricActionResponse:
+      type: object
+      required:
+        - status
+      properties:
+        status:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricStatus"
     LsmStorageStatus:
       type: object
       description: Compact LSM backend operational status. Detailed low-level counters are available through metrics.
@@ -3573,6 +3818,2036 @@ components:
         transformed:
           type: integer
           description: Number of documents successfully transformed
+    RowPrimarySelector:
+      type: object
+      additionalProperties: true
+      description: |
+        Structured primary-key identity. Keys are the declared
+        `primary_key.columns`; values are JSON scalar values coerced with the
+        table's relational column types.
+      example:
+        tenant_id: "t1"
+        order_id: "o9"
+    RowUniqueSelector:
+      type: object
+      additionalProperties: false
+      description: |
+        Structured unique-key selector. The server encodes `values` with the
+        same relational tuple encoder used by storage, routes to the durable
+        unique-owner range, and reads the owner row to resolve the physical row
+        identity. This is a point lookup, not a query scan. The selector object
+        is exact: only `name` and `values` are accepted.
+      properties:
+        name:
+          type: string
+          description: Unique constraint name.
+        values:
+          type: object
+          additionalProperties: true
+          description: Values for the declared unique-constraint columns.
+      required:
+        - name
+        - values
+    RowSelector:
+      type: object
+      additionalProperties: false
+      description: |
+        Structured row selector. `primary` addresses declared primary-key
+        tables directly. `unique` addresses a declared unique constraint through
+        durable unique-owner rows. The selector is exact and accepts exactly one
+        of `primary` or `unique`.
+      properties:
+        primary:
+          $ref: "#/components/schemas/RowPrimarySelector"
+        unique:
+          $ref: "#/components/schemas/RowUniqueSelector"
+      oneOf:
+        - required:
+            - primary
+        - required:
+            - unique
+    RowsRowDocument:
+      type: object
+      additionalProperties: true
+      description: |
+        Full relational row document. Keys are declared relational columns and
+        values are JSON values coerced through the table schema before storage.
+    RowsFieldPatch:
+      type: object
+      additionalProperties: true
+      description: |
+        Static field patch for top-level relational columns. Primary-key fields
+        are rejected by the server.
+    RowsNumericIncrement:
+      type: object
+      description: Numeric increment map keyed by declared numeric columns.
+      additionalProperties:
+        type: number
+        format: double
+    RowsExpressionAssignmentMap:
+      type: object
+      description: Field-to-expression assignment map over the shared row-expression AST.
+      additionalProperties:
+        $ref: "#/components/schemas/RowsExpression"
+    RowsJsonSetTransform:
+      type: object
+      additionalProperties: false
+      description: JSON path assignment for a declared `json` column. Exactly one of `value` or `expr` must be supplied.
+      properties:
+        field:
+          type: string
+          description: Declared `json` column to update.
+        path:
+          type: array
+          minItems: 1
+          items:
+            type: string
+          description: Non-empty path under the JSON column.
+        value:
+          description: JSON value to write at the path.
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+          description: Expression value to evaluate at mutation time and write at the path.
+      required:
+        - field
+        - path
+    RowsArrayUpdateTransform:
+      type: object
+      additionalProperties: false
+      description: Array transform for a declared `array` column.
+      properties:
+        field:
+          type: string
+          description: Declared `array` column to update.
+        op:
+          type: string
+          enum:
+            - append
+            - remove
+            - add_to_set
+        value:
+          description: JSON value to append, remove, or add if absent.
+      required:
+        - field
+        - op
+        - value
+    RowsUniquePredicate:
+      type: object
+      additionalProperties: false
+      description: Predicate atom that must match a partial unique constraint definition.
+      properties:
+        field:
+          type: string
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - eq
+            - ne
+        value:
+          description: Predicate comparison value. Omit for null-test operators.
+      required:
+        - field
+        - op
+    RowsUniquePredicateGroup:
+      type: object
+      additionalProperties: false
+      description: Conjunction of partial-unique predicate atoms.
+      properties:
+        all:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsUniquePredicate"
+      required:
+        - all
+    RowsConflictUniqueTarget:
+      type: object
+      additionalProperties: false
+      description: Declared unique constraint target for `ON CONFLICT`.
+      properties:
+        name:
+          type: string
+          description: Unique constraint name.
+        where:
+          $ref: "#/components/schemas/RowsUniquePredicateGroup"
+        where_expressions:
+          type: array
+          description: |
+            Expression predicates for expression-partial unique conflict targets.
+            When present, the list must exactly match the named unique
+            constraint's stored expression predicate metadata.
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+      required:
+        - name
+    RowsConflictTarget:
+      type: object
+      additionalProperties: false
+      description: Primary-key or named unique constraint conflict target.
+      properties:
+        primary:
+          type: boolean
+          description: Set to `true` to target the declared primary key.
+        unique:
+          $ref: "#/components/schemas/RowsConflictUniqueTarget"
+      oneOf:
+        - required:
+            - primary
+        - required:
+            - unique
+    RowsOnConflict:
+      type: object
+      additionalProperties: false
+      description: |
+        Typed conflict action for insert operations. `nothing` skips the insert
+        when the target already exists. `update` applies the same typed update
+        operators as ordinary row updates, with expression sources allowed to
+        reference `existing` and `proposed` row images.
+      properties:
+        target:
+          $ref: "#/components/schemas/RowsConflictTarget"
+        action:
+          type: string
+          enum:
+            - update
+            - nothing
+        patch:
+          $ref: "#/components/schemas/RowsFieldPatch"
+        increment:
+          $ref: "#/components/schemas/RowsNumericIncrement"
+        patch_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+        increment_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+        json_set:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJsonSetTransform"
+        array_update:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsArrayUpdateTransform"
+        where_expression:
+          $ref: "#/components/schemas/RowsExpressionCondition"
+      required:
+        - target
+        - action
+    RowOperation:
+      type: object
+      additionalProperties: false
+      description: |
+        Structured relational row mutation. `insert` fails if the primary
+        identity already exists, `upsert` overwrites or creates, `update`
+        applies a non-upsert patch by primary or unique identity, and `delete`
+        removes by primary or unique identity. `update.patch` cannot change
+        primary-key components. Missing unique selectors fail the write request
+        rather than falling back to scans. The operation envelope is exact and
+        operation-specific: unsupported fields for the selected `op` fail
+        validation instead of being ignored.
+      properties:
+        op:
+          type: string
+          enum:
+            - insert
+            - upsert
+            - update
+            - delete
+        row:
+          $ref: "#/components/schemas/RowsRowDocument"
+          description: Full row document for insert/upsert. Must include primary-key columns.
+        where:
+          $ref: "#/components/schemas/RowSelector"
+        patch:
+          $ref: "#/components/schemas/RowsFieldPatch"
+          description: Top-level field patch for update operations.
+        increment:
+          $ref: "#/components/schemas/RowsNumericIncrement"
+        patch_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+        increment_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+        json_set:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJsonSetTransform"
+        array_update:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsArrayUpdateTransform"
+        on_conflict:
+          $ref: "#/components/schemas/RowsOnConflict"
+        returning:
+          type: array
+          items:
+            type: string
+          description: Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections.
+        returning_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionProjection"
+          description: Typed row-expression projections from the committed mutation image.
+        expected_version:
+          type: integer
+          format: int64
+          minimum: 0
+          description: Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+      required:
+        - op
+    RowsBatchRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        operations:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowOperation"
+        sync_level:
+          $ref: "#/components/schemas/SyncLevel"
+      required:
+        - operations
+    RowsMutationSourceRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Typed relational mutation-source plan. The `source` is a lockable base
+        row-query request with `row_claim.transaction_id` and no
+        `source_cte` or `doc_key_range`; update/delete intents are staged into
+        that transaction using committed-version predicates from the selected
+        preimages. Claims over physical ranges, CTEs, joins, aggregates,
+        windows, and lateral outputs are rejected until those stages expose an
+        explicit lockable base-row contract.
+      properties:
+        op:
+          type: string
+          enum:
+            - update
+            - delete
+        source:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        patch:
+          $ref: "#/components/schemas/RowsFieldPatch"
+          description: Top-level static field patch for update operations.
+        increment:
+          $ref: "#/components/schemas/RowsNumericIncrement"
+          description: Numeric increments for update operations.
+        patch_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+          description: Field-to-expression assignments evaluated over the selected row image.
+        increment_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+          description: Field-to-expression numeric deltas evaluated over the selected row image.
+        json_set:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJsonSetTransform"
+          description: JSON path transforms for update operations.
+        array_update:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsArrayUpdateTransform"
+          description: Array transforms for update operations.
+        temporal_portion:
+          $ref: "#/components/schemas/RowsTemporalPortion"
+          description: Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans.
+        returning:
+          type: array
+          items:
+            type: string
+          description: Fields to return from the final update image or deleted row image. `*` returns the full row.
+        returning_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionProjection"
+          description: Typed row-expression projections over the final update image or deleted row image.
+      required:
+        - op
+        - source
+    RowsTemporalPortion:
+      type: object
+      additionalProperties: false
+      description: Application-time temporal slice for update/delete mutation-source plans.
+      properties:
+        period:
+          type: string
+          minLength: 1
+          description: Period name declared on the relational table schema.
+        from:
+          description: Inclusive lower bound encoded as the period start column's JSON type.
+        to:
+          description: Exclusive upper bound encoded as the period end column's JSON type.
+      required:
+        - period
+        - from
+        - to
+    RowsInsertSourceAssignment:
+      type: object
+      additionalProperties: false
+      description: Target-column assignment for a typed insert-source plan.
+      properties:
+        target_field:
+          type: string
+          description: Declared target-table relational field to populate.
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+          description: Typed expression evaluated over each source row. A field expression copies a source field; operator expressions build generated insert values without carrying SQL text.
+      required:
+        - target_field
+        - expr
+    RowsInsertSourceRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Typed relational insert-source plan. The `source` is a read-only row
+        query over `source_table` or, when omitted, the target table named in the
+        path. Each selected source row is projected through `assignments` into a
+        target insert row, then optional conflict handling and `RETURNING`
+        projection run through the same row-batch semantics as ordinary
+        inserts. Execution is fail-closed until the storage/runtime layer
+        implements source-to-target routing, duplicate-target detection, and
+        owner-local insert staging for this native plan.
+      properties:
+        op:
+          type: string
+          enum:
+            - insert
+        source_table:
+          type: string
+          description: Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support.
+        source:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        assignments:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsInsertSourceAssignment"
+          description: Ordered target-field assignments used to build each proposed insert row from the source row.
+        on_conflict:
+          $ref: "#/components/schemas/RowsOnConflict"
+        returning:
+          type: array
+          items:
+            type: string
+          description: Fields to return from the committed inserted or conflict-updated row image. `*` returns the full row.
+        returning_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionProjection"
+          description: Typed row-expression projections over the committed inserted or conflict-updated row image.
+      required:
+        - op
+        - source
+        - assignments
+    RowsJoinedMutationSourceAssignment:
+      type: object
+      additionalProperties: false
+      description: Source-side assignment for joined mutation-source updates.
+      properties:
+        target_field:
+          type: string
+          description: Declared target-side relational field to assign.
+        side:
+          type: string
+          enum:
+            - left
+            - right
+          description: Join side that supplies the source field. Must be the non-target side.
+        field:
+          type: string
+          description: Declared relational field to copy from the source side.
+      required:
+        - target_field
+        - side
+        - field
+    RowsJoinedMutationSourceRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Typed relational joined mutation-source plan. The target side of the
+        `join` must carry a lockable `row_claim.transaction_id`; the non-target
+        side is read-only input. Update plans can copy same-typed values from
+        the source side through `source_assignments` and can apply target-local
+        patches or expression assignments. Delete plans reject update
+        assignments. Execution must stage intents only for claimed target rows.
+      properties:
+        op:
+          type: string
+          enum:
+            - update
+            - delete
+        source_table:
+          type: string
+          description: Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges.
+        target_side:
+          type: string
+          enum:
+            - left
+            - right
+        join:
+          $ref: "#/components/schemas/RowsJoinRequest"
+        match_expression_where:
+          type: array
+          description: "Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row."
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+        match_expression_any:
+          type: array
+          description: OR groups of post-match computed predicates over the target row and joined source row.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        match_expression_not:
+          type: array
+          description: NOT groups of post-match computed predicates over the target row and joined source row.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        match_expression_array_contains:
+          type: array
+          description: Post-match computed array-containment predicates over the target row and joined source row.
+          items:
+            $ref: "#/components/schemas/RowsExpressionArrayContainsPredicate"
+        source_assignments:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJoinedMutationSourceAssignment"
+          description: Source-side assignments that copy values from the read-only joined source side into the claimed target side.
+        patch:
+          $ref: "#/components/schemas/RowsFieldPatch"
+          description: Target-local static field patch for update operations.
+        increment:
+          $ref: "#/components/schemas/RowsNumericIncrement"
+          description: Target-local numeric increments for update operations.
+        patch_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+          description: Target-local field-to-expression assignments evaluated over the target row image.
+        increment_expr:
+          $ref: "#/components/schemas/RowsExpressionAssignmentMap"
+          description: Target-local field-to-expression numeric deltas evaluated over the target row image.
+        returning:
+          type: array
+          items:
+            type: string
+          description: Fields to return from the final target update image or deleted target row image. `*` returns the full row.
+        returning_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionProjection"
+          description: Typed row-expression projections over the final target update image or deleted target row image.
+      required:
+        - op
+        - target_side
+        - join
+    RowsMutationSourceResultSet:
+      type: object
+      properties:
+        matched:
+          type: integer
+          format: int64
+          description: Number of source rows that matched before lock/limit selection.
+        staged:
+          type: integer
+          format: int64
+          description: Number of rows staged into the claimed transaction.
+        returning:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+          description: Optional returning rows from the staged mutation.
+    RowsGetRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        keys:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowSelector"
+        include_physical_key:
+          type: boolean
+          default: false
+          description: Include the diagnostic storage-owned physical key in each result.
+      required:
+        - keys
+    RowsGetResult:
+      type: object
+      properties:
+        identity:
+          $ref: "#/components/schemas/RowSelector"
+        found:
+          type: boolean
+        row:
+          type: object
+          additionalProperties: true
+        version:
+          type: integer
+          format: uint64
+        physical_key:
+          type: string
+          nullable: true
+          description: Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity.
+    RowsGetResultSet:
+      type: object
+      properties:
+        rows:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsGetResult"
+    RowsQueryOrder:
+      description: Ordered row-stream key. Exactly one of `field` or `expr` is required. `field` names an output/base field; `expr` carries a typed row-expression AST for computed ordering.
+      oneOf:
+        - $ref: "#/components/schemas/RowsQueryOrderField"
+        - $ref: "#/components/schemas/RowsQueryOrderExpression"
+    RowsQueryOrderField:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Output/base field to order by. Mutually exclusive with `expr`.
+        null_test:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+    RowsQueryOrderExpression:
+      type: object
+      additionalProperties: false
+      required:
+        - expr
+      properties:
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+          description: Typed row-expression AST for computed ordering. Mutually exclusive with `field`.
+        null_test:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+        direction:
+          type: string
+          enum:
+            - asc
+            - desc
+    RowsRowClaim:
+      type: object
+      additionalProperties: false
+      description: |
+        Lockable base-row claim metadata. Public row-plan endpoints reject this
+        field; it is only accepted by `rows/mutation-source` lockable base-row
+        sources and internal/coordinator execution paths. `transaction_id` is
+        the canonical field name.
+      properties:
+        mode:
+          type: string
+          enum:
+            - for_update
+            - for_no_key_update
+          default: for_update
+        wait_policy:
+          type: string
+          enum:
+            - wait
+            - nowait
+            - skip_locked
+          default: wait
+        skip_locked:
+          type: boolean
+          default: false
+          deprecated: true
+        lease_ms:
+          type: integer
+          format: int64
+          minimum: 0
+          default: 30000
+        owner_id:
+          type: string
+        transaction_id:
+          type: string
+          pattern: "^[0-9a-fA-F]{32}$"
+          description: Canonical 16-byte transaction id encoded as 32 hex characters.
+    RowsDocKeyRange:
+      type: object
+      additionalProperties: false
+      description: |
+        Physical row-key range selector used by routed typed row plans after
+        durable range ownership is known. At least one of `start` or `end` must be present,
+        and a bounded range must have `start < end`.
+      anyOf:
+        - required:
+            - start
+        - required:
+            - end
+      properties:
+        start:
+          type: string
+          description: Inclusive physical row-key lower bound.
+        end:
+          type: string
+          description: Exclusive physical row-key upper bound.
+    RowsExpression:
+      description: |
+        Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`,
+        `{ "value": ... }`, or an operator node such as
+        `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported
+        operators are the shared row-local expression surface used by schema
+        predicates, mutation expressions, query projections, filters, grouping,
+        ordering, and SQL lowering.
+        Mutation expressions may set `source` to `existing` or `proposed`; query
+        expressions use the default row source.
+      oneOf:
+        - $ref: "#/components/schemas/RowsExpressionField"
+        - $ref: "#/components/schemas/RowsExpressionValue"
+        - $ref: "#/components/schemas/RowsExpressionOperator"
+    RowsExpressionField:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+      properties:
+        field:
+          type: string
+          minLength: 1
+        source:
+          type: string
+          enum:
+            - row
+            - existing
+            - proposed
+            - source
+    RowsExpressionValue:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+      properties:
+        value:
+          description: Literal JSON value for a value node.
+    RowsExpressionOperator:
+      type: object
+      additionalProperties: false
+      required:
+        - op
+      properties:
+        op:
+          type: string
+          enum:
+            - now
+            - coalesce
+            - lower
+            - upper
+            - trim
+            - btrim
+            - ltrim
+            - rtrim
+            - replace
+            - translate
+            - substring
+            - substr
+            - overlay
+            - split_part
+            - strpos
+            - left
+            - right
+            - lpad
+            - rpad
+            - repeat
+            - reverse
+            - starts_with
+            - ends_with
+            - ascii
+            - chr
+            - md5
+            - like
+            - ilike
+            - bool_and
+            - and
+            - bool_or
+            - or
+            - bool_not
+            - not
+            - concat
+            - concat_ws
+            - length
+            - char_length
+            - character_length
+            - octet_length
+            - nullif
+            - greatest
+            - least
+            - abs
+            - round
+            - trunc
+            - floor
+            - ceil
+            - sqrt
+            - sign
+            - power
+            - add
+            - sub
+            - mul
+            - div
+            - mod
+            - interval_ns
+            - interval_months
+            - date_trunc
+            - date_bin
+            - date_part
+            - extract
+            - cast
+            - json_extract
+            - json_extract_path
+            - json_extract_path_text
+            - jsonb_extract_path
+            - jsonb_extract_path_text
+            - json_typeof
+            - jsonb_typeof
+            - json_array_length
+            - jsonb_array_length
+            - array_length
+            - cardinality
+            - array_position
+            - array_positions
+            - array_append
+            - array_prepend
+            - array_cat
+            - array_remove
+            - array_replace
+            - array_to_string
+            - string_to_array
+            - uuid_v4
+            - gen_random_uuid
+            - uuid_generate_v4
+            - json_build_object
+            - jsonb_build_object
+            - to_jsonb
+            - json_path_exists
+            - regexp_replace
+            - case
+        args:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpression"
+          description: Operand expressions for operator nodes.
+        to:
+          type: string
+          enum:
+            - text
+            - numeric
+            - bool
+            - boolean
+            - datetime
+          description: Cast target for `cast`.
+        path:
+          description: Structured JSON path for `json_extract` and `json_path_exists`.
+        as_text:
+          type: boolean
+          description: Return JSON path extraction as text.
+        cases:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionCaseBranch"
+          description: Searched case branches, each with `when` and `then`.
+        else:
+          x-go-type-skip-optional-pointer: false
+          allOf:
+            - $ref: "#/components/schemas/RowsExpression"
+          description: Fallback expression for searched `case`.
+    RowsExpressionCaseBranch:
+      type: object
+      additionalProperties: false
+      properties:
+        when:
+          $ref: "#/components/schemas/RowsExpressionCondition"
+        then:
+          $ref: "#/components/schemas/RowsExpression"
+      required:
+        - when
+        - then
+    RowsExpressionCondition:
+      type: object
+      additionalProperties: false
+      description: Computed expression predicate over the shared row-expression AST.
+      properties:
+        lhs:
+          $ref: "#/components/schemas/RowsExpression"
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+        rhs:
+          $ref: "#/components/schemas/RowsExpression"
+      required:
+        - lhs
+        - op
+    RowsExpressionConditionGroup:
+      type: object
+      additionalProperties: false
+      properties:
+        all:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+      required:
+        - all
+    RowsExpressionArrayContainsPredicate:
+      type: object
+      additionalProperties: false
+      properties:
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+        value:
+          type: array
+          items: {}
+      required:
+        - expr
+        - value
+    RowsExpressionProjection:
+      type: object
+      additionalProperties: false
+      properties:
+        as:
+          type: string
+          minLength: 1
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+      required:
+        - as
+        - expr
+    RowsJsonExtractProjection:
+      type: object
+      additionalProperties: false
+      description: Compact JSON path projection over a declared `json` column.
+      properties:
+        as:
+          type: string
+          minLength: 1
+          description: Output field name.
+        field:
+          type: string
+          minLength: 1
+          description: Declared `json` column to read.
+        path:
+          description: Non-empty JSON path, encoded as a dot path string or array of path components.
+        as_text:
+          type: boolean
+          default: false
+          description: Return the extracted value as text, matching SQL `->>` behavior.
+      required:
+        - as
+        - field
+        - path
+    RowsArrayLengthProjection:
+      type: object
+      additionalProperties: false
+      description: Compact array-length projection over a declared `array` column.
+      properties:
+        as:
+          type: string
+          minLength: 1
+          description: Output field name.
+        field:
+          type: string
+          minLength: 1
+          description: Declared `array` column to measure.
+      required:
+        - as
+        - field
+    RowsCoalesceOperand:
+      description: Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
+      oneOf:
+        - $ref: "#/components/schemas/RowsCoalesceFieldOperand"
+        - $ref: "#/components/schemas/RowsCoalesceValueOperand"
+    RowsCoalesceFieldOperand:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Declared column to read.
+    RowsCoalesceValueOperand:
+      type: object
+      additionalProperties: false
+      required:
+        - value
+      properties:
+        value:
+          description: Literal JSON fallback value.
+    RowsCoalesceProjection:
+      type: object
+      additionalProperties: false
+      description: Compact COALESCE projection.
+      properties:
+        as:
+          type: string
+          minLength: 1
+          description: Output field name.
+        operands:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsCoalesceOperand"
+      required:
+        - as
+        - operands
+    RowsFieldAliasProjection:
+      type: object
+      additionalProperties: false
+      description: Compact field alias projection over a declared column.
+      properties:
+        as:
+          type: string
+          minLength: 1
+          description: Output field name.
+        field:
+          type: string
+          minLength: 1
+          description: Declared column to project.
+      required:
+        - as
+        - field
+    RowsWhereAtom:
+      type: object
+      additionalProperties: false
+      description: |
+        Typed scalar, array, JSON, or text-pattern row predicate atom over a
+        declared relational column. Null-test operators omit `value`; value
+        operators carry one JSON value; `in` and `not_in` carry an array value;
+        JSON path operators carry `path`; text-pattern operators carry
+        `pattern` and optional flags. The server validates column type and
+        operator-specific fields against the table schema.
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Declared relational column.
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+            - array_any
+            - array_contains
+            - array_eq
+            - in
+            - not_in
+            - json_contains
+            - json_path_eq
+            - json_path_exists
+            - text_pattern
+        value:
+          description: JSON comparison value or array operand for operators that require one.
+        path:
+          description: Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+        pattern:
+          type: string
+          description: SQL LIKE pattern for `text_pattern`.
+        case_insensitive:
+          type: boolean
+          default: false
+          description: ASCII case-insensitive matching for `text_pattern`.
+        negated:
+          type: boolean
+          default: false
+          description: Negates `text_pattern`.
+      required:
+        - field
+        - op
+    RowsWhereBranch:
+      description: Predicate branch used by `where.any` and `where.not`; exactly one typed atom or an `all`-only conjunction of typed atoms.
+      oneOf:
+        - $ref: "#/components/schemas/RowsWhereBranchAtom"
+        - $ref: "#/components/schemas/RowsWhereBranchAll"
+    RowsWhereBranchAtom:
+      type: object
+      additionalProperties: false
+      required:
+        - field
+        - op
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Declared relational column for a single-atom branch.
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+            - array_any
+            - array_contains
+            - array_eq
+            - in
+            - not_in
+            - json_contains
+            - json_path_eq
+            - json_path_exists
+            - text_pattern
+        value:
+          description: JSON comparison value or array operand for operators that require one.
+        path:
+          description: Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+        pattern:
+          type: string
+          description: SQL LIKE pattern for `text_pattern`.
+        case_insensitive:
+          type: boolean
+          default: false
+          description: ASCII case-insensitive matching for `text_pattern`.
+        negated:
+          type: boolean
+          default: false
+          description: Negates `text_pattern`.
+    RowsWhereBranchAll:
+      type: object
+      additionalProperties: false
+      required:
+        - all
+      properties:
+        all:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: Conjunction of typed atoms for this branch.
+    RowsWhere:
+      description: |
+        Canonical row predicate tree. A top-level `where` is one predicate
+        atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an
+        `all` conjunction plus branch groups. Branches may contain scalar,
+        membership, array, JSON, and text-pattern atoms; the server stores
+        branches containing structured atoms in native mixed access predicate
+        groups and keeps scalar-only branches in scalar predicate groups.
+      oneOf:
+        - type: object
+          additionalProperties: false
+          required:
+            - field
+            - op
+          not:
+            anyOf:
+              - required: [all]
+              - required: [any]
+              - required: [not]
+          properties:
+            field:
+              type: string
+              minLength: 1
+              description: Declared relational column for a single top-level atom.
+            op:
+              type: string
+              enum:
+                - is_null
+                - is_not_null
+                - is_distinct
+                - is_not_distinct
+                - eq
+                - ne
+                - gt
+                - gte
+                - lt
+                - lte
+                - array_any
+                - array_contains
+                - array_eq
+                - in
+                - not_in
+                - json_contains
+                - json_path_eq
+                - json_path_exists
+                - text_pattern
+            value:
+              description: JSON comparison value or array operand for operators that require one.
+            path:
+              description: Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+            pattern:
+              type: string
+              description: SQL LIKE pattern for `text_pattern`.
+            case_insensitive:
+              type: boolean
+              default: false
+              description: ASCII case-insensitive matching for `text_pattern`.
+            negated:
+              type: boolean
+              default: false
+              description: Negates `text_pattern`.
+        - type: object
+          additionalProperties: false
+          anyOf:
+            - required: [all]
+            - required: [any]
+            - required: [not]
+          not:
+            anyOf:
+              - required: [field]
+              - required: [op]
+              - required: [value]
+              - required: [path]
+              - required: [pattern]
+              - required: [case_insensitive]
+              - required: [negated]
+          properties:
+            all:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/RowsWhereAtom"
+            any:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/RowsWhereBranch"
+            not:
+              type: array
+              minItems: 1
+              items:
+                $ref: "#/components/schemas/RowsWhereBranch"
+    RowsQueryRequest:
+      type: object
+      additionalProperties: false
+      description: |
+        Typed relational row-query plan. Predicate and expression arrays carry
+        Antfly row-expression AST nodes; SQL syntax is adapter sugar over this
+        native request shape.
+      properties:
+        source_cte:
+          type: string
+          description: Optional ordered CTE name to read instead of the base table.
+        where:
+          $ref: "#/components/schemas/RowsWhere"
+          description: Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
+        expression_where:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+          description: All computed expression predicates that must pass.
+        expression_any:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+          description: OR groups of computed expression predicates.
+        expression_not:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+          description: NOT groups of computed expression predicates.
+        expression_array_contains:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionArrayContainsPredicate"
+          description: Computed array-containment predicates.
+        select:
+          type: array
+          items:
+            type: string
+        json_extract:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJsonExtractProjection"
+        array_length:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsArrayLengthProjection"
+        coalesce:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsCoalesceProjection"
+        field_aliases:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsFieldAliasProjection"
+        expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionProjection"
+          description: Typed row-expression projections.
+        distinct_on:
+          type: array
+          items:
+            type: string
+          description: Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`.
+        distinct_on_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpression"
+          description: Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match.
+        order_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+        row_claim:
+          $ref: "#/components/schemas/RowsRowClaim"
+        doc_key_range:
+          $ref: "#/components/schemas/RowsDocKeyRange"
+    RowsCte:
+      type: object
+      additionalProperties: false
+      description: Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce more rows or serialized row bytes than declared.
+      properties:
+        name:
+          type: string
+        max_rows:
+          type: integer
+          format: int64
+          minimum: 0
+        max_bytes:
+          type: integer
+          format: int64
+          minimum: 0
+        query:
+          $ref: "#/components/schemas/RowsQueryRequest"
+      required:
+        - name
+        - query
+    RowsAggregateSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        name:
+          type: string
+          minLength: 1
+        op:
+          type: string
+          enum:
+            - count
+            - sum
+            - min
+            - max
+            - avg
+            - array_agg
+            - string_agg
+            - percentile_cont
+            - percentile_disc
+            - mode
+            - bool_or
+            - bool_and
+        field:
+          type: string
+          minLength: 1
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+        distinct:
+          type: boolean
+        distinct_max_items:
+          type: integer
+          format: int64
+          minimum: 1
+        percentile:
+          type: number
+          format: double
+          minimum: 0
+          maximum: 1
+          description: Fraction for percentile_cont and percentile_disc aggregate specs.
+        percentiles:
+          type: array
+          minItems: 1
+          items:
+            type: number
+            format: double
+            minimum: 0
+            maximum: 1
+          description: Fractions for array-valued percentile_cont and percentile_disc aggregate specs.
+        percentile_max_items:
+          type: integer
+          format: int64
+          minimum: 1
+          description: Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+        percentile_order:
+          type: string
+          enum:
+            - asc
+            - desc
+          description: Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
+        array_max_items:
+          type: integer
+          format: int64
+          minimum: 1
+        array_order_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        delimiter:
+          type: string
+          description: Delimiter for string_agg aggregate specs.
+        filter:
+          $ref: "#/components/schemas/RowsWhere"
+        filter_array_any:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`."
+        filter_array_contains:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive declared-array containment filters for this aggregate. Each item must use `op: array_contains`."
+        filter_array_eq:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive declared-array equality filters for this aggregate. Each item must use `op: array_eq`."
+        filter_in:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive scalar membership filters for this aggregate. Each item must use `op: in` or `op: not_in`."
+        filter_json_contains:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive declared-JSON containment filters for this aggregate. Each item must use `op: json_contains`."
+        filter_json_path_eq:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive declared-JSON path equality filters for this aggregate. Each item must use `op: json_path_eq`."
+        filter_json_path_exists:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive declared-JSON path-existence filters for this aggregate. Each item must use `op: json_path_exists`."
+        filter_text_patterns:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsWhereAtom"
+          description: "Conjunctive text-pattern filters for this aggregate. Each item must use `op: text_pattern`."
+        filter_expressions:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+        filter_expression_array_contains:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsExpressionArrayContainsPredicate"
+          description: Conjunctive computed array-containment filters for this aggregate.
+        filter_any:
+          type: array
+          minItems: 1
+          description: Disjunction of input-row expression predicate groups for this aggregate. Each group is a conjunction; the aggregate consumes a row when at least one group matches.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        filter_not:
+          type: array
+          minItems: 1
+          description: Negated input-row expression predicate groups for this aggregate. The aggregate skips a row when any group matches.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+      required:
+        - name
+        - op
+    RowsAggregateHavingPredicate:
+      type: object
+      additionalProperties: false
+      description: Predicate over emitted aggregate output fields, evaluated after grouping.
+      properties:
+        field:
+          type: string
+          minLength: 1
+          description: Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias.
+        op:
+          type: string
+          enum:
+            - is_null
+            - is_not_null
+            - is_distinct
+            - is_not_distinct
+            - eq
+            - ne
+            - gt
+            - gte
+            - lt
+            - lte
+        value:
+          description: Comparison value. Omit for `is_null` and `is_not_null`.
+      required:
+        - field
+        - op
+    RowsAggregateHaving:
+      type: object
+      additionalProperties: false
+      description: Conjunction of emitted aggregate-output predicates for HAVING.
+      properties:
+        all:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsAggregateHavingPredicate"
+      required:
+        - all
+    RowsAggregateRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        group_by:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        group_expressions:
+          type: array
+          description: Named expression group keys. These are evaluated for each source row, included in the grouping key, and emitted under their `as` names in aggregate result rows.
+          items:
+            $ref: "#/components/schemas/RowsExpressionProjection"
+        aggregations:
+          type: array
+          description: Metric specs to compute for each group. May be empty or omitted only when group_by or group_expressions is non-empty, which returns one row per distinct group key.
+          items:
+            $ref: "#/components/schemas/RowsAggregateSpec"
+        having:
+          $ref: "#/components/schemas/RowsAggregateHaving"
+        having_expressions:
+          type: array
+          description: Expression predicates over aggregate output fields, evaluated after grouping. Field references bind to group keys or aggregation names.
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+        having_any:
+          type: array
+          minItems: 1
+          description: Disjunction of aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row passes when at least one group matches.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        having_not:
+          type: array
+          minItems: 1
+          description: Negated aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row is rejected when any group matches.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        order_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - source
+    RowsWindowFrame:
+      type: object
+      additionalProperties: false
+      properties:
+        unit:
+          type: string
+          enum:
+            - rows
+            - range
+        start:
+          type: string
+          enum:
+            - unbounded_preceding
+            - offset_preceding
+            - current_row
+            - offset_following
+        start_offset:
+          type: integer
+          format: int64
+          minimum: 0
+        end:
+          type: string
+          enum:
+            - offset_preceding
+            - current_row
+            - offset_following
+            - unbounded_following
+        end_offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - unit
+        - start
+        - end
+    RowsWindowSpec:
+      type: object
+      additionalProperties: false
+      properties:
+        as:
+          type: string
+        function:
+          type: string
+          description: Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and `max`.
+        partition_by:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        order_by:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        expr:
+          $ref: "#/components/schemas/RowsExpression"
+        offset:
+          type: integer
+          format: int64
+          minimum: 1
+        default:
+          nullable: true
+        frame:
+          $ref: "#/components/schemas/RowsWindowFrame"
+      required:
+        - as
+        - function
+        - order_by
+    RowsWindowRequest:
+      type: object
+      additionalProperties: false
+      properties:
+        source:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        windows:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsWindowSpec"
+        select:
+          type: array
+          items:
+            type: string
+            minLength: 1
+        order_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - source
+        - windows
+    RowsJoinOn:
+      type: object
+      additionalProperties: false
+      properties:
+        left_field:
+          type: string
+          minLength: 1
+        right_field:
+          type: string
+          minLength: 1
+      required:
+        - left_field
+        - right_field
+    RowsJoinProjection:
+      type: object
+      additionalProperties: false
+      properties:
+        as:
+          type: string
+          minLength: 1
+        side:
+          type: string
+          enum:
+            - left
+            - right
+        field:
+          type: string
+          minLength: 1
+      required:
+        - as
+        - side
+        - field
+    RowsJoinStrategy:
+      type: string
+      description: Physical join strategy requested by the typed plan. `auto` lets Antfly choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the leading join keys.
+      enum:
+        - auto
+        - lookup
+        - hash
+        - merge
+    RowsJoinStrategySelection:
+      type: object
+      additionalProperties: false
+      description: Join strategy admission metadata returned by native join execution.
+      properties:
+        requested:
+          $ref: "#/components/schemas/RowsJoinStrategy"
+        selected:
+          $ref: "#/components/schemas/RowsJoinStrategy"
+      required:
+        - requested
+        - selected
+    RowsJoinRequest:
+      type: object
+      additionalProperties: false
+      description: Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`.
+      properties:
+        left:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        right:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        "on":
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsJoinOn"
+        match_expression_where:
+          type: array
+          description: "Post-match computed predicates over the joined rows. Unqualified fields bind to the left row; fields with `source: source` bind to the right row."
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+        match_expression_any:
+          type: array
+          description: OR groups of post-match computed predicates over the joined rows.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        match_expression_not:
+          type: array
+          description: NOT groups of post-match computed predicates over the joined rows.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        match_expression_array_contains:
+          type: array
+          description: Post-match computed array-containment predicates over the joined rows.
+          items:
+            $ref: "#/components/schemas/RowsExpressionArrayContainsPredicate"
+        join_type:
+          type: string
+          enum:
+            - inner
+            - left
+        strategy:
+          $ref: "#/components/schemas/RowsJoinStrategy"
+        select:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJoinProjection"
+        order_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - left
+        - right
+        - "on"
+    RowsLateralCorrelation:
+      type: object
+      additionalProperties: false
+      properties:
+        left_field:
+          type: string
+          minLength: 1
+        right_field:
+          type: string
+          minLength: 1
+      required:
+        - left_field
+        - right_field
+    RowsLateralRequest:
+      type: object
+      additionalProperties: false
+      description: Typed bounded lateral plan. The right side must include a limit and can read an ordered CTE through `source_cte`.
+      properties:
+        left:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        right:
+          $ref: "#/components/schemas/RowsQueryRequest"
+        correlations:
+          type: array
+          minItems: 1
+          items:
+            $ref: "#/components/schemas/RowsLateralCorrelation"
+        match_expression_where:
+          type: array
+          description: "Post-match computed predicates over the left row and each bounded right row. Unqualified fields bind to the left row; fields with `source: source` bind to the right row."
+          items:
+            $ref: "#/components/schemas/RowsExpressionCondition"
+        match_expression_any:
+          type: array
+          description: OR groups of post-match computed predicates over the left row and each bounded right row.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        match_expression_not:
+          type: array
+          description: NOT groups of post-match computed predicates over the left row and each bounded right row.
+          items:
+            $ref: "#/components/schemas/RowsExpressionConditionGroup"
+        match_expression_array_contains:
+          type: array
+          description: Post-match computed array-containment predicates over the left row and each bounded right row.
+          items:
+            $ref: "#/components/schemas/RowsExpressionArrayContainsPredicate"
+        select:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsJoinProjection"
+        order_by:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsQueryOrder"
+        limit:
+          type: integer
+          format: int64
+          minimum: 0
+        offset:
+          type: integer
+          format: int64
+          minimum: 0
+      required:
+        - left
+        - right
+        - correlations
+    RowsPlanRequest:
+      description: |
+        Generic typed relational row plan envelope. It is exactly one
+        operation-specific envelope: query, aggregate, window, join, or
+        lateral. Query, aggregate, and window plans use `ranges`; join and
+        lateral plans use paired `left_ranges` and `right_ranges`.
+      oneOf:
+        - $ref: "#/components/schemas/RowsQueryPlanRequest"
+        - $ref: "#/components/schemas/RowsAggregatePlanRequest"
+        - $ref: "#/components/schemas/RowsWindowPlanRequest"
+        - $ref: "#/components/schemas/RowsJoinPlanRequest"
+        - $ref: "#/components/schemas/RowsLateralPlanRequest"
+    RowsQueryPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsCte"
+        ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        query:
+          $ref: "#/components/schemas/RowsQueryRequest"
+      required:
+        - query
+    RowsAggregatePlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsCte"
+        ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        aggregate:
+          $ref: "#/components/schemas/RowsAggregateRequest"
+      required:
+        - aggregate
+    RowsWindowPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes` and declared `ranges`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsCte"
+        ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        window:
+          $ref: "#/components/schemas/RowsWindowRequest"
+      required:
+        - window
+    RowsJoinPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsCte"
+        left_table:
+          type: string
+          description: Optional source table for the left side. Omitted or empty uses the endpoint table.
+        right_table:
+          type: string
+          description: Optional source table for the right side. Omitted or empty uses the endpoint table.
+        left_ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        right_ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        join:
+          $ref: "#/components/schemas/RowsJoinRequest"
+      required:
+        - join
+    RowsLateralPlanRequest:
+      type: object
+      additionalProperties: false
+      description: Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
+      properties:
+        ctes:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsCte"
+        left_table:
+          type: string
+          description: Optional source table for the left side. Omitted or empty uses the endpoint table.
+        right_table:
+          type: string
+          description: Optional source table for the right side. Omitted or empty uses the endpoint table.
+        left_ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        right_ranges:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsDocKeyRange"
+        lateral:
+          $ref: "#/components/schemas/RowsLateralRequest"
+      required:
+        - lateral
+    RowsResultColumn:
+      type: object
+      additionalProperties: false
+      description: Typed column metadata emitted by a native relational read plan.
+      properties:
+        name:
+          type: string
+          description: Unique public result-object field name.
+        display_name:
+          type: string
+          nullable: true
+          description: Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key.
+        path:
+          type: string
+          description: Source path represented by this result field.
+        type:
+          type: string
+          description: Antfly scalar/container type for the result field.
+        array_item_type:
+          type: string
+          nullable: true
+          description: Item type when `type` is `array`.
+        collation:
+          type: string
+          nullable: true
+          description: Optional source collation metadata for source-backed text or keyword result fields.
+        nullable:
+          type: boolean
+          description: Whether the result field may be null.
+      required:
+        - name
+        - path
+        - type
+        - nullable
+    RowsQueryResultSet:
+      type: object
+      properties:
+        total:
+          type: integer
+          format: int64
+        result_schema:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsResultColumn"
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    RowsAggregateResultSet:
+      type: object
+      properties:
+        total_groups:
+          type: integer
+          format: int64
+        result_schema:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsResultColumn"
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
+    RowsStreamResultSet:
+      type: object
+      properties:
+        total_rows:
+          type: integer
+          format: int64
+        join_strategy:
+          $ref: "#/components/schemas/RowsJoinStrategySelection"
+        result_schema:
+          type: array
+          items:
+            $ref: "#/components/schemas/RowsResultColumn"
+        rows:
+          type: array
+          items:
+            type: object
+            additionalProperties: true
     MultiBatchRequest:
       type: object
       description: |
@@ -5431,6 +7706,12 @@ components:
               "field": "content"
             }
             ```
+        graph_metric_rerank:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricRerank"
+          description: |
+            Optional graph metric score feature to blend into ordinary search hit ranking.
+            The metric must have a published generation. With `metric_freshness: fresh`,
+            the request fails if graph writes have made the published generation stale.
         analyses:
           $ref: "#/components/schemas/Analyses"
         graph_searches:
@@ -5750,6 +8031,39 @@ components:
         merge:
           $ref: "#/components/schemas/MergeProfile"
           description: Result merge statistics (present for hybrid search).
+        graph_metrics:
+          type: array
+          items:
+            $ref: "#/components/schemas/GraphMetricProfile"
+          description: Graph metric freshness and generation details for metric-aware query work.
+    GraphMetricProfile:
+      type: object
+      required:
+        - query_name
+        - source
+        - index_name
+        - metric_name
+        - freshness
+        - status
+      properties:
+        query_name:
+          type: string
+          description: Name of the graph query or graph metric query that used the metric.
+        source:
+          type: string
+          description: Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+        index_name:
+          type: string
+          description: Graph index that owns the metric.
+        metric_name:
+          type: string
+          description: Graph metric name within the index.
+        freshness:
+          type: string
+          description: Effective freshness mode requested for this metric use.
+        status:
+          $ref: "indexes.yaml#/components/schemas/GraphMetricStatus"
+          description: Published generation and freshness status observed by the query.
     ShardsProfile:
       type: object
       description: Shard-level execution statistics.
@@ -5881,6 +8195,64 @@ components:
             type: number
             format: float
             x-go-type: float64
+    QueryScoreDetails:
+      type: object
+      description: Optional score provenance for ranking features that changed the final hit score.
+      properties:
+        graph_metric_rerank:
+          $ref: "#/components/schemas/GraphMetricRerankScoreDetails"
+          description: Score contribution from an explicit graph_metric_rerank request.
+    GraphMetricRerankScoreDetails:
+      type: object
+      required:
+        - index_name
+        - metric_name
+        - base_score
+        - base_weight
+        - metric_score_used
+        - metric_weight
+        - missing_score_used
+        - final_score
+        - published_generation
+      properties:
+        index_name:
+          type: string
+          description: Graph index that provided the metric score.
+        metric_name:
+          type: string
+          description: Graph metric used as a score feature.
+        base_score:
+          type: number
+          format: double
+          description: Hit score before graph metric rerank composition.
+        base_weight:
+          type: number
+          format: double
+          description: Weight applied to the base score.
+        metric_score:
+          type: number
+          format: double
+          nullable: true
+          description: Published metric score for this hit, or null when the hit was missing from the metric generation.
+        metric_score_used:
+          type: number
+          format: double
+          description: Metric feature value used in the formula after applying missing_score fallback if needed.
+        metric_weight:
+          type: number
+          format: double
+          description: Weight applied to the metric score feature.
+        missing_score_used:
+          type: boolean
+          description: True when metric_score was missing and the request's missing_score fallback was used.
+        final_score:
+          type: number
+          format: double
+          description: Final hit score after graph metric rerank composition.
+        published_generation:
+          type: integer
+          format: int64
+          description: Published graph metric score generation used for this hit.
     QueryHit:
       type: object
       description: A single query result hit
@@ -5903,6 +8275,10 @@ components:
           additionalProperties: true
           description: Scores partitioned by index when using RRF search.
           x-go-name: indexScores
+        _score_details:
+          $ref: "#/components/schemas/QueryScoreDetails"
+          description: Optional explain-style score provenance for score features applied to this hit.
+          x-go-name: scoreDetails
         _source:
           type: object
           additionalProperties: true # map[string]any for field values
@@ -6010,6 +8386,11 @@ components:
           additionalProperties:
             $ref: "indexes.yaml#/components/schemas/GraphQueryResult"
           description: Results from declarative graph queries.
+        graph_metric_results:
+          type: object
+          additionalProperties:
+            $ref: "indexes.yaml#/components/schemas/GraphMetricResult"
+          description: Results from direct graph metric reads.
         profile:
           x-go-type-skip-optional-pointer: false
           allOf:
@@ -6520,6 +8901,12 @@ components:
         application/json:
           schema:
             $ref: "#/components/schemas/Error"
+    Forbidden:
+      description: Forbidden
+      content:
+        application/json:
+          schema:
+            $ref: "#/components/schemas/Error"
     MethodNotAllowed:
       description: Method not allowed for this resource
       content:
@@ -6776,6 +9163,67 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "404":
           $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/indexes/{indexName}/graph-metrics/{metricName}/actions/{action}:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the graph index
+        schema:
+          type: string
+      - name: metricName
+        in: path
+        required: true
+        description: Name of the configured graph metric
+        schema:
+          type: string
+      - name: action
+        in: path
+        required: true
+        description: Operational action to apply to the graph metric materialization
+        schema:
+          type: string
+          enum:
+            - refresh
+            - rebuild
+            - delete
+            - pause
+            - resume
+    post:
+      summary: Execute a graph metric operational action
+      description: |
+        Refresh, rebuild, delete, pause, or resume maintenance for a configured
+        graph metric. The metric configuration remains owned by the graph index.
+        `delete` clears materialized metric state and maintenance controls; a
+        later refresh or rebuild can publish a new generation.
+      tags:
+        - index_management
+      operationId: executeGraphMetricAction
+      responses:
+        "200":
+          description: Updated graph metric status
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/GraphMetricActionResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "405":
+          description: Graph metric actions are unavailable for this runtime
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/Error"
         "500":
           $ref: "#/components/responses/InternalServerError"
   /transactions/commit:
@@ -7249,6 +9697,39 @@ paths:
           $ref: "#/components/responses/BadRequest"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /db/v1/sql:
+    post:
+      summary: Execute SQL text in a logical SQL session
+      tags:
+        - data_operations
+      description: |
+        Executes SQL through Antfly's psql-style HTTP ingress. The request is a
+        single synchronous statement and the response returns the logical
+        `session_id` that should be supplied on later requests when session
+        state such as prepared statements, LISTEN/NOTIFY subscriptions, or SQL
+        catalog defaults must be reused. Prepared statements and cursors are
+        SQL session state, not durable REST resources. Cursor-backed fetches and
+        asynchronous statement jobs are reserved for later extensions.
+      operationId: executeSql
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/SqlStatementRequest"
+      responses:
+        "200":
+          description: SQL statement result metadata
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/SqlStatementResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "408":
+          description: SQL statement timeout
+        "501":
+          description: SQL statement shape is not supported by the HTTP SQL ingress yet
   /query:
     post:
       summary: Perform a global query
@@ -7491,6 +9972,929 @@ paths:
             application/json:
               schema:
                 $ref: "#/components/schemas/Error"
+  /tablespaces:
+    get:
+      summary: List tablespaces
+      description: Lists tablespace catalog objects visible to the caller.
+      tags:
+        - table_management
+      operationId: listTablespaces
+      responses:
+        "200":
+          description: A list of tablespaces
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tablespaces/{tablespaceName}:
+    parameters:
+      - name: tablespaceName
+        in: path
+        required: true
+        description: Tablespace name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get tablespace
+      tags:
+        - table_management
+      operationId: getTablespace
+      responses:
+        "200":
+          description: Tablespace details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create tablespace
+      description: Creates a tablespace catalog object. The server applies the same lifecycle semantics as `CREATE TABLESPACE`.
+      tags:
+        - table_management
+      operationId: createTablespace
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTablespaceRequest"
+      responses:
+        "201":
+          description: Tablespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TablespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Tablespace already exists
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop tablespace
+      description: Drops a tablespace catalog object. Table placement by tablespace is fail-closed until native placement planning consumes tablespace policy.
+      tags:
+        - table_management
+      operationId: dropTablespace
+      responses:
+        "204":
+          description: Tablespace dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases:
+    get:
+      summary: List databases
+      description: Lists database catalog objects visible to the caller. Shorthand table APIs resolve through the caller's current/default database.
+      tags:
+        - table_management
+      operationId: listDatabases
+      responses:
+        "200":
+          description: A list of databases
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get database
+      tags:
+        - table_management
+      operationId: getDatabase
+      responses:
+        "200":
+          description: Database details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create database
+      description: Creates a database catalog object. The server applies the same semantics as `CREATE DATABASE`.
+      tags:
+        - table_management
+      operationId: createDatabase
+      responses:
+        "201":
+          description: Database created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "409":
+          description: Database already exists
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop database
+      description: Drops an empty database catalog object. Non-empty databases fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropDatabase
+      responses:
+        "204":
+          description: Database dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Database is not empty
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+    put:
+      summary: Set database tablespace
+      description: Binds the database catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setDatabaseTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "200":
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear database tablespace
+      description: Clears the database catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearDatabaseTablespace
+      responses:
+        "200":
+          description: Updated database
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/DatabaseCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List namespaces
+      description: Lists namespace catalog objects inside a database. PostgreSQL schemas map to these namespaces.
+      tags:
+        - table_management
+      operationId: listNamespaces
+      responses:
+        "200":
+          description: A list of namespaces in the database
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Create namespace
+      description: Creates a namespace catalog object in a database. The server applies the same semantics as `CREATE SCHEMA` for the selected database.
+      tags:
+        - table_management
+      operationId: createNamespace
+      responses:
+        "201":
+          description: Namespace created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Namespace already exists
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Drop namespace
+      description: Drops an empty namespace catalog object. Non-empty namespaces fail with a conflict.
+      tags:
+        - table_management
+      operationId: dropNamespace
+      responses:
+        "204":
+          description: Namespace dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          description: Namespace is not empty
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tablespace:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+    put:
+      summary: Set namespace tablespace
+      description: Binds the namespace catalog object to an existing tablespace.
+      tags:
+        - table_management
+      operationId: setNamespaceTablespace
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CatalogTablespaceBindingRequest"
+      responses:
+        "200":
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+    delete:
+      summary: Clear namespace tablespace
+      description: Clears the namespace catalog object's durable tablespace binding.
+      tags:
+        - table_management
+      operationId: clearNamespaceTablespace
+      responses:
+        "200":
+          description: Updated namespace
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/NamespaceCatalogRecord"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List tables in namespace
+      description: Lists table catalog objects under an explicit database and namespace.
+      tags:
+        - table_management
+      operationId: listNamespaceTables
+      parameters:
+        - name: prefix
+          in: query
+          required: false
+          schema:
+            type: string
+            maxLength: 255
+          description: Filter tables by name prefix.
+      responses:
+        "200":
+          description: A list of tables in the namespace
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: Get namespace table details
+      description: Gets a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: getNamespaceTable
+      responses:
+        "200":
+          description: Table details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+    post:
+      summary: Create namespace table
+      description: Creates a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: createNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/CreateTableRequest"
+      responses:
+        "200":
+          description: Table created
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableStatus"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "501":
+          description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
+    delete:
+      summary: Drop namespace table
+      description: Drops a table through an explicit database and namespace route.
+      tags:
+        - table_management
+      operationId: dropNamespaceTable
+      responses:
+        "204":
+          description: Table dropped
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          description: Explicit catalog table lifecycle is not supported by the configured local table write backend.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/query:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Query an explicit namespace table
+      description: Queries a table through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - query_operations
+      operationId: queryNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/QueryRequest"
+          application/x-ndjson:
+            schema:
+              type: string
+      responses:
+        "200":
+          description: Query successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/QueryResponses"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/batch:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Perform batch inserts and deletes on an explicit namespace table
+      description: Performs batch writes through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: batchNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BatchRequest"
+      responses:
+        "201":
+          description: Batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/rows/batch:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Perform structured relational row writes on an explicit namespace table
+      description: Relational row batch endpoint for an explicit database and namespace table. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: rowsBatchNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsBatchRequest"
+      responses:
+        "201":
+          description: Row batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/backup:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Backup an explicit namespace table
+      tags:
+        - data_operations
+      operationId: backupNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/BackupRequest"
+      responses:
+        "201":
+          description: Backup process initiated successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  backup:
+                    type: string
+                    example: successful
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/restore:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    post:
+      summary: Restore an explicit namespace table from backup
+      tags:
+        - data_operations
+      operationId: restoreNamespaceTable
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RestoreRequest"
+      responses:
+        "202":
+          description: Restore process triggered successfully
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  restore:
+                    type: string
+                    example: triggered
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/documents/{key}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: key
+        in: path
+        required: true
+        description: Key of the document to retrieve
+        schema:
+          type: string
+    get:
+      summary: Retrieve a document by key from an explicit namespace table
+      description: Retrieves a document through an explicit database and namespace route. While storage APIs are still bare-table-name based, the server fails closed when the resolved catalog table does not map to a unique physical table name.
+      tags:
+        - data_operations
+      operationId: lookupNamespaceTableDocument
+      parameters:
+        - name: fields
+          in: query
+          required: false
+          description: Comma-separated list of fields to include in the response.
+          schema:
+            type: string
+      responses:
+        "200":
+          description: Record found
+          headers:
+            X-Antfly-Version:
+              description: Version token for this document.
+              schema:
+                type: string
+          content:
+            application/json:
+              schema:
+                type: object
+                additionalProperties: true
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+    get:
+      summary: List indexes for an explicit namespace table
+      description: Lists index metadata through an explicit database and namespace route.
+      tags:
+        - index_management
+      operationId: listNamespaceTableIndexes
+      responses:
+        "200":
+          description: A list of indexes for the table
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+  /databases/{databaseName}/namespaces/{namespaceName}/tables/{tableName}/indexes/{indexName}:
+    parameters:
+      - name: databaseName
+        in: path
+        required: true
+        description: Database name
+        schema:
+          type: string
+          maxLength: 255
+      - name: namespaceName
+        in: path
+        required: true
+        description: Namespace name
+        schema:
+          type: string
+          maxLength: 255
+      - name: tableName
+        in: path
+        required: true
+        description: Table name
+        schema:
+          type: string
+          maxLength: 255
+      - name: indexName
+        in: path
+        required: true
+        description: Name of the index
+        schema:
+          type: string
+    get:
+      summary: Get index details for an explicit namespace table
+      tags:
+        - index_management
+      operationId: getNamespaceTableIndex
+      responses:
+        "200":
+          description: Index details
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/IndexStatus"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+    post:
+      summary: Add an index to an explicit namespace table
+      tags:
+        - index_management
+      operationId: createNamespaceTableIndex
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "indexes.yaml#/components/schemas/IndexConfig"
+      responses:
+        "201":
+          description: Index added successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
+    delete:
+      summary: Drop an index from an explicit namespace table
+      tags:
+        - index_management
+      operationId: dropNamespaceTableIndex
+      responses:
+        "201":
+          description: Index dropped successfully
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+        "501":
+          description: Catalog target cannot be delegated to legacy table storage unambiguously.
   /tables:
     get:
       summary: List all tables
@@ -7751,6 +11155,347 @@ paths:
         "404":
           $ref: "#/components/responses/NotFound"
         "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/batch:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Perform structured relational row writes by row identity
+      tags:
+        - data_operations
+      operationId: rowsBatchWrite
+      description: |
+        Relational row batch endpoint for tables with a declared `primary_key`.
+        Callers address rows by structured primary-key identity or declared
+        unique-key identity instead of physical document keys. The server
+        derives the storage-owned physical row key from the canonical typed
+        primary-key tuple, or resolves a unique selector through durable
+        unique-owner rows, then executes through the normal batch/2PC path.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsBatchRequest"
+      responses:
+        "201":
+          description: Row batch operation successful
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/BatchResponse"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/mutation-source:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Stage typed relational update/delete operations from a claimed row source
+      tags:
+        - data_operations
+      operationId: rowsMutationSource
+      description: |
+        Transaction-staging endpoint for bounded multi-row relational writes.
+        Update/delete sources use either a typed base row query with a
+        `row_claim` and transaction id, or a typed joined mutation-source plan
+        whose target side carries the row claim. Insert-source requests expose
+        the native source-to-target insert plan shape: the server reads the
+        typed source query, applies target-column assignments and conflict
+        actions through the row-batch constraint path, and returns optional
+        projections from the planned final target image. Update/delete plans
+        claim selected target rows, record committed-version predicates, stage
+        intents into the existing transaction, and return optional projections
+        from the planned final target image or deleted target row image.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              oneOf:
+                - $ref: "#/components/schemas/RowsMutationSourceRequest"
+                - $ref: "#/components/schemas/RowsInsertSourceRequest"
+                - $ref: "#/components/schemas/RowsJoinedMutationSourceRequest"
+      responses:
+        "200":
+          description: Rows staged into the claimed transaction or inserted from a typed source
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsMutationSourceResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "409":
+          $ref: "#/components/responses/Conflict"
+        "501":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/get:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Lookup relational rows by structured row identity
+      tags:
+        - data_operations
+      operationId: rowsGet
+      description: |
+        Point lookup endpoint for relational tables with a declared
+        `primary_key`. The request uses structured primary-key selectors or
+        declared unique-key selectors. Unique selectors resolve through durable
+        unique-owner rows; a missing unique owner returns `found: false`
+        without scanning. Responses include row JSON, version, and optional
+        diagnostic physical keys.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsGetRequest"
+      responses:
+        "200":
+          description: Row lookup response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsGetResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/plan:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row read plan
+      description: |
+        Executes exactly one typed read-plan envelope. This endpoint accepts the
+        same query, aggregate, window, join, and lateral plan bodies as the
+        operation-specific endpoints and dispatches them by the single operation
+        branch present in the request.
+      tags:
+        - data_operations
+      operationId: rowsPlan
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsPlanRequest"
+      responses:
+        "200":
+          description: Row read-plan response
+          content:
+            application/json:
+              schema:
+                oneOf:
+                  - $ref: "#/components/schemas/RowsQueryResultSet"
+                  - $ref: "#/components/schemas/RowsAggregateResultSet"
+                  - $ref: "#/components/schemas/RowsStreamResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/query:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row query plan
+      tags:
+        - data_operations
+      operationId: rowsQuery
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsQueryPlanRequest"
+      responses:
+        "200":
+          description: Row query response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsQueryResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/aggregate:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row aggregate plan
+      tags:
+        - data_operations
+      operationId: rowsAggregate
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsAggregatePlanRequest"
+      responses:
+        "200":
+          description: Row aggregate response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsAggregateResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/window:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row window plan
+      tags:
+        - data_operations
+      operationId: rowsWindow
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsWindowPlanRequest"
+      responses:
+        "200":
+          description: Row window response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsStreamResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/join:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row join plan
+      tags:
+        - data_operations
+      operationId: rowsJoin
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsJoinPlanRequest"
+      responses:
+        "200":
+          description: Row join response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsStreamResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
+          $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/rows/lateral:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the relational table
+        schema:
+          type: string
+    post:
+      summary: Execute a typed relational row lateral plan
+      tags:
+        - data_operations
+      operationId: rowsLateral
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: "#/components/schemas/RowsLateralPlanRequest"
+      responses:
+        "200":
+          description: Row lateral response
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/RowsStreamResultSet"
+        "400":
+          $ref: "#/components/responses/BadRequest"
+        "403":
+          $ref: "#/components/responses/Forbidden"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "501":
           $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/merge:
     parameters:

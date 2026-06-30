@@ -18,9 +18,13 @@ const antfly_client = @import("antfly-client");
 const httpx = @import("httpx");
 
 pub const table = @import("table.zig");
+pub const database_cmd = @import("database.zig");
+pub const namespace_cmd = @import("namespace.zig");
+pub const tablespace = @import("tablespace.zig");
 pub const index = @import("index.zig");
 pub const artifact = @import("artifact.zig");
 pub const query = @import("query.zig");
+pub const sql = @import("sql.zig");
 pub const data = @import("data.zig");
 pub const backup = @import("backup.zig");
 pub const agents = @import("agents.zig");
@@ -35,11 +39,41 @@ pub const GlobalConfig = struct {
     output: OutputFormat = .json,
 };
 
+pub const CatalogFlags = struct {
+    database: ?[]const u8 = null,
+    namespace: ?[]const u8 = null,
+
+    pub const Explicit = struct {
+        database: []const u8,
+        namespace: []const u8,
+    };
+
+    pub fn defaultsFromEnv() CatalogFlags {
+        return .{
+            .database = platform.env.getenv("ANTFLY_DATABASE"),
+            .namespace = platform.env.getenv("ANTFLY_NAMESPACE"),
+        };
+    }
+
+    pub fn explicit(self: CatalogFlags) ?Explicit {
+        if (self.database == null and self.namespace == null) return null;
+        return .{
+            .database = self.database orelse fatal("--database is required when --namespace is set or ANTFLY_NAMESPACE is configured", .{}),
+            .namespace = self.namespace orelse fatal("--namespace is required when --database is set or ANTFLY_DATABASE is configured", .{}),
+        };
+    }
+
+    pub fn databaseOrFatal(self: CatalogFlags) []const u8 {
+        return self.database orelse fatal("--database is required or ANTFLY_DATABASE must be configured", .{});
+    }
+};
+
 /// Build global CLI config from environment variables.
 ///
 /// Supported env vars:
 ///   ANTFLY_URL    — server base URL (default http://localhost:8080)
 ///   ANTFLY_TOKEN  — bearer token for authentication
+///   ANTFLY_DATABASE / ANTFLY_NAMESPACE — default catalog target for catalog-aware table commands
 pub fn parseGlobalFlags() GlobalConfig {
     var config = GlobalConfig{};
     if (platform.env.getenv("ANTFLY_URL")) |raw| {
@@ -49,6 +83,25 @@ pub fn parseGlobalFlags() GlobalConfig {
         config.token = raw;
     }
     return config;
+}
+
+pub fn isCatalogFlag(arg: []const u8) bool {
+    return std.mem.eql(u8, arg, "--database") or
+        std.mem.eql(u8, arg, "-d") or
+        std.mem.eql(u8, arg, "--namespace") or
+        std.mem.eql(u8, arg, "-n");
+}
+
+pub fn parseCatalogFlag(catalog: *CatalogFlags, arg: []const u8, args: *std.process.Args.Iterator) bool {
+    if (std.mem.eql(u8, arg, "--database") or std.mem.eql(u8, arg, "-d")) {
+        catalog.database = args.next() orelse fatal("--database requires a value", .{});
+        return true;
+    }
+    if (std.mem.eql(u8, arg, "--namespace") or std.mem.eql(u8, arg, "-n")) {
+        catalog.namespace = args.next() orelse fatal("--namespace requires a value", .{});
+        return true;
+    }
+    return false;
 }
 
 pub fn initClient(allocator: std.mem.Allocator, http: *httpx.Client, config: GlobalConfig) !antfly_client.AntflyClient {
@@ -111,9 +164,13 @@ pub fn fatal(comptime fmt: []const u8, args: anytype) noreturn {
 
 test "cli mod compiles" {
     _ = table;
+    _ = database_cmd;
+    _ = namespace_cmd;
+    _ = tablespace;
     _ = index;
     _ = artifact;
     _ = query;
+    _ = sql;
     _ = data;
     _ = backup;
     _ = agents;

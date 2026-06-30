@@ -1,0 +1,734 @@
+{
+  "coverage_format": 1,
+  "cases": [
+    {
+      "name": "stale table tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale temporal table token",
+          "family": "insert",
+          "sql": "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+          "plan": "insert:table=products_extra:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+          "apply_setup_sql": ["CREATE TABLE products (id text PRIMARY KEY)"]
+        },
+        {
+          "name": "stale insert source table token",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_table=archived_records_extra:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+          "source_schema_json": "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}"
+        }
+      ],
+      "expect_false": [
+        "schema_temporal_open_daterange_insert",
+        "insert_source_cross_table_source_schema"
+      ]
+    },
+    {
+      "name": "exact table tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact temporal table token",
+          "family": "insert",
+          "sql": "INSERT INTO products VALUES ('[2025-01-01,)'::daterange)",
+          "plan": "insert:table=products:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+          "apply_setup_sql": ["CREATE TABLE products (id text PRIMARY KEY)"]
+        },
+        {
+          "name": "exact insert source table token",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0",
+          "source_schema_json": "{\"storage_mode\":\"relational\",\"relational\":{\"primary_key\":{\"columns\":[\"id\"]},\"columns\":[{\"name\":\"id\",\"type\":\"text\",\"nullable\":false}]}}"
+        }
+      ],
+      "expect_true": [
+        "schema_temporal_open_daterange_insert",
+        "insert_source_cross_table_source_schema"
+      ]
+    },
+    {
+      "name": "stale pagination tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale set operation limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=50:claim=none"
+        },
+        {
+          "name": "stale fetch limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=10:claim=none"
+        },
+        {
+          "name": "stale nullable mutation-source pagination",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-10:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_false": [
+        "query_set_operation_order_limit",
+        "set_operation_fetch_tail",
+        "update_source_nullable_pagination"
+      ]
+    },
+    {
+      "name": "exact pagination tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact set operation limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION SELECT id FROM archived_records ORDER BY id LIMIT 5",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none"
+        },
+        {
+          "name": "exact fetch limit",
+          "family": "query",
+          "sql": "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records FETCH FIRST ROW ONLY",
+          "plan": "query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=1:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=1:claim=none"
+        },
+        {
+          "name": "exact nullable mutation-source pagination",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open' LIMIT NULL OFFSET NULL",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_true": [
+        "query_set_operation_order_limit",
+        "set_operation_fetch_tail",
+        "update_source_nullable_pagination"
+      ]
+    },
+    {
+      "name": "stale joined-source count tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale joined update right predicate count",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
+          "plan": "update_joined_source:table=usage_records:source=archived_records:right_pred=0x:on=1:ops=1:returning=0:returning_expr=0"
+        },
+        {
+          "name": "stale joined delete join count",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
+          "plan": "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=20:returning=0:returning_expr=0"
+        }
+      ],
+      "expect_false": [
+        "update_joined_source_non_primary_semijoin",
+        "delete_joined_source_correlated_semijoin"
+      ]
+    },
+    {
+      "name": "exact joined-source count tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact joined update right predicate count",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = 'archived' WHERE organization_id IN (SELECT organization_id FROM archived_records)",
+          "plan": "update_joined_source:table=usage_records:source=archived_records:right_pred=0:on=1:ops=1:returning=0:returning_expr=0"
+        },
+        {
+          "name": "exact joined delete join count",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records WHERE archived_records.status = usage_records.status",
+          "plan": "delete_joined_source:table=usage_records:source=archived_records:right_pred=0:on=2:returning=0:returning_expr=0"
+        }
+      ],
+      "expect_true": [
+        "update_joined_source_non_primary_semijoin",
+        "delete_joined_source_correlated_semijoin"
+      ]
+    },
+    {
+      "name": "stale cte chain count token does not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale cte chain count",
+          "family": "query",
+          "sql": "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
+          "plan": "query:table=usage_records:ctes=20:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none"
+        }
+      ],
+      "expect_false": ["query_cte_chain"]
+    },
+    {
+      "name": "exact cte chain count token satisfies coverage",
+      "entries": [
+        {
+          "name": "exact cte chain count",
+          "family": "query",
+          "sql": "WITH open_usage AS (SELECT id FROM usage_records), expensive_open_usage AS (SELECT id FROM open_usage) SELECT id FROM expensive_open_usage",
+          "plan": "query:table=usage_records:ctes=2:source_cte=1:pred=0:select=1:order=0:limit=none:claim=none"
+        }
+      ],
+      "expect_true": ["query_cte_chain"]
+    },
+    {
+      "name": "stale cross-table source schema tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale joined mutation source schema token",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = source_records.status FROM source_records WHERE source_records.id = usage_records.id",
+          "plan": "update_joined_source:target=usage_records:source=source_records_extra:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "stale join source schema token",
+          "family": "join",
+          "sql": "SELECT usage_records.id, customer_records.id FROM usage_records LEFT JOIN customer_records ON customer_records.id = usage_records.customer_id",
+          "plan": "join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "stale lateral source schema token",
+          "family": "lateral",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "plan": "lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "stale merge source schema token",
+          "family": "merge_mutation",
+          "sql": "MERGE INTO usage_records USING archived_records ON archived_records.id = usage_records.id WHEN MATCHED THEN UPDATE SET status = archived_records.status",
+          "plan": "merge_mutation:target=usage_records:source=archived_records_extra:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        }
+      ],
+      "expect_false": [
+        "joined_source_cross_table_source_schema",
+        "read_join_cross_table_source_schema",
+        "read_lateral_cross_table_source_schema",
+        "merge_cross_table_source_schema"
+      ]
+    },
+    {
+      "name": "exact cross-table source schema tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact joined mutation source schema token",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = source_records.status FROM source_records WHERE source_records.id = usage_records.id",
+          "plan": "update_joined_source:target=usage_records:source=source_records:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "exact join source schema token",
+          "family": "join",
+          "sql": "SELECT usage_records.id, customer_records.id FROM usage_records LEFT JOIN customer_records ON customer_records.id = usage_records.customer_id",
+          "plan": "join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "exact lateral source schema token",
+          "family": "lateral",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "plan": "lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "exact merge source schema token",
+          "family": "merge_mutation",
+          "sql": "MERGE INTO usage_records USING archived_records ON archived_records.id = usage_records.id WHEN MATCHED THEN UPDATE SET status = archived_records.status",
+          "plan": "merge_mutation:target=usage_records:source=archived_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        }
+      ],
+      "expect_true": [
+        "joined_source_cross_table_source_schema",
+        "read_join_cross_table_source_schema",
+        "read_lateral_cross_table_source_schema",
+        "merge_cross_table_source_schema"
+      ]
+    },
+    {
+      "name": "stale read-classifier cross-table source schema tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "stale read join source schema token",
+          "family": "read",
+          "sql": "SELECT usage_records.id, customer_records.id FROM usage_records LEFT JOIN customer_records ON customer_records.id = usage_records.customer_id",
+          "plan": "read:join:join:type=left:left=usage_records:right=customer_records_extra:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "stale read lateral source schema token",
+          "family": "read",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "plan": "read:lateral:lateral:left=usage_records:right=balance_records_extra:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        }
+      ],
+      "expect_false": [
+        "read_join_cross_table_source_schema_classifier",
+        "read_lateral_cross_table_source_schema_classifier"
+      ]
+    },
+    {
+      "name": "exact read-classifier cross-table source schema tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact read join source schema token",
+          "family": "read",
+          "sql": "SELECT usage_records.id, customer_records.id FROM usage_records LEFT JOIN customer_records ON customer_records.id = usage_records.customer_id",
+          "plan": "read:join:join:type=left:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        },
+        {
+          "name": "exact read lateral source schema token",
+          "family": "read",
+          "sql": "SELECT usage_records.id, balance_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM balance_records LIMIT 1) balance_records ON true",
+          "plan": "read:lateral:lateral:left=usage_records:right=balance_records:ctes=0:left_pred=0:right_pred=0:right_order=0:right_limit=1:corr=1:select=2:order=0:limit=-1",
+          "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"
+        }
+      ],
+      "expect_true": [
+        "read_join_cross_table_source_schema_classifier",
+        "read_lateral_cross_table_source_schema_classifier"
+      ]
+    },
+    {
+      "name": "malformed ddl boolean tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "malformed replace table token",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE OR REPLACE TABLE usage_records (id text PRIMARY KEY)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true_extra"
+        },
+        {
+          "name": "malformed function replace token",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_function"},
+          "sql": "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+          "plan": "ddl:create_function:name=touch_updated_at:args=0:replace=true_extra:returns=trigger:language=plpgsql"
+        },
+        {
+          "name": "malformed drop table cascade token",
+          "family": "ddl",
+          "summary": {"ddl_tag": "drop_table"},
+          "sql": "DROP TABLE usage_records CASCADE",
+          "plan": "ddl:drop_table:table=usage_records:if_exists=false:cascade=true_extra"
+        },
+        {
+          "name": "malformed truncate restart identity token",
+          "family": "truncate_source",
+          "sql": "TRUNCATE usage_records RESTART IDENTITY",
+          "plan": "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=10"
+        },
+        {
+          "name": "wrong truncate continue identity table token",
+          "family": "truncate_source",
+          "sql": "TRUNCATE usage_records CONTINUE IDENTITY",
+          "plan": "truncate_source:table=usage_records_extra:source_pred=0:source_order=0:source_limit=-1:claim=locked"
+        }
+      ],
+      "expect_false": [
+        "ddl_replace_table",
+        "ddl_function_replace",
+        "ddl_drop_table_cascade",
+        "truncate_restart_identity",
+        "truncate_continue_identity"
+      ]
+    },
+    {
+      "name": "exact ddl boolean tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact replace table token",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE OR REPLACE TABLE usage_records (id text PRIMARY KEY)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:replace=true"
+        },
+        {
+          "name": "exact function replace token",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_function"},
+          "sql": "CREATE OR REPLACE FUNCTION touch_updated_at() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN RETURN NEW; END $$",
+          "plan": "ddl:create_function:name=touch_updated_at:args=0:replace=true:returns=trigger:language=plpgsql"
+        },
+        {
+          "name": "exact drop table cascade token",
+          "family": "ddl",
+          "summary": {"ddl_tag": "drop_table"},
+          "sql": "DROP TABLE usage_records CASCADE",
+          "plan": "ddl:drop_table:table=usage_records:if_exists=false:cascade=true"
+        },
+        {
+          "name": "exact truncate restart identity token",
+          "family": "truncate_source",
+          "sql": "TRUNCATE usage_records RESTART IDENTITY",
+          "plan": "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked:restart_identity=1"
+        },
+        {
+          "name": "exact truncate continue identity token",
+          "family": "truncate_source",
+          "sql": "TRUNCATE usage_records CONTINUE IDENTITY",
+          "plan": "truncate_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:claim=locked"
+        }
+      ],
+      "expect_true": [
+        "ddl_replace_table",
+        "ddl_function_replace",
+        "ddl_drop_table_cascade",
+        "truncate_restart_identity",
+        "truncate_continue_identity"
+      ]
+    },
+    {
+      "name": "malformed count tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "malformed aggregate zero count",
+          "family": "aggregate",
+          "sql": "SELECT status FROM usage_records GROUP BY status",
+          "plan": "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0x:agg_expr=0:filter_expr=0:having=0:order=0:limit=none"
+        },
+        {
+          "name": "malformed temporal set null foreign key count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10"
+        },
+        {
+          "name": "malformed temporal cascade foreign key count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=10"
+        },
+        {
+          "name": "malformed temporal period count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
+          "plan": "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1x"
+        }
+      ],
+      "expect_false": [
+        "aggregate_distinct_group_projection",
+        "ddl_temporal_fk_delete_set_null_action",
+        "ddl_temporal_fk_delete_cascade_action",
+        "ddl_temporal_fk_update_cascade_action",
+        "ddl_temporal_table"
+      ]
+    },
+    {
+      "name": "exact count tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact aggregate zero count",
+          "family": "aggregate",
+          "sql": "SELECT status FROM usage_records GROUP BY status",
+          "plan": "aggregate:table=usage_records:source_pred=0:group=1:group_expr=0:aggs=0:agg_expr=0:filter_expr=0:having=0:order=0:limit=none"
+        },
+        {
+          "name": "exact temporal set null foreign key count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE SET NULL)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1"
+        },
+        {
+          "name": "exact temporal cascade foreign key count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON DELETE CASCADE)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1"
+        },
+        {
+          "name": "exact temporal update cascade foreign key count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (FOREIGN KEY (period_id) REFERENCES periods(id) ON UPDATE CASCADE)",
+          "plan": "ddl:create_table:table=usage_records:columns=1:unique=0:fk=0:checks=0:if_not_exists=false:temporal_fk=1"
+        },
+        {
+          "name": "exact temporal period count",
+          "family": "ddl",
+          "summary": {"ddl_tag": "create_table"},
+          "sql": "CREATE TABLE usage_records (valid_from numeric, valid_to numeric, PERIOD FOR valid_time (valid_from, valid_to))",
+          "plan": "ddl:create_table:table=usage_records:columns=2:unique=0:fk=0:checks=0:if_not_exists=false:periods=1"
+        }
+      ],
+      "expect_true": [
+        "aggregate_distinct_group_projection",
+        "ddl_temporal_fk_delete_set_null_action",
+        "ddl_temporal_fk_delete_cascade_action",
+        "ddl_temporal_fk_update_cascade_action",
+        "ddl_temporal_table"
+      ]
+    },
+    {
+      "name": "malformed side-access tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "malformed join side access",
+          "family": "join",
+          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN usage_records AS related ON related.id = usage_records.id",
+          "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1:left_json_contains=1x:right_json_exists=0"
+        },
+        {
+          "name": "malformed lateral side access",
+          "family": "lateral",
+          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM usage_records LIMIT 1) related ON true",
+          "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1x"
+        }
+      ],
+      "expect_false": [
+        "join_structured_side_access",
+        "lateral_structured_side_access"
+      ]
+    },
+    {
+      "name": "exact side-access tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact join side access",
+          "family": "join",
+          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN usage_records AS related ON related.id = usage_records.id",
+          "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=-1:left_json_contains=1:right_json_exists=0"
+        },
+        {
+          "name": "exact lateral side access",
+          "family": "lateral",
+          "sql": "SELECT usage_records.id FROM usage_records LEFT JOIN LATERAL (SELECT id FROM usage_records LIMIT 1) related ON true",
+          "plan": "lateral:left=usage_records:right=usage_records:ctes=0:left_pred=0:right_pred=0:right_order=1:right_limit=1:corr=1:select=2:order=0:limit=-1:left_json_contains=0:right_json_exists=1"
+        }
+      ],
+      "expect_true": [
+        "join_structured_side_access",
+        "lateral_structured_side_access"
+      ]
+    },
+    {
+      "name": "malformed insert-source assignment expression token does not satisfy coverage",
+      "entries": [
+        {
+          "name": "malformed insert-source assignment expression",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records (id, status) SELECT id, lower(status) FROM usage_records",
+          "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=0:returning_expr=0:returning_all=0:assignment_expr=1x"
+        }
+      ],
+      "expect_false": ["insert_source_expression_assignment"]
+    },
+    {
+      "name": "exact insert-source assignment expression token satisfies coverage",
+      "entries": [
+        {
+          "name": "exact insert-source assignment expression",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records (id, status) SELECT id, lower(status) FROM usage_records",
+          "plan": "insert_source:table=usage_records:source_table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=3:conflict=0:returning=0:returning_expr=0:returning_all=0:assignment_expr=1"
+        }
+      ],
+      "expect_true": ["insert_source_expression_assignment"]
+    },
+    {
+      "name": "wrapped merge token does not satisfy typed-plan coverage",
+      "entries": [
+        {
+          "name": "wrapped merge token",
+          "family": "merge_mutation",
+          "sql": "MERGE INTO usage_records USING source_records ON source_records.id = usage_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status",
+          "plan": "write_wrapper:merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_false": ["merge_mutation_typed_plan"]
+    },
+    {
+      "name": "exact merge token satisfies typed-plan coverage",
+      "entries": [
+        {
+          "name": "exact merge token",
+          "family": "merge_mutation",
+          "sql": "MERGE INTO usage_records USING source_records ON source_records.id = usage_records.id WHEN MATCHED THEN UPDATE SET status = source_records.status",
+          "plan": "merge_mutation:target=usage_records:source=source_records:match=1:matched_pred=0:matched_update=1:matched_delete=0:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=0:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_true": ["merge_mutation_typed_plan"]
+    },
+    {
+      "name": "malformed conflict write count tokens do not satisfy coverage",
+      "entries": [
+        {
+          "name": "malformed conflict duplicate target write count",
+          "family": "insert",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a'), ('b') ON CONFLICT DO NOTHING",
+          "plan": "insert:table=usage_records:writes=10:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+          "resolver_exists": false
+        },
+        {
+          "name": "malformed conflict returning transform count",
+          "family": "insert",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO NOTHING RETURNING *",
+          "plan": "insert:table=usage_records:writes=0:transforms=10:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1"
+        },
+        {
+          "name": "malformed conflict guard returning count",
+          "family": "insert",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
+          "plan": "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=00x:returning_expr=0:conflict_where=1"
+        }
+      ],
+      "expect_false": [
+        "multi_row_conflict_do_nothing_duplicate_target",
+        "conflict_do_nothing_returning_all",
+        "conflict_guard_where_skip"
+      ]
+    },
+    {
+      "name": "exact conflict write count tokens satisfy coverage",
+      "entries": [
+        {
+          "name": "exact conflict duplicate target write count",
+          "family": "insert",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a'), ('b') ON CONFLICT DO NOTHING",
+          "plan": "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0",
+          "resolver_exists": false
+        },
+        {
+          "name": "exact conflict returning transform count",
+          "family": "insert",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO NOTHING RETURNING *",
+          "plan": "insert:table=usage_records:writes=0:transforms=0:ops=0:deletes=0:returning_rows=0:returning_expr=0:returning_all=1"
+        },
+        {
+          "name": "exact conflict guard returning count",
+          "family": "insert",
+          "sql": "INSERT INTO usage_records (id) VALUES ('a') ON CONFLICT DO UPDATE SET status = excluded.status WHERE false",
+          "plan": "insert:table=usage_records:writes=0:transforms=0:ops=1:deletes=0:returning_rows=0:returning_expr=0:conflict_where=1"
+        }
+      ],
+      "expect_true": [
+        "multi_row_conflict_do_nothing_duplicate_target",
+        "conflict_do_nothing_returning_all",
+        "conflict_guard_where_skip"
+      ]
+    },
+    {
+      "name": "family-only migration backfill plans do not satisfy coverage",
+      "entries": [
+        {
+          "name": "insert source missing source table evidence",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "update source missing mutation evidence",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open'",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "delete source missing returning evidence",
+          "family": "delete_source",
+          "sql": "DELETE FROM usage_records WHERE status = 'archived'",
+          "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked"
+        },
+        {
+          "name": "joined update missing join evidence",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:ops=1:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "joined delete missing join evidence",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records USING archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_false": [
+        "migration_equivalent_data_backfill_insert",
+        "migration_equivalent_data_backfill_update",
+        "migration_equivalent_data_backfill_delete"
+      ]
+    },
+    {
+      "name": "typed migration backfill plans satisfy coverage",
+      "entries": [
+        {
+          "name": "typed insert source backfill",
+          "family": "insert_source",
+          "sql": "INSERT INTO usage_records SELECT * FROM archived_records",
+          "plan": "insert_source:table=usage_records:source_table=archived_records:source_pred=0:source_order=0:source_limit=-1:assignments=0:conflict=0:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed update source backfill",
+          "family": "update_source",
+          "sql": "UPDATE usage_records SET status = 'ready' WHERE status = 'open'",
+          "plan": "update_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:ops=1:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed delete source backfill",
+          "family": "delete_source",
+          "sql": "DELETE FROM usage_records WHERE status = 'archived'",
+          "plan": "delete_source:table=usage_records:source_pred=1:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed joined update backfill",
+          "family": "update_joined_source",
+          "sql": "UPDATE usage_records SET status = source.status FROM archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "update_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:ops=1:returning=0:returning_expr=0:returning_all=0"
+        },
+        {
+          "name": "typed joined delete backfill",
+          "family": "delete_joined_source",
+          "sql": "DELETE FROM usage_records USING archived_records AS source WHERE source.id = usage_records.id",
+          "plan": "delete_joined_source:target=usage_records:source=archived_records:left_pred=0:right_pred=0:on=1:returning=0:returning_expr=0:returning_all=0"
+        }
+      ],
+      "expect_true": [
+        "migration_equivalent_data_backfill_insert",
+        "migration_equivalent_data_backfill_update",
+        "migration_equivalent_data_backfill_delete"
+      ]
+    },
+    {
+      "name": "malformed temporal conflict transform count does not satisfy coverage",
+      "entries": [
+        {
+          "name": "malformed temporal conflict transform count",
+          "family": "insert",
+          "sql": "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
+          "plan": "insert:table=prices:writes=0:transforms=10:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+          "apply_setup_sql": [
+            "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));"
+          ],
+          "resolver_row_json": "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
+          "resolver_version": 45
+        }
+      ],
+      "expect_false": ["schema_temporal_unique_conflict_upsert"]
+    },
+    {
+      "name": "exact temporal conflict transform count satisfies coverage",
+      "entries": [
+        {
+          "name": "exact temporal conflict transform count",
+          "family": "insert",
+          "sql": "INSERT INTO prices (id, sku, valid_from, valid_to, price) VALUES ('p2', 'sku:a', 5, 15, 12) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price RETURNING id, price",
+          "plan": "insert:table=prices:writes=0:transforms=1:ops=1:deletes=0:returning_rows=1:returning_expr=0:op_set=1",
+          "apply_setup_sql": [
+            "CREATE TABLE prices (id uuid PRIMARY KEY, sku text NOT NULL, valid_from numeric NOT NULL, valid_to numeric NOT NULL, price numeric, PERIOD FOR valid_time (valid_from, valid_to), CONSTRAINT prices_sku_time_key UNIQUE (sku, valid_time WITHOUT OVERLAPS));"
+          ],
+          "resolver_row_json": "{\"id\":\"p1\",\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}",
+          "resolver_version": 45
+        }
+      ],
+      "expect_true": ["schema_temporal_unique_conflict_upsert"]
+    }
+  ]
+}

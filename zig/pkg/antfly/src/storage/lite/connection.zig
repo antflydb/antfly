@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const backend = @import("backend.zig");
-const db_mod = @import("../db/db.zig");
+const db_mod = @import("../db/mod.zig");
 
 const Allocator = std.mem.Allocator;
 

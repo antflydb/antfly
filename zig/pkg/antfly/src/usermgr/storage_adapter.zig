@@ -462,6 +462,12 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
                 \\[policy_definition]
                 \\p = sub, typ, obj, act
                 \\p2 = sub, obj, filter
+                \\p3 = sub, setting, value
+                \\p4 = table
+                \\p5 = sub, database, setting, value
+                \\p6 = sub, database, setting, value
+                \\p7 = sub, table, target
+                \\p8 = sub, obj, filter
                 \\[role_definition]
                 \\g = _, _
                 \\[matchers]
@@ -479,7 +485,16 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
 
     var created = try manager.createUserWithMetadata("alice", "secret", &initial, "{\"tenant_id\":\"acme\"}");
     defer created.deinit(std.testing.allocator);
+    var bob = try manager.createUser("bob", "secret", &.{});
+    defer bob.deinit(std.testing.allocator);
     try manager.setRowFilter("alice", "docs", "{\"term\":{\"team\":\"eng\"}}");
+    try manager.createRoleSubject("role:app_writer");
+    try manager.addRoleToUser("alice", "role:app_writer");
+    try manager.setRoleSetting("role:app_writer", "app.tenant_id", "acme");
+    try manager.setRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id", "tenant-appdb");
+    try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
+    try manager.enableSqlRowSecurity("docs");
+    try manager.createSqlRowSecurityPolicyWithTargets("docs_tenant", "docs", "{\"term\":{\"tenant_id\":\"acme\"}}", &.{"role:app_writer"});
     try std.testing.expect(try manager.enforce("alice", .table, "docs", .read));
 
     var reloaded_user_store = StorageUserStore.init(std.testing.allocator, runtime);
@@ -495,6 +510,12 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
                 \\[policy_definition]
                 \\p = sub, typ, obj, act
                 \\p2 = sub, obj, filter
+                \\p3 = sub, setting, value
+                \\p4 = table
+                \\p5 = sub, database, setting, value
+                \\p6 = sub, database, setting, value
+                \\p7 = sub, table, target
+                \\p8 = sub, obj, filter
                 \\[role_definition]
                 \\g = _, _
                 \\[matchers]
@@ -512,6 +533,30 @@ test "storage-backed user store and casbin adapter persist usermgr state" {
     const filter = try reloaded.getRowFilter("alice", "docs");
     defer std.testing.allocator.free(filter);
     try std.testing.expect(std.mem.indexOf(u8, filter, "\"team\":\"eng\"") != null);
+    const alice_filters = try reloaded.getRowFilters("alice");
+    defer {
+        for (alice_filters) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(alice_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"team\":\"eng\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"tenant_id\":\"acme\"") != null);
+    const bob_filters = try reloaded.getRowFilters("bob");
+    defer {
+        for (bob_filters) |*entry| entry.deinit(std.testing.allocator);
+        std.testing.allocator.free(bob_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 0), bob_filters.len);
+    const role_setting = try reloaded.getRoleSetting("role:app_writer", "app.tenant_id");
+    defer std.testing.allocator.free(role_setting);
+    try std.testing.expectEqualStrings("acme", role_setting);
+    const database_role_setting = try reloaded.getRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id");
+    defer std.testing.allocator.free(database_role_setting);
+    try std.testing.expectEqualStrings("tenant-appdb", database_role_setting);
+    const runtime_role_setting = try reloaded.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer std.testing.allocator.free(runtime_role_setting);
+    try std.testing.expectEqualStrings("1ms", runtime_role_setting);
+    try std.testing.expect(try reloaded.sqlRowSecurityEnabled("docs"));
 
     var api_row_filter = [_]user_manager.RowFilterEntry{
         try user_manager.RowFilterEntry.initOwned(std.testing.allocator, "docs", "{\"term\":{\"tier\":\"gold\"}}"),

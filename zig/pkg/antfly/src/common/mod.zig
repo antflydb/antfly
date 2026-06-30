@@ -21,6 +21,7 @@ pub const health_server = @import("health_server.zig");
 pub const group_ids = @import("group_ids.zig");
 pub const data_format = @import("data_format.zig");
 pub const fs_paths = @import("fs_paths.zig");
+pub const json_helpers = @import("json_helpers.zig");
 pub const byte_copy = @import("byte_copy.zig");
 
 test {
@@ -33,5 +34,6 @@ test {
     _ = group_ids;
     _ = data_format;
     _ = fs_paths;
+    _ = json_helpers;
     _ = byte_copy;
 }

@@ -2438,6 +2438,107 @@ func TestForwardLookupToShardWithVersion_SplitParentOutOfRangeFallsBackToWriteRe
 	assert.Equal(t, 1, childRPC.lookupHit)
 }
 
+func TestForwardLookupToShardWithVersion_TableParentOutOfRangeFallsBackToWriteReadyChild(t *testing.T) {
+	ms, db := setupTestMetadataStore(t)
+
+	parentShardID := types.ID(100)
+	childShardID := types.ID(101)
+	parentNodeID := types.ID(1)
+	childNodeID := types.ID(2)
+	splitKey := []byte("m")
+	key := "mango"
+	expectedDoc := []byte(`{"key":"mango"}`)
+	const expectedVersion = 43
+
+	parentRPC := &stubStoreRPC{
+		id: parentNodeID,
+		lookupWithVersionFn: func(shardID types.ID, gotKey string) ([]byte, uint64, error) {
+			assert.Equal(t, parentShardID, shardID)
+			assert.Equal(t, key, gotKey)
+			return nil, 0, client.ErrKeyOutOfRange
+		},
+	}
+	childRPC := &stubStoreRPC{
+		id: childNodeID,
+		lookupWithVersionFn: func(shardID types.ID, gotKey string) ([]byte, uint64, error) {
+			assert.Equal(t, childShardID, shardID)
+			assert.Equal(t, key, gotKey)
+			return expectedDoc, expectedVersion, nil
+		},
+	}
+	ms.tm.SetStoreClientFactory(func(_ *http.Client, id types.ID, _ string) client.StoreRPC {
+		switch id {
+		case parentNodeID:
+			return parentRPC
+		case childNodeID:
+			return childRPC
+		default:
+			return &stubStoreRPC{id: id}
+		}
+	})
+	writeTable(t, db, &store.Table{
+		Name: "test_table",
+		Shards: map[types.ID]*store.ShardConfig{
+			parentShardID: {ByteRange: [2][]byte{{0x00}, {0xff}}},
+		},
+	})
+
+	parentStatus := &store.ShardStatus{
+		ID:    parentShardID,
+		Table: "test_table",
+		State: store.ShardState_Splitting,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{{0x00}, splitKey},
+			},
+			Peers:      common.NewPeerSet(parentNodeID),
+			ReportedBy: common.NewPeerSet(parentNodeID),
+			RaftStatus: &common.RaftStatus{
+				Lead:   parentNodeID,
+				Voters: common.NewPeerSet(parentNodeID),
+			},
+		},
+	}
+	parentStatus.SplitState = &storedb.SplitState{}
+	parentStatus.SplitState.SetPhase(storedb.SplitState_PHASE_SPLITTING)
+	parentStatus.SplitState.SetSplitKey(splitKey)
+	parentStatus.SplitState.SetNewShardId(uint64(childShardID))
+
+	childStatus := &store.ShardStatus{
+		ID:    childShardID,
+		Table: "test_table",
+		State: store.ShardState_SplitOffPreSnap,
+		ShardInfo: storedb.ShardInfo{
+			ShardConfig: storedb.ShardConfig{
+				ByteRange: [2][]byte{splitKey, {0xff}},
+			},
+			Peers:               common.NewPeerSet(childNodeID),
+			ReportedBy:          common.NewPeerSet(childNodeID),
+			HasSnapshot:         true,
+			Initializing:        false,
+			SplitReplayRequired: true,
+			SplitReplayCaughtUp: true,
+			SplitCutoverReady:   false,
+			RaftStatus: &common.RaftStatus{
+				Lead:   childNodeID,
+				Voters: common.NewPeerSet(childNodeID),
+			},
+		},
+	}
+
+	writeShardStatus(t, db, parentStatus)
+	writeShardStatus(t, db, childStatus)
+	writeStoreStatus(t, db, parentNodeID, true)
+	writeStoreStatus(t, db, childNodeID, true)
+
+	doc, version, err := ms.forwardLookupToShardWithVersion(context.Background(), parentShardID, key)
+	require.NoError(t, err)
+	assert.Equal(t, expectedDoc, doc)
+	assert.Equal(t, uint64(expectedVersion), version)
+	assert.Equal(t, 1, parentRPC.lookupHit)
+	assert.Equal(t, 1, childRPC.lookupHit)
+}
+
 func TestForwardLookupToShardWithVersion_StaleParentOutOfRangeFallsBackToReadReadyChild(t *testing.T) {
 	ms, db := setupTestMetadataStore(t)
 

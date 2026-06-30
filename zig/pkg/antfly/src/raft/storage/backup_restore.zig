@@ -466,7 +466,7 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
 
     var removed: usize = 0;
     for (current) |cfg| {
-        if (object.contains(cfg.name)) continue;
+        if (desiredStorageIndexContainsName(object, cfg.name)) continue;
         if (try db.deleteIndex(cfg.name)) removed += 1;
     }
     return removed;
@@ -483,6 +483,8 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     var added: usize = 0;
     var it = object.iterator();
     while (it.next()) |entry| {
+        if (isReservedTopLevelIndexSection(entry.key_ptr.*)) continue;
+        if (isMetadataOnlyScalarIndexConfig(entry.value_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
         switch (kind) {
             .full_text => {
@@ -521,6 +523,12 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
     return added;
 }
 
+fn desiredStorageIndexContainsName(object: std.json.ObjectMap, name: []const u8) bool {
+    const value = object.get(name) orelse return false;
+    if (isReservedTopLevelIndexSection(name)) return false;
+    return !isMetadataOnlyScalarIndexConfig(value);
+}
+
 fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     if (value != .object) return .full_text;
     const type_value = value.object.get("type") orelse return .full_text;
@@ -536,6 +544,29 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
         return if (sparse) .sparse_vector else .dense_vector;
     }
     return error.UnsupportedCreateTableRequest;
+}
+
+fn isReservedTopLevelIndexSection(name: []const u8) bool {
+    return std.mem.eql(u8, name, "resolvers") or
+        std.mem.eql(u8, name, "enrichments");
+}
+
+fn isMetadataOnlyScalarIndexConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return false;
+    if (type_value != .string) return false;
+    return indexConfigTypeIsMetadataOnlyScalar(type_value.string);
+}
+
+fn indexConfigTypeIsMetadataOnlyScalar(type_name: []const u8) bool {
+    return std.mem.eql(u8, type_name, "scalar") or
+        std.mem.eql(u8, type_name, "path") or
+        std.mem.eql(u8, type_name, "secondary") or
+        std.mem.eql(u8, type_name, "keyword") or
+        std.mem.eql(u8, type_name, "numeric") or
+        std.mem.eql(u8, type_name, "boolean") or
+        std.mem.eql(u8, type_name, "datetime") or
+        std.mem.eql(u8, type_name, "term");
 }
 
 fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, value: std.json.Value) ![]u8 {

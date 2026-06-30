@@ -70,6 +70,23 @@ const hosted_freestanding_available_inference_modes = [_][]const u8{
 };
 
 pub const Capabilities = struct {
+    pub const Relational = struct {
+        tables: bool = true,
+        closed_schema_validation: bool = true,
+        local_schema_rewrite_jobs: bool = true,
+        portable_backup: bool = true,
+        transactions: []const u8 = "local",
+    };
+
+    pub const Sql = struct {
+        adapter: bool = true,
+        ddl: bool = true,
+        dml: bool = true,
+        sessions: bool = true,
+        document_tables: []const u8 = "read_only_planned",
+        embedded_exec: bool = true,
+    };
+
     freestanding_build: bool = builtin.os.tag == .freestanding,
     hosted_profile: bool = false,
     manual_maintenance: bool = false,
@@ -94,6 +111,8 @@ pub const Capabilities = struct {
     sparse_vector_search: bool = true,
     hybrid_search: bool = true,
     graph_search: bool = true,
+    relational: Relational = .{},
+    sql: Sql = .{},
     distributed_shard_ownership: bool = false,
     raft_replication: bool = false,
     cluster_placement: bool = false,
@@ -162,6 +181,8 @@ pub fn capabilitiesForProfile(profile: Profile) Capabilities {
         .sparse_vector_search = true,
         .hybrid_search = true,
         .graph_search = true,
+        .relational = .{},
+        .sql = .{},
         .distributed_shard_ownership = false,
         .raft_replication = false,
         .cluster_placement = false,

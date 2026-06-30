@@ -71,8 +71,8 @@ components:
 
     ResourceType:
       type: string
-      enum: ["table", "user", "*"]
-      description: "Type of the resource, e.g., table, user, or global ('*')."
+      enum: ["database", "namespace", "table", "tablespace", "user", "*"]
+      description: "Type of the resource, e.g., database, namespace, table, tablespace, user, or global ('*')."
       example: "table"
 
     PermissionType:

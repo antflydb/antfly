@@ -22,7 +22,7 @@ const generating = @import("antfly_generating");
 const platform_time = @import("../platform/time.zig");
 const query_api = @import("query.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("../common/json_helpers.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -37,6 +37,14 @@ const RetrievalAgentResult = metadata_openapi.RetrievalAgentResult;
 const RetrievalQueryRequest = metadata_openapi.RetrievalQueryRequest;
 const RetrievalStrategy = metadata_openapi.RetrievalStrategy;
 const TreeSearchConfig = metadata_openapi.TreeSearchConfig;
+
+fn testChatMessageText(message: generating.ChatMessage) []const u8 {
+    const content = message.content orelse return "";
+    return switch (content) {
+        .text => |text| text,
+        .parts => "",
+    };
+}
 
 const ToolPolicy = struct {
     global_tools: ?generating_api_openapi.ChatToolsConfig = null,
@@ -6331,17 +6339,17 @@ test "build generation messages includes tree hierarchy context" {
     });
 
     try std.testing.expectEqual(@as(usize, 2), messages.len);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Tree hierarchy context:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Tree roots=1, tree_hits=1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Selected tree branches:") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Branch 1 (root=doc:root, path=doc:root > doc:child > doc:leaf)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Summary: child") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "1. root=doc:root path=doc:root > doc:child > doc:leaf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Root doc:root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Path doc:root > doc:child") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Branch doc:root > doc:child > doc:leaf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Leaf true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Title child") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Tree hierarchy context:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Tree roots=1, tree_hits=1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Selected tree branches:") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Branch 1 (root=doc:root, path=doc:root > doc:child > doc:leaf)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Summary: child") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "1. root=doc:root path=doc:root > doc:child > doc:leaf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Root doc:root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Path doc:root > doc:child") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Branch doc:root > doc:child > doc:leaf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Leaf true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Title child") != null);
 }
 
 test "tree branch selection context ranks strongest branches first" {
@@ -6420,13 +6428,13 @@ test "generation messages keep only the strongest tree branches" {
         .generation_context = null,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:root > doc:a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:root > doc:b") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:root > doc:c") == null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Branch 1 (root=doc:root, path=doc:root > doc:a)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Branch 2 (root=doc:root, path=doc:root > doc:b)") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Summary: branch a") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "Summary: branch b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:root > doc:a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:root > doc:b") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:root > doc:c") == null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Branch 1 (root=doc:root, path=doc:root > doc:a)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Branch 2 (root=doc:root, path=doc:root > doc:b)") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Summary: branch a") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "Summary: branch b") != null);
 }
 
 test "generation messages prefer query-relevant tree branches" {
@@ -6477,9 +6485,9 @@ test "generation messages prefer query-relevant tree branches" {
         .generation_context = null,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:root > doc:payments") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "query_relevance=") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:root > doc:storage") == null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:root > doc:payments") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "query_relevance=") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:root > doc:storage") == null);
 }
 
 test "generation messages trim branch context after ancestor-first limit" {
@@ -6530,10 +6538,10 @@ test "generation messages trim branch context after ancestor-first limit" {
         .generation_context = null,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:root") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:child") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:grandchild") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:leaf") == null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:root") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:child") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:grandchild") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:leaf") == null);
 }
 
 test "generation messages expand branch when deeper node is query-relevant" {
@@ -6585,8 +6593,8 @@ test "generation messages expand branch when deeper node is query-relevant" {
         .generation_context = null,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "doc:leaf") != null);
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "payments rollout") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:leaf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "payments rollout") != null);
 }
 
 test "generation messages can expand to a deeply relevant descendant" {
@@ -6654,7 +6662,7 @@ test "generation messages can expand to a deeply relevant descendant" {
         .generation_context = null,
     });
 
-    try std.testing.expect(std.mem.indexOf(u8, messages[1].content, "id=doc:leaf") != null);
+    try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "id=doc:leaf") != null);
 }
 
 test "generation ordering prefers tree ancestors before leaves" {
@@ -8399,7 +8407,7 @@ test "retrieval agent supports generation step in phase 2" {
             try std.testing.expectEqual(@as(usize, 1), chain.len);
             try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
             try std.testing.expectEqual(generating.default_max_tokens, chain[0].generator.max_tokens);
-            try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "doc:a") != null);
+            try std.testing.expect(std.mem.indexOf(u8, testChatMessageText(messages[1]), "doc:a") != null);
             return .{
                 .content = try alloc.dupe(u8, "Generated answer citing doc:a"),
                 .allocator = alloc,

@@ -21,6 +21,7 @@ pub const Skill = struct {
     name: []const u8,
     description: []const u8,
     tags: []const []const u8 = &.{},
+    scopes: []const []const u8 = &.{},
 };
 
 pub const RequestContext = struct {
@@ -493,6 +494,9 @@ fn skillValue(alloc: std.mem.Allocator, skill: Skill) !std.json.Value {
     var tags = std.json.Array.init(alloc);
     for (skill.tags) |tag| try tags.append(.{ .string = tag });
 
+    var scopes = std.json.Array.init(alloc);
+    for (skill.scopes) |scope| try scopes.append(.{ .string = scope });
+
     var input_modes = std.json.Array.init(alloc);
     try input_modes.append(.{ .string = "text" });
     try input_modes.append(.{ .string = "data" });
@@ -502,6 +506,7 @@ fn skillValue(alloc: std.mem.Allocator, skill: Skill) !std.json.Value {
     try out.put(alloc, "name", .{ .string = skill.name });
     try out.put(alloc, "description", .{ .string = skill.description });
     try out.put(alloc, "tags", .{ .array = tags });
+    try out.put(alloc, "scopes", .{ .array = scopes });
     try out.put(alloc, "inputModes", .{ .array = input_modes });
     try out.put(alloc, "outputModes", try textDataModes(alloc));
     return .{ .object = out };
@@ -663,6 +668,7 @@ test "a2a agent card lists skills" {
     defer alloc.free(resp);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"protocolVersion\":\"0.3.0\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, resp, "\"id\":\"s\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, resp, "\"scopes\":[]") != null);
 }
 
 test "a2a maps malformed requests, unknown skills, and missing tasks to JSON-RPC errors" {

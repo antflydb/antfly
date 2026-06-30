@@ -14,9 +14,15 @@
 
 const std = @import("std");
 const schema_mod = @import("../schema/mod.zig");
+const runtime_schema = @import("../storage/schema.zig");
 
 pub const lifecycle = @import("lifecycle.zig");
+pub const sql_adapter = @import("sql_adapter.zig");
 pub const wasmtime_runtime = @import("wasmtime_runtime.zig");
+
+test {
+    _ = sql_adapter;
+}
 
 pub const manifest_api_version_v1 = "extensions/v1";
 pub const package_manifest_filename = "extension.json";
@@ -148,6 +154,7 @@ pub fn objectKindV1(kind: ExtensionObjectKind) bool {
         .mcp_tool,
         .skill,
         .agent,
+        .query_function,
         => true,
         else => false,
     };
@@ -163,6 +170,7 @@ pub const ExtensionObjectDecl = struct {
     pub fn validate(self: ExtensionObjectDecl) !void {
         try requireObjectName(self.name);
         try validateJsonObject("object.config_json", self.config_json);
+        if (self.kind == .query_function) try validateQueryFunctionConfig(self.config_json);
     }
 };
 
@@ -258,6 +266,7 @@ pub const PackageManifest = struct {
     kind: PackageKind = .extension,
     description: []const u8 = "",
     digest: []const u8 = "",
+    sql_names: []const []const u8 = &.{},
     antfly_min_version: []const u8 = "",
     antfly_max_version: []const u8 = "",
     trusted: bool = false,
@@ -273,6 +282,7 @@ pub const PackageManifest = struct {
         try requirePackageName(self.name);
         try requireName("package.version", self.version);
         try requireName("package.digest", self.digest);
+        for (self.sql_names) |sql_name| try requireObjectName(sql_name);
         if (self.kind != .extension) return error.UnsupportedPackageKind;
         for (self.capabilities_requested) |capability| try capability.validate();
         for (self.dependencies) |dependency| try dependency.validate();
@@ -470,6 +480,15 @@ pub const ExtensionDependency = struct {
         freeExtensionDependency(alloc, self.*);
         self.* = undefined;
     }
+};
+
+pub const QueryFunctionBinding = struct {
+    extension_name: []const u8,
+    object_name: []const u8,
+    sql_name: []const u8,
+    native_expression: []const u8,
+    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
 };
 
 pub const ExtensionCatalog = struct {
@@ -1078,6 +1097,40 @@ pub fn cloneExtensionDependencyAlloc(alloc: std.mem.Allocator, dependency: Exten
     return try cloneExtensionDependency(alloc, dependency);
 }
 
+pub fn listReadyNativeQueryFunctionBindingsAlloc(
+    alloc: std.mem.Allocator,
+    installed: []const InstalledExtension,
+    members: []const ExtensionMember,
+) ![]QueryFunctionBinding {
+    var out = std.ArrayListUnmanaged(QueryFunctionBinding).empty;
+    errdefer {
+        freeQueryFunctionBindingItems(alloc, out.items);
+        out.deinit(alloc);
+    }
+
+    for (members) |member| {
+        if (member.object_kind != .query_function) continue;
+        if (!readyInstalledExtensionExists(installed, member.extension_name)) continue;
+        try appendQueryFunctionBindingsForMember(alloc, &out, member);
+    }
+
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn freeQueryFunctionBindings(alloc: std.mem.Allocator, bindings: []QueryFunctionBinding) void {
+    freeQueryFunctionBindingItems(alloc, bindings);
+    if (bindings.len > 0) alloc.free(bindings);
+}
+
+fn freeQueryFunctionBindingItems(alloc: std.mem.Allocator, bindings: []QueryFunctionBinding) void {
+    for (bindings) |binding| {
+        alloc.free(@constCast(binding.extension_name));
+        alloc.free(@constCast(binding.object_name));
+        alloc.free(@constCast(binding.sql_name));
+        alloc.free(@constCast(binding.native_expression));
+    }
+}
+
 fn loadPackageStoreEntryAlloc(
     alloc: std.mem.Allocator,
     io: std.Io,
@@ -1182,6 +1235,100 @@ fn validateGrantedCapabilities(requested: []const Capability, grants: []const Ca
     }
 }
 
+fn readyInstalledExtensionExists(installed: []const InstalledExtension, extension_name: []const u8) bool {
+    for (installed) |extension| {
+        if (extension.status == .ready and std.mem.eql(u8, extension.name, extension_name)) return true;
+    }
+    return false;
+}
+
+fn appendQueryFunctionBindingsForMember(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(QueryFunctionBinding),
+    member: ExtensionMember,
+) !void {
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, member.owner_metadata_json, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidExtensionQueryFunction;
+    const native_expression = queryFunctionNativeExpression(parsed.value) orelse return error.InvalidExtensionQueryFunction;
+    const arity = try queryFunctionArity(parsed.value);
+    const expression_kind = queryFunctionNativeExpressionKind(native_expression) orelse return error.InvalidExtensionQueryFunction;
+    try validateQueryFunctionNativeExpressionArity(expression_kind, arity);
+    if (parsed.value.object.get("sql_names")) |sql_names| {
+        if (sql_names != .array or sql_names.array.items.len == 0) return error.InvalidExtensionQueryFunction;
+        for (sql_names.array.items) |sql_name_value| {
+            if (sql_name_value != .string) return error.InvalidExtensionQueryFunction;
+            try requireObjectName(sql_name_value.string);
+            try appendQueryFunctionBinding(alloc, out, member, sql_name_value.string, native_expression, expression_kind, arity);
+        }
+    } else {
+        try appendQueryFunctionBinding(alloc, out, member, member.object_name, native_expression, expression_kind, arity);
+    }
+}
+
+fn appendQueryFunctionBinding(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(QueryFunctionBinding),
+    member: ExtensionMember,
+    sql_name: []const u8,
+    native_expression: []const u8,
+    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
+) !void {
+    const extension_name = try alloc.dupe(u8, member.extension_name);
+    errdefer alloc.free(extension_name);
+    const object_name = try alloc.dupe(u8, member.object_name);
+    errdefer alloc.free(object_name);
+    const owned_sql_name = try alloc.dupe(u8, sql_name);
+    errdefer alloc.free(owned_sql_name);
+    const owned_native_expression = try alloc.dupe(u8, native_expression);
+    errdefer alloc.free(owned_native_expression);
+    try out.append(alloc, .{
+        .extension_name = extension_name,
+        .object_name = object_name,
+        .sql_name = owned_sql_name,
+        .native_expression = owned_native_expression,
+        .native_expression_kind = native_expression_kind,
+        .arity = arity,
+    });
+}
+
+fn queryFunctionNativeExpression(root: std.json.Value) ?[]const u8 {
+    const value = root.object.get("native_expression") orelse return null;
+    if (value != .string) return null;
+    if (queryFunctionNativeExpressionKind(value.string) == null) return null;
+    return value.string;
+}
+
+fn queryFunctionArity(root: std.json.Value) !u16 {
+    const value = root.object.get("arity") orelse return error.InvalidExtensionQueryFunction;
+    if (value != .integer or value.integer < 0 or value.integer > 16) return error.InvalidExtensionQueryFunction;
+    return @intCast(value.integer);
+}
+
+pub fn queryFunctionNativeExpressionKind(name: []const u8) ?runtime_schema.RelationalRowsExpressionKind {
+    if (std.mem.eql(u8, name, "uuid_v4")) return .uuid_v4;
+    if (std.mem.eql(u8, name, "md5")) return .md5;
+    if (std.mem.eql(u8, name, "lower")) return .lower;
+    if (std.mem.eql(u8, name, "upper")) return .upper;
+    if (std.mem.eql(u8, name, "concat")) return .concat;
+    if (std.mem.eql(u8, name, "concat_ws")) return .concat_ws;
+    return null;
+}
+
+pub fn validateQueryFunctionNativeExpressionArity(
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    arity: u16,
+) !void {
+    switch (kind) {
+        .uuid_v4 => if (arity != 0) return error.InvalidExtensionQueryFunction,
+        .md5, .lower, .upper => if (arity != 1) return error.InvalidExtensionQueryFunction,
+        .concat => if (arity < 1) return error.InvalidExtensionQueryFunction,
+        .concat_ws => if (arity < 2) return error.InvalidExtensionQueryFunction,
+        else => return error.InvalidExtensionQueryFunction,
+    }
+}
+
 fn memberFromShapeAlloc(
     alloc: std.mem.Allocator,
     extension_name: []const u8,
@@ -1234,7 +1381,9 @@ fn memberFromObjectAlloc(
     install: InstallManifest,
     object: ExtensionObjectDecl,
 ) !ExtensionMember {
-    const table_name = if (object.table_name.len > 0)
+    const table_name = if (object.kind == .query_function)
+        ""
+    else if (object.table_name.len > 0)
         object.table_name
     else if (scope.kind == .table)
         scope.table_name
@@ -1266,6 +1415,25 @@ fn cloneStrings(comptime T: type, alloc: std.mem.Allocator, values: []const T) !
     return out;
 }
 
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(value);
+    if (values.len > 0) alloc.free(values);
+}
+
 fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !PackageManifest {
     const manifest_api_version = try alloc.dupe(u8, package.manifest_api_version);
     errdefer alloc.free(manifest_api_version);
@@ -1277,6 +1445,8 @@ fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !Pac
     errdefer alloc.free(description);
     const digest = try alloc.dupe(u8, package.digest);
     errdefer alloc.free(digest);
+    const sql_names = try cloneStringSlice(alloc, package.sql_names);
+    errdefer freeStringSlice(alloc, sql_names);
     const antfly_min_version = try alloc.dupe(u8, package.antfly_min_version);
     errdefer alloc.free(antfly_min_version);
     const antfly_max_version = try alloc.dupe(u8, package.antfly_max_version);
@@ -1298,6 +1468,7 @@ fn clonePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) !Pac
         .kind = package.kind,
         .description = description,
         .digest = digest,
+        .sql_names = sql_names,
         .antfly_min_version = antfly_min_version,
         .antfly_max_version = antfly_max_version,
         .trusted = package.trusted,
@@ -1316,6 +1487,7 @@ fn freePackageManifest(alloc: std.mem.Allocator, package: PackageManifest) void 
     alloc.free(package.version);
     alloc.free(package.description);
     alloc.free(package.digest);
+    freeStringSlice(alloc, package.sql_names);
     alloc.free(package.antfly_min_version);
     alloc.free(package.antfly_max_version);
     freeCapabilities(alloc, package.capabilities_requested);
@@ -1696,6 +1868,25 @@ fn validateJsonObject(_: []const u8, value: []const u8) !void {
     }
 }
 
+fn validateQueryFunctionConfig(value: []const u8) !void {
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena.allocator(), value, .{});
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidExtensionQueryFunction;
+    const native_expression = queryFunctionNativeExpression(parsed.value) orelse return error.InvalidExtensionQueryFunction;
+    const expression_kind = queryFunctionNativeExpressionKind(native_expression) orelse return error.InvalidExtensionQueryFunction;
+    const arity = try queryFunctionArity(parsed.value);
+    try validateQueryFunctionNativeExpressionArity(expression_kind, arity);
+    if (parsed.value.object.get("sql_names")) |sql_names| {
+        if (sql_names != .array or sql_names.array.items.len == 0) return error.InvalidExtensionQueryFunction;
+        for (sql_names.array.items) |sql_name| {
+            if (sql_name != .string) return error.InvalidExtensionQueryFunction;
+            try requireObjectName(sql_name.string);
+        }
+    }
+}
+
 pub fn packageVersionLess(a: []const u8, b: []const u8) bool {
     var a_it = std.mem.splitScalar(u8, a, '.');
     var b_it = std.mem.splitScalar(u8, b, '.');
@@ -2041,6 +2232,63 @@ test "manifest-only install rejects v2 object kinds in v1 plan" {
         .{ .scope = .{ .kind = .cluster } },
         1234,
     ));
+}
+
+test "manifest-only query functions validate and expose ready native bindings" {
+    const package = PackageManifest{
+        .name = "pgcrypto",
+        .version = "1.0.0",
+        .digest = "sha256:pgcrypto",
+        .sql_names = &.{"pgcrypto"},
+        .install = .{
+            .scopes_supported = &.{.cluster},
+            .objects = &.{.{
+                .kind = .query_function,
+                .name = "gen_random_uuid",
+                .config_json = "{\"native_expression\":\"uuid_v4\",\"arity\":0,\"sql_names\":[\"gen_random_uuid\"]}",
+            }},
+        },
+    };
+
+    var plan = try planManifestOnlyInstallAlloc(
+        std.testing.allocator,
+        "pgcrypto",
+        package,
+        .{ .scope = .{ .kind = .cluster } },
+        1234,
+    );
+    defer plan.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), plan.members.len);
+    try std.testing.expectEqual(.query_function, plan.members[0].object_kind);
+    try std.testing.expectEqualStrings("gen_random_uuid", plan.members[0].object_name);
+    try std.testing.expectEqualStrings("", plan.members[0].table_name);
+
+    const bindings = try listReadyNativeQueryFunctionBindingsAlloc(std.testing.allocator, &.{plan.installed}, plan.members);
+    defer freeQueryFunctionBindings(std.testing.allocator, bindings);
+    try std.testing.expectEqual(@as(usize, 1), bindings.len);
+    try std.testing.expectEqualStrings("pgcrypto", bindings[0].extension_name);
+    try std.testing.expectEqualStrings("gen_random_uuid", bindings[0].sql_name);
+    try std.testing.expectEqualStrings("uuid_v4", bindings[0].native_expression);
+    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.uuid_v4, bindings[0].native_expression_kind);
+    try std.testing.expectEqual(@as(u16, 0), bindings[0].arity);
+
+    var disabled = plan.installed;
+    disabled.status = .disabled;
+    const disabled_bindings = try listReadyNativeQueryFunctionBindingsAlloc(std.testing.allocator, &.{disabled}, plan.members);
+    defer freeQueryFunctionBindings(std.testing.allocator, disabled_bindings);
+    try std.testing.expectEqual(@as(usize, 0), disabled_bindings.len);
+
+    try std.testing.expectError(error.InvalidExtensionQueryFunction, (ExtensionObjectDecl{
+        .kind = .query_function,
+        .name = "unsafe",
+        .config_json = "{\"native_expression\":\"shell_exec\",\"arity\":1}",
+    }).validate());
+    try std.testing.expectError(error.InvalidExtensionQueryFunction, (ExtensionObjectDecl{
+        .kind = .query_function,
+        .name = "wrong_arity",
+        .config_json = "{\"native_expression\":\"uuid_v4\",\"arity\":1}",
+    }).validate());
 }
 
 test "manifest-only table install rejects document shapes that are not table schemas" {

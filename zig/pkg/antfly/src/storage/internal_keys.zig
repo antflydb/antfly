@@ -18,10 +18,22 @@ const Allocator = std.mem.Allocator;
 pub const user_namespace: u8 = 0x01;
 pub const replay_namespace: u8 = 0x02;
 pub const identity_namespace: u8 = 0x03;
+pub const relational_column_index_namespace: u8 = 0x04;
+pub const relational_column_index_by_doc_namespace: u8 = 0x05;
+pub const relational_foreign_key_ref_namespace: u8 = 0x06;
+pub const relational_unique_namespace: u8 = 0x07;
+pub const relational_foreign_key_conflict_namespace: u8 = 0x08;
+pub const relational_array_element_index_namespace: u8 = 0x09;
+pub const relational_json_value_index_namespace: u8 = 0x0a;
+pub const relational_array_value_index_namespace: u8 = 0x0b;
+pub const relational_json_path_index_namespace: u8 = 0x0c;
+pub const relational_temporal_unique_namespace: u8 = 0x0d;
 pub const replay_all_kind: u8 = 0xfe;
 
 pub const primary_kind: u8 = 0x10;
 pub const ttl_kind: u8 = 0x11;
+pub const relational_row_kind: u8 = 0x12;
+pub const relational_column_kind: u8 = 0x13;
 pub const artifact_kind: u8 = 0x20;
 pub const chunk_record_kind: u8 = 0x30;
 pub const derived_embedding_kind: u8 = 0x31;
@@ -38,6 +50,8 @@ pub const ha_applied_lsn_key = [_]u8{ replay_namespace, 0xff, 0x04 };
 pub const artifact_presence_key = [_]u8{ replay_namespace, 0xff, 0x20 };
 pub const asset_artifact_source_index_kind: u8 = 0x21;
 pub const document_child_range_outbox_kind: u8 = 0x22;
+pub const relational_cte_spill_kind: u8 = 0x40;
+pub const relational_aggregate_spill_kind: u8 = 0x41;
 pub const identity_doc_to_ordinal_kind: u8 = 0x01;
 pub const identity_ordinal_to_doc_kind: u8 = 0x02;
 pub const identity_ordinal_state_kind: u8 = 0x03;
@@ -53,6 +67,25 @@ pub fn isInternalMetadataKey(key: []const u8) bool {
 
 pub fn isInternalUserKey(key: []const u8) bool {
     return key.len > 0 and key[0] == user_namespace;
+}
+
+pub fn isInternalPhysicalTableDataKey(key: []const u8) bool {
+    return isInternalUserKey(key) or isRelationalPhysicalTableDataKey(key);
+}
+
+pub fn isRelationalPhysicalTableDataKey(key: []const u8) bool {
+    return isRelationalRowKey(key) or
+        isRelationalColumnKey(key) or
+        isRelationalColumnIndexKey(key) or
+        isRelationalArrayElementIndexKey(key) or
+        isRelationalArrayValueIndexKey(key) or
+        isRelationalJsonValueIndexKey(key) or
+        isRelationalJsonPathIndexKey(key) or
+        isRelationalColumnIndexByDocKey(key) or
+        isRelationalForeignKeyRefKey(key) or
+        isRelationalUniqueKey(key) or
+        isRelationalTemporalUniqueKey(key) or
+        isRelationalForeignKeyConflictKey(key);
 }
 
 pub fn encodedBodyLen(bytes: []const u8) usize {
@@ -173,6 +206,353 @@ pub fn ttlKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
     try appendDocumentPrefix(&list, alloc, doc_key);
     try list.append(alloc, ttl_kind);
     return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalCteSpillPrefixAlloc(alloc: Allocator, spill_id: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_cte_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalCteSpillRowKeyAlloc(alloc: Allocator, spill_id: []const u8, row_index: u64) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_cte_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    const start = list.items.len;
+    try list.resize(alloc, start + @sizeOf(u64));
+    std.mem.writeInt(u64, list.items[start..][0..@sizeOf(u64)], row_index, .big);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalAggregateSpillPrefixAlloc(alloc: Allocator, spill_id: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_aggregate_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalAggregateDistinctSpillKeyAlloc(alloc: Allocator, spill_id: []const u8, distinct_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, replay_namespace);
+    try list.append(alloc, relational_aggregate_spill_kind);
+    try appendEncodedComponent(&list, alloc, spill_id);
+    try appendEncodedComponent(&list, alloc, distinct_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalRowKeyAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, relational_row_kind);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalColumnKeyAlloc(alloc: Allocator, doc_key: []const u8, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendDocumentPrefix(&list, alloc, doc_key);
+    try list.append(alloc, relational_column_kind);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalColumnIndexKeyAlloc(alloc: Allocator, column_path: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_column_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalColumnIndexPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_column_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayElementIndexKeyAlloc(alloc: Allocator, column_path: []const u8, element_key: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_element_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, element_key);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayElementIndexPrefixAlloc(alloc: Allocator, column_path: []const u8, element_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_element_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, element_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayElementIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_element_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayValueIndexKeyAlloc(alloc: Allocator, column_path: []const u8, array_key: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, array_key);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayValueIndexPrefixAlloc(alloc: Allocator, column_path: []const u8, array_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, array_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalArrayValueIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_array_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonValueIndexKeyAlloc(alloc: Allocator, column_path: []const u8, json_path: []const u8, value_key: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, json_path);
+    try appendEncodedComponent(&list, alloc, value_key);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonValueIndexPrefixAlloc(alloc: Allocator, column_path: []const u8, json_path: []const u8, value_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, json_path);
+    try appendEncodedComponent(&list, alloc, value_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonValueIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_value_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonPathIndexKeyAlloc(alloc: Allocator, column_path: []const u8, json_path: []const u8, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_path_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, json_path);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonPathIndexPrefixAlloc(alloc: Allocator, column_path: []const u8, json_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_path_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    try appendEncodedComponent(&list, alloc, json_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalJsonPathIndexColumnPrefixAlloc(alloc: Allocator, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_json_path_index_namespace);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalColumnIndexByDocKeyAlloc(alloc: Allocator, doc_key: []const u8, column_path: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_column_index_by_doc_namespace);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    try appendEncodedComponent(&list, alloc, column_path);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalColumnIndexByDocRangeLowerAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_column_index_by_doc_namespace);
+    const start = list.items.len;
+    try list.resize(alloc, start + encodedBodyLen(doc_key));
+    _ = encodeBody(list.items[start..], doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalColumnIndexByDocRangeUpperAlloc(alloc: Allocator, doc_key: []const u8) !?[]u8 {
+    if (doc_key.len == 0) {
+        return try alloc.dupe(u8, &[_]u8{relational_column_index_by_doc_namespace + 1});
+    }
+    const lower = try relationalColumnIndexByDocRangeLowerAlloc(alloc, doc_key);
+    errdefer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    alloc.free(lower);
+    return upper;
+}
+
+pub fn relationalForeignKeyRefKeyAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalForeignKeyParentPrefix(&list, alloc, constraint_name, parent_table, parent_key);
+    try appendEncodedComponent(&list, alloc, child_table);
+    try appendEncodedComponent(&list, alloc, child_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalForeignKeyRefParentPrefixAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalForeignKeyParentPrefix(&list, alloc, constraint_name, parent_table, parent_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalForeignKeyRefParentPrefixUpperAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) !?[]u8 {
+    const lower = try relationalForeignKeyRefParentPrefixAlloc(alloc, constraint_name, parent_table, parent_key);
+    errdefer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    alloc.free(lower);
+    return upper;
+}
+
+pub fn relationalUniqueKeyAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_unique_namespace);
+    try appendEncodedComponent(&list, alloc, constraint_name);
+    try appendEncodedComponent(&list, alloc, encoded_value);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalTemporalUniqueKeyAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    encoded_start: []const u8,
+    encoded_end: []const u8,
+    doc_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalTemporalUniquePrefix(&list, alloc, constraint_name, encoded_value);
+    try appendEncodedComponent(&list, alloc, encoded_start);
+    try appendEncodedComponent(&list, alloc, encoded_end);
+    try appendEncodedComponent(&list, alloc, doc_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalTemporalUniquePrefixAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try appendRelationalTemporalUniquePrefix(&list, alloc, constraint_name, encoded_value);
+    return try list.toOwnedSlice(alloc);
+}
+
+pub fn relationalTemporalUniquePrefixUpperAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !?[]u8 {
+    const lower = try relationalTemporalUniquePrefixAlloc(alloc, constraint_name, encoded_value);
+    errdefer alloc.free(lower);
+    const upper = try nextPrefixAlloc(alloc, lower);
+    alloc.free(lower);
+    return upper;
+}
+
+fn appendRelationalTemporalUniquePrefix(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+) !void {
+    try list.append(alloc, relational_temporal_unique_namespace);
+    try appendEncodedComponent(list, alloc, constraint_name);
+    try appendEncodedComponent(list, alloc, encoded_value);
+}
+
+pub fn relationalForeignKeyConflictKeyAlloc(
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) ![]u8 {
+    var list = std.ArrayListUnmanaged(u8).empty;
+    defer list.deinit(alloc);
+    try list.append(alloc, relational_foreign_key_conflict_namespace);
+    try appendEncodedComponent(&list, alloc, constraint_name);
+    try appendEncodedComponent(&list, alloc, parent_table);
+    try appendEncodedComponent(&list, alloc, parent_key);
+    return try list.toOwnedSlice(alloc);
+}
+
+fn appendRelationalForeignKeyParentPrefix(
+    list: *std.ArrayListUnmanaged(u8),
+    alloc: Allocator,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+) !void {
+    try list.append(alloc, relational_foreign_key_ref_namespace);
+    try appendEncodedComponent(list, alloc, constraint_name);
+    try appendEncodedComponent(list, alloc, parent_table);
+    try appendEncodedComponent(list, alloc, parent_key);
 }
 
 pub fn documentExactPrefixAlloc(alloc: Allocator, doc_key: []const u8) ![]u8 {
@@ -450,8 +830,400 @@ pub fn isTtlKey(key: []const u8) bool {
     return term + 3 == key.len and key[term + 2] == ttl_kind;
 }
 
+pub fn isRelationalRowKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const term = findComponentTerminator(key, 1) orelse return false;
+    return term + 3 == key.len and key[term + 2] == relational_row_kind;
+}
+
+pub fn isRelationalColumnKey(key: []const u8) bool {
+    if (!isInternalUserKey(key)) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    var pos = doc_term + 2;
+    if (pos >= key.len or key[pos] != relational_column_kind) return false;
+    pos += 1;
+    const column_term = findComponentTerminator(key, pos) orelse return false;
+    return column_term + 2 == key.len;
+}
+
+pub fn isRelationalColumnIndexKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_column_index_namespace) return false;
+    const column_term = findComponentTerminator(key, 1) orelse return false;
+    const doc_start = column_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
+}
+
+pub fn isRelationalArrayElementIndexKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_array_element_index_namespace) return false;
+    const column_term = findComponentTerminator(key, 1) orelse return false;
+    const element_start = column_term + 2;
+    const element_term = findComponentTerminator(key, element_start) orelse return false;
+    const doc_start = element_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
+}
+
+pub fn isRelationalArrayValueIndexKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_array_value_index_namespace) return false;
+    const column_term = findComponentTerminator(key, 1) orelse return false;
+    const value_start = column_term + 2;
+    const value_term = findComponentTerminator(key, value_start) orelse return false;
+    const doc_start = value_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
+}
+
+pub fn isRelationalJsonValueIndexKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_json_value_index_namespace) return false;
+    const column_term = findComponentTerminator(key, 1) orelse return false;
+    const path_start = column_term + 2;
+    const path_term = findComponentTerminator(key, path_start) orelse return false;
+    const value_start = path_term + 2;
+    const value_term = findComponentTerminator(key, value_start) orelse return false;
+    const doc_start = value_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
+}
+
+pub fn isRelationalJsonPathIndexKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_json_path_index_namespace) return false;
+    const column_term = findComponentTerminator(key, 1) orelse return false;
+    const path_start = column_term + 2;
+    const path_term = findComponentTerminator(key, path_start) orelse return false;
+    const doc_start = path_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
+}
+
+pub fn isRelationalColumnIndexByDocKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_column_index_by_doc_namespace) return false;
+    const doc_term = findComponentTerminator(key, 1) orelse return false;
+    const column_start = doc_term + 2;
+    const column_term = findComponentTerminator(key, column_start) orelse return false;
+    return column_term + 2 == key.len;
+}
+
+pub fn isRelationalForeignKeyRefKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_foreign_key_ref_namespace) return false;
+    const constraint_term = findComponentTerminator(key, 1) orelse return false;
+    const parent_table_start = constraint_term + 2;
+    const parent_table_term = findComponentTerminator(key, parent_table_start) orelse return false;
+    const parent_key_start = parent_table_term + 2;
+    const parent_key_term = findComponentTerminator(key, parent_key_start) orelse return false;
+    const child_table_start = parent_key_term + 2;
+    const child_table_term = findComponentTerminator(key, child_table_start) orelse return false;
+    const child_key_start = child_table_term + 2;
+    const child_key_term = findComponentTerminator(key, child_key_start) orelse return false;
+    return child_key_term + 2 == key.len;
+}
+
+pub fn isRelationalUniqueKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_unique_namespace) return false;
+    const constraint_term = findComponentTerminator(key, 1) orelse return false;
+    const value_start = constraint_term + 2;
+    const value_term = findComponentTerminator(key, value_start) orelse return false;
+    return value_term + 2 == key.len;
+}
+
+pub fn isRelationalTemporalUniqueKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_temporal_unique_namespace) return false;
+    const constraint_term = findComponentTerminator(key, 1) orelse return false;
+    const value_start = constraint_term + 2;
+    const value_term = findComponentTerminator(key, value_start) orelse return false;
+    const start_start = value_term + 2;
+    const start_term = findComponentTerminator(key, start_start) orelse return false;
+    const end_start = start_term + 2;
+    const end_term = findComponentTerminator(key, end_start) orelse return false;
+    const doc_start = end_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start) orelse return false;
+    return doc_term + 2 == key.len;
+}
+
+pub fn isRelationalForeignKeyConflictKey(key: []const u8) bool {
+    if (key.len == 0 or key[0] != relational_foreign_key_conflict_namespace) return false;
+    const constraint_term = findComponentTerminator(key, 1) orelse return false;
+    const parent_table_start = constraint_term + 2;
+    const parent_table_term = findComponentTerminator(key, parent_table_start) orelse return false;
+    const parent_key_start = parent_table_term + 2;
+    const parent_key_term = findComponentTerminator(key, parent_key_start) orelse return false;
+    return parent_key_term + 2 == key.len;
+}
+
+pub fn isStoredDocumentRowKey(key: []const u8) bool {
+    return isPrimaryDocumentKey(key) or isRelationalRowKey(key);
+}
+
 pub fn decodePrimaryDocumentKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
     if (!isPrimaryDocumentKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub fn decodeRelationalRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isRelationalRowKey(key)) return null;
+    const term = findComponentTerminator(key, 1).?;
+    return try decodeBodyAlloc(alloc, key[1..term]);
+}
+
+pub const RelationalColumnKey = struct {
+    doc_key: []u8,
+    column_path: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.column_path);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalColumnIndexKey = struct {
+    column_path: []u8,
+    doc_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.column_path);
+        alloc.free(self.doc_key);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalArrayElementIndexKey = struct {
+    column_path: []u8,
+    element_key: []u8,
+    doc_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.column_path);
+        alloc.free(self.element_key);
+        alloc.free(self.doc_key);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalArrayValueIndexKey = struct {
+    column_path: []u8,
+    array_key: []u8,
+    doc_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.column_path);
+        alloc.free(self.array_key);
+        alloc.free(self.doc_key);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalJsonValueIndexKey = struct {
+    column_path: []u8,
+    json_path: []u8,
+    value_key: []u8,
+    doc_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.column_path);
+        alloc.free(self.json_path);
+        alloc.free(self.value_key);
+        alloc.free(self.doc_key);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalJsonPathIndexKey = struct {
+    column_path: []u8,
+    json_path: []u8,
+    doc_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.column_path);
+        alloc.free(self.json_path);
+        alloc.free(self.doc_key);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalColumnIndexByDocKey = struct {
+    doc_key: []u8,
+    column_path: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.doc_key);
+        alloc.free(self.column_path);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalForeignKeyRefKey = struct {
+    constraint_name: []u8,
+    parent_table: []u8,
+    parent_key: []u8,
+    child_table: []u8,
+    child_key: []u8,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.constraint_name);
+        alloc.free(self.parent_table);
+        alloc.free(self.parent_key);
+        alloc.free(self.child_table);
+        alloc.free(self.child_key);
+        self.* = undefined;
+    }
+};
+
+pub fn decodeRelationalColumnKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalColumnKey {
+    if (!isRelationalColumnKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+    const column_start = doc_term + 3;
+    const column_term = findComponentTerminator(key, column_start).?;
+    const column_path = try decodeBodyAlloc(alloc, key[column_start..column_term]);
+    return .{
+        .doc_key = doc_key,
+        .column_path = column_path,
+    };
+}
+
+pub fn decodeRelationalColumnIndexKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalColumnIndexKey {
+    if (!isRelationalColumnIndexKey(key)) return null;
+    const column_term = findComponentTerminator(key, 1).?;
+    const column_path = try decodeBodyAlloc(alloc, key[1..column_term]);
+    errdefer alloc.free(column_path);
+    const doc_start = column_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[doc_start..doc_term]);
+    return .{
+        .column_path = column_path,
+        .doc_key = doc_key,
+    };
+}
+
+pub fn decodeRelationalArrayElementIndexKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalArrayElementIndexKey {
+    if (!isRelationalArrayElementIndexKey(key)) return null;
+    const column_term = findComponentTerminator(key, 1).?;
+    const column_path = try decodeBodyAlloc(alloc, key[1..column_term]);
+    errdefer alloc.free(column_path);
+    const element_start = column_term + 2;
+    const element_term = findComponentTerminator(key, element_start).?;
+    const element_key = try decodeBodyAlloc(alloc, key[element_start..element_term]);
+    errdefer alloc.free(element_key);
+    const doc_start = element_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[doc_start..doc_term]);
+    return .{
+        .column_path = column_path,
+        .element_key = element_key,
+        .doc_key = doc_key,
+    };
+}
+
+pub fn decodeRelationalArrayValueIndexKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalArrayValueIndexKey {
+    if (!isRelationalArrayValueIndexKey(key)) return null;
+    const column_term = findComponentTerminator(key, 1).?;
+    const column_path = try decodeBodyAlloc(alloc, key[1..column_term]);
+    errdefer alloc.free(column_path);
+    const value_start = column_term + 2;
+    const value_term = findComponentTerminator(key, value_start).?;
+    const array_key = try decodeBodyAlloc(alloc, key[value_start..value_term]);
+    errdefer alloc.free(array_key);
+    const doc_start = value_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[doc_start..doc_term]);
+    return .{
+        .column_path = column_path,
+        .array_key = array_key,
+        .doc_key = doc_key,
+    };
+}
+
+pub fn decodeRelationalJsonValueIndexKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalJsonValueIndexKey {
+    if (!isRelationalJsonValueIndexKey(key)) return null;
+    const column_term = findComponentTerminator(key, 1).?;
+    const column_path = try decodeBodyAlloc(alloc, key[1..column_term]);
+    errdefer alloc.free(column_path);
+    const path_start = column_term + 2;
+    const path_term = findComponentTerminator(key, path_start).?;
+    const json_path = try decodeBodyAlloc(alloc, key[path_start..path_term]);
+    errdefer alloc.free(json_path);
+    const value_start = path_term + 2;
+    const value_term = findComponentTerminator(key, value_start).?;
+    const value_key = try decodeBodyAlloc(alloc, key[value_start..value_term]);
+    errdefer alloc.free(value_key);
+    const doc_start = value_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[doc_start..doc_term]);
+    return .{
+        .column_path = column_path,
+        .json_path = json_path,
+        .value_key = value_key,
+        .doc_key = doc_key,
+    };
+}
+
+pub fn decodeRelationalJsonPathIndexKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalJsonPathIndexKey {
+    if (!isRelationalJsonPathIndexKey(key)) return null;
+    const column_term = findComponentTerminator(key, 1).?;
+    const column_path = try decodeBodyAlloc(alloc, key[1..column_term]);
+    errdefer alloc.free(column_path);
+    const path_start = column_term + 2;
+    const path_term = findComponentTerminator(key, path_start).?;
+    const json_path = try decodeBodyAlloc(alloc, key[path_start..path_term]);
+    errdefer alloc.free(json_path);
+    const doc_start = path_term + 2;
+    const doc_term = findComponentTerminator(key, doc_start).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[doc_start..doc_term]);
+    return .{
+        .column_path = column_path,
+        .json_path = json_path,
+        .doc_key = doc_key,
+    };
+}
+
+pub fn decodeRelationalColumnIndexByDocKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalColumnIndexByDocKey {
+    if (!isRelationalColumnIndexByDocKey(key)) return null;
+    const doc_term = findComponentTerminator(key, 1).?;
+    const doc_key = try decodeBodyAlloc(alloc, key[1..doc_term]);
+    errdefer alloc.free(doc_key);
+    const column_start = doc_term + 2;
+    const column_term = findComponentTerminator(key, column_start).?;
+    const column_path = try decodeBodyAlloc(alloc, key[column_start..column_term]);
+    return .{
+        .doc_key = doc_key,
+        .column_path = column_path,
+    };
+}
+
+pub fn decodeRelationalForeignKeyRefKeyAlloc(alloc: Allocator, key: []const u8) !?RelationalForeignKeyRefKey {
+    if (!isRelationalForeignKeyRefKey(key)) return null;
+    const constraint_term = findComponentTerminator(key, 1).?;
+    const constraint_name = try decodeBodyAlloc(alloc, key[1..constraint_term]);
+    errdefer alloc.free(constraint_name);
+    const parent_table_start = constraint_term + 2;
+    const parent_table_term = findComponentTerminator(key, parent_table_start).?;
+    const parent_table = try decodeBodyAlloc(alloc, key[parent_table_start..parent_table_term]);
+    errdefer alloc.free(parent_table);
+    const parent_key_start = parent_table_term + 2;
+    const parent_key_term = findComponentTerminator(key, parent_key_start).?;
+    const parent_key = try decodeBodyAlloc(alloc, key[parent_key_start..parent_key_term]);
+    errdefer alloc.free(parent_key);
+    const child_table_start = parent_key_term + 2;
+    const child_table_term = findComponentTerminator(key, child_table_start).?;
+    const child_table = try decodeBodyAlloc(alloc, key[child_table_start..child_table_term]);
+    errdefer alloc.free(child_table);
+    const child_key_start = child_table_term + 2;
+    const child_key_term = findComponentTerminator(key, child_key_start).?;
+    const child_key = try decodeBodyAlloc(alloc, key[child_key_start..child_key_term]);
+    return .{
+        .constraint_name = constraint_name,
+        .parent_table = parent_table,
+        .parent_key = parent_key,
+        .child_table = child_table,
+        .child_key = child_key,
+    };
+}
+
+pub fn decodeStoredDocumentRowKeyAlloc(alloc: Allocator, key: []const u8) !?[]u8 {
+    if (!isStoredDocumentRowKey(key)) return null;
     const term = findComponentTerminator(key, 1).?;
     return try decodeBodyAlloc(alloc, key[1..term]);
 }
@@ -1011,6 +1783,136 @@ test "internal key round trips adversarial document ids" {
         defer alloc.free(decoded);
         try std.testing.expectEqualSlices(u8, raw, decoded);
     }
+}
+
+test "relational row key shares document range but is not primary" {
+    const alloc = std.testing.allocator;
+    const raw = "doc\x00a";
+    const column_path = "metrics:amount\x00p95";
+
+    const primary = try documentKeyAlloc(alloc, raw);
+    defer alloc.free(primary);
+    const relational = try relationalRowKeyAlloc(alloc, raw);
+    defer alloc.free(relational);
+    const relational_column = try relationalColumnKeyAlloc(alloc, raw, column_path);
+    defer alloc.free(relational_column);
+    const relational_column_index = try relationalColumnIndexKeyAlloc(alloc, column_path, raw);
+    defer alloc.free(relational_column_index);
+    const relational_array_element_index = try relationalArrayElementIndexKeyAlloc(alloc, column_path, "hot\x00tag", raw);
+    defer alloc.free(relational_array_element_index);
+    const relational_array_value_index = try relationalArrayValueIndexKeyAlloc(alloc, column_path, "[hot\x00tag]", raw);
+    defer alloc.free(relational_array_value_index);
+    const relational_json_value_index = try relationalJsonValueIndexKeyAlloc(alloc, column_path, "attrs.plan", "\"pro\"", raw);
+    defer alloc.free(relational_json_value_index);
+    const relational_json_path_index = try relationalJsonPathIndexKeyAlloc(alloc, column_path, "attrs.plan", raw);
+    defer alloc.free(relational_json_path_index);
+    const relational_column_index_by_doc = try relationalColumnIndexByDocKeyAlloc(alloc, raw, column_path);
+    defer alloc.free(relational_column_index_by_doc);
+    const fk_ref = try relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a", "orders", raw);
+    defer alloc.free(fk_ref);
+    const unique = try relationalUniqueKeyAlloc(alloc, "orders_external_id_key", "external\x00a");
+    defer alloc.free(unique);
+    const temporal_unique = try relationalTemporalUniqueKeyAlloc(alloc, "prices_sku_valid_time_key", "sku\x00a", "10", "20", raw);
+    defer alloc.free(temporal_unique);
+    const fk_conflict = try relationalForeignKeyConflictKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a");
+    defer alloc.free(fk_conflict);
+    const fk_ref_prefix = try relationalForeignKeyRefParentPrefixAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a");
+    defer alloc.free(fk_ref_prefix);
+    const fk_ref_upper = (try relationalForeignKeyRefParentPrefixUpperAlloc(alloc, "orders_customer_id_fkey", "customers", "customer\x00a")).?;
+    defer alloc.free(fk_ref_upper);
+    const lower = try documentRangeLowerAlloc(alloc, "doc");
+    defer alloc.free(lower);
+    const upper = (try documentRangeUpperAlloc(alloc, "doc")).?;
+    defer alloc.free(upper);
+
+    try std.testing.expect(isPrimaryDocumentKey(primary));
+    try std.testing.expect(!isPrimaryDocumentKey(relational));
+    try std.testing.expect(isRelationalRowKey(relational));
+    try std.testing.expect(isStoredDocumentRowKey(relational));
+    try std.testing.expect(isRelationalColumnKey(relational_column));
+    try std.testing.expect(isRelationalColumnIndexKey(relational_column_index));
+    try std.testing.expect(isRelationalArrayElementIndexKey(relational_array_element_index));
+    try std.testing.expect(isRelationalArrayValueIndexKey(relational_array_value_index));
+    try std.testing.expect(isRelationalJsonValueIndexKey(relational_json_value_index));
+    try std.testing.expect(isRelationalJsonPathIndexKey(relational_json_path_index));
+    try std.testing.expect(isRelationalColumnIndexByDocKey(relational_column_index_by_doc));
+    try std.testing.expect(isRelationalForeignKeyRefKey(fk_ref));
+    try std.testing.expect(isRelationalUniqueKey(unique));
+    try std.testing.expect(isRelationalTemporalUniqueKey(temporal_unique));
+    try std.testing.expect(isRelationalForeignKeyConflictKey(fk_conflict));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_column));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_array_element_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_array_value_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_json_value_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_json_path_index));
+    try std.testing.expect(isInternalPhysicalTableDataKey(relational_column_index_by_doc));
+    try std.testing.expect(isInternalPhysicalTableDataKey(fk_ref));
+    try std.testing.expect(isInternalPhysicalTableDataKey(unique));
+    try std.testing.expect(isInternalPhysicalTableDataKey(temporal_unique));
+    try std.testing.expect(isInternalPhysicalTableDataKey(fk_conflict));
+    try std.testing.expect(!isInternalMetadataKey(relational_column_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_array_element_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_array_value_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_json_value_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_json_path_index));
+    try std.testing.expect(!isInternalMetadataKey(relational_column_index_by_doc));
+    try std.testing.expect(!isInternalMetadataKey(fk_ref));
+    try std.testing.expect(!isInternalMetadataKey(unique));
+    try std.testing.expect(!isInternalMetadataKey(temporal_unique));
+    try std.testing.expect(!isInternalMetadataKey(fk_conflict));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_column));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_column_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_array_element_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_array_value_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_json_value_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_json_path_index));
+    try std.testing.expect(!isStoredDocumentRowKey(relational_column_index_by_doc));
+    const decoded_relational = (try decodeStoredDocumentRowKeyAlloc(alloc, relational)).?;
+    defer alloc.free(decoded_relational);
+    try std.testing.expectEqualSlices(u8, raw, decoded_relational);
+    var decoded_column = (try decodeRelationalColumnKeyAlloc(alloc, relational_column)).?;
+    defer decoded_column.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, raw, decoded_column.doc_key);
+    try std.testing.expectEqualSlices(u8, column_path, decoded_column.column_path);
+    var decoded_column_index = (try decodeRelationalColumnIndexKeyAlloc(alloc, relational_column_index)).?;
+    defer decoded_column_index.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, raw, decoded_column_index.doc_key);
+    try std.testing.expectEqualSlices(u8, column_path, decoded_column_index.column_path);
+    var decoded_array_element_index = (try decodeRelationalArrayElementIndexKeyAlloc(alloc, relational_array_element_index)).?;
+    defer decoded_array_element_index.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, raw, decoded_array_element_index.doc_key);
+    try std.testing.expectEqualSlices(u8, column_path, decoded_array_element_index.column_path);
+    try std.testing.expectEqualSlices(u8, "hot\x00tag", decoded_array_element_index.element_key);
+    var decoded_json_value_index = (try decodeRelationalJsonValueIndexKeyAlloc(alloc, relational_json_value_index)).?;
+    defer decoded_json_value_index.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, raw, decoded_json_value_index.doc_key);
+    try std.testing.expectEqualSlices(u8, column_path, decoded_json_value_index.column_path);
+    try std.testing.expectEqualSlices(u8, "attrs.plan", decoded_json_value_index.json_path);
+    try std.testing.expectEqualSlices(u8, "\"pro\"", decoded_json_value_index.value_key);
+    var decoded_column_index_by_doc = (try decodeRelationalColumnIndexByDocKeyAlloc(alloc, relational_column_index_by_doc)).?;
+    defer decoded_column_index_by_doc.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, raw, decoded_column_index_by_doc.doc_key);
+    try std.testing.expectEqualSlices(u8, column_path, decoded_column_index_by_doc.column_path);
+    var decoded_fk_ref = (try decodeRelationalForeignKeyRefKeyAlloc(alloc, fk_ref)).?;
+    defer decoded_fk_ref.deinit(alloc);
+    try std.testing.expectEqualSlices(u8, "orders_customer_id_fkey", decoded_fk_ref.constraint_name);
+    try std.testing.expectEqualSlices(u8, "customers", decoded_fk_ref.parent_table);
+    try std.testing.expectEqualSlices(u8, "customer\x00a", decoded_fk_ref.parent_key);
+    try std.testing.expectEqualSlices(u8, "orders", decoded_fk_ref.child_table);
+    try std.testing.expectEqualSlices(u8, raw, decoded_fk_ref.child_key);
+    try std.testing.expect(std.mem.startsWith(u8, fk_ref, fk_ref_prefix));
+    try std.testing.expect(std.mem.order(u8, fk_ref_prefix, fk_ref) != .gt);
+    try std.testing.expect(std.mem.order(u8, fk_ref, fk_ref_upper) == .lt);
+    try std.testing.expect(std.mem.order(u8, lower, relational) != .gt);
+    try std.testing.expect(std.mem.order(u8, relational, upper) == .lt);
+    try std.testing.expect(std.mem.order(u8, lower, relational_column) != .gt);
+    try std.testing.expect(std.mem.order(u8, relational_column, upper) == .lt);
+    try std.testing.expect(relational_column_index[0] == relational_column_index_namespace);
+    try std.testing.expect(relational_array_element_index[0] == relational_array_element_index_namespace);
+    try std.testing.expect(relational_column_index_by_doc[0] == relational_column_index_by_doc_namespace);
+    try std.testing.expect(fk_ref[0] == relational_foreign_key_ref_namespace);
 }
 
 test "internal key binary prefix bounds select only matching document ids" {

@@ -281,12 +281,26 @@ pub const StdHttpListener = struct {
             }
             return;
         };
-        self.handleRequest(&request) catch |err| {
-            std.log.err("http request handler error: {}", .{err});
-            _ = request.respond("internal server error", .{
-                .status = .internal_server_error,
-                .keep_alive = false,
-            }) catch {};
+        self.serveRequest(&request);
+    }
+
+    fn serveRequest(self: *StdHttpListener, request: *std.http.Server.Request) void {
+        self.handleRequest(request) catch |err| {
+            switch (err) {
+                error.NotFound => {
+                    _ = request.respond("not found", .{
+                        .status = .not_found,
+                        .keep_alive = false,
+                    }) catch {};
+                },
+                else => {
+                    std.log.err("http request handler error: {}", .{err});
+                    _ = request.respond("internal server error", .{
+                        .status = .internal_server_error,
+                        .keep_alive = false,
+                    }) catch {};
+                },
+            }
         };
     }
 
@@ -913,6 +927,47 @@ test "std http listener can stream a chunked response through optional executor"
     try std.testing.expect(std.mem.indexOf(u8, output, "transfer-encoding: chunked\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "content-type: text/event-stream\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "event: message\ndata: {\"ok\":true}\n\n") != null);
+}
+
+test "std http listener maps bubbled not found to 404" {
+    const App = struct {
+        fn iface(self: *@This()) common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: common.HttpRequest) !common.HttpResponse {
+            return error.NotFound;
+        }
+    };
+
+    var input_reader: std.Io.Reader = .fixed(
+        "GET /missing HTTP/1.1\r\n" ++
+            "Host: localhost\r\n" ++
+            "\r\n",
+    );
+    var output_buffer: [1024]u8 = undefined;
+    var output_writer: std.Io.Writer = .fixed(&output_buffer);
+    var server: std.http.Server = .init(&input_reader, &output_writer);
+    var request = try server.receiveHead();
+    var app = App{};
+
+    var listener: StdHttpListener = .{
+        .alloc = std.testing.allocator,
+        .cfg = .{},
+        .app = app.iface(),
+        .io_impl = undefined,
+        .io_owner = .shared,
+    };
+
+    listener.serveRequest(&request);
+    const output = output_writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, output, "HTTP/1.1 404 Not Found\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "not found") != null);
 }
 
 test "std http listener caps active connection handoff threads" {

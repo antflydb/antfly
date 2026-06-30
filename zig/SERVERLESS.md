@@ -450,6 +450,10 @@ coverage green after each slice.
 
 ## Current Execution Priorities
 
+Release blockers and transient CI bugs are not tracked in this document. With
+main and this PR assumed green, the remaining serverless work is product and
+architecture convergence.
+
 The bootstrap/objectstore/control-plane seam is in decent shape. The next
 priority is no longer basic end-to-end publication scaffolding. The next
 priority is making the published read path and runtime model look like a real
@@ -479,21 +483,36 @@ What is already in decent shape:
 - bootstrap validation
 - `GET /health`, `GET /status`, and `GET /metrics`
 - URI-driven backend config for `file://`, `s3://`, and `gs://`
+- local query cache, compaction, and query-only runtime-role wiring now exist
+  as implementation foundations rather than as first-bring-up tasks
 
 Execute the next tranche in this order:
 
-1. finish real indexed-reader execution and the query request model
-2. finish local query cache under `pkg/antfly/src/serverless/query/`
-3. finish compaction that produces optimized published artifacts
-4. harden publish/prune concurrency and crash/retry behavior
-5. split query runtime from maintenance runtime roles
-6. only then package with operator/proxy deployment patterns
+1. make the published read/search path operationally credible:
+   - avoid full document-state reconstruction per query where the published
+     artifacts can answer directly
+   - keep text, sparse, dense, and graph readers aligned with the table-facing
+     query contract
+   - preserve explicit freshness modes instead of silently mixing published and
+     latest/exact-read semantics
+2. harden publication and retention under real object-store conditions:
+   - concurrent publish/prune behavior
+   - crash/retry and idempotent publish recovery
+   - remote backend parity for file/S3/GCS-style stores
+   - cache invalidation when published heads advance
+3. finish table-centric lifecycle parity:
+   - schema / `read_schema` migration cutover
+   - richer index status during pending rebuild/publication windows
+   - concrete chunk/enrichment publication actions rather than family-level
+     inference
+4. separate public and internal HTTP surfaces where the current shared server
+   shape still makes product/provider boundaries blurry
+5. only then package operator/proxy deployment patterns
 
-After that, keep retrieval as the first-class product until the published
-text/sparse/dense path is operationally credible. Then finish graph as a
-read-mostly immutable published artifact family under
-`pkg/antfly/src/serverless/*`, and only add narrow conditional write semantics
-if the product needs them.
+Retrieval should remain the first-class product lane until published text,
+sparse, dense, and graph reads are credible under immutable artifacts and remote
+object stores. Conditional write semantics should stay narrow and explicit
+unless the product needs stronger serverless write visibility.
 
 ## Current Reusable Pieces
 

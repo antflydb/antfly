@@ -15,13 +15,18 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const antfly_benches_build = @import("pkg/antfly/build/benches.zig");
+const antfly_capi_build = @import("pkg/antfly/build/capi.zig");
+const antfly_conformance_build = @import("pkg/antfly/build/conformance.zig");
 const antfly_embedded_build = @import("pkg/antfly/build/embedded.zig");
+const antfly_generated_build = @import("pkg/antfly/build/generated.zig");
+const antfly_inference_build = @import("pkg/antfly/build/inference.zig");
+const antfly_lite_build = @import("pkg/antfly/build/lite.zig");
 const antfly_storage_build = @import("pkg/antfly/build/storage.zig");
 const antfly_tests_build = @import("pkg/antfly/build/tests.zig");
+const antfly_tools_build = @import("pkg/antfly/build/tools.zig");
 const inference_runtime_build = @import("pkg/inference/build/runtime.zig");
 
 const LmdbBackend = antfly_storage_build.LmdbBackend;
-const chainLabeledFilteredTests = antfly_tests_build.chainLabeledFilteredTests;
 const chainLabeledRun = antfly_tests_build.chainLabeledRun;
 const configureEmbeddedModule = antfly_embedded_build.configureModule;
 const lmdb_c_flags = antfly_storage_build.lmdb_c_flags;
@@ -36,38 +41,22 @@ const BuildEdition = enum {
     inference,
 };
 
-const snowball_languages = [_][]const u8{
-    "danish",
-    "dutch",
-    "finnish",
-    "french",
-    "german",
-    "italian",
-    "norwegian",
-    "portuguese",
-    "spanish",
-    "swedish",
-};
+fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
+    for (dependencies) |dependency| {
+        step.dependOn(dependency);
+    }
+}
 
-const snowball_generated_root = "pkg/antfly/src/search/snowball/generated";
+fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
+    run.has_side_effects = true;
+    run.expectExitCode(0);
+    run.expectStdErrMatch("");
+    return &run.step;
+}
 
-const snowball_compiler_sources = [_][]const u8{
-    "compiler/analyser.c",
-    "compiler/driver.c",
-    "compiler/generator.c",
-    "compiler/generator_ada.c",
-    "compiler/generator_csharp.c",
-    "compiler/generator_dart.c",
-    "compiler/generator_go.c",
-    "compiler/generator_java.c",
-    "compiler/generator_js.c",
-    "compiler/generator_pascal.c",
-    "compiler/generator_php.c",
-    "compiler/generator_python.c",
-    "compiler/generator_rust.c",
-    "compiler/generator_zig.c",
-    "compiler/space.c",
-    "compiler/tokeniser.c",
+const FfmpegPaths = struct {
+    include_dir: []const u8,
+    lib_dir: []const u8,
 };
 
 fn pathExists(b: *std.Build, path: []const u8) bool {
@@ -86,175 +75,6 @@ fn addMacosSdkPaths(b: *std.Build, module: *std.Build.Module, target: std.Build.
     module.addLibraryPath(.{ .cwd_relative = b.fmt("{s}/usr/lib", .{sdk_root}) });
     module.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{sdk_root}) });
 }
-
-fn addScriptsPythonCommand(b: *std.Build, script_path: []const u8, args: []const []const u8) *std.Build.Step.Run {
-    const run = b.addSystemCommand(&.{
-        "uv",
-        "run",
-        "--project",
-        "../scripts",
-        "--locked",
-        "python",
-    });
-    run.addFileArg(b.path(script_path));
-    run.addArgs(args);
-    return run;
-}
-
-const openapi_join_input_paths = [_][]const u8{
-    "../scripts/join_openapi.py",
-    "../scripts/openapi_joiner.py",
-    "../specs/openapi/antfly/audio.yaml",
-    "../specs/openapi/antfly/chunking.yaml",
-    "../specs/openapi/antfly/config.yaml",
-    "../specs/openapi/antfly/embeddings.yaml",
-    "../specs/openapi/antfly/eval.yaml",
-    "../specs/openapi/antfly/generating.yaml",
-    "../specs/openapi/antfly/metadata.yaml",
-    "../specs/openapi/antfly/query.yaml",
-    "../specs/openapi/antfly/reranking.yaml",
-    "../specs/openapi/antfly/websearch.yaml",
-    "../specs/openapi/auth/api.yaml",
-    "../specs/openapi/extensions/api.yaml",
-    "../specs/openapi/inference/api.yaml",
-    "../specs/openapi/inference/config.yaml",
-    "../specs/openapi/shared/generating.yaml",
-    "../specs/openapi/antfly/schema.yaml",
-    "../specs/openapi/antfly/indexes.yaml",
-};
-
-fn addOpenApiJoinInputs(b: *std.Build, run: *std.Build.Step.Run) void {
-    for (openapi_join_input_paths) |path| {
-        run.addFileInput(b.path(path));
-    }
-}
-
-const inference_delegated_steps = [_][]const u8{
-    "run",
-    "finetune",
-    "bench-paged-attention",
-    "bench-training",
-    "bench-linalg",
-    "bench-audio",
-    "bench-gliner2-native",
-    "gliner2-production-readiness",
-    "test-finetune",
-    "test",
-    "wasm",
-};
-
-const DelegatedPackageStep = struct {
-    run: *std.Build.Step.Run,
-    step: *std.Build.Step,
-};
-
-const DelegatedInferenceBuildSteps = struct {
-    inference_test: *std.Build.Step,
-    inference_finetune_test: *std.Build.Step,
-};
-
-fn dependOnAll(step: *std.Build.Step, dependencies: []const *std.Build.Step) void {
-    for (dependencies) |dependency| {
-        step.dependOn(dependency);
-    }
-}
-
-fn addDelegatedPackageStep(
-    b: *std.Build,
-    package_step_prefix: []const u8,
-    package_dir: []const u8,
-    step_name: []const u8,
-    package_name: []const u8,
-) DelegatedPackageStep {
-    const run = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "build",
-        step_name,
-    });
-    run.setCwd(b.path(package_dir));
-    const delegated = b.step(
-        b.fmt("{s}-{s}", .{ package_step_prefix, step_name }),
-        b.fmt("Delegate to {s} zig build {s}", .{ package_name, step_name }),
-    );
-    delegated.dependOn(&run.step);
-    return .{
-        .run = run,
-        .step = delegated,
-    };
-}
-
-fn forwardBuildArgs(b: *std.Build, run: *std.Build.Step.Run) void {
-    if (b.args) |args| {
-        run.addArg("--");
-        run.addArgs(args);
-    }
-}
-
-fn addDelegatedInferenceOptions(
-    b: *std.Build,
-    run: *std.Build.Step.Run,
-    enable_metal: bool,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-    enable_cuda: bool,
-    cuda_artifacts: []const u8,
-    enable_system_blas: bool,
-    blas_root: ?[]const u8,
-) void {
-    run.addArg("-Dshared-lib-root=../..");
-    run.addArg(if (enable_metal) "-Dmetal=true" else "-Dmetal=false");
-    run.addArg(if (enable_onnx) "-Donnx=true" else "-Donnx=false");
-    if (enable_onnx) {
-        run.addArg(b.fmt("-Donnx-root={s}", .{onnx_root}));
-    }
-    run.addArg(if (enable_cuda) "-Dcuda=true" else "-Dcuda=false");
-    run.addArg(b.fmt("-Dcuda-artifacts={s}", .{cuda_artifacts}));
-    run.addArg(if (enable_system_blas) "-Dsystem-blas=true" else "-Dsystem-blas=false");
-    if (enable_system_blas) {
-        if (blas_root) |root| run.addArg(b.fmt("-Dblas-root={s}", .{root}));
-    }
-}
-
-fn expectQuietSuccess(run: *std.Build.Step.Run) *std.Build.Step {
-    run.has_side_effects = true;
-    run.expectExitCode(0);
-    run.expectStdErrMatch("");
-    return &run.step;
-}
-
-fn addDelegatedInferenceBuildSteps(
-    b: *std.Build,
-    enable_metal: bool,
-    enable_onnx: bool,
-    onnx_root: []const u8,
-    enable_cuda: bool,
-    cuda_artifacts: []const u8,
-    enable_system_blas: bool,
-    blas_root: ?[]const u8,
-) DelegatedInferenceBuildSteps {
-    var test_step: ?*std.Build.Step = null;
-    var finetune_test_step: ?*std.Build.Step = null;
-    for (inference_delegated_steps) |step_name| {
-        const delegated = addDelegatedPackageStep(b, "inference", "pkg/inference", step_name, "pkg/inference");
-        const run = delegated.run;
-        addDelegatedInferenceOptions(b, run, enable_metal, enable_onnx, onnx_root, enable_cuda, cuda_artifacts, enable_system_blas, blas_root);
-        forwardBuildArgs(b, run);
-        if (std.mem.eql(u8, step_name, "test")) {
-            test_step = delegated.step;
-        } else if (std.mem.eql(u8, step_name, "test-finetune")) {
-            finetune_test_step = delegated.step;
-        }
-    }
-    return .{
-        .inference_test = test_step.?,
-        .inference_finetune_test = finetune_test_step.?,
-    };
-}
-
-const FfmpegPaths = struct {
-    include_dir: []const u8,
-    lib_dir: []const u8,
-};
 
 const SpngPaths = struct {
     include_dir: []const u8,
@@ -332,61 +152,6 @@ fn detectSpngPaths(b: *std.Build, target: std.Build.ResolvedTarget) ?SpngPaths {
         if (pathExists(b, header) and (pathExists(b, dylib) or pathExists(b, so) or pathExists(b, static_lib))) return candidate;
     }
     return null;
-}
-
-fn addLocalSentencePieceProtoModule(
-    b: *std.Build,
-    protobuf_dep: *std.Build.Dependency,
-) *std.Build.Module {
-    const codegen = b.addRunArtifact(protobuf_dep.artifact("protoc-zig"));
-    codegen.addArg("--desc");
-    codegen.addFileArg(b.path("lib/tokenizer/proto/sentencepiece_model.desc"));
-    codegen.addArg("--output");
-    const raw_dir = codegen.addOutputDirectoryArg("sentencepiece_proto_raw");
-
-    const fixup_tool = b.addExecutable(.{
-        .name = "patch_sentencepiece_proto",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/inference/tools/patch_sentencepiece_proto.zig"),
-            .target = b.graph.host,
-            .optimize = .ReleaseSafe,
-        }),
-    });
-    const fixup_run = b.addRunArtifact(fixup_tool);
-    fixup_run.addFileArg(raw_dir.path(b, "root.zig"));
-    fixup_run.addFileArg(raw_dir.path(b, "sentencepiece.zig"));
-    const gen_dir = fixup_run.addOutputDirectoryArg("sentencepiece_proto");
-
-    const mod = b.createModule(.{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-    mod.addImport("protobuf", protobuf_dep.module("protobuf"));
-    return mod;
-}
-
-fn addLocalOpenApiCodegen(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Step.Compile {
-    const openapi_mod = b.createModule(.{
-        .root_source_file = b.path("lib/openapi/src/openapi.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-
-    const exe = b.addExecutable(.{
-        .name = "openapi-zig",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/openapi/src/main.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    exe.root_module.addImport("openapi", openapi_mod);
-    exe.root_module.addImport("httpx", httpx_mod);
-    return exe;
 }
 
 fn addLocalHttpxModule(
@@ -533,7 +298,7 @@ const AntflyRootImports = struct {
         .{ .name = "antfly_platform", .field = "platform" },
     };
 
-    fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
+    pub fn configure(self: @This(), b: *std.Build, mod: *std.Build.Module, include_lmdb_c: bool, link_libc: bool) void {
         mod.addOptions("build_options", self.build_options);
         inline for (import_table) |entry| {
             mod.addImport(entry.name, @field(self, entry.field));
@@ -552,504 +317,19 @@ const AntflyRootImports = struct {
 
 fn addSnowballModule(b: *std.Build, lib_mod: *std.Build.Module) void {
     const snowball_mod = b.addModule("snowball", .{
-        .root_source_file = b.path(snowball_generated_root ++ "/root.zig"),
+        .root_source_file = b.path(antfly_generated_build.snowball_generated_root ++ "/root.zig"),
     });
 
     lib_mod.addImport("snowball", snowball_mod);
 }
 
-fn snowballGeneratedPath(b: *std.Build, comptime fmt: []const u8, args: anytype) []const u8 {
-    return b.fmt(snowball_generated_root ++ "/" ++ fmt, args);
-}
-
-fn snowballRootContents(b: *std.Build) []const u8 {
-    const fragments = b.allocator.alloc([]const u8, 1 + snowball_languages.len) catch @panic("OOM");
-    fragments[0] =
-        "pub const Env = @import(\"env.zig\").Env;\n" ++
-        "pub const Among = @import(\"env.zig\").Among;\n";
-    for (snowball_languages, 0..) |lang, idx| {
-        fragments[1 + idx] = b.fmt("pub const {s} = @import(\"{s}_stemmer.zig\");\n", .{ lang, lang });
-    }
-    return std.mem.concat(b.allocator, u8, fragments) catch @panic("OOM");
-}
-
-fn addSnowballCompiler(b: *std.Build) *std.Build.Step.Compile {
-    const snowball_dep = b.path("deps/snowball");
-
-    const snowball_compiler = b.addExecutable(.{
-        .name = "snowball",
-        .root_module = b.createModule(.{
-            .root_source_file = null,
-            .target = b.graph.host,
-        }),
-    });
-    snowball_compiler.root_module.link_libc = true;
-    for (snowball_compiler_sources) |src| {
-        snowball_compiler.root_module.addCSourceFiles(.{
-            .root = snowball_dep,
-            .files = &.{src},
-            .flags = &.{ "-O2", "-W", "-Wall" },
-        });
-    }
-
-    return snowball_compiler;
-}
-
-fn addFileCompareTool(b: *std.Build) *std.Build.Step.Compile {
-    return b.addExecutable(.{
-        .name = "check-files-equal",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("tools/check_files_equal.zig"),
-            .target = b.graph.host,
-        }),
-    });
-}
-
-fn addSnowballGeneratedOutputs(
-    b: *std.Build,
-    snowball_compiler: *std.Build.Step.Compile,
-) struct {
-    root: std.Build.LazyPath,
-    env: std.Build.LazyPath,
-    stemmers: [snowball_languages.len]std.Build.LazyPath,
-} {
-    const snowball_dep = b.path("deps/snowball");
-
-    const wf = b.addWriteFiles();
-    const root = wf.add("root.zig", snowballRootContents(b));
-    const env = wf.addCopyFile(snowball_dep.path(b, "zig/env.zig"), "env.zig");
-
-    var stemmers: [snowball_languages.len]std.Build.LazyPath = undefined;
-    inline for (snowball_languages, 0..) |lang, idx| {
-        const run = b.addRunArtifact(snowball_compiler);
-        run.addFileArg(snowball_dep.path(b, b.fmt("algorithms/{s}.sbl", .{lang})));
-        run.addArg("-zig");
-        run.addArg("-o");
-        stemmers[idx] = run.addOutputFileArg(b.fmt("{s}_stemmer.zig", .{lang}));
-    }
-
-    return .{
-        .root = root,
-        .env = env,
-        .stemmers = stemmers,
-    };
-}
-
-fn addSnowballRegenStep(b: *std.Build) void {
-    const regen_step = b.step("regen-snowball", "Regenerate checked-in Zig Snowball stemmers");
-    const snowball_compiler = addSnowballCompiler(b);
-    const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
-
-    const update = b.addUpdateSourceFiles();
-    update.addCopyFileToSource(generated.root, snowball_generated_root ++ "/root.zig");
-    update.addCopyFileToSource(generated.env, snowball_generated_root ++ "/env.zig");
-    for (snowball_languages, 0..) |lang, idx| {
-        update.addCopyFileToSource(generated.stemmers[idx], snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang}));
-    }
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        snowball_generated_root,
-    });
-    fmt.step.dependOn(&update.step);
-    regen_step.dependOn(&fmt.step);
-}
-
-fn addSnowballCheckStep(b: *std.Build) void {
-    const check_step = b.step("check-snowball", "Check checked-in Zig Snowball stemmers are current");
-    const snowball_compiler = addSnowballCompiler(b);
-    const generated = addSnowballGeneratedOutputs(b, snowball_compiler);
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-    });
-    fmt.addFileArg(generated.root);
-    fmt.addFileArg(generated.env);
-    for (snowball_languages, 0..) |_, idx| {
-        fmt.addFileArg(generated.stemmers[idx]);
-    }
-
-    const compare_tool = addFileCompareTool(b);
-    const compare = b.addRunArtifact(compare_tool);
-    compare.step.dependOn(&fmt.step);
-    compare.addFileArg(generated.root);
-    compare.addFileArg(b.path(snowball_generated_root ++ "/root.zig"));
-    compare.addFileArg(generated.env);
-    compare.addFileArg(b.path(snowball_generated_root ++ "/env.zig"));
-    for (snowball_languages, 0..) |lang, idx| {
-        compare.addFileArg(generated.stemmers[idx]);
-        compare.addFileArg(b.path(snowballGeneratedPath(b, "{s}_stemmer.zig", .{lang})));
-    }
-    check_step.dependOn(&compare.step);
-}
-
-fn addOpenApiModuleFromYamlPath(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Module {
-    _ = target;
-    _ = optimize;
-
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
-
-    return b.addModule(package_name, .{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-}
-
-fn addYamlOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: []const u8,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Module {
-    return addOpenApiModuleFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        b.path(source_path),
-        package_name,
-        output_dir_name,
-        generate_what,
-        import_mappings,
-    );
-}
-
-fn addOpenApiRootCheckStep(b: *std.Build) *std.Build.Step.Run {
-    const check = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{"--compare"});
-    addOpenApiJoinInputs(b, check);
-    check.addFileArg(b.path("../openapi.yaml"));
-    return check;
-}
-
-fn addJoinedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
-    const join = addScriptsPythonCommand(b, "../scripts/join_openapi.py", &.{"--joined-only"});
-    addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg("openapi.public.joined.yaml");
-}
-
-fn addPrefixedPublicOpenApiSpec(b: *std.Build) std.Build.LazyPath {
-    const join = addScriptsPythonCommand(b, "../scripts/join_public_openapi.py", &.{});
-    addOpenApiJoinInputs(b, join);
-    return join.addOutputFileArg("openapi.public.prefixed.yaml");
-}
-
-fn addPublicOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-) *std.Build.Module {
-    return addOpenApiModuleFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        addJoinedPublicOpenApiSpec(b),
-        "antfly_public_openapi",
-        "antfly_public_openapi",
-        "types,extractors",
-        &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        },
-    );
-}
-
-fn addPublicClientOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    return addOpenApiModuleWithHttpxFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        addPrefixedPublicOpenApiSpec(b),
-        "antfly_client_openapi",
-        "antfly_client_openapi",
-        "types,client",
-        &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        },
-        httpx_mod,
-    );
-}
-
-/// Like addYamlOpenApiModule but also wires in httpx for client generation.
-fn addOpenApiModuleWithHttpxFromYamlPath(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    _ = target;
-    _ = optimize;
-
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{output_dir_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{"--output"});
-    const gen_dir = codegen.addOutputDirectoryArg(output_dir_name);
-
-    const mod = b.addModule(package_name, .{
-        .root_source_file = gen_dir.path(b, "root.zig"),
-    });
-    mod.addImport("httpx", httpx_mod);
-    return mod;
-}
-
-fn addYamlOpenApiModuleWithHttpx(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: []const u8,
-    package_name: []const u8,
-    output_dir_name: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    return addOpenApiModuleWithHttpxFromYamlPath(
-        b,
-        target,
-        optimize,
-        openapi_codegen,
-        b.path(source_path),
-        package_name,
-        output_dir_name,
-        generate_what,
-        import_mappings,
-        httpx_mod,
-    );
-}
-
-fn addCommittedOpenApiModule(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    package_name: []const u8,
-    generated_dir: []const u8,
-) *std.Build.Module {
-    return b.addModule(package_name, .{
-        .root_source_file = b.path(b.fmt("{s}/root.zig", .{generated_dir})),
-        .target = target,
-        .optimize = optimize,
-    });
-}
-
-fn addCommittedOpenApiModuleWithHttpx(
-    b: *std.Build,
-    target: std.Build.ResolvedTarget,
-    optimize: std.builtin.OptimizeMode,
-    package_name: []const u8,
-    generated_dir: []const u8,
-    httpx_mod: *std.Build.Module,
-) *std.Build.Module {
-    const mod = addCommittedOpenApiModule(b, target, optimize, package_name, generated_dir);
-    mod.addImport("httpx", httpx_mod);
-    return mod;
-}
-
-fn addOpenApiRegenRun(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-    source_path: std.Build.LazyPath,
-    package_name: []const u8,
-    generated_dir: []const u8,
-    generate_what: []const u8,
-    import_mappings: []const [2][]const u8,
-) *std.Build.Step.Run {
-    const convert = addScriptsPythonCommand(b, "../scripts/yaml_to_json.py", &.{});
-    convert.addFileArg(source_path);
-    const json_spec = convert.addOutputFileArg(b.fmt("{s}.json", .{package_name}));
-
-    const codegen = b.addRunArtifact(openapi_codegen);
-    codegen.addArgs(&.{"--spec"});
-    codegen.addFileArg(json_spec);
-    codegen.addArgs(&.{ "--package", package_name });
-    codegen.addArgs(&.{ "--generate", generate_what });
-    for (import_mappings) |mapping| {
-        codegen.addArgs(&.{"--import-mapping"});
-        codegen.addArg(b.fmt("{s}={s}", .{ mapping[0], mapping[1] }));
-    }
-    codegen.addArgs(&.{ "--output", generated_dir });
-    return codegen;
-}
-
-fn addOpenApiRegenStep(
-    b: *std.Build,
-    openapi_codegen: *std.Build.Step.Compile,
-) void {
-    const regen_step = b.step("regen-openapi", "Regenerate checked-in Zig OpenAPI modules");
-
-    const antfly_generated_root = "pkg/antfly/src/openapi/generated";
-    const inference_generated_root = "pkg/inference/src/api/generated";
-    const runs = [_]*std.Build.Step.Run{
-        addOpenApiRegenRun(b, openapi_codegen, addJoinedPublicOpenApiSpec(b), "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi", "types,extractors", &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, addPrefixedPublicOpenApiSpec(b), "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", "types,client", &.{
-            .{ "specs/openapi/antfly/schema.yaml", "antfly_schema_openapi" },
-            .{ "specs/openapi/antfly/indexes.yaml", "antfly_indexes_openapi" },
-            .{ "specs/openapi/antfly/generating.yaml", "antfly_generating_api_openapi" },
-            .{ "specs/openapi/antfly/eval.yaml", "antfly_eval_openapi" },
-            .{ "specs/openapi/shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "specs/openapi/antfly/reranking.yaml", "antfly_reranking_openapi" },
-            .{ "specs/openapi/antfly/query.yaml", "antfly_query_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/schema.yaml"), "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/indexes.yaml"), "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi", "types", &.{
-            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "chunking.yaml", "antfly_chunking_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/websearch.yaml"), "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi", "types", &.{
-            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/eval.yaml"), "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi", "types", &.{
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/query.yaml"), "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/admin.yaml"), "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", "types,server", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/internal.yaml"), "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", "types,server", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/auth/api.yaml"), "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", "types,server", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/metadata.yaml"), "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", "types,server", &.{
-            .{ "../auth/api.yaml", "antfly_usermgr_openapi" },
-            .{ "indexes.yaml", "antfly_indexes_openapi" },
-            .{ "schema.yaml", "antfly_schema_openapi" },
-            .{ "generating.yaml", "antfly_generating_api_openapi" },
-            .{ "eval.yaml", "antfly_eval_openapi" },
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "reranking.yaml", "antfly_reranking_openapi" },
-            .{ "query.yaml", "antfly_query_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/logging.yaml"), "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/audio.yaml"), "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi", "types", &.{
-            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../go/pkg/antfly/lib/middleware/openapi.yaml"), "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/scraping.yaml"), "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/s3.yaml"), "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/config.yaml"), "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi", "types", &.{
-            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
-            .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
-            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-            .{ "../shared/logging.yaml", "antfly_logging_openapi" },
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/chunking.yaml"), "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/chunking.yaml"), "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi", "types", &.{
-            .{ "../shared/chunking.yaml", "antfly_chunking_api_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/embeddings.yaml"), "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/config.yaml"), "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi", "types", &.{
-            .{ "../shared/logging.yaml", "antfly_logging_openapi" },
-            .{ "audio.yaml", "antfly_audio_openapi" },
-            .{ "../../../go/pkg/antfly/lib/middleware/openapi.yaml", "antfly_middleware_openapi" },
-            .{ "embeddings.yaml", "antfly_embeddings_openapi" },
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "reranking.yaml", "antfly_reranking_openapi" },
-            .{ "chunking.yaml", "antfly_chunking_openapi" },
-            .{ "../shared/scraping.yaml", "antfly_scraping_openapi" },
-            .{ "../shared/s3.yaml", "antfly_s3_openapi" },
-            .{ "../inference/config.yaml", "antfly_inference_config_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/shared/generating.yaml"), "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/reranking.yaml"), "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi", "types", &.{}),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/ai/extraction.yaml"), "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi", "types", &.{
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/antfly/generating.yaml"), "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi", "types", &.{
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "websearch.yaml", "antfly_websearch_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("../specs/openapi/inference/api.yaml"), "inference_api", inference_generated_root ++ "/inference_api", "types,server", &.{
-            .{ "../shared/generating.yaml", "antfly_generating_openapi" },
-            .{ "../ai/extraction.yaml", "antfly_extraction_openapi" },
-        }),
-        addOpenApiRegenRun(b, openapi_codegen, b.path("specs/openai-openapi.yaml"), "openai_api", antfly_generated_root ++ "/openai_api", "types", &.{}),
-    };
-
-    const fmt = b.addSystemCommand(&.{
-        b.graph.zig_exe,
-        "fmt",
-        antfly_generated_root,
-        inference_generated_root,
-    });
-    for (runs) |run| {
-        fmt.step.dependOn(&run.step);
-    }
-    regen_step.dependOn(&fmt.step);
-}
-
 pub fn build(b: *std.Build) void {
+    // Keep focused test inventories in pkg/antfly/build/tests.zig. build.zig
+    // wires durable suites and modules; it should not grow exact test-title
+    // lists as API/storage refactors move coverage closer to implementation.
+    antfly_tests_build.assertBuildZigDoesNotOwnTestInventory(b);
+    antfly_tests_build.assertDBRefactorBoundary(b);
+
     // On Linux, an implicit native target can cause Zig 0.16.0 to discover and
     // link against the host distro's crt startup objects. Newer glibc/binutils
     // builds may include .sframe sections with relocation types that Zig's
@@ -1114,16 +394,16 @@ pub fn build(b: *std.Build) void {
             @panic("-Donnx=true requires an ONNX Runtime install; pass -Donnx-root=<path>");
         }
     }
-    const delegated_inference_steps = addDelegatedInferenceBuildSteps(
-        b,
-        termite_enable_metal,
-        termite_enable_onnx,
-        termite_onnx_root,
-        termite_enable_cuda,
-        termite_cuda_artifacts,
-        termite_enable_system_blas,
-        termite_blas_root,
-    );
+    const delegated_inference_steps = antfly_inference_build.addDelegatedBuildSteps(.{
+        .b = b,
+        .enable_metal = termite_enable_metal,
+        .enable_onnx = termite_enable_onnx,
+        .onnx_root = termite_onnx_root,
+        .enable_cuda = termite_enable_cuda,
+        .cuda_artifacts = termite_cuda_artifacts,
+        .enable_system_blas = termite_enable_system_blas,
+        .blas_root = termite_blas_root,
+    });
 
     const lmdb_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
     const build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, with_tla, link_libc, false, lite_local_inference_runtime, antfly_version);
@@ -1146,92 +426,52 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
-    addSnowballRegenStep(b);
-    addSnowballCheckStep(b);
-    const openapi_codegen = addLocalOpenApiCodegen(b, target, optimize, httpx_mod);
-    addOpenApiRegenStep(b, openapi_codegen);
-    const openapi_root_check = addOpenApiRootCheckStep(b);
-    const antfly_generated_root = "pkg/antfly/src/openapi/generated";
-    const public_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_public_openapi", antfly_generated_root ++ "/antfly_public_openapi");
-    const client_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_client_openapi", antfly_generated_root ++ "/antfly_client_openapi", httpx_mod);
-    const schema_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_schema_openapi", antfly_generated_root ++ "/antfly_schema_openapi");
-    const indexes_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_indexes_openapi", antfly_generated_root ++ "/antfly_indexes_openapi");
-    const websearch_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_websearch_openapi", antfly_generated_root ++ "/antfly_websearch_openapi");
-    const eval_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_eval_openapi", antfly_generated_root ++ "/antfly_eval_openapi");
-    const query_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_query_openapi", antfly_generated_root ++ "/antfly_query_openapi");
-    const admin_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_admin_openapi", antfly_generated_root ++ "/antfly_admin_openapi", httpx_mod);
-    const internal_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_internal_openapi", antfly_generated_root ++ "/antfly_internal_openapi", httpx_mod);
-    const usermgr_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_usermgr_openapi", antfly_generated_root ++ "/antfly_usermgr_openapi", httpx_mod);
-    const metadata_openapi_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "antfly_metadata_openapi", antfly_generated_root ++ "/antfly_metadata_openapi", httpx_mod);
-    const logging_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_logging_openapi", antfly_generated_root ++ "/antfly_logging_openapi");
-    const audio_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_audio_openapi", antfly_generated_root ++ "/antfly_audio_openapi");
-    const middleware_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_middleware_openapi", antfly_generated_root ++ "/antfly_middleware_openapi");
-    const scraping_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_scraping_openapi", antfly_generated_root ++ "/antfly_scraping_openapi");
-    const s3_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_s3_openapi", antfly_generated_root ++ "/antfly_s3_openapi");
-    const inference_config_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_inference_config_openapi", antfly_generated_root ++ "/antfly_inference_config_openapi");
-    const chunking_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_api_openapi", antfly_generated_root ++ "/antfly_chunking_api_openapi");
-    const chunking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_chunking_openapi", antfly_generated_root ++ "/antfly_chunking_openapi");
-    const embeddings_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_embeddings_openapi", antfly_generated_root ++ "/antfly_embeddings_openapi");
-    const common_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_common_openapi", antfly_generated_root ++ "/antfly_common_openapi");
-    const generating_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_openapi", antfly_generated_root ++ "/antfly_generating_openapi");
-    const reranking_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_reranking_openapi", antfly_generated_root ++ "/antfly_reranking_openapi");
-    const generating_api_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_generating_api_openapi", antfly_generated_root ++ "/antfly_generating_api_openapi");
-    const extraction_openapi_mod = addCommittedOpenApiModule(b, target, optimize, "antfly_extraction_openapi", antfly_generated_root ++ "/antfly_extraction_openapi");
-    extraction_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    indexes_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
-    websearch_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    eval_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    generating_api_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    generating_api_openapi_mod.addImport("antfly_websearch_openapi", websearch_openapi_mod);
-    public_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    public_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    public_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    public_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    public_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    public_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    public_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    client_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    client_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    client_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    client_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    client_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    client_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    client_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_usermgr_openapi", usermgr_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_indexes_openapi", indexes_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_schema_openapi", schema_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_generating_api_openapi", generating_api_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_eval_openapi", eval_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    metadata_openapi_mod.addImport("antfly_query_openapi", query_openapi_mod);
-    chunking_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    audio_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_chunking_api_openapi", chunking_api_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
-    inference_config_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    common_openapi_mod.addImport("antfly_logging_openapi", logging_openapi_mod);
-    common_openapi_mod.addImport("antfly_audio_openapi", audio_openapi_mod);
-    common_openapi_mod.addImport("antfly_middleware_openapi", middleware_openapi_mod);
-    common_openapi_mod.addImport("antfly_embeddings_openapi", embeddings_openapi_mod);
-    common_openapi_mod.addImport("antfly_generating_openapi", generating_openapi_mod);
-    common_openapi_mod.addImport("antfly_reranking_openapi", reranking_openapi_mod);
-    common_openapi_mod.addImport("antfly_chunking_openapi", chunking_openapi_mod);
-    common_openapi_mod.addImport("antfly_scraping_openapi", scraping_openapi_mod);
-    common_openapi_mod.addImport("antfly_s3_openapi", s3_openapi_mod);
-    common_openapi_mod.addImport("antfly_inference_config_openapi", inference_config_openapi_mod);
+    // Protobuf wire format
+    const protobuf_dep = b.dependency("protobuf", .{});
+    const protobuf_mod = protobuf_dep.module("protobuf");
+    const generated_steps = antfly_generated_build.addGeneratedArtifactSteps(.{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .httpx_mod = httpx_mod,
+        .protobuf_dep = protobuf_dep,
+    });
+    const openapi_modules = antfly_generated_build.addCommittedOpenApiModules(.{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .httpx_mod = httpx_mod,
+    });
+    const public_openapi_mod = openapi_modules.public;
+    const client_openapi_mod = openapi_modules.client;
+    const schema_openapi_mod = openapi_modules.schema;
+    const indexes_openapi_mod = openapi_modules.indexes;
+    const eval_openapi_mod = openapi_modules.eval;
+    const query_openapi_mod = openapi_modules.query;
+    const admin_openapi_mod = openapi_modules.admin;
+    const internal_openapi_mod = openapi_modules.internal;
+    const usermgr_openapi_mod = openapi_modules.usermgr;
+    const metadata_openapi_mod = openapi_modules.metadata;
+    const logging_openapi_mod = openapi_modules.logging;
+    const audio_openapi_mod = openapi_modules.audio;
+    const middleware_openapi_mod = openapi_modules.middleware;
+    const scraping_openapi_mod = openapi_modules.scraping;
+    const s3_openapi_mod = openapi_modules.s3;
+    const inference_config_openapi_mod = openapi_modules.inference_config;
+    const chunking_api_openapi_mod = openapi_modules.chunking_api;
+    const chunking_openapi_mod = openapi_modules.chunking;
+    const embeddings_openapi_mod = openapi_modules.embeddings;
+    const common_openapi_mod = openapi_modules.common;
+    const generating_openapi_mod = openapi_modules.generating;
+    const reranking_openapi_mod = openapi_modules.reranking;
+    const generating_api_openapi_mod = openapi_modules.generating_api;
+    const extraction_openapi_mod = openapi_modules.extraction;
+    const openai_api_mod = openapi_modules.openai;
 
     // Handlebars template engine
     const handlebars_dep = b.dependency("handlebars", .{});
     const handlebars_mod = handlebars_dep.module("handlebars");
 
-    // Protobuf wire format
-    const protobuf_dep = b.dependency("protobuf", .{});
-    const protobuf_mod = protobuf_dep.module("protobuf");
     const platform_mod = b.createModule(.{
         .root_source_file = b.path("lib/platform/src/root.zig"),
         .target = target,
@@ -1427,9 +667,6 @@ pub fn build(b: *std.Build) void {
     extracting_mod.addImport("httpx", httpx_mod);
     extracting_mod.addImport("antfly_extraction_openapi", extraction_openapi_mod);
 
-    // Inference dependencies
-    const openai_api_mod = addCommittedOpenApiModuleWithHttpx(b, target, optimize, "openai_api", antfly_generated_root ++ "/openai_api", httpx_mod);
-
     // --- Inference backend detection (must precede module creation) ---
     const termite_ffmpeg_paths = if (link_libc) detectFfmpegPaths(b, target) else null;
     const image_mod = b.createModule(.{
@@ -1467,7 +704,7 @@ pub fn build(b: *std.Build) void {
     wasm_pdf_mod.addImport("antfly_image", wasm_image_mod);
     wasm_pdf_mod.addImport("antfly_font", wasm_font_mod);
 
-    const sentencepiece_proto_mod = addLocalSentencePieceProtoModule(b, protobuf_dep);
+    const sentencepiece_proto_mod = antfly_generated_build.addSentencePieceProtoModule(b, protobuf_dep);
     const termite_jinja_mod = b.createModule(.{
         .root_source_file = b.path("lib/jinja/src/jinja.zig"),
         .target = target,
@@ -1490,12 +727,7 @@ pub fn build(b: *std.Build) void {
     });
     termite_onnx_graph_mod.addImport("protobuf", protobuf_mod);
     termite_onnx_graph_mod.addImport("ml", termite_ml_mod);
-    const termite_pjrt_xla_proto_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pjrt/proto/xla_proto_stub.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    termite_pjrt_xla_proto_mod.addImport("protobuf", protobuf_mod);
+    const termite_pjrt_xla_proto_mod = antfly_generated_build.addXlaProtoModule(b, protobuf_dep);
     const termite_pjrt_mod = b.createModule(.{
         .root_source_file = b.path("lib/pjrt/src/root.zig"),
         .target = target,
@@ -1673,6 +905,13 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, lib_test_mod, true, true);
+
+    const api_query_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/api_query_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    antfly_imports.configure(b, api_query_test_mod, true, true);
 
     const data_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/data_runtime_test_root.zig"),
@@ -1865,168 +1104,17 @@ pub fn build(b: *std.Build) void {
     });
     antfly_embedded_pkg_wasm_mod.addImport("embedded_surface", embedded_wasm_mod);
 
-    // --- Inference WASM modules for unified antfly.wasm ---
-    const inference_wasm_build_options = b.addOptions();
-    inference_wasm_build_options.addOption(bool, "enable_onnx", false);
-    inference_wasm_build_options.addOption(bool, "enable_pjrt", false);
-    inference_wasm_build_options.addOption(bool, "enable_cuda", false);
-    inference_wasm_build_options.addOption([]const u8, "cuda_artifacts", "portable");
-    inference_wasm_build_options.addOption(bool, "enable_metal", false);
-    inference_wasm_build_options.addOption(bool, "enable_native", false);
-    inference_wasm_build_options.addOption(bool, "enable_system_blas", false);
-    inference_wasm_build_options.addOption(bool, "enable_wasm", true);
-    inference_wasm_build_options.addOption(bool, "enable_webgpu", true);
-    inference_wasm_build_options.addOption(bool, "enable_ffmpeg_audio", false);
-    inference_wasm_build_options.addOption(bool, "link_libc", false);
-    inference_wasm_build_options.addOption(bool, "skip_openapi", false);
-    inference_wasm_build_options.addOption([]const u8, "inference_version", antfly_version);
-    inference_wasm_build_options.addOption([]const u8, "wasm_memory_model", "wasm32");
-    const inference_wasm_build_options_mod = inference_wasm_build_options.createModule();
-
-    const wasm_inference_jinja_mod = b.createModule(.{
-        .root_source_file = b.path("lib/jinja/src/jinja.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-        .single_threaded = true,
+    antfly_embedded_build.addUnifiedWasmSteps(.{
+        .b = b,
+        .wasm_target = wasm_target,
+        .antfly_version = antfly_version,
+        .sentencepiece_proto_mod = sentencepiece_proto_mod,
+        .protobuf_mod = protobuf_mod,
+        .wasm_image_mod = wasm_image_mod,
+        .wasm_platform_mod = wasm_platform_mod,
+        .antfly_embedded_db_pkg_wasm_mod = antfly_embedded_db_pkg_wasm_mod,
+        .antfly_embedded_api_pkg_wasm_mod = antfly_embedded_api_pkg_wasm_mod,
     });
-    const wasm_inference_tokenizer_mod = b.createModule(.{
-        .root_source_file = b.path("lib/tokenizer/src/tokenizer.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    wasm_inference_tokenizer_mod.addImport("sentencepiece_proto", sentencepiece_proto_mod);
-    const wasm_inference_hf_tokenizer_mod = b.createModule(.{
-        .root_source_file = b.path("lib/tokenizer/src/hf_root.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    wasm_inference_hf_tokenizer_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
-    const wasm_inference_linalg_mod = b.createModule(.{
-        .root_source_file = b.path("lib/linalg/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    const wasm_inference_ml_mod = b.createModule(.{
-        .root_source_file = b.path("lib/ml/src/root.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-        .single_threaded = true,
-    });
-    const wasm_inference_onnx_graph_mod = b.createModule(.{
-        .root_source_file = b.path("lib/onnx/src/root.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-        .single_threaded = true,
-    });
-    wasm_inference_onnx_graph_mod.addImport("protobuf", protobuf_mod);
-    wasm_inference_onnx_graph_mod.addImport("ml", wasm_inference_ml_mod);
-    const wasm_inference_audio_mod = b.createModule(.{
-        .root_source_file = b.path("lib/audio/src/mod.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    const inference_wasm_inference_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/inference/src/wasm_entry.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    inference_wasm_inference_mod.addImport("build_options", inference_wasm_build_options_mod);
-    inference_wasm_inference_mod.addImport("inference_audio", wasm_inference_audio_mod);
-    inference_wasm_inference_mod.addImport("inference_linalg", wasm_inference_linalg_mod);
-    inference_wasm_inference_mod.addImport("inference_tokenizer", wasm_inference_tokenizer_mod);
-    inference_wasm_inference_mod.addImport("inference_hf_tokenizer", wasm_inference_hf_tokenizer_mod);
-    inference_wasm_inference_mod.addImport("antfly_image", wasm_image_mod);
-    inference_wasm_inference_mod.addImport("antfly_platform", wasm_platform_mod);
-    inference_wasm_inference_mod.addImport("jinja", wasm_inference_jinja_mod);
-    inference_wasm_inference_mod.addImport("ml", wasm_inference_ml_mod);
-    inference_wasm_inference_mod.addImport("onnx_graph", wasm_inference_onnx_graph_mod);
-
-    const antfly_wasm_mod = b.createModule(.{
-        .root_source_file = b.path("examples/antfly_wasm.zig"),
-        .target = wasm_target,
-        .optimize = .ReleaseSafe,
-    });
-    antfly_wasm_mod.addImport("antfly_embedded_db", antfly_embedded_db_pkg_wasm_mod);
-    antfly_wasm_mod.addImport("antfly_embedded_api", antfly_embedded_api_pkg_wasm_mod);
-    antfly_wasm_mod.addImport("inference_runtime", inference_wasm_inference_mod);
-
-    const antfly_wasm = b.addExecutable(.{
-        .name = "antfly_wasm",
-        .root_module = antfly_wasm_mod,
-    });
-    antfly_wasm.entry = .disabled;
-    antfly_wasm.rdynamic = true;
-    antfly_wasm.export_memory = true;
-    const install_antfly_wasm = b.addInstallArtifact(antfly_wasm, .{
-        .dest_dir = .{ .override = .prefix },
-        .dest_sub_path = "antfly-wasm/antfly.wasm",
-    });
-    const install_antfly_wasm_smoke_run = b.addInstallFile(
-        b.path("pkg/antfly-embedded/wasm_smoke_run.mjs"),
-        "antfly-wasm/run.mjs",
-    );
-    const install_antfly_wasm_client = b.addInstallFile(
-        b.path("pkg/antfly-embedded/wasm_client.mjs"),
-        "antfly-wasm/antfly_embedded_wasm_client.mjs",
-    );
-    const install_antfly_wasm_browser = b.addInstallFile(
-        b.path("pkg/antfly-embedded/wasm_smoke_browser.mjs"),
-        "antfly-wasm/browser.mjs",
-    );
-    const install_antfly_wasm_index = b.addInstallFile(
-        b.path("pkg/antfly-embedded/wasm_smoke_index.html"),
-        "antfly-wasm/index.html",
-    );
-    const install_antfly_wasm_readme = b.addInstallFile(
-        b.path("pkg/antfly-embedded/WASM.md"),
-        "antfly-wasm/README.md",
-    );
-
-    const install_antfly_wasm_webgpu_ops = b.addInstallFile(
-        b.path("pkg/antfly-embedded/webgpu_ops.mjs"),
-        "antfly-wasm/webgpu_ops.mjs",
-    );
-    const shader_names = [_][]const u8{
-        "attention",            "causal_attention",     "cross_attention",
-        "gqa_cached_attention", "gqa_causal_attention", "layer_norm",
-        "matmul",               "matmul_transb",        "matmul_transb_q4_0",
-        "matmul_transb_q4_1",   "matmul_transb_q5_0",   "matmul_transb_q5_1",
-        "matmul_transb_q8_0",   "matmul_transb_q8_1",   "matmul_transb_iq4_nl",
-        "matmul_transb_iq4_xs", "matmul_transb_q2_k",   "matmul_transb_q3_k",
-        "matmul_transb_q4_k",   "matmul_transb_q5_k",   "matmul_transb_q6_k",
-        "matmul_transb_q8_k",   "rms_norm",
-    };
-    var install_shader_steps: [shader_names.len]*std.Build.Step = undefined;
-    for (shader_names, 0..) |name, i| {
-        const install_shader = b.addInstallFile(
-            b.path(b.fmt("pkg/antfly-embedded/shaders/{s}.wgsl", .{name})),
-            b.fmt("antfly-wasm/shaders/{s}.wgsl", .{name}),
-        );
-        install_shader_steps[i] = &install_shader.step;
-    }
-
-    const install_wasm_step = b.step("install-wasm", "Build and install the unified antfly wasm target (antfly-embedded + inference runtime)");
-    install_wasm_step.dependOn(&install_antfly_wasm.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_smoke_run.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_client.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_browser.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_index.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_readme.step);
-    install_wasm_step.dependOn(&install_antfly_wasm_webgpu_ops.step);
-    for (&install_shader_steps) |step| {
-        install_wasm_step.dependOn(step);
-    }
-
-    const run_antfly_wasm_smoke = b.addSystemCommand(&.{
-        "node",
-        b.getInstallPath(.prefix, "antfly-wasm/run.mjs"),
-    });
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm.step);
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_smoke_run.step);
-    run_antfly_wasm_smoke.step.dependOn(&install_antfly_wasm_client.step);
-
-    const wasm_step = b.step("wasm", "Build and run the antfly wasm smoke test under Node");
-    wasm_step.dependOn(&run_antfly_wasm_smoke.step);
 
     // Static library
     const lib = b.addLibrary(.{
@@ -2036,272 +1124,26 @@ pub fn build(b: *std.Build) void {
     });
     _ = lib;
 
-    const capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+    const capi_steps = antfly_capi_build.addCApiSteps(.{
+        .b = b,
+        .target = target,
+        .optimize = optimize,
+        .lib_mod = lib_mod,
+        .structlog_mod = structlog_mod,
+    });
+
+    const fuzz_tabular_loader_mod = b.createModule(.{
+        .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
         .target = target,
         .optimize = optimize,
     });
-    capi_mod.addImport("antfly-zig", lib_mod);
-    capi_mod.addImport("structlog", structlog_mod);
 
-    const capi_lib = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "antfly_zig_capi",
-        .root_module = capi_mod,
-    });
-    const install_capi_lib = b.addInstallArtifact(capi_lib, .{});
-
-    const lite_capi_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/db.zig"),
+    const run_lib_toon_conformance_after_fetch_quiet_step = antfly_conformance_build.addToonConformanceSteps(.{
+        .b = b,
         .target = target,
         .optimize = optimize,
+        .toon_mod = toon_mod,
     });
-    lite_capi_mod.addImport("antfly-zig", lib_mod);
-    lite_capi_mod.addImport("structlog", structlog_mod);
-
-    const lite_capi_lib = b.addLibrary(.{
-        .linkage = .dynamic,
-        .name = "antfly",
-        .root_module = lite_capi_mod,
-    });
-    const install_lite_capi_lib = b.addInstallArtifact(lite_capi_lib, .{});
-    const install_lite_capi_header = b.addInstallFileWithDir(
-        b.path("pkg/antfly/include/antfly.h"),
-        .header,
-        "antfly.h",
-    );
-
-    const capi_step = b.step("capi", "Build the Zig C API shared libraries");
-    capi_step.dependOn(&install_capi_lib.step);
-    capi_step.dependOn(&install_lite_capi_lib.step);
-    capi_step.dependOn(&install_lite_capi_header.step);
-
-    const lite_capi_step = b.step("lite-capi", "Build the libantfly C ABI shared library");
-    lite_capi_step.dependOn(&install_lite_capi_lib.step);
-    lite_capi_step.dependOn(&install_lite_capi_header.step);
-
-    const lite_capi_smoke_mod = b.createModule(.{
-        .target = target,
-        .optimize = optimize,
-    });
-    lite_capi_smoke_mod.link_libc = true;
-    lite_capi_smoke_mod.addIncludePath(b.path("pkg/antfly/include"));
-    lite_capi_smoke_mod.addCSourceFile(.{
-        .file = b.path("examples/antfly_lite_c_smoke.c"),
-        .flags = &.{ "-std=c11", "-Wall", "-Wextra", "-Werror" },
-    });
-    const lite_capi_smoke = b.addExecutable(.{
-        .name = "antfly-lite-c-smoke",
-        .root_module = lite_capi_smoke_mod,
-    });
-    lite_capi_smoke.root_module.linkLibrary(lite_capi_lib);
-    const run_lite_capi_smoke = b.addRunArtifact(lite_capi_smoke);
-    const lite_capi_smoke_step = b.step("lite-capi-smoke", "Compile and run a C consumer smoke test for libantfly");
-    lite_capi_smoke_step.dependOn(&run_lite_capi_smoke.step);
-
-    const run_lite_go_tests = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "test",
-        "-tags",
-        "antflylite_capi",
-        "-count=1",
-        "./...",
-    });
-    run_lite_go_tests.setCwd(b.path("../go/pkg/antflylite"));
-    run_lite_go_tests.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_tests.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_test_step = b.step("lite-go-test", "Run Go Antfly Lite binding tests against libantfly");
-    lite_go_test_step.dependOn(&run_lite_go_tests.step);
-
-    const run_lite_go_example = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-go-example.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-go-example.afb",
-    });
-    run_lite_go_example.setCwd(b.path("../examples/antfly-lite-go"));
-    run_lite_go_example.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_example.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_example_step = b.step("lite-go-example", "Run the embedded Go Antfly Lite example app");
-    lite_go_example_step.dependOn(&run_lite_go_example.step);
-
-    const run_lite_go_retrieval_template = b.addSystemCommand(&.{
-        "env",
-        "GOWORK=off",
-        "go",
-        "run",
-        ".",
-        "--reset",
-        "--db",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.aflite",
-        "--backup",
-        "../../zig/.zig-cache/antfly-lite-retrieval-go.afb",
-    });
-    run_lite_go_retrieval_template.setCwd(b.path("../examples/antfly-lite-retrieval-go"));
-    run_lite_go_retrieval_template.step.dependOn(&install_lite_capi_lib.step);
-    run_lite_go_retrieval_template.step.dependOn(&install_lite_capi_header.step);
-    const lite_go_retrieval_template_step = b.step("lite-go-retrieval-template", "Run the embedded Go Antfly Lite retrieval template");
-    lite_go_retrieval_template_step.dependOn(&run_lite_go_retrieval_template.step);
-
-    const run_cabi_packaging_tests = b.addSystemCommand(&.{
-        "env",
-        "PYTHONPYCACHEPREFIX=/tmp/antfly-pycache",
-        "python3",
-        "scripts/packaging/test_cabi_packaging.py",
-    });
-    run_cabi_packaging_tests.setCwd(b.path(".."));
-    const lite_package_test_step = b.step("lite-package-test", "Run Antfly C ABI release packaging regression tests");
-    lite_package_test_step.dependOn(&run_cabi_packaging_tests.step);
-
-    const capi_default_filters = [_][]const u8{
-        "capi lite opens exports imports checks and vacuums aflite",
-        "capi zero buffer helper wipes bytes before free",
-        "capi lite exposes hosted and status-only profiles",
-        "capi lite open options validate and configure ttl cleanup",
-        "capi execute graph queries honors identity read generation",
-        "capi search rejects stale identity generation before readable lease hook",
-        "capi search json returns stamped identity generation",
-        "packed dense response exposes public ids not doc ordinals",
-        "dense response identity generation footer",
-        "capi aggregate hits rejects stale identity generation before aggregation materialization",
-    };
-    const capi_tests = b.addTest(.{
-        .root_module = capi_mod,
-        .filters = selectTestFilters(b, &capi_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_capi_tests = b.addRunArtifact(capi_tests);
-    const capi_test_step = b.step("capi-test", "Run C API tests");
-    capi_test_step.dependOn(&run_capi_tests.step);
-
-    // Tests
-    const lib_regex_tests = b.addTest(.{
-        .root_module = regex_mod,
-    });
-    const run_lib_regex_tests = b.addRunArtifact(lib_regex_tests);
-    const lib_regex_test_step = b.step("lib-regex-test", "Run standalone lib/regex tests");
-    lib_regex_test_step.dependOn(&run_lib_regex_tests.step);
-
-    const lib_jsonschema_tests = b.addTest(.{
-        .root_module = jsonschema_mod,
-    });
-    const run_lib_jsonschema_tests = b.addRunArtifact(lib_jsonschema_tests);
-    const lib_jsonschema_test_step = b.step("lib-jsonschema-test", "Run standalone lib/jsonschema tests");
-    lib_jsonschema_test_step.dependOn(&run_lib_jsonschema_tests.step);
-
-    const lib_json_tests = b.addTest(.{
-        .root_module = json_mod,
-    });
-    const run_lib_json_tests = b.addRunArtifact(lib_json_tests);
-    const lib_json_test_step = b.step("lib-json-test", "Run standalone lib/json tests");
-    lib_json_test_step.dependOn(&run_lib_json_tests.step);
-
-    const lib_ml_tabular_tests = b.addTest(.{
-        .root_module = ml_tabular_mod,
-    });
-    const run_lib_ml_tabular_tests = b.addRunArtifact(lib_ml_tabular_tests);
-    const lib_ml_tabular_test_step = b.step("lib-ml-tabular-test", "Run standalone lib/ml/tabular tests");
-    lib_ml_tabular_test_step.dependOn(&run_lib_ml_tabular_tests.step);
-
-    const fuzz_tabular_loader = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/ml/tabular/src/fuzz_loader.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_fuzz_tabular_loader = b.addRunArtifact(fuzz_tabular_loader);
-    const fuzz_tabular_loader_step = b.step("fuzz-tabular-loader", "Fuzz the tabular_model.json loader (--fuzz to keep running)");
-    fuzz_tabular_loader_step.dependOn(&run_fuzz_tabular_loader.step);
-
-    const lib_toon_tests = b.addTest(.{
-        .root_module = toon_mod,
-    });
-    const run_lib_toon_tests = b.addRunArtifact(lib_toon_tests);
-    const lib_toon_test_step = b.step("lib-toon-test", "Run standalone lib/toon tests");
-    lib_toon_test_step.dependOn(&run_lib_toon_tests.step);
-
-    const lib_mcp_tests = b.addTest(.{
-        .root_module = mcp_mod,
-    });
-    const run_lib_mcp_tests = b.addRunArtifact(lib_mcp_tests);
-    const lib_mcp_test_step = b.step("lib-mcp-test", "Run standalone lib/mcp tests");
-    lib_mcp_test_step.dependOn(&run_lib_mcp_tests.step);
-
-    const lib_a2a_tests = b.addTest(.{
-        .root_module = a2a_mod,
-    });
-    const run_lib_a2a_tests = b.addRunArtifact(lib_a2a_tests);
-    const lib_a2a_test_step = b.step("lib-a2a-test", "Run standalone lib/a2a tests");
-    lib_a2a_test_step.dependOn(&run_lib_a2a_tests.step);
-
-    const lib_matcher_tests = b.addTest(.{
-        .root_module = matcher_mod,
-    });
-    const run_lib_matcher_tests = b.addRunArtifact(lib_matcher_tests);
-    const lib_matcher_test_step = b.step("lib-matcher-test", "Run standalone lib/matcher tests");
-    lib_matcher_test_step.dependOn(&run_lib_matcher_tests.step);
-
-    const lib_resolver_tests = b.addTest(.{
-        .root_module = resolver_mod,
-    });
-    const run_lib_resolver_tests = b.addRunArtifact(lib_resolver_tests);
-    const lib_resolver_test_step = b.step("lib-resolver-test", "Run standalone lib/resolver tests");
-    lib_resolver_test_step.dependOn(&run_lib_resolver_tests.step);
-
-    const lib_toon_conformance = b.addExecutable(.{
-        .name = "lib-toon-conformance",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/toon/toon_conformance.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    lib_toon_conformance.root_module.addImport("antfly_toon", toon_mod);
-
-    const fetch_lib_toon_conformance = b.addRunArtifact(lib_toon_conformance);
-    fetch_lib_toon_conformance.addArg("fetch");
-    fetch_lib_toon_conformance.addArg("/tmp/toon-format-spec");
-    const lib_toon_conformance_fetch_step = b.step("lib-toon-conformance-fetch", "Fetch the lib/toon upstream conformance fixtures");
-    lib_toon_conformance_fetch_step.dependOn(&fetch_lib_toon_conformance.step);
-
-    const fetch_lib_toon_conformance_quiet = b.addRunArtifact(lib_toon_conformance);
-    fetch_lib_toon_conformance_quiet.addArg("fetch");
-    fetch_lib_toon_conformance_quiet.addArg("/tmp/toon-format-spec");
-    const fetch_lib_toon_conformance_quiet_step = expectQuietSuccess(fetch_lib_toon_conformance_quiet);
-
-    const run_lib_toon_conformance = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance.addArg("run");
-    run_lib_toon_conformance.addArg("/tmp/toon-format-spec");
-    run_lib_toon_conformance.addArg("--no-fetch");
-    const lib_toon_conformance_run_step = b.step("lib-toon-conformance-run", "Run lib/toon conformance suite without fetching fixtures");
-    lib_toon_conformance_run_step.dependOn(&run_lib_toon_conformance.step);
-
-    const run_lib_toon_conformance_after_fetch = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance_after_fetch.addArg("run");
-    run_lib_toon_conformance_after_fetch.addArg("/tmp/toon-format-spec");
-    run_lib_toon_conformance_after_fetch.addArg("--no-fetch");
-    run_lib_toon_conformance_after_fetch.step.dependOn(&fetch_lib_toon_conformance.step);
-    const lib_toon_conformance_step = b.step("lib-toon-conformance", "Fetch and run lib/toon conformance suite");
-    lib_toon_conformance_step.dependOn(&run_lib_toon_conformance_after_fetch.step);
-
-    const run_lib_toon_conformance_after_fetch_quiet = b.addRunArtifact(lib_toon_conformance);
-    run_lib_toon_conformance_after_fetch_quiet.addArg("run");
-    run_lib_toon_conformance_after_fetch_quiet.addArg("/tmp/toon-format-spec");
-    run_lib_toon_conformance_after_fetch_quiet.addArg("--no-fetch");
-    run_lib_toon_conformance_after_fetch_quiet.step.dependOn(fetch_lib_toon_conformance_quiet_step);
-    const run_lib_toon_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_toon_conformance_after_fetch_quiet);
 
     const httpx_json_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/httpx/src/util/json.zig"),
@@ -2309,19 +1151,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     httpx_json_test_mod.addImport("antfly-json", json_mod);
-    const httpx_json_tests = b.addTest(.{
-        .root_module = httpx_json_test_mod,
-    });
-    const run_httpx_json_tests = b.addRunArtifact(httpx_json_tests);
-    const lib_httpx_json_test_step = b.step("lib-httpx-json-test", "Run standalone lib/httpx JSON helper tests");
-    lib_httpx_json_test_step.dependOn(&run_httpx_json_tests.step);
-
-    const httpx_tests = b.addTest(.{
-        .root_module = httpx_mod,
-    });
-    const run_httpx_tests = b.addRunArtifact(httpx_tests);
-    const lib_httpx_test_step = b.step("lib-httpx-test", "Run standalone lib/httpx tests");
-    lib_httpx_test_step.dependOn(&run_httpx_tests.step);
 
     const api_json_helpers_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api/json_helpers.zig"),
@@ -2329,12 +1158,6 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     api_json_helpers_test_mod.addImport("antfly-json", json_mod);
-    const api_json_helpers_tests = b.addTest(.{
-        .root_module = api_json_helpers_test_mod,
-    });
-    const run_api_json_helpers_tests = b.addRunArtifact(api_json_helpers_tests);
-    const lib_api_json_helpers_test_step = b.step("lib-api-json-helpers-test", "Run standalone api/json_helpers tests");
-    lib_api_json_helpers_test_step.dependOn(&run_api_json_helpers_tests.step);
 
     const api_artifact_reprocess_jobs_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/api_artifact_reprocess_jobs_test_root.zig"),
@@ -2342,63 +1165,17 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, api_artifact_reprocess_jobs_test_mod, true, true);
-    const api_artifact_reprocess_jobs_tests = b.addTest(.{
-        .root_module = api_artifact_reprocess_jobs_test_mod,
-        .filters = &.{
-            "artifact reprocess job store starts and updates a job",
-            "artifact reprocess job store recovers durable jobs and reseeds ids",
-            "artifact reprocess job cleanup removes recovered durable expired jobs",
+    const run_api_artifact_reprocess_jobs_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        api_artifact_reprocess_jobs_test_mod,
+        "lib-api-artifact-reprocess-jobs-test",
+        "Run artifact reprocess job store tests",
+        .{
+            .filters = &antfly_tests_build.ArtifactReprocessJobTestFilters.store,
+            .select_filters = false,
+            .simple_runner = true,
         },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_api_artifact_reprocess_jobs_tests = b.addRunArtifact(api_artifact_reprocess_jobs_tests);
-    const lib_api_artifact_reprocess_jobs_test_step = b.step("lib-api-artifact-reprocess-jobs-test", "Run artifact reprocess job store tests");
-    lib_api_artifact_reprocess_jobs_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
-
-    const lib_generating_tests = b.addTest(.{
-        .root_module = generating_mod,
-    });
-    const run_lib_generating_tests = b.addRunArtifact(lib_generating_tests);
-    const lib_generating_test_step = b.step("lib-generating-test", "Run standalone lib/generating tests");
-    lib_generating_test_step.dependOn(&run_lib_generating_tests.step);
-
-    const lib_embeddings_tests = b.addTest(.{
-        .root_module = embeddings_mod,
-    });
-    const run_lib_embeddings_tests = b.addRunArtifact(lib_embeddings_tests);
-    const lib_embeddings_test_step = b.step("lib-embeddings-test", "Run standalone lib/embeddings tests");
-    lib_embeddings_test_step.dependOn(&run_lib_embeddings_tests.step);
-
-    const lib_vectorindex_tests = b.addTest(.{
-        .root_module = vectorindex_mod,
-    });
-    const run_lib_vectorindex_tests = b.addRunArtifact(lib_vectorindex_tests);
-    const lib_vectorindex_test_step = b.step("lib-vectorindex-test", "Run standalone lib/vectorindex tests");
-    lib_vectorindex_test_step.dependOn(&run_lib_vectorindex_tests.step);
-
-    const lib_chunking_tests = b.addTest(.{
-        .root_module = chunking_mod,
-    });
-    const run_lib_chunking_tests = b.addRunArtifact(lib_chunking_tests);
-    const lib_chunking_test_step = b.step("lib-chunking-test", "Run standalone lib/chunking tests");
-    lib_chunking_test_step.dependOn(&run_lib_chunking_tests.step);
-
-    const lib_readers_tests = b.addTest(.{
-        .root_module = readers_mod,
-    });
-    const run_lib_readers_tests = b.addRunArtifact(lib_readers_tests);
-    const lib_readers_test_step = b.step("lib-readers-test", "Run standalone lib/readers tests");
-    lib_readers_test_step.dependOn(&run_lib_readers_tests.step);
-
-    const lib_extracting_tests = b.addTest(.{
-        .root_module = extracting_mod,
-    });
-    const run_lib_extracting_tests = b.addRunArtifact(lib_extracting_tests);
-    const lib_extracting_test_step = b.step("lib-extracting-test", "Run standalone lib/extracting tests");
-    lib_extracting_test_step.dependOn(&run_lib_extracting_tests.step);
+    ).run;
 
     const image_test_mod = b.createModule(.{
         .root_source_file = b.path("lib/image/image_test_root.zig"),
@@ -2406,396 +1183,134 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     image_test_mod.addImport("antfly_image", image_mod);
-    const lib_image_tests = b.addTest(.{
-        .root_module = image_test_mod,
-    });
-    const run_lib_image_tests = b.addRunArtifact(lib_image_tests);
-    const lib_image_test_step = b.step("lib-image-test", "Run shared image tests");
-    lib_image_test_step.dependOn(&run_lib_image_tests.step);
 
-    const lib_image_bench_build_options = b.addOptions();
     const lib_image_spng_paths = detectSpngPaths(b, target);
     const lib_image_enable_spng = lib_image_spng_paths != null;
-    lib_image_bench_build_options.addOption(bool, "enable_spng", lib_image_enable_spng);
-    const lib_image_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/image_bench.zig"),
+    antfly_benches_build.addLibraryBenchSteps(.{
+        .b = b,
         .target = target,
-        .optimize = .ReleaseFast,
+        .lib_image_spng_paths = lib_image_spng_paths,
+        .lib_image_enable_spng = lib_image_enable_spng,
+        .inference_linalg_mod = inference_graph.inference_linalg_mod,
+        .inference_audio_mod = inference_graph.inference_audio_mod,
     });
-    lib_image_bench_mod.addOptions("build_options", lib_image_bench_build_options);
-    if (lib_image_spng_paths) |spng_paths| {
-        lib_image_bench_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
-    }
-    const lib_image_bench = b.addExecutable(.{
-        .name = "lib-image-bench",
-        .root_module = lib_image_bench_mod,
-    });
-    if (lib_image_spng_paths) |spng_paths| {
-        lib_image_bench.root_module.addLibraryPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_bench.root_module.addRPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_bench.root_module.linkSystemLibrary("spng", .{});
-        lib_image_bench.root_module.link_libc = true;
-    }
-    const run_lib_image_bench = b.addRunArtifact(lib_image_bench);
-    if (b.args) |args| {
-        run_lib_image_bench.addArgs(args);
-    } else {
-        run_lib_image_bench.addArgs(&.{
-            "image-decode-suite",
-            "25",
-        });
-    }
-    const lib_image_bench_step = b.step("lib-image-bench", "Run lib/image decode benchmarks");
-    lib_image_bench_step.dependOn(&run_lib_image_bench.step);
 
-    const bench_image_step = b.step("bench-image", "Run lib/image decode benchmarks");
-    bench_image_step.dependOn(&run_lib_image_bench.step);
-
-    const pdf_bench_image_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/mod.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const pdf_bench_font_mod = b.createModule(.{
-        .root_source_file = b.path("lib/font/src/mod.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const pdf_bench_pdf_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pdf/src/mod.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    pdf_bench_pdf_mod.addImport("antfly_image", pdf_bench_image_mod);
-    pdf_bench_pdf_mod.addImport("antfly_font", pdf_bench_font_mod);
-    const pdf_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/pdf/src/pdf_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    pdf_bench_mod.addImport("antfly_pdf", pdf_bench_pdf_mod);
-    const lib_pdf_bench = b.addExecutable(.{
-        .name = "lib-pdf-bench",
-        .root_module = pdf_bench_mod,
-    });
-    const run_lib_pdf_bench = b.addRunArtifact(lib_pdf_bench);
-    if (b.args) |args| {
-        run_lib_pdf_bench.addArgs(args);
-    } else {
-        run_lib_pdf_bench.addArgs(&.{
-            "suite",
-            "lib/pdf/testdata/simple_text_fixture.pdf",
-            "25",
-        });
-    }
-    const lib_pdf_bench_step = b.step("lib-pdf-bench", "Run lib/pdf benchmarks");
-    lib_pdf_bench_step.dependOn(&run_lib_pdf_bench.step);
-
-    const bench_pdf_step = b.step("bench-pdf", "Run lib/pdf benchmarks");
-    bench_pdf_step.dependOn(&run_lib_pdf_bench.step);
-
-    const lib_image_conformance_test_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/mod.zig"),
+    const image_conformance_steps = antfly_conformance_build.addImageConformanceSteps(.{
+        .b = b,
         .target = target,
         .optimize = optimize,
+        .image_mod = image_mod,
+        .spng_paths = lib_image_spng_paths,
+        .enable_spng = lib_image_enable_spng,
     });
-    const lib_image_conformance_tests = b.addTest(.{
-        .root_module = lib_image_conformance_test_mod,
-        .filters = &.{"conformance corpus"},
-    });
-    const run_lib_image_conformance_tests = b.addRunArtifact(lib_image_conformance_tests);
-    const lib_image_conformance_run_step = b.step("lib-image-conformance-run", "Run lib/image conformance suites without fetching fixtures");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_conformance_tests.step);
 
-    const lib_image_corpus_build_options = b.addOptions();
-    lib_image_corpus_build_options.addOption(bool, "enable_spng", lib_image_enable_spng);
-    const lib_image_corpus_mod = b.createModule(.{
-        .root_source_file = b.path("lib/image/src/image_corpus.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    lib_image_corpus_mod.addOptions("build_options", lib_image_corpus_build_options);
-    if (lib_image_spng_paths) |spng_paths| {
-        lib_image_corpus_mod.addIncludePath(.{ .cwd_relative = spng_paths.include_dir });
-    }
-    const lib_image_corpus = b.addExecutable(.{
-        .name = "lib-image-corpus",
-        .root_module = lib_image_corpus_mod,
-    });
-    if (lib_image_spng_paths) |spng_paths| {
-        lib_image_corpus.root_module.addLibraryPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_corpus.root_module.addRPath(.{ .cwd_relative = spng_paths.lib_dir });
-        lib_image_corpus.root_module.linkSystemLibrary("spng", .{});
-        lib_image_corpus.root_module.link_libc = true;
-    }
-    const run_lib_image_corpus_verify_jpeg = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_jpeg.addArg("verify-jpeg");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_jpeg.step);
+    const run_lib_generating_runtime_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-generating-runtime-test",
+        "Run generating backend adapter tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.generating_runtime },
+    ).run;
 
-    const run_lib_image_corpus_verify_jpeg_quiet = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_jpeg_quiet.addArg("verify-jpeg");
-    const run_lib_image_corpus_verify_jpeg_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_jpeg_quiet);
+    const run_lib_reranking_runtime_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-reranking-runtime-test",
+        "Run reranking backend adapter tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.reranking_runtime },
+    ).run;
 
-    const run_lib_image_corpus_verify_png = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_png.addArg("verify-png");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_png.step);
+    const run_lib_common_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-common-test",
+        "Run common/provider registry tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.common },
+    ).run;
 
-    const run_lib_image_corpus_verify_png_quiet = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_png_quiet.addArg("verify-png");
-    const run_lib_image_corpus_verify_png_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_png_quiet);
-
-    const run_lib_image_corpus_verify_png_spng = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_png_spng.addArg("verify-png-spng");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_png_spng.step);
-
-    const run_lib_image_corpus_verify_png_spng_quiet = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_png_spng_quiet.addArg("verify-png-spng");
-    const run_lib_image_corpus_verify_png_spng_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_png_spng_quiet);
-
-    const run_lib_image_corpus_verify_gif = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_gif.addArg("verify-gif");
-    lib_image_conformance_run_step.dependOn(&run_lib_image_corpus_verify_gif.step);
-
-    const run_lib_image_corpus_verify_gif_quiet = b.addRunArtifact(lib_image_corpus);
-    run_lib_image_corpus_verify_gif_quiet.addArg("verify-gif");
-    const run_lib_image_corpus_verify_gif_quiet_step = expectQuietSuccess(run_lib_image_corpus_verify_gif_quiet);
-
-    const image_jpeg_seed_corpora_e2e = b.addExecutable(.{
-        .name = "image-jpeg-seed-corpora-e2e",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/image/src/image_jpeg_seed_corpora_e2e.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const image_jpeg_seed_corpora_e2e_step = b.step("image-jpeg-seed-corpora-e2e", "Build the lib/image upstream JPEG seed-corpora e2e runner");
-    image_jpeg_seed_corpora_e2e_step.dependOn(&image_jpeg_seed_corpora_e2e.step);
-
-    const fetch_image_jpeg_seed_corpora_e2e = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
-    fetch_image_jpeg_seed_corpora_e2e.addArg("fetch");
-    fetch_image_jpeg_seed_corpora_e2e.addArg("/tmp/libjpeg-turbo-seed-corpora");
-    const image_jpeg_seed_corpora_e2e_fetch_step = b.step("image-jpeg-seed-corpora-e2e-fetch", "Fetch or refresh the upstream lib/image JPEG seed-corpora checkout");
-    image_jpeg_seed_corpora_e2e_fetch_step.dependOn(&fetch_image_jpeg_seed_corpora_e2e.step);
-
-    const fetch_image_jpeg_seed_corpora_e2e_quiet = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
-    fetch_image_jpeg_seed_corpora_e2e_quiet.addArg("fetch");
-    fetch_image_jpeg_seed_corpora_e2e_quiet.addArg("/tmp/libjpeg-turbo-seed-corpora");
-    const fetch_image_jpeg_seed_corpora_e2e_quiet_step = expectQuietSuccess(fetch_image_jpeg_seed_corpora_e2e_quiet);
-
-    const run_image_jpeg_seed_corpora_e2e = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
-    run_image_jpeg_seed_corpora_e2e.addArg("run");
-    run_image_jpeg_seed_corpora_e2e.addArg("/tmp/libjpeg-turbo-seed-corpora");
-    run_image_jpeg_seed_corpora_e2e.addArg("--no-fetch");
-    const image_jpeg_seed_corpora_e2e_run_step = b.step("image-jpeg-seed-corpora-e2e-run", "Run the lib/image upstream JPEG seed-corpora e2e runner");
-    image_jpeg_seed_corpora_e2e_run_step.dependOn(&run_image_jpeg_seed_corpora_e2e.step);
-
-    const run_image_jpeg_seed_corpora_e2e_after_fetch_quiet = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
-    run_image_jpeg_seed_corpora_e2e_after_fetch_quiet.addArg("run");
-    run_image_jpeg_seed_corpora_e2e_after_fetch_quiet.addArg("/tmp/libjpeg-turbo-seed-corpora");
-    run_image_jpeg_seed_corpora_e2e_after_fetch_quiet.addArg("--no-fetch");
-    run_image_jpeg_seed_corpora_e2e_after_fetch_quiet.addArg("--quiet-failures");
-    run_image_jpeg_seed_corpora_e2e_after_fetch_quiet.step.dependOn(fetch_image_jpeg_seed_corpora_e2e_quiet_step);
-    const run_image_jpeg_seed_corpora_e2e_after_fetch_quiet_step = expectQuietSuccess(run_image_jpeg_seed_corpora_e2e_after_fetch_quiet);
-
-    const triage_image_jpeg_seed_corpora_e2e = b.addRunArtifact(image_jpeg_seed_corpora_e2e);
-    triage_image_jpeg_seed_corpora_e2e.addArg("triage-djpeg");
-    triage_image_jpeg_seed_corpora_e2e.addArg("/tmp/libjpeg-turbo-seed-corpora");
-    triage_image_jpeg_seed_corpora_e2e.addArg("--no-fetch");
-    const image_jpeg_seed_corpora_e2e_triage_step = b.step("image-jpeg-seed-corpora-e2e-triage", "Triage upstream JPEG decode failures against local djpeg");
-    image_jpeg_seed_corpora_e2e_triage_step.dependOn(&triage_image_jpeg_seed_corpora_e2e.step);
-
-    const jpeg2000_fuzz = b.addExecutable(.{
-        .name = "jpeg2000-fuzz",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/image/src/jpeg2000_fuzz.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    jpeg2000_fuzz.root_module.addImport("antfly_image", image_mod);
-    const install_jpeg2000_fuzz = b.addInstallArtifact(jpeg2000_fuzz, .{});
-    const jpeg2000_fuzz_step = b.step("image-jpeg2000-fuzz", "Build the JPEG 2000 fuzz runner");
-    jpeg2000_fuzz_step.dependOn(&install_jpeg2000_fuzz.step);
-
-    // External lib/image conformance fixtures. The fetcher shallow-clones
-    // openjpeg-data into /tmp; normal tests skip gracefully when the checkout
-    // is missing.
-    const lib_image_conformance_fetcher = b.addExecutable(.{
-        .name = "lib-image-conformance-fetch",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/image/src/jpeg2000_conformance_fixtures.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const fetch_lib_image_conformance_fixtures = b.addRunArtifact(lib_image_conformance_fetcher);
-    fetch_lib_image_conformance_fixtures.addArg("fetch");
-    fetch_lib_image_conformance_fixtures.addArg("/tmp/openjpeg-data");
-    const lib_image_conformance_fetch_step = b.step(
-        "lib-image-conformance-fetch",
-        "Fetch the lib/image external conformance fixtures",
-    );
-    lib_image_conformance_fetch_step.dependOn(&fetch_lib_image_conformance_fixtures.step);
-
-    const fetch_lib_image_conformance_fixtures_quiet = b.addRunArtifact(lib_image_conformance_fetcher);
-    fetch_lib_image_conformance_fixtures_quiet.addArg("fetch");
-    fetch_lib_image_conformance_fixtures_quiet.addArg("/tmp/openjpeg-data");
-    const fetch_lib_image_conformance_fixtures_quiet_step = expectQuietSuccess(fetch_lib_image_conformance_fixtures_quiet);
-
-    const run_lib_image_conformance_tests_after_fetch = b.addRunArtifact(lib_image_conformance_tests);
-    run_lib_image_conformance_tests_after_fetch.step.dependOn(&fetch_lib_image_conformance_fixtures.step);
-    const lib_image_conformance_step = b.step("lib-image-conformance", "Fetch and run lib/image conformance suites");
-    lib_image_conformance_step.dependOn(&run_lib_image_conformance_tests_after_fetch.step);
-    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_jpeg.step);
-    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_png.step);
-    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_png_spng.step);
-    lib_image_conformance_step.dependOn(&run_lib_image_corpus_verify_gif.step);
-
-    const run_lib_image_conformance_tests_after_fetch_quiet = b.addRunArtifact(lib_image_conformance_tests);
-    run_lib_image_conformance_tests_after_fetch_quiet.step.dependOn(fetch_lib_image_conformance_fixtures_quiet_step);
-
-    const lib_generating_runtime_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{ "generating backend factory executes fallback chain across providers", "asset producer runtime" },
-    });
-    const run_lib_generating_runtime_tests = b.addRunArtifact(lib_generating_runtime_tests);
-    const lib_generating_runtime_test_step = b.step("lib-generating-runtime-test", "Run generating backend adapter tests");
-    lib_generating_runtime_test_step.dependOn(&run_lib_generating_runtime_tests.step);
-
-    const lib_reranking_tests = b.addTest(.{
-        .root_module = reranking_mod,
-    });
-    const run_lib_reranking_tests = b.addRunArtifact(lib_reranking_tests);
-    const lib_reranking_test_step = b.step("lib-reranking-test", "Run standalone lib/reranking tests");
-    lib_reranking_test_step.dependOn(&run_lib_reranking_tests.step);
-
-    const lib_reranking_runtime_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"reranking runtime"},
-    });
-    const run_lib_reranking_runtime_tests = b.addRunArtifact(lib_reranking_runtime_tests);
-    const lib_reranking_runtime_test_step = b.step("lib-reranking-runtime-test", "Run reranking backend adapter tests");
-    lib_reranking_runtime_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
-
-    const lib_common_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"provider registry"},
-    });
-    const run_lib_common_tests = b.addRunArtifact(lib_common_tests);
-    const lib_common_test_step = b.step("lib-common-test", "Run common/provider registry tests");
-    lib_common_test_step.dependOn(&run_lib_common_tests.step);
-
-    const lib_common_config_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"common config"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const run_lib_common_config_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-common-config-test",
+        "Run common/config tests",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.common_config,
+            .simple_runner = true,
         },
-    });
-    const run_lib_common_config_tests = b.addRunArtifact(lib_common_config_tests);
-    const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
-    lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
+    ).run;
 
-    const lib_casbin_tests = b.addTest(.{
-        .root_module = casbin_mod,
-    });
-    const run_lib_casbin_tests = b.addRunArtifact(lib_casbin_tests);
-    const lib_casbin_test_step = b.step("lib-casbin-test", "Run standalone lib/casbin tests");
-    lib_casbin_test_step.dependOn(&run_lib_casbin_tests.step);
-
-    const lib_usermgr_tests = b.addTest(.{
-        .root_module = usermgr_mod,
-    });
-    const run_lib_usermgr_tests = b.addRunArtifact(lib_usermgr_tests);
-    const lib_usermgr_test_step = b.step("lib-usermgr-test", "Run standalone pkg/antfly/src/usermgr tests");
-    lib_usermgr_test_step.dependOn(&run_lib_usermgr_tests.step);
-
-    const embedded_tests = b.addTest(.{
-        .root_module = embedded_mod,
-        .filters = &.{"embedded"},
-    });
-    const run_embedded_tests = b.addRunArtifact(embedded_tests);
-    const embedded_test_step = b.step("embedded-test", "Run embedded API tests");
-    embedded_test_step.dependOn(&run_embedded_tests.step);
+    const embedded_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        embedded_mod,
+        "embedded-test",
+        "Run embedded API tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.embedded },
+    );
+    const run_embedded_tests = embedded_test_run.run;
 
     const antfly_embedded_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_pkg_mod,
-        .filters = &.{"pkg antfly embedded root"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_root),
     });
     const run_antfly_embedded_pkg_tests = b.addRunArtifact(antfly_embedded_pkg_tests);
     const antfly_embedded_db_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_db_pkg_mod,
-        .filters = &.{"pkg antfly embedded db"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_db),
     });
     const run_antfly_embedded_db_pkg_tests = b.addRunArtifact(antfly_embedded_db_pkg_tests);
     const antfly_embedded_api_pkg_tests = b.addTest(.{
         .root_module = antfly_embedded_api_pkg_mod,
-        .filters = &.{"pkg antfly embedded api"},
+        .filters = selectTestFilters(b, &antfly_tests_build.PackageTestFilters.antfly_embedded_api),
     });
     const run_antfly_embedded_api_pkg_tests = b.addRunArtifact(antfly_embedded_api_pkg_tests);
-    const antfly_embedded_pkg_test_step = b.step("antfly-embedded-test", "Run the standalone antfly-embedded package compile test");
-    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
-    antfly_embedded_pkg_test_step.dependOn(&run_antfly_embedded_api_pkg_tests.step);
+    embedded_test_run.step.dependOn(&run_antfly_embedded_pkg_tests.step);
+    embedded_test_run.step.dependOn(&run_antfly_embedded_db_pkg_tests.step);
+    embedded_test_run.step.dependOn(&run_antfly_embedded_api_pkg_tests.step);
 
-    const antfly_client_pkg_tests = b.addTest(.{
-        .root_module = antfly_client_pkg_mod,
-        .filters = &.{"antfly client pkg compiles"},
+    const run_antfly_client_pkg_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        antfly_client_pkg_mod,
+        "antfly-client-test",
+        "Run the standalone antfly-client package compile test",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.antfly_client },
+    ).run;
+
+    const root_test_skip_filters = antfly_tests_build.RootTestFilters.skip;
+    const unit_progress_skip_filters = antfly_tests_build.RootTestFilters.unit_progress_skip;
+    const root_module_tests = antfly_tests_build.addRootTestStep(b, lib_test_mod);
+    const root_test_step = root_module_tests.step;
+
+    const lake_scaffold_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/lake_scaffold_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    const run_antfly_client_pkg_tests = b.addRunArtifact(antfly_client_pkg_tests);
-    const antfly_client_pkg_test_step = b.step("antfly-client-test", "Run the standalone antfly-client package compile test");
-    antfly_client_pkg_test_step.dependOn(&run_antfly_client_pkg_tests.step);
-
-    const root_test_skip_filters = [_][]const u8{
-        "metadata http cluster simulation",
-        "managed host simulation",
-        "managed http host simulation",
-        "managed http cluster simulation",
-        "cluster simulation",
-        "http host simulation",
-        "simulation harness module compiles",
-        "lsm backend simulation",
-        "persistent sim ",
-        "wal sim ",
-        "index manager sim ",
-        "db split sim ",
-        "HBC recall",
-    };
-    const unit_progress_skip_filters = root_test_skip_filters ++ [_][]const u8{
-        "lsm backend compaction chaos campaign",
-    };
-    const lib_unit_default_filters = [_][]const u8{
-        ".test_0",
-        "module compiles",
-        "batch parser preserves oversized value errors",
-        "batch parser accepts raw payload value under public request cap",
-        "linear merge request parser accepts raw payload value under public request cap",
-        "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
-        "provisioned group storage wires remote content to writer caches",
-        "write cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails",
-        "provisioned table write cache retires stale db when index metadata changes",
-        "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible",
-        "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery",
-        "retrieval agent treats aggregations as first-class tool capability",
-        "retrieval agent requires filter and aggregate tools for filtered aggregations",
-        "retrieval agent ignores empty map-valued tool fields for policy and strategy",
-    };
-    const lib_unit_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_unit_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
+    const lake_scaffold_transcribing_stub_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/testing/transcribing_stub.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    const run_lib_unit_tests = b.addRunArtifact(lib_unit_tests);
-    for (root_test_skip_filters) |filter| {
-        run_lib_unit_tests.addArgs(&.{ "--skip-test-filter", filter });
-    }
-    const root_test_step = b.step("root-test", "Run fast root-module compile smoke tests");
-    root_test_step.dependOn(&run_lib_unit_tests.step);
+    lake_scaffold_transcribing_stub_mod.addImport("httpx", httpx_mod);
+    lake_scaffold_test_mod.addImport("objectstore", objectstore_mod);
+    lake_scaffold_test_mod.addImport("antfly_vector", vector_mod);
+    lake_scaffold_test_mod.addImport("raft_engine", raft_engine_mod);
+    lake_scaffold_test_mod.addImport("antfly_pdf", pdf_mod);
+    lake_scaffold_test_mod.addImport("antfly_scraping", scraping_mod);
+    lake_scaffold_test_mod.addImport("antfly_platform", platform_mod);
+    lake_scaffold_test_mod.addImport("handlebars", handlebars_mod);
+    lake_scaffold_test_mod.addImport("antfly_transcribing", lake_scaffold_transcribing_stub_mod);
+    const lake_scaffold_tests = b.addTest(.{
+        .root_module = lake_scaffold_test_mod,
+    });
+    const run_lake_scaffold_tests = b.addRunArtifact(lake_scaffold_tests);
+    const lake_test_step = b.step("lake-test", "Run Antfly lake-native tests");
+    lake_test_step.dependOn(&run_lake_scaffold_tests.step);
+    root_test_step.dependOn(&run_lake_scaffold_tests.step);
 
+    const graph_metric_tests = antfly_tests_build.addGraphMetricTestSteps(b, .{
+        .root = lib_test_mod,
+        .query_fan_in = api_query_test_mod,
+    }, &root_test_skip_filters);
     const lite_native_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_native_test.zig"),
         .target = target,
@@ -2804,15 +1319,13 @@ pub fn build(b: *std.Build) void {
     antfly_imports.configure(b, lite_native_test_mod, true, true);
     const lite_native_tests = b.addTest(.{
         .root_module = lite_native_test_mod,
-        .filters = &.{"storage.lite."},
+        .filters = antfly_tests_build.selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_native),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lite_native_tests = b.addRunArtifact(lite_native_tests);
-    const lite_native_test_step = b.step("lite-native-test", "Run Lite native backend tests");
-    lite_native_test_step.dependOn(&run_lite_native_tests.step);
 
     const lite_cli_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/lite_cli_test.zig"),
@@ -2830,1324 +1343,224 @@ pub fn build(b: *std.Build) void {
     lite_cli_test_mod.addOptions("build_options", build_options);
     const lite_cli_tests = b.addTest(.{
         .root_module = lite_cli_test_mod,
-        .filters = &.{ "cmd.lite", "cmd.cli.backup" },
+        .filters = antfly_tests_build.selectTestFilters(b, &antfly_tests_build.PackageTestFilters.lite_cli),
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
     const run_lite_cli_tests = b.addRunArtifact(lite_cli_tests);
-    const lite_cli_test_step = b.step("lite-cli-test", "Run Antfly Lite CLI tests");
-    lite_cli_test_step.dependOn(&run_lite_cli_tests.step);
 
-    const lib_recall_default_filters = [_][]const u8{
-        "HBC recall",
-    };
-    const lib_recall_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_recall_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const recall_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "recall-test",
+        "Run HBC vector recall quality tests",
+        .{
+            .filters = &antfly_tests_build.RecallTestFilters.hbc,
+            .simple_runner = true,
         },
-    });
-    const run_lib_recall_tests = b.addRunArtifact(lib_recall_tests);
-    const recall_test_step = b.step("recall-test", "Run HBC vector recall quality tests");
-    recall_test_step.dependOn(&run_lib_recall_tests.step);
+    );
+    const recall_test_step = recall_test_run.step;
 
     const raft_unit_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"raft."}),
+        .filters = selectTestFilters(b, &antfly_tests_build.RaftTestFilters.root),
     });
     const run_raft_unit_tests = b.addRunArtifact(raft_unit_tests);
 
     const raft_transport_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &.{"raft.transport."},
+        .filters = &antfly_tests_build.RaftTestFilters.transport,
     });
     const run_raft_transport_tests = b.addRunArtifact(raft_transport_tests);
 
-    const lib_raft_sim_default_filters = [_][]const u8{
-        "managed host simulation drives add and peer refresh through deterministic steps",
-        "managed host simulation restores through both raft state backends",
-        "managed host simulation keeps WAL replay debt bounded across repeated proposals",
-        "managed host simulation removes routes and replicas across deterministic steps",
-        "simulation harness module compiles",
-        "cluster simulation validates mirrored merge pair invariants",
-        "cluster simulation validates split transition enrichment invariants",
-        "cluster simulation validates merge transition enrichment invariants",
-        "cluster simulation drives split transition actions deterministically",
-        "cluster simulation drives merge transition actions deterministically",
-    };
     const lib_raft_sim_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &lib_raft_sim_default_filters,
+        .filters = &antfly_tests_build.RaftTestFilters.sim,
     });
     const run_lib_raft_sim_tests = b.addRunArtifact(lib_raft_sim_tests);
     const lib_raft_sim_test_step = b.step("lib-raft-sim-test", "Run raft simulation harness tests");
     lib_raft_sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
 
-    const lib_raft_chaos_default_filters = [_][]const u8{
-        "managed host simulation restores through both raft state backends",
-        "managed host simulation persists replica removal across restart for both raft state backends",
-        "managed host simulation drops queued metadata updates across restart for both raft state backends",
-        "managed host simulation does not persist proposals before a runtime round across both raft state backends",
-        "managed http host simulation starts listener and applies deterministic metadata updates",
-        "managed http host simulations elect and replicate over real HTTP",
-        "managed http host simulation can remove and rejoin from HTTP snapshot fetch",
-        "managed http cluster simulation",
-        "http host simulation drives queued split transitions through the service lane",
-        "http host simulation rolls back and retries queued split transitions through the service lane",
-        "http host simulation removes queued split transition mid-flight",
-        "http host simulation updates split transition to rollback mid-flight",
-        "cluster simulation drives queued split transitions through service-owned metadata updates",
-        "cluster simulation resumes queued split transitions after node restart",
-        "cluster simulation removes queued split transition mid-flight across node restart",
-        "cluster simulation rolls back queued split transition mid-flight across node restart",
-        "cluster simulation survives repeated same-id split overwrites across restart",
-        "cluster simulation drives queued merge transitions through service-owned metadata updates",
-        "http host simulation drives queued merge transitions through the service lane",
-        "http host simulation rolls back and retries queued merge transitions through the service lane",
-        "http host simulation removes queued merge transition mid-flight",
-        "http host simulation updates merge transition to rollback mid-flight",
-        "cluster simulation resumes queued merge transitions after node restart",
-        "cluster simulation rolls back queued merge transition mid-flight across node restart",
-        "cluster simulation survives repeated same-id merge overwrites across restart",
-        "cluster simulation isolates concurrent",
-        "cluster simulation drives multiple concurrent real transition ids through multiplexed runtime",
-        "cluster simulation isolates overlapping same-id split overwrites while other transitions complete",
-        "cluster simulation removes queued merge transition mid-flight across node restart",
-    };
     const lib_raft_chaos_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = &lib_raft_chaos_default_filters,
+        .filters = &antfly_tests_build.RaftTestFilters.chaos,
     });
     const run_lib_raft_chaos_tests = b.addRunArtifact(lib_raft_chaos_tests);
     const lib_raft_chaos_test_step = b.step("lib-raft-chaos-test", "Run longer raft restart/HTTP simulation campaigns");
     lib_raft_chaos_test_step.dependOn(&run_lib_raft_chaos_tests.step);
 
-    const lib_lsm_backend_sim_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"lsm backend simulation"},
-    });
-    const run_lib_lsm_backend_sim_tests = b.addRunArtifact(lib_lsm_backend_sim_tests);
-    const lib_lsm_backend_sim_test_step = b.step("lib-lsm-backend-sim-test", "Run LSM backend storage workload simulation tests");
-    lib_lsm_backend_sim_test_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
+    const run_lib_lsm_backend_sim_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-lsm-backend-sim-test",
+        "Run LSM backend storage workload simulation tests",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.lsm_backend_sim },
+    ).run;
 
-    const lib_lsm_backend_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"lsm backend compaction chaos campaign"},
-    });
-    const run_lib_lsm_backend_chaos_tests = b.addRunArtifact(lib_lsm_backend_chaos_tests);
-    const lib_lsm_backend_chaos_test_step = b.step("lib-lsm-backend-chaos-test", "Run longer LSM backend compaction chaos campaigns");
-    lib_lsm_backend_chaos_test_step.dependOn(&run_lib_lsm_backend_chaos_tests.step);
-    const lib_ha_chaos_default_filters = [_][]const u8{
-        "storage.ha chaos crash during base backup preserves slot pin and catch-up boundary",
-        "storage.ha chaos crash after receive replays durable WAL before streaming resumes",
-        "storage.ha chaos rejects noncontiguous records and follows timeline switch across restart",
-        "storage.ha chaos crash during apply preserves remote write and blocks remote apply",
-        "storage.ha chaos crash after apply before ack reports durable progress on resume",
-        "storage.ha chaos primary restart preserves synchronous acknowledgement boundaries",
-        "storage.ha chaos lag retention forces reseed and former primary cannot rewind expired WAL",
-        "storage.ha chaos network partition requires fence before standby promotion",
-    };
-    const lib_ha_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_ha_chaos_default_filters),
-    });
-    const run_lib_ha_chaos_tests = b.addRunArtifact(lib_ha_chaos_tests);
-    const lib_ha_chaos_test_step = b.step("ha-chaos-test", "Run HA hot-standby crash and partition hardening tests");
-    lib_ha_chaos_test_step.dependOn(&run_lib_ha_chaos_tests.step);
-    const lib_ha_compat_default_filters = [_][]const u8{
-        "storage.ha compat decodes v1 replication record fixture",
-        "storage.ha compat keeps v1 replication record encoding stable",
-        "storage.ha compat decodes v1 timeline switch record fixture",
-        "storage.ha compat keeps v1 timeline switch encoding stable",
-        "storage.ha compat decodes v1 base backup and checkpoint record fixtures",
-        "storage.ha compat keeps v1 base backup and checkpoint encodings stable",
-        "storage.ha compat decodes v1 backup manifest fixture",
-        "storage.ha compat keeps v1 backup manifest encoding stable",
-        "storage.ha compat keeps v1 backup manifest file kind tags stable",
-        "storage.ha compat keeps v1 record kind tags stable",
-    };
+    const lib_lsm_backend_chaos_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "lib-lsm-backend-chaos-test",
+        "Run longer LSM backend compaction chaos campaigns",
+        .{ .filters = &antfly_tests_build.PackageTestFilters.lsm_backend_chaos },
+    );
+    const lib_lsm_backend_chaos_tests = lib_lsm_backend_chaos_test_run.tests;
+    _ = lib_lsm_backend_chaos_test_run.step;
+    const ha_chaos_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "ha-chaos-test",
+        "Run HA hot-standby crash and partition hardening tests",
+        .{ .filters = &antfly_tests_build.HATestFilters.chaos },
+    );
+    const lib_ha_chaos_tests = ha_chaos_test_run.tests;
     const lib_ha_compat_tests = b.addTest(.{
         .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_ha_compat_default_filters),
+        .filters = &antfly_tests_build.HATestFilters.compat,
     });
     const run_lib_ha_compat_tests = b.addRunArtifact(lib_ha_compat_tests);
-    const lib_ha_compat_test_step = b.step("ha-compat-test", "Run HA replication format compatibility tests");
-    lib_ha_compat_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const test_step = b.step("test", "Run default package test aggregates");
     const antfly_test_step = b.step("antfly-test", "Run default Antfly unit, simulation, integration, chaos, and recall checks");
     const conformance_test_step = b.step("conformance-test", "Fetch and run conformance suites");
+    const promotion_test_step = b.step("promotion-test", "Run explicit promotion and release qualification suites");
     const soak_test_step = b.step("soak-test", "Run long-running soak test aggregates");
 
     dependOnAll(conformance_test_step, &.{
         run_lib_toon_conformance_after_fetch_quiet_step,
-        &run_lib_image_conformance_tests_after_fetch_quiet.step,
-        run_lib_image_corpus_verify_jpeg_quiet_step,
-        run_lib_image_corpus_verify_png_quiet_step,
-        run_lib_image_corpus_verify_png_spng_quiet_step,
-        run_lib_image_corpus_verify_gif_quiet_step,
-        run_image_jpeg_seed_corpora_e2e_after_fetch_quiet_step,
+        &image_conformance_steps.tests_after_fetch_quiet.step,
+        image_conformance_steps.corpus_verify_jpeg_quiet,
+        image_conformance_steps.corpus_verify_png_quiet,
+        image_conformance_steps.corpus_verify_png_spng_quiet,
+        image_conformance_steps.corpus_verify_gif_quiet,
+        image_conformance_steps.jpeg_seed_corpora_after_fetch_quiet,
     });
 
     const unit_test_step = b.step("unit-test", "Run hermetic unit and focused integration test buckets without metadata chaos simulations");
     const unit_test_progress_step = b.step("unit-test-progress", "Run labeled major unit test suites to expose slow or stuck phases");
 
-    const lib_db_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"storage.db.db.test."}),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_db_tests = b.addRunArtifact(lib_db_tests);
-    const lib_db_test_step = b.step("lib-db-test", "Run root-module DB tests only");
-    lib_db_test_step.dependOn(&run_lib_db_tests.step);
+    const lib_db_test = antfly_tests_build.addDBRootTestStep(b, lib_test_mod);
 
-    const serverless_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"serverless"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const serverless_test_run = antfly_tests_build.addModuleTestStep(
+        b,
+        lib_test_mod,
+        "serverless-test",
+        "Run serverless and serverless transport tests",
+        .{
+            .filters = &antfly_tests_build.PackageTestFilters.serverless,
+            .simple_runner = true,
         },
-    });
-    const run_serverless_tests = b.addRunArtifact(serverless_tests);
-    const serverless_test_step = b.step("serverless-test", "Run serverless and serverless transport tests");
-    serverless_test_step.dependOn(&run_serverless_tests.step);
+    );
+    const serverless_tests = serverless_test_run.tests;
+    const run_serverless_tests = serverless_test_run.run;
 
-    const lib_data_runtime_default_filters = [_][]const u8{
-        "data runtime status refresh publishes synthetic missing status for absent local group db",
-        "data runtime status refresh budget reuses cached group status instead of opening db",
-        "data runtime status refresh reuses managed writer snapshot instead of reopening table db",
-        "data runtime keeps status refresh dirty for non-startup async index work",
-        "data runtime runRound does not refresh provisioned replica root inline while worker is active",
-        "data runtime data changes mark provisioned startup catch-up dirty",
-        "data runtime raft status changes force immediate store status publication",
-        "data runtime structural changes preserve writer-published runtime status",
-        "data runtime startup catch-up prefers cached admin snapshot",
-        "data runtime startup catch-up clears no-debt busy writer groups",
-        "data runtime provisioned root refresh spawn failure preserves retry bookkeeping",
-        "data runtime background maintenance is due for dense posting cadence without lsm debt",
-        "data runtime live writer source follows raft apply ownership",
-        "data runtime local split fallback preserves source identity namespace",
-        "data runtime split apply store seeding reuses cached source writer",
-        "data runtime local merge fallback derives receiver identity namespace from catalog",
-        "data runtime resolves extension package store env before local default",
-        "data runtime cli accepts ARD identity flags",
-        "data public API listener uses public API request body limit",
-        "data server can register a store without enabling data raft",
-        "data server registered data raft uses wal state backend by default",
-        "data server wires configured HA executors into API server",
-        "data server mirrors managed primary writes into HA replication log",
-        "data server fail-closed sync policy rejects primary writes before local commit",
-        "data server block sync policy waits for standby acknowledgement before commit returns",
-        "data server propagates standby HA write gate into provisioned write sources",
-        "storage.ha data server rejects writes and owner jobs after primary promotion fence",
-        "data server applies routed HA replication records through standby write gate",
-        "data server pulls and applies HA standby replication through internal HTTP client",
-        "data server resumes HA standby replication from durable progress after restart",
-        "data runtime records HA standby replication round failures",
-        "data runtime records HA standby apply failures without stopping run round",
-    };
-    const lib_data_runtime_tests = b.addTest(.{
+    const data_runtime_tests = b.addTest(.{
         .root_module = data_runtime_test_mod,
-        .filters = selectTestFilters(b, &lib_data_runtime_default_filters),
+        .filters = &antfly_tests_build.DataTestFilters.runtime,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const run_lib_data_runtime_tests = b.addRunArtifact(lib_data_runtime_tests);
-    const lib_data_runtime_test_step = b.step("lib-data-runtime-test", "Run focused data runtime tests");
-    lib_data_runtime_test_step.dependOn(&run_lib_data_runtime_tests.step);
+    const run_data_runtime_tests = b.addRunArtifact(data_runtime_tests);
 
-    const lib_data_storage_default_filters = [_][]const u8{
-        "db split destination read-only open does not create missing root",
-        "db split sync coordinator allocates destination identity namespace",
-        "db split status rejects stale destination identity namespace",
-        "db merge coordinator opt-in applies configured receiver identity namespace",
-        "db merge coordinator reapplies target namespace for persisted reassignment opt-in",
-        "db merge coordinator rollback reapplies target namespace for persisted reassignment opt-in",
-    };
-    const lib_data_storage_tests = b.addTest(.{
-        .root_module = data_storage_test_mod,
-        .filters = selectTestFilters(b, &lib_data_storage_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
+    const run_lib_data_storage_tests = antfly_tests_build.addModuleTestStep(
+        b,
+        data_storage_test_mod,
+        "lib-data-storage-test",
+        "Run focused data storage tests",
+        .{
+            .filters = &antfly_tests_build.DataTestFilters.storage,
+            .simple_runner = true,
         },
-    });
-    const run_lib_data_storage_tests = b.addRunArtifact(lib_data_storage_tests);
-    const lib_data_storage_test_step = b.step("lib-data-storage-test", "Run focused data storage tests");
-    lib_data_storage_test_step.dependOn(&run_lib_data_storage_tests.step);
+    ).run;
 
-    const lib_db_enrichment_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db batch plans generated enrichment",
-            "storage.db.db.test.db computeEnrichments",
-            "storage.db.db.test.db leased enrichment",
-            "storage.db.db.test.db shared embedding enrichment",
-            "storage.db.db.test.db dense index can reference existing",
-            "storage.db.db.test.db persists shorthand chunk enrichment",
-            "storage.db.db.test.db listEnrichments",
-            "storage.db.db.test.db dense parent paging",
-            "storage.db.db.test.db batch persists per-index applied sequence",
-            "storage.db.db.test.db batch truncates derived log",
-            "storage.db.db.test.db io_threaded executor processes indexed writes",
-            "storage.db.db.test.db reopen replays pending derived embeddings",
-            "storage.db.db.test.db replay respects per-index applied watermarks",
-            "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
-            "storage.db.db.test.db split cutover",
-            "storage.db.db.test.db merge-style cutover",
-        },
-    });
-    const run_lib_db_enrichment_tests = b.addRunArtifact(lib_db_enrichment_tests);
-    const lib_db_enrichment_step = b.step("lib-db-enrichment-test", "Run root-module DB enrichment/replay/cutover tests");
-    lib_db_enrichment_step.dependOn(&run_lib_db_enrichment_tests.step);
+    const lib_db_module_tests = antfly_tests_build.addDBRootModuleTestSteps(b, lib_test_mod);
 
-    const lib_db_enrichment_worker_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db batch plans generated enrichment",
-            "storage.db.db.test.db computeEnrichments",
-            "storage.db.db.test.db leased enrichment worker",
-            "storage.db.db.test.db shared embedding enrichment",
-            "storage.db.db.test.db dense index can reference existing",
-            "storage.db.db.test.db persists shorthand chunk enrichment",
-            "storage.db.db.test.db listEnrichments",
-            "storage.db.db.test.db dense parent paging",
-        },
-    });
-    const run_lib_db_enrichment_worker_tests = b.addRunArtifact(lib_db_enrichment_worker_tests);
-    const lib_db_enrichment_worker_step = b.step("lib-db-enrichment-worker-test", "Run root-module DB enrichment worker tests");
-    lib_db_enrichment_worker_step.dependOn(&run_lib_db_enrichment_worker_tests.step);
-
-    const lib_db_enrichment_replay_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db batch persists per-index applied sequence",
-            "storage.db.db.test.db batch truncates derived log",
-            "storage.db.db.test.db io_threaded executor processes indexed writes",
-            "storage.db.db.test.db reopen replays pending derived embeddings",
-            "storage.db.db.test.db replay respects per-index applied watermarks",
-            "storage.db.db.test.db replay applies dense embeddings from artifact payloads",
-        },
-    });
-    const run_lib_db_enrichment_replay_tests = b.addRunArtifact(lib_db_enrichment_replay_tests);
-    const lib_db_enrichment_replay_step = b.step("lib-db-enrichment-replay-test", "Run root-module DB enrichment replay tests");
-    lib_db_enrichment_replay_step.dependOn(&run_lib_db_enrichment_replay_tests.step);
-
-    const lib_db_enrichment_cutover_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db split cutover",
-            "storage.db.db.test.db merge-style cutover",
-        },
-    });
-    const run_lib_db_enrichment_cutover_tests = b.addRunArtifact(lib_db_enrichment_cutover_tests);
-    const lib_db_enrichment_cutover_step = b.step("lib-db-enrichment-cutover-test", "Run root-module DB enrichment cutover tests");
-    lib_db_enrichment_cutover_step.dependOn(&run_lib_db_enrichment_cutover_tests.step);
-
-    const lib_db_enrichment_split_cutover_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db split cutover fences enrichment to the owning range",
-            "storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen",
-        },
-    });
-    const run_lib_db_enrichment_split_cutover_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_tests);
-    const lib_db_enrichment_split_cutover_step = b.step("lib-db-enrichment-split-cutover-test", "Run root-module DB enrichment split cutover tests");
-    lib_db_enrichment_split_cutover_step.dependOn(&run_lib_db_enrichment_split_cutover_tests.step);
-
-    const lib_db_enrichment_merge_cutover_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db merge-style cutover fences enrichment to the merged receiver range",
-            "storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen",
-        },
-    });
-    const run_lib_db_enrichment_merge_cutover_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_tests);
-    const lib_db_enrichment_merge_cutover_step = b.step("lib-db-enrichment-merge-cutover-test", "Run root-module DB enrichment merge cutover tests");
-    lib_db_enrichment_merge_cutover_step.dependOn(&run_lib_db_enrichment_merge_cutover_tests.step);
-
-    const lib_db_enrichment_split_cutover_reopen_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"storage.db.db.test.db split cutover preserves enrichment resume and fencing across reopen"},
-    });
-    const run_lib_db_enrichment_split_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_split_cutover_reopen_tests);
-    const lib_db_enrichment_split_cutover_reopen_step = b.step("lib-db-enrichment-split-cutover-reopen-test", "Run root-module DB split cutover reopen test");
-    lib_db_enrichment_split_cutover_reopen_step.dependOn(&run_lib_db_enrichment_split_cutover_reopen_tests.step);
-
-    const lib_db_enrichment_merge_cutover_reopen_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"storage.db.db.test.db merge-style cutover preserves enrichment resume and fencing across reopen"},
-    });
-    const run_lib_db_enrichment_merge_cutover_reopen_tests = b.addRunArtifact(lib_db_enrichment_merge_cutover_reopen_tests);
-    const lib_db_enrichment_merge_cutover_reopen_step = b.step("lib-db-enrichment-merge-cutover-reopen-test", "Run root-module DB merge cutover reopen test");
-    lib_db_enrichment_merge_cutover_reopen_step.dependOn(&run_lib_db_enrichment_merge_cutover_reopen_tests.step);
-
-    const lib_db_query_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db full-text",
-            "storage.db.db.test.db dense ",
-            "storage.db.db.test.db sparse ",
-            "storage.db.db.test.db graph ",
-            "storage.db.db.test.db search ",
-            "storage.db.db.test.db document _edges",
-            "storage.db.db.test.db document _embeddings",
-        },
-    });
-    const run_lib_db_query_tests = b.addRunArtifact(lib_db_query_tests);
-    const lib_db_query_step = b.step("lib-db-query-test", "Run root-module DB query/indexing tests");
-    lib_db_query_step.dependOn(&run_lib_db_query_tests.step);
-
-    const lib_db_result_shape_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "dedupeSearchHitsById uses ordinals when hit page is complete",
-            "applyStoredSearchPatternFilters resolves native doc id constraints to hit ordinals",
-            "applyStoredSearchPatternFilters uses hit ordinals for resolved doc filters",
-            "applyStoredSearchPatternFilters fails closed without resolved ordinal projection",
-            "applyStoredSearchPatternFilters fails closed when ordinal projection is unsupported",
-            "native dense constraints fail closed without ordinal vector mapping",
-            "buildPatternDocumentHits preserves resolved binding ordinals",
-            "executeSingleNonPatternQueryWithSets hydrates graph documents from include_documents",
-            "executeSearchGraphWithSets preserves node ordinals",
-            "cloneNamedSetAsResult preserves hit ordinals",
-            "fuseNamedSets preserves source hit ordinals",
-            "fuseNamedSets deduplicates aliases by ordinal when complete",
-            "fuseNamedSets drops conflicting source hit ordinals",
-            "applyGraphUnion deduplicates by ordinals when hit pages are complete",
-            "applyGraphIntersection uses ordinals when hit pages are complete",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_db_result_shape_tests = b.addRunArtifact(lib_db_result_shape_tests);
-    const lib_db_result_shape_step = b.step("lib-db-result-shape-test", "Run focused DB query doc id boundary tests");
-    lib_db_result_shape_step.dependOn(&run_lib_db_result_shape_tests.step);
-
-    const lib_db_reopen_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db reopens persisted",
-            "storage.db.db.test.db delete index persists",
-            "storage.db.db.test.db indexed delete removes",
-            "storage.db.db.test.db indexed overwrite replaces",
-            "storage.db.db.test.db compacts tiny text segments",
-            "storage.db.db.test.db phrase query survives",
-            "storage.db.db.test.db prefix wildcard and regexp",
-            "storage.db.db.test.db typed and dictionary queries survive",
-            "storage.db.db.test.db mixed-type stored fields survive",
-            "storage.db.db.test.db persists byte range across reopen",
-            "storage.db.db.test.db snapshot copies current store and derived log",
-            "storage.db.db.test.db updateRange constrains index backfill",
-        },
-    });
-    const run_lib_db_reopen_tests = b.addRunArtifact(lib_db_reopen_tests);
-    const lib_db_reopen_step = b.step("lib-db-reopen-test", "Run root-module DB reopen/compaction tests");
-    lib_db_reopen_step.dependOn(&run_lib_db_reopen_tests.step);
-
-    const lib_db_txn_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "storage.db.db.test.db writes and reads timestamp",
-            "storage.db.db.test.db lookup hides expired",
-            "storage.db.db.test.db search filters expired",
-            "storage.db.db.test.db ttl cleanup",
-            "storage.db.db.test.db exposes local transaction lifecycle",
-            "storage.db.db.test.db transaction ",
-            "storage.db.db.test.db explicit resolveTransactionIntents",
-            "storage.db.db.test.db recoverTransactions",
-            "storage.db.db.test.db participant recovery",
-            "storage.db.db.test.db batch enforces optimistic version predicates",
-        },
-    });
-    const run_lib_db_txn_tests = b.addRunArtifact(lib_db_txn_tests);
-    const lib_db_txn_step = b.step("lib-db-txn-test", "Run root-module DB TTL/transaction tests");
-    lib_db_txn_step.dependOn(&run_lib_db_txn_tests.step);
-
-    const lib_metadata_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &.{"metadata."}),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_tests = b.addRunArtifact(lib_metadata_tests);
-    const lib_metadata_test_step = b.step("lib-metadata-test", "Run root-module metadata tests only");
-    lib_metadata_test_step.dependOn(&run_lib_metadata_tests.step);
-
-    const lib_metadata_table_workflow_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "table workflow can drive real metadata service topology and split setup",
-            "table workflow can drive placement intents through the real metadata control loop",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_table_workflow_tests = b.addRunArtifact(lib_metadata_table_workflow_tests);
-    const lib_metadata_table_workflow_test_step = b.step("lib-metadata-table-workflow-test", "Run focused metadata table workflow tests");
-    lib_metadata_table_workflow_test_step.dependOn(&run_lib_metadata_table_workflow_tests.step);
-
-    const lib_metadata_sim_default_filters = [_][]const u8{"metadata http cluster simulation"};
-    const lib_metadata_sim_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_tests = b.addRunArtifact(lib_metadata_sim_tests);
-    const lib_metadata_sim_test_step = b.step("lib-metadata-sim-test", "Run metadata real-HTTP simulation tests only");
-    lib_metadata_sim_test_step.dependOn(&run_lib_metadata_sim_tests.step);
-
-    const lib_metadata_sim_core_default_filters = [_][]const u8{
-        "metadata http cluster simulation drives table placement convergence",
-        "metadata http cluster simulation converges placement after candidate churn",
-        "metadata http cluster simulation drives split intent through the control loop",
-        "metadata http cluster simulation drives merge intent through the control loop",
-        "metadata http cluster simulation drives automatic split through the control loop",
-        "metadata http cluster simulation drives automatic merge through the control loop",
-        "metadata http cluster simulation uses live median key for automatic split planning",
-        "metadata http cluster simulation uses remote live median key when metadata leader is not a shard replica",
-        "metadata http cluster simulation publishes split topology after finalize",
-        "metadata http cluster simulation publishes merge topology after finalize",
-        "metadata http cluster simulation provisions split destination replicas across nodes",
-        "metadata http cluster simulation retires merge donor replicas across nodes",
-    };
-    const lib_metadata_sim_core_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_core_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_core_tests = b.addRunArtifact(lib_metadata_sim_core_tests);
-    const lib_metadata_sim_core_test_step = b.step("lib-metadata-sim-core-test", "Run deterministic metadata virtual-transport simulation tests without public API or chaos");
-    lib_metadata_sim_core_test_step.dependOn(&run_lib_metadata_sim_core_tests.step);
-
-    const lib_metadata_sim_smoke_default_filters = [_][]const u8{
-        "metadata sim split runtime preserves source identity namespace",
-        "metadata sim merge runtime records doc identity reassignment opt-in",
-        "metadata http cluster simulation drives table placement convergence",
-        "metadata http cluster simulation drives split intent through the control loop",
-    };
-    const lib_metadata_sim_smoke_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_sim_smoke_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_smoke_tests = b.addRunArtifact(lib_metadata_sim_smoke_tests);
-    const lib_metadata_sim_smoke_test_step = b.step("lib-metadata-sim-smoke-test", "Run fast metadata virtual-transport simulation smoke tests");
-    lib_metadata_sim_smoke_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-
-    const lib_metadata_vopr_default_filters = [_][]const u8{
-        "metadata VOPR seeded smoke campaign",
-    };
-    const lib_metadata_vopr_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_vopr_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_vopr_tests = b.addRunArtifact(lib_metadata_vopr_tests);
-    const lib_metadata_vopr_test_step = b.step("lib-metadata-vopr-test", "Run seeded metadata virtual-operation campaign tests");
-    lib_metadata_vopr_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-
-    const lib_metadata_vopr_chaos_default_filters = [_][]const u8{
-        "metadata VOPR expanded generated workload campaign",
-    };
-    const lib_metadata_vopr_chaos_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_metadata_vopr_chaos_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_vopr_chaos_tests = b.addRunArtifact(lib_metadata_vopr_chaos_tests);
-    const lib_metadata_vopr_chaos_test_step = b.step("lib-metadata-vopr-chaos-test", "Run expanded metadata VOPR generated workload campaigns");
-    lib_metadata_vopr_chaos_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
-
-    const lib_metadata_transition_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation completes automatic split after metadata leader restart",
-        "metadata http cluster simulation completes automatic split after metadata leader partition",
-        "metadata http cluster simulation completes automatic split under delayed raft transport",
-        "metadata http cluster simulation completes automatic split after leader restart under delayed raft transport",
-        "metadata http cluster simulation completes automatic split after source group leader restart",
-        "metadata http cluster simulation completes automatic split after destination group leader restart",
-        "metadata http cluster simulation completes automatic split after leader partition under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after metadata leader restart",
-        "metadata http cluster simulation completes automatic merge after donor group leader restart",
-        "metadata http cluster simulation completes automatic merge after receiver group leader restart",
-        "metadata http cluster simulation completes automatic merge after metadata leader partition",
-        "metadata http cluster simulation completes automatic merge under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after leader restart under delayed raft transport",
-        "metadata http cluster simulation completes automatic merge after leader partition under delayed raft transport",
-        "metadata http cluster simulation survives leader restart before forced automatic split reconcile",
-    };
-    const lib_metadata_public_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation serves public traffic across automatic split under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after source leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after leader partition under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic split after metadata leader partition",
-        "metadata http cluster simulation serves public traffic across automatic merge under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after donor leader restart under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after leader partition under delayed raft transport",
-        "metadata http cluster simulation serves public traffic across automatic merge after metadata leader partition",
-    };
-    const lib_metadata_placement_chaos_default_filters = [_][]const u8{
-        "metadata http cluster simulation survives metadata leader restart during placement reconcile",
-        "metadata http cluster simulation drops table topology across leader restart",
-    };
-    const lib_metadata_transition_chaos_filters = selectTestFilters(b, &lib_metadata_transition_chaos_default_filters);
-    const lib_metadata_public_chaos_filters = selectTestFilters(b, &lib_metadata_public_chaos_default_filters);
-    const lib_metadata_placement_chaos_filters = selectTestFilters(b, &lib_metadata_placement_chaos_default_filters);
-
-    const lib_metadata_transition_chaos_test_step = b.step("lib-metadata-transition-chaos-test", "Run metadata split/merge transition restart and partition chaos simulations");
-    var metadata_transition_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_transition_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, metadata_transition_chaos_progress_tail);
-    lib_metadata_transition_chaos_test_step.dependOn(metadata_transition_chaos_progress_tail.?);
-
-    const lib_metadata_public_chaos_test_step = b.step("lib-metadata-public-chaos-test", "Run metadata public traffic split/merge chaos simulations");
-    var metadata_public_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_public_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_public_chaos_progress_tail);
-    lib_metadata_public_chaos_test_step.dependOn(metadata_public_chaos_progress_tail.?);
-
-    const lib_metadata_placement_chaos_test_step = b.step("lib-metadata-placement-chaos-test", "Run metadata placement restart chaos simulations");
-    var metadata_placement_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_placement_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_placement_chaos_progress_tail);
-    lib_metadata_placement_chaos_test_step.dependOn(metadata_placement_chaos_progress_tail.?);
-
-    const lib_metadata_chaos_test_step = b.step("lib-metadata-chaos-test", "Run metadata delayed/restart/partition chaos simulations");
-    var metadata_chaos_progress_tail: ?*std.Build.Step = null;
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, metadata_chaos_progress_tail);
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, metadata_chaos_progress_tail);
-    metadata_chaos_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, metadata_chaos_progress_tail);
-    lib_metadata_chaos_test_step.dependOn(metadata_chaos_progress_tail.?);
-
-    const lib_metadata_sim_public_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata http cluster simulation serves public lifecycle from a non-host node after public create",
-            "metadata http cluster simulation seeds default admin for auth-enabled public api",
-            "metadata http cluster simulation forwards public split flow from a non-host node after public create",
-            "metadata http cluster simulation forwards public merge flow from a non-host node after public create",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_public_tests = b.addRunArtifact(lib_metadata_sim_public_tests);
-    const lib_metadata_sim_public_test_step = b.step("lib-metadata-sim-public-test", "Run metadata public lifecycle/split/merge simulation tests");
-    lib_metadata_sim_public_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
-
-    const public_api_parity_default_filters = [_][]const u8{
-        "public openapi contract module is generated and wired",
-        "admin openapi contract module is generated and wired",
-        "internal openapi contract module is generated and wired",
-        "metadata openapi module generates extractor surface for routed endpoints",
-        "usermgr openapi module generates extractor surface for routed endpoints",
-        "client openapi module resolves shared refs through owner modules",
-        "batch parser accepts Go transform op spelling",
-        "public table contract exposes migration metadata",
-        "api http client round-trips public table management routes",
-        "api http server serves status",
-        "api http server returns json eval and query builder validation errors",
-        "api http server returns json not found for missing query builder table",
-        "api http server serves eval response envelope",
-        "api http server serves query builder response envelope",
-        "api http server query builder infers semantic indexes from table metadata",
-        "api http server query builder handles tree graph indexes",
-        "api http server query builder replays clarification decisions",
-        "api http server serves secrets crud when backed by a local store",
-        "api http server lists secrets status without a local secret store",
-        "api http server rejects secret writes without a local secret store",
-        "api http server serves table lookup with version header",
-        "api http server serves table scan as ndjson",
-        "api http server routes table query through read schema full text index",
-        "api http server serves table query response envelope",
-        "api http server serves retrieval agent response envelope",
-        "api http server serves table batch writes",
-        "auto bulk max-window session rolls without a following write",
-        "auto bulk group writes release leases so idle finish can publish",
-        "auto bulk max-window rolls publish all threshold aligned docs",
-        "provisioned table write source seeds doc identity namespace from table range",
-        "provisioned table write source cached runtime status does not fetch catalog coverage",
-        "managed startup catch-up uses provided indexes json without catalog fetch",
-        "idle startup runtime status preserves live empty cached status",
-        "api http server serves table batch transforms",
-        "api http server updates local table schema through bound write source",
-        "api http server serves public transaction commit route",
-        "api http server surfaces structured participant diagnostics for unavailable transaction commits",
-        "api http server surfaces structured decision conflicts for transaction commits",
-        "api http server surfaces structured torn-state conflicts when txn record is missing",
-        "api http server surfaces structured torn-state conflicts when txn record is corrupted",
-        "api http server serves transaction session cleanup route",
-        "api http server serves table metadata list and detail",
-        "api http server serves runtime schema debug on table and index detail",
-        "api http server serves table index metadata routes",
-        "api index status prefers best-effort write runtime status",
-        "api index status prefers cached read runtime status before write status",
-        "api index status does not fall through to write runtime status when read cache is empty",
-        "api index status uses propagated remote store runtime status",
-        "api index status ignores propagated runtime status from removed owner",
-        "api index status reports missing remote shard as not ready",
-        "single embeddings index encoder keeps backfill active while enrichment replay lags",
-        "api http server serves local index runtime backfill status",
-        "api http server serves provisioned index runtime backfill status across shards",
-        "api http server serves table create and drop",
-        "api http server serves table metadata routes against real metadata service",
-        "api http server create table with replication sources returns encoded table detail",
-        "api http server lists cluster backups through public route",
-        "api http server forwards cluster backup mutations to metadata leader",
-        "api http server backs up and restores a table through public routes",
-        "api http server prefers metadata-owned restore over inline write-source restore",
-        "public API request body limit matches Go linear merge contract",
-        "public api smoke e2e creates table inserts and queries documents",
-        "public api e2e recreates managed embeddings index after corrupt artifact",
-        "public api split e2e uses distributed global text stats for bm25 and significant_terms",
-        "public api multi-node e2e routes CRUD from a non-host node",
-    };
-    const public_api_parity_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &public_api_parity_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_public_api_parity_tests = b.addRunArtifact(public_api_parity_tests);
-    run_public_api_parity_tests.step.dependOn(&openapi_root_check.step);
-    const public_api_parity_test_step = b.step("public-api-parity-test", "Run focused stateful public API parity tests");
-    public_api_parity_test_step.dependOn(&run_public_api_parity_tests.step);
-
-    const lib_resolution_source_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "DistributedCandidateSource",
-            "prefixUpperBoundAlloc",
-            "DistributedEntitySink",
-        },
-    });
-    const run_lib_resolution_source_tests = b.addRunArtifact(lib_resolution_source_tests);
-    const lib_resolution_source_test_step = b.step("lib-resolution-source-test", "Run focused cross-shard resolution candidate-source and entity-sink tests");
-    lib_resolution_source_test_step.dependOn(&run_lib_resolution_source_tests.step);
-
-    const lib_api_auth_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "api http server requires auth on public routes when enabled",
-            "api http server dispatches HA admin and internal executors",
-            "api http server protects HA admin routes while exempting HA internal routes",
-            "api http server forbids non-admin secret access when auth is enabled",
-            "api http server query builder requires table read permission when auth is enabled",
-            "api http server restricts runtime schema debug to admins when auth is enabled",
-            "api http server serves user management routes when auth is enabled",
-            "api http server serves api key and row filter routes",
-            "api http server returns json user auth errors",
-            "document artifact routes declare read and admin permissions",
-            "api http server serves mcp and a2a protocol surfaces",
-            "api http server serves ARD catalogs with public bootstrap and authenticated tenant entries",
-            "api http server requires auth for ARD tenant catalog when auth is enabled",
-            "api http server serves ARD OpenAPI, skill, resource, and registry endpoints",
-            "api http server filters extension mcp tools by trusted principal table permissions",
-            "ARD search filters scoped catalog entries",
-            "ARD search requires text while explore accepts filter-only requests",
-            "ARD search supports publisher and metadata filters",
-            "ARD search validates federation and returns referral envelope",
-            "ARD explore returns requested facet buckets over scoped entries",
-            "ARD catalog entries contain required value or reference fields",
-            "ARD catalog resolves artifact urls against configured base url",
-            "ARD MCP descriptors resolve endpoints against configured base url",
-            "ARD catalog hides admin-only built-in skills from non-admin entries",
-            "ARD catalog applies declared table permissions to built-in skills",
-            "ARD extension package entries use trust provenance for artifact digests",
-            "ARD search supports extension metadata filters",
-            "ARD profile filter keeps only profile-compatible skills",
-            "auth row filter resolver expands username references",
-            "auth row filter resolver expands metadata references",
-            "auth row filter validator accepts username references",
-            "auth row filter resolver rejects unsupported auth paths",
-            "auth row filter validator rejects malformed auth node",
-            "effective resolved row filter prefers table filter before wildcard",
-            "artifact operations apply source document row filter visibility",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_api_auth_tests = b.addRunArtifact(lib_api_auth_tests);
-    run_lib_api_auth_tests.step.dependOn(&openapi_root_check.step);
-    const lib_api_auth_test_step = b.step("lib-api-auth-test", "Run focused API auth/usermgr HTTP tests");
-    lib_api_auth_test_step.dependOn(&run_lib_api_auth_tests.step);
-
-    const lib_api_docid_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "api table reads reject stale doc identity before multigroup fanout",
-            "distributed table reads reject stale doc identity before multigroup fanout",
-            "api public table query rejects only top-level internal fields",
-            "single embeddings index encoder scopes isolated enrichment failure to one index",
-            "api query contract rejects doc identity control fields when with relaxes schema",
-            "api query contract public parser rejects internal shard doc identity controls",
-            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
-            "distributed graph rejects doc identity rebuild before cross-range fanout",
-            "distributed graph rejects unstamped result refs before cross-range fanout",
-            "distributed graph edge reader carries identity generation",
-            "query merge preserves common identity read generation",
-            "query encoder does not expose internal doc ordinals",
-            "graph edge local read rejects stale identity generation",
-            "catalog doc identity readiness checks table range health",
-            "catalog resolved filter validation accepts preserved split identity domains",
-            "metadata merge request validation rejects incompatible doc identity namespaces",
-            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata reconciler does not automatically split ordinal exhausted doc identity",
-            "metadata state classifies mixed-version doc identity lifecycle reports",
-            "metadata state marks doc identity rebuild required on range namespace mismatch",
-            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
-            "metadata http server serves status and filtered admin routes",
-            "metadata http server maps source split merge doc identity conflicts",
-            "metadata http client preserves split merge doc identity conflicts",
-            "metadata http client parses legacy range records without doc identity fields",
-            "metadata http client round-trips range doc identity fields",
-            "metadata http client round-trips server endpoints",
-            "table workflow doc identity guards reject active transition intents",
-            "table workflow doc identity lifecycle handles mixed-version transition status",
-            "metadata reconciler doc identity guards block new planning during active reassignment",
-            "metadata reconciler does not upsert desired split with stale doc identity namespace",
-            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
-            "replay batcher tuple map keys preserve embedded delimiters",
-            "db chunk cache keys preserve embedded separators",
-            "enrichment worker chunk cache keys preserve embedded separators",
-            "search request text stats keys preserve embedded separators",
-            "merge distributed background text stats keys preserve embedded separators",
-            "graph edge local read rejects stale identity namespace",
-            "dense metadata keys preserve embedded index separators",
-            "dense metadata lookups read legacy textual rows",
-            "distributed txn participant ids preserve embedded group markers",
-            "distributed join unmatched worker pages group-local right hits",
-            "distributed join follow-up pagination requires stamped identity request",
-            "distributed join group-local hit pagination reuses structured search generation",
-            "distributed right join unmatched tracking uses ordinal identity keys",
-            "distributed join unmatched worker prefers local search results over query envelopes",
-            "distributed join rejects doc identity rebuild before right-table fanout",
-            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
-            "internal worker doc identity exchange audit covers every boundary",
-            "internal group write routes map shard doc identity mismatch to conflict",
-            "internal group join routes map doc identity mismatch to conflict",
-            "internal group read routes map doc identity mismatch to conflict",
-            "api http client preserves group doc identity conflicts",
-            "aggregation context rejects non-current identity generation",
-            "aggregation full-result rerun can reuse snapped result identity generation",
-            "explicit text stats requests preserve identity generation",
-            "explicit text stats requests carry resolved doc filters and apply exact projection",
-            "explicit text stats requests reject stale identity generation",
-            "algebraic partial request fails closed when lifecycle is stale",
-            "algebraic partial request accepts current identity generation and rejects stale",
-            "provisioned distributed aggregations collect path terms nested cardinality",
-            "algebraic distributed planner selects identity-stamped derived join tensor program",
-            "algebraic derived join tensor reads subtract identity tombstones at generation",
-            "planner rejects rebuild-required schema lifecycle state",
-            "algebraic adaptive progress marks rebuild required on schema drift",
-            "db vector symbolic filters fail closed when algebraic lifecycle is stale",
-            "remote simple vector query uses vector worker route",
-            "encode query request serializes internal resolved doc filters with wire context",
-            "simple vector shard request carries serializable resolved doc filter",
-            "api http server maps public query doc identity mismatch to unavailable",
-            "api http server maps retrieval agent doc identity mismatch to unavailable",
-            "api http server query builder maps doc identity mismatch to unavailable",
-            "api http server surfaces structured doc identity conflicts for transaction commits",
-            "internal group vector worker rejects unsupported identity generation",
-            "internal group graph expand rejects unsupported identity generation",
-            "distributed graph expand request preserves algebraic semiring planning flag",
-            "batch identity metadata delete observes buffered resurrection state",
-            "identity validation accepts missing canonical rows but rejects conflicts",
-            "identity allocation rejects canonical row conflicts before reserving ordinal",
-            "batch identity metadata fails closed at ordinal capacity",
-            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
-            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-            "db stats flag document identity ordinal capacity exhaustion",
-            "db stats expose document identity coverage and tombstones",
-            "db allocates final document ordinal with all index families present",
-            "db lsm primary compaction preserves doc identity ordinals",
-            "db rejects new document writes at ordinal exhaustion for every sync level",
-            "db transaction intent writes reject new documents at ordinal exhaustion",
-            "db restore snapshot rejects invalid doc identity metadata",
-            "db deferred restore rejects strict doc identity namespace mismatch",
-            "db explicit restore runtime repair repairs managed chunked dense embeddings once for restored shard",
-            "db incomplete deferred restore import recovers before runtime repair",
-            "export and import preserves doc identity metadata",
-            "import rejects doc identity metadata with invalid canonical ids",
-            "import rejects doc identity namespace mismatch unless preserving existing namespace",
-            "db resolved doc-set projection honors identity read generation",
-            "db doc set planning stats record ordinal bitmap promotion",
-            "db search requests default to current identity generation snapshot",
-            "db validates internal resolved doc filter wire namespace and generation",
-            "db explicit doc-id filter resolution honors identity generation",
-            "doc filter wire round-trips ordinal and doc-key filters",
-            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
-            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
-            "dense vector id ignores ordinal metadata for a different doc",
-            "dense metadata prefetch includes legacy ordinal vector ids",
-            "db dense index stores stable vector ids with ordinal filter mappings",
-            "db dense artifact rebuild preserves stable vector ids distinct from ordinals",
-            "db sparse index keeps physical doc nums distinct from doc identity ordinals",
-            "db sparse hits resolve doc ordinals through identity not sparse doc nums",
-            "native dense constraints fail closed without ordinal vector mapping",
-            "native constraints fail closed when resolved ordinals cannot be represented",
-            "native sparse constraints fail closed without ordinal doc num mapper",
-            "native sparse constraints map resolved ordinals to physical doc nums",
-            "match_all candidate ordinal lookup uses identity read generation",
-            "match_all consumes resolved ordinal filters without doc id projection",
-            "native constraints pass identity generation to doc-set id projection",
-            "native constraints pass identity read generation to live doc filtering",
-            "native constraints treat resolved all-doc exclusion as empty candidates",
-            "native sparse constraints keep explicit doc ids when identity coverage is incomplete",
-            "text resolved doc filter projection passes identity generation to live filtering",
-            "text native constraints fall back for mixed ordinal sidecar coverage",
-            "text native constraints fail closed when resolved ordinals cannot be projected",
-            "text native constraints treat resolved all-doc exclusion as empty candidates",
-            "segment doc ordinal sidecar roundtrip and merge preserve live order",
-            "db text compaction preserves ordinal filters across reopen",
-            "structured filter doc set cache returns owned clones",
-            "structured filter doc set cache separates shared namespace generation keys",
-            "cache invalidates ownership move prefix without reviving pinned generations",
-            "applyGraphUnion deduplicates by ordinals when hit pages are complete",
-            "applyGraphIntersection uses ordinals when hit pages are complete",
-            "query merge preserves single-result doc ordinals",
-            "fuseNamedSets deduplicates aliases by ordinal when complete",
-            "graph result_ref fails closed when unbounded resolved doc-set cannot project",
-            "graph result_ref uses complete node doc-set when hits are paged",
-            "graph query result doc-set resolution receives identity generation",
-            "provisioned direct read db opens reject stale identity namespace",
-            "provisioned query runtime db rejects stale identity namespace",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_transactions_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_transactions_test_root.zig"),
+    const metadata_fk_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/metadata_fk_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    antfly_imports.configure(b, api_transactions_docid_test_mod, true, true);
-    const api_table_writes_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_table_writes_test_root.zig"),
+    antfly_imports.configure(b, metadata_fk_test_mod, true, true);
+    const metadata_tests = antfly_tests_build.addMetadataTestSteps(b, lib_test_mod, metadata_fk_test_mod);
+    const metadata_root_tests = metadata_tests.root.tests;
+    const run_lib_metadata_sim_smoke_tests = metadata_tests.sim_smoke.run;
+    const run_lib_metadata_vopr_tests = metadata_tests.vopr.run;
+    const run_lib_metadata_vopr_chaos_tests = metadata_tests.vopr_chaos.run;
+    const lib_metadata_public_chaos_test_step = metadata_tests.chaos.public;
+    const run_lib_metadata_sim_public_tests = metadata_tests.sim_public.run;
+
+    const api_focused_tests = antfly_tests_build.addAPIFocusedTestSteps(b, lib_test_mod, &generated_steps.openapi_root_check.step);
+    const run_public_api_parity_tests = api_focused_tests.public_api_parity.run;
+    const run_public_api_graph_metric_e2e_tests = api_focused_tests.public_api_graph_metric_e2e.run;
+    const run_lib_api_auth_tests = api_focused_tests.auth.run;
+    const run_lib_api_logic_tests = api_focused_tests.logic.run;
+
+    // Keep API tests wired at stable suite granularity. Leaf implementation
+    // tests should join these roots via pkg/antfly/build/tests.zig filters,
+    // not by adding one top-level build step per regression.
+    const api_table_tests = antfly_tests_build.addAPITableTestRootSteps(b, .{
+        .root = lib_test_mod,
         .target = target,
         .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_table_writes_docid_test_mod, true, true);
-    const api_table_reads_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_table_reads_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_table_reads_docid_test_mod, true, true);
-    const api_public_table_http_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api_public_table_http_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, api_public_table_http_docid_test_mod, true, true);
-    const raft_transition_runtime_docid_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/raft_transition_runtime_test_root.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    antfly_imports.configure(b, raft_transition_runtime_docid_test_mod, true, true);
-    const api_transactions_docid_tests = b.addTest(.{
-        .root_module = api_transactions_docid_test_mod,
-        .filters = &.{
-            "transaction read snapshot map keys preserve embedded delimiters",
-            "transaction session commit response includes retry hints for doc identity availability conflicts",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_table_writes_docid_tests = b.addTest(.{
-        .root_module = api_table_writes_docid_test_mod,
-        .filters = &.{
-            "api auto bulk ingest does not open sessions for normal online writes",
-            "provisioned table write source rejects stale doc identity namespace before write",
-            "bound table write source backs up and restores a local table",
-            "bound table write source backs up and restores a portable local table",
-            "provisioned table write source backs up a portable local table",
-            "provisioned table restore rejects mismatched doc identity namespace",
-            "provisioned table restore retry skips exact incomplete restore state with active writer",
-            "provisioned restore repair open rejects stale doc identity namespace",
-            "write cache blocks same-root generation replacement while stale lease stays live",
-            "provisioned create index updates cached writer in place",
-            "write cache metadata refresh preserves inactive adoptable seed",
-            "write cache adopts active just-created db across generation bump",
-            "runtime status collection leaves active stale write lease live",
-            "primary lookup adopts seeded write cache across visible generation bump",
-            "provisioned write cache close detaches promotion leadership callback before stats",
-            "provisioned table write source coalesces same-group waiters",
-            "provisioned table write coalescer isolates failed waiters",
-            "provisioned table write source consistent visibility hook does not block on busy apply lock",
-            "provisioned table write source consistent visibility refreshes stale dense status",
-            "managed startup catch-up repeats replay while dense debt progresses",
-            "provisioned group storage wires remote content to writer caches",
-            "startup runtime status snapshot publishes live db when active cache is empty",
-            "best effort startup runtime status publishes live db when cache is empty",
-            "idle startup runtime status publish is live when startup flag is still set",
-            "managed startup catch-up uses provided indexes json without catalog fetch",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_table_reads_docid_tests = b.addTest(.{
-        .root_module = api_table_reads_docid_test_mod,
-        .filters = &.{
-            "provisioned read cache invalidates repeated ownership moves with pinned leases",
-            "parseRemoteSearchResult preserves fused index scores",
-            "provisioned standby read gate permits stale reads and routes non-stale reads to primary",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const api_public_table_http_docid_tests = b.addTest(.{
-        .root_module = api_public_table_http_docid_test_mod,
-        .filters = &.{
-            "public table batch handler maps doc identity unavailable errors",
-            "public table batch handler maps write unavailable errors",
-            "public table batch handler maps HA write gate errors",
-            "public table query handler maps doc identity unavailable errors",
-            "public table query handler maps HA read gate errors",
-            "public table query view handler maps doc identity unavailable errors",
-            "public table backup handler accepts portable format",
-            "public table query view handler maps HA read gate errors",
-            "public document artifact manifest handlers map HA read gate errors",
-            "public document artifact manifest handler returns summary and raw state",
-            "public document artifact reprocess handler returns accepted",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const raft_transition_runtime_docid_tests = b.addTest(.{
-        .root_module = raft_transition_runtime_docid_test_mod,
-        .filters = &.{
-            "transition runtime fails closed when doc identity reassignment callback is missing",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const lib_serverless_docid_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "serverless query module compiles",
-            "search plan rejects internal doc identity controls",
-            "serverless graph plans reject internal doc identity controls",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_api_docid_tests = b.addRunArtifact(lib_api_docid_tests);
-    const run_lib_serverless_docid_tests = b.addRunArtifact(lib_serverless_docid_tests);
-    const run_api_transactions_docid_tests = b.addRunArtifact(api_transactions_docid_tests);
-    const run_api_table_writes_docid_tests = b.addRunArtifact(api_table_writes_docid_tests);
-    const run_api_table_reads_docid_tests = b.addRunArtifact(api_table_reads_docid_tests);
-    const run_api_public_table_http_docid_tests = b.addRunArtifact(api_public_table_http_docid_tests);
-    const run_raft_transition_runtime_docid_tests = b.addRunArtifact(raft_transition_runtime_docid_tests);
-    const api_table_writes_docid_test_step = b.step("api-table-writes-docid-test", "Run focused API table write tests");
-    api_table_writes_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    const api_table_reads_docid_test_step = b.step("api-table-reads-docid-test", "Run focused API table read tests");
-    api_table_reads_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    const api_public_table_http_docid_test_step = b.step("api-public-table-http-docid-test", "Run focused public table HTTP read-unavailable tests");
-    api_public_table_http_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    const lib_docid_lifecycle_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata reconciler does not automatically split ordinal exhausted doc identity",
-            "metadata state classifies mixed-version doc identity lifecycle reports",
-            "metadata state marks doc identity rebuild required on range namespace mismatch",
-            "metadata merge validation handles rolling mixed-version doc identity status fixtures",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata http server rejects split and merge during active doc identity reassignment before source mutation",
-            "table workflow doc identity guards reject active transition intents",
-            "metadata reconciler doc identity guards block new planning during active reassignment",
-            "metadata reconciler does not upsert desired split with stale doc identity namespace",
-            "metadata reconciler allows explicit merge with doc identity reassignment opt-in",
-            "distributed join follow-up pagination requires stamped identity request",
-            "distributed join group-local hit pagination reuses structured search generation",
-            "distributed join rejects doc identity rebuild before right-table fanout",
-            "distributed join stateful shuffle rejects doc identity rebuild before worker dispatch",
-            "distributed graph rejects doc identity rebuild before cross-range fanout",
-            "distributed graph rejects unstamped result refs before cross-range fanout",
-            "api distributed graph hydrate carries identity generation and clears cross-range ordinals",
-            "internal worker doc identity exchange audit covers every boundary",
-            "aggregation context rejects non-current identity generation",
-            "aggregation full-result rerun can reuse snapped result identity generation",
-            "explicit text stats requests preserve identity generation",
-            "explicit text stats requests reject stale identity generation",
-            "structured filter doc set cache separates shared namespace generation keys",
-            "cache invalidates ownership move prefix without reviving pinned generations",
-            "db text compaction preserves ordinal filters across reopen",
-            "db lsm primary compaction preserves doc identity ordinals",
-            "db allocates final document ordinal with all index families present",
-            "identity namespace reassignment preserves snapshot generations and rejects stale writers",
-            "near-u32 ordinal pressure preserves sparse high ordinal state through reassignment",
-            "index manager split handoff preserves interleaved write and query summaries",
-            "db stats flag document identity ordinal capacity exhaustion",
-            "db rejects new document writes at ordinal exhaustion for every sync level",
-            "db transaction intent writes reject new documents at ordinal exhaustion",
-            "db search requests default to current identity generation snapshot",
-            "db validates internal resolved doc filter wire namespace and generation",
-            "db resolved doc-set projection honors identity read generation",
-            "doc filter wire rejects old required-field fixtures but tolerates additive fields",
-            "doc filter wire rejects invalid ordinal fixtures from mixed-version senders",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_docid_lifecycle_tests = b.addRunArtifact(lib_docid_lifecycle_tests);
-    const docid_lifecycle_test_step = b.step("docid-lifecycle-test", "Run focused DOCID lifecycle and distributed snapshot hardening tests");
-    docid_lifecycle_test_step.dependOn(&run_lib_docid_lifecycle_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    docid_lifecycle_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    }, antfly_imports);
+    _ = antfly_tests_build.addDocIdTestStep(
+        b,
+        api_focused_tests.docid_lifecycle,
+        api_table_tests,
+        lib_db_module_tests.result_shape,
+    );
 
-    const docid_operational_hardening_test_step = b.step("docid-operational-hardening-test", "Run extended DOCID lifecycle, metadata chaos, and compaction hardening tests");
-    docid_operational_hardening_test_step.dependOn(docid_lifecycle_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_transition_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    docid_operational_hardening_test_step.dependOn(lib_lsm_backend_chaos_test_step);
-
-    const lib_api_docid_test_step = b.step("lib-api-docid-test", "Run focused API DOCID boundary tests");
-    lib_api_docid_test_step.dependOn(&run_lib_api_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_serverless_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_transactions_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_reads_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_table_writes_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_api_public_table_http_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_raft_transition_runtime_docid_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_storage_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_data_runtime_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
-    lib_api_docid_test_step.dependOn(&run_lib_metadata_vopr_chaos_tests.step);
-    lib_api_docid_test_step.dependOn(lib_metadata_public_chaos_test_step);
-    lib_api_docid_test_step.dependOn(&run_lib_db_result_shape_tests.step);
-
-    const lib_api_swarm_backup_restore_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "public api swarm-like e2e backs up drops and restores a table",
-        },
+    _ = antfly_tests_build.addAPITableAggregateTestStep(b, api_table_tests, .{
+        .data_storage = run_lib_data_storage_tests,
+        .data_runtime = run_data_runtime_tests,
+        .metadata_sim_smoke = run_lib_metadata_sim_smoke_tests,
+        .metadata_sim_public = run_lib_metadata_sim_public_tests,
+        .metadata_vopr = run_lib_metadata_vopr_tests,
+        .metadata_vopr_chaos = run_lib_metadata_vopr_chaos_tests,
+        .metadata_public_chaos = lib_metadata_public_chaos_test_step,
+        .db_result_shape = lib_db_module_tests.result_shape,
     });
-    const run_lib_api_swarm_backup_restore_tests = b.addRunArtifact(lib_api_swarm_backup_restore_tests);
-    const lib_api_swarm_backup_restore_test_step = b.step("lib-api-swarm-backup-restore-test", "Run the focused swarm-like backup/restore e2e test");
-    lib_api_swarm_backup_restore_test_step.dependOn(&run_lib_api_swarm_backup_restore_tests.step);
 
-    const openapi_root_check_step = b.step("openapi-root-check", "Check that the bundled root OpenAPI spec matches the modular Zig specs");
-    openapi_root_check_step.dependOn(&openapi_root_check.step);
+    antfly_tests_build.dependOnAPIGeneratedChecks(generated_steps.generated_check, api_table_tests);
 
-    const lib_metadata_sim_forward_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"forwards public table io"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_sim_forward_tests = b.addRunArtifact(lib_metadata_sim_forward_tests);
-    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run metadata HTTP forwarding simulation tests only");
-    lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
+    const run_lib_metadata_sim_forward_tests = metadata_tests.sim_forward.run;
 
-    const lib_metadata_service_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata service ",
-            "metadata control loop can drive the real metadata service",
-            "table workflow can drive real metadata service topology and split setup",
-            "table workflow can drive placement intents through the real metadata control loop",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_service_tests = b.addRunArtifact(lib_metadata_service_tests);
-    const lib_metadata_service_test_step = b.step("lib-metadata-service-test", "Run metadata service/control-loop integration tests");
-    lib_metadata_service_test_step.dependOn(&run_lib_metadata_service_tests.step);
+    const storage_tests = antfly_tests_build.addStorageTestSteps(b, lib_test_mod, &unit_progress_skip_filters);
+    const run_lib_storage_tests = storage_tests.root.run;
+    const run_ha_tests = storage_tests.ha.run;
+    const lib_storage_progress_tests = storage_tests.progress.tests;
+    const run_lsm_backend_tests = storage_tests.lsm_backend.run;
+    const run_resource_budget_tests = storage_tests.resource_budget.run;
 
-    const lib_metadata_logic_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "metadata reconciler",
-            "metadata transition state",
-            "metadata server module compiles",
-            "metadata merge request validation rejects incompatible doc identity namespaces",
-            "metadata split request validation rejects stale doc identity namespace",
-            "metadata transition actions",
-            "placement planner",
-            "metadata control loop proposes desired transitions through the service seam",
-            "metadata control loop plans placement intents",
-            "table manager ",
-            "metadata state ",
-            "transition controller ",
-            "metadata module compiles",
-            "metadata transition driver ",
-            "metadata storage module compiles",
-            "table workflow can build desired topology through the control loop seam",
-            "table workflow doc identity guards reject active transition intents",
-            "table workflow can remove a table topology from desired state",
-            "table workflow can reconcile projected local placement intents",
-            "metadata raft apply store ",
-            "metadata state machine projects transitions through metadata apply store",
-            "table provisioner restore rejects mismatched doc identity namespace",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_metadata_logic_tests = b.addRunArtifact(lib_metadata_logic_tests);
-    const lib_metadata_logic_test_step = b.step("lib-metadata-logic-test", "Run metadata logic/state/planner tests");
-    lib_metadata_logic_test_step.dependOn(&run_lib_metadata_logic_tests.step);
-
-    const lib_storage_default_filters = [_][]const u8{
-        "storage.",
-    };
-    const lib_storage_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_storage_tests = b.addRunArtifact(lib_storage_tests);
-    const lib_storage_test_step = b.step("lib-storage-test", "Run root-module storage tests only");
-    lib_storage_test_step.dependOn(&run_lib_storage_tests.step);
-
-    const ha_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"storage.ha"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_ha_tests = b.addRunArtifact(ha_tests);
-    const ha_test_step = b.step("ha-test", "Run hot-standby HA storage tests");
+    const ha_test_step = b.step("ha-test", "Run HA hot-standby storage and replication compatibility tests");
     ha_test_step.dependOn(&run_ha_tests.step);
-
-    const lib_storage_progress_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = selectTestFilters(b, &lib_storage_default_filters),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lib_storage_progress_tests = b.addRunArtifact(lib_storage_progress_tests);
-    for (unit_progress_skip_filters) |filter| {
-        run_lib_storage_progress_tests.addArgs(&.{ "--skip-test-filter", filter });
-    }
-
-    const lsm_backend_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{"storage.lsm_backend."},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lsm_backend_tests = b.addRunArtifact(lsm_backend_tests);
-    const lsm_backend_test_step = b.step("lsm-backend-test", "Run LSM backend unit tests only");
-    lsm_backend_test_step.dependOn(&run_lsm_backend_tests.step);
-
-    const resource_budget_tests = b.addTest(.{
-        .root_module = lib_test_mod,
-        .filters = &.{
-            "resource manager observes over-budget external usage",
-            "cache reports shared byte usage to resource manager",
-            "derived backlog tracker accounts and releases payload bytes",
-            "hbc shared cache namespaces entries",
-            "hbc shared cache evicts across namespaces under one resource budget",
-            "hbc cache reports byte usage to resource manager",
-            "hbc cache shrinks to resource budget under pressure",
-            "provisioned group storage derives all resource budgets",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_resource_budget_tests = b.addRunArtifact(resource_budget_tests);
-    const resource_budget_test_step = b.step("resource-budget-test", "Run storage resource-manager accounting tests");
-    resource_budget_test_step.dependOn(&run_resource_budget_tests.step);
+    ha_test_step.dependOn(&run_lib_ha_compat_tests.step);
 
     const sim_test_step = b.step("sim-test", "Run mocked-time Antfly simulation suites");
-    sim_test_step.dependOn(&run_lib_metadata_sim_smoke_tests.step);
-    sim_test_step.dependOn(&run_lib_metadata_vopr_tests.step);
+    sim_test_step.dependOn(metadata_tests.sim_all);
     sim_test_step.dependOn(&run_lib_raft_sim_tests.step);
 
     const integration_test_step = b.step("integration-test", "Run focused real HTTP and public API integration suites");
     integration_test_step.dependOn(&run_lib_metadata_sim_public_tests.step);
     integration_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
     integration_test_step.dependOn(&run_public_api_parity_tests.step);
+    integration_test_step.dependOn(graph_metric_tests.integration);
+    integration_test_step.dependOn(&run_public_api_graph_metric_e2e_tests.step);
 
     const chaos_test_step = b.step("chaos-test", "Run bounded generated chaos campaigns with labeled progress");
     var chaos_progress_tail: ?*std.Build.Step = null;
-    chaos_progress_tail = chainLabeledRun(b, lib_metadata_vopr_chaos_tests, "lib-metadata-vopr-chaos-test", chaos_progress_tail);
+    chaos_test_step.dependOn(metadata_tests.chaos.all);
     chaos_progress_tail = chainLabeledRun(b, lib_lsm_backend_chaos_tests, "lib-lsm-backend-chaos-test", chaos_progress_tail);
     chaos_progress_tail = chainLabeledRun(b, lib_ha_chaos_tests, "ha-chaos-test", chaos_progress_tail);
     chaos_test_step.dependOn(chaos_progress_tail.?);
 
     const chaos_soak_test_step = b.step("chaos-soak-test", "Run broad legacy metadata and raft chaos simulation soaks");
     var chaos_soak_progress_tail: ?*std.Build.Step = null;
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-transition-chaos-test", lib_metadata_transition_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-public-chaos-test", lib_metadata_public_chaos_filters, chaos_soak_progress_tail);
-    chaos_soak_progress_tail = chainLabeledFilteredTests(b, lib_test_mod, "lib-metadata-placement-chaos-test", lib_metadata_placement_chaos_filters, chaos_soak_progress_tail);
+    chaos_soak_progress_tail = antfly_tests_build.chainMetadataChaosSoakTests(b, lib_test_mod, chaos_soak_progress_tail);
     chaos_soak_progress_tail = chainLabeledRun(b, lib_raft_chaos_tests, "lib-raft-chaos-test", chaos_soak_progress_tail);
     chaos_soak_test_step.dependOn(chaos_soak_progress_tail.?);
     soak_test_step.dependOn(chaos_soak_test_step);
@@ -4158,12 +1571,32 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     antfly_imports.configure(b, template_test_mod, false, true);
-    const lib_template_tests = b.addTest(.{
-        .root_module = template_test_mod,
+    const standalone_module_tests = antfly_tests_build.addStandaloneModuleTestSteps(b, .{
+        .regex = regex_mod,
+        .jsonschema = jsonschema_mod,
+        .json = json_mod,
+        .ml_tabular = ml_tabular_mod,
+        .fuzz_tabular_loader = fuzz_tabular_loader_mod,
+        .toon = toon_mod,
+        .mcp = mcp_mod,
+        .a2a = a2a_mod,
+        .matcher = matcher_mod,
+        .resolver = resolver_mod,
+        .httpx_json = httpx_json_test_mod,
+        .httpx = httpx_mod,
+        .api_json_helpers = api_json_helpers_test_mod,
+        .generating = generating_mod,
+        .embeddings = embeddings_mod,
+        .vectorindex = vectorindex_mod,
+        .chunking = chunking_mod,
+        .readers = readers_mod,
+        .extracting = extracting_mod,
+        .image = image_test_mod,
+        .reranking = reranking_mod,
+        .casbin = casbin_mod,
+        .usermgr = usermgr_mod,
+        .template = template_test_mod,
     });
-    const run_lib_template_tests = b.addRunArtifact(lib_template_tests);
-    const lib_template_test_step = b.step("lib-template-test", "Run template rendering tests");
-    lib_template_test_step.dependOn(&run_lib_template_tests.step);
 
     const audio_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/audio_test_root.zig"),
@@ -4183,101 +1616,13 @@ pub fn build(b: *std.Build) void {
     lib_audio_test_step.dependOn(&run_lib_audio_tests.step);
     lib_audio_test_step.dependOn(&run_lib_transcribing_tests.step);
 
-    const lib_audio_xiph_conformance = b.addExecutable(.{
-        .name = "lib-audio-xiph-conformance",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/audio/audio_xiph_corpora_e2e.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
+    antfly_conformance_build.addAudioConformanceSteps(.{
+        .b = b,
+        .target = target,
+        .ffmpeg_paths = termite_ffmpeg_paths,
+        .inference_build_options_mod = inference_build_options_mod,
+        .conformance_test_step = conformance_test_step,
     });
-    lib_audio_xiph_conformance.root_module.addImport("build_options", inference_build_options_mod);
-    if (termite_ffmpeg_paths) |ffmpeg_paths| {
-        lib_audio_xiph_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-    }
-    lib_audio_xiph_conformance.root_module.link_libc = true;
-
-    const lib_audio_misc_conformance = b.addExecutable(.{
-        .name = "lib-audio-misc-conformance",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("lib/audio/audio_misc_corpora_e2e.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-    lib_audio_misc_conformance.root_module.addImport("build_options", inference_build_options_mod);
-    if (termite_ffmpeg_paths) |ffmpeg_paths| {
-        lib_audio_misc_conformance.root_module.addIncludePath(.{ .cwd_relative = ffmpeg_paths.include_dir });
-    }
-    lib_audio_misc_conformance.root_module.link_libc = true;
-
-    const fetch_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
-    fetch_lib_audio_xiph_conformance.addArg("fetch");
-    fetch_lib_audio_xiph_conformance.addArg("/tmp/termite-audio-xiph-corpora");
-
-    const fetch_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
-    fetch_lib_audio_misc_conformance.addArg("fetch");
-    fetch_lib_audio_misc_conformance.addArg("/tmp/termite-audio-misc-corpora");
-
-    const lib_audio_conformance_fetch_step = b.step("lib-audio-conformance-fetch", "Fetch the lib/audio external conformance fixtures");
-    lib_audio_conformance_fetch_step.dependOn(&fetch_lib_audio_xiph_conformance.step);
-    lib_audio_conformance_fetch_step.dependOn(&fetch_lib_audio_misc_conformance.step);
-
-    const fetch_lib_audio_xiph_conformance_quiet = b.addRunArtifact(lib_audio_xiph_conformance);
-    fetch_lib_audio_xiph_conformance_quiet.addArg("fetch");
-    fetch_lib_audio_xiph_conformance_quiet.addArg("/tmp/termite-audio-xiph-corpora");
-    const fetch_lib_audio_xiph_conformance_quiet_step = expectQuietSuccess(fetch_lib_audio_xiph_conformance_quiet);
-
-    const fetch_lib_audio_misc_conformance_quiet = b.addRunArtifact(lib_audio_misc_conformance);
-    fetch_lib_audio_misc_conformance_quiet.addArg("fetch");
-    fetch_lib_audio_misc_conformance_quiet.addArg("/tmp/termite-audio-misc-corpora");
-    const fetch_lib_audio_misc_conformance_quiet_step = expectQuietSuccess(fetch_lib_audio_misc_conformance_quiet);
-
-    const run_lib_audio_xiph_conformance = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance.addArg("run");
-    run_lib_audio_xiph_conformance.addArg("/tmp/termite-audio-xiph-corpora");
-    run_lib_audio_xiph_conformance.addArg("--no-fetch");
-
-    const run_lib_audio_misc_conformance = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance.addArg("run");
-    run_lib_audio_misc_conformance.addArg("/tmp/termite-audio-misc-corpora");
-    run_lib_audio_misc_conformance.addArg("--no-fetch");
-
-    const lib_audio_conformance_run_step = b.step("lib-audio-conformance-run", "Run lib/audio conformance suites without fetching fixtures");
-    lib_audio_conformance_run_step.dependOn(&run_lib_audio_xiph_conformance.step);
-    lib_audio_conformance_run_step.dependOn(&run_lib_audio_misc_conformance.step);
-
-    const run_lib_audio_xiph_conformance_after_fetch = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance_after_fetch.addArg("run");
-    run_lib_audio_xiph_conformance_after_fetch.addArg("/tmp/termite-audio-xiph-corpora");
-    run_lib_audio_xiph_conformance_after_fetch.addArg("--no-fetch");
-    run_lib_audio_xiph_conformance_after_fetch.step.dependOn(&fetch_lib_audio_xiph_conformance.step);
-
-    const run_lib_audio_misc_conformance_after_fetch = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance_after_fetch.addArg("run");
-    run_lib_audio_misc_conformance_after_fetch.addArg("/tmp/termite-audio-misc-corpora");
-    run_lib_audio_misc_conformance_after_fetch.addArg("--no-fetch");
-    run_lib_audio_misc_conformance_after_fetch.step.dependOn(&fetch_lib_audio_misc_conformance.step);
-
-    const lib_audio_conformance_step = b.step("lib-audio-conformance", "Fetch and run lib/audio conformance suites");
-    lib_audio_conformance_step.dependOn(&run_lib_audio_xiph_conformance_after_fetch.step);
-    lib_audio_conformance_step.dependOn(&run_lib_audio_misc_conformance_after_fetch.step);
-
-    const run_lib_audio_xiph_conformance_after_fetch_quiet = b.addRunArtifact(lib_audio_xiph_conformance);
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("run");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("/tmp/termite-audio-xiph-corpora");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.addArg("--no-fetch");
-    run_lib_audio_xiph_conformance_after_fetch_quiet.step.dependOn(fetch_lib_audio_xiph_conformance_quiet_step);
-    const run_lib_audio_xiph_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_audio_xiph_conformance_after_fetch_quiet);
-
-    const run_lib_audio_misc_conformance_after_fetch_quiet = b.addRunArtifact(lib_audio_misc_conformance);
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("run");
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("/tmp/termite-audio-misc-corpora");
-    run_lib_audio_misc_conformance_after_fetch_quiet.addArg("--no-fetch");
-    run_lib_audio_misc_conformance_after_fetch_quiet.step.dependOn(fetch_lib_audio_misc_conformance_quiet_step);
-    const run_lib_audio_misc_conformance_after_fetch_quiet_step = expectQuietSuccess(run_lib_audio_misc_conformance_after_fetch_quiet);
-    conformance_test_step.dependOn(run_lib_audio_xiph_conformance_after_fetch_quiet_step);
-    conformance_test_step.dependOn(run_lib_audio_misc_conformance_after_fetch_quiet_step);
 
     const swarm_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/swarm_runtime_test_root.zig"),
@@ -4295,233 +1640,114 @@ pub fn build(b: *std.Build) void {
     usermgr_storage_swarm_runtime_test_mod.addImport("antfly_root", swarm_runtime_test_mod);
     usermgr_storage_swarm_runtime_test_mod.addImport("antfly_platform", platform_mod);
     swarm_runtime_test_mod.addImport("usermgr_storage", usermgr_storage_swarm_runtime_test_mod);
-    const lib_swarm_runtime_tests = b.addTest(.{
+    const swarm_tests = b.addTest(.{
         .root_module = swarm_runtime_test_mod,
-        .filters = &.{
-            "swarm runtime module compiles",
-            "swarm runtime local replica reconcile permit stays blocked while startup debt is unresolved",
-            "swarm runtime registers internal group routes explicitly",
-            "swarm runtime registers mcp routes before antfarm catch-all",
-            "parse cli accepts config path",
-            "parse cli accepts secret store path",
-            "parse cli accepts ARD identity flags",
-            "parse cli accepts canonical host port and models dir flags",
-            "parse cli accepts HA primary runtime flags",
-            "parse cli accepts HA primary sync policy flags",
-            "parse cli accepts HA standby runtime flags",
-            "swarm HA standby replication flags require upstream and slot",
-            "swarm HA string classifier distinguishes missing padded and valid values",
-            "swarm HA runtime rejects ambiguous role flags",
-            "antfly config uses cli override before common config",
-            "swarm public api caps keep alive request reuse",
-            "swarm public api body limit matches common http listener",
-            "swarm public HTTP server uses public API request body limit",
-            "parse cli accepts inference budget overrides",
-            "inference config falls back to common config",
-            "swarm runtime resolves paths from common storage base dir",
-            "swarm runtime resolves extension package store env before local default",
-        },
+        .filters = &antfly_tests_build.SwarmRuntimeTestFilters.focused,
         .test_runner = .{
             .path = b.path("pkg/antfly/src/test_runner.zig"),
             .mode = .simple,
         },
     });
-    const lib_swarm_runtime_test_step = b.step("lib-swarm-runtime-test", "Run focused swarm runtime tests");
-    const run_lib_swarm_runtime_tests = b.addRunArtifact(lib_swarm_runtime_tests);
-    lib_swarm_runtime_test_step.dependOn(&run_lib_swarm_runtime_tests.step);
+    const run_swarm_tests = b.addRunArtifact(swarm_tests);
 
-    const raft_test_step = b.step("raft-test", "Run raft integration unit tests");
+    const runtime_test_step = b.step("runtime-test", "Run focused data and swarm runtime tests");
+    runtime_test_step.dependOn(&run_data_runtime_tests.step);
+    runtime_test_step.dependOn(&run_swarm_tests.step);
+
+    const raft_test_step = b.step("raft-test", "Run raft unit and transport tests");
     raft_test_step.dependOn(&run_raft_unit_tests.step);
+    raft_test_step.dependOn(&run_raft_transport_tests.step);
+    raft_test_step.dependOn(&api_table_tests.raft_transition_runtime_docid.step);
 
-    const raft_transport_test_step = b.step("raft-transport-test", "Run raft transport unit tests");
-    raft_transport_test_step.dependOn(&run_raft_transport_tests.step);
-
-    unit_test_step.dependOn(&run_lib_regex_tests.step);
-    unit_test_step.dependOn(&run_lib_jsonschema_tests.step);
-    unit_test_step.dependOn(&run_lib_generating_tests.step);
-    unit_test_step.dependOn(&run_lib_embeddings_tests.step);
-    unit_test_step.dependOn(&run_lib_vectorindex_tests.step);
-    unit_test_step.dependOn(&run_lib_chunking_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.regex.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.jsonschema.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.generating.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.embeddings.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.vectorindex.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.chunking.run.step);
     unit_test_step.dependOn(&run_lib_generating_runtime_tests.step);
-    unit_test_step.dependOn(&run_lib_reranking_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.reranking.run.step);
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
-    unit_test_step.dependOn(&run_lib_casbin_tests.step);
-    unit_test_step.dependOn(&run_lib_usermgr_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.casbin.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.usermgr.run.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
     unit_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    unit_test_step.dependOn(&run_capi_tests.step);
+    unit_test_step.dependOn(&capi_steps.run_capi_tests.step);
     unit_test_step.dependOn(&run_lite_native_tests.step);
     unit_test_step.dependOn(&run_lite_cli_tests.step);
-    unit_test_step.dependOn(&run_lib_db_tests.step);
-    unit_test_step.dependOn(&run_lib_db_result_shape_tests.step);
+    unit_test_step.dependOn(&lib_db_test.run.step);
+    unit_test_step.dependOn(&lib_db_module_tests.result_shape.step);
     unit_test_step.dependOn(&run_serverless_tests.step);
-    unit_test_step.dependOn(&run_lib_data_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_data_storage_tests.step);
-    unit_test_step.dependOn(&run_lib_metadata_logic_tests.step);
-    unit_test_step.dependOn(&run_lib_metadata_service_tests.step);
-    unit_test_step.dependOn(&run_lib_api_docid_tests.step);
+    unit_test_step.dependOn(metadata_tests.root.step);
+    antfly_tests_build.dependOnAPITableUnitTestRuns(unit_test_step, api_table_tests);
     unit_test_step.dependOn(&run_lib_api_auth_tests.step);
+    unit_test_step.dependOn(&run_lib_api_logic_tests.step);
     unit_test_step.dependOn(&run_api_artifact_reprocess_jobs_tests.step);
     unit_test_step.dependOn(&run_public_api_parity_tests.step);
-    unit_test_step.dependOn(&run_lib_template_tests.step);
-    unit_test_step.dependOn(&run_lib_toon_tests.step);
-    unit_test_step.dependOn(&run_lib_mcp_tests.step);
-    unit_test_step.dependOn(&run_lib_a2a_tests.step);
-    unit_test_step.dependOn(&run_lib_image_tests.step);
+    unit_test_step.dependOn(&standalone_module_tests.template.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.toon.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.mcp.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.a2a.run.step);
+    unit_test_step.dependOn(&standalone_module_tests.image.run.step);
     unit_test_step.dependOn(&run_lib_audio_tests.step);
     unit_test_step.dependOn(delegated_inference_steps.inference_test);
     unit_test_step.dependOn(delegated_inference_steps.inference_finetune_test);
-    unit_test_step.dependOn(lib_swarm_runtime_test_step);
-    unit_test_step.dependOn(ha_test_step);
+    unit_test_step.dependOn(runtime_test_step);
+    unit_test_step.dependOn(&run_ha_tests.step);
     unit_test_step.dependOn(&run_raft_unit_tests.step);
     unit_test_step.dependOn(&run_raft_transport_tests.step);
 
     var unit_progress_tail: ?*std.Build.Step = null;
     unit_progress_tail = chainLabeledRun(b, lib_storage_progress_tests, "lib-storage-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_db_tests, "lib-db-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_metadata_tests, "lib-metadata-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, lib_db_test.tests, antfly_tests_build.db_root_step_name, unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, metadata_root_tests, "metadata-test", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, raft_unit_tests, "raft-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft-transport-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, raft_transport_tests, "raft.transport", unit_progress_tail);
     unit_progress_tail = chainLabeledRun(b, serverless_tests, "serverless-test", unit_progress_tail);
-    unit_progress_tail = chainLabeledRun(b, lib_template_tests, "lib-template-test", unit_progress_tail);
+    unit_progress_tail = chainLabeledRun(b, standalone_module_tests.template.tests, "lib-template-test", unit_progress_tail);
     unit_test_progress_step.dependOn(unit_progress_tail.?);
 
-    const lmdb_unit_tests = b.addTest(.{
-        .root_module = lmdb_engine_mod,
-    });
-    const run_lmdb_unit_tests = b.addRunArtifact(lmdb_unit_tests);
-
-    const lmdb_test_step = b.step("lmdb-test", "Run Zig LMDB port unit tests");
-    lmdb_test_step.dependOn(&run_lmdb_unit_tests.step);
-
     const storage_lmdb_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
-    const storage_lmdb_unit_tests = b.addTest(.{
-        .root_module = storage_lmdb_test_mod,
-    });
-    const run_storage_lmdb_unit_tests = b.addRunArtifact(storage_lmdb_unit_tests);
-
-    const storage_lmdb_test_step = b.step("storage-lmdb-test", "Run storage/lmdb wrapper unit tests");
-    storage_lmdb_test_step.dependOn(&run_storage_lmdb_unit_tests.step);
-
-    const storage_lmdb_replay_tests = b.addTest(.{
-        .root_module = storage_lmdb_test_mod,
-        .filters = &.{"LMDB replay fixtures stay green"},
-    });
-    const run_storage_lmdb_replay_tests = b.addRunArtifact(storage_lmdb_replay_tests);
-    const storage_lmdb_replay_step = b.step("lmdb-replay-fixtures", "Run only the LMDB replay fixture test");
-    storage_lmdb_replay_step.dependOn(&run_storage_lmdb_replay_tests.step);
 
     const storage_sim_runtime_test_mod = b.createModule(.{
         .root_source_file = b.path("pkg/antfly/src/storage_sim_runtime_root.zig"),
         .target = target,
         .optimize = optimize,
     });
-    const storage_sim_runtime_tests = b.addTest(.{
-        .root_module = storage_sim_runtime_test_mod,
-    });
-    const run_storage_sim_runtime_tests = b.addRunArtifact(storage_sim_runtime_tests);
-    const storage_sim_runtime_test_step = b.step("storage-sim-runtime-test", "Run storage simulation runtime and modeled device tests");
-    storage_sim_runtime_test_step.dependOn(&run_storage_sim_runtime_tests.step);
 
     const storage_lmdb_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const storage_lmdb_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, storage_lmdb_soak_build_options);
     const storage_lmdb_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, optimize, storage_lmdb_soak_build_options, storage_lmdb_soak_engine_mod, platform_mod);
-    const storage_lmdb_soak_tests = b.addTest(.{
-        .root_module = storage_lmdb_soak_test_mod,
-        .filters = &.{"LMDB sim soak stays green"},
-    });
-    const run_storage_lmdb_soak_tests = b.addRunArtifact(storage_lmdb_soak_tests);
-    const storage_lmdb_soak_step = b.step("lmdb-sim-soak", "Run only the LMDB simulation soak test");
-    storage_lmdb_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
 
     const docstore_test_mod = makeLmdbModule(b, "pkg/antfly/src/docstore_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     docstore_test_mod.addImport("bloom", bloom_mod);
-    const docstore_unit_tests = b.addTest(.{
-        .root_module = docstore_test_mod,
-    });
-    const run_docstore_unit_tests = b.addRunArtifact(docstore_unit_tests);
-
-    const docstore_test_step = b.step("docstore-test", "Run storage/docstore unit tests");
-    docstore_test_step.dependOn(&run_docstore_unit_tests.step);
+    docstore_test_mod.addImport("antfly_vellum", vellum_mod);
+    docstore_test_mod.addImport("antfly_regex", regex_mod);
+    docstore_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const shard_test_mod = makeLmdbModule(b, "pkg/antfly/src/shard_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     shard_test_mod.addImport("bloom", bloom_mod);
-    const shard_unit_tests = b.addTest(.{
-        .root_module = shard_test_mod,
-    });
-    const run_shard_unit_tests = b.addRunArtifact(shard_unit_tests);
-
-    const shard_test_step = b.step("shard-test", "Run storage/shard unit tests");
-    shard_test_step.dependOn(&run_shard_unit_tests.step);
+    shard_test_mod.addImport("antfly_vellum", vellum_mod);
+    shard_test_mod.addImport("antfly_regex", regex_mod);
+    shard_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const wal_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     wal_test_mod.addImport("bloom", bloom_mod);
+    wal_test_mod.addImport("antfly_vellum", vellum_mod);
+    wal_test_mod.addImport("antfly_regex", regex_mod);
+    wal_test_mod.addImport("antfly_reranking", reranking_mod);
     wal_test_mod.addImport("structlog", structlog_mod);
-    const wal_unit_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_wal_unit_tests = b.addRunArtifact(wal_unit_tests);
-
-    const wal_test_step = b.step("wal-test", "Run storage/wal unit tests");
-    wal_test_step.dependOn(&run_wal_unit_tests.step);
-
-    const wal_sim_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .filters = &.{"wal sim"},
-    });
-    const run_wal_sim_tests = b.addRunArtifact(wal_sim_tests);
-    const wal_sim_test_step = b.step("wal-sim-test", "Run only the WAL simulation workload tests");
-    wal_sim_test_step.dependOn(&run_wal_sim_tests.step);
-
-    const wal_vopr_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .filters = &.{
-            "wal group commit uses injected virtual clock",
-            "wal can reopen on modeled storage device",
-            "wal modeled storage survives crash before close after acknowledged append",
-            "wal modeled replay runner uses virtual storage and time",
-            "wal modeled crash runner preserves acknowledged public append",
-            "wal modeled VOPR campaign stays green",
-            "wal modeled replay fixtures stay green",
-            "wal modeled crash fixtures stay green",
-            "wal modeled commit backend completion uses scheduled virtual time",
-            "wal modeled storage commit delay uses injected virtual clock",
-        },
-    });
-    const run_wal_vopr_tests = b.addRunArtifact(wal_vopr_tests);
-    const wal_vopr_test_step = b.step("wal-vopr-test", "Run WAL modeled-time VOPR smoke tests");
-    wal_vopr_test_step.dependOn(&run_wal_vopr_tests.step);
-
-    const wal_replay_tests = b.addTest(.{
-        .root_module = wal_test_mod,
-        .filters = &.{"wal replay fixtures stay green"},
-    });
-    const run_wal_replay_tests = b.addRunArtifact(wal_replay_tests);
-    const wal_replay_step = b.step("wal-replay-fixtures", "Run only the WAL replay fixture tests");
-    wal_replay_step.dependOn(&run_wal_replay_tests.step);
 
     const wal_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const wal_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, wal_soak_build_options);
     const wal_soak_test_mod = makeLmdbModule(b, "pkg/antfly/src/wal_test_root.zig", target, optimize, wal_soak_build_options, wal_soak_engine_mod, platform_mod);
     wal_soak_test_mod.addImport("bloom", bloom_mod);
-    const wal_soak_tests = b.addTest(.{
-        .root_module = wal_soak_test_mod,
-        .filters = &.{"wal sim soak stays green"},
-    });
-    const run_wal_soak_tests = b.addRunArtifact(wal_soak_tests);
-    const wal_soak_step = b.step("wal-sim-soak", "Run only the WAL simulation soak test");
-    wal_soak_step.dependOn(&run_wal_soak_tests.step);
-
-    const storage_sim_soak_step = b.step("storage-sim-soak", "Run the LMDB and WAL simulation soak tests");
-    storage_sim_soak_step.dependOn(&run_storage_lmdb_soak_tests.step);
-    storage_sim_soak_step.dependOn(&run_wal_soak_tests.step);
-    soak_test_step.dependOn(storage_sim_soak_step);
+    wal_soak_test_mod.addImport("antfly_vellum", vellum_mod);
+    wal_soak_test_mod.addImport("antfly_regex", regex_mod);
+    wal_soak_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const persistent_test_mod = makeLmdbModule(b, "pkg/antfly/src/persistent_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     persistent_test_mod.addImport("bloom", bloom_mod);
@@ -4531,45 +1757,6 @@ pub fn build(b: *std.Build) void {
     persistent_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_test_mod.addImport("antfly_reranking", reranking_mod);
     persistent_test_mod.addImport("structlog", structlog_mod);
-    const persistent_unit_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_persistent_unit_tests = b.addRunArtifact(persistent_unit_tests);
-
-    const persistent_test_step = b.step("persistent-test", "Run storage/persistent unit tests");
-    persistent_test_step.dependOn(&run_persistent_unit_tests.step);
-
-    const persistent_sim_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .filters = &.{"persistent sim workloads stay green"},
-    });
-    const run_persistent_sim_tests = b.addRunArtifact(persistent_sim_tests);
-    const persistent_sim_step = b.step("persistent-sim-test", "Run only the persistent simulation workload tests");
-    persistent_sim_step.dependOn(&run_persistent_sim_tests.step);
-
-    const persistent_replay_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .filters = &.{"persistent replay fixtures stay green"},
-    });
-    const run_persistent_replay_tests = b.addRunArtifact(persistent_replay_tests);
-    const persistent_replay_step = b.step("persistent-replay-fixtures", "Run only the persistent replay fixture tests");
-    persistent_replay_step.dependOn(&run_persistent_replay_tests.step);
-
-    const persistent_vopr_tests = b.addTest(.{
-        .root_module = persistent_test_mod,
-        .filters = &.{
-            "persistent modeled replay fixtures stay green",
-            "persistent modeled sim workload stays green",
-            "persistent modeled full-text compaction publish faults stay green",
-        },
-    });
-    const run_persistent_vopr_tests = b.addRunArtifact(persistent_vopr_tests);
-    const persistent_vopr_step = b.step("persistent-vopr-test", "Run persistent modeled-storage VOPR smoke tests");
-    persistent_vopr_step.dependOn(&run_persistent_vopr_tests.step);
 
     const persistent_soak_build_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, true);
     const persistent_soak_engine_mod = makeLmdbEngineModule(b, target, optimize, true, persistent_soak_build_options);
@@ -4580,15 +1767,6 @@ pub fn build(b: *std.Build) void {
     persistent_soak_test_mod.addImport("antfly_vector", vector_mod);
     persistent_soak_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
     persistent_soak_test_mod.addImport("antfly_reranking", reranking_mod);
-    const persistent_soak_tests = b.addTest(.{
-        .root_module = persistent_soak_test_mod,
-        .filters = &.{"persistent sim soak stays green"},
-    });
-    const run_persistent_soak_tests = b.addRunArtifact(persistent_soak_tests);
-    const persistent_soak_step = b.step("persistent-sim-soak", "Run only the persistent simulation soak test");
-    persistent_soak_step.dependOn(&run_persistent_soak_tests.step);
-
-    storage_sim_soak_step.dependOn(&run_persistent_soak_tests.step);
 
     const index_manager_test_mod = makeLmdbModule(b, "pkg/antfly/src/index_manager_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     addSnowballModule(b, index_manager_test_mod);
@@ -4599,55 +1777,9 @@ pub fn build(b: *std.Build) void {
     index_manager_test_mod.addImport("antfly_matcher", matcher_mod);
     index_manager_test_mod.addImport("antfly_resolver", resolver_mod);
     index_manager_test_mod.addImport("antfly_chunking", chunking_mod);
+    index_manager_test_mod.addImport("antfly_reranking", reranking_mod);
     index_manager_test_mod.addImport("antfly_regex", regex_mod);
     index_manager_test_mod.addImport("structlog", structlog_mod);
-    const index_manager_unit_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = selectTestFilters(b, &.{}),
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_index_manager_unit_tests = b.addRunArtifact(index_manager_unit_tests);
-
-    const index_manager_test_step = b.step("index-manager-test", "Run storage/db/catalog/index_manager unit tests");
-    index_manager_test_step.dependOn(&run_index_manager_unit_tests.step);
-
-    const index_manager_resource_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &.{"text merge resource manager accounts pending bytes and active buffers"},
-    });
-    const run_index_manager_resource_tests = b.addRunArtifact(index_manager_resource_tests);
-    const index_manager_resource_step = b.step("index-manager-resource-test", "Run index manager resource-manager accounting tests");
-    index_manager_resource_step.dependOn(&run_index_manager_resource_tests.step);
-
-    const index_manager_sim_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &.{"index manager sim workloads stay green"},
-    });
-    const run_index_manager_sim_tests = b.addRunArtifact(index_manager_sim_tests);
-    const index_manager_sim_step = b.step("index-manager-sim-test", "Run only the index manager simulation workload tests");
-    index_manager_sim_step.dependOn(&run_index_manager_sim_tests.step);
-
-    const index_manager_replay_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &.{"index manager replay fixtures stay green"},
-    });
-    const run_index_manager_replay_tests = b.addRunArtifact(index_manager_replay_tests);
-    const index_manager_replay_step = b.step("index-manager-replay-fixtures", "Run only the index manager replay fixture tests");
-    index_manager_replay_step.dependOn(&run_index_manager_replay_tests.step);
-
-    const index_manager_vopr_tests = b.addTest(.{
-        .root_module = index_manager_test_mod,
-        .filters = &.{
-            "index manager modeled replay fixtures stay green",
-            "index manager modeled crash fixtures stay green",
-        },
-    });
-    const run_index_manager_vopr_tests = b.addRunArtifact(index_manager_vopr_tests);
-    const index_manager_vopr_step = b.step("index-manager-vopr-test", "Run index manager modeled-storage VOPR smoke tests");
-    index_manager_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
 
     const db_test_mod = makeLmdbModule(b, "pkg/antfly/src/db_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     const transcribing_db_test_stub_mod = b.createModule(.{
@@ -4656,1805 +1788,110 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
     transcribing_db_test_stub_mod.addImport("httpx", httpx_mod);
-    addSnowballModule(b, db_test_mod);
-    db_test_mod.addImport("bloom", bloom_mod);
-    db_test_mod.addImport("handlebars", handlebars_mod);
-    db_test_mod.addImport("antfly_vellum", vellum_mod);
-    db_test_mod.addImport("antfly_vector", vector_mod);
-    db_test_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    db_test_mod.addImport("antfly_matcher", matcher_mod);
-    db_test_mod.addImport("antfly_resolver", resolver_mod);
-    db_test_mod.addImport("antfly_chunking", chunking_mod);
-    db_test_mod.addImport("antfly_regex", regex_mod);
-    db_test_mod.addImport("raft_engine", raft_engine_mod);
-    db_test_mod.addImport("inference_chunker", inference_chunker_mod);
-    db_test_mod.addImport("inference_api", inference_api_mod);
-    db_test_mod.addImport("antfly_reranking", reranking_mod);
-    db_test_mod.addImport("antfly_scraping", scraping_mod);
+    antfly_imports.configure(b, db_test_mod, false, link_libc);
     db_test_mod.addImport("antfly_transcribing", transcribing_db_test_stub_mod);
-    db_test_mod.addImport("httpx", httpx_mod);
-    db_test_mod.addImport("antfly_pdf", pdf_mod);
-    db_test_mod.addImport("antfly_image", image_mod);
-    db_test_mod.addImport("antfly_font", font_mod);
-    db_test_mod.addImport("structlog", structlog_mod);
-
-    const db_split_sim_default_filters = [_][]const u8{
-        "db split sim default workload stays green",
-        "db split sim reopen-heavy workload stays green",
-    };
-    const db_split_sim_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = selectTestFilters(b, &db_split_sim_default_filters),
+    const usermgr_storage_db_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/usermgr/storage_imports.zig"),
+        .target = target,
+        .optimize = optimize,
     });
-    const run_db_split_sim_tests = b.addRunArtifact(db_split_sim_tests);
-    const db_split_sim_step = b.step("db-split-sim-test", "Run only the DB split simulation workload tests");
-    db_split_sim_step.dependOn(&run_db_split_sim_tests.step);
+    usermgr_storage_db_test_mod.addImport("antfly_root", db_test_mod);
+    usermgr_storage_db_test_mod.addImport("antfly_platform", platform_mod);
+    db_test_mod.addImport("usermgr_storage", usermgr_storage_db_test_mod);
 
-    const db_split_vopr_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{
-            "db split modeled replay fixtures stay green",
-            "db split modeled sim workloads stay green",
-        },
-    });
-    const run_db_split_vopr_tests = b.addRunArtifact(db_split_vopr_tests);
-    const db_split_vopr_step = b.step("db-split-vopr-test", "Run only the DB split modeled-storage replay fixture tests");
-    db_split_vopr_step.dependOn(&run_db_split_vopr_tests.step);
-
-    const storage_workload_sim_step = b.step("storage-sim-test", "Run legacy deterministic storage workload simulations that still use real storage I/O");
-    storage_workload_sim_step.dependOn(&run_wal_sim_tests.step);
-    storage_workload_sim_step.dependOn(&run_persistent_sim_tests.step);
-    storage_workload_sim_step.dependOn(&run_index_manager_sim_tests.step);
-
-    const storage_vopr_step = b.step("storage-vopr-test", "Run storage modeled-time/model-I/O VOPR smoke and simulation checks");
-    storage_vopr_step.dependOn(&run_storage_sim_runtime_tests.step);
-    storage_vopr_step.dependOn(&run_lib_lsm_backend_sim_tests.step);
-    storage_vopr_step.dependOn(&run_wal_vopr_tests.step);
-    storage_vopr_step.dependOn(&run_persistent_vopr_tests.step);
-    storage_vopr_step.dependOn(&run_index_manager_vopr_tests.step);
-    storage_vopr_step.dependOn(&run_db_split_vopr_tests.step);
-    sim_test_step.dependOn(storage_vopr_step);
-
-    const db_unit_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_db_unit_tests = b.addRunArtifact(db_unit_tests);
-    const db_test_step = b.step("db-test", "Run storage/db unit tests");
-    db_test_step.dependOn(&run_db_unit_tests.step);
-
-    const db_enrichment_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"enrichment"},
-    });
-    const run_db_enrichment_tests = b.addRunArtifact(db_enrichment_tests);
-    const db_enrichment_test_step = b.step("db-enrichment-test", "Run storage/db enrichment-related unit tests");
-    db_enrichment_test_step.dependOn(&run_db_enrichment_tests.step);
-
-    const db_enrichment_single_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db dense index can reference existing whole-doc embedding enrichment"},
-    });
-    const run_db_enrichment_single_tests = b.addRunArtifact(db_enrichment_single_tests);
-    const db_enrichment_single_step = b.step("db-enrichment-single-test", "Run the focused whole-doc enrichment DB test");
-    db_enrichment_single_step.dependOn(&run_db_enrichment_single_tests.step);
-
-    const db_restore_managed_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db restore snapshot replays managed chunked dense embeddings"},
-    });
-    const run_db_restore_managed_tests = b.addRunArtifact(db_restore_managed_tests);
-    const db_restore_managed_step = b.step("db-restore-managed-test", "Run the focused managed chunked dense restore DB test");
-    db_restore_managed_step.dependOn(&run_db_restore_managed_tests.step);
-
-    const provisioned_write_cache_failed_close_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"provisioned write cache invalidation closes failed managed enrichment db without aborting"},
-    });
-    const run_provisioned_write_cache_failed_close_tests = b.addRunArtifact(provisioned_write_cache_failed_close_tests);
-    const provisioned_write_cache_failed_close_step = b.step(
-        "provisioned-write-cache-failed-close-test",
-        "Run the focused provisioned write-cache failed-enrichment close regression",
-    );
-    provisioned_write_cache_failed_close_step.dependOn(&run_provisioned_write_cache_failed_close_tests.step);
-
-    const provisioned_query_visibility_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{
-            "provisioned table write source invalidates cached query db after managed dense replay becomes visible",
-            "managed visibility publish hook updates runtime status cache from live writer",
-            "provisioned read preparation invalidates readers without closing dirty writer cache",
-            "provisioned read preparation does not block on same-table batch after early dirty publication",
-            "provisioned table write source runtime status does not inspect read cache hbc stats when dirty",
-            "provisioned table write source read cache overlay preserves live replay status",
-            "read preparation keeps write cache dirty while auto bulk ingest is active",
-            "dirty runtime status refresh finishes expired auto bulk before collecting leases",
-            "managed startup catch-up ignores stale dirty bit after writer cache entry is gone",
-            "provisioned table write source deinit drains restore repair jobs",
-        },
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_provisioned_query_visibility_tests = b.addRunArtifact(provisioned_query_visibility_tests);
-    const provisioned_query_visibility_step = b.step(
-        "provisioned-query-visibility-test",
-        "Run the focused managed dense query-visibility cache invalidation regression",
-    );
-    provisioned_query_visibility_step.dependOn(&run_provisioned_query_visibility_tests.step);
-    unit_test_step.dependOn(&run_provisioned_query_visibility_tests.step);
-
-    const db_embeddings_update_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db document _embeddings update vector index and strip stored special fields"},
-    });
-    const run_db_embeddings_update_tests = b.addRunArtifact(db_embeddings_update_tests);
-    const db_embeddings_update_step = b.step("db-embeddings-update-test", "Run the explicit _embeddings update DB test");
-    db_embeddings_update_step.dependOn(&run_db_embeddings_update_tests.step);
-
-    const db_merge_cutover_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db merge-style cutover preserves enrichment resume and fencing across reopen"},
-    });
-    const run_db_merge_cutover_tests = b.addRunArtifact(db_merge_cutover_tests);
-    const db_merge_cutover_step = b.step("db-merge-cutover-test", "Run the merge cutover enrichment reopen DB test");
-    db_merge_cutover_step.dependOn(&run_db_merge_cutover_tests.step);
-
-    const db_shared_embedding_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db shared embedding enrichment feeds multiple dense indexes"},
-    });
-    const run_db_shared_embedding_tests = b.addRunArtifact(db_shared_embedding_tests);
-    const db_shared_embedding_step = b.step("db-shared-embedding-test", "Run the shared embedding enrichment DB test");
-    db_shared_embedding_step.dependOn(&run_db_shared_embedding_tests.step);
-
-    const db_dense_parent_paging_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db dense parent paging fetches enough chunk hits before grouping"},
-    });
-    const run_db_dense_parent_paging_tests = b.addRunArtifact(db_dense_parent_paging_tests);
-    const db_dense_parent_paging_step = b.step("db-dense-parent-paging-test", "Run the dense parent paging enrichment DB test");
-    db_dense_parent_paging_step.dependOn(&run_db_dense_parent_paging_tests.step);
-
-    const db_split_replay_tests = b.addTest(.{
-        .root_module = db_test_mod,
-        .filters = &.{"db split replay fixtures stay green"},
-    });
-    const run_db_split_replay_tests = b.addRunArtifact(db_split_replay_tests);
-    const db_split_replay_step = b.step("db-split-replay-fixtures", "Run only the DB split replay fixture tests");
-    db_split_replay_step.dependOn(&run_db_split_replay_tests.step);
+    const db_storage_tests = antfly_tests_build.addDBStorageTestSteps(b, db_test_mod);
+    sim_test_step.dependOn(&db_storage_tests.sim.step);
 
     const sparse_test_mod = makeLmdbModule(b, "pkg/antfly/src/sparse_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     sparse_test_mod.addImport("bloom", bloom_mod);
-    const sparse_unit_tests = b.addTest(.{
-        .root_module = sparse_test_mod,
-    });
-    const run_sparse_unit_tests = b.addRunArtifact(sparse_unit_tests);
-
-    const sparse_test_step = b.step("sparse-test", "Run sparse index unit tests");
-    sparse_test_step.dependOn(&run_sparse_unit_tests.step);
+    sparse_test_mod.addImport("antfly_vellum", vellum_mod);
+    sparse_test_mod.addImport("antfly_regex", regex_mod);
+    sparse_test_mod.addImport("antfly_reranking", reranking_mod);
 
     const derived_log_test_mod = makeLmdbModule(b, "pkg/antfly/src/derived_log_test_root.zig", target, optimize, build_options, lmdb_engine_mod, platform_mod);
     derived_log_test_mod.addImport("bloom", bloom_mod);
-    const derived_log_unit_tests = b.addTest(.{
-        .root_module = derived_log_test_mod,
+    derived_log_test_mod.addImport("antfly_vellum", vellum_mod);
+    derived_log_test_mod.addImport("antfly_regex", regex_mod);
+    derived_log_test_mod.addImport("antfly_reranking", reranking_mod);
+    const storage_backend_tests = antfly_tests_build.addStorageBackendTestSteps(b, .{
+        .lmdb_engine = lmdb_engine_mod,
+        .storage_lmdb = storage_lmdb_test_mod,
+        .storage_lmdb_soak = storage_lmdb_soak_test_mod,
+        .storage_sim_runtime = storage_sim_runtime_test_mod,
+        .docstore = docstore_test_mod,
+        .shard = shard_test_mod,
+        .wal = wal_test_mod,
+        .wal_soak = wal_soak_test_mod,
+        .persistent = persistent_test_mod,
+        .persistent_soak = persistent_soak_test_mod,
+        .index_manager = index_manager_test_mod,
+        .sparse = sparse_test_mod,
+        .derived_log = derived_log_test_mod,
+    }, .{
+        .lsm_backend_sim = run_lib_lsm_backend_sim_tests,
     });
-    const run_derived_log_unit_tests = b.addRunArtifact(derived_log_unit_tests);
-
-    const derived_log_test_step = b.step("derived-log-test", "Run storage/db/derived/derived_log unit tests");
-    derived_log_test_step.dependOn(&run_derived_log_unit_tests.step);
+    sim_test_step.dependOn(storage_backend_tests.storage_vopr);
+    soak_test_step.dependOn(storage_backend_tests.storage_sim_soak);
 
     // Default Antfly unit coverage is hermetic: no network fetchers, no
     // benchmarks, and no soak/conformance suites that require external corpora.
-    // Focused aliases stay available as separate steps; broader module suites
+    // Focused local test steps stay available separately; broader module suites
     // are wired here once.
     dependOnAll(unit_test_step, &.{
-        &run_lib_json_tests.step,
-        &run_httpx_json_tests.step,
-        &run_httpx_tests.step,
-        &run_api_json_helpers_tests.step,
+        &standalone_module_tests.json.run.step,
+        &standalone_module_tests.httpx_json.run.step,
+        &standalone_module_tests.httpx.run.step,
+        &standalone_module_tests.api_json_helpers.run.step,
         &run_antfly_client_pkg_tests.step,
-        &run_lib_unit_tests.step,
-        &run_lib_metadata_tests.step,
+        &root_module_tests.run.step,
+        metadata_tests.root.step,
         &run_lib_storage_tests.step,
         &run_lsm_backend_tests.step,
         &run_resource_budget_tests.step,
-        &run_lmdb_unit_tests.step,
-        &run_storage_lmdb_unit_tests.step,
-        &run_docstore_unit_tests.step,
-        &run_shard_unit_tests.step,
-        &run_wal_unit_tests.step,
-        &run_persistent_unit_tests.step,
-        &run_index_manager_unit_tests.step,
-        &run_db_unit_tests.step,
-        &run_sparse_unit_tests.step,
-        &run_derived_log_unit_tests.step,
+        &storage_backend_tests.lmdb.run.step,
+        &storage_backend_tests.storage_lmdb.run.step,
+        &storage_backend_tests.docstore.run.step,
+        &storage_backend_tests.shard.run.step,
+        &storage_backend_tests.wal.run.step,
+        &storage_backend_tests.persistent.run.step,
+        &storage_backend_tests.index_manager.run.step,
+        &db_storage_tests.all.step,
+        &storage_backend_tests.sparse.run.step,
+        &storage_backend_tests.derived_log.run.step,
+        graph_metric_tests.unit,
+        &graph_metric_tests.smoke.step,
     });
 
-    const lmdb_bench_engine_options_c = makeLmdbBuildOptions(b, .c, false, false);
-    const lmdb_bench_build_options_c = makeRootBuildOptions(b, .c, false, false, false, true, false, lite_local_inference_runtime, antfly_version);
-    const lmdb_bench_engine_mod_c = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_c);
-    const lmdb_bench_wrapper_mod_c = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_c, lmdb_bench_engine_mod_c, platform_mod);
-    const lmdb_bench_mod_c = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    lmdb_bench_mod_c.addImport("lmdb", lmdb_bench_wrapper_mod_c);
-    lmdb_bench_mod_c.addImport("lmdb_engine", lmdb_bench_engine_mod_c);
-
-    const lmdb_bench_c = b.addExecutable(.{
-        .name = "lmdb_bench_c",
-        .root_module = lmdb_bench_mod_c,
-    });
-
-    const lmdb_bench_engine_options_zig = makeLmdbBuildOptions(b, .zig, lmdb_evented_async_io, false);
-    const lmdb_bench_build_options_zig = makeRootBuildOptions(b, .zig, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
-    const lmdb_bench_engine_mod_zig = makeLmdbEngineModule(b, target, .ReleaseFast, true, lmdb_bench_engine_options_zig);
-    const lmdb_bench_wrapper_mod_zig = makeLmdbModule(b, "pkg/antfly/src/storage/lmdb.zig", target, .ReleaseFast, lmdb_bench_build_options_zig, lmdb_bench_engine_mod_zig, platform_mod);
-    const lmdb_bench_mod_zig = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lmdb_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    lmdb_bench_mod_zig.addImport("lmdb", lmdb_bench_wrapper_mod_zig);
-    lmdb_bench_mod_zig.addImport("lmdb_engine", lmdb_bench_engine_mod_zig);
-
-    const lmdb_bench_zig = b.addExecutable(.{
-        .name = "lmdb_bench_zig",
-        .root_module = lmdb_bench_mod_zig,
-    });
-
-    const run_lmdb_bench_c = b.addRunArtifact(lmdb_bench_c);
-    run_lmdb_bench_c.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128" });
-
-    const run_lmdb_bench_zig = b.addRunArtifact(lmdb_bench_zig);
-    run_lmdb_bench_zig.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128" });
-
-    const lmdb_bench_step = b.step("lmdb-bench", "Compare LMDB wrapper benchmarks on c and zig backends");
-    lmdb_bench_step.dependOn(&run_lmdb_bench_c.step);
-    lmdb_bench_step.dependOn(&run_lmdb_bench_zig.step);
-
-    const run_lmdb_bench_worker_zig = b.addRunArtifact(lmdb_bench_zig);
-    run_lmdb_bench_worker_zig.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128", "--worker-thread" });
-    const lmdb_bench_worker_step = b.step("lmdb-bench-worker", "Run LMDB wrapper benchmarks on zig worker-thread commit backend");
-    lmdb_bench_worker_step.dependOn(&run_lmdb_bench_worker_zig.step);
-
-    const run_lmdb_bench_async_zig = b.addRunArtifact(lmdb_bench_zig);
-    run_lmdb_bench_async_zig.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128", "--async-io" });
-    const lmdb_bench_async_step = b.step("lmdb-bench-async", "Run LMDB wrapper benchmarks on zig async-io commit backend");
-    lmdb_bench_async_step.dependOn(&run_lmdb_bench_async_zig.step);
-
-    const run_lmdb_bench_adaptive_zig = b.addRunArtifact(lmdb_bench_zig);
-    run_lmdb_bench_adaptive_zig.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128", "--adaptive" });
-    const lmdb_bench_adaptive_step = b.step("lmdb-bench-adaptive", "Run LMDB wrapper benchmarks on zig adaptive commit backend");
-    lmdb_bench_adaptive_step.dependOn(&run_lmdb_bench_adaptive_zig.step);
-
-    const run_lmdb_bench_repeat_c = b.addRunArtifact(lmdb_bench_c);
-    run_lmdb_bench_repeat_c.addArgs(&.{ "--samples", "5", "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128" });
-
-    const run_lmdb_bench_repeat_zig = b.addRunArtifact(lmdb_bench_zig);
-    run_lmdb_bench_repeat_zig.addArgs(&.{ "--samples", "5", "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128" });
-
-    const lmdb_bench_repeat_step = b.step("lmdb-bench-repeat", "Repeat LMDB wrapper benchmarks on c and zig backends");
-    lmdb_bench_repeat_step.dependOn(&run_lmdb_bench_repeat_c.step);
-    lmdb_bench_repeat_step.dependOn(&run_lmdb_bench_repeat_zig.step);
-
-    const run_lmdb_bench_zig_mmap = b.addRunArtifact(lmdb_bench_zig);
-    run_lmdb_bench_zig_mmap.addArgs(&.{ "--cycles", "8", "--keys", "512", "--dups", "32", "--named-keys", "128", "--write-map", "--map-async" });
-
-    const lmdb_bench_mmap_step = b.step("lmdb-bench-mmap", "Run LMDB wrapper benchmarks on zig mmap modes");
-    lmdb_bench_mmap_step.dependOn(&run_lmdb_bench_zig_mmap.step);
-
-    const split_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const split_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
-    const split_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, split_bench_engine_options);
-    const split_bench_root_mod = makeLmdbModule(b, antfly_benches_build.split_bench_root, target, .ReleaseFast, split_bench_build_options, split_bench_engine_mod, platform_mod);
-    const split_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/split_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    split_bench_mod.addImport("split_storage", split_bench_root_mod);
-
-    const split_bench = b.addExecutable(.{
-        .name = "split_bench",
-        .root_module = split_bench_mod,
-    });
-
-    const run_split_bench = b.addRunArtifact(split_bench);
-    const split_bench_step = b.step("split-bench", "Benchmark median-key selection and split range copy");
-    split_bench_step.dependOn(&run_split_bench.step);
-
-    const run_split_bench_repeat = b.addRunArtifact(split_bench);
-    run_split_bench_repeat.addArgs(&.{ "--samples", "5" });
-    const split_bench_repeat_step = b.step("split-bench-repeat", "Benchmark median-key selection and split range copy with repeated samples");
-    split_bench_repeat_step.dependOn(&run_split_bench_repeat.step);
-
-    const db_split_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/db_split_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    db_split_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const db_split_bench = b.addExecutable(.{
-        .name = "db_split_bench",
-        .root_module = db_split_bench_mod,
-    });
-
-    const run_db_split_bench = b.addRunArtifact(db_split_bench);
-    const db_split_bench_step = b.step("db-split-bench", "Benchmark DB split preparation old vs current");
-    db_split_bench_step.dependOn(&run_db_split_bench.step);
-
-    const run_db_split_bench_repeat = b.addRunArtifact(db_split_bench);
-    run_db_split_bench_repeat.addArgs(&.{ "--samples", "5" });
-    const db_split_bench_repeat_step = b.step("db-split-bench-repeat", "Benchmark DB split preparation old vs current with repeated samples");
-    db_split_bench_repeat_step.dependOn(&run_db_split_bench_repeat.step);
-
-    const docid_doc_set_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/docid_doc_set_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const docid_doc_set_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/docid_doc_set_bench_root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    docid_doc_set_bench_mod.addImport("docid_doc_set_bench_root", docid_doc_set_bench_root_mod);
-
-    const docid_doc_set_bench = b.addExecutable(.{
-        .name = "docid_doc_set_bench",
-        .root_module = docid_doc_set_bench_mod,
-    });
-
-    const run_docid_doc_set_bench = b.addRunArtifact(docid_doc_set_bench);
-    if (b.args) |args| {
-        run_docid_doc_set_bench.addArgs(args);
-    } else {
-        run_docid_doc_set_bench.addArgs(&.{ "--samples", "1", "--repeats", "16", "--small", "32", "--medium", "1024", "--large", "16384" });
-    }
-    const docid_doc_set_bench_step = b.step("docid-doc-set-bench", "Benchmark DOCID doc-set representations against sparse id baselines");
-    docid_doc_set_bench_step.dependOn(&run_docid_doc_set_bench.step);
-
-    const backend_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/backend_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    backend_bench_mod.addImport("antfly_zig", lib_mod);
-    const backend_bench = b.addExecutable(.{
-        .name = "backend_bench",
-        .root_module = backend_bench_mod,
-    });
-
-    const run_backend_bench = b.addRunArtifact(backend_bench);
-    if (b.args) |args| {
-        run_backend_bench.addArgs(args);
-    } else {
-        run_backend_bench.addArgs(&.{ "--samples", "3", "--keys", "20000", "--value-size", "128", "--hit-repeats", "3", "--miss-repeats", "3", "--scan-repeats", "5" });
-    }
-    const backend_bench_step = b.step("backend-bench", "Benchmark shared backend workloads across LMDB and LSM backends");
-    backend_bench_step.dependOn(&run_backend_bench.step);
-
-    const lsm_backend_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lsm_backend_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    lsm_backend_bench_mod.addImport("antfly_zig", lib_mod);
-    const lsm_backend_bench = b.addExecutable(.{
-        .name = "lsm_backend_bench",
-        .root_module = lsm_backend_bench_mod,
-    });
-
-    const run_lsm_backend_bench = b.addRunArtifact(lsm_backend_bench);
-    if (b.args) |args| {
-        run_lsm_backend_bench.addArgs(args);
-    } else {
-        run_lsm_backend_bench.addArgs(&.{
-            "--samples",            "3",
-            "--keys",               "20000",
-            "--value-size",         "128",
-            "--hit-repeats",        "5",
-            "--miss-repeats",       "5",
-            "--short-scan-len",     "64",
-            "--short-scan-repeats", "16",
-            "--full-scan-repeats",  "5",
-            "--reopen-repeats",     "5",
-            "--mixed-repeats",      "3",
-            "--storage",            "host",
-            "--cache",              "both",
-        });
-    }
-    const lsm_backend_bench_step = b.step("lsm-backend-bench", "Benchmark LSM read and scan paths with optional cache and storage instrumentation");
-    lsm_backend_bench_step.dependOn(&run_lsm_backend_bench.step);
-
-    const hbc_storage_read_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/hbc_storage_read_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_storage_read_bench_mod.addImport("antfly-zig", lib_mod);
-    const hbc_storage_read_bench = b.addExecutable(.{
-        .name = "hbc_storage_read_bench",
-        .root_module = hbc_storage_read_bench_mod,
-    });
-
-    const run_hbc_storage_read_bench = b.addRunArtifact(hbc_storage_read_bench);
-    if (b.args) |args| {
-        run_hbc_storage_read_bench.addArgs(args);
-    } else {
-        run_hbc_storage_read_bench.addArgs(&.{
-            "--docs",       "75000",
-            "--dims",       "512",
-            "--queries",    "1000",
-            "--candidates", "800",
-        });
-    }
-    const hbc_storage_read_bench_build_step = b.step("hbc-storage-read-bench-build", "Build the HBC-shaped LSM hot-read benchmark");
-    hbc_storage_read_bench_build_step.dependOn(&hbc_storage_read_bench.step);
-    const hbc_storage_read_bench_step = b.step("hbc-storage-read-bench", "Benchmark HBC-shaped metadata/vector artifact reads through the LSM");
-    hbc_storage_read_bench_step.dependOn(&run_hbc_storage_read_bench.step);
-
-    const lsm_write_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lsm_write_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const lsm_write_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lsm_write_bench_root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    lsm_write_bench_root_mod.addImport("bloom", bloom_mod);
-    lsm_write_bench_root_mod.addImport("antfly_platform", platform_mod);
-    lsm_write_bench_mod.addImport("antfly_zig", lsm_write_bench_root_mod);
-    const lsm_write_bench = b.addExecutable(.{
-        .name = "lsm_write_bench",
-        .root_module = lsm_write_bench_mod,
-    });
-
-    const run_lsm_write_bench = b.addRunArtifact(lsm_write_bench);
-    if (b.args) |args| {
-        run_lsm_write_bench.addArgs(args);
-    } else {
-        run_lsm_write_bench.addArgs(&.{
-            "--samples",          "3",
-            "--keys",             "20000",
-            "--hot-keys",         "1000",
-            "--overwrite-rounds", "20",
-            "--value-size",       "128",
-            "--batch-size",       "1000",
-            "--storage",          "host",
-            "--mode",             "both",
-        });
-    }
-    const lsm_write_bench_step = b.step("lsm-write-bench", "Benchmark LSM write amplification across sorted, random, overwrite, and delete workloads");
-    lsm_write_bench_step.dependOn(&run_lsm_write_bench.step);
-
-    const lsm_write_bench_compare_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lsm_write_bench_compare.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const lsm_write_bench_compare = b.addExecutable(.{
-        .name = "lsm_write_bench_compare",
-        .root_module = lsm_write_bench_compare_mod,
-    });
-
-    const run_lsm_write_bench_compare = b.addRunArtifact(lsm_write_bench_compare);
-    if (b.args) |args| {
-        run_lsm_write_bench_compare.addArgs(args);
-    } else {
-        run_lsm_write_bench_compare.addArgs(&.{
-            "--before",
-            "/tmp/lsm-write-before.jsonl",
-            "--after",
-            "/tmp/lsm-write-after.jsonl",
-        });
-    }
-    const lsm_write_bench_compare_step = b.step("lsm-write-bench-compare", "Compare two LSM write bench JSONL outputs by scenario and workload");
-    lsm_write_bench_compare_step.dependOn(&run_lsm_write_bench_compare.step);
-
-    const text_segment_write_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/text_segment_write_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const text_segment_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/text_segment_bench_root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    text_segment_bench_root_mod.addImport("bloom", bloom_mod);
-    text_segment_bench_root_mod.addImport("antfly_vellum", vellum_mod);
-    text_segment_bench_root_mod.addImport("antfly_platform", platform_mod);
-    text_segment_write_bench_mod.addImport("antfly_text_bench", text_segment_bench_root_mod);
-    const text_segment_write_bench = b.addExecutable(.{
-        .name = "text_segment_write_bench",
-        .root_module = text_segment_write_bench_mod,
-    });
-
-    const run_text_segment_write_bench = b.addRunArtifact(text_segment_write_bench);
-    if (b.args) |args| {
-        run_text_segment_write_bench.addArgs(args);
-    } else {
-        run_text_segment_write_bench.addArgs(&.{
-            "--samples",       "3",
-            "--docs",          "20000",
-            "--batch-size",    "1000",
-            "--terms-per-doc", "12",
-            "--merge-width",   "8",
-            "--storage",       "host",
-        });
-    }
-    const text_segment_write_bench_step = b.step("text-segment-write-bench", "Benchmark full-text segment build, on-disk publish, merge, and force-merge");
-    text_segment_write_bench_step.dependOn(&run_text_segment_write_bench.step);
-
-    const lsm_backend_bench_compare_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lsm_backend_bench_compare.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const lsm_backend_bench_compare = b.addExecutable(.{
-        .name = "lsm_backend_bench_compare",
-        .root_module = lsm_backend_bench_compare_mod,
-    });
-
-    const run_lsm_backend_bench_compare = b.addRunArtifact(lsm_backend_bench_compare);
-    if (b.args) |args| {
-        run_lsm_backend_bench_compare.addArgs(args);
-    } else {
-        run_lsm_backend_bench_compare.addArgs(&.{
-            "--before",
-            "/tmp/lsm-before.jsonl",
-            "--after",
-            "/tmp/lsm-after.jsonl",
-        });
-    }
-    const lsm_backend_bench_compare_step = b.step("lsm-backend-bench-compare", "Compare two LSM backend bench JSONL outputs by scenario and workload");
-    lsm_backend_bench_compare_step.dependOn(&run_lsm_backend_bench_compare.step);
-
-    const regex_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/regex/bench/regex_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    regex_bench_mod.addImport("antfly_regex", regex_mod);
-    regex_bench_mod.addImport("antfly_vellum", vellum_mod);
-    const regex_bench = b.addExecutable(.{
-        .name = "regex_bench",
-        .root_module = regex_bench_mod,
-    });
-
-    const run_regex_bench = b.addRunArtifact(regex_bench);
-    if (b.args) |args| {
-        run_regex_bench.addArgs(args);
-    }
-    const regex_bench_step = b.step("regex-bench", "Benchmark regex haystack matching and vellum automaton traversal");
-    regex_bench_step.dependOn(&run_regex_bench.step);
-
-    const wal_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const wal_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
-    const wal_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, wal_bench_engine_options);
-    const wal_bench_wal_mod = makeLmdbModule(b, antfly_benches_build.wal_bench_root, target, .ReleaseFast, wal_bench_build_options, wal_bench_engine_mod, platform_mod);
-    const wal_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/wal_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    wal_bench_mod.addImport("wal", wal_bench_wal_mod);
-    wal_bench_wal_mod.addImport("bloom", bloom_mod);
-
-    const wal_bench = b.addExecutable(.{
-        .name = "wal_bench",
-        .root_module = wal_bench_mod,
-    });
-
-    const run_wal_bench = b.addRunArtifact(wal_bench);
-    const wal_bench_step = b.step("wal-bench", "Benchmark WAL append throughput with and without group commit");
-    wal_bench_step.dependOn(&run_wal_bench.step);
-
-    const run_wal_bench_repeat = b.addRunArtifact(wal_bench);
-    run_wal_bench_repeat.addArgs(&.{ "--samples", "5" });
-    const wal_bench_repeat_step = b.step("wal-bench-repeat", "Benchmark WAL append throughput with repeated samples");
-    wal_bench_repeat_step.dependOn(&run_wal_bench_repeat.step);
-
-    const run_wal_bench_repeat_long = b.addRunArtifact(wal_bench);
-    run_wal_bench_repeat_long.addArgs(&.{ "--samples", "15" });
-    const wal_bench_repeat_long_step = b.step("wal-bench-repeat-long", "Benchmark WAL sync backend with 15 repeated samples");
-    wal_bench_repeat_long_step.dependOn(&run_wal_bench_repeat_long.step);
-
-    const run_wal_bench_repeat_stress = b.addRunArtifact(wal_bench);
-    run_wal_bench_repeat_stress.addArgs(&.{ "--samples", "5", "--sync-delay-us", "2000" });
-    const wal_bench_repeat_stress_step = b.step("wal-bench-repeat-stress", "Benchmark WAL sync backend with repeated stressed samples");
-    wal_bench_repeat_stress_step.dependOn(&run_wal_bench_repeat_stress.step);
-
-    const run_wal_bench_worker = b.addRunArtifact(wal_bench);
-    run_wal_bench_worker.addArg("--worker-thread");
-    const wal_bench_worker_step = b.step("wal-bench-worker", "Benchmark WAL append throughput with worker-thread commit backend");
-    wal_bench_worker_step.dependOn(&run_wal_bench_worker.step);
-
-    const run_wal_bench_worker_repeat = b.addRunArtifact(wal_bench);
-    run_wal_bench_worker_repeat.addArgs(&.{ "--samples", "5", "--worker-thread" });
-    const wal_bench_worker_repeat_step = b.step("wal-bench-worker-repeat", "Benchmark WAL append throughput with repeated worker-thread samples");
-    wal_bench_worker_repeat_step.dependOn(&run_wal_bench_worker_repeat.step);
-
-    const run_wal_bench_worker_repeat_stress = b.addRunArtifact(wal_bench);
-    run_wal_bench_worker_repeat_stress.addArgs(&.{ "--samples", "5", "--worker-thread", "--sync-delay-us", "2000" });
-    const wal_bench_worker_repeat_stress_step = b.step("wal-bench-worker-repeat-stress", "Benchmark WAL worker-thread backend with repeated stressed samples");
-    wal_bench_worker_repeat_stress_step.dependOn(&run_wal_bench_worker_repeat_stress.step);
-
-    const run_wal_bench_async = b.addRunArtifact(wal_bench);
-    run_wal_bench_async.addArg("--async-io");
-    const wal_bench_async_step = b.step("wal-bench-async", "Benchmark WAL append throughput with async-io commit backend");
-    wal_bench_async_step.dependOn(&run_wal_bench_async.step);
-
-    const run_wal_bench_async_repeat = b.addRunArtifact(wal_bench);
-    run_wal_bench_async_repeat.addArgs(&.{ "--samples", "5", "--async-io" });
-    const wal_bench_async_repeat_step = b.step("wal-bench-async-repeat", "Benchmark WAL append throughput with repeated async-io samples");
-    wal_bench_async_repeat_step.dependOn(&run_wal_bench_async_repeat.step);
-
-    const run_wal_bench_async_repeat_long = b.addRunArtifact(wal_bench);
-    run_wal_bench_async_repeat_long.addArgs(&.{ "--samples", "15", "--async-io" });
-    const wal_bench_async_repeat_long_step = b.step("wal-bench-async-repeat-long", "Benchmark WAL append throughput with 15 async-io samples");
-    wal_bench_async_repeat_long_step.dependOn(&run_wal_bench_async_repeat_long.step);
-
-    const run_wal_bench_async_repeat_stress = b.addRunArtifact(wal_bench);
-    run_wal_bench_async_repeat_stress.addArgs(&.{ "--samples", "5", "--async-io", "--sync-delay-us", "2000" });
-    const wal_bench_async_repeat_stress_step = b.step("wal-bench-async-repeat-stress", "Benchmark WAL async-io backend with repeated stressed samples");
-    wal_bench_async_repeat_stress_step.dependOn(&run_wal_bench_async_repeat_stress.step);
-
-    const run_wal_bench_adaptive = b.addRunArtifact(wal_bench);
-    run_wal_bench_adaptive.addArg("--adaptive");
-    const wal_bench_adaptive_step = b.step("wal-bench-adaptive", "Benchmark WAL append throughput with adaptive commit backend");
-    wal_bench_adaptive_step.dependOn(&run_wal_bench_adaptive.step);
-
-    const run_wal_bench_adaptive_repeat = b.addRunArtifact(wal_bench);
-    run_wal_bench_adaptive_repeat.addArgs(&.{ "--samples", "5", "--adaptive" });
-    const wal_bench_adaptive_repeat_step = b.step("wal-bench-adaptive-repeat", "Benchmark WAL append throughput with repeated adaptive samples");
-    wal_bench_adaptive_repeat_step.dependOn(&run_wal_bench_adaptive_repeat.step);
-
-    const run_wal_bench_adaptive_repeat_long = b.addRunArtifact(wal_bench);
-    run_wal_bench_adaptive_repeat_long.addArgs(&.{ "--samples", "15", "--adaptive" });
-    const wal_bench_adaptive_repeat_long_step = b.step("wal-bench-adaptive-repeat-long", "Benchmark WAL append throughput with 15 adaptive samples");
-    wal_bench_adaptive_repeat_long_step.dependOn(&run_wal_bench_adaptive_repeat_long.step);
-
-    const run_wal_bench_adaptive_stress = b.addRunArtifact(wal_bench);
-    run_wal_bench_adaptive_stress.addArgs(&.{ "--samples", "5", "--adaptive", "--sync-delay-us", "2000" });
-    const wal_bench_adaptive_stress_step = b.step("wal-bench-adaptive-stress", "Benchmark WAL adaptive backend with artificial sync delay");
-    wal_bench_adaptive_stress_step.dependOn(&run_wal_bench_adaptive_stress.step);
-
-    const derived_log_bench_engine_options = makeLmdbBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false);
-    const derived_log_bench_build_options = makeRootBuildOptions(b, lmdb_backend, lmdb_evented_async_io, false, false, true, false, lite_local_inference_runtime, antfly_version);
-    const derived_log_bench_engine_mod = makeLmdbEngineModule(b, target, .ReleaseFast, true, derived_log_bench_engine_options);
-    const derived_log_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path(antfly_benches_build.derived_log_bench_root),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    derived_log_bench_root_mod.addOptions("build_options", derived_log_bench_build_options);
-    derived_log_bench_root_mod.addImport("lmdb_engine", derived_log_bench_engine_mod);
-    derived_log_bench_root_mod.addImport("bloom", bloom_mod);
-    derived_log_bench_root_mod.addImport("antfly_platform", platform_mod);
-    derived_log_bench_root_mod.link_libc = true;
-    const derived_log_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/derived_log_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    derived_log_bench_mod.addImport("derived_log", derived_log_bench_root_mod);
-
-    const derived_log_bench = b.addExecutable(.{
-        .name = "derived_log_bench",
-        .root_module = derived_log_bench_mod,
-    });
-
-    const run_derived_log_bench = b.addRunArtifact(derived_log_bench);
-    const derived_log_bench_step = b.step("derived-log-bench", "Benchmark derived log throughput with and without group commit");
-    derived_log_bench_step.dependOn(&run_derived_log_bench.step);
-
-    const run_derived_log_bench_repeat = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_repeat.addArgs(&.{ "--samples", "5" });
-    const derived_log_bench_repeat_step = b.step("derived-log-bench-repeat", "Benchmark derived log throughput with repeated samples");
-    derived_log_bench_repeat_step.dependOn(&run_derived_log_bench_repeat.step);
-
-    const run_derived_log_bench_repeat_long = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_repeat_long.addArgs(&.{ "--samples", "15" });
-    const derived_log_bench_repeat_long_step = b.step("derived-log-bench-repeat-long", "Benchmark derived log sync backend with 15 repeated samples");
-    derived_log_bench_repeat_long_step.dependOn(&run_derived_log_bench_repeat_long.step);
-
-    const run_derived_log_bench_repeat_stress = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_repeat_stress.addArgs(&.{ "--samples", "5", "--sync-delay-us", "2000" });
-    const derived_log_bench_repeat_stress_step = b.step("derived-log-bench-repeat-stress", "Benchmark derived log sync backend with repeated stressed samples");
-    derived_log_bench_repeat_stress_step.dependOn(&run_derived_log_bench_repeat_stress.step);
-
-    const run_derived_log_bench_worker = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_worker.addArg("--worker-thread");
-    const derived_log_bench_worker_step = b.step("derived-log-bench-worker", "Benchmark derived log throughput with worker-thread commit backend");
-    derived_log_bench_worker_step.dependOn(&run_derived_log_bench_worker.step);
-
-    const run_derived_log_bench_worker_repeat = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_worker_repeat.addArgs(&.{ "--samples", "5", "--worker-thread" });
-    const derived_log_bench_worker_repeat_step = b.step("derived-log-bench-worker-repeat", "Benchmark derived log throughput with repeated worker-thread samples");
-    derived_log_bench_worker_repeat_step.dependOn(&run_derived_log_bench_worker_repeat.step);
-
-    const run_derived_log_bench_worker_repeat_stress = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_worker_repeat_stress.addArgs(&.{ "--samples", "5", "--worker-thread", "--sync-delay-us", "2000" });
-    const derived_log_bench_worker_repeat_stress_step = b.step("derived-log-bench-worker-repeat-stress", "Benchmark derived log worker-thread backend with repeated stressed samples");
-    derived_log_bench_worker_repeat_stress_step.dependOn(&run_derived_log_bench_worker_repeat_stress.step);
-
-    const run_derived_log_bench_async = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_async.addArg("--async-io");
-    const derived_log_bench_async_step = b.step("derived-log-bench-async", "Benchmark derived log throughput with async-io commit backend");
-    derived_log_bench_async_step.dependOn(&run_derived_log_bench_async.step);
-
-    const run_derived_log_bench_async_repeat = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_async_repeat.addArgs(&.{ "--samples", "5", "--async-io" });
-    const derived_log_bench_async_repeat_step = b.step("derived-log-bench-async-repeat", "Benchmark derived log throughput with repeated async-io samples");
-    derived_log_bench_async_repeat_step.dependOn(&run_derived_log_bench_async_repeat.step);
-
-    const run_derived_log_bench_async_repeat_long = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_async_repeat_long.addArgs(&.{ "--samples", "15", "--async-io" });
-    const derived_log_bench_async_repeat_long_step = b.step("derived-log-bench-async-repeat-long", "Benchmark derived log throughput with 15 async-io samples");
-    derived_log_bench_async_repeat_long_step.dependOn(&run_derived_log_bench_async_repeat_long.step);
-
-    const run_derived_log_bench_async_repeat_stress = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_async_repeat_stress.addArgs(&.{ "--samples", "5", "--async-io", "--sync-delay-us", "2000" });
-    const derived_log_bench_async_repeat_stress_step = b.step("derived-log-bench-async-repeat-stress", "Benchmark derived log async-io backend with repeated stressed samples");
-    derived_log_bench_async_repeat_stress_step.dependOn(&run_derived_log_bench_async_repeat_stress.step);
-
-    const run_derived_log_bench_adaptive = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_adaptive.addArg("--adaptive");
-    const derived_log_bench_adaptive_step = b.step("derived-log-bench-adaptive", "Benchmark derived log throughput with adaptive commit backend");
-    derived_log_bench_adaptive_step.dependOn(&run_derived_log_bench_adaptive.step);
-
-    const run_derived_log_bench_adaptive_repeat = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_adaptive_repeat.addArgs(&.{ "--samples", "5", "--adaptive" });
-    const derived_log_bench_adaptive_repeat_step = b.step("derived-log-bench-adaptive-repeat", "Benchmark derived log throughput with repeated adaptive samples");
-    derived_log_bench_adaptive_repeat_step.dependOn(&run_derived_log_bench_adaptive_repeat.step);
-
-    const run_derived_log_bench_adaptive_repeat_long = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_adaptive_repeat_long.addArgs(&.{ "--samples", "15", "--adaptive" });
-    const derived_log_bench_adaptive_repeat_long_step = b.step("derived-log-bench-adaptive-repeat-long", "Benchmark derived log throughput with 15 adaptive samples");
-    derived_log_bench_adaptive_repeat_long_step.dependOn(&run_derived_log_bench_adaptive_repeat_long.step);
-
-    const run_derived_log_bench_adaptive_stress = b.addRunArtifact(derived_log_bench);
-    run_derived_log_bench_adaptive_stress.addArgs(&.{ "--samples", "5", "--adaptive", "--sync-delay-us", "2000" });
-    const derived_log_bench_adaptive_stress_step = b.step("derived-log-bench-adaptive-stress", "Benchmark derived log adaptive backend with artificial sync delay");
-    derived_log_bench_adaptive_stress_step.dependOn(&run_derived_log_bench_adaptive_stress.step);
-
-    const json_bench_mod = b.createModule(.{
-        .root_source_file = b.path("lib/json/bench/json_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    json_bench_mod.addImport("antfly-json", json_mod);
-
-    const json_bench = b.addExecutable(.{
-        .name = "json_bench",
-        .root_module = json_bench_mod,
-    });
-
-    const run_json_bench = b.addRunArtifact(json_bench);
-    if (b.args) |args| {
-        run_json_bench.addArgs(args);
-    }
-    const json_bench_step = b.step("json-bench", "Benchmark std.json vs antfly-json parsing");
-    json_bench_step.dependOn(&run_json_bench.step);
-
-    // Benchmark executable
-    const bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    bench_mod.addImport("antfly-zig", lib_mod);
-
-    const bench = b.addExecutable(.{
-        .name = "bench",
-        .root_module = bench_mod,
-    });
-
-    const run_bench = b.addRunArtifact(bench);
-    const bench_step = b.step("bench", "Run benchmarks");
-    bench_step.dependOn(&run_bench.step);
-
-    // Quickstart-shaped benchmark: mirrors the workload of
-    // `test_text_quickstart_and_document_artifact` (e2e/antfly/test_quickstart.py)
-    // so the per-iteration cost can be compared against the per-primitive
-    // numbers reported by `bench`. Uses a slim root module so it only depends
-    // on text/search code (and skips OpenAPI codegen).
-    const quickstart_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/quickstart_bench_root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    quickstart_bench_root_mod.addImport("antfly_vellum", vellum_mod);
-    quickstart_bench_root_mod.addImport("bloom", bloom_mod);
-    addSnowballModule(b, quickstart_bench_root_mod);
-
-    const quickstart_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/quickstart_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-        .link_libc = true,
-    });
-    quickstart_bench_mod.addImport("antfly_quickstart_bench", quickstart_bench_root_mod);
-
-    const quickstart_bench = b.addExecutable(.{
-        .name = "quickstart_bench",
-        .root_module = quickstart_bench_mod,
-    });
-
-    const run_quickstart_bench = b.addRunArtifact(quickstart_bench);
-    if (b.args) |args| {
-        run_quickstart_bench.addArgs(args);
-    }
-    const quickstart_bench_step = b.step("quickstart-bench", "Run the quickstart-shaped end-to-end benchmark");
-    quickstart_bench_step.dependOn(&run_quickstart_bench.step);
-
-    const compat_mod = b.createModule(.{
-        .root_source_file = b.path("bench/compat_runner.zig"),
+    const bench_steps = antfly_benches_build.addBenchSteps(.{
+        .b = b,
         .target = target,
         .optimize = optimize,
+        .lmdb_backend = lmdb_backend,
+        .lmdb_evented_async_io = lmdb_evented_async_io,
+        .lite_local_inference_runtime = lite_local_inference_runtime,
+        .antfly_version = antfly_version,
+        .with_tla = with_tla,
+        .lib_mod = lib_mod,
+        .platform_mod = platform_mod,
+        .lmdb_engine_mod = lmdb_engine_mod,
+        .json_mod = json_mod,
+        .bloom_mod = bloom_mod,
+        .vector_mod = vector_mod,
+        .vectorindex_mod = vectorindex_mod,
+        .matcher_mod = matcher_mod,
+        .resolver_mod = resolver_mod,
+        .vellum_mod = vellum_mod,
+        .regex_mod = regex_mod,
+        .reranking_mod = reranking_mod,
+        .scraping_mod = scraping_mod,
+        .raft_engine_mod = raft_engine_mod,
+        .run_lib_ha_compat_tests = run_lib_ha_compat_tests,
+        .makeLmdbBuildOptions = makeLmdbBuildOptions,
+        .makeRootBuildOptions = makeRootBuildOptions,
+        .makeLmdbEngineModule = makeLmdbEngineModule,
+        .makeLmdbModule = makeLmdbModule,
+        .addSnowballModule = addSnowballModule,
     });
-    compat_mod.addImport("antfly-zig", lib_mod);
-
-    const compat = b.addExecutable(.{
-        .name = "compat_runner",
-        .root_module = compat_mod,
-    });
-
-    const run_compat = b.addRunArtifact(compat);
-    run_compat.addArg("compat/cases");
-    const compat_step = b.step("compat", "Run the shared compatibility corpus");
-    compat_step.dependOn(&run_compat.step);
-    compat_step.dependOn(&run_lib_ha_compat_tests.step);
-
-    const search_benchmark_index_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/search_benchmark_index.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    search_benchmark_index_mod.addImport("antfly-zig", lib_mod);
-    const search_benchmark_index = b.addExecutable(.{
-        .name = "search_benchmark_index",
-        .root_module = search_benchmark_index_mod,
-    });
-    const install_search_benchmark_index = b.addInstallArtifact(search_benchmark_index, .{});
-
-    const search_benchmark_query_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/search_benchmark_query.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    search_benchmark_query_mod.addImport("antfly-zig", lib_mod);
-    const search_benchmark_query = b.addExecutable(.{
-        .name = "search_benchmark_query",
-        .root_module = search_benchmark_query_mod,
-    });
-    const install_search_benchmark_query = b.addInstallArtifact(search_benchmark_query, .{});
-
-    const search_benchmark_codec_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/search_benchmark_codec_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    search_benchmark_codec_bench_mod.addImport("antfly-zig", lib_mod);
-    const search_benchmark_codec_bench = b.addExecutable(.{
-        .name = "search_benchmark_codec_bench",
-        .root_module = search_benchmark_codec_bench_mod,
-    });
-    const install_search_benchmark_codec_bench = b.addInstallArtifact(search_benchmark_codec_bench, .{});
-
-    const run_search_benchmark_codec_bench = b.addRunArtifact(search_benchmark_codec_bench);
-    if (b.args) |args| {
-        run_search_benchmark_codec_bench.addArgs(args);
-    }
-    const search_bench_codec_step = b.step("search-bench-codec-bench", "Benchmark StreamVByte codec used by search postings");
-    search_bench_codec_step.dependOn(&run_search_benchmark_codec_bench.step);
-
-    const wand_skip_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/wand_skip_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    wand_skip_bench_mod.addImport("antfly-zig", lib_mod);
-    const wand_skip_bench = b.addExecutable(.{
-        .name = "wand_skip_bench",
-        .root_module = wand_skip_bench_mod,
-    });
-    const run_wand_skip_bench = b.addRunArtifact(wand_skip_bench);
-    if (b.args) |args| {
-        run_wand_skip_bench.addArgs(args);
-    }
-    const wand_skip_bench_step = b.step("wand-skip-bench", "Profile WAND advance vs score iter.next() ratio across query shapes");
-    wand_skip_bench_step.dependOn(&run_wand_skip_bench.step);
-
-    const search_bench_build_step = b.step("search-bench-build", "Build search-benchmark-game antfly-zig adapter and search codec benchmark binaries");
-    search_bench_build_step.dependOn(&install_search_benchmark_index.step);
-    search_bench_build_step.dependOn(&install_search_benchmark_query.step);
-    search_bench_build_step.dependOn(&install_search_benchmark_codec_bench.step);
-
-    const storage_fixture_promote_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/storage_fixture_promote.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    const storage_fixture_promote = b.addExecutable(.{
-        .name = "storage_fixture_promote",
-        .root_module = storage_fixture_promote_mod,
-    });
-
-    const run_storage_fixture_promote = b.addRunArtifact(storage_fixture_promote);
-    if (b.args) |args| {
-        run_storage_fixture_promote.addArgs(args);
-    }
-    const storage_fixture_promote_step = b.step("storage-fixture-promote", "Promote a storage sim fixture into the checked-in replay corpus");
-    storage_fixture_promote_step.dependOn(&run_storage_fixture_promote.step);
-
-    const lmdb_fixture_promote_step = b.step("lmdb-fixture-promote", "Promote an LMDB replay fixture into pkg/antfly/src/storage/lmdb_sim_fixtures");
-    lmdb_fixture_promote_step.dependOn(&run_storage_fixture_promote.step);
-
-    const merge_cycle_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/merge_cycle_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    merge_cycle_mod.addImport("antfly-zig", lib_mod);
-
-    const merge_cycle = b.addExecutable(.{
-        .name = "merge_cycle_bench",
-        .root_module = merge_cycle_mod,
-    });
-
-    const run_merge_cycle = b.addRunArtifact(merge_cycle);
-    const merge_cycle_step = b.step("merge-cycle", "Run the merge-cycle benchmark");
-    merge_cycle_step.dependOn(&run_merge_cycle.step);
-
-    const merge_cost_mod = b.createModule(.{
-        .root_source_file = b.path("bench/full_text/merge_cost_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    merge_cost_mod.addImport("antfly-zig", lib_mod);
-
-    const merge_cost = b.addExecutable(.{
-        .name = "merge_cost_bench",
-        .root_module = merge_cost_mod,
-    });
-
-    const run_merge_cost = b.addRunArtifact(merge_cost);
-    const merge_cost_step = b.step("merge-cost", "Run the direct merge cost benchmark");
-    merge_cost_step.dependOn(&run_merge_cost.step);
-
-    const hbc_parity_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/tools/hbc_parity.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    hbc_parity_mod.addImport("antfly-zig", lib_mod);
-
-    const hbc_parity = b.addExecutable(.{
-        .name = "hbc_parity",
-        .root_module = hbc_parity_mod,
-    });
-
-    const run_hbc_parity = b.addRunArtifact(hbc_parity);
-    const hbc_parity_step = b.step("hbc-parity", "Run the deterministic HBC parity harness");
-    hbc_parity_step.dependOn(&run_hbc_parity.step);
-
-    const hbc_bench_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/bench/hbc_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const hbc_bench = b.addExecutable(.{
-        .name = "hbc_bench",
-        .root_module = hbc_bench_mod,
-    });
-
-    const run_hbc_bench = b.addRunArtifact(hbc_bench);
-    if (b.args) |args| {
-        run_hbc_bench.addArgs(args);
-    }
-    const hbc_bench_step = b.step("hbc-bench", "Benchmark HBC kmeans vs hilbert split algorithms");
-    hbc_bench_step.dependOn(&run_hbc_bench.step);
-
-    const hbc_write_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/hbc_write_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_write_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const hbc_write_bench = b.addExecutable(.{
-        .name = "hbc_write_bench",
-        .root_module = hbc_write_bench_mod,
-    });
-
-    const run_hbc_write_bench = b.addRunArtifact(hbc_write_bench);
-    if (b.args) |args| {
-        run_hbc_write_bench.addArgs(args);
-    } else {
-        run_hbc_write_bench.addArgs(&.{
-            "--samples",    "3",
-            "--vectors",    "10000",
-            "--dims",       "128",
-            "--batch-size", "1000",
-            "--leaf-size",  "128",
-            "--storage",    "host",
-        });
-    }
-    const hbc_write_bench_step = b.step("hbc-write-bench", "Benchmark HBC bulk build and online batched write amplification");
-    hbc_write_bench_step.dependOn(&run_hbc_write_bench.step);
-
-    const run_hbc_write_guardrail = b.addRunArtifact(hbc_write_bench);
-    if (b.args) |args| {
-        run_hbc_write_guardrail.addArgs(args);
-    } else {
-        run_hbc_write_guardrail.addArgs(&.{
-            "--samples",    "1",
-            "--vectors",    "5000",
-            "--dims",       "1536",
-            "--batch-size", "500",
-            "--leaf-size",  "168",
-            "--storage",    "host",
-        });
-    }
-    const hbc_write_guardrail_step = b.step("hbc-write-guardrail", "Run a VectorDBBench-shaped HBC write-amplification smoke guardrail");
-    hbc_write_guardrail_step.dependOn(&run_hbc_write_guardrail.step);
-
-    const hbc_read_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/hbc_read_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_read_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const hbc_read_bench = b.addExecutable(.{
-        .name = "hbc_read_bench",
-        .root_module = hbc_read_bench_mod,
-    });
-
-    const run_hbc_read_bench = b.addRunArtifact(hbc_read_bench);
-    if (b.args) |args| {
-        run_hbc_read_bench.addArgs(args);
-    } else {
-        run_hbc_read_bench.addArgs(&.{
-            "--samples",    "3",
-            "--vectors",    "10000",
-            "--dims",       "128",
-            "--queries",    "200",
-            "--k",          "10",
-            "--batch-size", "1000",
-            "--leaf-size",  "128",
-            "--storage",    "host",
-            "--build",      "both",
-        });
-    }
-    const hbc_read_bench_step = b.step("hbc-read-bench", "Benchmark HBC query read paths with storage and search-profile counters");
-    hbc_read_bench_step.dependOn(&run_hbc_read_bench.step);
-
-    const hbc_isolate_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/tools/hbc_isolate.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const hbc_isolate_root_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/hbc_isolate_root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_isolate_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
-    hbc_isolate_root_mod.addImport("bloom", bloom_mod);
-    hbc_isolate_root_mod.addImport("antfly_vector", vector_mod);
-    hbc_isolate_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    hbc_isolate_root_mod.addImport("antfly_platform", platform_mod);
-    hbc_isolate_mod.addImport("antfly_hbc_isolate_root", hbc_isolate_root_mod);
-
-    const hbc_isolate = b.addExecutable(.{
-        .name = "hbc_isolate",
-        .root_module = hbc_isolate_mod,
-    });
-
-    const run_hbc_isolate = b.addRunArtifact(hbc_isolate);
-    if (b.args) |args| {
-        run_hbc_isolate.addArgs(args);
-    }
-    const hbc_isolate_step = b.step("hbc-isolate", "Run the deterministic raw Zig HBC isolate benchmark");
-    hbc_isolate_step.dependOn(&run_hbc_isolate.step);
-
-    const dense_stack_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/dense_stack_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    dense_stack_bench_mod.addImport("antfly-zig", lib_mod);
-    const capi_bench_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/capi/root.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    capi_bench_mod.addImport("antfly-zig", lib_mod);
-    dense_stack_bench_mod.addImport("antfly_capi", capi_bench_mod);
-
-    const dense_stack_bench = b.addExecutable(.{
-        .name = "dense_stack_bench",
-        .root_module = dense_stack_bench_mod,
-    });
-
-    const run_dense_stack_bench = b.addRunArtifact(dense_stack_bench);
-    if (b.args) |args| {
-        run_dense_stack_bench.addArgs(args);
-    }
-    const build_dense_stack_bench_step = b.step("dense-stack-bench-build", "Build dense_stack_bench without running it");
-    build_dense_stack_bench_step.dependOn(&dense_stack_bench.step);
-    const dense_stack_bench_step = b.step("dense-stack-bench", "Benchmark dense DB search vs dense CAPI layers");
-    dense_stack_bench_step.dependOn(&run_dense_stack_bench.step);
-
-    const replay_bench_build_options = b.addOptions();
-    replay_bench_build_options.addOption([]const u8, "lmdb_backend", @tagName(lmdb_backend));
-    replay_bench_build_options.addOption(bool, "lmdb_evented_async_io", lmdb_evented_async_io);
-    replay_bench_build_options.addOption(bool, "storage_sim_soak", false);
-    replay_bench_build_options.addOption(bool, "with_tla", with_tla);
-    replay_bench_build_options.addOption(bool, "link_libc", true);
-    replay_bench_build_options.addOption(bool, "swarm_runtime_focused_test", false);
-    replay_bench_build_options.addOption(bool, "bench_minimal_deps", true);
-
-    const replay_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/replay_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const replay_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path(antfly_benches_build.replay_bench_root),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    replay_bench_root_mod.addOptions("build_options", replay_bench_build_options);
-    replay_bench_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
-    replay_bench_root_mod.addImport("antfly-json", json_mod);
-    replay_bench_root_mod.addImport("bloom", bloom_mod);
-    replay_bench_root_mod.addImport("antfly_vector", vector_mod);
-    replay_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    replay_bench_root_mod.addImport("antfly_matcher", matcher_mod);
-    replay_bench_root_mod.addImport("antfly_resolver", resolver_mod);
-    replay_bench_root_mod.addImport("antfly_vellum", vellum_mod);
-    replay_bench_root_mod.addImport("antfly_regex", regex_mod);
-    replay_bench_root_mod.addImport("antfly_reranking", reranking_mod);
-    replay_bench_root_mod.addImport("antfly_scraping", scraping_mod);
-    replay_bench_root_mod.addImport("antfly_platform", platform_mod);
-    addSnowballModule(b, replay_bench_root_mod);
-    replay_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const replay_bench = b.addExecutable(.{
-        .name = "replay_bench",
-        .root_module = replay_bench_mod,
-    });
-
-    const run_replay_bench = b.addRunArtifact(replay_bench);
-    if (b.args) |args| {
-        run_replay_bench.addArgs(args);
-    }
-    const replay_bench_step = b.step("replay-bench", "Benchmark replay stream write and catch-up paths");
-    replay_bench_step.dependOn(&run_replay_bench.step);
-
-    const dense_ingest_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/dense_ingest_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    dense_ingest_guardrail_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const dense_ingest_guardrail = b.addExecutable(.{
-        .name = "dense_ingest_guardrail",
-        .root_module = dense_ingest_guardrail_mod,
-    });
-    const install_dense_ingest_guardrail = b.addInstallArtifact(dense_ingest_guardrail, .{});
-
-    const run_dense_ingest_guardrail = b.addRunArtifact(dense_ingest_guardrail);
-    if (b.args) |args| {
-        run_dense_ingest_guardrail.addArgs(args);
-    } else {
-        run_dense_ingest_guardrail.addArgs(&.{
-            "--docs",
-            "5000",
-            "--dims",
-            "1536",
-            "--batch-size",
-            "500",
-            "--sync-level",
-            "write",
-            "--status-probe-every",
-            "1",
-            "--max-dense-lsm-run-bytes",
-            "1073741824",
-            "--max-dense-l0-runs",
-            "64",
-            "--max-status-probe-ns",
-            "500000000",
-        });
-    }
-    const build_dense_ingest_guardrail_step = b.step("dense-ingest-guardrail-build", "Build the dedicated dense ingest guardrail without running it");
-    build_dense_ingest_guardrail_step.dependOn(&dense_ingest_guardrail.step);
-    const install_dense_ingest_guardrail_step = b.step("dense-ingest-guardrail-install", "Build and install the dedicated dense ingest guardrail");
-    install_dense_ingest_guardrail_step.dependOn(&install_dense_ingest_guardrail.step);
-
-    const batch_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/batch_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    batch_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const batch_bench = b.addExecutable(.{
-        .name = "batch_bench",
-        .root_module = batch_bench_mod,
-    });
-
-    const run_batch_bench = b.addRunArtifact(batch_bench);
-    if (b.args) |args| {
-        run_batch_bench.addArgs(args);
-    }
-    const batch_bench_step = b.step("batch-bench", "Benchmark overwrite-heavy batch writes and bulk-session coalescing");
-    batch_bench_step.dependOn(&run_batch_bench.step);
-
-    const docid_write_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/docid_write_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    docid_write_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const docid_write_bench = b.addExecutable(.{
-        .name = "docid_write_bench",
-        .root_module = docid_write_bench_mod,
-    });
-
-    const run_docid_write_bench = b.addRunArtifact(docid_write_bench);
-    if (b.args) |args| {
-        run_docid_write_bench.addArgs(args);
-    } else {
-        run_docid_write_bench.addArgs(&.{ "--docs", "512", "--batch-size", "128", "--body-repeat", "1" });
-    }
-    const docid_write_bench_step = b.step("docid-write-bench", "Benchmark DOCID write-path identity metadata overhead across sync levels");
-    docid_write_bench_step.dependOn(&run_docid_write_bench.step);
-
-    const docid_query_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/docid_query_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    docid_query_bench_mod.addImport("antfly-zig", replay_bench_root_mod);
-
-    const docid_query_bench = b.addExecutable(.{
-        .name = "docid_query_bench",
-        .root_module = docid_query_bench_mod,
-    });
-
-    const run_docid_query_bench = b.addRunArtifact(docid_query_bench);
-    if (b.args) |args| {
-        run_docid_query_bench.addArgs(args);
-    } else {
-        run_docid_query_bench.addArgs(&.{ "--docs", "4096", "--queries", "16", "--repeats", "8", "--filter-size", "256", "--limit", "32" });
-    }
-    const docid_query_bench_step = b.step("docid-query-bench", "Benchmark real DB query shapes with public IDs, ordinal doc sets, and sparse-ID projection");
-    docid_query_bench_step.dependOn(&run_docid_query_bench.step);
-    const build_docid_query_bench_step = b.step("docid-query-bench-build", "Build docid_query_bench without running it");
-    build_docid_query_bench_step.dependOn(&docid_query_bench.step);
-
-    const algebraic_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/algebraic_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_bench_root_mod = b.createModule(.{
-        .root_source_file = b.path(antfly_benches_build.algebraic_bench_root),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    algebraic_bench_root_mod.addOptions("build_options", replay_bench_build_options);
-    algebraic_bench_root_mod.addImport("lmdb_engine", lmdb_engine_mod);
-    algebraic_bench_root_mod.addImport("antfly-json", json_mod);
-    algebraic_bench_root_mod.addImport("bloom", bloom_mod);
-    algebraic_bench_root_mod.addImport("antfly_vector", vector_mod);
-    algebraic_bench_root_mod.addImport("antfly_vectorindex", vectorindex_mod);
-    algebraic_bench_root_mod.addImport("antfly_vellum", vellum_mod);
-    algebraic_bench_root_mod.addImport("antfly_regex", regex_mod);
-    algebraic_bench_root_mod.addImport("antfly_platform", platform_mod);
-    algebraic_bench_root_mod.addImport("antfly_reranking", reranking_mod);
-    addSnowballModule(b, algebraic_bench_root_mod);
-    algebraic_bench_mod.addImport("antfly-zig", algebraic_bench_root_mod);
-
-    const algebraic_bench = b.addExecutable(.{
-        .name = "algebraic_bench",
-        .root_module = algebraic_bench_mod,
-    });
-
-    const run_algebraic_bench = b.addRunArtifact(algebraic_bench);
-    if (b.args) |args| {
-        run_algebraic_bench.addArgs(args);
-    } else {
-        run_algebraic_bench.addArgs(&.{
-            "--docs",
-            "20000",
-            "--repeats",
-            "25",
-            "--batch-size",
-            "500",
-        });
-    }
-    const algebraic_bench_step = b.step("algebraic-bench", "Benchmark algebraic aggregations against document-scan aggregations");
-    algebraic_bench_step.dependOn(&run_algebraic_bench.step);
-
-    const algebraic_summary_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/algebraic_summary.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_summary = b.addExecutable(.{
-        .name = "algebraic_summary",
-        .root_module = algebraic_summary_mod,
-    });
-    const run_algebraic_summary = b.addRunArtifact(algebraic_summary);
-    if (b.args) |args| {
-        run_algebraic_summary.addArgs(args);
-    }
-    const algebraic_summary_step = b.step("algebraic-summary", "Summarize algebraic benchmark JSONL output");
-    algebraic_summary_step.dependOn(&run_algebraic_summary.step);
-
-    const run_algebraic_performance_guardrail = b.addRunArtifact(algebraic_summary);
-    if (b.args) |args| {
-        run_algebraic_performance_guardrail.addArgs(args);
-    } else {
-        run_algebraic_performance_guardrail.addArgs(&.{
-            "--input",
-            "bench/storage/algebraic_performance_guardrail_fixture.jsonl",
-            "--baseline",
-            "bench/storage/algebraic_performance_guardrail_baseline.jsonl",
-            "--require-performance-evidence",
-            "--min-lsm-dataset-cases",
-            "1",
-            "--min-lsm-query-records",
-            "3",
-            "--min-cold-query-records",
-            "2",
-            "--min-warm-query-records",
-            "2",
-            "--min-constrained-query-records",
-            "3",
-            "--min-wide-query-records",
-            "3",
-            "--min-stats-query-records",
-            "3",
-            "--min-cardinality-query-records",
-            "3",
-            "--min-range-query-records",
-            "3",
-            "--min-histogram-query-records",
-            "3",
-            "--min-fanout-dataset-cases",
-            "1",
-            "--min-public-query-comparison-pairs",
-            "2",
-            "--min-lsm-sorted-ingest-runs",
-            "1",
-            "--max-lsm-flushes",
-            "0",
-            "--max-lsm-write-pressure-compactions",
-            "0",
-            "--max-correctness-failures",
-            "0",
-            "--max-algebraic-query-ms",
-            "2",
-            "--max-public-query-http-us",
-            "100",
-            "--max-algebraic-bytes-per-doc",
-            "10",
-            "--max-symbol-bytes-per-doc",
-            "0",
-            "--max-support-bytes-per-doc",
-            "0",
-            "--max-accumulator-flush-count",
-            "0",
-            "--max-path-dictionary-fst-rebuild-count",
-            "1",
-            "--max-public-query-load-rss-peak-bytes",
-            "0",
-            "--max-public-query-search-rss-peak-bytes",
-            "0",
-            "--max-churn-algebraic-update-ms",
-            "2",
-            "--max-algebraic-query-ms-ratio-vs-baseline",
-            "1.0",
-            "--max-public-query-http-us-ratio-vs-baseline",
-            "1.0",
-            "--max-algebraic-bytes-per-doc-ratio-vs-baseline",
-            "1.0",
-            "--max-churn-algebraic-update-ms-ratio-vs-baseline",
-            "1.0",
-        });
-    }
-    const algebraic_performance_guardrail_step = b.step("algebraic-performance-guardrail", "Run the algebraic benchmark summary coverage and baseline-ratio guardrail fixture");
-    algebraic_performance_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
-
-    const algebraic_planner_ownership_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("tools/guardrails/algebraic_planner_ownership_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_planner_ownership_guardrail = b.addExecutable(.{
-        .name = "algebraic_planner_ownership_guardrail",
-        .root_module = algebraic_planner_ownership_guardrail_mod,
-    });
-    const run_algebraic_planner_ownership_guardrail = b.addRunArtifact(algebraic_planner_ownership_guardrail);
-    if (b.args) |args| {
-        run_algebraic_planner_ownership_guardrail.addArgs(args);
-    }
-    const algebraic_planner_ownership_guardrail_step = b.step("algebraic-planner-ownership-guardrail", "Verify algebraic tensor programs are built by the planner layer outside tests");
-    algebraic_planner_ownership_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
-
-    const algebraic_archive_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/algebraic_archive_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    const algebraic_archive_guardrail = b.addExecutable(.{
-        .name = "algebraic_archive_guardrail",
-        .root_module = algebraic_archive_guardrail_mod,
-    });
-    const run_algebraic_archive_guardrail = b.addRunArtifact(algebraic_archive_guardrail);
-    if (b.args) |args| {
-        run_algebraic_archive_guardrail.addArgs(args);
-    } else {
-        run_algebraic_archive_guardrail.addArgs(&.{
-            "--archive",
-            "bench/storage/algebraic_production_archive_fixture",
-            "--require-thresholds",
-            "--require-baseline",
-            "--require-non-smoke",
-            "--min-docs",
-            "100",
-            "--min-repeats",
-            "1",
-            "--min-churn-ops",
-            "1",
-            "--min-public-docs",
-            "100",
-            "--min-graph-docs",
-            "100",
-        });
-    }
-    const algebraic_archive_guardrail_step = b.step("algebraic-archive-guardrail", "Verify archived algebraic production-hardening run evidence");
-    algebraic_archive_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
-
-    const algebraic_roadmap_guardrail_step = b.step("algebraic-roadmap-guardrail", "Run CI-safe algebraic roadmap guardrails");
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_performance_guardrail.step);
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_planner_ownership_guardrail.step);
-    algebraic_roadmap_guardrail_step.dependOn(&run_algebraic_archive_guardrail.step);
-
-    const rw_lock_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/rw_lock_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    rw_lock_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const rw_lock_bench = b.addExecutable(.{
-        .name = "rw_lock_bench",
-        .root_module = rw_lock_bench_mod,
-    });
-
-    const run_rw_lock_bench = b.addRunArtifact(rw_lock_bench);
-    if (b.args) |args| {
-        run_rw_lock_bench.addArgs(args);
-    }
-    const rw_lock_bench_step = b.step("rw-lock-bench", "Benchmark mixed search/write load against the DB RW apply lock");
-    rw_lock_bench_step.dependOn(&run_rw_lock_bench.step);
-
-    const open_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/open_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    open_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const open_bench = b.addExecutable(.{
-        .name = "open_bench",
-        .root_module = open_bench_mod,
-    });
-
-    const run_open_bench = b.addRunArtifact(open_bench);
-    if (b.args) |args| {
-        run_open_bench.addArgs(args);
-    }
-    const open_bench_step = b.step("open-bench", "Benchmark DB.open for configurable index mixes and replay backlog");
-    open_bench_step.dependOn(&run_open_bench.step);
-
-    const artifact_rebuild_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/artifact_rebuild_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    artifact_rebuild_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const artifact_rebuild_bench = b.addExecutable(.{
-        .name = "artifact_rebuild_bench",
-        .root_module = artifact_rebuild_bench_mod,
-    });
-
-    const run_artifact_rebuild_bench = b.addRunArtifact(artifact_rebuild_bench);
-    if (b.args) |args| {
-        run_artifact_rebuild_bench.addArgs(args);
-    }
-    const build_artifact_rebuild_bench_step = b.step("artifact-rebuild-bench-build", "Build artifact_rebuild_bench without running it");
-    build_artifact_rebuild_bench_step.dependOn(&artifact_rebuild_bench.step);
-    const artifact_rebuild_bench_step = b.step("artifact-rebuild-bench", "Benchmark loaded-root startup artifact rebuild progress and reopen cost");
-    artifact_rebuild_bench_step.dependOn(&run_artifact_rebuild_bench.step);
-
-    const provisioned_warmup_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/provisioned_warmup_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    provisioned_warmup_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const provisioned_warmup_bench = b.addExecutable(.{
-        .name = "provisioned_warmup_bench",
-        .root_module = provisioned_warmup_bench_mod,
-    });
-
-    const run_provisioned_warmup_bench = b.addRunArtifact(provisioned_warmup_bench);
-    if (b.args) |args| {
-        run_provisioned_warmup_bench.addArgs(args);
-    }
-    const provisioned_warmup_bench_step = b.step("provisioned-warmup-bench", "Benchmark provisioned cache warmup against first read/write latency");
-    provisioned_warmup_bench_step.dependOn(&run_provisioned_warmup_bench.step);
-
-    const provisioned_dense_ingest_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/provisioned_dense_ingest_guardrail.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    provisioned_dense_ingest_guardrail_mod.addImport("antfly-zig", lib_mod);
-
-    const provisioned_dense_ingest_guardrail = b.addExecutable(.{
-        .name = "provisioned_dense_ingest_guardrail",
-        .root_module = provisioned_dense_ingest_guardrail_mod,
-    });
-    const install_provisioned_dense_ingest_guardrail = b.addInstallArtifact(provisioned_dense_ingest_guardrail, .{});
-
-    const run_provisioned_dense_ingest_guardrail = b.addRunArtifact(provisioned_dense_ingest_guardrail);
-    if (b.args) |args| {
-        run_provisioned_dense_ingest_guardrail.addArgs(args);
-    } else {
-        run_provisioned_dense_ingest_guardrail.addArgs(&.{
-            "--docs",
-            "50000",
-            "--dims",
-            "1536",
-            "--batch-size",
-            "100",
-            "--sync-level",
-            "write",
-        });
-    }
-    const build_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-build", "Build the provisioned table dense ingest guardrail without running it");
-    build_provisioned_dense_ingest_guardrail_step.dependOn(&provisioned_dense_ingest_guardrail.step);
-    const install_provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail-install", "Build and install the provisioned table dense ingest guardrail");
-    install_provisioned_dense_ingest_guardrail_step.dependOn(&install_provisioned_dense_ingest_guardrail.step);
-    const provisioned_dense_ingest_guardrail_step = b.step("provisioned-dense-ingest-guardrail", "Benchmark the provisioned table write path without HTTP for VectorDBBench-shaped dense ingest");
-    provisioned_dense_ingest_guardrail_step.dependOn(&run_provisioned_dense_ingest_guardrail.step);
-
-    const public_query_guardrail_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/public_query_guardrail.zig"),
-        .target = target,
-        .optimize = optimize,
-    });
-    public_query_guardrail_mod.addImport("antfly-zig", lib_mod);
-
-    const public_query_guardrail = b.addExecutable(.{
-        .name = "public_query_guardrail",
-        .root_module = public_query_guardrail_mod,
-    });
-
-    const run_public_query_guardrail = b.addRunArtifact(public_query_guardrail);
-    if (b.args) |args| {
-        run_public_query_guardrail.addArgs(args);
-    } else {
-        run_public_query_guardrail.addArgs(&.{
-            "--docs",
-            "5000",
-            "--dims",
-            "384",
-            "--queries",
-            "25",
-            "--repeats",
-            "10",
-            "--k",
-            "100",
-            "--batch-size",
-            "250",
-            "--search-threads",
-            "5",
-            "--sync-level",
-            "write",
-        });
-    }
-    const build_public_query_guardrail_step = b.step("public-query-guardrail-build", "Build the dedicated public query guardrail without running it");
-    build_public_query_guardrail_step.dependOn(&public_query_guardrail.step);
-    const public_query_guardrail_step = b.step("public-query-guardrail", "Benchmark the public /db/v1/tables/<table>/query path against direct DB search and health responsiveness");
-    public_query_guardrail_step.dependOn(&run_public_query_guardrail.step);
-
-    const raft_apply_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/raft_apply_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    raft_apply_bench_mod.addImport("antfly-zig", lib_mod);
-    raft_apply_bench_mod.addImport("raft_engine", raft_engine_mod);
-
-    const raft_apply_bench = b.addExecutable(.{
-        .name = "raft_apply_bench",
-        .root_module = raft_apply_bench_mod,
-    });
-
-    const run_raft_apply_bench = b.addRunArtifact(raft_apply_bench);
-    if (b.args) |args| {
-        run_raft_apply_bench.addArgs(args);
-    }
-    const raft_apply_bench_step = b.step("raft-apply-bench", "Benchmark committed-entry encoding and data raft apply store persistence");
-    raft_apply_bench_step.dependOn(&run_raft_apply_bench.step);
-
-    const managed_host_wal_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/managed_host_wal_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    managed_host_wal_bench_mod.addImport("antfly-zig", lib_mod);
-    managed_host_wal_bench_mod.addImport("raft_engine", raft_engine_mod);
-
-    const managed_host_wal_bench = b.addExecutable(.{
-        .name = "managed_host_wal_bench",
-        .root_module = managed_host_wal_bench_mod,
-    });
-
-    const run_managed_host_wal_bench = b.addRunArtifact(managed_host_wal_bench);
-    if (b.args) |args| {
-        run_managed_host_wal_bench.addArgs(args);
-    }
-    const managed_host_wal_bench_step = b.step("managed-host-wal-bench", "Benchmark ManagedHost proposal persistence with WAL-backed raft state and restart");
-    managed_host_wal_bench_step.dependOn(&run_managed_host_wal_bench.step);
-
-    const dense_ingest_guardrail_step = b.step("dense-ingest-guardrail", "Run a VectorDBBench-shaped dense ingest smoke guardrail");
-    dense_ingest_guardrail_step.dependOn(&run_dense_ingest_guardrail.step);
-
-    const vector_write_guardrails_step = b.step("vector-write-guardrails", "Run local VectorDBBench-shaped vector write guardrails");
-    vector_write_guardrails_step.dependOn(hbc_write_guardrail_step);
-    vector_write_guardrails_step.dependOn(dense_ingest_guardrail_step);
-
-    const dense_profile_summary = b.addExecutable(.{
-        .name = "dense_profile_summary",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("bench/vectors/dense_profile_summary.zig"),
-            .target = target,
-            .optimize = .ReleaseFast,
-        }),
-    });
-
-    const run_dense_profile_summary = b.addRunArtifact(dense_profile_summary);
-    if (b.args) |args| {
-        run_dense_profile_summary.addArgs(args);
-    }
-    const dense_profile_summary_step = b.step("dense-profile-summary", "Summarize dense-stack-bench profile JSONL output");
-    dense_profile_summary_step.dependOn(&run_dense_profile_summary.step);
-
-    const lmdb_commit_compare_mod = b.createModule(.{
-        .root_source_file = b.path("bench/storage/lmdb_commit_compare.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    lmdb_commit_compare_mod.addImport("antfly-zig", lib_mod);
-
-    const lmdb_commit_compare = b.addExecutable(.{
-        .name = "lmdb_commit_compare",
-        .root_module = lmdb_commit_compare_mod,
-    });
-
-    const run_lmdb_commit_compare = b.addRunArtifact(lmdb_commit_compare);
-    if (b.args) |args| {
-        run_lmdb_commit_compare.addArgs(args);
-    }
-    const lmdb_commit_compare_step = b.step("lmdb-commit-compare", "Benchmark LMDB commit cost in isolation");
-    lmdb_commit_compare_step.dependOn(&run_lmdb_commit_compare.step);
-
-    const hbc_split_bench_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/bench/hbc_split_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_split_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const hbc_split_bench = b.addExecutable(.{
-        .name = "hbc_split_bench",
-        .root_module = hbc_split_bench_mod,
-    });
-
-    const run_hbc_split_bench = b.addRunArtifact(hbc_split_bench);
-    if (b.args) |args| {
-        run_hbc_split_bench.addArgs(args);
-    }
-    const hbc_split_bench_step = b.step("hbc-split-bench", "Benchmark dense-only HBC split child rebuild");
-    hbc_split_bench_step.dependOn(&run_hbc_split_bench.step);
-
-    const sparse_split_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/sparse_split_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    sparse_split_bench_mod.addImport("antfly-zig", lib_mod);
-
-    const sparse_split_bench = b.addExecutable(.{
-        .name = "sparse_split_bench",
-        .root_module = sparse_split_bench_mod,
-    });
-
-    const run_sparse_split_bench = b.addRunArtifact(sparse_split_bench);
-    if (b.args) |args| {
-        run_sparse_split_bench.addArgs(args);
-    }
-    const sparse_split_bench_step = b.step("sparse-split-bench", "Benchmark sparse-only split handoff");
-    sparse_split_bench_step.dependOn(&run_sparse_split_bench.step);
-
-    const rabitq_bench_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/rabitq_bench.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    rabitq_bench_mod.addImport("antfly-zig", lib_mod);
-    rabitq_bench_mod.addImport("antfly_vector", vector_mod);
-
-    const rabitq_bench = b.addExecutable(.{
-        .name = "rabitq_bench",
-        .root_module = rabitq_bench_mod,
-    });
-
-    const run_rabitq_bench = b.addRunArtifact(rabitq_bench);
-    if (b.args) |args| {
-        run_rabitq_bench.addArgs(args);
-    }
-    const rabitq_bench_step = b.step("rabitq-bench", "Benchmark RaBitQ primitives and estimator");
-    rabitq_bench_step.dependOn(&run_rabitq_bench.step);
-
-    const recall_harness_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/recall_harness.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    recall_harness_mod.addImport("antfly-zig", lib_mod);
-
-    const recall_harness = b.addExecutable(.{
-        .name = "recall_harness",
-        .root_module = recall_harness_mod,
-    });
-
-    const run_recall_harness = b.addRunArtifact(recall_harness);
-    run_recall_harness.stdio = .inherit;
-    if (b.args) |args| {
-        run_recall_harness.addArgs(args);
-    }
-    const recall_harness_step = b.step("recall-harness", "Run Zig recall suites against exported vector datasets");
-    recall_harness_step.dependOn(&run_recall_harness.step);
 
     const antfly_main_mod = if (edition == .full) blk: {
         const mod = b.createModule(.{
@@ -6499,6 +1936,20 @@ pub fn build(b: *std.Build) void {
         .name = "antfly",
         .root_module = antfly_main_mod,
     });
+    const graph_metric_maintenance_test_mod = b.createModule(.{
+        .root_source_file = b.path("pkg/antfly/src/cmd_graph_metric_maintenance_test_root.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    graph_metric_maintenance_test_mod.addImport("antfly-zig", lib_mod);
+    graph_metric_maintenance_test_mod.addImport("antfly-client", antfly_client_pkg_mod);
+    graph_metric_maintenance_test_mod.addImport("httpx", httpx_mod);
+    graph_metric_maintenance_test_mod.addImport("antfly_vellum", vellum_mod);
+    graph_metric_maintenance_test_mod.addImport("raft_engine", raft_engine_mod);
+    graph_metric_maintenance_test_mod.addImport("structlog", structlog_mod);
+    graph_metric_maintenance_test_mod.addImport("antfly_platform", platform_mod);
+    graph_metric_maintenance_test_mod.addImport("handlebars", handlebars_mod);
+    graph_metric_maintenance_test_mod.addOptions("build_options", build_options);
     const antfly_main_tests = b.addTest(.{
         .root_module = antfly_main_mod,
         .test_runner = .{
@@ -6507,9 +1958,42 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_antfly_main_tests = b.addRunArtifact(antfly_main_tests);
-    const antfly_main_test_step = b.step("antfly-main-test", "Run top-level Antfly CLI tests");
-    antfly_main_test_step.dependOn(&run_antfly_main_tests.step);
     unit_test_step.dependOn(&run_antfly_main_tests.step);
+
+    const graph_metric_operations_command_tests = b.addTest(.{
+        .root_module = graph_metric_maintenance_test_mod,
+        .filters = &antfly_tests_build.GraphMetricCommandTestFilters.operations,
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_graph_metric_operations_command_tests = b.addRunArtifact(graph_metric_operations_command_tests);
+    const cli_test_step = b.step("cli-test", "Run Antfly command-line tests");
+    cli_test_step.dependOn(&run_antfly_main_tests.step);
+    cli_test_step.dependOn(&run_lite_cli_tests.step);
+    cli_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
+    unit_test_step.dependOn(&run_graph_metric_operations_command_tests.step);
+
+    if (edition == .full) {
+        const graph_metric_process_harness_mod = b.createModule(.{
+            .root_source_file = b.path("pkg/antfly/src/cmd/graph_metric_process_harness.zig"),
+            .target = target,
+            .optimize = optimize,
+        });
+        graph_metric_process_harness_mod.addImport("antfly-zig", lib_mod);
+        graph_metric_process_harness_mod.addImport("antfly_platform", platform_mod);
+        const graph_metric_process_harness = b.addExecutable(.{
+            .name = "graph-metric-process-harness",
+            .root_module = graph_metric_process_harness_mod,
+        });
+        graph_metric_process_harness.step.dependOn(&antfly_main.step);
+        const run_graph_metric_process_harness = b.addRunArtifact(graph_metric_process_harness);
+        run_graph_metric_process_harness.addArtifactArg(antfly_main);
+        run_graph_metric_process_harness.addArgs(&.{ "--profile", "promotion" });
+        run_graph_metric_process_harness.has_side_effects = true;
+        promotion_test_step.dependOn(&run_graph_metric_process_harness.step);
+    }
 
     const install_antfly = b.addInstallArtifact(antfly_main, .{ .dest_sub_path = antfly_bin_name });
     const install_antfarm_assets = b.addInstallDirectory(.{
@@ -6522,136 +2006,30 @@ pub fn build(b: *std.Build) void {
         b.getInstallStep().dependOn(&install_antfarm_assets.step);
     }
 
-    const lite_core_main_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_core_main.zig"),
+    antfly_lite_build.addCliSteps(.{
+        .b = b,
         .target = target,
+        .wasm_target = wasm_target,
         .optimize = optimize,
+        .lib_mod = lib_mod,
+        .antfly_client_pkg_mod = antfly_client_pkg_mod,
+        .httpx_mod = httpx_mod,
+        .vellum_mod = vellum_mod,
+        .raft_engine_mod = raft_engine_mod,
+        .structlog_mod = structlog_mod,
+        .platform_mod = platform_mod,
+        .handlebars_mod = handlebars_mod,
+        .build_options = build_options,
+        .antfly_main = antfly_main,
+        .antfly_bin_name = antfly_bin_name,
+        .install_antfly = install_antfly,
+        .lite_local_inference_runtime = lite_local_inference_runtime,
+        .capi_steps = capi_steps,
+        .run_antfly_main_tests = run_antfly_main_tests,
+        .run_lite_cli_tests = run_lite_cli_tests,
+        .run_lite_native_tests = run_lite_native_tests,
+        .run_antfly_embedded_pkg_tests = run_antfly_embedded_pkg_tests,
     });
-    lite_core_main_mod.addImport("antfly-zig", lib_mod);
-    lite_core_main_mod.addImport("antfly-client", antfly_client_pkg_mod);
-    lite_core_main_mod.addImport("httpx", httpx_mod);
-    lite_core_main_mod.addImport("antfly_vellum", vellum_mod);
-    lite_core_main_mod.addImport("raft_engine", raft_engine_mod);
-    lite_core_main_mod.addImport("structlog", structlog_mod);
-    lite_core_main_mod.addImport("antfly_platform", platform_mod);
-    lite_core_main_mod.addImport("handlebars", handlebars_mod);
-    const lite_core_main = b.addExecutable(.{
-        .name = "antfly-lite-core",
-        .root_module = lite_core_main_mod,
-    });
-    const lite_cli_smoke = b.addExecutable(.{
-        .name = "antfly-lite-cli-smoke",
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("examples/antfly_lite_cli_smoke.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    const run_lite_core_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_core_cli_smoke.addArtifactArg(lite_core_main);
-    const run_lite_full_cli_smoke = b.addRunArtifact(lite_cli_smoke);
-    run_lite_full_cli_smoke.addArtifactArg(antfly_main);
-    const lite_cli_smoke_step = b.step("lite-cli-smoke", "Run black-box Antfly Lite CLI smoke tests");
-    lite_cli_smoke_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_cli_smoke_step.dependOn(&run_lite_full_cli_smoke.step);
-    const lite_core_main_tests = b.addTest(.{
-        .root_module = lite_core_main_mod,
-        .filters = &.{"lite core main compiles"},
-        .test_runner = .{
-            .path = b.path("pkg/antfly/src/test_runner.zig"),
-            .mode = .simple,
-        },
-    });
-    const run_lite_core_main_tests = b.addRunArtifact(lite_core_main_tests);
-    const lite_core_test_step = b.step("lite-core-test", "Run Antfly Lite core wrapper tests");
-    lite_core_test_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_test_step.dependOn(&run_lite_cli_tests.step);
-    lite_core_test_step.dependOn(&run_lite_native_tests.step);
-    lite_core_test_step.dependOn(&run_lite_capi_smoke.step);
-    lite_core_test_step.dependOn(&run_lite_go_tests.step);
-    lite_core_test_step.dependOn(&run_lite_go_example.step);
-    lite_core_test_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_core_test_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_test_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-    const install_lite_core_main = b.addInstallArtifact(lite_core_main, .{ .dest_sub_path = antfly_bin_name });
-
-    const lite_core_step = b.step("lite-core", "Build Antfly Lite core CLI, embedded package check, and libantfly C ABI");
-    lite_core_step.dependOn(&install_lite_core_main.step);
-    lite_core_step.dependOn(&install_lite_capi_lib.step);
-    lite_core_step.dependOn(&install_lite_capi_header.step);
-    lite_core_step.dependOn(&run_lite_core_main_tests.step);
-    lite_core_step.dependOn(&run_lite_capi_smoke.step);
-    lite_core_step.dependOn(&run_lite_go_tests.step);
-    lite_core_step.dependOn(&run_lite_go_example.step);
-    lite_core_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_core_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_core_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const lite_full_step = b.step("lite-full", "Build the full Antfly CLI with Lite commands, local inference runtime capability, embedded package check, and libantfly C ABI");
-    if (!lite_local_inference_runtime) {
-        lite_full_step.dependOn(&b.addFail("lite-full requires -Dlite-local-inference-runtime=true so Lite status and bindings advertise the local inference runtime").step);
-    }
-    lite_full_step.dependOn(&install_antfly.step);
-    lite_full_step.dependOn(&install_lite_capi_lib.step);
-    lite_full_step.dependOn(&install_lite_capi_header.step);
-    lite_full_step.dependOn(&run_antfly_main_tests.step);
-    lite_full_step.dependOn(&run_lite_cli_tests.step);
-    lite_full_step.dependOn(&run_lite_native_tests.step);
-    lite_full_step.dependOn(&run_lite_capi_smoke.step);
-    lite_full_step.dependOn(&run_lite_go_tests.step);
-    lite_full_step.dependOn(&run_lite_go_example.step);
-    lite_full_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_full_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_full_step.dependOn(&run_antfly_embedded_pkg_tests.step);
-
-    const lite_wasm_profile_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-        .target = wasm_target,
-        .optimize = optimize,
-    });
-    lite_wasm_profile_mod.addOptions("build_options", build_options);
-    const lite_wasm_profile = b.addExecutable(.{
-        .name = "antfly_lite_wasm_profile",
-        .root_module = lite_wasm_profile_mod,
-    });
-    lite_wasm_profile.entry = .disabled;
-    lite_wasm_profile.rdynamic = true;
-    lite_wasm_profile.export_memory = true;
-    const install_lite_wasm_profile = b.addInstallArtifact(lite_wasm_profile, .{
-        .dest_sub_path = "antfly-lite-wasm/antfly_lite_wasm_profile.wasm",
-    });
-    const lite_wasm_profile_tests = b.addTest(.{
-        .root_module = b.createModule(.{
-            .root_source_file = b.path("pkg/antfly/src/lite_wasm_profile.zig"),
-            .target = target,
-            .optimize = optimize,
-        }),
-    });
-    lite_wasm_profile_tests.root_module.addOptions("build_options", build_options);
-    const run_lite_wasm_profile_tests = b.addRunArtifact(lite_wasm_profile_tests);
-    const lite_wasm_step = b.step("lite-wasm", "Build the Antfly Lite hosted/manual-maintenance WASM profile");
-    lite_wasm_step.dependOn(&install_lite_wasm_profile.step);
-    lite_wasm_step.dependOn(&run_lite_wasm_profile_tests.step);
-
-    const lite_dev_step = b.step("lite-dev", "Build the Antfly Lite development profile with CLI diagnostics and C ABI checks");
-    lite_dev_step.dependOn(&install_antfly.step);
-    lite_dev_step.dependOn(&install_lite_capi_lib.step);
-    lite_dev_step.dependOn(&install_lite_capi_header.step);
-    lite_dev_step.dependOn(&run_antfly_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_core_main_tests.step);
-    lite_dev_step.dependOn(&run_lite_cli_tests.step);
-    lite_dev_step.dependOn(&run_lite_native_tests.step);
-    lite_dev_step.dependOn(&run_lite_capi_smoke.step);
-    lite_dev_step.dependOn(&run_lite_go_tests.step);
-    lite_dev_step.dependOn(&run_lite_go_example.step);
-    lite_dev_step.dependOn(&run_lite_go_retrieval_template.step);
-    lite_dev_step.dependOn(&run_lite_core_cli_smoke.step);
-    lite_dev_step.dependOn(&run_lite_full_cli_smoke.step);
-    lite_dev_step.dependOn(&install_lite_wasm_profile.step);
-    lite_dev_step.dependOn(&run_lite_wasm_profile_tests.step);
-    lite_dev_step.dependOn(&run_cabi_packaging_tests.step);
-    lite_dev_step.dependOn(&run_capi_tests.step);
-    lite_dev_step.dependOn(&run_antfly_embedded_pkg_tests.step);
 
     const run_antfly = b.addRunArtifact(antfly_main);
     if (b.args) |args| {
@@ -6660,7 +2038,7 @@ pub fn build(b: *std.Build) void {
     const antfly_step = b.step("antfly", "Run the top-level Antfly CLI");
     antfly_step.dependOn(&run_antfly.step);
 
-    const run_recall_harness_default = b.addRunArtifact(recall_harness);
+    const run_recall_harness_default = b.addRunArtifact(bench_steps.recall_harness);
     run_recall_harness_default.stdio = .inherit;
     run_recall_harness_default.addArgs(&.{
         "--dataset-dir",
@@ -6680,49 +2058,9 @@ pub fn build(b: *std.Build) void {
         delegated_inference_steps.inference_test,
     });
 
-    const hbc_trace_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/tools/hbc_trace.zig"),
+    antfly_tools_build.addToolSteps(.{
+        .b = b,
         .target = target,
-        .optimize = .ReleaseFast,
+        .lib_mod = lib_mod,
     });
-    hbc_trace_mod.addImport("antfly-zig", lib_mod);
-    const recall_common_mod = b.createModule(.{
-        .root_source_file = b.path("bench/vectors/recall_common.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    recall_common_mod.addImport("antfly-zig", lib_mod);
-    hbc_trace_mod.addImport("recall_common", recall_common_mod);
-
-    const hbc_trace = b.addExecutable(.{
-        .name = "hbc_trace",
-        .root_module = hbc_trace_mod,
-    });
-
-    const run_hbc_trace = b.addRunArtifact(hbc_trace);
-    if (b.args) |args| {
-        run_hbc_trace.addArgs(args);
-    }
-    const hbc_trace_step = b.step("hbc-trace", "Trace one Zig HBC query against an exported vector dataset");
-    hbc_trace_step.dependOn(&run_hbc_trace.step);
-
-    const hbc_leaf_debug_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/tools/hbc_leaf_debug.zig"),
-        .target = target,
-        .optimize = .ReleaseFast,
-    });
-    hbc_leaf_debug_mod.addImport("antfly-zig", lib_mod);
-    hbc_leaf_debug_mod.addImport("recall_common", recall_common_mod);
-
-    const hbc_leaf_debug = b.addExecutable(.{
-        .name = "hbc_leaf_debug",
-        .root_module = hbc_leaf_debug_mod,
-    });
-
-    const run_hbc_leaf_debug = b.addRunArtifact(hbc_leaf_debug);
-    if (b.args) |args| {
-        run_hbc_leaf_debug.addArgs(args);
-    }
-    const hbc_leaf_debug_step = b.step("hbc-leaf-debug", "Inspect cached versus fresh quantized HBC leaf scoring");
-    hbc_leaf_debug_step.dependOn(&run_hbc_leaf_debug.step);
 }

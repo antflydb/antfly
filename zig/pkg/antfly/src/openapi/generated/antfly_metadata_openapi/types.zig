@@ -12,6 +12,33 @@ const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 
 pub const Error = antfly_usermgr_openapi.Error;
 
+/// Synchronous SQL statement request. `session_id` is optional on the first request and should be reused from prior responses when SQL session state must persist across requests.
+pub const SqlStatementRequest = struct {
+    /// SQL statement text to execute.
+    sql: []const u8,
+    /// Logical SQL session id returned by an earlier SQL response.
+    session_id: ?i64 = null,
+    /// Optional current database override for this request.
+    database: ?[]const u8 = null,
+    /// Optional single search-path namespace override for this request.
+    namespace: ?[]const u8 = null,
+    /// Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
+    read_only: ?bool = null,
+};
+
+/// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs. Point write statements lower through the typed row-batch mutation path, and insert-from-source statements lower through the typed row-read plus row-batch mutation path.
+pub const SqlStatementResponse = struct {
+    kind: []const u8,
+    session_id: i64,
+    noop: ?bool = null,
+    /// Applied DDL/session result record.
+    applied: ?std.json.Value = null,
+    /// Lowered read or write statement family for data responses.
+    statement_kind: ?[]const u8 = null,
+    /// Typed relational row-plan, row-batch, or mutation-source response for data statements.
+    result: ?std.json.Value = null,
+};
+
 pub const SortDirection = antfly_indexes_openapi.SortDirection;
 
 pub const SortField = antfly_indexes_openapi.SortField;
@@ -508,22 +535,20 @@ pub const SecretWriteRequest = struct {
 
 pub const ByteRange = []const []const u8;
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable) - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "query": Wait until affected documents are visible to query paths such as full-text search - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
-    full_text,
+    query,
     enrichments,
-    aknn,
     full_index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
-            .full_text => "full_text",
+            .query => "query",
             .enrichments => "enrichments",
-            .aknn => "aknn",
             .full_index => "full_index",
         };
         try jw.write(s);
@@ -537,9 +562,8 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
-            .{ "full_text", .full_text },
+            .{ "query", .query },
             .{ "enrichments", .enrichments },
-            .{ "aknn", .aknn },
             .{ "full_index", .full_index },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -547,6 +571,57 @@ pub const SyncLevel = enum {
 };
 
 pub const AntflyType = antfly_indexes_openapi.AntflyType;
+
+/// Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+pub const DatabaseCatalogRecord = struct {
+    /// Stable database catalog identifier.
+    database_id: i64,
+    /// Database name.
+    name: []const u8,
+    /// JSON-encoded database settings owned by the catalog.
+    settings_json: []const u8,
+    /// Optional durable tablespace binding inherited by new namespace/table placement policy.
+    tablespace_name: ?[]const u8 = null,
+};
+
+/// Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+pub const NamespaceCatalogRecord = struct {
+    /// Stable namespace catalog identifier.
+    namespace_id: i64,
+    /// Parent database identifier.
+    database_id: i64,
+    /// Parent database name.
+    database_name: []const u8,
+    /// Namespace name.
+    name: []const u8,
+    /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
+    tablespace_name: ?[]const u8 = null,
+};
+
+pub const CatalogTablespaceBindingRequest = struct {
+    /// Existing tablespace name to bind to the catalog object.
+    tablespace_name: []const u8,
+};
+
+/// Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.
+pub const TablespaceCatalogRecord = struct {
+    /// Stable tablespace catalog identifier.
+    tablespace_id: i64,
+    /// Tablespace name.
+    name: []const u8,
+    /// JSON-encoded location descriptor. String locations are encoded as JSON strings.
+    location_json: []const u8,
+    /// JSON-encoded placement policy reserved for native placement planning.
+    placement_policy_json: []const u8,
+};
+
+/// Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it.
+pub const CreateTablespaceRequest = struct {
+    /// JSON-encoded location descriptor. Defaults to `null`.
+    location_json: ?[]const u8 = null,
+    /// JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+    placement_policy_json: ?[]const u8 = null,
+};
 
 /// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
 pub const TableMigration = struct {
@@ -617,6 +692,35 @@ pub const AggregationType = enum {
             .{ "geohash_grid", .geohash_grid },
             .{ "geo_distance", .geo_distance },
             .{ "significant_terms", .significant_terms },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Exact-vs-approximate selection for a cardinality aggregation: - auto: use a materialized HyperLogLog sketch when one applies and is current, else an exact distinct scan (default). - exact: always compute an exact distinct count. - approximate: require a matching sketch; error if none applies.
+pub const CardinalityMode = enum {
+    auto,
+    exact,
+    approximate,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .exact => "exact",
+            .approximate => "approximate",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "exact", .exact },
+            .{ "approximate", .approximate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -772,6 +876,10 @@ pub const IndexStatus = struct {
     shard_status: std.json.ArrayHashMap(antfly_indexes_openapi.IndexStats),
     config: antfly_indexes_openapi.IndexConfig,
     status: antfly_indexes_openapi.IndexStats,
+};
+
+pub const GraphMetricActionResponse = struct {
+    status: antfly_indexes_openapi.GraphMetricStatus,
 };
 
 /// Compact LSM backend operational status. Detailed low-level counters are available through metrics.
@@ -948,6 +1056,275 @@ pub const BatchResponse = struct {
     deleted: ?i64 = null,
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
+};
+
+/// Structured primary-key identity. Keys are the declared `primary_key.columns`; values are JSON scalar values coerced with the table's relational column types.
+pub const RowPrimarySelector = struct {};
+
+/// Structured unique-key selector. The server encodes `values` with the same relational tuple encoder used by storage, routes to the durable unique-owner range, and reads the owner row to resolve the physical row identity. This is a point lookup, not a query scan. The selector object is exact: only `name` and `values` are accepted.
+pub const RowUniqueSelector = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    /// Values for the declared unique-constraint columns.
+    values: std.json.Value,
+};
+
+/// Full relational row document. Keys are declared relational columns and values are JSON values coerced through the table schema before storage.
+pub const RowsRowDocument = struct {};
+
+/// Static field patch for top-level relational columns. Primary-key fields are rejected by the server.
+pub const RowsFieldPatch = struct {};
+
+/// Numeric increment map keyed by declared numeric columns.
+pub const RowsNumericIncrement = struct {};
+
+/// Array transform for a declared `array` column.
+pub const RowsArrayUpdateTransform = struct {
+    /// Declared `array` column to update.
+    field: []const u8,
+    op: []const u8,
+    /// JSON value to append, remove, or add if absent.
+    value: std.json.Value,
+};
+
+/// Predicate atom that must match a partial unique constraint definition.
+pub const RowsUniquePredicate = struct {
+    field: []const u8,
+    op: []const u8,
+    /// Predicate comparison value. Omit for null-test operators.
+    value: ?std.json.Value = null,
+};
+
+/// Application-time temporal slice for update/delete mutation-source plans.
+pub const RowsTemporalPortion = struct {
+    /// Period name declared on the relational table schema.
+    period: []const u8,
+    /// Inclusive lower bound encoded as the period start column's JSON type.
+    from: std.json.Value,
+    /// Exclusive upper bound encoded as the period end column's JSON type.
+    to: std.json.Value,
+};
+
+/// Source-side assignment for joined mutation-source updates.
+pub const RowsJoinedMutationSourceAssignment = struct {
+    /// Declared target-side relational field to assign.
+    target_field: []const u8,
+    /// Join side that supplies the source field. Must be the non-target side.
+    side: []const u8,
+    /// Declared relational field to copy from the source side.
+    field: []const u8,
+};
+
+pub const RowsMutationSourceResultSet = struct {
+    /// Number of source rows that matched before lock/limit selection.
+    matched: ?i64 = null,
+    /// Number of rows staged into the claimed transaction.
+    staged: ?i64 = null,
+    /// Optional returning rows from the staged mutation.
+    returning: ?[]const std.json.Value = null,
+};
+
+pub const RowsQueryOrderField = struct {
+    /// Output/base field to order by. Mutually exclusive with `expr`.
+    field: []const u8,
+    null_test: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+};
+
+/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows/mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
+pub const RowsRowClaim = struct {
+    mode: ?[]const u8 = null,
+    wait_policy: ?[]const u8 = null,
+    skip_locked: ?bool = null,
+    lease_ms: ?i64 = null,
+    owner_id: ?[]const u8 = null,
+    /// Canonical 16-byte transaction id encoded as 32 hex characters.
+    transaction_id: ?[]const u8 = null,
+};
+
+/// Physical row-key range selector used by routed typed row plans after durable range ownership is known. At least one of `start` or `end` must be present, and a bounded range must have `start < end`.
+pub const RowsDocKeyRange = struct {
+    /// Inclusive physical row-key lower bound.
+    start: ?[]const u8 = null,
+    /// Exclusive physical row-key upper bound.
+    end: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.end) |value| {
+            try jw.objectField("end");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RowsExpressionField = struct {
+    field: []const u8,
+    source: ?[]const u8 = null,
+};
+
+pub const RowsExpressionValue = struct {
+    /// Literal JSON value for a value node.
+    value: std.json.Value,
+};
+
+/// Compact JSON path projection over a declared `json` column.
+pub const RowsJsonExtractProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared `json` column to read.
+    field: []const u8,
+    /// Non-empty JSON path, encoded as a dot path string or array of path components.
+    path: std.json.Value,
+    /// Return the extracted value as text, matching SQL `->>` behavior.
+    as_text: ?bool = null,
+};
+
+/// Compact array-length projection over a declared `array` column.
+pub const RowsArrayLengthProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared `array` column to measure.
+    field: []const u8,
+};
+
+pub const RowsCoalesceFieldOperand = struct {
+    /// Declared column to read.
+    field: []const u8,
+};
+
+pub const RowsCoalesceValueOperand = struct {
+    /// Literal JSON fallback value.
+    value: std.json.Value,
+};
+
+/// Compact field alias projection over a declared column.
+pub const RowsFieldAliasProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared column to project.
+    field: []const u8,
+};
+
+/// Typed scalar, array, JSON, or text-pattern row predicate atom over a declared relational column. Null-test operators omit `value`; value operators carry one JSON value; `in` and `not_in` carry an array value; JSON path operators carry `path`; text-pattern operators carry `pattern` and optional flags. The server validates column type and operator-specific fields against the table schema.
+pub const RowsWhereAtom = struct {
+    /// Declared relational column.
+    field: []const u8,
+    op: []const u8,
+    /// JSON comparison value or array operand for operators that require one.
+    value: ?std.json.Value = null,
+    /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+    path: ?std.json.Value = null,
+    /// SQL LIKE pattern for `text_pattern`.
+    pattern: ?[]const u8 = null,
+    /// ASCII case-insensitive matching for `text_pattern`.
+    case_insensitive: ?bool = null,
+    /// Negates `text_pattern`.
+    negated: ?bool = null,
+};
+
+pub const RowsWhereBranchAtom = struct {
+    /// Declared relational column for a single-atom branch.
+    field: []const u8,
+    op: []const u8,
+    /// JSON comparison value or array operand for operators that require one.
+    value: ?std.json.Value = null,
+    /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+    path: ?std.json.Value = null,
+    /// SQL LIKE pattern for `text_pattern`.
+    pattern: ?[]const u8 = null,
+    /// ASCII case-insensitive matching for `text_pattern`.
+    case_insensitive: ?bool = null,
+    /// Negates `text_pattern`.
+    negated: ?bool = null,
+};
+
+/// Predicate over emitted aggregate output fields, evaluated after grouping.
+pub const RowsAggregateHavingPredicate = struct {
+    /// Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias.
+    field: []const u8,
+    op: []const u8,
+    /// Comparison value. Omit for `is_null` and `is_not_null`.
+    value: ?std.json.Value = null,
+};
+
+pub const RowsWindowFrame = struct {
+    unit: []const u8,
+    start: []const u8,
+    start_offset: ?i64 = null,
+    end: []const u8,
+    end_offset: ?i64 = null,
+};
+
+pub const RowsJoinOn = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RowsJoinProjection = struct {
+    as: []const u8,
+    side: []const u8,
+    field: []const u8,
+};
+
+/// Physical join strategy requested by the typed plan. `auto` lets Antfly choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the leading join keys.
+pub const RowsJoinStrategy = enum {
+    auto,
+    lookup,
+    hash,
+    merge,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .lookup => "lookup",
+            .hash => "hash",
+            .merge => "merge",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "lookup", .lookup },
+            .{ "hash", .hash },
+            .{ "merge", .merge },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsLateralCorrelation = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+/// Typed column metadata emitted by a native relational read plan.
+pub const RowsResultColumn = struct {
+    /// Unique public result-object field name.
+    name: []const u8,
+    /// Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key.
+    display_name: ?[]const u8 = null,
+    /// Source path represented by this result field.
+    path: []const u8,
+    /// Antfly scalar/container type for the result field.
+    type: []const u8,
+    /// Item type when `type` is `array`.
+    array_item_type: ?[]const u8 = null,
+    /// Optional source collation metadata for source-backed text or keyword result fields.
+    collation: ?[]const u8 = null,
+    /// Whether the result field may be null.
+    nullable: bool,
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -1525,6 +1902,21 @@ pub const JoinStrategy = enum {
     }
 };
 
+pub const GraphMetricProfile = struct {
+    /// Name of the graph query or graph metric query that used the metric.
+    query_name: []const u8,
+    /// Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+    source: []const u8,
+    /// Graph index that owns the metric.
+    index_name: []const u8,
+    /// Graph metric name within the index.
+    metric_name: []const u8,
+    /// Effective freshness mode requested for this metric use.
+    freshness: []const u8,
+    /// Published generation and freshness status observed by the query.
+    status: antfly_indexes_openapi.GraphMetricStatus,
+};
+
 /// Shard-level execution statistics.
 pub const ShardsProfile = struct {
     /// Total shards targeted by the query.
@@ -1576,19 +1968,27 @@ pub const AnalysesResult = struct {
     tsne: ?[]const f32 = null,
 };
 
-/// A single query result hit
-pub const QueryHit = struct {
-    /// ID of the record.
-    _id: []const u8,
-    /// Relevance score of the hit.
-    _score: f32,
-    /// Scores partitioned by index when using RRF search.
-    _index_scores: ?std.json.Value = null,
-    _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
-    hierarchy: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
-    _sort: ?[]const []const u8 = null,
+pub const GraphMetricRerankScoreDetails = struct {
+    /// Graph index that provided the metric score.
+    index_name: []const u8,
+    /// Graph metric used as a score feature.
+    metric_name: []const u8,
+    /// Hit score before graph metric rerank composition.
+    base_score: f64,
+    /// Weight applied to the base score.
+    base_weight: f64,
+    /// Published metric score for this hit, or null when the hit was missing from the metric generation.
+    metric_score: ?f64 = null,
+    /// Metric feature value used in the formula after applying missing_score fallback if needed.
+    metric_score_used: f64,
+    /// Weight applied to the metric score feature.
+    metric_weight: f64,
+    /// True when metric_score was missing and the request's missing_score fallback was used.
+    missing_score_used: bool,
+    /// Final hit score after graph metric rerank composition.
+    final_score: f64,
+    /// Published graph metric score generation used for this hit.
+    published_generation: i64,
 };
 
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
@@ -1914,6 +2314,8 @@ pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
     field: ?[]const u8 = null,
+    /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
+    mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
@@ -1976,6 +2378,108 @@ pub const TransactionCommitResponse = struct {
     conflict: ?std.json.Value = null,
     /// Per-table batch results (only present when status is "committed")
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
+};
+
+/// Structured row selector. `primary` addresses declared primary-key tables directly. `unique` addresses a declared unique constraint through durable unique-owner rows. The selector is exact and accepts exactly one of `primary` or `unique`.
+pub const RowSelector = struct {
+    primary: ?RowPrimarySelector = null,
+    unique: ?RowUniqueSelector = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.unique) |value| {
+            try jw.objectField("unique");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Conjunction of partial-unique predicate atoms.
+pub const RowsUniquePredicateGroup = struct {
+    all: []const RowsUniquePredicate,
+};
+
+/// Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
+pub const RowsCoalesceOperand = union(enum) {
+    rows_coalesce_field_operand: *RowsCoalesceFieldOperand,
+    rows_coalesce_value_operand: *RowsCoalesceValueOperand,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+        })) {
+            if (try parseStructuralVariant(RowsCoalesceFieldOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_field_operand = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsCoalesceValueOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_value_operand = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_coalesce_field_operand => |v| try jw.write(v.*),
+            .rows_coalesce_value_operand => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsWhereBranchAll = struct {
+    /// Conjunction of typed atoms for this branch.
+    all: []const RowsWhereAtom,
+};
+
+/// Conjunction of emitted aggregate-output predicates for HAVING.
+pub const RowsAggregateHaving = struct {
+    all: []const RowsAggregateHavingPredicate,
+};
+
+/// Join strategy admission metadata returned by native join execution.
+pub const RowsJoinStrategySelection = struct {
+    requested: RowsJoinStrategy,
+    selected: RowsJoinStrategy,
+};
+
+pub const RowsQueryResultSet = struct {
+    total: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsAggregateResultSet = struct {
+    total_groups: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
 };
 
 pub const TransactionStageReadResponse = struct {
@@ -2192,13 +2696,10 @@ pub const TableStatistics = struct {
     last_updated: ?[]const u8 = null,
 };
 
-/// A list of query hits.
-pub const QueryHits = struct {
-    /// Total number of hits available.
-    total: ?i64 = null,
-    hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
-    max_score: ?f32 = null,
+/// Optional score provenance for ranking features that changed the final hit score.
+pub const QueryScoreDetails = struct {
+    /// Score contribution from an explicit graph_metric_rerank request.
+    graph_metric_rerank: ?GraphMetricRerankScoreDetails = null,
 };
 
 pub const LinearMergeResult = struct {
@@ -2324,7 +2825,285 @@ pub const TransactionSessionCommitResponse = struct {
     transaction_id: []const u8,
 };
 
+pub const RowsGetRequest = struct {
+    keys: []const RowSelector,
+    /// Include the diagnostic storage-owned physical key in each result.
+    include_physical_key: ?bool = null,
+};
+
+pub const RowsGetResult = struct {
+    identity: ?RowSelector = null,
+    found: ?bool = null,
+    row: ?std.json.Value = null,
+    version: ?i64 = null,
+    /// Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity.
+    physical_key: ?[]const u8 = null,
+};
+
+/// Compact COALESCE projection.
+pub const RowsCoalesceProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    operands: []const RowsCoalesceOperand,
+};
+
+/// Predicate branch used by `where.any` and `where.not`; exactly one typed atom or an `all`-only conjunction of typed atoms.
+pub const RowsWhereBranch = union(enum) {
+    rows_where_branch_atom: *RowsWhereBranchAtom,
+    rows_where_branch_all: *RowsWhereBranchAll,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "op",
+            "value",
+            "path",
+            "pattern",
+            "case_insensitive",
+            "negated",
+        })) {
+            if (try parseStructuralVariant(RowsWhereBranchAtom, allocator, source, options)) |parsed| return .{ .rows_where_branch_atom = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "all",
+        })) {
+            if (try parseStructuralVariant(RowsWhereBranchAll, allocator, source, options)) |parsed| return .{ .rows_where_branch_all = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_where_branch_atom => |v| try jw.write(v.*),
+            .rows_where_branch_all => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    join_strategy: ?RowsJoinStrategySelection = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 pub const SSEStepCompleted = AgentStep;
+
+/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
+pub const JoinClause = struct {
+    /// Name of the table to join with.
+    right_table: []const u8,
+    /// Type of join to perform. Defaults to "inner".
+    join_type: ?JoinType = null,
+    /// Join condition specifying which fields to match.
+    on: JoinCondition,
+    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
+    right_filters: ?JoinFilters = null,
+    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
+    right_fields: ?[]const []const u8 = null,
+    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
+    strategy_hint: ?JoinStrategy = null,
+    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
+    nested_join: ?std.json.Value = null,
+};
+
+/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
+pub const QueryProfile = struct {
+    /// Shard-level execution statistics.
+    shards: ?ShardsProfile = null,
+    /// Join execution statistics (present when query used a join).
+    join: ?JoinProfile = null,
+    /// Reranking statistics (present when a reranker was used).
+    reranker: ?RerankerProfile = null,
+    /// Result merge statistics (present for hybrid search).
+    merge: ?MergeProfile = null,
+    /// Graph metric freshness and generation details for metric-aware query work.
+    graph_metrics: ?[]const GraphMetricProfile = null,
+};
+
+/// A single query result hit
+pub const QueryHit = struct {
+    /// ID of the record.
+    _id: []const u8,
+    /// Relevance score of the hit.
+    _score: f32,
+    /// Scores partitioned by index when using RRF search.
+    _index_scores: ?std.json.Value = null,
+    /// Optional explain-style score provenance for score features applied to this hit.
+    _score_details: ?QueryScoreDetails = null,
+    _source: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
+    hierarchy: ?std.json.Value = null,
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
+    _sort: ?[]const []const u8 = null,
+};
+
+pub const ReplicationSource = struct {
+    /// Type of the replication source. Currently only "postgres" is supported.
+    type: []const u8,
+    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
+    dsn: []const u8,
+    /// Name of the table in the PostgreSQL database to replicate from.
+    postgres_table: []const u8,
+    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
+    key_template: ?[]const u8 = null,
+    /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
+    slot_name: ?[]const u8 = null,
+    /// PostgreSQL publication name. If omitted, auto-derived and created automatically. Specify this when using pre-created publications.
+    publication_name: ?[]const u8 = null,
+    /// Transform operations applied on INSERT/UPDATE events. Values can reference PG columns via `{{column}}` syntax. If omitted, auto-generates `$set` for every column (passthrough mode).
+    on_update: ?[]const ReplicationTransformOp = null,
+    /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
+    on_delete: ?[]const ReplicationTransformOp = null,
+    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
+    publication_filter: ?std.json.Value = null,
+    /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
+    routes: ?[]const ReplicationRoute = null,
+    /// When true, indicates this source was reseeded with exact cutover mode and must replay from a consistent snapshot before streaming.
+    require_exact_cutover: ?bool = null,
+    status: ?ReplicationSourceStatus = null,
+    action_hint: ?ReplicationSourceActionHint = null,
+};
+
+pub const ConnectionsResponse = struct {
+    connections: []const Connection,
+};
+
+/// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
+pub const BatchRequest = struct {
+    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
+    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
+    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
+    deletes: ?[]const []const u8 = null,
+    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
+    transforms: ?[]const Transform = null,
+    sync_level: ?SyncLevel = null,
+};
+
+pub const RowsGetResultSet = struct {
+    rows: ?[]const RowsGetResult = null,
+};
+
+/// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
+pub const RowsWhere = union(enum) {
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(_: @This(), _: anytype) !void {}
+};
+
+pub const QueryRequest = struct {
+    /// Name of the table to query. Optional for global queries.
+    table: ?[]const u8 = null,
+    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
+    query: ?std.json.Value = null,
+    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
+    full_text_search: ?std.json.Value = null,
+    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
+    semantic_search: ?[]const u8 = null,
+    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
+    embedding_template: ?[]const u8 = null,
+    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
+    indexes: ?[]const []const u8 = null,
+    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
+    filter_prefix: ?[]const u8 = null,
+    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
+    filter_query: ?std.json.Value = null,
+    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
+    exclusion_query: ?std.json.Value = null,
+    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
+    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
+    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
+    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
+    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
+    search_effort: ?f32 = null,
+    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
+    fields: ?[]const []const u8 = null,
+    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
+    limit: ?i64 = null,
+    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
+    offset: ?i64 = null,
+    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
+    order_by: ?[]const SortField = null,
+    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_after: ?[]const []const u8 = null,
+    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
+    search_before: ?[]const []const u8 = null,
+    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
+    distance_under: ?f32 = null,
+    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
+    distance_over: ?f32 = null,
+    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
+    merge_config: ?antfly_indexes_openapi.MergeConfig = null,
+    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts.
+    count: ?bool = null,
+    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
+    profile: ?bool = null,
+    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
+    reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
+    analyses: ?Analyses = null,
+    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
+    graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
+    /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
+    expand_strategy: ?[]const u8 = null,
+    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
+    document_renderer: ?[]const u8 = null,
+    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
+    pruner: ?antfly_indexes_openapi.Pruner = null,
+    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
+    join: ?JoinClause = null,
+    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
+    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+};
 
 /// Result from the retrieval agent
 pub const RetrievalAgentResult = struct {
@@ -2378,140 +3157,13 @@ pub const RetrievalAgentResult = struct {
     eval_result: ?antfly_eval_openapi.EvalResult = null,
 };
 
-/// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
-pub const JoinClause = struct {
-    /// Name of the table to join with.
-    right_table: []const u8,
-    /// Type of join to perform. Defaults to "inner".
-    join_type: ?JoinType = null,
-    /// Join condition specifying which fields to match.
-    on: JoinCondition,
-    /// Optional filters to apply to the right table before joining. Use to reduce the amount of data being joined.
-    right_filters: ?JoinFilters = null,
-    /// Fields to include from the right table in the result. If not specified, all fields from the right table are included. Fields are prefixed with the right table name in the result.
-    right_fields: ?[]const []const u8 = null,
-    /// Optional hint for which join strategy to use. If not specified, the planner automatically selects based on table statistics.
-    strategy_hint: ?JoinStrategy = null,
-    /// Optional nested join for multi-way joins. The nested join operates on the result of the current join.
-    nested_join: ?std.json.Value = null,
-};
-
-/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
-pub const QueryProfile = struct {
-    /// Shard-level execution statistics.
-    shards: ?ShardsProfile = null,
-    /// Join execution statistics (present when query used a join).
-    join: ?JoinProfile = null,
-    /// Reranking statistics (present when a reranker was used).
-    reranker: ?RerankerProfile = null,
-    /// Result merge statistics (present for hybrid search).
-    merge: ?MergeProfile = null,
-};
-
-pub const ReplicationSource = struct {
-    /// Type of the replication source. Currently only "postgres" is supported.
-    type: []const u8,
-    /// Data source name (connection string) for the PostgreSQL database. Supports `${secret:key_name}` references that resolve from the Antfly keystore or environment variables. Requires `wal_level=logical` on the source.
-    dsn: []const u8,
-    /// Name of the table in the PostgreSQL database to replicate from.
-    postgres_table: []const u8,
-    /// Template for constructing the Antfly document key from PG columns. A plain string (e.g., "id") uses that column's value directly. Use `{{column}}` syntax for composite keys: `{{tenant_id}}:{{user_id}}`.
-    key_template: ?[]const u8 = null,
-    /// PostgreSQL replication slot name. If omitted, auto-derived from the Antfly table and PG table names. Specify this when using pre-created slots (e.g., on Supabase or Neon).
-    slot_name: ?[]const u8 = null,
-    /// PostgreSQL publication name. If omitted, auto-derived and created automatically. Specify this when using pre-created publications.
-    publication_name: ?[]const u8 = null,
-    /// Transform operations applied on INSERT/UPDATE events. Values can reference PG columns via `{{column}}` syntax. If omitted, auto-generates `$set` for every column (passthrough mode).
-    on_update: ?[]const ReplicationTransformOp = null,
-    /// Transform operations applied on DELETE events. If omitted, auto-derives `$unset` ops from `on_update`'s `$set` paths (safe for multi-source). Use `$delete_document` op to delete the entire Antfly document.
-    on_delete: ?[]const ReplicationTransformOp = null,
-    /// Bleve-style filter query that gets translated to SQL and applied as a WHERE clause on the PostgreSQL publication. This filters rows at the source before they are sent over the replication stream, reducing network and processing overhead. Only a subset of filter types are supported (term, match, range, conjuncts, disjuncts, must_not). The filter is translated to SQL with inlined literal values. Example: `{"term": "active", "field": "status"}` becomes `WHERE ("status" = 'active')` on the publication.
-    publication_filter: ?std.json.Value = null,
-    /// Conditional routes for fan-out replication. Each route evaluates its `where` filter against every CDC row and, on match, writes to the specified `target_table`. Multiple routes can match the same row. When routes are present, the top-level `on_update`/`on_delete` are ignored — each route defines its own transforms.
-    routes: ?[]const ReplicationRoute = null,
-    /// When true, indicates this source was reseeded with exact cutover mode and must replay from a consistent snapshot before streaming.
-    require_exact_cutover: ?bool = null,
-    status: ?ReplicationSourceStatus = null,
-    action_hint: ?ReplicationSourceActionHint = null,
-};
-
-pub const ConnectionsResponse = struct {
-    connections: []const Connection,
-};
-
-/// Batch insert, delete, and transform operations in a single request. **Atomicity**: - **Single shard**: Operations are atomic within shard boundaries - **Multiple shards**: Uses distributed 2-phase commit (2PC) for atomic cross-shard writes **How distributed transactions work**: 1. Metadata server allocates HLC timestamp and selects coordinator shard 2. Coordinator writes transaction record, participants write intents 3. After all intents succeed, coordinator commits transaction 4. Participants are notified asynchronously to resolve intents 5. Recovery loop ensures notifications complete even after coordinator failure **Performance**: - Single-shard batches: < 5ms latency - Cross-shard transactions: ~20ms latency - Intent resolution: < 30 seconds worst-case (via recovery loop) **Guarantees**: - All writes succeed or all fail (atomicity across all shards) - Coordinator failure is recoverable (new leader resumes notifications) - Idempotent resolution (duplicate notifications are safe) **Benefits**: - Reduces network overhead compared to individual requests - More efficient indexing (updates are batched) - Automatic distributed transactions when operations span shards The inserts are upserts - existing keys are overwritten, new keys are created.
-pub const BatchRequest = struct {
-    /// Map of document IDs to document objects. Each key is the unique identifier for the document. Best practices: - Use consistent key naming schemes (e.g., "user:123", "article:456") - Key length affects storage and performance - keep them reasonably short - Keys are sorted lexicographically, so choose prefixes that support range scans
-    inserts: ?std.json.ArrayHashMap(std.json.Value) = null,
-    /// Array of document IDs to delete. Documents are removed from all indexes. Notes: - Non-existent keys are silently ignored - Deletions are processed before inserts in the same batch - Keys are permanently removed from storage and indexes
-    deletes: ?[]const []const u8 = null,
-    /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
-    transforms: ?[]const Transform = null,
-    sync_level: ?SyncLevel = null,
-};
-
-pub const QueryRequest = struct {
-    /// Name of the table to query. Optional for global queries.
-    table: ?[]const u8 = null,
-    /// Canonical public query AST. Prefer this field for new clients. Boolean clauses are normalized before planning: - `bool.must` is scoring query input. - `bool.filter` is a non-scoring structured filter. - `bool.must_not` is a structured exclusion filter. The same AST accepts direct structured filters using `field` or JSON-pointer `path`, scalar `term` values, multi-value `terms`, and `exists`. Query-string objects remain supported as a full-text escape hatch.
-    query: ?std.json.Value = null,
-    /// Antfly query for full-text search. Supports all Antfly query types. See specs/openapi/antfly/query.yaml for complete type definitions. Examples: - Simple: `{"query": "computer"}` - Field-specific: `{"query": "body:computer"}` - Boolean: `{"query": "+artificial +intelligence"}` - Range: `{"query": "year:>2020"}` - Phrase: `{"query": "\"exact phrase\""}`
-    full_text_search: ?std.json.Value = null,
-    /// Natural language query for vector similarity search. Results are ranked by semantic similarity to the query and can be combined with full_text_search using Reciprocal Rank Fusion (RRF). The semantic_search string is automatically embedded using the configured embedding model for the specified indexes. Use `embedding_template` for multimodal queries.
-    semantic_search: ?[]const u8 = null,
-    /// Optional Handlebars template for multimodal embedding of the semantic_search query. The template has access to `this` which contains the semantic_search string value. Use this when you want to embed multimodal content (images, PDFs, etc.) instead of just text. The template is rendered using dotprompt with access to remote content helpers. **Available Helpers**: - `remoteMedia url=<url>` - Fetches and embeds remote images/media - `remotePDF url=<url>` - Fetches and extracts content from PDFs - `remoteText url=<url>` - Fetches and includes remote text content **Examples**: - PDF search: `{{remotePDF url=this}}` - Image search: `{{remoteMedia url=this}}` - Mixed: `Search for: {{this}} {{#if this}}{{remoteMedia url=this}}{{/if}}` When not specified, the semantic_search string is embedded as plain text.
-    embedding_template: ?[]const u8 = null,
-    /// List of vector index names to use for semantic search. Required when using semantic_search. Multiple indexes can be specified, and their results will be merged using RRF.
-    indexes: ?[]const []const u8 = null,
-    /// Filter results by key prefix. Only returns documents whose keys start with this string. Applied before scoring to improve performance. Common use cases: - Multi-tenant filtering: `"tenant:acme:"` - User-specific data: `"user:123:"` - Document type filtering: `"article:"`
-    filter_prefix: ?[]const u8 = null,
-    /// Antfly query applied as an AND condition. Documents must match both the main query and this filter. Applied before scoring for better performance. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Status filtering: `"status:published"` - Date ranges: `"created_at:>2023-01-01"` - Category filtering: `"+category:technology +language:en"`
-    filter_query: ?std.json.Value = null,
-    /// Antfly query applied as a NOT condition. Documents matching this query are excluded from results. Applied before scoring. See specs/openapi/antfly/query.yaml for complete type definitions. Use for: - Excluding drafts: `"status:draft"` - Removing deprecated content: `"deprecated:true"` - Filtering out archived items: `"status:archived"`
-    exclusion_query: ?std.json.Value = null,
-    /// Aggregation requests for computing metrics and bucketing results. Each key is a user-defined name for the aggregation, and the value specifies the aggregation configuration. Supports metric aggregations (sum, avg, min, max, count, stats, cardinality), bucketing aggregations (terms, range, date_range, histogram, date_histogram), geo aggregations (geohash_grid, geo_distance), and analytics (significant_terms). Example: ```json { "price_stats": { "type": "stats", "field": "price" }, "categories": { "type": "terms", "field": "category", "size": 10 } } ```
-    aggregations: ?std.json.ArrayHashMap(AggregationRequest) = null,
-    /// Pre-computed embeddings to use for semantic searches instead of embedding the semantic_search string. The keys are the index names. Values can be either: - **Dense (array)**: an array of floats, e.g. `[0.1, 0.2, 0.3]` - **Dense (packed)**: a base64 string of little-endian float32 bytes (~4x more compact) - **Sparse**: an object with `indices` (array of ints) and `values` (array of floats), e.g. `{"indices": [1, 5, 100], "values": [0.3, 0.7, 0.1]}` - **Sparse (packed)**: an object with `packed_indices` (base64 uint32 LE) and `packed_values` (base64 float32 LE) Use when you've already generated embeddings on the client side to avoid redundant embedding calls.
-    embeddings: ?std.json.ArrayHashMap(Embedding) = null,
-    /// Controls the vector search recall/latency tradeoff for semantic searches. - `0.0` = fastest, lowest recall - `0.5` = balanced default - `1.0` = highest recall When omitted, Antfly uses the balanced default effort (`0.5`) unless lower-level vector search overrides are provided internally.
-    search_effort: ?f32 = null,
-    /// List of fields to include in the results. If not specified, all fields are returned. Use to reduce response size and improve performance.
-    fields: ?[]const []const u8 = null,
-    /// Maximum number of results to return. For semantic_search, this is the topk parameter. Default varies by query type (typically 10).
-    limit: ?i64 = null,
-    /// Number of results to skip for pagination. Only available for full_text_search queries. Not supported for semantic_search due to vector index limitations.
-    offset: ?i64 = null,
-    /// Sort order for results. Array of sort fields with direction. Only applicable for full_text_search queries. Semantic searches are always sorted by similarity score.
-    order_by: ?[]const SortField = null,
-    /// Cursor for forward pagination. Pass the `_sort` values from the last hit of the previous page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_after: ?[]const []const u8 = null,
-    /// Cursor for backward pagination. Pass the `_sort` values from the first hit of the current page. Mutually exclusive with `offset`. Requires `order_by` to be set. Only supported for full_text_search queries.
-    search_before: ?[]const []const u8 = null,
-    /// Maximum distance threshold for semantic similarity search. Results with distance greater than this value are excluded. Lower distances indicate higher similarity. Useful for filtering out low-confidence matches.
-    distance_under: ?f32 = null,
-    /// Minimum distance threshold for semantic similarity search. Results with distance less than this value are excluded. Useful for excluding near-exact duplicates or finding dissimilar documents.
-    distance_over: ?f32 = null,
-    /// Configuration for merging full-text and semantic search results. Only applies when both `full_text_search` and `semantic_search` are specified.
-    merge_config: ?antfly_indexes_openapi.MergeConfig = null,
-    /// If true, returns only the total count of matching documents without retrieving the actual documents. Useful for pagination and displaying result counts.
-    count: ?bool = null,
-    /// If true, includes detailed execution profiling in the response. Adds a `profile` object with per-phase timing breakdowns, shard statistics, join metadata, reranker stats, and merge details. Has minor performance overhead — not recommended for production traffic.
-    profile: ?bool = null,
-    /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
-    reranker: ?antfly_reranking_openapi.RerankerConfig = null,
-    analyses: ?Analyses = null,
-    /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
-    graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
-    /// Strategy for merging graph results with search results: - union: Include nodes from both search and graph results - intersection: Only include nodes appearing in both
-    expand_strategy: ?[]const u8 = null,
-    /// Optional Handlebars template string for rendering document content in RAG queries. Template has access to document fields via `{{this.fields.fieldName}}`. **Default**: Uses TOON (Token-Oriented Object Notation) format for 30-60% token reduction: ```handlebars {{encodeToon this.fields}} ``` **Available Helpers**: - `encodeToon` - Renders fields in compact TOON format with configurable options: - `lengthMarker` (bool): Add # prefix to array counts (default: true) - `indent` (int): Indentation spacing (default: 2) - `delimiter` (string): Field separator for tabular arrays - `scrubHtml` - Removes HTML tags and extracts text - `media` - Wraps data URIs for GenKit multimodal support - `eq` - Equality comparison for conditionals **Examples**: - Basic TOON: `{{encodeToon this.fields}}` - Compact TOON: `{{encodeToon this.fields lengthMarker=false indent=0}}` - Tabular data: `{{encodeToon this.fields delimiter="\t"}}` - Custom template: `Title: {{this.fields.title}}\nBody: {{this.fields.body}}` - Traditional format: `{{#each this.fields}}{{@key}}: {{this}}\n{{/each}}` TOON format produces compact, LLM-optimized output like: ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml ``` **References**: - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon
-    document_renderer: ?[]const u8 = null,
-    /// Optional result pruning configuration to filter low-relevance results. Pruning helps detect "elbows" in score distributions and removes results that are significantly worse than top matches. **Common patterns:** - RAG queries: Use `max_score_gap_percent: 30` to stop at quality drop-offs - Strict matching: Use `min_score_ratio: 0.7` for high-quality results only - Combine both for best results Example: ```json { "min_score_ratio": 0.5, "max_score_gap_percent": 25.0, "min_absolute_score": 0.3 } ```
-    pruner: ?antfly_indexes_openapi.Pruner = null,
-    /// Cross-table join configuration for combining results from multiple tables. Joins allow you to enrich query results with data from related tables, similar to SQL JOINs but optimized for distributed execution. **Join Types:** - `inner`: Only return rows that have matches in both tables - `left`: Return all rows from the primary table, with NULL for non-matching right rows - `right`: Return all rows from the joined table, with NULL for non-matching left rows **Join Strategies** (auto-selected based on table sizes): - `broadcast`: Small table broadcast to all shards (best for dimension tables < 10MB) - `index_lookup`: Batch key lookups using indexes (best for selective joins) - `shuffle`: Hash-partition both tables (best for large-large joins) **Example - Enrich orders with customer data:** ```json { "table": "orders", "full_text_search": {"query": "status:pending"}, "join": { "right_table": "customers", "join_type": "inner", "on": { "left_field": "customer_id", "right_field": "id" }, "right_filters": { "filter_query": {"query": "tier:premium"} } }, "fields": ["order_id", "amount", "customers.name", "customers.email"] } ``` **Multi-way joins** (nested): ```json { "table": "orders", "join": { "right_table": "customers", "on": {"left_field": "customer_id", "right_field": "id"}, "nested_join": { "right_table": "addresses", "on": {"left_field": "customers.address_id", "right_field": "id"} } } } ``` **Performance Tips:** - Filter the driving table first to reduce join input size - Put the smaller table on the right side for broadcast joins - Use indexed fields in join conditions for index_lookup strategy - Limit result fields to reduce data transfer
-    join: ?JoinClause = null,
-    /// Map of table name to foreign data source configuration for query-time federated access. When a table name referenced in this query (or in a join's `right_table`) appears as a key here, the query is routed to the external database instead of Antfly shards. This enables joining Antfly search results with structured relational data (customer records, product catalogs, etc.) without ingesting that data into Antfly. **Supported operations on foreign tables:** filter_query, field selection, limit/offset. **Not supported:** full_text_search, semantic_search, graph_searches, aggregations, reranker. **Example - Join Antfly products with Postgres customers:** ```json { "table": "products", "full_text_search": {"query": "category:electronics"}, "join": { "right_table": "pg_customers", "on": {"left_field": "customer_id", "right_field": "id"} }, "foreign_sources": { "pg_customers": { "type": "postgres", "dsn": "${secret:pg_dsn}", "postgres_table": "customers" } } } ```
-    foreign_sources: ?std.json.ArrayHashMap(ForeignSource) = null,
+/// A list of query hits.
+pub const QueryHits = struct {
+    /// Total number of hits available.
+    total: ?i64 = null,
+    hits: ?[]const QueryHit = null,
+    /// Maximum score of the results.
+    max_score: ?f32 = null,
 };
 
 pub const CreateTableRequest = struct {
@@ -2521,16 +3173,22 @@ pub const CreateTableRequest = struct {
     description: ?[]const u8 = null,
     /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
     indexes: ?std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig) = null,
+    /// Table-level typed document path metadata used by SQL planning for JSON/path scalar comparison semantics. This is not a physical index and does not imply indexed lookup, rebuild, catch-up, compaction, or PostgreSQL `CREATE INDEX` behavior. Use real index definitions for physical access paths. Keys are scalar type names such as `keyword`, `numeric`, `boolean`, or `datetime`; values are a path string or an array of path strings.
+    typed_paths: ?std.json.Value = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?antfly_schema_openapi.TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     replication_sources: ?[]const ReplicationSource = null,
+    /// Optional tablespace binding for the table. When set, the named tablespace must exist and cannot be dropped while the table references it.
+    tablespace_name: ?[]const u8 = null,
 };
 
 pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
+    /// Optional durable tablespace binding for this table.
+    tablespace_name: ?[]const u8 = null,
     indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
@@ -2606,6 +3264,8 @@ pub const RetrievalQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?antfly_reranking_openapi.RerankerConfig = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?antfly_indexes_openapi.GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQuery) = null,
@@ -2653,6 +3313,8 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
+    /// Optional durable tablespace binding for this table.
+    tablespace_name: ?[]const u8 = null,
     indexes: std.json.ArrayHashMap(antfly_indexes_openapi.IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?antfly_schema_openapi.TableSchema = null,
@@ -2768,6 +3430,10 @@ pub const AggregationBucket = struct {
 pub const AggregationResult = struct {
     /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
     value: ?f32 = null,
+    /// For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+    approximate: ?bool = null,
+    /// For an approximate cardinality value, the relative standard error of the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate is true.
+    relative_error: ?f32 = null,
     /// Document count for stats aggregations
     count: ?i64 = null,
     /// Minimum value for stats aggregations
@@ -2786,6 +3452,632 @@ pub const AggregationResult = struct {
     variance: ?f32 = null,
     /// Buckets for bucketing aggregations (terms, range, histogram, etc.)
     buckets: ?[]const AggregationBucket = null,
+};
+
+/// Field-to-expression assignment map over the shared row-expression AST.
+pub const RowsExpressionAssignmentMap = struct {};
+
+/// JSON path assignment for a declared `json` column. Exactly one of `value` or `expr` must be supplied.
+pub const RowsJsonSetTransform = struct {
+    /// Declared `json` column to update.
+    field: []const u8,
+    /// Non-empty path under the JSON column.
+    path: []const []const u8,
+    /// JSON value to write at the path.
+    value: ?std.json.Value = null,
+    /// Expression value to evaluate at mutation time and write at the path.
+    expr: ?RowsExpression = null,
+};
+
+/// Declared unique constraint target for `ON CONFLICT`.
+pub const RowsConflictUniqueTarget = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    where: ?RowsUniquePredicateGroup = null,
+    /// Expression predicates for expression-partial unique conflict targets. When present, the list must exactly match the named unique constraint's stored expression predicate metadata.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+};
+
+/// Primary-key or named unique constraint conflict target.
+pub const RowsConflictTarget = struct {
+    /// Set to `true` to target the declared primary key.
+    primary: ?bool = null,
+    unique: ?RowsConflictUniqueTarget = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.unique) |value| {
+            try jw.objectField("unique");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
+pub const RowsOnConflict = struct {
+    target: RowsConflictTarget,
+    action: []const u8,
+    patch: ?RowsFieldPatch = null,
+    increment: ?RowsNumericIncrement = null,
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    json_set: ?[]const RowsJsonSetTransform = null,
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    where_expression: ?RowsExpressionCondition = null,
+};
+
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans. The operation envelope is exact and operation-specific: unsupported fields for the selected `op` fail validation instead of being ignored.
+pub const RowOperation = struct {
+    op: []const u8,
+    /// Full row document for insert/upsert. Must include primary-key columns.
+    row: ?RowsRowDocument = null,
+    where: ?RowSelector = null,
+    /// Top-level field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    increment: ?RowsNumericIncrement = null,
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    json_set: ?[]const RowsJsonSetTransform = null,
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    on_conflict: ?RowsOnConflict = null,
+    /// Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections from the committed mutation image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+    /// Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+    expected_version: ?i64 = null,
+};
+
+pub const RowsBatchRequest = struct {
+    operations: []const RowOperation,
+    sync_level: ?SyncLevel = null,
+};
+
+/// Typed relational mutation-source plan. The `source` is a lockable base row-query request with `row_claim.transaction_id` and no `source_cte` or `doc_key_range`; update/delete intents are staged into that transaction using committed-version predicates from the selected preimages. Claims over physical ranges, CTEs, joins, aggregates, windows, and lateral outputs are rejected until those stages expose an explicit lockable base-row contract.
+pub const RowsMutationSourceRequest = struct {
+    op: []const u8,
+    source: RowsQueryRequest,
+    /// Top-level static field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    /// Numeric increments for update operations.
+    increment: ?RowsNumericIncrement = null,
+    /// Field-to-expression assignments evaluated over the selected row image.
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    /// Field-to-expression numeric deltas evaluated over the selected row image.
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    /// JSON path transforms for update operations.
+    json_set: ?[]const RowsJsonSetTransform = null,
+    /// Array transforms for update operations.
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    /// Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans.
+    temporal_portion: ?RowsTemporalPortion = null,
+    /// Fields to return from the final update image or deleted row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the final update image or deleted row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Target-column assignment for a typed insert-source plan.
+pub const RowsInsertSourceAssignment = struct {
+    /// Declared target-table relational field to populate.
+    target_field: []const u8,
+    /// Typed expression evaluated over each source row. A field expression copies a source field; operator expressions build generated insert values without carrying SQL text.
+    expr: RowsExpression,
+};
+
+/// Typed relational insert-source plan. The `source` is a read-only row query over `source_table` or, when omitted, the target table named in the path. Each selected source row is projected through `assignments` into a target insert row, then optional conflict handling and `RETURNING` projection run through the same row-batch semantics as ordinary inserts. Execution is fail-closed until the storage/runtime layer implements source-to-target routing, duplicate-target detection, and owner-local insert staging for this native plan.
+pub const RowsInsertSourceRequest = struct {
+    op: []const u8,
+    /// Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support.
+    source_table: ?[]const u8 = null,
+    source: RowsQueryRequest,
+    /// Ordered target-field assignments used to build each proposed insert row from the source row.
+    assignments: []const RowsInsertSourceAssignment,
+    on_conflict: ?RowsOnConflict = null,
+    /// Fields to return from the committed inserted or conflict-updated row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the committed inserted or conflict-updated row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Typed relational joined mutation-source plan. The target side of the `join` must carry a lockable `row_claim.transaction_id`; the non-target side is read-only input. Update plans can copy same-typed values from the source side through `source_assignments` and can apply target-local patches or expression assignments. Delete plans reject update assignments. Execution must stage intents only for claimed target rows.
+pub const RowsJoinedMutationSourceRequest = struct {
+    op: []const u8,
+    /// Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges.
+    source_table: ?[]const u8 = null,
+    target_side: []const u8,
+    join: RowsJoinRequest,
+    /// Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the target row and joined source row.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the target row and joined source row.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the target row and joined source row.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    /// Source-side assignments that copy values from the read-only joined source side into the claimed target side.
+    source_assignments: ?[]const RowsJoinedMutationSourceAssignment = null,
+    /// Target-local static field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    /// Target-local numeric increments for update operations.
+    increment: ?RowsNumericIncrement = null,
+    /// Target-local field-to-expression assignments evaluated over the target row image.
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    /// Target-local field-to-expression numeric deltas evaluated over the target row image.
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    /// Fields to return from the final target update image or deleted target row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the final target update image or deleted target row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Ordered row-stream key. Exactly one of `field` or `expr` is required. `field` names an output/base field; `expr` carries a typed row-expression AST for computed ordering.
+pub const RowsQueryOrder = union(enum) {
+    rows_query_order_expression: *RowsQueryOrderExpression,
+    rows_query_order_field: *RowsQueryOrderField,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "expr",
+            "null_test",
+            "direction",
+        })) {
+            if (try parseStructuralVariant(RowsQueryOrderExpression, allocator, source, options)) |parsed| return .{ .rows_query_order_expression = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "null_test",
+            "direction",
+        })) {
+            if (try parseStructuralVariant(RowsQueryOrderField, allocator, source, options)) |parsed| return .{ .rows_query_order_field = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_query_order_expression => |v| try jw.write(v.*),
+            .rows_query_order_field => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsQueryOrderExpression = struct {
+    /// Typed row-expression AST for computed ordering. Mutually exclusive with `field`.
+    expr: RowsExpression,
+    null_test: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+};
+
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+pub const RowsExpression = union(enum) {
+    rows_expression_operator: *RowsExpressionOperator,
+    rows_expression_field: *RowsExpressionField,
+    rows_expression_value: *RowsExpressionValue,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "op",
+            "args",
+            "to",
+            "path",
+            "as_text",
+            "cases",
+            "else",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionOperator, allocator, source, options)) |parsed| return .{ .rows_expression_operator = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "source",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionField, allocator, source, options)) |parsed| return .{ .rows_expression_field = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionValue, allocator, source, options)) |parsed| return .{ .rows_expression_value = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_expression_operator => |v| try jw.write(v.*),
+            .rows_expression_field => |v| try jw.write(v.*),
+            .rows_expression_value => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsExpressionOperator = struct {
+    op: []const u8,
+    /// Operand expressions for operator nodes.
+    args: ?[]const RowsExpression = null,
+    /// Cast target for `cast`.
+    to: ?[]const u8 = null,
+    /// Structured JSON path for `json_extract` and `json_path_exists`.
+    path: ?std.json.Value = null,
+    /// Return JSON path extraction as text.
+    as_text: ?bool = null,
+    /// Searched case branches, each with `when` and `then`.
+    cases: ?[]const RowsExpressionCaseBranch = null,
+    /// Fallback expression for searched `case`.
+    @"else": ?std.json.Value = null,
+};
+
+pub const RowsExpressionCaseBranch = struct {
+    when: RowsExpressionCondition,
+    then: RowsExpression,
+};
+
+/// Computed expression predicate over the shared row-expression AST.
+pub const RowsExpressionCondition = struct {
+    lhs: RowsExpression,
+    op: []const u8,
+    rhs: ?RowsExpression = null,
+};
+
+pub const RowsExpressionConditionGroup = struct {
+    all: []const RowsExpressionCondition,
+};
+
+pub const RowsExpressionArrayContainsPredicate = struct {
+    expr: RowsExpression,
+    value: []const std.json.Value,
+};
+
+pub const RowsExpressionProjection = struct {
+    as: []const u8,
+    expr: RowsExpression,
+};
+
+/// Typed relational row-query plan. Predicate and expression arrays carry Antfly row-expression AST nodes; SQL syntax is adapter sugar over this native request shape.
+pub const RowsQueryRequest = struct {
+    /// Optional ordered CTE name to read instead of the base table.
+    source_cte: ?[]const u8 = null,
+    /// Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
+    where: ?RowsWhere = null,
+    /// All computed expression predicates that must pass.
+    expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of computed expression predicates.
+    expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of computed expression predicates.
+    expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Computed array-containment predicates.
+    expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    select: ?[]const []const u8 = null,
+    json_extract: ?[]const RowsJsonExtractProjection = null,
+    array_length: ?[]const RowsArrayLengthProjection = null,
+    coalesce: ?[]const RowsCoalesceProjection = null,
+    field_aliases: ?[]const RowsFieldAliasProjection = null,
+    /// Typed row-expression projections.
+    expressions: ?[]const RowsExpressionProjection = null,
+    /// Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`.
+    distinct_on: ?[]const []const u8 = null,
+    /// Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match.
+    distinct_on_expressions: ?[]const RowsExpression = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+    row_claim: ?RowsRowClaim = null,
+    doc_key_range: ?RowsDocKeyRange = null,
+};
+
+/// Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce more rows or serialized row bytes than declared.
+pub const RowsCte = struct {
+    name: []const u8,
+    max_rows: ?i64 = null,
+    max_bytes: ?i64 = null,
+    query: RowsQueryRequest,
+};
+
+pub const RowsAggregateSpec = struct {
+    name: []const u8,
+    op: []const u8,
+    field: ?[]const u8 = null,
+    expr: ?RowsExpression = null,
+    distinct: ?bool = null,
+    distinct_max_items: ?i64 = null,
+    /// Fraction for percentile_cont and percentile_disc aggregate specs.
+    percentile: ?f64 = null,
+    /// Fractions for array-valued percentile_cont and percentile_disc aggregate specs.
+    percentiles: ?[]const f64 = null,
+    /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+    percentile_max_items: ?i64 = null,
+    /// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
+    percentile_order: ?[]const u8 = null,
+    array_max_items: ?i64 = null,
+    array_order_by: ?[]const RowsQueryOrder = null,
+    /// Delimiter for string_agg aggregate specs.
+    delimiter: ?[]const u8 = null,
+    filter: ?RowsWhere = null,
+    /// Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`.
+    filter_array_any: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-array containment filters for this aggregate. Each item must use `op: array_contains`.
+    filter_array_contains: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-array equality filters for this aggregate. Each item must use `op: array_eq`.
+    filter_array_eq: ?[]const RowsWhereAtom = null,
+    /// Conjunctive scalar membership filters for this aggregate. Each item must use `op: in` or `op: not_in`.
+    filter_in: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON containment filters for this aggregate. Each item must use `op: json_contains`.
+    filter_json_contains: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON path equality filters for this aggregate. Each item must use `op: json_path_eq`.
+    filter_json_path_eq: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON path-existence filters for this aggregate. Each item must use `op: json_path_exists`.
+    filter_json_path_exists: ?[]const RowsWhereAtom = null,
+    /// Conjunctive text-pattern filters for this aggregate. Each item must use `op: text_pattern`.
+    filter_text_patterns: ?[]const RowsWhereAtom = null,
+    filter_expressions: ?[]const RowsExpressionCondition = null,
+    /// Conjunctive computed array-containment filters for this aggregate.
+    filter_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    /// Disjunction of input-row expression predicate groups for this aggregate. Each group is a conjunction; the aggregate consumes a row when at least one group matches.
+    filter_any: ?[]const RowsExpressionConditionGroup = null,
+    /// Negated input-row expression predicate groups for this aggregate. The aggregate skips a row when any group matches.
+    filter_not: ?[]const RowsExpressionConditionGroup = null,
+};
+
+pub const RowsAggregateRequest = struct {
+    source: RowsQueryRequest,
+    group_by: ?[]const []const u8 = null,
+    /// Named expression group keys. These are evaluated for each source row, included in the grouping key, and emitted under their `as` names in aggregate result rows.
+    group_expressions: ?[]const RowsExpressionProjection = null,
+    /// Metric specs to compute for each group. May be empty or omitted only when group_by or group_expressions is non-empty, which returns one row per distinct group key.
+    aggregations: ?[]const RowsAggregateSpec = null,
+    having: ?RowsAggregateHaving = null,
+    /// Expression predicates over aggregate output fields, evaluated after grouping. Field references bind to group keys or aggregation names.
+    having_expressions: ?[]const RowsExpressionCondition = null,
+    /// Disjunction of aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row passes when at least one group matches.
+    having_any: ?[]const RowsExpressionConditionGroup = null,
+    /// Negated aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row is rejected when any group matches.
+    having_not: ?[]const RowsExpressionConditionGroup = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+pub const RowsWindowSpec = struct {
+    as: []const u8,
+    /// Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and `max`.
+    function: []const u8,
+    partition_by: ?[]const []const u8 = null,
+    order_by: []const RowsQueryOrder,
+    expr: ?RowsExpression = null,
+    offset: ?i64 = null,
+    default: ?std.json.Value = null,
+    frame: ?RowsWindowFrame = null,
+};
+
+pub const RowsWindowRequest = struct {
+    source: RowsQueryRequest,
+    windows: []const RowsWindowSpec,
+    select: ?[]const []const u8 = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`.
+pub const RowsJoinRequest = struct {
+    left: RowsQueryRequest,
+    right: RowsQueryRequest,
+    on: []const RowsJoinOn,
+    /// Post-match computed predicates over the joined rows. Unqualified fields bind to the left row; fields with `source: source` bind to the right row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the joined rows.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the joined rows.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the joined rows.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    join_type: ?[]const u8 = null,
+    strategy: ?RowsJoinStrategy = null,
+    select: ?[]const RowsJoinProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Typed bounded lateral plan. The right side must include a limit and can read an ordered CTE through `source_cte`.
+pub const RowsLateralRequest = struct {
+    left: RowsQueryRequest,
+    right: RowsQueryRequest,
+    correlations: []const RowsLateralCorrelation,
+    /// Post-match computed predicates over the left row and each bounded right row. Unqualified fields bind to the left row; fields with `source: source` bind to the right row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the left row and each bounded right row.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the left row and each bounded right row.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the left row and each bounded right row.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    select: ?[]const RowsJoinProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Generic typed relational row plan envelope. It is exactly one operation-specific envelope: query, aggregate, window, join, or lateral. Query, aggregate, and window plans use `ranges`; join and lateral plans use paired `left_ranges` and `right_ranges`.
+pub const RowsPlanRequest = union(enum) {
+    rows_join_plan_request: *RowsJoinPlanRequest,
+    rows_lateral_plan_request: *RowsLateralPlanRequest,
+    rows_aggregate_plan_request: *RowsAggregatePlanRequest,
+    rows_query_plan_request: *RowsQueryPlanRequest,
+    rows_window_plan_request: *RowsWindowPlanRequest,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "left_table",
+            "right_table",
+            "left_ranges",
+            "right_ranges",
+            "join",
+        })) {
+            if (try parseStructuralVariant(RowsJoinPlanRequest, allocator, source, options)) |parsed| return .{ .rows_join_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "left_table",
+            "right_table",
+            "left_ranges",
+            "right_ranges",
+            "lateral",
+        })) {
+            if (try parseStructuralVariant(RowsLateralPlanRequest, allocator, source, options)) |parsed| return .{ .rows_lateral_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "aggregate",
+        })) {
+            if (try parseStructuralVariant(RowsAggregatePlanRequest, allocator, source, options)) |parsed| return .{ .rows_aggregate_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "query",
+        })) {
+            if (try parseStructuralVariant(RowsQueryPlanRequest, allocator, source, options)) |parsed| return .{ .rows_query_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "window",
+        })) {
+            if (try parseStructuralVariant(RowsWindowPlanRequest, allocator, source, options)) |parsed| return .{ .rows_window_plan_request = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_join_plan_request => |v| try jw.write(v.*),
+            .rows_lateral_plan_request => |v| try jw.write(v.*),
+            .rows_aggregate_plan_request => |v| try jw.write(v.*),
+            .rows_query_plan_request => |v| try jw.write(v.*),
+            .rows_window_plan_request => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`.
+pub const RowsQueryPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
+    query: RowsQueryRequest,
+};
+
+/// Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`.
+pub const RowsAggregatePlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
+    aggregate: RowsAggregateRequest,
+};
+
+/// Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes` and declared `ranges`.
+pub const RowsWindowPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
+    window: RowsWindowRequest,
+};
+
+/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
+pub const RowsJoinPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
+    left_ranges: ?[]const RowsDocKeyRange = null,
+    right_ranges: ?[]const RowsDocKeyRange = null,
+    join: RowsJoinRequest,
+};
+
+/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
+pub const RowsLateralPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
+    left_ranges: ?[]const RowsDocKeyRange = null,
+    right_ranges: ?[]const RowsDocKeyRange = null,
+    lateral: RowsLateralRequest,
 };
 
 /// DEPRECATED: Use RetrievalAgentResult instead. Result from the answer agent.
@@ -2820,6 +4112,8 @@ pub const QueryResult = struct {
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
     /// Results from declarative graph queries.
     graph_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphQueryResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(antfly_indexes_openapi.GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.

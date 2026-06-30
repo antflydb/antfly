@@ -25,8 +25,8 @@ const change_journal_mod = @import("../storage/db/derived/change_journal.zig");
 const managed_embedder = @import("../inference/managed_embedder.zig");
 const indexes_api = @import("../api/indexes.zig");
 const table_reads = @import("../api/table_reads.zig");
-const table_catalog = @import("../api/table_catalog.zig");
-const tables_api = @import("../api/tables.zig");
+const catalog_source = @import("catalog/source.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const raft_mod = @import("../raft/mod.zig");
 const backend_runtime_mod = @import("../storage/background_runtime.zig");
 const shard_db_adapter_mod = @import("shard_db_adapter.zig");
@@ -178,7 +178,7 @@ pub fn reconcileReplicaRootWithOptions(
         var db = try db_mod.DB.open(alloc, path, open_options);
         defer db.close();
         summary.dbs_opened += 1;
-        try applyTableSchemaJson(alloc, &db, table.schema_json);
+        try db.applyTableSchemaJson(alloc, table.schema_json, .{});
         const index_summary = try reconcileDbIndexes(alloc, &db, table.indexes_json);
         summary.indexes_removed += index_summary.indexes_removed;
         summary.indexes_added += index_summary.indexes_added;
@@ -190,15 +190,6 @@ pub fn reconcileReplicaRootWithOptions(
         summary.resolvers_removed += index_summary.resolvers_removed;
     }
     return summary;
-}
-
-fn applyTableSchemaJson(alloc: std.mem.Allocator, db: *db_mod.DB, schema_json: []const u8) !void {
-    if (schema_json.len == 0) return;
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
-    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
-    defer @import("../storage/schema.zig").freeSchema(alloc, runtime_schema);
-    try db.setSchema(runtime_schema);
 }
 
 pub fn reconcileDbIndexes(
@@ -502,7 +493,7 @@ fn removeMissingIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: 
 
     var removed: usize = 0;
     for (current) |cfg| {
-        if (object.contains(cfg.name)) continue;
+        if (desiredStorageIndexContainsName(object, cfg.name)) continue;
         if (try db.deleteIndex(cfg.name)) removed += 1;
     }
     return removed;
@@ -531,6 +522,7 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         // by the index reconciler.
         if (std.mem.eql(u8, entry.key_ptr.*, "resolvers") or
             std.mem.eql(u8, entry.key_ptr.*, "enrichments")) continue;
+        if (isMetadataOnlyScalarIndexConfig(entry.value_ptr.*)) continue;
         const kind = try parseIndexKind(entry.value_ptr.*);
 
         const existing = findIndexConfig(current, entry.key_ptr.*);
@@ -557,6 +549,12 @@ fn ensureIndexes(alloc: std.mem.Allocator, db: *db_mod.DB, indexes_json: []const
         summary.added += 1;
     }
     return summary;
+}
+
+fn desiredStorageIndexContainsName(object: std.json.ObjectMap, name: []const u8) bool {
+    const value = object.get(name) orelse return false;
+    if (isReservedTopLevelIndexSection(name)) return false;
+    return !isMetadataOnlyScalarIndexConfig(value);
 }
 
 fn findIndexConfig(configs: []const db_mod.types.IndexConfig, name: []const u8) ?db_mod.types.IndexConfig {
@@ -876,7 +874,7 @@ fn localRangeHasSchemaVersionIndex(
 
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         try std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version});
     const target_index = findDbIndexStats(stats.indexes, target_name) orelse return false;
@@ -885,7 +883,7 @@ fn localRangeHasSchemaVersionIndex(
 
     var read_name_buf: [64]u8 = undefined;
     const read_name = if (read_schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         try std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version});
     const read_index = findDbIndexStats(stats.indexes, read_name) orelse return true;
@@ -933,7 +931,7 @@ fn runtimeHasReadySchemaVersionIndex(
 ) bool {
     var target_name_buf: [64]u8 = undefined;
     const target_name = if (schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         std.fmt.bufPrint(&target_name_buf, "full_text_index_v{d}", .{schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, target_name) orelse return false;
@@ -941,7 +939,7 @@ fn runtimeHasReadySchemaVersionIndex(
 
     var read_name_buf: [64]u8 = undefined;
     const read_name = if (read_schema_version == 0)
-        @import("../api/tables.zig").default_full_text_index_name
+        catalog_table_ddl.default_full_text_index_name
     else
         std.fmt.bufPrint(&read_name_buf, "full_text_index_v{d}", .{read_schema_version}) catch return false;
     _ = findReadyRuntimeFullTextIndex(runtime.indexes, read_name) orelse return true;
@@ -1001,6 +999,29 @@ fn parseIndexKind(value: std.json.Value) !db_mod.types.IndexKind {
     return error.UnsupportedCreateTableRequest;
 }
 
+fn isReservedTopLevelIndexSection(name: []const u8) bool {
+    return std.mem.eql(u8, name, "resolvers") or
+        std.mem.eql(u8, name, "enrichments");
+}
+
+fn isMetadataOnlyScalarIndexConfig(value: std.json.Value) bool {
+    if (value != .object) return false;
+    const type_value = value.object.get("type") orelse return false;
+    if (type_value != .string) return false;
+    return indexConfigTypeIsMetadataOnlyScalar(type_value.string);
+}
+
+fn indexConfigTypeIsMetadataOnlyScalar(type_name: []const u8) bool {
+    return std.mem.eql(u8, type_name, "scalar") or
+        std.mem.eql(u8, type_name, "path") or
+        std.mem.eql(u8, type_name, "secondary") or
+        std.mem.eql(u8, type_name, "keyword") or
+        std.mem.eql(u8, type_name, "numeric") or
+        std.mem.eql(u8, type_name, "boolean") or
+        std.mem.eql(u8, type_name, "datetime") or
+        std.mem.eql(u8, type_name, "term");
+}
+
 fn looksLikeStoredAlgebraicIndexConfig(value: std.json.Value) bool {
     if (value != .object) return false;
     if (value.object.get("schema_version") == null and
@@ -1019,6 +1040,12 @@ fn extractIndexConfigJson(alloc: std.mem.Allocator, index_name: []const u8, valu
         else => {},
     }
 
+    // Algebraic configs carry their own `version` field (config format version),
+    // which must be preserved -- unlike full-text, where `version` is the schema
+    // wrapper that gets stripped. `derive_from_schema` is also dropped here: by
+    // this point the marker should already be expanded into a concrete config,
+    // but stripping it defensively keeps an unexpanded marker from leaking into
+    // the stored config.
     var out = std.ArrayListUnmanaged(u8).empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -1155,6 +1182,100 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
+}
+
+test "table provisioner applies schema-derived algebraic reloads to hosted group dbs" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-provisioner-algebraic-reload", .{tmp.sub_path});
+    defer alloc.free(replica_root);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root) catch {};
+
+    const schema_v1 =
+        \\{"version":1,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"old_field":{"type":"keyword"},"new_field":{"type":"keyword"}}}}}}
+    ;
+    const schema_v2 =
+        \\{"version":2,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"new_field":{"type":"keyword"}}}}}}
+    ;
+    const seed_indexes = "{\"alg\":{\"type\":\"algebraic\",\"derive_from_schema\":true}}";
+    const indexes_v1 = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(alloc, "docs", seed_indexes, schema_v1);
+    defer alloc.free(indexes_v1);
+    const indexes_v2 = try catalog_table_ddl.regenerateAlgebraicIndexesFromSchemaAlloc(alloc, "docs", indexes_v1, schema_v2);
+    defer alloc.free(indexes_v2);
+
+    const range = table_manager.RangeRecord{
+        .group_id = 2001,
+        .table_id = 7,
+        .start_key = "doc:a",
+        .end_key = "doc:z",
+    };
+
+    _ = try reconcileReplicaRoot(
+        alloc,
+        replica_root,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_v1,
+            .indexes_json = indexes_v1,
+        }},
+        &.{range},
+    );
+
+    const db_path = try groupDbPathFromReplicaRoot(alloc, replica_root, 2001);
+    defer alloc.free(db_path);
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        try db.batch(.{
+            .writes = &.{.{ .key = "doc:m", .value = "{\"old_field\":\"legacy\",\"new_field\":\"fresh\"}" }},
+            .timestamp_ns = 1,
+            .sync_level = .full_index,
+        });
+    }
+    try std.testing.expect(try groupDbHasAlgebraicDocFactScalarKeyContaining(alloc, db_path, "old_field"));
+
+    _ = try reconcileReplicaRoot(
+        alloc,
+        replica_root,
+        100,
+        &.{ 100, 2001 },
+        &.{.{
+            .table_id = 7,
+            .name = "docs",
+            .schema_json = schema_v2,
+            .indexes_json = indexes_v2,
+        }},
+        &.{range},
+    );
+
+    try std.testing.expect(!try groupDbHasAlgebraicDocFactScalarKeyContaining(alloc, db_path, "old_field"));
+    try std.testing.expect(try groupDbHasAlgebraicDocFactScalarKeyContaining(alloc, db_path, "new_field"));
+    {
+        var db = try db_mod.DB.open(alloc, db_path, .{});
+        defer db.close();
+        const alg = db.core.index_manager.algebraicIndex("alg") orelse return error.TestExpectedEqual;
+        try std.testing.expectEqualStrings("current", alg.index.config().capability_lifecycle_status);
+    }
+}
+
+fn groupDbHasAlgebraicDocFactScalarKeyContaining(alloc: std.mem.Allocator, db_path: []const u8, needle: []const u8) !bool {
+    var db = try db_mod.DB.open(alloc, db_path, .{});
+    defer db.close();
+    const rows = try db.core.store.scanRange(alloc, "", "");
+    defer db_mod.docstore.DocStore.freeResults(alloc, rows);
+    for (rows) |row| {
+        if (std.mem.indexOf(u8, row.key, "docfact_scalar") != null and
+            std.mem.indexOf(u8, row.key, needle) != null) return true;
+    }
+    return false;
 }
 
 test "table provisioner reconciliation is non-mutating for query read-only dbs" {
@@ -1351,6 +1472,7 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
     // The graph index was added; the resolvers section was not treated as one.
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
+    try std.testing.expectEqual(@as(usize, 1), summary.enrichments_added);
     try std.testing.expectEqual(@as(usize, 1), summary.resolvers_added);
     try std.testing.expectEqual(@as(usize, 0), summary.resolvers_updated);
 
@@ -1362,6 +1484,13 @@ test "table provisioner registers a resolver declared in the table index config"
 
         try std.testing.expect(db.core.index_manager.has("relations_graph"));
         try std.testing.expect(!db.core.index_manager.has("resolvers"));
+
+        const enrichments = try db.listEnrichments(std.testing.allocator);
+        defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
+        try std.testing.expectEqual(@as(usize, 1), enrichments.len);
+        try std.testing.expectEqualStrings("relations_v1", enrichments[0].name);
+        try std.testing.expectEqual(db_mod.types.EnrichmentKind.asset, enrichments[0].kind);
+        try std.testing.expectEqualStrings("relations", enrichments[0].field);
 
         const resolvers = try db.listResolvers(std.testing.allocator);
         defer {
@@ -2062,7 +2191,7 @@ test "table provisioner restores local shard data from metadata restore intent" 
     const FakeCatalog = struct {
         restore_location: []const u8,
 
-        fn iface(self: *@This()) table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source.CatalogSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -2174,7 +2303,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
             .table_id = 7,
             .name = "docs",
             .description = "docs table",
-            .indexes_json = tables_api.default_indexes_json,
+            .indexes_json = catalog_table_ddl.default_indexes_json,
             .placement_role = "data",
         },
         &.{.{
@@ -2198,7 +2327,7 @@ test "table provisioner restore rejects mismatched doc identity namespace" {
         &.{.{
             .table_id = 7,
             .name = "docs",
-            .indexes_json = tables_api.default_indexes_json,
+            .indexes_json = catalog_table_ddl.default_indexes_json,
             .restore_backup_id = "snap1",
             .restore_location = restore_location,
             .placement_role = "data",

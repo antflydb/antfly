@@ -22,6 +22,7 @@ const fusion_mod = @import("../../search/fusion.zig");
 const distributed_stats_mod = @import("../../search/distributed_stats.zig");
 const docstore_mod = @import("../docstore.zig");
 const shard_mod = @import("../shard.zig");
+const schema_mod = @import("../schema.zig");
 const transactions_mod = @import("../transactions.zig");
 const reranking_mod = @import("antfly_reranking");
 const doc_identity_mod = @import("doc_identity.zig");
@@ -49,9 +50,8 @@ pub const SyncLevel = enum {
 pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
     if (std.mem.eql(u8, text, "propose")) return .propose;
     if (std.mem.eql(u8, text, "write")) return .write;
-    if (std.mem.eql(u8, text, "full_text")) return .full_text;
+    if (std.mem.eql(u8, text, "query")) return .full_text;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "aknn")) return .full_index;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
 }
@@ -67,15 +67,18 @@ pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
     return switch (level) {
         .propose => "propose",
         .write => "write",
-        .full_text => "full_text",
+        .full_text => "query",
         .enrichments => "enrichments",
         .aknn, .full_index => "full_index",
     };
 }
 
-test "public sync level text treats aknn as deprecated alias for full_index" {
-    try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("aknn").?);
+test "public sync level text maps query and rejects deprecated spellings" {
+    try std.testing.expectEqual(SyncLevel.full_text, parsePublicSyncLevelText("query").?);
+    try std.testing.expect(parsePublicSyncLevelText("full_text") == null);
+    try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
     try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("full_index").?);
+    try std.testing.expectEqualStrings("query", publicSyncLevelText(.full_text));
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.aknn));
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
 }
@@ -116,6 +119,7 @@ pub const DocumentTransform = struct {
 pub const BatchRequest = struct {
     writes: []const BatchWrite = &.{},
     deletes: []const []const u8 = &.{},
+    relational_identity_rewrites: []const RelationalIdentityRewrite = &.{},
     transforms: []const DocumentTransform = &.{},
     graph_writes: []const GraphEdgeWrite = &.{},
     graph_deletes: []const GraphEdgeDelete = &.{},
@@ -984,6 +988,1649 @@ pub const DocumentArtifactTableReprocessResult = struct {
     }
 };
 
+pub const RelationalRowsQueryOrderDirection = enum {
+    asc,
+    desc,
+};
+
+pub const RelationalRowsQueryOrderNullTest = enum {
+    is_null,
+    is_not_null,
+};
+
+pub const RelationalRowsQueryOrder = struct {
+    field: []const u8 = "",
+    expression: ?RelationalRowsExpression = null,
+    direction: RelationalRowsQueryOrderDirection = .asc,
+    null_test: ?RelationalRowsQueryOrderNullTest = null,
+    collation: ?[]const u8 = null,
+};
+
+pub const RelationalRowsArrayAnyPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsArrayContainsPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsArrayEqPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsInPredicate = struct {
+    field: []const u8,
+    values_json: []const u8,
+    negated: bool = false,
+    collation: ?[]const u8 = null,
+};
+
+pub const RelationalRowsJsonContainsPredicate = struct {
+    field: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsJsonPathEqPredicate = struct {
+    field: []const u8,
+    path: []const u8,
+    value_json: []const u8,
+};
+
+pub const RelationalRowsJsonPathExistsPredicate = struct {
+    field: []const u8,
+    path: []const u8,
+};
+
+pub const RelationalRowsPredicateGroup = struct {
+    predicates: []const schema_mod.RelationalCheck = &.{},
+};
+
+pub const RelationalRowsAccessPredicateGroup = struct {
+    predicates: []const schema_mod.RelationalCheck = &.{},
+    array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    in_predicates: []const RelationalRowsInPredicate = &.{},
+    json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+};
+
+fn freeRelationalRowsAccessPredicateGroup(alloc: Allocator, group: RelationalRowsAccessPredicateGroup) void {
+    for (group.predicates) |predicate| freeRelationalRowsRequestPredicate(alloc, predicate);
+    if (group.predicates.len > 0) alloc.free(group.predicates);
+    for (group.array_any) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_any.len > 0) alloc.free(group.array_any);
+    for (group.array_contains) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_contains.len > 0) alloc.free(group.array_contains);
+    for (group.array_eq) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.array_eq.len > 0) alloc.free(group.array_eq);
+    for (group.in_predicates) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.values_json);
+        if (predicate.collation) |collation| alloc.free(collation);
+    }
+    if (group.in_predicates.len > 0) alloc.free(group.in_predicates);
+    for (group.json_contains) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.value_json);
+    }
+    if (group.json_contains.len > 0) alloc.free(group.json_contains);
+    for (group.json_path_eq) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.path);
+        alloc.free(predicate.value_json);
+    }
+    if (group.json_path_eq.len > 0) alloc.free(group.json_path_eq);
+    for (group.json_path_exists) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.path);
+    }
+    if (group.json_path_exists.len > 0) alloc.free(group.json_path_exists);
+    for (group.text_patterns) |predicate| {
+        alloc.free(predicate.field);
+        alloc.free(predicate.pattern);
+    }
+    if (group.text_patterns.len > 0) alloc.free(group.text_patterns);
+}
+
+fn freeRelationalRowsRequestPredicate(alloc: Allocator, predicate: schema_mod.RelationalCheck) void {
+    alloc.free(predicate.field);
+    if (predicate.value_json) |value_json| alloc.free(value_json);
+    if (predicate.collation) |collation| alloc.free(collation);
+    if (predicate.expression) |expression| freeRelationalRowsExpressionCondition(alloc, expression);
+}
+
+fn freeRelationalRowsQueryOrder(alloc: Allocator, order: RelationalRowsQueryOrder) void {
+    if (order.field.len > 0) alloc.free(order.field);
+    if (order.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+    if (order.collation) |collation| alloc.free(collation);
+}
+
+fn freeRelationalRowsQueryOrders(alloc: Allocator, orders: []const RelationalRowsQueryOrder) void {
+    for (orders) |order| freeRelationalRowsQueryOrder(alloc, order);
+    if (orders.len > 0) alloc.free(orders);
+}
+
+pub const RelationalRowsJsonExtractProjection = struct {
+    output: []const u8,
+    field: []const u8,
+    path: []const u8,
+    as_text: bool = false,
+};
+
+pub const RelationalRowsArrayLengthProjection = struct {
+    output: []const u8,
+    field: []const u8,
+};
+
+pub const RelationalRowsCoalesceOperandKind = enum {
+    field,
+    value,
+};
+
+pub const RelationalRowsCoalesceOperand = struct {
+    kind: RelationalRowsCoalesceOperandKind,
+    field: []const u8 = "",
+    value_json: []const u8 = "",
+};
+
+pub const RelationalRowsCoalesceProjection = struct {
+    output: []const u8,
+    operands: []const RelationalRowsCoalesceOperand = &.{},
+};
+
+pub const RelationalRowsFieldAliasProjection = struct {
+    output: []const u8,
+    field: []const u8,
+};
+
+pub const RelationalRowsExpressionKind = schema_mod.RelationalRowsExpressionKind;
+pub const RelationalRowsExpressionFieldSource = schema_mod.RelationalRowsExpressionFieldSource;
+pub const RelationalRowsExpressionCastType = schema_mod.RelationalRowsExpressionCastType;
+pub const RelationalRowsExpressionCondition = schema_mod.RelationalRowsExpressionCondition;
+pub const RelationalRowsExpressionPredicateGroup = schema_mod.RelationalRowsExpressionPredicateGroup;
+pub const RelationalRowsExpressionArrayContainsPredicate = schema_mod.RelationalRowsExpressionArrayContainsPredicate;
+pub const RelationalRowsExpressionCaseBranch = schema_mod.RelationalRowsExpressionCaseBranch;
+pub const RelationalRowsExpression = schema_mod.RelationalRowsExpression;
+pub const RelationalRowsExpressionProjection = schema_mod.RelationalRowsExpressionProjection;
+pub const RelationalRowsExpressionAssignment = schema_mod.RelationalRowsExpressionAssignment;
+
+pub const RelationalRowsTextPatternPredicate = struct {
+    field: []const u8,
+    pattern: []const u8,
+    case_insensitive: bool = false,
+    negated: bool = false,
+};
+
+pub const RelationalRowsDocKeyRange = struct {
+    start: []const u8 = "",
+    end: []const u8 = "",
+};
+
+pub const RelationalRowsCollectedRow = struct {
+    key: []const u8,
+    json: []const u8,
+    version: u64,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.key));
+        alloc.free(@constCast(self.json));
+        self.* = undefined;
+    }
+};
+
+pub fn freeRelationalRowsCollectedRows(alloc: Allocator, rows: []const RelationalRowsCollectedRow) void {
+    for (rows) |row_value| {
+        var row = row_value;
+        row.deinit(alloc);
+    }
+    if (rows.len > 0) alloc.free(rows);
+}
+
+pub const RelationalRowsQueryRequest = struct {
+    source_cte: []const u8 = "",
+    predicates: []const schema_mod.RelationalCheck = &.{},
+    array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    in_predicates: []const RelationalRowsInPredicate = &.{},
+    json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+    or_predicates: []const RelationalRowsPredicateGroup = &.{},
+    not_predicates: []const RelationalRowsPredicateGroup = &.{},
+    access_or_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
+    access_not_predicates: []const RelationalRowsAccessPredicateGroup = &.{},
+    expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    select: []const []const u8 = &.{},
+    json_extract: []const RelationalRowsJsonExtractProjection = &.{},
+    array_length: []const RelationalRowsArrayLengthProjection = &.{},
+    coalesce: []const RelationalRowsCoalesceProjection = &.{},
+    field_aliases: []const RelationalRowsFieldAliasProjection = &.{},
+    expressions: []const RelationalRowsExpressionProjection = &.{},
+    select_all: bool = true,
+    distinct_on: []const []const u8 = &.{},
+    distinct_on_expressions: []const RelationalRowsExpression = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    row_claim: ?RowClaimRequest = null,
+    doc_key_range: ?RelationalRowsDocKeyRange = null,
+    limit: ?u32 = null,
+    offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.source_cte.len > 0) alloc.free(self.source_cte);
+        for (self.predicates) |predicate| freeRelationalRowsRequestPredicate(alloc, predicate);
+        if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.array_any) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.array_any.len > 0) alloc.free(self.array_any);
+        for (self.array_contains) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.array_contains.len > 0) alloc.free(self.array_contains);
+        for (self.array_eq) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.array_eq.len > 0) alloc.free(self.array_eq);
+        for (self.in_predicates) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.values_json);
+            if (predicate.collation) |collation| alloc.free(collation);
+        }
+        if (self.in_predicates.len > 0) alloc.free(self.in_predicates);
+        for (self.json_contains) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.value_json);
+        }
+        if (self.json_contains.len > 0) alloc.free(self.json_contains);
+        for (self.json_path_eq) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.path);
+            alloc.free(predicate.value_json);
+        }
+        if (self.json_path_eq.len > 0) alloc.free(self.json_path_eq);
+        for (self.json_path_exists) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.path);
+        }
+        if (self.json_path_exists.len > 0) alloc.free(self.json_path_exists);
+        for (self.text_patterns) |predicate| {
+            alloc.free(predicate.field);
+            alloc.free(predicate.pattern);
+        }
+        if (self.text_patterns.len > 0) alloc.free(self.text_patterns);
+        for (self.or_predicates) |group| {
+            for (group.predicates) |predicate| freeRelationalRowsRequestPredicate(alloc, predicate);
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+        }
+        if (self.or_predicates.len > 0) alloc.free(self.or_predicates);
+        for (self.not_predicates) |group| {
+            for (group.predicates) |predicate| freeRelationalRowsRequestPredicate(alloc, predicate);
+            if (group.predicates.len > 0) alloc.free(group.predicates);
+        }
+        if (self.not_predicates.len > 0) alloc.free(self.not_predicates);
+        for (self.access_or_predicates) |group| freeRelationalRowsAccessPredicateGroup(alloc, group);
+        if (self.access_or_predicates.len > 0) alloc.free(self.access_or_predicates);
+        for (self.access_not_predicates) |group| freeRelationalRowsAccessPredicateGroup(alloc, group);
+        if (self.access_not_predicates.len > 0) alloc.free(self.access_not_predicates);
+        for (self.expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.expression_predicates.len > 0) alloc.free(self.expression_predicates);
+        for (self.expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.expression_or_predicates.len > 0) alloc.free(self.expression_or_predicates);
+        for (self.expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.expression_not_predicates.len > 0) alloc.free(self.expression_not_predicates);
+        for (self.expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.expression_array_contains.len > 0) alloc.free(self.expression_array_contains);
+        for (self.select) |field| alloc.free(field);
+        if (self.select.len > 0) alloc.free(self.select);
+        for (self.distinct_on) |field| alloc.free(field);
+        if (self.distinct_on.len > 0) alloc.free(self.distinct_on);
+        for (self.json_extract) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+            alloc.free(projection.path);
+        }
+        if (self.json_extract.len > 0) alloc.free(self.json_extract);
+        for (self.array_length) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.array_length.len > 0) alloc.free(self.array_length);
+        for (self.coalesce) |projection| {
+            alloc.free(projection.output);
+            for (projection.operands) |operand| {
+                switch (operand.kind) {
+                    .field => if (operand.field.len > 0) alloc.free(operand.field),
+                    .value => if (operand.value_json.len > 0) alloc.free(operand.value_json),
+                }
+            }
+            if (projection.operands.len > 0) alloc.free(projection.operands);
+        }
+        if (self.coalesce.len > 0) alloc.free(self.coalesce);
+        for (self.field_aliases) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.field_aliases.len > 0) alloc.free(self.field_aliases);
+        for (self.expressions) |projection| {
+            alloc.free(projection.output);
+            freeRelationalRowsExpression(alloc, projection.expression);
+        }
+        if (self.expressions.len > 0) alloc.free(self.expressions);
+        for (self.distinct_on_expressions) |expression| freeRelationalRowsExpression(alloc, expression);
+        if (self.distinct_on_expressions.len > 0) alloc.free(self.distinct_on_expressions);
+        freeRelationalRowsQueryOrders(alloc, self.order_by);
+        if (self.row_claim) |claim| if (claim.owner_id.len > 0) alloc.free(claim.owner_id);
+        if (self.doc_key_range) |range| {
+            if (range.start.len > 0) alloc.free(range.start);
+            if (range.end.len > 0) alloc.free(range.end);
+        }
+        self.* = undefined;
+    }
+};
+
+fn freeRelationalRowsExpression(alloc: Allocator, expression: RelationalRowsExpression) void {
+    if (expression.field.len > 0) alloc.free(expression.field);
+    if (expression.value_json.len > 0) alloc.free(expression.value_json);
+    if (expression.json_path.len > 0) alloc.free(expression.json_path);
+    for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
+    if (expression.operands.len > 0) alloc.free(expression.operands);
+    for (expression.case_branches) |branch| {
+        freeRelationalRowsExpressionCondition(alloc, branch.when);
+        freeRelationalRowsExpression(alloc, branch.then);
+    }
+    if (expression.case_branches.len > 0) alloc.free(expression.case_branches);
+    for (expression.case_else) |fallback| freeRelationalRowsExpression(alloc, fallback);
+    if (expression.case_else.len > 0) alloc.free(expression.case_else);
+}
+
+fn freeRelationalRowsExpressionCondition(alloc: Allocator, condition: RelationalRowsExpressionCondition) void {
+    freeRelationalRowsExpression(alloc, condition.lhs);
+    for (condition.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
+    if (condition.rhs.len > 0) alloc.free(condition.rhs);
+}
+
+fn freeRelationalRowsExpressionAssignments(alloc: Allocator, assignments: []const RelationalRowsExpressionAssignment) void {
+    for (assignments) |assignment| {
+        alloc.free(assignment.field);
+        freeRelationalRowsExpression(alloc, assignment.expression);
+    }
+    if (assignments.len > 0) alloc.free(assignments);
+}
+
+fn freeRelationalRowsExpressionProjections(alloc: Allocator, projections: []const RelationalRowsExpressionProjection) void {
+    for (projections) |projection| {
+        alloc.free(projection.output);
+        freeRelationalRowsExpression(alloc, projection.expression);
+    }
+    if (projections.len > 0) alloc.free(projections);
+}
+
+fn freeRelationalRowsTransformOps(alloc: Allocator, operations: []const TransformOp) void {
+    for (operations) |op| {
+        alloc.free(op.path);
+        if (op.value_json) |value_json| alloc.free(value_json);
+    }
+    if (operations.len > 0) alloc.free(operations);
+}
+
+fn freeRelationalRowsOnConflict(alloc: Allocator, conflict: RelationalRowsOnConflict) void {
+    freeRelationalRowsTransformOps(alloc, conflict.operations);
+    freeRelationalRowsExpressionAssignments(alloc, conflict.patch_expressions);
+    freeRelationalRowsExpressionAssignments(alloc, conflict.increment_expressions);
+    for (conflict.json_set_expressions) |assignment| {
+        alloc.free(assignment.field);
+        for (assignment.path) |part| alloc.free(part);
+        if (assignment.path.len > 0) alloc.free(assignment.path);
+        freeRelationalRowsExpression(alloc, assignment.expression);
+    }
+    if (conflict.json_set_expressions.len > 0) alloc.free(conflict.json_set_expressions);
+    if (conflict.where_expression) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    for (conflict.where_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    if (conflict.where_expressions.len > 0) alloc.free(conflict.where_expressions);
+    for (conflict.where_any) |group| {
+        for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (group.conditions.len > 0) alloc.free(group.conditions);
+    }
+    if (conflict.where_any.len > 0) alloc.free(conflict.where_any);
+    for (conflict.where_not) |group| {
+        for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (group.conditions.len > 0) alloc.free(group.conditions);
+    }
+    if (conflict.where_not.len > 0) alloc.free(conflict.where_not);
+}
+
+pub const RelationalRowsCte = struct {
+    name: []const u8,
+    query: RelationalRowsQueryRequest = .{},
+    table_function: ?RelationalRowsTableFunction = null,
+    max_rows: ?u32 = null,
+    max_bytes: ?u64 = null,
+    spill_after_bytes: ?u64 = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(self.name);
+        self.query.deinit(alloc);
+        if (self.table_function) |*table_function| table_function.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsTableFunctionKind = enum {
+    graph_query,
+    graph_metric_query,
+    graph_metric_rerank_query,
+};
+
+pub const RelationalRowsTableFunction = union(RelationalRowsTableFunctionKind) {
+    graph_query: RelationalRowsGraphTableFunction,
+    graph_metric_query: RelationalRowsGraphMetricTableFunction,
+    graph_metric_rerank_query: RelationalRowsGraphMetricRerankTableFunction,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        switch (self.*) {
+            .graph_query => |*query| query.deinit(alloc),
+            .graph_metric_query => |*query| query.deinit(alloc),
+            .graph_metric_rerank_query => |*query| query.deinit(alloc),
+        }
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphTableFunction = struct {
+    table_name: []const u8,
+    query: NamedGraphQuery,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        freeNamedGraphQuery(alloc, &self.query);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphMetricTableFunction = struct {
+    table_name: []const u8,
+    query: NamedGraphMetricQuery,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        freeNamedGraphMetricQuery(alloc, &self.query);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphMetricRerankTableFunction = struct {
+    table_name: []const u8,
+    request: SearchRequest,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        if (self.request.primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
+        if (self.request.full_text) |*full_text| full_text.deinit(alloc);
+        if (self.request.graph_metric_rerank) |rerank| {
+            alloc.free(@constCast(rerank.index_name));
+            alloc.free(@constCast(rerank.metric_name));
+        }
+        if (self.request.filter_query_json.len > 0) alloc.free(@constCast(self.request.filter_query_json));
+        if (self.request.exclusion_query_json.len > 0) alloc.free(@constCast(self.request.exclusion_query_json));
+        self.* = undefined;
+    }
+};
+
+pub const relational_rows_graph_table_function_fields = [_][]const u8{
+    "id",
+    "score",
+    "graph_name",
+    "node_key",
+    "depth",
+    "distance",
+    "path_json",
+    "match_json",
+    "stored_json",
+};
+
+fn freeNamedGraphQuery(alloc: Allocator, named: *NamedGraphQuery) void {
+    alloc.free(@constCast(named.name));
+    freeGraphQuery(alloc, &named.query);
+    named.* = undefined;
+}
+
+fn freeNamedGraphMetricQuery(alloc: Allocator, named: *NamedGraphMetricQuery) void {
+    alloc.free(@constCast(named.name));
+    alloc.free(@constCast(named.query.index_name));
+    alloc.free(@constCast(named.query.metric_name));
+    named.* = undefined;
+}
+
+fn freeGraphQuery(alloc: Allocator, query: *graph_query_mod.GraphQuery) void {
+    alloc.free(@constCast(query.index_name));
+    freeGraphNodeSelector(alloc, query.start_nodes);
+    if (query.target_nodes) |target| freeGraphNodeSelector(alloc, target);
+    freeGraphQueryParams(alloc, query.params);
+    for (query.pattern) |step| {
+        alloc.free(@constCast(step.alias));
+        for (step.edge.types) |edge_type| alloc.free(@constCast(edge_type));
+        if (step.edge.types.len > 0) alloc.free(@constCast(step.edge.types));
+        if (step.node_filter.filter_prefix.len > 0) alloc.free(@constCast(step.node_filter.filter_prefix));
+        if (step.node_filter.filter_query_json) |filter| alloc.free(@constCast(filter));
+    }
+    if (query.pattern.len > 0) alloc.free(@constCast(query.pattern));
+    for (query.return_aliases) |alias| alloc.free(@constCast(alias));
+    if (query.return_aliases.len > 0) alloc.free(@constCast(query.return_aliases));
+    for (query.fields) |field| alloc.free(@constCast(field));
+    if (query.fields.len > 0) alloc.free(@constCast(query.fields));
+    for (query.metrics) |metric| alloc.free(@constCast(metric.name));
+    if (query.metrics.len > 0) alloc.free(@constCast(query.metrics));
+    for (query.order_by) |order| alloc.free(@constCast(order.name));
+    if (query.order_by.len > 0) alloc.free(@constCast(query.order_by));
+    for (query.where_metric) |filter| alloc.free(@constCast(filter.name));
+    if (query.where_metric.len > 0) alloc.free(@constCast(query.where_metric));
+    query.* = undefined;
+}
+
+fn freeGraphQueryParams(alloc: Allocator, params: graph_query_mod.QueryParams) void {
+    for (params.edge_types) |edge_type| alloc.free(@constCast(edge_type));
+    if (params.edge_types.len > 0) alloc.free(@constCast(params.edge_types));
+}
+
+fn freeGraphNodeSelector(alloc: Allocator, selector: graph_query_mod.NodeSelector) void {
+    switch (selector) {
+        .keys => |keys| {
+            for (keys) |key| alloc.free(@constCast(key));
+            if (keys.len > 0) alloc.free(@constCast(keys));
+        },
+        .result_ref => |ref| alloc.free(@constCast(ref.ref)),
+    }
+}
+
+pub const default_relational_rows_cte_max_rows: u32 = 65_536;
+pub const default_relational_rows_cte_max_bytes: u64 = 64 * 1024 * 1024;
+pub const default_relational_rows_cte_spill_after_bytes: u64 = default_relational_rows_cte_max_bytes;
+
+pub const RelationalRowsCteMaterializationDecision = enum {
+    memory,
+    spill,
+    reject,
+};
+
+pub const RelationalRowsCteMaterializationLimits = struct {
+    max_rows: u32,
+    max_bytes: u64,
+    spill_after_bytes: u64,
+};
+
+pub fn relationalRowsCteMaterializationLimits(cte: RelationalRowsCte) RelationalRowsCteMaterializationLimits {
+    const max_bytes = cte.max_bytes orelse default_relational_rows_cte_max_bytes;
+    const configured_spill_after = cte.spill_after_bytes orelse default_relational_rows_cte_spill_after_bytes;
+    return .{
+        .max_rows = cte.max_rows orelse default_relational_rows_cte_max_rows,
+        .max_bytes = max_bytes,
+        .spill_after_bytes = @min(configured_spill_after, max_bytes),
+    };
+}
+
+pub fn relationalRowsCteMaterializedJsonBytes(rows: []const []const u8) ?u64 {
+    var materialized_bytes: u64 = 2; // JSON array brackets around the materialized stream.
+    for (rows, 0..) |row, row_index| {
+        if (row_index > 0) {
+            materialized_bytes = std.math.add(u64, materialized_bytes, 1) catch return null;
+        }
+        materialized_bytes = std.math.add(u64, materialized_bytes, @intCast(row.len)) catch return null;
+    }
+    return materialized_bytes;
+}
+
+pub fn relationalRowsCteMaterializationDecision(
+    cte: RelationalRowsCte,
+    observed_rows: usize,
+    observed_bytes: u64,
+) RelationalRowsCteMaterializationDecision {
+    const limits = relationalRowsCteMaterializationLimits(cte);
+    if (observed_rows > limits.max_rows) return .reject;
+    if (observed_bytes > limits.max_bytes) return .reject;
+    if (observed_bytes > limits.spill_after_bytes) return .spill;
+    return .memory;
+}
+
+pub fn relationalRowsSetOperationMaterializationDecision(
+    plan: RelationalRowsSetOperationPlan,
+    observed_rows: usize,
+    observed_bytes: u64,
+) RelationalRowsCteMaterializationDecision {
+    return relationalRowsCteMaterializationDecision(.{
+        .name = "set_operation",
+        .query = .{},
+        .max_rows = plan.max_rows,
+        .max_bytes = plan.max_bytes,
+        .spill_after_bytes = plan.spill_after_bytes,
+    }, observed_rows, observed_bytes);
+}
+
+test "relational CTE materialization admission distinguishes memory spill and reject" {
+    const rows = [_][]const u8{
+        "{\"id\":\"1\"}",
+        "{\"id\":\"2\"}",
+    };
+    const observed_bytes = relationalRowsCteMaterializedJsonBytes(&rows) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(@as(u64, 23), observed_bytes);
+
+    const in_memory = RelationalRowsCte{
+        .name = "small",
+        .max_rows = 2,
+        .max_bytes = 23,
+        .spill_after_bytes = 23,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.memory, relationalRowsCteMaterializationDecision(in_memory, rows.len, observed_bytes));
+
+    const spill = RelationalRowsCte{
+        .name = "spill",
+        .max_rows = 2,
+        .max_bytes = 23,
+        .spill_after_bytes = 22,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.spill, relationalRowsCteMaterializationDecision(spill, rows.len, observed_bytes));
+
+    const too_many_rows = RelationalRowsCte{
+        .name = "too_many_rows",
+        .max_rows = 1,
+        .max_bytes = 23,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.reject, relationalRowsCteMaterializationDecision(too_many_rows, rows.len, observed_bytes));
+
+    const too_many_bytes = RelationalRowsCte{
+        .name = "too_many_bytes",
+        .max_rows = 2,
+        .max_bytes = 22,
+    };
+    try std.testing.expectEqual(RelationalRowsCteMaterializationDecision.reject, relationalRowsCteMaterializationDecision(too_many_bytes, rows.len, observed_bytes));
+}
+
+pub const RelationalRowsQueryPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
+    query: RelationalRowsQueryRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
+        self.query.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsQueryResult = struct {
+    rows: [][]const u8 = &.{},
+    total: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsSetOperation = enum {
+    union_distinct,
+    union_all,
+    intersect,
+    except,
+};
+
+pub const RelationalRowsSetOperationPlan = struct {
+    operation: RelationalRowsSetOperation,
+    ctes: []const RelationalRowsCte = &.{},
+    left: RelationalRowsQueryPlan,
+    right: RelationalRowsQueryPlan,
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+    max_rows: ?u32 = null,
+    max_bytes: ?u64 = null,
+    spill_after_bytes: ?u64 = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
+        var order_query: RelationalRowsQueryRequest = .{ .order_by = self.order_by };
+        order_query.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsMutationKind = enum {
+    update,
+    delete,
+};
+
+pub const RelationalRowsJsonSetExpressionAssignment = struct {
+    field: []const u8,
+    path: []const []const u8,
+    expression: RelationalRowsExpression,
+};
+
+pub const RelationalRowsTemporalPortion = struct {
+    period: []const u8,
+    from_json: []const u8,
+    to_json: []const u8,
+};
+
+pub const RelationalRowsMutationSourceRequest = struct {
+    kind: RelationalRowsMutationKind,
+    source: RelationalRowsQueryRequest = .{},
+    rewrite_identity: bool = false,
+    restart_identity: bool = false,
+    operations: []const TransformOp = &.{},
+    patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
+    temporal_portion: ?RelationalRowsTemporalPortion = null,
+    returning: []const []const u8 = &.{},
+    returning_expressions: []const RelationalRowsExpressionProjection = &.{},
+    returning_all: bool = false,
+};
+
+pub const RelationalRowsConflictAction = enum {
+    update,
+    nothing,
+};
+
+pub const RelationalRowsConflictTargetKind = enum {
+    any,
+    primary,
+    unique,
+};
+
+pub const RelationalRowsConflictTarget = struct {
+    kind: RelationalRowsConflictTargetKind = .primary,
+    unique_name: []const u8 = "",
+    unique_predicates: []const schema_mod.RelationalCheck = &.{},
+    unique_predicate_expressions: []const RelationalRowsExpressionCondition = &.{},
+};
+
+pub const RelationalRowsOnConflict = struct {
+    target: RelationalRowsConflictTarget = .{},
+    action: RelationalRowsConflictAction = .nothing,
+    operations: []const TransformOp = &.{},
+    patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
+    where_expression: ?RelationalRowsExpressionCondition = null,
+    where_expressions: []const RelationalRowsExpressionCondition = &.{},
+    where_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    where_not: []const RelationalRowsExpressionPredicateGroup = &.{},
+};
+
+pub const RelationalRowsInsertSourceRequest = struct {
+    source_table: []const u8 = "",
+    source: RelationalRowsQueryRequest = .{},
+    assignments: []const RelationalRowsExpressionAssignment = &.{},
+    on_conflict: ?RelationalRowsOnConflict = null,
+    returning: []const []const u8 = &.{},
+    returning_expressions: []const RelationalRowsExpressionProjection = &.{},
+    returning_all: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        if (self.source_table.len > 0) alloc.free(self.source_table);
+        self.source.deinit(alloc);
+        freeRelationalRowsExpressionAssignments(alloc, self.assignments);
+        if (self.on_conflict) |conflict| freeRelationalRowsOnConflict(alloc, conflict);
+        for (self.returning) |field| alloc.free(field);
+        if (self.returning.len > 0) alloc.free(self.returning);
+        freeRelationalRowsExpressionProjections(alloc, self.returning_expressions);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsInsertSourcePlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
+    insert_source: RelationalRowsInsertSourceRequest = .{},
+    sync_level: SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
+        self.insert_source.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsMutationSourceResult = struct {
+    matched: u32 = 0,
+    staged: u32 = 0,
+    returning_rows: [][]const u8 = &.{},
+    participant_predicates: []TransactionVersionPredicate = &.{},
+    participant_preimages: []TransactionWrite = &.{},
+    participant_writes: []TransactionWrite = &.{},
+    participant_deletes: [][]const u8 = &.{},
+    participant_transforms: []DocumentTransform = &.{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.returning_rows) |row| alloc.free(@constCast(row));
+        if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
+        for (self.participant_predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (self.participant_predicates.len > 0) alloc.free(self.participant_predicates);
+        for (self.participant_preimages) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.participant_preimages.len > 0) alloc.free(self.participant_preimages);
+        for (self.participant_writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.participant_writes.len > 0) alloc.free(self.participant_writes);
+        for (self.participant_deletes) |key| alloc.free(key);
+        if (self.participant_deletes.len > 0) alloc.free(self.participant_deletes);
+        for (self.participant_transforms) |transform| {
+            alloc.free(@constCast(transform.key));
+            for (transform.operations) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (transform.operations.len > 0) alloc.free(transform.operations);
+        }
+        if (self.participant_transforms.len > 0) alloc.free(self.participant_transforms);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsWindowFunction = enum {
+    row_number,
+    rank,
+    dense_rank,
+    percent_rank,
+    cume_dist,
+    ntile,
+    lag,
+    lead,
+    first_value,
+    last_value,
+    nth_value,
+    count,
+    sum,
+    avg,
+    min,
+    max,
+    bool_or,
+    bool_and,
+};
+
+pub const RelationalRowsWindowFrameUnit = enum {
+    rows,
+    range,
+};
+
+pub const RelationalRowsWindowFrameBound = enum {
+    unbounded_preceding,
+    offset_preceding,
+    current_row,
+    offset_following,
+    unbounded_following,
+};
+
+pub const RelationalRowsWindowFrame = struct {
+    unit: RelationalRowsWindowFrameUnit = .range,
+    start: RelationalRowsWindowFrameBound = .unbounded_preceding,
+    start_offset: u32 = 0,
+    end: RelationalRowsWindowFrameBound = .current_row,
+    end_offset: u32 = 0,
+};
+
+pub const RelationalRowsWindowSpec = struct {
+    output: []const u8,
+    function: RelationalRowsWindowFunction,
+    partition_by: []const []const u8 = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    value_expression: ?RelationalRowsExpression = null,
+    offset: u32 = 1,
+    default_json: []const u8 = "",
+    frame: ?RelationalRowsWindowFrame = null,
+    filter_predicates: []const schema_mod.RelationalCheck = &.{},
+    filter_array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    filter_array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    filter_array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    filter_in_predicates: []const RelationalRowsInPredicate = &.{},
+    filter_json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    filter_json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    filter_json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    filter_text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+    filter_expressions: []const RelationalRowsExpressionCondition = &.{},
+    filter_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    filter_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    filter_not: []const RelationalRowsExpressionPredicateGroup = &.{},
+};
+
+pub const RelationalRowsWindowRequest = struct {
+    source: RelationalRowsQueryRequest = .{},
+    windows: []const RelationalRowsWindowSpec = &.{},
+    select: []const []const u8 = &.{},
+    select_all: bool = false,
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.source.deinit(alloc);
+        for (self.windows) |window| {
+            alloc.free(window.output);
+            for (window.partition_by) |field| alloc.free(field);
+            if (window.partition_by.len > 0) alloc.free(window.partition_by);
+            freeRelationalRowsQueryOrders(alloc, window.order_by);
+            if (window.value_expression) |expression| freeRelationalRowsExpression(alloc, expression);
+            if (window.default_json.len > 0) alloc.free(window.default_json);
+            for (window.filter_predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.value_json) |json| alloc.free(json);
+            }
+            if (window.filter_predicates.len > 0) alloc.free(window.filter_predicates);
+            for (window.filter_array_any) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_array_any.len > 0) alloc.free(window.filter_array_any);
+            for (window.filter_array_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_array_contains.len > 0) alloc.free(window.filter_array_contains);
+            for (window.filter_array_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_array_eq.len > 0) alloc.free(window.filter_array_eq);
+            for (window.filter_in_predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.values_json.len > 0) alloc.free(predicate.values_json);
+                if (predicate.collation) |collation| alloc.free(collation);
+            }
+            if (window.filter_in_predicates.len > 0) alloc.free(window.filter_in_predicates);
+            for (window.filter_json_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_json_contains.len > 0) alloc.free(window.filter_json_contains);
+            for (window.filter_json_path_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_json_path_eq.len > 0) alloc.free(window.filter_json_path_eq);
+            for (window.filter_json_path_exists) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+            }
+            if (window.filter_json_path_exists.len > 0) alloc.free(window.filter_json_path_exists);
+            for (window.filter_text_patterns) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.pattern);
+            }
+            if (window.filter_text_patterns.len > 0) alloc.free(window.filter_text_patterns);
+            for (window.filter_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (window.filter_expressions.len > 0) alloc.free(window.filter_expressions);
+            for (window.filter_expression_array_contains) |predicate| {
+                freeRelationalRowsExpression(alloc, predicate.expression);
+                alloc.free(predicate.value_json);
+            }
+            if (window.filter_expression_array_contains.len > 0) alloc.free(window.filter_expression_array_contains);
+            for (window.filter_any) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (window.filter_any.len > 0) alloc.free(window.filter_any);
+            for (window.filter_not) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (window.filter_not.len > 0) alloc.free(window.filter_not);
+        }
+        if (self.windows.len > 0) alloc.free(self.windows);
+        for (self.select) |field| alloc.free(field);
+        if (self.select.len > 0) alloc.free(self.select);
+        freeRelationalRowsQueryOrders(alloc, self.order_by);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsWindowPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
+    window: RelationalRowsWindowRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
+        self.window.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsWindowResult = struct {
+    rows: [][]const u8 = &.{},
+    total_rows: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsAggregateOp = enum {
+    count,
+    sum,
+    min,
+    max,
+    avg,
+    percentile_cont,
+    percentile_disc,
+    mode,
+    array_agg,
+    string_agg,
+    bool_or,
+    bool_and,
+};
+
+pub const default_relational_rows_aggregate_distinct_max_items: u32 = 65536;
+pub const default_relational_rows_percentile_max_items: u32 = 65536;
+pub const default_relational_rows_array_agg_max_items: u32 = 1024;
+
+pub const RelationalRowsAggregateSpec = struct {
+    name: []const u8,
+    op: RelationalRowsAggregateOp,
+    field: ?[]const u8 = null,
+    expression: ?RelationalRowsExpression = null,
+    distinct: bool = false,
+    distinct_max_items: u32 = default_relational_rows_aggregate_distinct_max_items,
+    percentile: ?f64 = null,
+    percentiles: []const f64 = &.{},
+    percentile_max_items: u32 = 0,
+    percentile_order: RelationalRowsQueryOrderDirection = .asc,
+    array_max_items: u32 = 0,
+    array_order_by: []const RelationalRowsQueryOrder = &.{},
+    string_delimiter: ?[]const u8 = null,
+    filter_predicates: []const schema_mod.RelationalCheck = &.{},
+    filter_array_any: []const RelationalRowsArrayAnyPredicate = &.{},
+    filter_array_contains: []const RelationalRowsArrayContainsPredicate = &.{},
+    filter_array_eq: []const RelationalRowsArrayEqPredicate = &.{},
+    filter_in_predicates: []const RelationalRowsInPredicate = &.{},
+    filter_json_contains: []const RelationalRowsJsonContainsPredicate = &.{},
+    filter_json_path_eq: []const RelationalRowsJsonPathEqPredicate = &.{},
+    filter_json_path_exists: []const RelationalRowsJsonPathExistsPredicate = &.{},
+    filter_text_patterns: []const RelationalRowsTextPatternPredicate = &.{},
+    filter_expressions: []const RelationalRowsExpressionCondition = &.{},
+    filter_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    filter_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    filter_not: []const RelationalRowsExpressionPredicateGroup = &.{},
+};
+
+pub const RelationalRowsAggregateRequest = struct {
+    source: RelationalRowsQueryRequest = .{},
+    group_by: []const []const u8 = &.{},
+    group_expressions: []const RelationalRowsExpressionProjection = &.{},
+    aggregations: []const RelationalRowsAggregateSpec = &.{},
+    having_predicates: []const schema_mod.RelationalCheck = &.{},
+    having_expressions: []const RelationalRowsExpressionCondition = &.{},
+    having_any: []const RelationalRowsExpressionPredicateGroup = &.{},
+    having_not: []const RelationalRowsExpressionPredicateGroup = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.source.deinit(alloc);
+        for (self.group_by) |field| alloc.free(field);
+        if (self.group_by.len > 0) alloc.free(self.group_by);
+        for (self.group_expressions) |projection| {
+            alloc.free(projection.output);
+            freeRelationalRowsExpression(alloc, projection.expression);
+        }
+        if (self.group_expressions.len > 0) alloc.free(self.group_expressions);
+        for (self.aggregations) |aggregation| {
+            alloc.free(aggregation.name);
+            if (aggregation.field) |field| alloc.free(field);
+            if (aggregation.percentiles.len > 0) alloc.free(aggregation.percentiles);
+            if (aggregation.string_delimiter) |delimiter| alloc.free(delimiter);
+            if (aggregation.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+            freeRelationalRowsQueryOrders(alloc, aggregation.array_order_by);
+            for (aggregation.filter_predicates) |predicate| {
+                alloc.free(predicate.field);
+                if (predicate.value_json) |value_json| alloc.free(value_json);
+            }
+            if (aggregation.filter_predicates.len > 0) alloc.free(aggregation.filter_predicates);
+            for (aggregation.filter_array_any) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_array_any.len > 0) alloc.free(aggregation.filter_array_any);
+            for (aggregation.filter_array_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_array_contains.len > 0) alloc.free(aggregation.filter_array_contains);
+            for (aggregation.filter_array_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_array_eq.len > 0) alloc.free(aggregation.filter_array_eq);
+            for (aggregation.filter_in_predicates) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.values_json);
+                if (predicate.collation) |collation| alloc.free(collation);
+            }
+            if (aggregation.filter_in_predicates.len > 0) alloc.free(aggregation.filter_in_predicates);
+            for (aggregation.filter_json_contains) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_json_contains.len > 0) alloc.free(aggregation.filter_json_contains);
+            for (aggregation.filter_json_path_eq) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_json_path_eq.len > 0) alloc.free(aggregation.filter_json_path_eq);
+            for (aggregation.filter_json_path_exists) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.path);
+            }
+            if (aggregation.filter_json_path_exists.len > 0) alloc.free(aggregation.filter_json_path_exists);
+            for (aggregation.filter_text_patterns) |predicate| {
+                alloc.free(predicate.field);
+                alloc.free(predicate.pattern);
+            }
+            if (aggregation.filter_text_patterns.len > 0) alloc.free(aggregation.filter_text_patterns);
+            for (aggregation.filter_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (aggregation.filter_expressions.len > 0) alloc.free(aggregation.filter_expressions);
+            for (aggregation.filter_expression_array_contains) |predicate| {
+                freeRelationalRowsExpression(alloc, predicate.expression);
+                alloc.free(predicate.value_json);
+            }
+            if (aggregation.filter_expression_array_contains.len > 0) alloc.free(aggregation.filter_expression_array_contains);
+            for (aggregation.filter_any) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (aggregation.filter_any.len > 0) alloc.free(aggregation.filter_any);
+            for (aggregation.filter_not) |group| {
+                for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+                if (group.conditions.len > 0) alloc.free(group.conditions);
+            }
+            if (aggregation.filter_not.len > 0) alloc.free(aggregation.filter_not);
+        }
+        if (self.aggregations.len > 0) alloc.free(self.aggregations);
+        for (self.having_predicates) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        if (self.having_predicates.len > 0) alloc.free(self.having_predicates);
+        for (self.having_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.having_expressions.len > 0) alloc.free(self.having_expressions);
+        for (self.having_any) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.having_any.len > 0) alloc.free(self.having_any);
+        for (self.having_not) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.having_not.len > 0) alloc.free(self.having_not);
+        freeRelationalRowsQueryOrders(alloc, self.order_by);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsAggregatePlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    ranges: []const RelationalRowsDocKeyRange = &.{},
+    aggregate: RelationalRowsAggregateRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        freeRelationalRowsDocKeyRanges(alloc, self.ranges);
+        self.aggregate.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsAggregateResult = struct {
+    rows: [][]const u8 = &.{},
+    total_groups: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsJoinType = enum {
+    inner,
+    left,
+};
+
+pub const RelationalRowsJoinStrategy = enum {
+    auto,
+    lookup,
+    hash,
+    merge,
+};
+
+pub const default_relational_rows_lookup_join_max_build_rows: usize = 256;
+
+pub const RelationalRowsJoinStrategySelection = struct {
+    requested: RelationalRowsJoinStrategy,
+    selected: RelationalRowsJoinStrategy,
+};
+
+pub const RelationalRowsJoinOn = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RelationalRowsJoinProjectionSide = enum {
+    left,
+    right,
+};
+
+pub const RelationalRowsJoinedMutationFieldAssignment = struct {
+    field: []const u8,
+    source_side: RelationalRowsJoinProjectionSide,
+    source_field: []const u8,
+};
+
+pub const RelationalRowsJoinProjection = struct {
+    output: []const u8,
+    side: RelationalRowsJoinProjectionSide,
+    field: []const u8,
+};
+
+pub const RelationalRowsJoinRequest = struct {
+    left: RelationalRowsQueryRequest = .{},
+    right: RelationalRowsQueryRequest = .{},
+    on: []const RelationalRowsJoinOn = &.{},
+    on_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    on_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    on_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    on_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    join_type: RelationalRowsJoinType = .inner,
+    strategy: RelationalRowsJoinStrategy = .auto,
+    select: []const RelationalRowsJoinProjection = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
+        for (self.on) |join_on| {
+            alloc.free(join_on.left_field);
+            alloc.free(join_on.right_field);
+        }
+        if (self.on.len > 0) alloc.free(self.on);
+        for (self.on_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.on_expression_predicates.len > 0) alloc.free(self.on_expression_predicates);
+        for (self.on_expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.on_expression_or_predicates.len > 0) alloc.free(self.on_expression_or_predicates);
+        for (self.on_expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.on_expression_not_predicates.len > 0) alloc.free(self.on_expression_not_predicates);
+        for (self.on_expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.on_expression_array_contains.len > 0) alloc.free(self.on_expression_array_contains);
+        for (self.match_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
+        for (self.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_or_predicates.len > 0) alloc.free(self.match_expression_or_predicates);
+        for (self.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_not_predicates.len > 0) alloc.free(self.match_expression_not_predicates);
+        for (self.match_expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.match_expression_array_contains.len > 0) alloc.free(self.match_expression_array_contains);
+        for (self.select) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.select.len > 0) alloc.free(self.select);
+        freeRelationalRowsQueryOrders(alloc, self.order_by);
+        self.* = undefined;
+    }
+};
+
+pub fn relationalRowsSelectJoinStrategy(
+    req: RelationalRowsJoinRequest,
+    left_rows: usize,
+    right_rows: usize,
+    inputs_sorted_on_join_keys: bool,
+) ?RelationalRowsJoinStrategySelection {
+    if (req.on.len == 0) {
+        const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
+            .merge => return null,
+            .lookup => .lookup,
+            .hash, .auto => .hash,
+        };
+        return .{
+            .requested = req.strategy,
+            .selected = selected,
+        };
+    }
+    const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
+        .lookup => .lookup,
+        .hash => .hash,
+        .merge => if (inputs_sorted_on_join_keys) .merge else return null,
+        .auto => if (inputs_sorted_on_join_keys and left_rows > default_relational_rows_lookup_join_max_build_rows and right_rows > default_relational_rows_lookup_join_max_build_rows)
+            .merge
+        else if (right_rows <= default_relational_rows_lookup_join_max_build_rows)
+            .lookup
+        else
+            .hash,
+    };
+    return .{
+        .requested = req.strategy,
+        .selected = selected,
+    };
+}
+
+pub fn relationalRowsJoinInputsSortedOnJoinKeys(req: RelationalRowsJoinRequest) bool {
+    return relationalRowsJoinSourceOrderCoversJoinKeys(req.left.order_by, req.on, .left) and
+        relationalRowsJoinSourceOrderCoversJoinKeys(req.right.order_by, req.on, .right);
+}
+
+const RelationalRowsJoinOrderSide = enum {
+    left,
+    right,
+};
+
+fn relationalRowsJoinSourceOrderCoversJoinKeys(
+    order_by: []const RelationalRowsQueryOrder,
+    predicates: []const RelationalRowsJoinOn,
+    side: RelationalRowsJoinOrderSide,
+) bool {
+    if (predicates.len == 0 or order_by.len < predicates.len) return false;
+    for (predicates, 0..) |predicate, i| {
+        const order = order_by[i];
+        if (order.expression != null or order.null_test != null or order.direction != .asc) return false;
+        const field = switch (side) {
+            .left => predicate.left_field,
+            .right => predicate.right_field,
+        };
+        if (!std.mem.eql(u8, order.field, field)) return false;
+    }
+    return true;
+}
+
+test "relational rows join strategy selection is explicit and fail closed for unproven merge" {
+    const join_on = [_]RelationalRowsJoinOn{.{
+        .left_field = "customer_id",
+        .right_field = "id",
+    }};
+    const auto_small = RelationalRowsJoinRequest{ .on = join_on[0..] };
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.lookup, relationalRowsSelectJoinStrategy(auto_small, 1000, 16, false).?.selected);
+
+    const auto_large = RelationalRowsJoinRequest{ .on = join_on[0..] };
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.hash, relationalRowsSelectJoinStrategy(auto_large, 1000, 1000, false).?.selected);
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.merge, relationalRowsSelectJoinStrategy(auto_large, 1000, 1000, true).?.selected);
+
+    const explicit_hash = RelationalRowsJoinRequest{ .on = join_on[0..], .strategy = .hash };
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.hash, relationalRowsSelectJoinStrategy(explicit_hash, 1, 1, false).?.selected);
+
+    const explicit_merge = RelationalRowsJoinRequest{ .on = join_on[0..], .strategy = .merge };
+    try std.testing.expect(relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, false) == null);
+    try std.testing.expectEqual(RelationalRowsJoinStrategy.merge, relationalRowsSelectJoinStrategy(explicit_merge, 1, 1, true).?.selected);
+}
+
+test "relational rows join sorted input proof requires leading ascending join key order" {
+    const join_on = [_]RelationalRowsJoinOn{.{
+        .left_field = "customer_id",
+        .right_field = "id",
+    }};
+    const left_order = [_]RelationalRowsQueryOrder{.{
+        .field = "customer_id",
+    }};
+    const right_order = [_]RelationalRowsQueryOrder{.{
+        .field = "id",
+    }};
+    const sorted = RelationalRowsJoinRequest{
+        .left = .{ .order_by = left_order[0..] },
+        .right = .{ .order_by = right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(relationalRowsJoinInputsSortedOnJoinKeys(sorted));
+
+    const wrong_right_order = [_]RelationalRowsQueryOrder{.{
+        .field = "other_id",
+    }};
+    const unsorted = RelationalRowsJoinRequest{
+        .left = .{ .order_by = left_order[0..] },
+        .right = .{ .order_by = wrong_right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(unsorted));
+
+    const desc_left_order = [_]RelationalRowsQueryOrder{.{
+        .field = "customer_id",
+        .direction = .desc,
+    }};
+    const descending = RelationalRowsJoinRequest{
+        .left = .{ .order_by = desc_left_order[0..] },
+        .right = .{ .order_by = right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(descending));
+}
+
+pub const RelationalRowsJoinedMutationSourceRequest = struct {
+    kind: RelationalRowsMutationKind,
+    ctes: []const RelationalRowsCte = &.{},
+    source_table: []const u8 = "",
+    target_side: RelationalRowsJoinProjectionSide = .left,
+    join: RelationalRowsJoinRequest = .{},
+    match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    rewrite_identity: bool = false,
+    source_assignments: []const RelationalRowsJoinedMutationFieldAssignment = &.{},
+    operations: []const TransformOp = &.{},
+    patch_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    increment_expressions: []const RelationalRowsExpressionAssignment = &.{},
+    json_set_expressions: []const RelationalRowsJsonSetExpressionAssignment = &.{},
+    returning: []const []const u8 = &.{},
+    returning_expressions: []const RelationalRowsExpressionProjection = &.{},
+    returning_all: bool = false,
+};
+
+pub const RelationalRowsJoinPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    left_table: []const u8 = "",
+    right_table: []const u8 = "",
+    left_ranges: []const RelationalRowsDocKeyRange = &.{},
+    right_ranges: []const RelationalRowsDocKeyRange = &.{},
+    join: RelationalRowsJoinRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        if (self.left_table.len > 0) alloc.free(self.left_table);
+        if (self.right_table.len > 0) alloc.free(self.right_table);
+        freeRelationalRowsDocKeyRanges(alloc, self.left_ranges);
+        freeRelationalRowsDocKeyRanges(alloc, self.right_ranges);
+        self.join.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsLateralCorrelation = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RelationalRowsLateralRequest = struct {
+    left: RelationalRowsQueryRequest = .{},
+    right: RelationalRowsQueryRequest = .{},
+    correlations: []const RelationalRowsLateralCorrelation = &.{},
+    match_expression_predicates: []const RelationalRowsExpressionCondition = &.{},
+    match_expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
+    match_expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    select: []const RelationalRowsJoinProjection = &.{},
+    order_by: []const RelationalRowsQueryOrder = &.{},
+    limit: ?u32 = null,
+    offset: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        self.left.deinit(alloc);
+        self.right.deinit(alloc);
+        for (self.correlations) |correlation| {
+            alloc.free(correlation.left_field);
+            alloc.free(correlation.right_field);
+        }
+        if (self.correlations.len > 0) alloc.free(self.correlations);
+        for (self.match_expression_predicates) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.match_expression_predicates.len > 0) alloc.free(self.match_expression_predicates);
+        for (self.match_expression_or_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_or_predicates.len > 0) alloc.free(self.match_expression_or_predicates);
+        for (self.match_expression_not_predicates) |group| {
+            for (group.conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+            if (group.conditions.len > 0) alloc.free(group.conditions);
+        }
+        if (self.match_expression_not_predicates.len > 0) alloc.free(self.match_expression_not_predicates);
+        for (self.match_expression_array_contains) |predicate| {
+            freeRelationalRowsExpression(alloc, predicate.expression);
+            alloc.free(predicate.value_json);
+        }
+        if (self.match_expression_array_contains.len > 0) alloc.free(self.match_expression_array_contains);
+        for (self.select) |projection| {
+            alloc.free(projection.output);
+            alloc.free(projection.field);
+        }
+        if (self.select.len > 0) alloc.free(self.select);
+        freeRelationalRowsQueryOrders(alloc, self.order_by);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalRowsLateralPlan = struct {
+    ctes: []const RelationalRowsCte = &.{},
+    left_table: []const u8 = "",
+    right_table: []const u8 = "",
+    left_ranges: []const RelationalRowsDocKeyRange = &.{},
+    right_ranges: []const RelationalRowsDocKeyRange = &.{},
+    lateral: RelationalRowsLateralRequest = .{},
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.ctes) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        if (self.ctes.len > 0) alloc.free(self.ctes);
+        if (self.left_table.len > 0) alloc.free(self.left_table);
+        if (self.right_table.len > 0) alloc.free(self.right_table);
+        freeRelationalRowsDocKeyRanges(alloc, self.left_ranges);
+        freeRelationalRowsDocKeyRanges(alloc, self.right_ranges);
+        self.lateral.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn freeRelationalRowsDocKeyRanges(alloc: Allocator, ranges: []const RelationalRowsDocKeyRange) void {
+    for (ranges) |range| {
+        if (range.start.len > 0) alloc.free(range.start);
+        if (range.end.len > 0) alloc.free(range.end);
+    }
+    if (ranges.len > 0) alloc.free(ranges);
+}
+
+pub const RelationalRowsJoinResult = struct {
+    rows: [][]const u8 = &.{},
+    total_rows: u32 = 0,
+    strategy_selection: ?RelationalRowsJoinStrategySelection = null,
+
+    pub fn deinit(self: *@This(), alloc: Allocator) void {
+        for (self.rows) |row| alloc.free(@constCast(row));
+        if (self.rows.len > 0) alloc.free(self.rows);
+        self.* = undefined;
+    }
+};
+
 pub const TxnId = transactions_mod.TxnId;
 pub const TxnStatus = transactions_mod.TxnStatus;
 pub const TxnRecoveryStats = transactions_mod.RecoveryStats;
@@ -1001,16 +2648,145 @@ pub const TransactionWrite = struct {
     value: []const u8,
 };
 
+pub const RelationalIdentityRewrite = struct {
+    old_key: []const u8,
+    new_key: []const u8,
+    value: []const u8,
+};
+
 pub const TransactionVersionPredicate = struct {
     key: []const u8,
     expected_version: u64,
 };
 
+pub const ForeignKeyParentCheck = struct {
+    pub const Timing = enum(u8) {
+        immediate,
+        deferred,
+    };
+
+    constraint_name: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    parent_constraint_name: ?[]const u8 = null,
+    child_period_start_json: ?[]const u8 = null,
+    child_period_end_json: ?[]const u8 = null,
+    timing: Timing = .immediate,
+};
+
+pub const ForeignKeyConstraintTimingOverride = struct {
+    constraint_name: []const u8,
+    timing: ForeignKeyParentCheck.Timing,
+};
+
+pub const ForeignKeyParentDeleteCheck = struct {
+    pub const Operation = enum(u8) {
+        delete,
+        update,
+    };
+
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    timing: ForeignKeyParentCheck.Timing = .immediate,
+    operation: Operation = .delete,
+};
+
+pub const ForeignKeyConflictCheck = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+};
+
+pub const ForeignKeyRefMutation = struct {
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_table: []const u8,
+    child_key: []const u8,
+};
+
+pub const ForeignKeyRefChild = struct {
+    child_table: []const u8,
+    child_key: []const u8,
+};
+
+pub const ForeignKeyRefChildrenPage = struct {
+    children: []ForeignKeyRefChild,
+    complete: bool = true,
+    next_child_table: ?[]const u8 = null,
+    next_child_key: ?[]const u8 = null,
+};
+
+pub const ForeignKeySetNullChildAction = struct {
+    pub const Operation = enum(u8) {
+        delete,
+        update,
+    };
+
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_key: []const u8,
+    operation: Operation = .delete,
+};
+
+pub const ForeignKeyCascadeChildAction = struct {
+    pub const Operation = enum(u8) {
+        delete,
+        update,
+    };
+
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    child_key: []const u8,
+    updated_parent_key: ?[]const u8 = null,
+    operation: Operation = .delete,
+};
+
+pub const ForeignKeyActionScheduleMutation = struct {
+    schedule_id: []const u8,
+    action_job_id: []const u8,
+    action: []const u8,
+    worker_id: []const u8,
+    constraint_name: []const u8,
+    parent_table: []const u8,
+    parent_key: []const u8,
+    updated_parent_key: ?[]const u8 = null,
+    page_limit: usize,
+    cascade_depth: u32,
+    cascade_max_depth: u32,
+};
+
+pub const UniqueConstraintMutation = struct {
+    constraint_name: []const u8,
+    encoded_value: []const u8,
+    owner_key: []const u8,
+    temporal_start: ?[]const u8 = null,
+    temporal_end: ?[]const u8 = null,
+};
+
 pub const TransactionIntentRequest = struct {
     writes: []const TransactionWrite = &.{},
     deletes: []const []const u8 = &.{},
+    relational_identity_rewrites: []const RelationalIdentityRewrite = &.{},
     transforms: []const DocumentTransform = &.{},
     predicates: []const TransactionVersionPredicate = &.{},
+    foreign_key_parent_checks: []const ForeignKeyParentCheck = &.{},
+    foreign_key_parent_delete_checks: []const ForeignKeyParentDeleteCheck = &.{},
+    foreign_key_conflict_checks: []const ForeignKeyConflictCheck = &.{},
+    foreign_key_set_null_children: []const ForeignKeySetNullChildAction = &.{},
+    foreign_key_cascade_children: []const ForeignKeyCascadeChildAction = &.{},
+    foreign_key_action_schedules: []const ForeignKeyActionScheduleMutation = &.{},
+    foreign_key_ref_writes: []const ForeignKeyRefMutation = &.{},
+    foreign_key_ref_deletes: []const ForeignKeyRefMutation = &.{},
+    foreign_key_externalized_parent_checks: []const ForeignKeyParentCheck = &.{},
+    foreign_key_constraint_timing_overrides: []const ForeignKeyConstraintTimingOverride = &.{},
+    unique_constraint_writes: []const UniqueConstraintMutation = &.{},
+    unique_constraint_deletes: []const UniqueConstraintMutation = &.{},
 };
 
 pub const SplitState = struct {
@@ -1083,6 +2859,8 @@ pub const SearchRequest = struct {
     dense_queries: []const NamedDenseQuery = &.{},
     sparse_queries: []const NamedSparseQuery = &.{},
     graph_queries: []const NamedGraphQuery = &.{},
+    graph_metric_queries: []const NamedGraphMetricQuery = &.{},
+    graph_metric_rerank: ?GraphMetricRerank = null,
     merge_config: ?MergeConfig = null,
     reranker: ?reranking_mod.Config = null,
     reranker_query_text: []const u8 = "",
@@ -1095,6 +2873,7 @@ pub const SearchRequest = struct {
     fields: []const []const u8 = &.{},
     include_all_fields: bool = true,
     defer_stored_projection: bool = false,
+    row_claim: ?RowClaimRequest = null,
     limit: u32 = 10,
     offset: u32 = 0,
     include_stored: bool = true,
@@ -1142,9 +2921,82 @@ pub const ReturnMode = enum {
     parent_with_chunks,
 };
 
+pub const RowClaimMode = enum {
+    for_update,
+    for_no_key_update,
+    for_share,
+    for_key_share,
+
+    pub fn isExclusiveWriteClaim(self: @This()) bool {
+        return switch (self) {
+            .for_update, .for_no_key_update => true,
+            .for_share, .for_key_share => false,
+        };
+    }
+
+    pub fn usesDurableIntent(self: @This()) bool {
+        return switch (self) {
+            .for_update,
+            .for_no_key_update,
+            .for_share,
+            .for_key_share,
+            => true,
+        };
+    }
+};
+
+pub const RowClaimWaitPolicy = enum {
+    wait,
+    nowait,
+    skip_locked,
+};
+
+pub const RowClaimRequest = struct {
+    mode: RowClaimMode = .for_update,
+    wait_policy: RowClaimWaitPolicy = .wait,
+    skip_locked: bool = false,
+    lease_ms: u64 = 30_000,
+    owner_id: []const u8 = "",
+    txn_id: ?TxnId = null,
+
+    pub fn effectiveWaitPolicy(self: @This()) RowClaimWaitPolicy {
+        return if (self.skip_locked) .skip_locked else self.wait_policy;
+    }
+
+    pub fn effectiveSkipLocked(self: @This()) bool {
+        return self.effectiveWaitPolicy() == .skip_locked;
+    }
+};
+
 pub const NamedGraphQuery = struct {
     name: []const u8,
     query: graph_query_mod.GraphQuery,
+};
+
+pub const GraphMetricFreshness = enum {
+    published,
+    fresh,
+};
+
+pub const GraphMetricQuery = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    top_k: u32 = 10,
+    freshness: GraphMetricFreshness = .published,
+};
+
+pub const NamedGraphMetricQuery = struct {
+    name: []const u8,
+    query: GraphMetricQuery,
+};
+
+pub const GraphMetricRerank = struct {
+    index_name: []const u8,
+    metric_name: []const u8,
+    freshness: GraphMetricFreshness = .published,
+    base_weight: f64 = 1.0,
+    weight: f64 = 1.0,
+    missing_score: f64 = 0.0,
 };
 
 pub const NamedFullTextQuery = struct {
@@ -1172,10 +3024,49 @@ pub const MergeConfig = struct {
     weights: []const fusion_mod.NamedWeight = &.{},
 };
 
+pub const GraphMetricRerankScoreDetails = struct {
+    index_name: []u8,
+    metric_name: []u8,
+    base_score: f64 = 0.0,
+    base_weight: f64 = 1.0,
+    metric_score: ?f64 = null,
+    metric_score_used: f64 = 0.0,
+    metric_weight: f64 = 1.0,
+    missing_score_used: bool = false,
+    final_score: f64 = 0.0,
+    published_generation: u64 = 0,
+
+    pub fn clone(self: GraphMetricRerankScoreDetails, alloc: Allocator) !GraphMetricRerankScoreDetails {
+        const index_name = try alloc.dupe(u8, self.index_name);
+        errdefer alloc.free(index_name);
+        const metric_name = try alloc.dupe(u8, self.metric_name);
+        errdefer alloc.free(metric_name);
+        return .{
+            .index_name = index_name,
+            .metric_name = metric_name,
+            .base_score = self.base_score,
+            .base_weight = self.base_weight,
+            .metric_score = self.metric_score,
+            .metric_score_used = self.metric_score_used,
+            .metric_weight = self.metric_weight,
+            .missing_score_used = self.missing_score_used,
+            .final_score = self.final_score,
+            .published_generation = self.published_generation,
+        };
+    }
+
+    pub fn deinit(self: *GraphMetricRerankScoreDetails, alloc: Allocator) void {
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        self.* = undefined;
+    }
+};
+
 pub const SearchHit = struct {
     id: []u8,
     doc_ordinal: ?u32 = null,
     score: ?f32 = null,
+    score_details: ?GraphMetricRerankScoreDetails = null,
     index_scores: []fusion_mod.IndexScore = &.{},
     stored_data: ?[]u8 = null,
     ancestor_source_data: ?[]u8 = null,
@@ -1188,6 +3079,7 @@ pub const SearchHit = struct {
             .id = try alloc.dupe(u8, self.id),
             .doc_ordinal = self.doc_ordinal,
             .score = self.score,
+            .score_details = if (self.score_details) |details| try details.clone(alloc) else null,
             .index_scores = try cloneIndexScores(alloc, self.index_scores),
             .stored_data = if (self.stored_data) |data| try alloc.dupe(u8, data) else null,
             .ancestor_source_data = if (self.ancestor_source_data) |data| try alloc.dupe(u8, data) else null,
@@ -1197,6 +3089,7 @@ pub const SearchHit = struct {
         };
         errdefer {
             alloc.free(cloned.id);
+            if (cloned.score_details) |*details| details.deinit(alloc);
             freeIndexScores(alloc, cloned.index_scores);
             if (cloned.stored_data) |data| alloc.free(data);
             if (cloned.ancestor_source_data) |data| alloc.free(data);
@@ -1221,6 +3114,7 @@ pub const SearchHit = struct {
 
     pub fn deinit(self: *SearchHit, alloc: Allocator) void {
         alloc.free(self.id);
+        if (self.score_details) |*details| details.deinit(alloc);
         freeIndexScores(alloc, self.index_scores);
         if (self.stored_data) |data| alloc.free(data);
         if (self.ancestor_source_data) |data| alloc.free(data);
@@ -1296,12 +3190,45 @@ pub const SearchResult = struct {
     total_hits_relation: TotalHitsRelation = .exact,
     identity_read_generation: ?u64 = null,
     graph_results: []GraphSearchResult = &.{},
+    graph_metric_results: []GraphMetricResult = &.{},
+    graph_metric_rerank_status: ?GraphMetricStatus = null,
 
     pub fn deinit(self: *SearchResult) void {
         for (self.hits) |*hit| hit.deinit(self.alloc);
         if (self.hits.len > 0) self.alloc.free(self.hits);
         for (self.graph_results) |*graph_result| graph_result.deinit(self.alloc);
         if (self.graph_results.len > 0) self.alloc.free(self.graph_results);
+        for (self.graph_metric_results) |*metric_result| metric_result.deinit(self.alloc);
+        if (self.graph_metric_results.len > 0) self.alloc.free(self.graph_metric_results);
+        if (self.graph_metric_rerank_status) |*status| status.deinit(self.alloc);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricScore = struct {
+    node: []u8,
+    score: f64,
+
+    pub fn deinit(self: *GraphMetricScore, alloc: Allocator) void {
+        alloc.free(self.node);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricResult = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: []GraphMetricScore,
+    status: GraphMetricStatus,
+
+    pub fn deinit(self: *GraphMetricResult, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.index_name);
+        alloc.free(self.metric_name);
+        for (self.scores) |*score| score.deinit(alloc);
+        if (self.scores.len > 0) alloc.free(self.scores);
+        self.status.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -1313,6 +3240,7 @@ pub const GraphSearchResult = struct {
     matches: []GraphPatternMatch = &.{},
     hits: []SearchHit,
     total_hits: u32,
+    metric_status: []GraphMetricStatus = &.{},
 
     pub fn deinit(self: *GraphSearchResult, alloc: Allocator) void {
         alloc.free(self.name);
@@ -1324,9 +3252,83 @@ pub const GraphSearchResult = struct {
         if (self.matches.len > 0) alloc.free(self.matches);
         for (self.hits) |*hit| hit.deinit(alloc);
         if (self.hits.len > 0) alloc.free(self.hits);
+        freeGraphMetricStatuses(alloc, self.metric_status);
         self.* = undefined;
     }
 };
+
+pub const GraphMetricStatus = struct {
+    name: []u8,
+    state: graph_mod.GraphIndex.GraphMetricState = .not_ready,
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    edge_filter: graph_mod.GraphMetricEdgeFilter = .{},
+    metadata_version: u32 = 0,
+    maintenance_paused: bool = false,
+    build_queued: bool = false,
+    published_generation: u64 = 0,
+    edge_generation: u64 = 0,
+    target_edge_generation: u64 = 0,
+    queued_generation: u64 = 0,
+    building_generation: u64 = 0,
+    build_job_id: u64 = 0,
+    build_started_at_ms: u64 = 0,
+    build_iteration: u32 = 0,
+    build_lease_expires_at_ms: u64 = 0,
+    build_worker_id: []const u8 = "",
+    build_cursor: []const u8 = "",
+    build_completed_units: u64 = 0,
+    build_total_units: u64 = 0,
+    build_pages: []GraphMetricBuildPageStatus = &.{},
+    build_pages_truncated: bool = false,
+    retry_count: u64 = 0,
+    last_error: []const u8 = "",
+    progress: f64 = 0.0,
+    converged: bool = false,
+    iterations_completed: u32 = 0,
+    delta: f64 = 0.0,
+    computed_at_ms: u64 = 0,
+    last_event: ?graph_mod.GraphIndex.GraphMetricEvent = null,
+    recent_events: []graph_mod.GraphIndex.GraphMetricEvent = &.{},
+
+    pub fn deinit(self: *GraphMetricStatus, alloc: Allocator) void {
+        alloc.free(self.name);
+        self.edge_filter.deinit(alloc);
+        if (self.build_worker_id.len > 0) alloc.free(self.build_worker_id);
+        if (self.build_cursor.len > 0) alloc.free(self.build_cursor);
+        for (self.build_pages) |*page| page.deinit(alloc);
+        if (self.build_pages.len > 0) alloc.free(self.build_pages);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        if (self.recent_events.len > 0) alloc.free(self.recent_events);
+        self.* = undefined;
+    }
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: graph_mod.GraphIndex.GraphMetricBuildPhase = .idle,
+    iteration: u32 = 0,
+    page_id: u64 = 0,
+    state: graph_mod.GraphIndex.GraphMetricBuildPageState = .pending,
+    range_kind: graph_mod.GraphIndex.GraphMetricBuildPageRangeKind = .full,
+    worker_id: []const u8 = "",
+    lease_expires_at_ms: u64 = 0,
+    attempt: u64 = 0,
+    cursor: []const u8 = "",
+    completed_units: u64 = 0,
+    total_units: u64 = 0,
+    last_error: []const u8 = "",
+
+    pub fn deinit(self: *GraphMetricBuildPageStatus, alloc: Allocator) void {
+        if (self.worker_id.len > 0) alloc.free(self.worker_id);
+        if (self.cursor.len > 0) alloc.free(self.cursor);
+        if (self.last_error.len > 0) alloc.free(self.last_error);
+        self.* = undefined;
+    }
+};
+
+pub fn freeGraphMetricStatuses(alloc: Allocator, statuses: []GraphMetricStatus) void {
+    for (statuses) |*status| status.deinit(alloc);
+    if (statuses.len > 0) alloc.free(statuses);
+}
 
 pub const GraphPatternBinding = struct {
     alias: []u8,
@@ -1350,7 +3352,6 @@ pub const GraphPatternMatch = struct {
             alloc.free(edge.source);
             alloc.free(edge.target);
             alloc.free(edge.edge_type);
-            if (edge.metadata.len > 0) alloc.free(edge.metadata);
         }
         if (self.path.len > 0) alloc.free(self.path);
         self.* = undefined;
@@ -1440,6 +3441,7 @@ pub const TransactionRecoveryStats = struct {
     lease_owned: bool = false,
     has_lease: bool = false,
     acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
     lease_acquire_failures: u64 = 0,
     lost_leases: u64 = 0,
     last_acquired_ms: u64 = 0,
@@ -1486,6 +3488,107 @@ pub const TextMergeStats = struct {
     backpressure_ns: u64 = 0,
     max_pending_segments: u64 = 0,
     max_pending_bytes: u64 = 0,
+};
+
+pub const GraphMetricRuntimeRole = enum {
+    combined,
+    coordinator,
+    worker,
+    worker_pool,
+};
+
+pub const GraphMetricRuntimeStats = struct {
+    enabled: bool = false,
+    role: ?GraphMetricRuntimeRole = null,
+    runtime_id_hash: u64 = 0,
+    owner_id_hash: u64 = 0,
+    lease_key_hash: u64 = 0,
+    worker_id_hash: u64 = 0,
+    worker_count: u64 = 0,
+    lease_owned: bool = false,
+    has_lease: bool = false,
+    acquisition_count: u64 = 0,
+    takeover_count: u64 = 0,
+    lease_acquire_failures: u64 = 0,
+    lost_leases: u64 = 0,
+    last_acquired_ms: u64 = 0,
+    started: bool = false,
+    shutdown: bool = false,
+    notified: bool = false,
+    ticks_started: u64 = 0,
+    ticks_completed: u64 = 0,
+    durable_progress_ticks: u64 = 0,
+    idle_ticks: u64 = 0,
+    error_ticks: u64 = 0,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: u64 = 0,
+    total_active_builds: u64 = 0,
+    total_builds_started: u64 = 0,
+    total_worker_steps: u64 = 0,
+    total_coordinator_steps: u64 = 0,
+    total_pages_claimed: u64 = 0,
+    total_pages_completed: u64 = 0,
+    total_phases_advanced: u64 = 0,
+    total_published: u64 = 0,
+    total_failed_builds: u64 = 0,
+    last_metrics_scanned: u64 = 0,
+    last_active_builds: u64 = 0,
+    last_builds_started: u64 = 0,
+    last_worker_steps: u64 = 0,
+    last_coordinator_steps: u64 = 0,
+    last_pages_claimed: u64 = 0,
+    last_pages_completed: u64 = 0,
+    last_phases_advanced: u64 = 0,
+    last_published: u64 = 0,
+    last_failed_builds: u64 = 0,
+    last_budget_exhausted: bool = false,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.enabled or
+            self.role != null or
+            self.runtime_id_hash != 0 or
+            self.owner_id_hash != 0 or
+            self.lease_key_hash != 0 or
+            self.worker_id_hash != 0 or
+            self.worker_count != 0 or
+            self.lease_owned or
+            self.has_lease or
+            self.acquisition_count != 0 or
+            self.takeover_count != 0 or
+            self.lease_acquire_failures != 0 or
+            self.lost_leases != 0 or
+            self.last_acquired_ms != 0 or
+            self.started or
+            self.shutdown or
+            self.notified or
+            self.ticks_started != 0 or
+            self.ticks_completed != 0 or
+            self.durable_progress_ticks != 0 or
+            self.idle_ticks != 0 or
+            self.error_ticks != 0 or
+            self.last_error_name != null or
+            self.total_metrics_scanned != 0 or
+            self.total_active_builds != 0 or
+            self.total_builds_started != 0 or
+            self.total_worker_steps != 0 or
+            self.total_coordinator_steps != 0 or
+            self.total_pages_claimed != 0 or
+            self.total_pages_completed != 0 or
+            self.total_phases_advanced != 0 or
+            self.total_published != 0 or
+            self.total_failed_builds != 0 or
+            self.last_metrics_scanned != 0 or
+            self.last_active_builds != 0 or
+            self.last_builds_started != 0 or
+            self.last_worker_steps != 0 or
+            self.last_coordinator_steps != 0 or
+            self.last_pages_claimed != 0 or
+            self.last_pages_completed != 0 or
+            self.last_phases_advanced != 0 or
+            self.last_published != 0 or
+            self.last_failed_builds != 0 or
+            self.last_budget_exhausted;
+    }
 };
 
 pub fn accumulateTextMergeStats(dst: *TextMergeStats, src: TextMergeStats) void {
@@ -1558,12 +3661,45 @@ pub const DocSetPlanningStats = struct {
     stale_identity_generation_rejection_count: u64 = 0,
 };
 
+pub const ForeignKeyStats = struct {
+    child_write_rejects: u64 = 0,
+    parent_delete_rejects: u64 = 0,
+    validation_runs: u64 = 0,
+    dry_run_runs: u64 = 0,
+    repair_runs: u64 = 0,
+    scanned_child_rows: u64 = 0,
+    referenced_child_rows: u64 = 0,
+    scanned_ref_rows: u64 = 0,
+    missing_parent_rows: u64 = 0,
+    missing_ref_rows: u64 = 0,
+    stale_ref_rows: u64 = 0,
+    repaired_ref_rows: u64 = 0,
+    deleted_stale_ref_rows: u64 = 0,
+
+    pub fn hasRuntimeFacts(self: @This()) bool {
+        return self.child_write_rejects != 0 or
+            self.parent_delete_rejects != 0 or
+            self.validation_runs != 0 or
+            self.dry_run_runs != 0 or
+            self.repair_runs != 0 or
+            self.scanned_child_rows != 0 or
+            self.referenced_child_rows != 0 or
+            self.scanned_ref_rows != 0 or
+            self.missing_parent_rows != 0 or
+            self.missing_ref_rows != 0 or
+            self.stale_ref_rows != 0 or
+            self.repaired_ref_rows != 0 or
+            self.deleted_stale_ref_rows != 0;
+    }
+};
+
 pub const DBStats = struct {
     doc_count: u64 = 0,
     index_count: u32 = 0,
     indexes: []DBIndexStats = &.{},
     doc_identity: DocIdentityStats = .{},
     doc_set_planning: DocSetPlanningStats = .{},
+    foreign_keys: ForeignKeyStats = .{},
     enrichment: EnrichmentStats = .{},
     resolution: ReplayStageStats = .{},
     promotion: ReplayStageStats = .{},
@@ -1571,6 +3707,7 @@ pub const DBStats = struct {
     ttl_cleanup: TTLCleanupStats = .{},
     transaction_recovery: TransactionRecoveryStats = .{},
     text_merge: TextMergeStats = .{},
+    graph_metric_runtime: GraphMetricRuntimeStats = .{},
     term_doc_freq_cache_hits: u64 = 0,
     term_doc_freq_cache_misses: u64 = 0,
     async_indexing: AsyncIndexingStats = .{},
@@ -1683,6 +3820,7 @@ pub const DBIndexStats = struct {
     algebraic_graph_traversal_rejected_count: u64 = 0,
     algebraic_graph_traversal_fallback_count: u64 = 0,
     algebraic_graph_traversal_result_node_count: u64 = 0,
+    graph_metric_status: []GraphMetricStatus = &.{},
     algebraic_observed_query_shape_count: u64 = 0,
     algebraic_recommendation_count: u64 = 0,
     algebraic_adaptive_candidate_count: u64 = 0,
@@ -2133,6 +4271,7 @@ pub fn freeDBStats(alloc: Allocator, stats: DBStats) void {
         if (item.algebraic_planner_lifecycle_blocking_reason) |value| alloc.free(value);
         if (item.algebraic_last_observed_query_shape) |value| alloc.free(value);
         if (item.algebraic_last_recommended_materialization) |value| alloc.free(value);
+        freeGraphMetricStatuses(alloc, @constCast(item.graph_metric_status));
         if (item.algebraic_top_candidate) |candidate| {
             alloc.free(candidate.recommendation);
             alloc.free(candidate.materialization_id);

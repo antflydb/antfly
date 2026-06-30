@@ -48,7 +48,7 @@ def test_schema_migration_full_text_rebuild(stateful_api):
         }
         for i in range(num_docs)
     }
-    batch = stateful_api.batch_write(table_name, inserts=inserts, sync_level="full_text")
+    batch = stateful_api.batch_write(table_name, inserts=inserts, sync_level="query")
     assert batch["inserted"] == num_docs
 
     initial_index = wait_until(

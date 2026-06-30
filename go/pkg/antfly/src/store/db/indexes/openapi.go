@@ -226,7 +226,8 @@ func (gc GraphIndexStats) Equal(oc GraphIndexStats) bool {
 		reflect.DeepEqual(gc.EdgeTypes, oc.EdgeTypes) &&
 		gc.Rebuilding == oc.Rebuilding &&
 		gc.BackfillProgress == oc.BackfillProgress &&
-		gc.BackfillItemsProcessed == oc.BackfillItemsProcessed
+		gc.BackfillItemsProcessed == oc.BackfillItemsProcessed &&
+		reflect.DeepEqual(gc.GraphMetricRuntime, oc.GraphMetricRuntime)
 }
 
 func (g GraphIndexStats) AsIndexStats() IndexStats {
@@ -344,6 +345,150 @@ func mergeBackfillFields(
 	}
 }
 
+func graphMetricRuntimeStatsHasFacts(stats *GraphMetricRuntimeStats) bool {
+	if stats == nil {
+		return false
+	}
+	return !reflect.DeepEqual(*stats, GraphMetricRuntimeStats{})
+}
+
+func cloneUint64Ptr(value *uint64) *uint64 {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneBoolPtr(value *bool) *bool {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneStringPtr(value *string) *string {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func cloneRuntimeRolePtr(value *GraphMetricRuntimeStatsRole) *GraphMetricRuntimeStatsRole {
+	if value == nil {
+		return nil
+	}
+	cloned := *value
+	return &cloned
+}
+
+func mergeUint64Sum(dst **uint64, src *uint64) {
+	if src == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = cloneUint64Ptr(src)
+		return
+	}
+	**dst += *src
+}
+
+func mergeUint64Xor(dst **uint64, src *uint64) {
+	if src == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = cloneUint64Ptr(src)
+		return
+	}
+	**dst ^= *src
+}
+
+func mergeUint64Max(dst **uint64, src *uint64) {
+	if src == nil {
+		return
+	}
+	if *dst == nil || *src > **dst {
+		*dst = cloneUint64Ptr(src)
+	}
+}
+
+func mergeBoolOr(dst **bool, src *bool) {
+	if src == nil {
+		return
+	}
+	if *dst == nil {
+		*dst = cloneBoolPtr(src)
+		return
+	}
+	**dst = **dst || *src
+}
+
+func mergeGraphMetricRuntimeStats(dst **GraphMetricRuntimeStats, src *GraphMetricRuntimeStats) {
+	if !graphMetricRuntimeStatsHasFacts(src) {
+		return
+	}
+	if *dst == nil {
+		*dst = &GraphMetricRuntimeStats{}
+	}
+
+	hadFacts := graphMetricRuntimeStatsHasFacts(*dst)
+	if src.Role != nil {
+		if !hadFacts {
+			(*dst).Role = cloneRuntimeRolePtr(src.Role)
+		} else if (*dst).Role != nil && *(*dst).Role != *src.Role {
+			(*dst).Role = nil
+		}
+	}
+	mergeBoolOr(&(*dst).Enabled, src.Enabled)
+	mergeUint64Xor(&(*dst).RuntimeIdHash, src.RuntimeIdHash)
+	mergeUint64Xor(&(*dst).OwnerIdHash, src.OwnerIdHash)
+	mergeUint64Xor(&(*dst).LeaseKeyHash, src.LeaseKeyHash)
+	mergeUint64Xor(&(*dst).WorkerIdHash, src.WorkerIdHash)
+	mergeUint64Sum(&(*dst).WorkerCount, src.WorkerCount)
+	mergeBoolOr(&(*dst).LeaseOwned, src.LeaseOwned)
+	mergeBoolOr(&(*dst).HasLease, src.HasLease)
+	mergeUint64Sum(&(*dst).AcquisitionCount, src.AcquisitionCount)
+	mergeUint64Sum(&(*dst).TakeoverCount, src.TakeoverCount)
+	mergeUint64Sum(&(*dst).LeaseAcquireFailures, src.LeaseAcquireFailures)
+	mergeUint64Sum(&(*dst).LostLeases, src.LostLeases)
+	mergeUint64Max(&(*dst).LastAcquiredMs, src.LastAcquiredMs)
+	mergeBoolOr(&(*dst).Started, src.Started)
+	mergeBoolOr(&(*dst).Shutdown, src.Shutdown)
+	mergeBoolOr(&(*dst).Notified, src.Notified)
+	mergeUint64Sum(&(*dst).TicksStarted, src.TicksStarted)
+	mergeUint64Sum(&(*dst).TicksCompleted, src.TicksCompleted)
+	mergeUint64Sum(&(*dst).DurableProgressTicks, src.DurableProgressTicks)
+	mergeUint64Sum(&(*dst).IdleTicks, src.IdleTicks)
+	mergeUint64Sum(&(*dst).ErrorTicks, src.ErrorTicks)
+	if (*dst).LastErrorName == nil {
+		(*dst).LastErrorName = cloneStringPtr(src.LastErrorName)
+	}
+	mergeUint64Sum(&(*dst).TotalMetricsScanned, src.TotalMetricsScanned)
+	mergeUint64Sum(&(*dst).TotalActiveBuilds, src.TotalActiveBuilds)
+	mergeUint64Sum(&(*dst).TotalBuildsStarted, src.TotalBuildsStarted)
+	mergeUint64Sum(&(*dst).TotalWorkerSteps, src.TotalWorkerSteps)
+	mergeUint64Sum(&(*dst).TotalCoordinatorSteps, src.TotalCoordinatorSteps)
+	mergeUint64Sum(&(*dst).TotalPagesClaimed, src.TotalPagesClaimed)
+	mergeUint64Sum(&(*dst).TotalPagesCompleted, src.TotalPagesCompleted)
+	mergeUint64Sum(&(*dst).TotalPhasesAdvanced, src.TotalPhasesAdvanced)
+	mergeUint64Sum(&(*dst).TotalPublished, src.TotalPublished)
+	mergeUint64Sum(&(*dst).TotalFailedBuilds, src.TotalFailedBuilds)
+	mergeUint64Sum(&(*dst).LastMetricsScanned, src.LastMetricsScanned)
+	mergeUint64Sum(&(*dst).LastActiveBuilds, src.LastActiveBuilds)
+	mergeUint64Sum(&(*dst).LastBuildsStarted, src.LastBuildsStarted)
+	mergeUint64Sum(&(*dst).LastWorkerSteps, src.LastWorkerSteps)
+	mergeUint64Sum(&(*dst).LastCoordinatorSteps, src.LastCoordinatorSteps)
+	mergeUint64Sum(&(*dst).LastPagesClaimed, src.LastPagesClaimed)
+	mergeUint64Sum(&(*dst).LastPagesCompleted, src.LastPagesCompleted)
+	mergeUint64Sum(&(*dst).LastPhasesAdvanced, src.LastPhasesAdvanced)
+	mergeUint64Sum(&(*dst).LastPublished, src.LastPublished)
+	mergeUint64Sum(&(*dst).LastFailedBuilds, src.LastFailedBuilds)
+	mergeBoolOr(&(*dst).LastBudgetExhausted, src.LastBudgetExhausted)
+}
+
 // MergeIndexStats merges src into dst by summing numeric fields across shards.
 // Errors are concatenated. Boolean flags like Rebuilding use logical OR.
 // If dst has no data yet (empty union), src is used as-is.
@@ -414,6 +559,7 @@ func MergeIndexStats(dst *IndexStats, src IndexStats) {
 				}
 			}
 		}
+		mergeGraphMetricRuntimeStats(&dstGraph.GraphMetricRuntime, srcGraph.GraphMetricRuntime)
 		mergeErrors(&dstGraph.Error, srcGraph.Error)
 		_ = dst.FromGraphIndexStats(dstGraph)
 

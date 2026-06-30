@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
+const graph_mod = @import("../graph/graph.zig");
 const graph_paths = @import("../graph/paths.zig");
 const graph_query_mod = @import("../graph/query.zig");
 const query_contract = @import("query_contract.zig");
@@ -78,10 +79,24 @@ pub fn mergeSearchResults(
 ) !db_mod.types.SearchResult {
     var total_hits: u32 = 0;
     var has_graph_results = false;
+    var has_graph_metric_results = false;
+    var has_graph_metric_rerank_status = false;
     for (results) |result| {
         if (result.graph_results.len > 0) has_graph_results = true;
+        if (result.graph_metric_results.len > 0) has_graph_metric_results = true;
+        if (result.graph_metric_rerank_status != null) has_graph_metric_rerank_status = true;
         total_hits +|= result.total_hits;
     }
+    if (req.graph_queries.len == 0 and has_graph_results) return error.UnsupportedQueryRequest;
+    if (req.graph_metric_queries.len == 0 and has_graph_metric_results) return error.UnsupportedQueryRequest;
+
+    var graph_metric_rerank_status = if (req.graph_metric_rerank != null)
+        try mergeGraphMetricRerankStatus(alloc, req, results)
+    else if (has_graph_metric_rerank_status)
+        try mergeGraphMetricRerankStatus(alloc, req, results)
+    else
+        null;
+    errdefer if (graph_metric_rerank_status) |*status| status.deinit(alloc);
 
     var merged_hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
     defer {
@@ -91,6 +106,7 @@ pub fn mergeSearchResults(
 
     for (results) |result| {
         for (result.hits) |hit| {
+            try validateSearchHitGraphMetricRerankPayload(req, graph_metric_rerank_status, hit);
             try merged_hits.append(alloc, try hit.clone(alloc));
         }
     }
@@ -123,13 +139,22 @@ pub fn mergeSearchResults(
         moved += 1;
     }
 
-    const graph_results = if (has_graph_results)
-        try mergeGraphSearchResults(alloc, results)
+    const graph_results = if (req.graph_queries.len > 0 or has_graph_results)
+        try mergeGraphSearchResults(alloc, req, results)
     else
         @constCast((&[_]db_mod.types.GraphSearchResult{})[0..]);
     errdefer {
         for (graph_results) |*graph_result| graph_result.deinit(alloc);
         if (graph_results.len > 0) alloc.free(graph_results);
+    }
+    stripUnrequestedGraphSearchMetricStatuses(alloc, req, graph_results);
+    const graph_metric_results = if (req.graph_metric_queries.len > 0 or has_graph_metric_results)
+        try mergeGraphMetricResults(alloc, req, results)
+    else
+        @constCast((&[_]db_mod.types.GraphMetricResult{})[0..]);
+    errdefer {
+        for (graph_metric_results) |*metric_result| metric_result.deinit(alloc);
+        if (graph_metric_results.len > 0) alloc.free(graph_metric_results);
     }
 
     if (results.len > 1) {
@@ -143,7 +168,55 @@ pub fn mergeSearchResults(
         .total_hits = total_hits,
         .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
         .graph_results = graph_results,
+        .graph_metric_results = graph_metric_results,
+        .graph_metric_rerank_status = graph_metric_rerank_status,
     };
+}
+
+fn validateSearchHitGraphMetricRerankPayload(
+    req: db_mod.types.SearchRequest,
+    rerank_status: ?db_mod.types.GraphMetricStatus,
+    hit: db_mod.types.SearchHit,
+) !void {
+    const rerank = req.graph_metric_rerank orelse {
+        if (hit.score_details != null) return error.UnsupportedQueryRequest;
+        return;
+    };
+
+    const hit_score = hit.score orelse return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(hit_score)) return error.UnsupportedQueryRequest;
+    const details = hit.score_details orelse return;
+    if (!std.mem.eql(u8, details.index_name, rerank.index_name)) return error.UnsupportedQueryRequest;
+    if (!std.mem.eql(u8, details.metric_name, rerank.metric_name)) return error.UnsupportedQueryRequest;
+    const status = rerank_status orelse return error.UnsupportedQueryRequest;
+    if (details.published_generation == 0 or details.published_generation != status.published_generation) {
+        return error.UnsupportedQueryRequest;
+    }
+    if (!std.math.isFinite(details.base_score)) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(details.base_weight)) return error.UnsupportedQueryRequest;
+    if (@abs(details.base_weight - rerank.base_weight) > 0.000001) return error.UnsupportedQueryRequest;
+    if (details.metric_score) |score| {
+        if (!std.math.isFinite(score)) return error.UnsupportedQueryRequest;
+        if (details.missing_score_used) return error.UnsupportedQueryRequest;
+        if (@abs(score - details.metric_score_used) > 0.000001) return error.UnsupportedQueryRequest;
+    } else {
+        if (!details.missing_score_used) return error.UnsupportedQueryRequest;
+        if (@abs(details.metric_score_used - rerank.missing_score) > 0.000001) return error.UnsupportedQueryRequest;
+    }
+    if (!std.math.isFinite(details.metric_score_used)) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(details.metric_weight)) return error.UnsupportedQueryRequest;
+    if (@abs(details.metric_weight - rerank.weight) > 0.000001) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(details.final_score)) return error.UnsupportedQueryRequest;
+    const expected_final_score = clampF64ToF32(details.base_score * details.base_weight + details.metric_score_used * details.metric_weight);
+    if (@abs(@as(f64, expected_final_score) - details.final_score) > 0.000001) return error.UnsupportedQueryRequest;
+    if (@abs(@as(f64, hit_score) - details.final_score) > 0.000001) return error.UnsupportedQueryRequest;
+}
+
+fn clampF64ToF32(value: f64) f32 {
+    const max = std.math.floatMax(f32);
+    if (value > max) return max;
+    if (value < -max) return -max;
+    return @floatCast(value);
 }
 
 fn mergedSearchResultIdentityReadGeneration(
@@ -173,6 +246,8 @@ fn isPureDenseRequest(req: db_mod.types.SearchRequest) bool {
         req.full_text == null and
         req.sparse_queries.len == 0 and
         req.graph_queries.len == 0 and
+        req.graph_metric_queries.len == 0 and
+        req.graph_metric_rerank == null and
         req.sparse == null and
         req.merge_config == null;
 }
@@ -183,6 +258,7 @@ const GraphSearchResultBuilder = struct {
     paths: std.ArrayListUnmanaged(db_mod.types.GraphPath) = .empty,
     matches: std.ArrayListUnmanaged(db_mod.types.GraphPatternMatch) = .empty,
     hits: std.ArrayListUnmanaged(db_mod.types.SearchHit) = .empty,
+    metric_status: std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus) = .empty,
     total_hits: u32 = 0,
 
     fn deinit(self: *GraphSearchResultBuilder, alloc: std.mem.Allocator) void {
@@ -195,6 +271,8 @@ const GraphSearchResultBuilder = struct {
         self.matches.deinit(alloc);
         for (self.hits.items) |*hit| hit.deinit(alloc);
         self.hits.deinit(alloc);
+        for (self.metric_status.items) |*status| status.deinit(alloc);
+        self.metric_status.deinit(alloc);
         self.* = undefined;
     }
 
@@ -206,14 +284,443 @@ const GraphSearchResultBuilder = struct {
             .matches = try self.matches.toOwnedSlice(alloc),
             .hits = try self.hits.toOwnedSlice(alloc),
             .total_hits = self.total_hits,
+            .metric_status = try self.metric_status.toOwnedSlice(alloc),
         };
     }
 };
 
+const GraphMetricResultBuilder = struct {
+    name: []u8,
+    index_name: []u8,
+    metric_name: []u8,
+    scores: std.ArrayListUnmanaged(db_mod.types.GraphMetricScore) = .empty,
+    status: ?db_mod.types.GraphMetricStatus = null,
+
+    fn deinit(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator) void {
+        if (self.name.len > 0) alloc.free(self.name);
+        if (self.index_name.len > 0) alloc.free(self.index_name);
+        if (self.metric_name.len > 0) alloc.free(self.metric_name);
+        for (self.scores.items) |*score| score.deinit(alloc);
+        self.scores.deinit(alloc);
+        if (self.status) |*status| status.deinit(alloc);
+        self.* = undefined;
+    }
+
+    fn toOwned(self: *GraphMetricResultBuilder, alloc: std.mem.Allocator, top_k: u32) !db_mod.types.GraphMetricResult {
+        std.sort.pdq(db_mod.types.GraphMetricScore, self.scores.items, {}, struct {
+            fn lessThan(_: void, a: db_mod.types.GraphMetricScore, b: db_mod.types.GraphMetricScore) bool {
+                if (a.score != b.score) return a.score > b.score;
+                return std.mem.order(u8, a.node, b.node) == .lt;
+            }
+        }.lessThan);
+
+        const count = if (top_k == 0)
+            self.scores.items.len
+        else
+            @min(self.scores.items.len, @as(usize, @intCast(top_k)));
+        const scores = try alloc.alloc(db_mod.types.GraphMetricScore, count);
+        var initialized: usize = 0;
+        errdefer {
+            for (scores[0..initialized]) |*score| score.deinit(alloc);
+            alloc.free(scores);
+        }
+        for (self.scores.items[0..count], 0..) |score, i| {
+            scores[i] = .{
+                .node = try alloc.dupe(u8, score.node),
+                .score = score.score,
+            };
+            initialized += 1;
+        }
+
+        return .{
+            .name = self.name,
+            .index_name = self.index_name,
+            .metric_name = self.metric_name,
+            .scores = scores,
+            .status = self.status orelse return error.InvalidQueryResponse,
+        };
+    }
+};
+
+fn mergeGraphMetricResults(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+) ![]db_mod.types.GraphMetricResult {
+    try validateRequestedGraphMetricFanIn(req, results);
+
+    var builders = std.ArrayListUnmanaged(GraphMetricResultBuilder).empty;
+    defer {
+        for (builders.items) |*builder| builder.deinit(alloc);
+        builders.deinit(alloc);
+    }
+
+    for (results) |result| {
+        for (result.graph_metric_results) |metric_result| {
+            const idx = blk: {
+                for (builders.items, 0..) |builder, i| {
+                    if (std.mem.eql(u8, builder.name, metric_result.name)) break :blk i;
+                }
+                try builders.append(alloc, .{
+                    .name = try alloc.dupe(u8, metric_result.name),
+                    .index_name = try alloc.dupe(u8, metric_result.index_name),
+                    .metric_name = try alloc.dupe(u8, metric_result.metric_name),
+                });
+                break :blk builders.items.len - 1;
+            };
+            var builder = &builders.items[idx];
+            try ensureGraphMetricResultComparable(builder, metric_result);
+            try validateGraphMetricScoreNodesUnique(builder.scores.items, metric_result.scores);
+            for (metric_result.scores) |score| {
+                try builder.scores.append(alloc, .{
+                    .node = try alloc.dupe(u8, score.node),
+                    .score = score.score,
+                });
+            }
+            if (builder.status) |*status| {
+                try mergeGraphMetricStatusInto(alloc, status, metric_result.status);
+            } else {
+                builder.status = try cloneGraphMetricStatus(alloc, metric_result.status);
+            }
+        }
+    }
+
+    const merged = try alloc.alloc(db_mod.types.GraphMetricResult, builders.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (merged[0..initialized]) |*metric_result| metric_result.deinit(alloc);
+        alloc.free(merged);
+    }
+    for (builders.items, 0..) |*builder, i| {
+        merged[i] = try builder.toOwned(alloc, graphMetricQueryTopK(req, builder.name));
+        initialized += 1;
+        builder.name = &.{};
+        builder.index_name = &.{};
+        builder.metric_name = &.{};
+        builder.status = null;
+    }
+    return merged;
+}
+
+fn validateRequestedGraphMetricFanIn(
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+) !void {
+    if (req.graph_metric_queries.len == 0) return;
+    try validateGraphMetricQueryNamesUnique(req.graph_metric_queries);
+
+    for (results) |result| {
+        for (result.graph_metric_results) |metric_result| {
+            if (!graphMetricQueryRequested(req, metric_result.name)) return error.UnsupportedQueryRequest;
+        }
+        for (req.graph_metric_queries) |query| {
+            var found = false;
+            for (result.graph_metric_results) |metric_result| {
+                if (!std.mem.eql(u8, metric_result.name, query.name)) continue;
+                if (found) return error.UnsupportedQueryRequest;
+                found = true;
+                if (!std.mem.eql(u8, metric_result.index_name, query.query.index_name)) return error.UnsupportedQueryRequest;
+                if (!std.mem.eql(u8, metric_result.metric_name, query.query.metric_name)) return error.UnsupportedQueryRequest;
+                if (!std.mem.eql(u8, metric_result.status.name, query.query.metric_name)) return error.UnsupportedQueryRequest;
+                if (metric_result.status.published_generation == 0) return error.UnsupportedQueryRequest;
+                try validateGraphMetricPublishedStatus(metric_result.status);
+                try validateGraphMetricFreshness(query.query.freshness, metric_result.status);
+            }
+            if (!found) return error.UnsupportedQueryRequest;
+        }
+        try validateRequestedHitsPairGraphMetricFanIn(req, result);
+    }
+}
+
+fn validateGraphMetricQueryNamesUnique(queries: []const db_mod.types.NamedGraphMetricQuery) !void {
+    for (queries, 0..) |query, i| {
+        for (queries[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, query.name)) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn graphMetricQueryRequested(req: db_mod.types.SearchRequest, query_name: []const u8) bool {
+    for (req.graph_metric_queries) |query| {
+        if (std.mem.eql(u8, query.name, query_name)) return true;
+    }
+    return false;
+}
+
+fn validateRequestedHitsPairGraphMetricFanIn(
+    req: db_mod.types.SearchRequest,
+    result: db_mod.types.SearchResult,
+) !void {
+    for (req.graph_metric_queries) |authority_query| {
+        if (!isDefaultHitsAuthorityMetric(authority_query.query.metric_name)) continue;
+        for (req.graph_metric_queries) |hub_query| {
+            if (!isDefaultHitsHubMetric(hub_query.query.metric_name)) continue;
+            if (!std.mem.eql(u8, authority_query.query.index_name, hub_query.query.index_name)) continue;
+            const authority = graphMetricResultByName(result.graph_metric_results, authority_query.name) orelse return error.UnsupportedQueryRequest;
+            const hub = graphMetricResultByName(result.graph_metric_results, hub_query.name) orelse return error.UnsupportedQueryRequest;
+            try validateHitsPairMetricStatusesCompatible(authority.status, hub.status);
+        }
+    }
+}
+
+fn graphMetricResultByName(
+    results: []const db_mod.types.GraphMetricResult,
+    name: []const u8,
+) ?db_mod.types.GraphMetricResult {
+    for (results) |result| {
+        if (std.mem.eql(u8, result.name, name)) return result;
+    }
+    return null;
+}
+
+fn isDefaultHitsAuthorityMetric(metric_name: []const u8) bool {
+    return std.mem.eql(u8, metric_name, "hits_authority");
+}
+
+fn isDefaultHitsHubMetric(metric_name: []const u8) bool {
+    return std.mem.eql(u8, metric_name, "hits_hub");
+}
+
+fn validateHitsPairMetricStatusesCompatible(
+    authority: db_mod.types.GraphMetricStatus,
+    hub: db_mod.types.GraphMetricStatus,
+) !void {
+    if (authority.published_generation == 0 or hub.published_generation == 0) return error.UnsupportedQueryRequest;
+    if (authority.published_generation != hub.published_generation) return error.UnsupportedQueryRequest;
+    try validateGraphMetricStatusCompatible(authority, hub);
+}
+
+fn validateGraphMetricFreshness(
+    freshness: db_mod.types.GraphMetricFreshness,
+    status: db_mod.types.GraphMetricStatus,
+) !void {
+    if (freshness == .fresh and status.state != .fresh) return error.UnsupportedQueryRequest;
+}
+
+fn validateGraphMetricPublishedStatus(status: db_mod.types.GraphMetricStatus) !void {
+    switch (status.state) {
+        .fresh, .stale, .building, .failed => {},
+        .not_ready, .disabled => return error.UnsupportedQueryRequest,
+    }
+    try validateGraphMetricStatusGenerationShape(status);
+    if (!std.math.isFinite(status.progress)) return error.UnsupportedQueryRequest;
+    if (status.progress < 0.0 or status.progress > 1.0) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(status.delta)) return error.UnsupportedQueryRequest;
+}
+
+fn validateGraphMetricUnpublishedStatus(status: db_mod.types.GraphMetricStatus) !void {
+    if (status.published_generation != 0) return error.UnsupportedQueryRequest;
+    switch (status.state) {
+        .not_ready, .building, .failed => {},
+        .fresh, .stale, .disabled => return error.UnsupportedQueryRequest,
+    }
+    if (!std.math.isFinite(status.progress)) return error.UnsupportedQueryRequest;
+    if (status.progress < 0.0 or status.progress > 1.0) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(status.delta)) return error.UnsupportedQueryRequest;
+}
+
+fn validateGraphMetricStatusGenerationShape(status: db_mod.types.GraphMetricStatus) !void {
+    const published = status.published_generation;
+    if (published == 0) return error.UnsupportedQueryRequest;
+    if (status.edge_generation != 0 and status.edge_generation < published) return error.UnsupportedQueryRequest;
+    if (status.target_edge_generation != 0 and status.target_edge_generation < published) return error.UnsupportedQueryRequest;
+    if (status.queued_generation != 0 and status.queued_generation < published) return error.UnsupportedQueryRequest;
+    if (status.building_generation != 0 and status.building_generation < published) return error.UnsupportedQueryRequest;
+    if (status.state == .fresh) {
+        if (status.edge_generation != 0 and status.edge_generation != published) return error.UnsupportedQueryRequest;
+        if (status.target_edge_generation != 0 and status.target_edge_generation != published) return error.UnsupportedQueryRequest;
+    }
+}
+
+fn ensureGraphMetricResultComparable(
+    builder: *const GraphMetricResultBuilder,
+    metric_result: db_mod.types.GraphMetricResult,
+) !void {
+    if (!std.mem.eql(u8, builder.index_name, metric_result.index_name)) return error.UnsupportedQueryRequest;
+    if (!std.mem.eql(u8, builder.metric_name, metric_result.metric_name)) return error.UnsupportedQueryRequest;
+    const existing = builder.status orelse return;
+    try validateGraphMetricStatusCompatible(existing, metric_result.status);
+    if (existing.published_generation != 0 and
+        metric_result.status.published_generation != 0 and
+        existing.published_generation != metric_result.status.published_generation)
+    {
+        return error.UnsupportedQueryRequest;
+    }
+    if ((existing.published_generation == 0 and builder.scores.items.len > 0) or
+        (metric_result.status.published_generation == 0 and metric_result.scores.len > 0))
+    {
+        return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateGraphMetricStatusCompatible(
+    existing: db_mod.types.GraphMetricStatus,
+    incoming: db_mod.types.GraphMetricStatus,
+) !void {
+    if (existing.metadata_version != 0 and
+        incoming.metadata_version != 0 and
+        existing.metadata_version != incoming.metadata_version)
+    {
+        return error.UnsupportedQueryRequest;
+    }
+    if (!existing.edge_filter.equivalent(incoming.edge_filter)) return error.UnsupportedQueryRequest;
+}
+
+fn validateGraphMetricScoreNodesUnique(
+    existing_scores: []const db_mod.types.GraphMetricScore,
+    incoming_scores: []const db_mod.types.GraphMetricScore,
+) !void {
+    for (incoming_scores, 0..) |incoming, i| {
+        if (!std.math.isFinite(incoming.score)) return error.UnsupportedQueryRequest;
+        for (incoming_scores[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.node, incoming.node)) return error.UnsupportedQueryRequest;
+        }
+        for (existing_scores) |existing| {
+            if (std.mem.eql(u8, existing.node, incoming.node)) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn graphMetricQueryTopK(req: db_mod.types.SearchRequest, query_name: []const u8) u32 {
+    for (req.graph_metric_queries) |query| {
+        if (std.mem.eql(u8, query.name, query_name)) return query.query.top_k;
+    }
+    return 0;
+}
+
+fn mergeGraphMetricRerankStatus(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+) !?db_mod.types.GraphMetricStatus {
+    const rerank = req.graph_metric_rerank orelse {
+        for (results) |result| {
+            if (result.graph_metric_rerank_status != null) return error.UnsupportedQueryRequest;
+        }
+        return null;
+    };
+
+    var merged: ?db_mod.types.GraphMetricStatus = null;
+    errdefer if (merged) |*status| status.deinit(alloc);
+
+    for (results) |result| {
+        const status = result.graph_metric_rerank_status orelse return error.UnsupportedQueryRequest;
+        if (!std.mem.eql(u8, status.name, rerank.metric_name)) return error.UnsupportedQueryRequest;
+        if (status.published_generation == 0) return error.UnsupportedQueryRequest;
+        try validateGraphMetricPublishedStatus(status);
+        try validateGraphMetricFreshness(rerank.freshness, status);
+        if (merged) |*existing| {
+            if (existing.published_generation != status.published_generation) return error.UnsupportedQueryRequest;
+            try validateGraphMetricStatusCompatible(existing.*, status);
+            try mergeGraphMetricStatusInto(alloc, existing, status);
+        } else {
+            merged = try cloneGraphMetricStatus(alloc, status);
+        }
+    }
+
+    return merged;
+}
+
+fn mergeGraphMetricStatusInto(alloc: std.mem.Allocator, target: *db_mod.types.GraphMetricStatus, source: db_mod.types.GraphMetricStatus) !void {
+    target.state = mergeGraphMetricState(target.state, source.state);
+    target.phase = mergeGraphMetricPhase(target.phase, source.phase);
+    target.metadata_version = mergeGraphMetricMetadataVersion(target.metadata_version, source.metadata_version);
+    target.maintenance_paused = target.maintenance_paused or source.maintenance_paused;
+    target.build_queued = target.build_queued or source.build_queued;
+    target.published_generation = mergeComparableGeneration(target.published_generation, source.published_generation);
+    target.edge_generation = @max(target.edge_generation, source.edge_generation);
+    target.target_edge_generation = @max(target.target_edge_generation, source.target_edge_generation);
+    target.queued_generation = @max(target.queued_generation, source.queued_generation);
+    target.building_generation = @max(target.building_generation, source.building_generation);
+    target.build_job_id = if (target.build_job_id == 0) source.build_job_id else if (source.build_job_id == 0 or source.build_job_id == target.build_job_id) target.build_job_id else 0;
+    target.build_started_at_ms = if (target.build_started_at_ms == 0) source.build_started_at_ms else if (source.build_started_at_ms == 0 or source.build_started_at_ms == target.build_started_at_ms) target.build_started_at_ms else @min(target.build_started_at_ms, source.build_started_at_ms);
+    target.build_iteration = @max(target.build_iteration, source.build_iteration);
+    target.build_lease_expires_at_ms = @max(target.build_lease_expires_at_ms, source.build_lease_expires_at_ms);
+    target.build_completed_units = @max(target.build_completed_units, source.build_completed_units);
+    target.build_total_units = @max(target.build_total_units, source.build_total_units);
+    if (target.build_worker_id.len == 0) {
+        target.build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+    } else if (source.build_worker_id.len > 0 and !std.mem.eql(u8, target.build_worker_id, source.build_worker_id)) {
+        alloc.free(target.build_worker_id);
+        target.build_worker_id = try alloc.dupe(u8, "multiple");
+    }
+    if (target.build_cursor.len == 0 and source.build_cursor.len > 0) {
+        target.build_cursor = try alloc.dupe(u8, source.build_cursor);
+    }
+    if (target.build_pages.len == 0 and source.build_pages.len > 0) {
+        target.build_pages = try cloneGraphMetricBuildPageStatuses(alloc, source.build_pages);
+    } else if (source.build_pages.len > 0) {
+        target.build_pages_truncated = true;
+    }
+    target.build_pages_truncated = target.build_pages_truncated or source.build_pages_truncated;
+    target.retry_count = @max(target.retry_count, source.retry_count);
+    if (target.last_error.len == 0 and source.last_error.len > 0) {
+        target.last_error = try alloc.dupe(u8, source.last_error);
+    }
+    target.progress = @min(target.progress, source.progress);
+    target.converged = target.converged and source.converged;
+    target.iterations_completed = @max(target.iterations_completed, source.iterations_completed);
+    target.delta = @max(target.delta, source.delta);
+    target.computed_at_ms = @max(target.computed_at_ms, source.computed_at_ms);
+}
+
+fn mergeGraphMetricMetadataVersion(left: u32, right: u32) u32 {
+    if (left == 0) return right;
+    if (right == 0) return left;
+    if (left == right) return left;
+    return 0;
+}
+
+fn mergeComparableGeneration(left: u64, right: u64) u64 {
+    if (left == 0) return right;
+    if (right == 0) return left;
+    if (left == right) return left;
+    return @min(left, right);
+}
+
+fn mergeGraphMetricState(left: graph_mod.GraphIndex.GraphMetricState, right: graph_mod.GraphIndex.GraphMetricState) graph_mod.GraphIndex.GraphMetricState {
+    return if (graphMetricStateSeverity(right) > graphMetricStateSeverity(left)) right else left;
+}
+
+fn graphMetricStateSeverity(state: graph_mod.GraphIndex.GraphMetricState) u8 {
+    return switch (state) {
+        .disabled => 5,
+        .failed => 4,
+        .building => 3,
+        .not_ready => 2,
+        .stale => 1,
+        .fresh => 0,
+    };
+}
+
+fn mergeGraphMetricPhase(left: graph_mod.GraphIndex.GraphMetricBuildPhase, right: graph_mod.GraphIndex.GraphMetricBuildPhase) graph_mod.GraphIndex.GraphMetricBuildPhase {
+    return if (graphMetricPhaseSeverity(right) > graphMetricPhaseSeverity(left)) right else left;
+}
+
+fn graphMetricPhaseSeverity(phase: graph_mod.GraphIndex.GraphMetricBuildPhase) u8 {
+    return switch (phase) {
+        .cleanup_old_generations => 10,
+        .publish_generation, .publishing => 9,
+        .check_convergence => 8,
+        .hits_hub_reduce_ranks => 8,
+        .hits_hub_contributions => 8,
+        .reduce_ranks => 7,
+        .iterate_contributions, .computing => 6,
+        .initialize_ranks => 5,
+        .scan_edges_and_out_degree => 4,
+        .prepare_generation => 3,
+        .idle => 1,
+        .complete => 0,
+    };
+}
+
 fn mergeGraphSearchResults(
     alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
     results: []const db_mod.types.SearchResult,
 ) ![]db_mod.types.GraphSearchResult {
+    try validateRequestedGraphSearchFanIn(req, results);
+
     var builders = std.ArrayListUnmanaged(GraphSearchResultBuilder).empty;
     defer {
         for (builders.items) |*builder| builder.deinit(alloc);
@@ -235,16 +742,25 @@ fn mergeGraphSearchResults(
             builder.total_hits +|= graph_result.total_hits;
 
             for (graph_result.nodes) |node| {
+                try validateGraphResultNodePayload(node);
+                try validateGraphResultNodeKeyUnique(builder.nodes.items, graph_result.nodes, node.key);
                 try builder.nodes.append(alloc, try cloneGraphResultNode(alloc, node));
             }
             for (graph_result.paths) |path| {
+                try validateGraphPathPayload(path);
                 try builder.paths.append(alloc, try cloneGraphPath(alloc, path));
             }
             for (graph_result.matches) |match| {
+                try validateGraphPatternMatchPayload(match);
                 try builder.matches.append(alloc, try cloneGraphPatternMatch(alloc, match));
             }
             for (graph_result.hits) |hit| {
+                try validateGraphSearchHitPayload(hit);
+                try validateGraphSearchHitIdUnique(builder.hits.items, graph_result.hits, hit.id);
                 try builder.hits.append(alloc, try hit.clone(alloc));
+            }
+            for (graph_result.metric_status) |status| {
+                try mergeGraphSearchMetricStatus(alloc, &builder.metric_status, status);
             }
         }
     }
@@ -263,8 +779,360 @@ fn mergeGraphSearchResults(
         builder.paths = .empty;
         builder.matches = .empty;
         builder.hits = .empty;
+        builder.metric_status = .empty;
     }
     return merged;
+}
+
+fn stripUnrequestedGraphSearchMetricStatuses(
+    alloc: std.mem.Allocator,
+    req: db_mod.types.SearchRequest,
+    graph_results: []db_mod.types.GraphSearchResult,
+) void {
+    for (graph_results) |*graph_result| {
+        if (graphSearchQueryIncludesMetricStatus(req, graph_result.name)) continue;
+        freeGraphSearchMetricStatuses(alloc, graph_result);
+    }
+}
+
+fn graphSearchQueryIncludesMetricStatus(req: db_mod.types.SearchRequest, name: []const u8) bool {
+    for (req.graph_queries) |query| {
+        if (std.mem.eql(u8, query.name, name)) return query.query.include_metric_status;
+    }
+    return false;
+}
+
+fn freeGraphSearchMetricStatuses(
+    alloc: std.mem.Allocator,
+    graph_result: *db_mod.types.GraphSearchResult,
+) void {
+    for (graph_result.metric_status) |*status| status.deinit(alloc);
+    if (graph_result.metric_status.len > 0) alloc.free(graph_result.metric_status);
+    graph_result.metric_status = &.{};
+}
+
+fn validateGraphResultNodePayload(node: graph_query_mod.GraphResultNode) !void {
+    if (!std.math.isFinite(node.distance)) return error.UnsupportedQueryRequest;
+    if (node.path) |path_nodes| {
+        if (node.path_edges) |edges| {
+            if (path_nodes.len != edges.len + 1) return error.UnsupportedQueryRequest;
+            if (node.depth != edges.len) return error.UnsupportedQueryRequest;
+        }
+    } else if (node.path_edges != null) {
+        return error.UnsupportedQueryRequest;
+    }
+    if (node.path_edges) |edges| {
+        for (edges) |edge| {
+            if (!std.math.isFinite(edge.weight)) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateGraphResultNodeKeyUnique(
+    existing: []const graph_query_mod.GraphResultNode,
+    incoming: []const graph_query_mod.GraphResultNode,
+    key: []const u8,
+) !void {
+    for (existing) |node| {
+        if (std.mem.eql(u8, node.key, key)) return error.UnsupportedQueryRequest;
+    }
+    var seen: usize = 0;
+    for (incoming) |node| {
+        if (std.mem.eql(u8, node.key, key)) {
+            seen += 1;
+            if (seen > 1) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateGraphPathPayload(path: db_mod.types.GraphPath) !void {
+    if (path.nodes.len != path.edges.len + 1) return error.UnsupportedQueryRequest;
+    if (path.length != path.edges.len) return error.UnsupportedQueryRequest;
+    if (!std.math.isFinite(path.total_weight)) return error.UnsupportedQueryRequest;
+    for (path.edges) |edge| {
+        if (!std.math.isFinite(edge.weight)) return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateGraphPatternMatchPayload(match: db_mod.types.GraphPatternMatch) !void {
+    for (match.bindings) |binding| try validateGraphResultNodePayload(binding.node);
+    for (match.path) |edge| {
+        if (!std.math.isFinite(edge.weight)) return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateGraphSearchHitPayload(hit: db_mod.types.SearchHit) !void {
+    if (hit.score_details != null) return error.UnsupportedQueryRequest;
+    if (hit.score) |score| {
+        if (!std.math.isFinite(score)) return error.UnsupportedQueryRequest;
+    }
+}
+
+fn validateGraphSearchHitIdUnique(
+    existing: []const db_mod.types.SearchHit,
+    incoming: []const db_mod.types.SearchHit,
+    id: []const u8,
+) !void {
+    for (existing) |hit| {
+        if (std.mem.eql(u8, hit.id, id)) return error.UnsupportedQueryRequest;
+    }
+    var seen: usize = 0;
+    for (incoming) |hit| {
+        if (std.mem.eql(u8, hit.id, id)) {
+            seen += 1;
+            if (seen > 1) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateRequestedGraphSearchFanIn(
+    req: db_mod.types.SearchRequest,
+    results: []const db_mod.types.SearchResult,
+) !void {
+    if (req.graph_queries.len == 0) return;
+    try validateGraphSearchQueryNamesUnique(req.graph_queries);
+
+    for (results) |result| {
+        for (result.graph_results) |graph_result| {
+            if (!graphSearchQueryRequested(req, graph_result.name)) return error.UnsupportedQueryRequest;
+        }
+        for (req.graph_queries) |query| {
+            var found = false;
+            for (result.graph_results) |graph_result| {
+                if (!std.mem.eql(u8, graph_result.name, query.name)) continue;
+                if (found) return error.UnsupportedQueryRequest;
+                found = true;
+                try validateGraphSearchMetricStatuses(query, graph_result);
+            }
+            if (!found) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateGraphSearchQueryNamesUnique(queries: []const db_mod.types.NamedGraphQuery) !void {
+    for (queries, 0..) |query, i| {
+        for (queries[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, query.name)) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn graphSearchQueryRequested(req: db_mod.types.SearchRequest, query_name: []const u8) bool {
+    for (req.graph_queries) |query| {
+        if (std.mem.eql(u8, query.name, query_name)) return true;
+    }
+    return false;
+}
+
+fn validateGraphSearchMetricStatuses(
+    query: db_mod.types.NamedGraphQuery,
+    graph_result: db_mod.types.GraphSearchResult,
+) !void {
+    try validateGraphSearchProjectedMetricNamesUnique(query.query.metrics);
+    try validateGraphSearchOrderMetricNamesUnique(query.query.order_by);
+    const expects_metric_status = query.query.include_metric_status or
+        query.query.metrics.len > 0 or
+        query.query.order_by.len > 0 or
+        query.query.where_metric.len > 0;
+    if (!expects_metric_status and graph_result.metric_status.len > 0) return error.UnsupportedQueryRequest;
+    try validateGraphSearchMetricStatusList(query, graph_result.metric_status);
+    if (!query.query.include_metric_status) {
+        try validateGraphSearchMetricStatusNamesRequested(query, graph_result.metric_status);
+    }
+    try validateGraphSearchMetricPayloads(query, graph_result);
+    for (query.query.metrics) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness, false);
+    for (query.query.order_by) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness, true);
+    for (query.query.where_metric) |metric| try validateGraphSearchMetricStatus(graph_result, metric.name, metric.freshness, true);
+}
+
+fn validateGraphSearchProjectedMetricNamesUnique(metrics: []const graph_query_mod.GraphMetricRead) !void {
+    for (metrics, 0..) |metric, i| {
+        for (metrics[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, metric.name)) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateGraphSearchOrderMetricNamesUnique(metrics: []const graph_query_mod.GraphMetricOrder) !void {
+    for (metrics, 0..) |metric, i| {
+        for (metrics[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, metric.name)) return error.UnsupportedQueryRequest;
+        }
+    }
+}
+
+fn validateGraphSearchMetricStatusList(
+    query: db_mod.types.NamedGraphQuery,
+    statuses: []const db_mod.types.GraphMetricStatus,
+) !void {
+    for (statuses, 0..) |status, i| {
+        const require_published = graphSearchMetricScoreReadRequested(query, status.name);
+        const allow_unpublished = !require_published and
+            (query.query.include_metric_status or graphSearchMetricProjected(query, status.name));
+        if (status.published_generation == 0) {
+            if (!allow_unpublished) return error.UnsupportedQueryRequest;
+            try validateGraphMetricUnpublishedStatus(status);
+        } else {
+            try validateGraphMetricPublishedStatus(status);
+        }
+        for (statuses[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, status.name)) return error.UnsupportedQueryRequest;
+        }
+    }
+    try validateHitsPairMetricStatusList(statuses);
+}
+
+fn validateHitsPairMetricStatusList(statuses: []const db_mod.types.GraphMetricStatus) !void {
+    var authority: ?db_mod.types.GraphMetricStatus = null;
+    var hub: ?db_mod.types.GraphMetricStatus = null;
+    for (statuses) |status| {
+        if (isDefaultHitsAuthorityMetric(status.name)) {
+            authority = status;
+        } else if (isDefaultHitsHubMetric(status.name)) {
+            hub = status;
+        }
+    }
+    if (authority) |authority_status| {
+        if (hub) |hub_status| try validateGraphSearchHitsPairMetricStatusesCompatible(authority_status, hub_status);
+    }
+}
+
+fn validateGraphSearchHitsPairMetricStatusesCompatible(
+    authority: db_mod.types.GraphMetricStatus,
+    hub: db_mod.types.GraphMetricStatus,
+) !void {
+    if (authority.published_generation == 0 or hub.published_generation == 0) {
+        if (authority.published_generation != 0 or hub.published_generation != 0) return error.UnsupportedQueryRequest;
+        try validateGraphMetricStatusCompatible(authority, hub);
+        return;
+    }
+    try validateHitsPairMetricStatusesCompatible(authority, hub);
+}
+
+fn validateGraphSearchMetricStatusNamesRequested(
+    query: db_mod.types.NamedGraphQuery,
+    statuses: []const db_mod.types.GraphMetricStatus,
+) !void {
+    for (statuses) |status| {
+        if (!graphSearchMetricNameRequested(query, status.name)) return error.UnsupportedQueryRequest;
+    }
+}
+
+fn graphSearchMetricNameRequested(
+    query: db_mod.types.NamedGraphQuery,
+    metric_name: []const u8,
+) bool {
+    if (graphSearchMetricProjected(query, metric_name)) return true;
+    if (graphSearchMetricScoreReadRequested(query, metric_name)) return true;
+    return false;
+}
+
+fn graphSearchMetricProjected(
+    query: db_mod.types.NamedGraphQuery,
+    metric_name: []const u8,
+) bool {
+    for (query.query.metrics) |metric| {
+        if (std.mem.eql(u8, metric.name, metric_name)) return true;
+    }
+    return false;
+}
+
+fn graphSearchMetricScoreReadRequested(
+    query: db_mod.types.NamedGraphQuery,
+    metric_name: []const u8,
+) bool {
+    for (query.query.order_by) |metric| {
+        if (std.mem.eql(u8, metric.name, metric_name)) return true;
+    }
+    for (query.query.where_metric) |metric| {
+        if (std.mem.eql(u8, metric.name, metric_name)) return true;
+    }
+    return false;
+}
+
+fn validateGraphSearchMetricPayloads(
+    query: db_mod.types.NamedGraphQuery,
+    graph_result: db_mod.types.GraphSearchResult,
+) !void {
+    for (graph_result.nodes) |node| try validateGraphResultNodeMetricPayload(query.query.metrics, node);
+    for (graph_result.matches) |match| {
+        for (match.bindings) |binding| try validateGraphResultNodeMetricPayload(query.query.metrics, binding.node);
+    }
+}
+
+fn validateGraphResultNodeMetricPayload(
+    projected_metrics: []const graph_query_mod.GraphMetricRead,
+    node: graph_query_mod.GraphResultNode,
+) !void {
+    for (node.metrics, 0..) |metric, i| {
+        if (!graphQueryMetricProjected(projected_metrics, metric.name)) return error.UnsupportedQueryRequest;
+        for (node.metrics[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, metric.name)) return error.UnsupportedQueryRequest;
+        }
+        if (metric.score) |score| {
+            if (!std.math.isFinite(score)) return error.UnsupportedQueryRequest;
+        }
+    }
+    for (projected_metrics) |projected| {
+        var found = false;
+        for (node.metrics) |metric| {
+            if (!std.mem.eql(u8, metric.name, projected.name)) continue;
+            found = true;
+            break;
+        }
+        if (!found) return error.UnsupportedQueryRequest;
+    }
+}
+
+fn graphQueryMetricProjected(
+    projected_metrics: []const graph_query_mod.GraphMetricRead,
+    metric_name: []const u8,
+) bool {
+    for (projected_metrics) |metric| {
+        if (std.mem.eql(u8, metric.name, metric_name)) return true;
+    }
+    return false;
+}
+
+fn validateGraphSearchMetricStatus(
+    graph_result: db_mod.types.GraphSearchResult,
+    metric_name: []const u8,
+    freshness: graph_query_mod.GraphMetricFreshness,
+    require_published: bool,
+) !void {
+    var found = false;
+    for (graph_result.metric_status) |status| {
+        if (!std.mem.eql(u8, status.name, metric_name)) continue;
+        if (found) return error.UnsupportedQueryRequest;
+        found = true;
+        try validateGraphQueryMetricFreshness(freshness, status, require_published);
+    }
+    if (!found) return error.UnsupportedQueryRequest;
+}
+
+fn validateGraphQueryMetricFreshness(
+    freshness: graph_query_mod.GraphMetricFreshness,
+    status: db_mod.types.GraphMetricStatus,
+    require_published: bool,
+) !void {
+    if (require_published and status.published_generation == 0) return error.UnsupportedQueryRequest;
+    if (freshness == .fresh and status.published_generation == 0) return error.UnsupportedQueryRequest;
+    if (freshness == .fresh and status.state != .fresh) return error.UnsupportedQueryRequest;
+}
+
+fn mergeGraphSearchMetricStatus(
+    alloc: std.mem.Allocator,
+    statuses: *std.ArrayListUnmanaged(db_mod.types.GraphMetricStatus),
+    source: db_mod.types.GraphMetricStatus,
+) !void {
+    for (statuses.items) |*status| {
+        if (!std.mem.eql(u8, status.name, source.name)) continue;
+        if (status.published_generation != source.published_generation) return error.UnsupportedQueryRequest;
+        try validateGraphMetricStatusCompatible(status.*, source);
+        try mergeGraphMetricStatusInto(alloc, status, source);
+        return;
+    }
+    try statuses.append(alloc, try cloneGraphMetricStatus(alloc, source));
 }
 
 fn cloneGraphSearchResult(
@@ -317,6 +1185,17 @@ fn cloneGraphSearchResult(
         initialized_matches += 1;
     }
 
+    const metric_status = try alloc.alloc(db_mod.types.GraphMetricStatus, source.metric_status.len);
+    var initialized_metric_status: usize = 0;
+    errdefer {
+        for (metric_status[0..initialized_metric_status]) |*status| status.deinit(alloc);
+        if (source.metric_status.len > 0) alloc.free(metric_status);
+    }
+    for (source.metric_status, 0..) |status, i| {
+        metric_status[i] = try cloneGraphMetricStatus(alloc, status);
+        initialized_metric_status += 1;
+    }
+
     return .{
         .name = try alloc.dupe(u8, source.name),
         .nodes = nodes,
@@ -324,7 +1203,104 @@ fn cloneGraphSearchResult(
         .matches = matches,
         .hits = hits,
         .total_hits = source.total_hits,
+        .metric_status = metric_status,
     };
+}
+
+fn cloneGraphMetricStatus(
+    alloc: std.mem.Allocator,
+    source: db_mod.types.GraphMetricStatus,
+) !db_mod.types.GraphMetricStatus {
+    const name = try alloc.dupe(u8, source.name);
+    errdefer alloc.free(name);
+    var edge_filter = try source.edge_filter.cloneAlloc(alloc);
+    errdefer edge_filter.deinit(alloc);
+    const recent_events = if (source.recent_events.len > 0)
+        try alloc.dupe(graph_mod.GraphIndex.GraphMetricEvent, source.recent_events)
+    else
+        @constCast((&[_]graph_mod.GraphIndex.GraphMetricEvent{})[0..]);
+    errdefer if (recent_events.len > 0) alloc.free(recent_events);
+    const last_error = if (source.last_error.len > 0) try alloc.dupe(u8, source.last_error) else "";
+    errdefer if (last_error.len > 0) alloc.free(last_error);
+    const build_worker_id = if (source.build_worker_id.len > 0) try alloc.dupe(u8, source.build_worker_id) else "";
+    errdefer if (build_worker_id.len > 0) alloc.free(build_worker_id);
+    const build_cursor = if (source.build_cursor.len > 0) try alloc.dupe(u8, source.build_cursor) else "";
+    errdefer if (build_cursor.len > 0) alloc.free(build_cursor);
+    const build_pages = try cloneGraphMetricBuildPageStatuses(alloc, source.build_pages);
+    errdefer {
+        for (build_pages) |*page| page.deinit(alloc);
+        if (build_pages.len > 0) alloc.free(build_pages);
+    }
+    return .{
+        .name = name,
+        .state = source.state,
+        .phase = source.phase,
+        .edge_filter = edge_filter,
+        .metadata_version = source.metadata_version,
+        .maintenance_paused = source.maintenance_paused,
+        .build_queued = source.build_queued,
+        .published_generation = source.published_generation,
+        .edge_generation = source.edge_generation,
+        .target_edge_generation = source.target_edge_generation,
+        .queued_generation = source.queued_generation,
+        .building_generation = source.building_generation,
+        .build_job_id = source.build_job_id,
+        .build_started_at_ms = source.build_started_at_ms,
+        .build_iteration = source.build_iteration,
+        .build_lease_expires_at_ms = source.build_lease_expires_at_ms,
+        .build_worker_id = build_worker_id,
+        .build_cursor = build_cursor,
+        .build_completed_units = source.build_completed_units,
+        .build_total_units = source.build_total_units,
+        .build_pages = build_pages,
+        .build_pages_truncated = source.build_pages_truncated,
+        .retry_count = source.retry_count,
+        .last_error = last_error,
+        .progress = source.progress,
+        .converged = source.converged,
+        .iterations_completed = source.iterations_completed,
+        .delta = source.delta,
+        .computed_at_ms = source.computed_at_ms,
+        .last_event = source.last_event,
+        .recent_events = recent_events,
+    };
+}
+
+fn cloneGraphMetricBuildPageStatuses(
+    alloc: std.mem.Allocator,
+    source: []const db_mod.types.GraphMetricBuildPageStatus,
+) ![]db_mod.types.GraphMetricBuildPageStatus {
+    if (source.len == 0) return @constCast((&[_]db_mod.types.GraphMetricBuildPageStatus{})[0..]);
+    const out = try alloc.alloc(db_mod.types.GraphMetricBuildPageStatus, source.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*page| page.deinit(alloc);
+        alloc.free(out);
+    }
+    for (source, 0..) |page, i| {
+        const worker_id = if (page.worker_id.len > 0) try alloc.dupe(u8, page.worker_id) else "";
+        errdefer if (worker_id.len > 0) alloc.free(worker_id);
+        const cursor = if (page.cursor.len > 0) try alloc.dupe(u8, page.cursor) else "";
+        errdefer if (cursor.len > 0) alloc.free(cursor);
+        const last_error = if (page.last_error.len > 0) try alloc.dupe(u8, page.last_error) else "";
+        errdefer if (last_error.len > 0) alloc.free(last_error);
+        out[i] = .{
+            .phase = page.phase,
+            .iteration = page.iteration,
+            .page_id = page.page_id,
+            .state = page.state,
+            .range_kind = page.range_kind,
+            .worker_id = worker_id,
+            .lease_expires_at_ms = page.lease_expires_at_ms,
+            .attempt = page.attempt,
+            .cursor = cursor,
+            .completed_units = page.completed_units,
+            .total_units = page.total_units,
+            .last_error = last_error,
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn cloneGraphPatternMatch(
@@ -407,6 +1383,20 @@ fn cloneGraphResultNode(
         break :blk out;
     } else null;
 
+    const metrics = try alloc.alloc(graph_query_mod.GraphMetricValue, source.metrics.len);
+    var initialized_metrics: usize = 0;
+    errdefer {
+        for (metrics[0..initialized_metrics]) |*metric| metric.deinit(alloc);
+        if (source.metrics.len > 0) alloc.free(metrics);
+    }
+    for (source.metrics, 0..) |metric, i| {
+        metrics[i] = .{
+            .name = try alloc.dupe(u8, metric.name),
+            .score = metric.score,
+        };
+        initialized_metrics += 1;
+    }
+
     return .{
         .key = try alloc.dupe(u8, source.key),
         .depth = source.depth,
@@ -414,6 +1404,8 @@ fn cloneGraphResultNode(
         .path = path,
         .path_edges = path_edges,
         .provenance = provenance,
+        .table = if (source.table) |table| try alloc.dupe(u8, table) else null,
+        .metrics = metrics,
     };
 }
 
@@ -555,6 +1547,42 @@ test "query parser accepts bleve match query shape" {
     try std.testing.expectEqualStrings("alpha", owned.req.full_text.?.match.text);
 }
 
+test "query parser accepts public generated match helper shape" {
+    var owned = try parsePublicQueryRequest(std.testing.allocator, null, "docs",
+        \\{"full_text_search":{"match":"hello","field":"body"},"fields":[],"limit":5,"count":false,"profile":false}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+    try std.testing.expect(owned.req.full_text != null);
+    try std.testing.expect(owned.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", owned.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("hello", owned.req.full_text.?.match.text);
+}
+
+test "query parser accepts public generated match helper shape with explicit nulls" {
+    var owned = try parsePublicQueryRequest(std.testing.allocator, null, "docs",
+        \\{"table":null,"query":null,"full_text_search":{"match":"hello","field":"body","analyzer":null,"boost":null,"prefix_length":null,"fuzziness":null,"operator":null},"semantic_search":null,"embedding_template":null,"indexes":null,"filter_prefix":null,"filter_query":null,"exclusion_query":null,"aggregations":null,"embeddings":null,"search_effort":null,"fields":[],"limit":5,"offset":null,"order_by":null,"search_after":null,"search_before":null,"distance_under":null,"distance_over":null,"merge_config":null,"count":false,"profile":false,"reranker":null,"graph_metric_rerank":null,"analyses":null,"graph_searches":null,"expand_strategy":null,"document_renderer":null,"pruner":null,"join":null,"foreign_sources":null}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+    try std.testing.expect(owned.req.full_text != null);
+    try std.testing.expect(owned.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", owned.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("hello", owned.req.full_text.?.match.text);
+}
+
+test "query parser accepts public generated match helper shape with semantic resolver" {
+    var owned = try parsePublicQueryRequest(std.testing.allocator, FakeSemanticResolver.iface(), "docs",
+        \\{"table":null,"query":null,"full_text_search":{"match":"hello","field":"body","analyzer":null,"boost":null,"prefix_length":null,"fuzziness":null,"operator":null},"semantic_search":null,"embedding_template":null,"indexes":null,"filter_prefix":null,"filter_query":null,"exclusion_query":null,"aggregations":null,"embeddings":null,"search_effort":null,"fields":[],"limit":5,"offset":null,"order_by":null,"search_after":null,"search_before":null,"distance_under":null,"distance_over":null,"merge_config":null,"count":false,"profile":false,"reranker":null,"graph_metric_rerank":null,"analyses":null,"graph_searches":null,"expand_strategy":null,"document_renderer":null,"pruner":null,"join":null,"foreign_sources":null}
+    );
+    defer owned.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+    try std.testing.expect(owned.req.full_text != null);
+    try std.testing.expect(owned.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", owned.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("hello", owned.req.full_text.?.match.text);
+}
+
 test "query parser accepts bleve match_all query shape" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
         \\{"full_text_search":{"match_all":{}},"limit":5}
@@ -646,6 +1674,19 @@ test "query parser accepts bleve query string queries" {
     try std.testing.expect(root.must[1] == .match_phrase);
     try std.testing.expectEqualStrings("title", root.must[1].match_phrase.field);
     try std.testing.expectEqualStrings("beta gamma", root.must[1].match_phrase.text);
+}
+
+test "query parser accepts public query string full text" {
+    var owned = try parsePublicQueryRequest(std.testing.allocator, null, "docs",
+        \\{"full_text_search":{"query":"body:hello"},"limit":5}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u32, 5), owned.req.limit);
+    try std.testing.expect(owned.req.full_text != null);
+    try std.testing.expect(owned.req.full_text.? == .match);
+    try std.testing.expectEqualStrings("body", owned.req.full_text.?.match.field);
+    try std.testing.expectEqualStrings("hello", owned.req.full_text.?.match.text);
 }
 
 test "query parser accepts bleve query string boosts" {
@@ -855,7 +1896,7 @@ test "query parser keeps stored documents for dense reranking without fields" {
 
 test "query parser accepts graph searches" {
     var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
-        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"]}}},"limit":10}
+        \\{"graph_searches":{"neighbors":{"type":"neighbors","index_name":"graph_idx","start_nodes":{"keys":["doc:a"]},"params":{"edge_types":["links"]},"metrics":["pagerank"],"order_by":[{"metric":"pagerank","direction":"desc","nulls":"last"}],"where_metric":[{"metric":"pagerank","op":">=","value":0.01}],"metric_freshness":"fresh","include_metric_status":true}},"limit":10}
     );
     defer owned.deinit(std.testing.allocator);
 
@@ -867,6 +1908,49 @@ test "query parser accepts graph searches" {
         .keys => |keys| try std.testing.expectEqualStrings("doc:a", keys[0]),
         else => return error.TestUnexpectedResult,
     }
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.metrics.len);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_queries[0].query.metrics[0].name);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricFreshness.fresh, owned.req.graph_queries[0].query.metrics[0].freshness);
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.order_by.len);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_queries[0].query.order_by[0].name);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricOrderDirection.desc, owned.req.graph_queries[0].query.order_by[0].direction);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricNullOrder.last, owned.req.graph_queries[0].query.order_by[0].nulls);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricFreshness.fresh, owned.req.graph_queries[0].query.order_by[0].freshness);
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_queries[0].query.where_metric.len);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_queries[0].query.where_metric[0].name);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricFilterOp.gte, owned.req.graph_queries[0].query.where_metric[0].op);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.01), owned.req.graph_queries[0].query.where_metric[0].value, 0.000001);
+    try std.testing.expectEqual(graph_query_mod.GraphMetricFreshness.fresh, owned.req.graph_queries[0].query.where_metric[0].freshness);
+    try std.testing.expect(owned.req.graph_queries[0].query.include_metric_status);
+}
+
+test "query parser accepts direct graph metric reads" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"graph_metric":{"index":"graph_idx","metric":"pagerank","top_k":25,"metric_freshness":"fresh"}}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), owned.req.graph_metric_queries.len);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_metric_queries[0].name);
+    try std.testing.expectEqualStrings("graph_idx", owned.req.graph_metric_queries[0].query.index_name);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_metric_queries[0].query.metric_name);
+    try std.testing.expectEqual(@as(u32, 25), owned.req.graph_metric_queries[0].query.top_k);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, owned.req.graph_metric_queries[0].query.freshness);
+}
+
+test "query parser accepts graph metric rerank" {
+    var owned = try parseQueryRequest(std.testing.allocator, null, "docs",
+        \\{"full_text_search":{"match_all":{}},"graph_metric_rerank":{"index":"graph_idx","metric":"pagerank","base_weight":0.5,"weight":2.5,"missing_score":-0.25,"metric_freshness":"fresh"},"limit":10}
+    );
+    defer owned.deinit(std.testing.allocator);
+
+    try std.testing.expect(owned.req.graph_metric_rerank != null);
+    try std.testing.expectEqualStrings("graph_idx", owned.req.graph_metric_rerank.?.index_name);
+    try std.testing.expectEqualStrings("pagerank", owned.req.graph_metric_rerank.?.metric_name);
+    try std.testing.expectEqual(db_mod.types.GraphMetricFreshness.fresh, owned.req.graph_metric_rerank.?.freshness);
+    try std.testing.expectApproxEqAbs(@as(f64, 0.5), owned.req.graph_metric_rerank.?.base_weight, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, 2.5), owned.req.graph_metric_rerank.?.weight, 0.000001);
+    try std.testing.expectApproxEqAbs(@as(f64, -0.25), owned.req.graph_metric_rerank.?.missing_score, 0.000001);
 }
 
 test "query parser accepts graph pattern searches" {
@@ -908,6 +1992,46 @@ test "query encoder emits antfly-style response envelope" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"responses\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_id\":\"doc:a\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"table\":\"docs\"") != null);
+}
+
+test "query encoder emits graph metric results" {
+    const alloc = std.testing.allocator;
+    var scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    scores[0] = .{
+        .node = try alloc.dupe(u8, "doc:b"),
+        .score = 0.75,
+    };
+    var metric_results = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    metric_results[0] = .{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 3,
+            .edge_generation = 3,
+            .converged = true,
+            .iterations_completed = 12,
+            .delta = 0.00001,
+            .computed_at_ms = 1780000000000,
+        },
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = metric_results,
+    };
+    defer result.deinit();
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{}, result);
+    defer encoded.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_metric_results\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"state\":\"fresh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"node\":\"doc:b\"") != null);
 }
 
 test "query encoder does not expose internal doc ordinals" {
@@ -999,9 +2123,58 @@ test "query encoder supports count-only and profile responses" {
         .hits = hits,
         .total_hits = 1,
     };
+    const graph_metric_results = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    graph_metric_results[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 7,
+            .edge_generation = 7,
+            .target_edge_generation = 7,
+            .progress = 1.0,
+            .converged = true,
+            .iterations_completed = 12,
+            .computed_at_ms = 1780000000000,
+        },
+    };
+    result.graph_metric_results = graph_metric_results;
+    result.graph_metric_rerank_status = .{
+        .name = try alloc.dupe(u8, "pagerank"),
+        .state = .fresh,
+        .published_generation = 7,
+        .edge_generation = 7,
+        .target_edge_generation = 7,
+        .progress = 1.0,
+        .converged = true,
+        .iterations_completed = 12,
+        .computed_at_ms = 1780000000000,
+    };
     defer result.deinit();
 
-    var encoded = try encodeQueryResponses(alloc, "docs", .{ .count_only = true, .profile = true }, .{
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .fresh,
+        },
+    }};
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{
+        .count_only = true,
+        .profile = true,
+        .graph_metric_queries = &graph_metric_queries,
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+    }, .{
         .took_ms = 7,
         .shard_count = 3,
         .merged = true,
@@ -1023,6 +2196,174 @@ test "query encoder supports count-only and profile responses" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"resolved_search_width\":128") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"resolved_epsilon\":0.15") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"hbc_reranked_vectors\":42") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_metrics\":[{\"query_name\":\"central\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"query_name\":\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"freshness\":\"fresh\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"published_generation\":7") != null);
+}
+
+test "query profile reports failed graph metric status across read surfaces" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_results = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    graph_metric_results[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .failed,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .building_generation = 6,
+            .retry_count = 2,
+            .last_error = try alloc.dupe(u8, "direct metric rebuild failed"),
+            .progress = 0.4,
+            .converged = true,
+        },
+    };
+
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .failed,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .building_generation = 6,
+                .retry_count = 3,
+                .last_error = try alloc.dupe(u8, "graph query metric rebuild failed"),
+                .progress = 0.3,
+                .converged = true,
+            },
+        }),
+    };
+
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = graph_metric_results,
+        .graph_results = graph_results,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .failed,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .building_generation = 6,
+            .retry_count = 4,
+            .last_error = try alloc.dupe(u8, "rerank metric rebuild failed"),
+            .progress = 0.2,
+            .converged = true,
+        },
+    };
+    defer result.deinit();
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+        },
+    }};
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+            .include_metric_status = true,
+        },
+    }};
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{
+        .profile = true,
+        .graph_metric_queries = &graph_metric_queries,
+        .graph_queries = &graph_queries,
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, .{ .took_ms = 2 }, result);
+    defer encoded.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"freshness\":\"published\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"published_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"building_generation\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"retry_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"retry_count\":3") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"retry_count\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"last_error\":\"direct metric rebuild failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"last_error\":\"graph query metric rebuild failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"last_error\":\"rerank metric rebuild failed\"") != null);
+}
+
+test "query encoder emits graph metric rerank score details" {
+    const alloc = std.testing.allocator;
+    var hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 4.0,
+        .score_details = .{
+            .index_name = try alloc.dupe(u8, "graph_idx"),
+            .metric_name = try alloc.dupe(u8, "pagerank"),
+            .base_score = 1.0,
+            .base_weight = 0.5,
+            .metric_score = 0.7,
+            .metric_score_used = 0.7,
+            .metric_weight = 5.0,
+            .missing_score_used = false,
+            .final_score = 4.0,
+            .published_generation = 11,
+        },
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = hits,
+        .total_hits = 1,
+    };
+    defer result.deinit();
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{}, .{ .took_ms = 2 }, result);
+    defer encoded.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"_score_details\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"index_name\":\"graph_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_name\":\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"base_score\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"base_weight\":0.5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_score\":0.7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_score_used\":0.7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_weight\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"missing_score_used\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"final_score\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"published_generation\":11") != null);
 }
 
 test "query encoder projects deferred stored fields without round-tripping bytes" {
@@ -1085,6 +2426,9 @@ test "query encoder emits graph results" {
         .distance = 1,
         .path = null,
         .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.75 },
+        }),
     };
     const graph_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
     graph_hits[0] = .{
@@ -1099,6 +2443,18 @@ test "query encoder emits graph results" {
         .paths = &.{},
         .hits = graph_hits,
         .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 3,
+                .edge_generation = 3,
+                .converged = true,
+                .iterations_completed = 12,
+                .delta = 0.00001,
+                .computed_at_ms = 1780000000000,
+            },
+        }),
     };
     var result = db_mod.types.SearchResult{
         .alloc = alloc,
@@ -1125,6 +2481,9 @@ test "query encoder emits graph results" {
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"neighbors\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"type\":\"neighbors\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"document\":{\"title\":\"beta\"}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metrics\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_status\":{\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"edge_filter\":{\"mode\":\"all\"}") != null);
 }
 
 test "query merge applies global score ordering and offset" {
@@ -1162,6 +2521,3471 @@ test "query merge applies global score ordering and offset" {
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:b", merged.hits[0].id);
     try std.testing.expectEqual(@as(?u32, null), merged.hits[0].doc_ordinal);
+}
+
+test "query merge applies deterministic graph metric top-k across shards" {
+    const alloc = std.testing.allocator;
+
+    const left_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 2);
+    left_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.8 };
+    left_scores[1] = .{ .node = try alloc.dupe(u8, "doc:d"), .score = 0.6 };
+    const left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = left_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .building_generation = 6,
+            .build_job_id = 12345,
+            .build_started_at_ms = 1780000000100,
+            .build_iteration = 2,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = left_metrics,
+    };
+    defer left.deinit();
+
+    const right_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 3);
+    right_scores[0] = .{ .node = try alloc.dupe(u8, "doc:c"), .score = 0.9 };
+    right_scores[1] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    right_scores[2] = .{ .node = try alloc.dupe(u8, "doc:e"), .score = 0.1 };
+    const right_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    right_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = right_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .stale,
+            .build_queued = true,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .queued_generation = 6,
+            .building_generation = 6,
+            .build_job_id = 12345,
+            .build_started_at_ms = 1780000000100,
+            .build_iteration = 3,
+            .progress = 0.0,
+            .converged = true,
+        },
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = right_metrics,
+    };
+    defer right.deinit();
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+    var merged = try mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_metric_results.len);
+    const central = merged.graph_metric_results[0];
+    try std.testing.expectEqualStrings("central", central.name);
+    try std.testing.expectEqual(@as(usize, 3), central.scores.len);
+    try std.testing.expectEqualStrings("doc:c", central.scores[0].node);
+    try std.testing.expectEqualStrings("doc:a", central.scores[1].node);
+    try std.testing.expectEqualStrings("doc:b", central.scores[2].node);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, central.status.state);
+    try std.testing.expect(central.status.build_queued);
+    try std.testing.expectEqual(@as(u64, 5), central.status.published_generation);
+    try std.testing.expectEqual(@as(u64, 6), central.status.edge_generation);
+    try std.testing.expectEqual(@as(u64, 6), central.status.queued_generation);
+    try std.testing.expectEqual(@as(u64, 6), central.status.building_generation);
+    try std.testing.expectEqual(@as(u64, 12345), central.status.build_job_id);
+    try std.testing.expectEqual(@as(u64, 1780000000100), central.status.build_started_at_ms);
+    try std.testing.expectEqual(@as(u32, 3), central.status.build_iteration);
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{
+        .profile = true,
+        .graph_metric_queries = &graph_metric_queries,
+    }, .{ .took_ms = 4, .shard_count = 2, .merged = true }, merged);
+    defer encoded.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"shards\":{\"total\":2,\"successful\":2,\"failed\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_metrics\":[{\"query_name\":\"central\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_metric\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"index_name\":\"graph_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_name\":\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"freshness\":\"published\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"state\":\"stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"published_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"building_generation\":6") != null);
+
+    const fresh_graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+            .freshness = .fresh,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &fresh_graph_metric_queries }, &.{ left, right }, 0, 10));
+
+    right_metrics[0].status.published_generation = 4;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, right }, 0, 10));
+}
+
+test "query merge rejects missing or unpublished graph metric shard results" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const left_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    left_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    const left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = left_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = left_metrics,
+    };
+    defer left.deinit();
+
+    var missing = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    };
+    defer missing.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, missing }, 0, 10));
+
+    const unpublished_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    unpublished_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .not_ready,
+            .published_generation = 0,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+        },
+    };
+    var unpublished = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = unpublished_metrics,
+    };
+    defer unpublished.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, unpublished }, 0, 10));
+}
+
+test "query merge rejects duplicate direct graph metric score nodes" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const duplicate_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 2);
+    duplicate_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    duplicate_scores[1] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.7 };
+    const duplicate_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    duplicate_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = duplicate_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var duplicate = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = duplicate_metrics,
+    };
+    defer duplicate.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{duplicate}, 0, 10));
+
+    const left_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    left_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.8 };
+    const left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = left_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = left_metrics,
+    };
+    defer left.deinit();
+
+    const right_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    right_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.7 };
+    const right_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    right_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = right_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = right_metrics,
+    };
+    defer right.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, right }, 0, 10));
+}
+
+test "query merge rejects non-finite direct graph metric scores" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const nan_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    nan_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = std.math.nan(f64) };
+    const nan_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    nan_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = nan_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var nan_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = nan_metrics,
+    };
+    defer nan_result.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{nan_result}, 0, 10));
+
+    const inf_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    inf_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = std.math.inf(f64) };
+    const inf_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    inf_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = inf_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var inf_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = inf_metrics,
+    };
+    defer inf_result.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{inf_result}, 0, 10));
+}
+
+test "query merge rejects duplicate direct graph metric shard results" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const scores_a = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    scores_a[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    const scores_b = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    scores_b[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.7 };
+    const duplicate_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    duplicate_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = scores_a,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    duplicate_metrics[1] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = scores_b,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var duplicate = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = duplicate_metrics,
+    };
+    defer duplicate.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{duplicate}, 0, 10));
+
+    const duplicate_request_queries = [_]db_mod.types.NamedGraphMetricQuery{
+        .{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "pagerank",
+                .top_k = 3,
+            },
+        },
+        .{
+            .name = "central",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "degree",
+                .top_k = 3,
+            },
+        },
+    };
+    var valid_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    valid_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    const valid_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    valid_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = valid_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var duplicate_request = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = valid_metrics,
+    };
+    defer duplicate_request.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &duplicate_request_queries }, &.{duplicate_request}, 0, 10));
+}
+
+test "query merge rejects mismatched direct graph metric shard identity" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const wrong_index_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    wrong_index_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "other_graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var wrong_index = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = wrong_index_metrics,
+    };
+    defer wrong_index.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{wrong_index}, 0, 10));
+
+    const wrong_metric_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    wrong_metric_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "degree"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "degree"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var wrong_metric = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = wrong_metric_metrics,
+    };
+    defer wrong_metric.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{wrong_metric}, 0, 10));
+
+    const wrong_status_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    wrong_status_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "degree"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var wrong_status = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = wrong_status_metrics,
+    };
+    defer wrong_status.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{wrong_status}, 0, 10));
+}
+
+test "query merge rejects inconsistent graph metric fan-in status state" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+    const direct_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    direct_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .not_ready,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+        },
+    };
+    var direct = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = direct_metrics,
+    };
+    defer direct.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{direct}, 0, 10));
+
+    const direct_future_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    direct_future_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var direct_future = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = direct_future_metrics,
+    };
+    defer direct_future.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{direct_future}, 0, 10));
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+            .include_metric_status = true,
+        },
+    }};
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .disabled,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+            },
+        }),
+    };
+    var graph = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer graph.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{graph}, 0, 10));
+
+    const graph_future_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_future_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var graph_future = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_future_results,
+    };
+    defer graph_future.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{graph_future}, 0, 10));
+
+    var rerank = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .not_ready,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+        },
+    };
+    defer rerank.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, &.{rerank}, 0, 10));
+
+    var rerank_future = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer rerank_future.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, &.{rerank_future}, 0, 10));
+}
+
+test "query merge rejects non-finite graph metric fan-in status numbers" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+    const direct_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    direct_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = std.math.nan(f64),
+            .converged = true,
+        },
+    };
+    var direct = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = direct_metrics,
+    };
+    defer direct.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{direct}, 0, 10));
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .include_metric_status = true,
+        },
+    }};
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .delta = std.math.inf(f64),
+                .converged = true,
+            },
+        }),
+    };
+    var graph = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer graph.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{graph}, 0, 10));
+
+    var rerank = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = std.math.inf(f64),
+            .converged = true,
+        },
+    };
+    defer rerank.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, &.{rerank}, 0, 10));
+}
+
+test "query merge rejects out-of-range graph metric fan-in progress" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const high_progress_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    high_progress_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .building,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .progress = 1.25,
+            .converged = false,
+        },
+    };
+    var high_progress = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = high_progress_metrics,
+    };
+    defer high_progress.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{high_progress}, 0, 10));
+
+    var negative_progress = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = -0.1,
+            .converged = true,
+        },
+    };
+    defer negative_progress.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, &.{negative_progress}, 0, 10));
+}
+
+test "query merge rejects incompatible graph metric fan-in metadata" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+
+    const left_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    left_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    const left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = left_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .metadata_version = 1,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = left_metrics,
+    };
+    defer left.deinit();
+
+    const right_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    right_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.7 };
+    const right_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    right_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = right_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .metadata_version = 2,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = right_metrics,
+    };
+    defer right.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, right }, 0, 10));
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+    const graph_left_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_left_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var graph_left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_left_results,
+    };
+    defer graph_left.deinit();
+
+    const filter_types = try alloc.alloc([]const u8, 1);
+    filter_types[0] = try alloc.dupe(u8, "cites");
+    const graph_right_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_right_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .edge_filter = .{ .mode = .types, .types = filter_types },
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var graph_right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_right_results,
+    };
+    defer graph_right.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{ graph_left, graph_right }, 0, 10));
+
+    const hits_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{
+        .{
+            .name = "authority",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_authority",
+                .top_k = 3,
+            },
+        },
+        .{
+            .name = "hub",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_hub",
+                .top_k = 3,
+            },
+        },
+    };
+    const hits_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    hits_metrics[0] = .{
+        .name = try alloc.dupe(u8, "authority"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_authority"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_authority"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    hits_metrics[1] = .{
+        .name = try alloc.dupe(u8, "hub"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_hub"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_hub"),
+            .state = .fresh,
+            .published_generation = 6,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var hits_pair_mismatch = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = hits_metrics,
+    };
+    defer hits_pair_mismatch.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &hits_metric_queries }, &.{hits_pair_mismatch}, 0, 10));
+
+    var rerank_left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .metadata_version = 1,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer rerank_left.deinit();
+    var rerank_right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .metadata_version = 2,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer rerank_right.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, &.{ rerank_left, rerank_right }, 0, 10));
+}
+
+test "query merge rejects unsolicited graph score surfaces" {
+    const alloc = std.testing.allocator;
+
+    const direct_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    direct_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var unsolicited_direct = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = direct_metrics,
+    };
+    defer unsolicited_direct.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{}, &.{unsolicited_direct}, 0, 10));
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 3,
+        },
+    }};
+    const extra_direct_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    extra_direct_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    extra_direct_metrics[1] = .{
+        .name = try alloc.dupe(u8, "extra"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = &.{},
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var extra_direct = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = extra_direct_metrics,
+    };
+    defer extra_direct.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{extra_direct}, 0, 10));
+
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = &.{},
+    };
+    var unsolicited_graph = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer unsolicited_graph.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{}, &.{unsolicited_graph}, 0, 10));
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+    const extra_graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 2);
+    extra_graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = &.{},
+    };
+    extra_graph_results[1] = .{
+        .name = try alloc.dupe(u8, "extra_neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = &.{},
+    };
+    var extra_graph = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = extra_graph_results,
+    };
+    defer extra_graph.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{extra_graph}, 0, 10));
+}
+
+test "query merge rejects unsolicited graph search metric status" {
+    const alloc = std.testing.allocator;
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var unsolicited_status = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer unsolicited_status.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{unsolicited_status}, 0, 10));
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const metric_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+    const extra_status_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    extra_status_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+            .{
+                .name = try alloc.dupe(u8, "degree"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var extra_status = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = extra_status_results,
+    };
+    defer extra_status.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &metric_graph_queries }, &.{extra_status}, 0, 10));
+}
+
+test "query merge validates included graph search metric status list" {
+    const alloc = std.testing.allocator;
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .include_metric_status = true,
+        },
+    }};
+
+    const duplicate_status_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_status_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_status = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_status_results,
+    };
+    defer duplicate_status.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{duplicate_status}, 0, 10));
+
+    const invalid_status_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    invalid_status_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .not_ready,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+            },
+        }),
+    };
+    var invalid_status = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = invalid_status_results,
+    };
+    defer invalid_status.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{invalid_status}, 0, 10));
+
+    const hits_pair_status_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    hits_pair_status_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "hits_authority"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+            .{
+                .name = try alloc.dupe(u8, "hits_hub"),
+                .state = .fresh,
+                .published_generation = 6,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var hits_pair_status_mismatch = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = hits_pair_status_results,
+    };
+    defer hits_pair_status_mismatch.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{hits_pair_status_mismatch}, 0, 10));
+}
+
+test "query merge rejects malformed graph search metric payloads" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+
+    const missing_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    missing_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = &.{},
+    };
+    const missing_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    missing_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = missing_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var missing_payload = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = missing_results,
+    };
+    defer missing_payload.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{missing_payload}, 0, 10));
+
+    const duplicate_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    duplicate_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.8 },
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.7 },
+        }),
+    };
+    const duplicate_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = duplicate_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_payload = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_results,
+    };
+    defer duplicate_payload.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{duplicate_payload}, 0, 10));
+
+    const non_finite_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    non_finite_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = std.math.nan(f64) },
+        }),
+    };
+    const non_finite_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    non_finite_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = non_finite_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var non_finite_payload = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = non_finite_results,
+    };
+    defer non_finite_payload.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{non_finite_payload}, 0, 10));
+
+    const duplicate_projected_metric_reads = [_]graph_query_mod.GraphMetricRead{
+        .{
+            .name = "pagerank",
+            .freshness = .published,
+        },
+        .{
+            .name = "pagerank",
+            .freshness = .published,
+        },
+    };
+    const duplicate_projected_metric_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &duplicate_projected_metric_reads,
+        },
+    }};
+    const duplicate_projected_metric_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    duplicate_projected_metric_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.8 },
+        }),
+    };
+    const duplicate_projected_metric_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_projected_metric_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = duplicate_projected_metric_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_projected_metric_payload = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_projected_metric_results,
+    };
+    defer duplicate_projected_metric_payload.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &duplicate_projected_metric_queries }, &.{duplicate_projected_metric_payload}, 0, 10));
+
+    const status_only_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .include_metric_status = true,
+        },
+    }};
+    const unsolicited_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    unsolicited_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.8 },
+        }),
+    };
+    const unsolicited_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    unsolicited_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = unsolicited_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var unsolicited_payload = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = unsolicited_results,
+    };
+    defer unsolicited_payload.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &status_only_queries }, &.{unsolicited_payload}, 0, 10));
+}
+
+test "query merge rejects malformed graph search traversal payloads" {
+    const alloc = std.testing.allocator;
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+
+    const non_finite_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    non_finite_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = std.math.inf(f64),
+        .path = null,
+        .path_edges = null,
+        .metrics = &.{},
+    };
+    const non_finite_node_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    non_finite_node_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = non_finite_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var non_finite_node = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = non_finite_node_results,
+    };
+    defer non_finite_node.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{non_finite_node}, 0, 10));
+
+    const node_path_edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, 1);
+    node_path_edges[0] = .{
+        .source = try alloc.dupe(u8, "doc:a"),
+        .target = try alloc.dupe(u8, "doc:b"),
+        .edge_type = try alloc.dupe(u8, "links"),
+        .weight = std.math.nan(f64),
+    };
+    const non_finite_node_edge_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    non_finite_node_edge_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = node_path_edges,
+        .metrics = &.{},
+    };
+    const non_finite_node_edge_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    non_finite_node_edge_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = non_finite_node_edge_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var non_finite_node_edge = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = non_finite_node_edge_results,
+    };
+    defer non_finite_node_edge.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{non_finite_node_edge}, 0, 10));
+
+    const mismatched_path_nodes = try alloc.alloc([]const u8, 1);
+    mismatched_path_nodes[0] = try alloc.dupe(u8, "doc:a");
+    const mismatched_path_edges = try alloc.alloc(graph_query_mod.PathEdgeInfo, 1);
+    mismatched_path_edges[0] = .{
+        .source = try alloc.dupe(u8, "doc:a"),
+        .target = try alloc.dupe(u8, "doc:b"),
+        .edge_type = try alloc.dupe(u8, "links"),
+        .weight = 1.0,
+    };
+    const mismatched_node_path_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    mismatched_node_path_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = mismatched_path_nodes,
+        .path_edges = mismatched_path_edges,
+        .metrics = &.{},
+    };
+    const mismatched_node_path_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    mismatched_node_path_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = mismatched_node_path_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var mismatched_node_path = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = mismatched_node_path_results,
+    };
+    defer mismatched_node_path.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{mismatched_node_path}, 0, 10));
+
+    const duplicate_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 2);
+    duplicate_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = &.{},
+    };
+    duplicate_nodes[1] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = &.{},
+    };
+    const duplicate_node_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_node_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = duplicate_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 2,
+        .metric_status = &.{},
+    };
+    var duplicate_node_payload = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_node_results,
+    };
+    defer duplicate_node_payload.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{duplicate_node_payload}, 0, 10));
+
+    const duplicate_shard_left_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    duplicate_shard_left_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:c"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = &.{},
+    };
+    const duplicate_shard_left_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_shard_left_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = duplicate_shard_left_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var duplicate_shard_left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_shard_left_results,
+    };
+    defer duplicate_shard_left.deinit();
+
+    const duplicate_shard_right_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    duplicate_shard_right_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:c"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = &.{},
+    };
+    const duplicate_shard_right_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_shard_right_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = duplicate_shard_right_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var duplicate_shard_right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_shard_right_results,
+    };
+    defer duplicate_shard_right.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{ duplicate_shard_left, duplicate_shard_right }, 0, 10));
+
+    const path_nodes = try alloc.alloc([]const u8, 2);
+    path_nodes[0] = try alloc.dupe(u8, "doc:a");
+    path_nodes[1] = try alloc.dupe(u8, "doc:b");
+    const path_edges = try alloc.alloc(graph_paths.PathEdge, 1);
+    path_edges[0] = .{
+        .source = try alloc.dupe(u8, "doc:a"),
+        .target = try alloc.dupe(u8, "doc:b"),
+        .edge_type = try alloc.dupe(u8, "links"),
+        .weight = 1.0,
+    };
+    const non_finite_paths = try alloc.alloc(db_mod.types.GraphPath, 1);
+    non_finite_paths[0] = .{
+        .nodes = path_nodes,
+        .edges = path_edges,
+        .total_weight = std.math.inf(f64),
+        .length = 1,
+    };
+    const non_finite_path_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    non_finite_path_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = non_finite_paths,
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var non_finite_path = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = non_finite_path_results,
+    };
+    defer non_finite_path.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{non_finite_path}, 0, 10));
+
+    const bad_length_path_nodes = try alloc.alloc([]const u8, 2);
+    bad_length_path_nodes[0] = try alloc.dupe(u8, "doc:a");
+    bad_length_path_nodes[1] = try alloc.dupe(u8, "doc:b");
+    const bad_length_path_edges = try alloc.alloc(graph_paths.PathEdge, 1);
+    bad_length_path_edges[0] = .{
+        .source = try alloc.dupe(u8, "doc:a"),
+        .target = try alloc.dupe(u8, "doc:b"),
+        .edge_type = try alloc.dupe(u8, "links"),
+        .weight = 1.0,
+    };
+    const bad_length_paths = try alloc.alloc(db_mod.types.GraphPath, 1);
+    bad_length_paths[0] = .{
+        .nodes = bad_length_path_nodes,
+        .edges = bad_length_path_edges,
+        .total_weight = 1.0,
+        .length = 2,
+    };
+    const bad_length_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    bad_length_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = bad_length_paths,
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var bad_length = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = bad_length_results,
+    };
+    defer bad_length.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{bad_length}, 0, 10));
+}
+
+test "query merge rejects malformed graph search hit payloads" {
+    const alloc = std.testing.allocator;
+
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+        },
+    }};
+
+    const non_finite_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    non_finite_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = std.math.inf(f32),
+    };
+    const non_finite_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    non_finite_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = non_finite_hits,
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var non_finite = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = non_finite_results,
+    };
+    defer non_finite.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{non_finite}, 0, 10));
+
+    const duplicate_hits = try alloc.alloc(db_mod.types.SearchHit, 2);
+    duplicate_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 1.0,
+    };
+    duplicate_hits[1] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 0.9,
+    };
+    const duplicate_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = duplicate_hits,
+        .total_hits = 2,
+        .metric_status = &.{},
+    };
+    var duplicate = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_results,
+    };
+    defer duplicate.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{duplicate}, 0, 10));
+
+    const duplicate_shard_left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    duplicate_shard_left_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:c"),
+        .score = 1.0,
+    };
+    const duplicate_shard_left_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_shard_left_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = duplicate_shard_left_hits,
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var duplicate_shard_left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_shard_left_results,
+    };
+    defer duplicate_shard_left.deinit();
+
+    const duplicate_shard_right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    duplicate_shard_right_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:c"),
+        .score = 0.9,
+    };
+    const duplicate_shard_right_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_shard_right_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = duplicate_shard_right_hits,
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var duplicate_shard_right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_shard_right_results,
+    };
+    defer duplicate_shard_right.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{ duplicate_shard_left, duplicate_shard_right }, 0, 10));
+
+    const score_detail_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    score_detail_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 2.0,
+        .score_details = .{
+            .index_name = try alloc.dupe(u8, "graph_idx"),
+            .metric_name = try alloc.dupe(u8, "pagerank"),
+            .base_score = 1.0,
+            .base_weight = 1.0,
+            .metric_score = 0.5,
+            .metric_score_used = 0.5,
+            .metric_weight = 2.0,
+            .final_score = 2.0,
+            .published_generation = 8,
+        },
+    };
+    const score_detail_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    score_detail_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = score_detail_hits,
+        .total_hits = 1,
+        .metric_status = &.{},
+    };
+    var score_detail = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = score_detail_results,
+    };
+    defer score_detail.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &graph_queries }, &.{score_detail}, 0, 10));
+}
+
+test "query merge preserves failed graph metric status across shard fan-in" {
+    const alloc = std.testing.allocator;
+
+    const left_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    left_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.8 };
+    const left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = left_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 5,
+            .edge_generation = 5,
+            .target_edge_generation = 5,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = left_metrics,
+    };
+    defer left.deinit();
+
+    const right_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    right_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.7 };
+    const right_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 1);
+    right_metrics[0] = .{
+        .name = try alloc.dupe(u8, "central"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "pagerank"),
+        .scores = right_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .failed,
+            .published_generation = 5,
+            .edge_generation = 6,
+            .target_edge_generation = 6,
+            .building_generation = 6,
+            .build_job_id = 99,
+            .retry_count = 3,
+            .last_error = try alloc.dupe(u8, "publish verifier rejected generation"),
+            .progress = 0.4,
+            .converged = true,
+        },
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = right_metrics,
+    };
+    defer right.deinit();
+
+    const graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 2,
+            .freshness = .published,
+        },
+    }};
+    var merged = try mergeSearchResults(alloc, .{ .graph_metric_queries = &graph_metric_queries }, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_metric_results.len);
+    try std.testing.expectEqual(@as(usize, 2), merged.graph_metric_results[0].scores.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, merged.graph_metric_results[0].status.state);
+    try std.testing.expectEqual(@as(u64, 5), merged.graph_metric_results[0].status.published_generation);
+    try std.testing.expectEqual(@as(u64, 6), merged.graph_metric_results[0].status.target_edge_generation);
+    try std.testing.expectEqual(@as(u64, 6), merged.graph_metric_results[0].status.building_generation);
+    try std.testing.expectEqual(@as(u32, 3), merged.graph_metric_results[0].status.retry_count);
+    try std.testing.expectEqualStrings("publish verifier rejected generation", merged.graph_metric_results[0].status.last_error);
+
+    const fresh_graph_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{.{
+        .name = "central",
+        .query = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .top_k = 2,
+            .freshness = .fresh,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &fresh_graph_metric_queries }, &.{ left, right }, 0, 10));
+
+    const hits_left_authority_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_left_authority_scores[0] = .{ .node = try alloc.dupe(u8, "doc:a"), .score = 0.9 };
+    const hits_left_hub_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_left_hub_scores[0] = .{ .node = try alloc.dupe(u8, "doc:c"), .score = 0.75 };
+    const hits_left_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    hits_left_metrics[0] = .{
+        .name = try alloc.dupe(u8, "authority"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_authority"),
+        .scores = hits_left_authority_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_authority"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    hits_left_metrics[1] = .{
+        .name = try alloc.dupe(u8, "hub"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_hub"),
+        .scores = hits_left_hub_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_hub"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    var hits_left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = hits_left_metrics,
+    };
+    defer hits_left.deinit();
+
+    const hits_right_authority_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_right_authority_scores[0] = .{ .node = try alloc.dupe(u8, "doc:b"), .score = 0.7 };
+    const hits_right_hub_scores = try alloc.alloc(db_mod.types.GraphMetricScore, 1);
+    hits_right_hub_scores[0] = .{ .node = try alloc.dupe(u8, "doc:d"), .score = 0.65 };
+    const hits_right_metrics = try alloc.alloc(db_mod.types.GraphMetricResult, 2);
+    hits_right_metrics[0] = .{
+        .name = try alloc.dupe(u8, "authority"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_authority"),
+        .scores = hits_right_authority_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_authority"),
+            .state = .failed,
+            .published_generation = 8,
+            .edge_generation = 9,
+            .target_edge_generation = 9,
+            .building_generation = 9,
+            .retry_count = 2,
+            .last_error = try alloc.dupe(u8, "authority shard failed"),
+            .progress = 0.5,
+            .converged = true,
+        },
+    };
+    hits_right_metrics[1] = .{
+        .name = try alloc.dupe(u8, "hub"),
+        .index_name = try alloc.dupe(u8, "graph_idx"),
+        .metric_name = try alloc.dupe(u8, "hits_hub"),
+        .scores = hits_right_hub_scores,
+        .status = .{
+            .name = try alloc.dupe(u8, "hits_hub"),
+            .state = .failed,
+            .published_generation = 8,
+            .edge_generation = 9,
+            .target_edge_generation = 9,
+            .building_generation = 9,
+            .retry_count = 2,
+            .last_error = try alloc.dupe(u8, "hub shard failed"),
+            .progress = 0.5,
+            .converged = true,
+        },
+    };
+    var hits_right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_results = hits_right_metrics,
+    };
+    defer hits_right.deinit();
+
+    const hits_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{
+        .{
+            .name = "authority",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_authority",
+                .top_k = 2,
+                .freshness = .published,
+            },
+        },
+        .{
+            .name = "hub",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_hub",
+                .top_k = 2,
+                .freshness = .published,
+            },
+        },
+    };
+    var hits_merged = try mergeSearchResults(alloc, .{ .graph_metric_queries = &hits_metric_queries }, &.{ hits_left, hits_right }, 0, 10);
+    defer hits_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 2), hits_merged.graph_metric_results.len);
+    for (hits_merged.graph_metric_results) |metric_result| {
+        try std.testing.expectEqual(@as(usize, 2), metric_result.scores.len);
+        try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, metric_result.status.state);
+        try std.testing.expectEqual(@as(u64, 8), metric_result.status.published_generation);
+        try std.testing.expectEqual(@as(u64, 9), metric_result.status.target_edge_generation);
+        try std.testing.expectEqual(@as(u64, 9), metric_result.status.building_generation);
+        try std.testing.expectEqual(@as(u32, 2), metric_result.status.retry_count);
+    }
+
+    const fresh_hits_metric_queries = [_]db_mod.types.NamedGraphMetricQuery{
+        .{
+            .name = "authority",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_authority",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        },
+        .{
+            .name = "hub",
+            .query = .{
+                .index_name = "graph_idx",
+                .metric_name = "hits_hub",
+                .top_k = 2,
+                .freshness = .fresh,
+            },
+        },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_metric_queries = &fresh_hits_metric_queries }, &.{ hits_left, hits_right }, 0, 10));
+}
+
+test "query merge requires comparable graph search metric generations across shards" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+            .include_metric_status = true,
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    const left_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    left_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.8 },
+        }),
+    };
+    const left_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    left_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = left_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = left_results,
+    };
+    defer left.deinit();
+
+    const right_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    right_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:c"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.7 },
+        }),
+    };
+    const right_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    right_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = right_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .stale,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = right_results,
+    };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, merged.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 5), merged.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .fresh,
+    }};
+    const fresh_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &fresh_graph_metric_reads,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &fresh_graph_queries }, &.{ left, right }, 0, 10));
+
+    right_results[0].metric_status[0].published_generation = 4;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
+
+    right_results[0].metric_status[0].published_generation = 0;
+    right_results[0].metric_status[0].state = .not_ready;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
+
+    var missing = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    };
+    defer missing.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, missing }, 0, 10));
+}
+
+test "query merge allows unpublished projected graph search metric status" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    const nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = null },
+        }),
+    };
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .not_ready,
+                .published_generation = 0,
+                .edge_generation = 3,
+                .target_edge_generation = 3,
+                .progress = 0.0,
+                .converged = false,
+            },
+        }),
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer result.deinit();
+
+    var merged = try mergeSearchResults(alloc, req, &.{result}, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].nodes[0].metrics.len);
+    try std.testing.expect(merged.graph_results[0].nodes[0].metrics[0].score == null);
+    try std.testing.expectEqual(@as(usize, 0), merged.graph_results[0].metric_status.len);
+
+    const include_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+            .include_metric_status = true,
+        },
+    }};
+    var included = try mergeSearchResults(alloc, .{ .graph_queries = &include_graph_queries }, &.{result}, 0, 10);
+    defer included.deinit();
+    try std.testing.expectEqual(@as(usize, 1), included.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.not_ready, included.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 0), included.graph_results[0].metric_status[0].published_generation);
+
+    const fresh_graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .fresh,
+    }};
+    const fresh_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &fresh_graph_metric_reads,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &fresh_graph_queries }, &.{result}, 0, 10));
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const order_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &graph_metric_orders,
+        },
+    }};
+    const order_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    order_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .not_ready,
+                .published_generation = 0,
+                .edge_generation = 3,
+                .target_edge_generation = 3,
+                .progress = 0.0,
+                .converged = false,
+            },
+        }),
+    };
+    var order_result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = order_results,
+    };
+    defer order_result.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &order_graph_queries }, &.{order_result}, 0, 10));
+}
+
+test "query merge rejects ambiguous graph search fan-in metric status" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    const duplicate_status_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_status_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .stale,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_status = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_status_results,
+    };
+    defer duplicate_status.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{duplicate_status}, 0, 10));
+
+    const duplicate_query_results = try alloc.alloc(db_mod.types.GraphSearchResult, 2);
+    duplicate_query_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    duplicate_query_results[1] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_query = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_query_results,
+    };
+    defer duplicate_query.deinit();
+
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{duplicate_query}, 0, 10));
+
+    const duplicate_request_queries = [_]db_mod.types.NamedGraphQuery{
+        .{
+            .name = "neighbors",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:a"} },
+                .metrics = &graph_metric_reads,
+            },
+        },
+        .{
+            .name = "neighbors",
+            .query = .{
+                .query_type = .neighbors,
+                .index_name = "graph_idx",
+                .start_nodes = .{ .keys = &.{"doc:b"} },
+                .metrics = &graph_metric_reads,
+            },
+        },
+    };
+    const valid_query_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    valid_query_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_request = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = valid_query_results,
+    };
+    defer duplicate_request.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &duplicate_request_queries }, &.{duplicate_request}, 0, 10));
+
+    const duplicate_order_metrics = [_]graph_query_mod.GraphMetricOrder{
+        .{
+            .name = "pagerank",
+            .freshness = .published,
+        },
+        .{
+            .name = "pagerank",
+            .direction = .asc,
+            .freshness = .published,
+        },
+    };
+    const duplicate_order_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &duplicate_order_metrics,
+        },
+    }};
+    const duplicate_order_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    duplicate_order_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 0,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var duplicate_order = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = duplicate_order_results,
+    };
+    defer duplicate_order.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &duplicate_order_queries }, &.{duplicate_order}, 0, 10));
+}
+
+test "query merge preserves failed graph search metric status across shards" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+            .include_metric_status = true,
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    const left_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    left_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:b"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.8 },
+        }),
+    };
+    const left_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    left_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = left_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = left_results,
+    };
+    defer left.deinit();
+
+    const right_nodes = try alloc.alloc(graph_query_mod.GraphResultNode, 1);
+    right_nodes[0] = .{
+        .key = try alloc.dupe(u8, "doc:c"),
+        .depth = 1,
+        .distance = 1,
+        .path = null,
+        .path_edges = null,
+        .metrics = try alloc.dupe(graph_query_mod.GraphMetricValue, &.{
+            .{ .name = try alloc.dupe(u8, "pagerank"), .score = 0.7 },
+        }),
+    };
+    const right_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    right_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = right_nodes,
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .failed,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .building_generation = 6,
+                .retry_count = 2,
+                .last_error = try alloc.dupe(u8, "metric rebuild failed"),
+                .progress = 0.35,
+                .converged = true,
+            },
+        }),
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = right_results,
+    };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 2), merged.graph_results[0].nodes.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, merged.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 5), merged.graph_results[0].metric_status[0].published_generation);
+    try std.testing.expectEqual(@as(u64, 6), merged.graph_results[0].metric_status[0].target_edge_generation);
+    try std.testing.expectEqual(@as(u64, 6), merged.graph_results[0].metric_status[0].building_generation);
+    try std.testing.expectEqual(@as(u32, 2), merged.graph_results[0].metric_status[0].retry_count);
+    try std.testing.expectEqualStrings("metric rebuild failed", merged.graph_results[0].metric_status[0].last_error);
+
+    const fresh_graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .fresh,
+    }};
+    const fresh_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &fresh_graph_metric_reads,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &fresh_graph_queries }, &.{ left, right }, 0, 10));
+}
+
+test "query merge enforces graph search order and filter metric generations across shards" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "pagerank",
+        .op = .gte,
+        .value = 0.5,
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &graph_metric_orders,
+            .where_metric = &graph_metric_filters,
+            .include_metric_status = true,
+        },
+    }};
+    const req = db_mod.types.SearchRequest{ .graph_queries = &graph_queries };
+
+    const left_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    left_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .fresh,
+                .published_generation = 5,
+                .edge_generation = 5,
+                .target_edge_generation = 5,
+                .progress = 1.0,
+                .converged = true,
+            },
+        }),
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = left_results,
+    };
+    defer left.deinit();
+
+    const right_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    right_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 1,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .stale,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .building_generation = 6,
+                .progress = 0.25,
+                .converged = true,
+            },
+        }),
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = right_results,
+    };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), merged.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, merged.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 5), merged.graph_results[0].metric_status[0].published_generation);
+    try std.testing.expectEqual(@as(u64, 6), merged.graph_results[0].metric_status[0].building_generation);
+
+    const no_status_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &graph_metric_orders,
+            .where_metric = &graph_metric_filters,
+        },
+    }};
+    var no_status_merged = try mergeSearchResults(alloc, .{ .graph_queries = &no_status_graph_queries }, &.{ left, right }, 0, 10);
+    defer no_status_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), no_status_merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 0), no_status_merged.graph_results[0].metric_status.len);
+
+    right_results[0].metric_status[0].state = .failed;
+    right_results[0].metric_status[0].retry_count = 2;
+    right_results[0].metric_status[0].last_error = try alloc.dupe(u8, "order/filter metric rebuild failed");
+
+    var failed_merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 10);
+    defer failed_merged.deinit();
+    try std.testing.expectEqual(@as(usize, 1), failed_merged.graph_results.len);
+    try std.testing.expectEqual(@as(usize, 1), failed_merged.graph_results[0].metric_status.len);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_merged.graph_results[0].metric_status[0].state);
+    try std.testing.expectEqual(@as(u64, 5), failed_merged.graph_results[0].metric_status[0].published_generation);
+    try std.testing.expectEqual(@as(u64, 6), failed_merged.graph_results[0].metric_status[0].building_generation);
+    try std.testing.expectEqual(@as(u32, 2), failed_merged.graph_results[0].metric_status[0].retry_count);
+    try std.testing.expectEqualStrings("order/filter metric rebuild failed", failed_merged.graph_results[0].metric_status[0].last_error);
+
+    const fresh_graph_metric_orders = [_]graph_query_mod.GraphMetricOrder{.{
+        .name = "pagerank",
+        .freshness = .fresh,
+    }};
+    const fresh_graph_metric_filters = [_]graph_query_mod.GraphMetricFilter{.{
+        .name = "pagerank",
+        .op = .gte,
+        .value = 0.5,
+        .freshness = .fresh,
+    }};
+    const fresh_graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .order_by = &fresh_graph_metric_orders,
+            .where_metric = &fresh_graph_metric_filters,
+        },
+    }};
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{ .graph_queries = &fresh_graph_queries }, &.{ left, right }, 0, 10));
+
+    right_results[0].metric_status[0].published_generation = 4;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
+
+    right_results[0].metric_status[0].published_generation = 0;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
+}
+
+test "query profile reports merged graph search metric generation" {
+    const alloc = std.testing.allocator;
+
+    const graph_metric_reads = [_]graph_query_mod.GraphMetricRead{.{
+        .name = "pagerank",
+        .freshness = .published,
+    }};
+    const graph_queries = [_]db_mod.types.NamedGraphQuery{.{
+        .name = "neighbors",
+        .query = .{
+            .query_type = .neighbors,
+            .index_name = "graph_idx",
+            .start_nodes = .{ .keys = &.{"doc:a"} },
+            .metrics = &graph_metric_reads,
+        },
+    }};
+
+    const graph_results = try alloc.alloc(db_mod.types.GraphSearchResult, 1);
+    graph_results[0] = .{
+        .name = try alloc.dupe(u8, "neighbors"),
+        .nodes = &.{},
+        .paths = &.{},
+        .hits = &.{},
+        .total_hits = 2,
+        .metric_status = try alloc.dupe(db_mod.types.GraphMetricStatus, &.{
+            .{
+                .name = try alloc.dupe(u8, "pagerank"),
+                .state = .stale,
+                .published_generation = 5,
+                .edge_generation = 6,
+                .target_edge_generation = 6,
+                .building_generation = 6,
+                .progress = 0.5,
+                .converged = true,
+            },
+        }),
+    };
+    var result = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_results = graph_results,
+    };
+    defer result.deinit();
+
+    var encoded = try encodeQueryResponses(alloc, "docs", .{
+        .profile = true,
+        .graph_queries = &graph_queries,
+    }, .{ .took_ms = 2 }, result);
+    defer encoded.deinit(alloc);
+
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"graph_metrics\":[{\"query_name\":\"neighbors\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"source\":\"graph_query\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"index_name\":\"graph_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"metric_name\":\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"freshness\":\"published\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"state\":\"stale\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"published_generation\":5") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded.json, "\"building_generation\":6") != null);
+}
+
+test "query merge requires comparable graph metric rerank generations across shards" {
+    const alloc = std.testing.allocator;
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 3.0,
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = left_hits,
+        .total_hits = 1,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer left.deinit();
+
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 2.0,
+    };
+    var right = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = right_hits,
+        .total_hits = 1,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .stale,
+            .published_generation = 8,
+            .edge_generation = 9,
+            .target_edge_generation = 9,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer right.deinit();
+
+    const req = db_mod.types.SearchRequest{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 2.0,
+        },
+    };
+
+    var merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+    try std.testing.expect(merged.graph_metric_rerank_status != null);
+    try std.testing.expectEqual(@as(u64, 8), merged.graph_metric_rerank_status.?.published_generation);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.stale, merged.graph_metric_rerank_status.?.state);
+    try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
+
+    const old_right_error = right.graph_metric_rerank_status.?.last_error;
+    right.graph_metric_rerank_status.?.state = .failed;
+    right.graph_metric_rerank_status.?.target_edge_generation = 9;
+    right.graph_metric_rerank_status.?.building_generation = 9;
+    right.graph_metric_rerank_status.?.retry_count = 2;
+    right.graph_metric_rerank_status.?.last_error = try alloc.dupe(u8, "metric rebuild failed");
+    if (old_right_error.len > 0) alloc.free(old_right_error);
+
+    var failed_merged = try mergeSearchResults(alloc, req, &.{ left, right }, 0, 10);
+    defer failed_merged.deinit();
+    try std.testing.expect(failed_merged.graph_metric_rerank_status != null);
+    try std.testing.expectEqual(graph_mod.GraphIndex.GraphMetricState.failed, failed_merged.graph_metric_rerank_status.?.state);
+    try std.testing.expectEqual(@as(u64, 8), failed_merged.graph_metric_rerank_status.?.published_generation);
+    try std.testing.expectEqual(@as(u64, 9), failed_merged.graph_metric_rerank_status.?.building_generation);
+    try std.testing.expectEqual(@as(u32, 2), failed_merged.graph_metric_rerank_status.?.retry_count);
+    try std.testing.expectEqualStrings("metric rebuild failed", failed_merged.graph_metric_rerank_status.?.last_error);
+
+    var encoded_failed = try encodeQueryResponses(alloc, "docs", .{
+        .profile = true,
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    }, .{ .took_ms = 5, .shard_count = 2, .merged = true }, failed_merged);
+    defer encoded_failed.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"profile\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"shards\":{\"total\":2,\"successful\":2,\"failed\":0}") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"query_name\":\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"source\":\"graph_metric_rerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"index_name\":\"graph_idx\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"metric_name\":\"pagerank\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"freshness\":\"published\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"state\":\"failed\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"published_generation\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"building_generation\":9") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"retry_count\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded_failed.json, "\"last_error\":\"metric rebuild failed\"") != null);
+
+    const fresh_req = db_mod.types.SearchRequest{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .fresh,
+            .weight = 1.0,
+        },
+    };
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, fresh_req, &.{ left, right }, 0, 10));
+
+    right.graph_metric_rerank_status.?.published_generation = 7;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, right }, 0, 10));
+}
+
+test "query merge rejects malformed graph metric rerank score details" {
+    const alloc = std.testing.allocator;
+
+    const Make = struct {
+        fn result(
+            allocator: std.mem.Allocator,
+            details_index_name: []const u8,
+            details_metric_name: []const u8,
+            details_generation: u64,
+            details_final_score: f64,
+        ) !db_mod.types.SearchResult {
+            var hits = try allocator.alloc(db_mod.types.SearchHit, 1);
+            hits[0] = .{
+                .id = try allocator.dupe(u8, "doc:a"),
+                .score = 2.0,
+                .score_details = .{
+                    .index_name = try allocator.dupe(u8, details_index_name),
+                    .metric_name = try allocator.dupe(u8, details_metric_name),
+                    .base_score = 1.0,
+                    .base_weight = 1.0,
+                    .metric_score = 0.5,
+                    .metric_score_used = 0.5,
+                    .metric_weight = 2.0,
+                    .final_score = details_final_score,
+                    .published_generation = details_generation,
+                },
+            };
+            return .{
+                .alloc = allocator,
+                .hits = hits,
+                .total_hits = 1,
+                .graph_metric_rerank_status = .{
+                    .name = try allocator.dupe(u8, "pagerank"),
+                    .state = .fresh,
+                    .published_generation = 8,
+                    .edge_generation = 8,
+                    .target_edge_generation = 8,
+                    .progress = 1.0,
+                    .converged = true,
+                },
+            };
+        }
+    };
+
+    var unsolicited_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    unsolicited_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 2.0,
+        .score_details = .{
+            .index_name = try alloc.dupe(u8, "graph_idx"),
+            .metric_name = try alloc.dupe(u8, "pagerank"),
+            .base_score = 1.0,
+            .base_weight = 1.0,
+            .metric_score = 0.5,
+            .metric_score_used = 0.5,
+            .metric_weight = 2.0,
+            .final_score = 2.0,
+            .published_generation = 8,
+        },
+    };
+    var unsolicited = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = unsolicited_hits,
+        .total_hits = 1,
+    };
+    defer unsolicited.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, .{}, &.{unsolicited}, 0, 10));
+
+    const req = db_mod.types.SearchRequest{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    };
+
+    var wrong_generation = try Make.result(alloc, "graph_idx", "pagerank", 7, 2.0);
+    defer wrong_generation.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{wrong_generation}, 0, 10));
+
+    var wrong_identity = try Make.result(alloc, "other_idx", "pagerank", 8, 2.0);
+    defer wrong_identity.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{wrong_identity}, 0, 10));
+
+    var mismatched_final_score = try Make.result(alloc, "graph_idx", "pagerank", 8, 1.5);
+    defer mismatched_final_score.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{mismatched_final_score}, 0, 10));
+
+    var mismatched_weight = try Make.result(alloc, "graph_idx", "pagerank", 8, 2.0);
+    defer mismatched_weight.deinit();
+    mismatched_weight.hits[0].score_details.?.metric_weight = 1.0;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{mismatched_weight}, 0, 10));
+
+    var mismatched_metric_score_used = try Make.result(alloc, "graph_idx", "pagerank", 8, 2.0);
+    defer mismatched_metric_score_used.deinit();
+    mismatched_metric_score_used.hits[0].score_details.?.metric_score_used = 0.25;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{mismatched_metric_score_used}, 0, 10));
+
+    var mismatched_missing_score = try Make.result(alloc, "graph_idx", "pagerank", 8, 2.0);
+    defer mismatched_missing_score.deinit();
+    mismatched_missing_score.hits[0].score_details.?.metric_score = null;
+    mismatched_missing_score.hits[0].score_details.?.missing_score_used = true;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{mismatched_missing_score}, 0, 10));
+
+    var mismatched_formula = try Make.result(alloc, "graph_idx", "pagerank", 8, 2.0);
+    defer mismatched_formula.deinit();
+    mismatched_formula.hits[0].score_details.?.base_score = 0.5;
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{mismatched_formula}, 0, 10));
+
+    var non_finite = try Make.result(alloc, "graph_idx", "pagerank", 8, std.math.nan(f64));
+    defer non_finite.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{non_finite}, 0, 10));
+
+    var non_finite_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    non_finite_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = std.math.inf(f32),
+    };
+    var non_finite_without_details = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = non_finite_hits,
+        .total_hits = 1,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer non_finite_without_details.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{non_finite_without_details}, 0, 10));
+}
+
+test "query merge rejects missing or unpublished graph metric rerank shard status" {
+    const alloc = std.testing.allocator;
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 3.0,
+    };
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = left_hits,
+        .total_hits = 1,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .fresh,
+            .published_generation = 8,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+            .progress = 1.0,
+            .converged = true,
+        },
+    };
+    defer left.deinit();
+
+    const req = db_mod.types.SearchRequest{
+        .graph_metric_rerank = .{
+            .index_name = "graph_idx",
+            .metric_name = "pagerank",
+            .freshness = .published,
+            .weight = 1.0,
+        },
+    };
+
+    var missing = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+    };
+    defer missing.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, missing }, 0, 10));
+
+    var unpublished = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = &.{},
+        .total_hits = 0,
+        .graph_metric_rerank_status = .{
+            .name = try alloc.dupe(u8, "pagerank"),
+            .state = .not_ready,
+            .published_generation = 0,
+            .edge_generation = 8,
+            .target_edge_generation = 8,
+        },
+    };
+    defer unpublished.deinit();
+    try std.testing.expectError(error.UnsupportedQueryRequest, mergeSearchResults(alloc, req, &.{ left, unpublished }, 0, 10));
 }
 
 test "query merge preserves single-result doc ordinals" {

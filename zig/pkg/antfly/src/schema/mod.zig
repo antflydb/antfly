@@ -43,12 +43,14 @@ pub fn validateWritesAgainstTableSchema(
 }
 
 pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSchema) !storage_schema.TableSchema {
-    var dynamic_templates: []storage_schema.DynamicTemplate = if (schema.dynamic_templates.len == 0)
+    const embedded_dynamic_template_count = countEmbeddedDynamicTemplates(schema);
+    const dynamic_template_count = schema.dynamic_templates.len + embedded_dynamic_template_count;
+    var dynamic_templates: []storage_schema.DynamicTemplate = if (dynamic_template_count == 0)
         &[_]storage_schema.DynamicTemplate{}
     else
-        try alloc.alloc(storage_schema.DynamicTemplate, schema.dynamic_templates.len);
+        try alloc.alloc(storage_schema.DynamicTemplate, dynamic_template_count);
     var initialized: usize = 0;
-    errdefer if (schema.dynamic_templates.len > 0) {
+    errdefer if (dynamic_template_count > 0) {
         for (dynamic_templates[0..initialized]) |template| {
             alloc.free(template.name);
             if (template.match_pattern) |value| alloc.free(value);
@@ -63,25 +65,33 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
     const full_text_documents = try deriveRuntimeFullTextDocuments(alloc, schema);
     errdefer freeRuntimeFullTextDocuments(alloc, full_text_documents);
 
-    for (schema.dynamic_templates, 0..) |template, i| {
-        const field_type = parseRuntimeFieldType(template.field_type orelse "text");
-        dynamic_templates[i] = .{
-            .name = try alloc.dupe(u8, template.name),
-            .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
-            .unmatch_pattern = if (template.unmatch_pattern) |value| try alloc.dupe(u8, value) else null,
-            .path_match = if (template.path_match) |value| try alloc.dupe(u8, value) else null,
-            .path_unmatch = if (template.path_unmatch) |value| try alloc.dupe(u8, value) else null,
-            .match_mapping_type = if (template.match_mapping_type) |value| try alloc.dupe(u8, value) else null,
-            .mapping = .{
-                .field_type = field_type,
-                .do_index = template.do_index orelse true,
-                .store = template.store orelse false,
-                .doc_values = template.doc_values orelse false,
-                .include_in_all = template.include_in_all orelse false,
-                .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
-            },
-        };
+    const relational_columns = try deriveRuntimeRelationalColumns(alloc, schema);
+    errdefer freeRuntimeRelationalColumns(alloc, relational_columns);
+    const primary_key = try deriveRuntimePrimaryKey(alloc, schema);
+    errdefer if (primary_key) |key| freeRuntimePrimaryKey(alloc, key);
+    const periods = try deriveRuntimePeriods(alloc, schema);
+    errdefer freeRuntimePeriods(alloc, periods);
+    const foreign_keys = try deriveRuntimeForeignKeys(alloc, schema);
+    errdefer freeRuntimeForeignKeys(alloc, foreign_keys);
+    const unique_constraints = try deriveRuntimeUniqueConstraints(alloc, schema);
+    errdefer freeRuntimeUniqueConstraints(alloc, unique_constraints);
+    const checks = try deriveRuntimeRelationalChecks(alloc, schema);
+    errdefer freeRuntimeRelationalChecks(alloc, checks);
+    const external_base_source = if (schema.external_base_source) |source| try cloneRuntimeExternalBaseSource(alloc, source) else null;
+    errdefer if (external_base_source) |source| storage_schema.freeExternalBaseSource(alloc, source);
+    const storage_mode: storage_schema.StorageMode = switch (schema.storage_mode) {
+        .document => .document,
+        .relational => .relational,
+    };
+
+    for (schema.dynamic_templates) |template| {
+        dynamic_templates[initialized] = try runtimeDynamicTemplateFromParsed(alloc, template, null);
         initialized += 1;
+    }
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            try appendEmbeddedRuntimeDynamicTemplates(alloc, &dynamic_templates, &initialized, property.name, property);
+        }
     }
 
     return .{
@@ -90,9 +100,895 @@ pub fn deriveRuntimeTableSchema(alloc: std.mem.Allocator, schema: ParsedTableSch
         .ttl_duration_ns = schema.ttl_duration_ns,
         .ttl_field = try alloc.dupe(u8, schema.ttl_field),
         .enforce_types = schema.enforce_types,
+        .storage_mode = storage_mode,
         .dynamic_templates = dynamic_templates,
         .full_text_documents = full_text_documents,
+        .relational_columns = relational_columns,
+        .primary_key = primary_key,
+        .periods = periods,
+        .foreign_keys = foreign_keys,
+        .unique_constraints = unique_constraints,
+        .checks = checks,
+        .external_base_source = external_base_source,
+        .system_versioned = schema.system_versioned,
     };
+}
+
+fn cloneRuntimeExternalBaseSource(
+    alloc: std.mem.Allocator,
+    source: storage_schema.ExternalBaseSource,
+) !storage_schema.ExternalBaseSource {
+    const table_id = try alloc.dupe(u8, source.table_id);
+    errdefer alloc.free(table_id);
+    const source_uri = try alloc.dupe(u8, source.source_uri);
+    errdefer alloc.free(source_uri);
+    const credential_ref = if (source.credential_ref) |credential| credential_blk: {
+        const ref_id = try alloc.dupe(u8, credential.ref_id);
+        errdefer alloc.free(ref_id);
+        const scope = try alloc.dupe(u8, credential.scope);
+        errdefer alloc.free(scope);
+        break :credential_blk storage_schema.ExternalCredentialRef{ .ref_id = ref_id, .scope = scope };
+    } else null;
+    errdefer if (credential_ref) |credential| {
+        alloc.free(credential.ref_id);
+        alloc.free(credential.scope);
+    };
+    const snapshot_mode: storage_schema.ExternalSnapshotMode = switch (source.snapshot_mode) {
+        .current => .current,
+        .snapshot_id => |snapshot_id| .{ .snapshot_id = try alloc.dupe(u8, snapshot_id) },
+        .object_version_digest => |digest| .{ .object_version_digest = try alloc.dupe(u8, digest) },
+    };
+    errdefer switch (snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| alloc.free(snapshot_id),
+        .object_version_digest => |digest| alloc.free(digest),
+    };
+    const schema_fingerprint = try alloc.dupe(u8, source.schema_fingerprint);
+    errdefer alloc.free(schema_fingerprint);
+    return .{
+        .table_id = table_id,
+        .format = source.format,
+        .source_uri = source_uri,
+        .credential_ref = credential_ref,
+        .snapshot_mode = snapshot_mode,
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = source.write_policy,
+    };
+}
+
+fn countEmbeddedDynamicTemplates(schema: ParsedTableSchema) usize {
+    var count: usize = 0;
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| count += countEmbeddedDynamicTemplatesForProperty(property);
+    }
+    return count;
+}
+
+fn countEmbeddedDynamicTemplatesForProperty(property: impl.DocumentProperty) usize {
+    var count = property.embedded_dynamic_templates.len;
+    if (property.embedded_schema) |embedded_schema| count += countEmbeddedDynamicTemplatesForProperty(embedded_schema.*);
+    if (property.item) |item| count += countEmbeddedDynamicTemplatesForProperty(item.*);
+    for (property.properties) |child| count += countEmbeddedDynamicTemplatesForProperty(child);
+    return count;
+}
+
+fn appendEmbeddedRuntimeDynamicTemplates(
+    alloc: std.mem.Allocator,
+    dynamic_templates: *[]storage_schema.DynamicTemplate,
+    initialized: *usize,
+    path: []const u8,
+    property: impl.DocumentProperty,
+) !void {
+    for (property.embedded_dynamic_templates) |template| {
+        dynamic_templates.*[initialized.*] = try runtimeDynamicTemplateFromParsed(alloc, template, path);
+        initialized.* += 1;
+    }
+    if (property.embedded_schema) |embedded_schema| {
+        try appendEmbeddedRuntimeDynamicTemplates(alloc, dynamic_templates, initialized, path, embedded_schema.*);
+    }
+    if (property.item) |item| {
+        try appendEmbeddedRuntimeDynamicTemplates(alloc, dynamic_templates, initialized, path, item.*);
+    }
+    for (property.properties) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        try appendEmbeddedRuntimeDynamicTemplates(alloc, dynamic_templates, initialized, child_path, child);
+    }
+}
+
+fn runtimeDynamicTemplateFromParsed(
+    alloc: std.mem.Allocator,
+    template: impl.DynamicTemplate,
+    scope_path: ?[]const u8,
+) !storage_schema.DynamicTemplate {
+    const field_type = parseRuntimeFieldType(template.field_type orelse "text");
+    return .{
+        .name = if (scope_path) |scope| try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, template.name }) else try alloc.dupe(u8, template.name),
+        .match_pattern = if (template.match_pattern) |value| try alloc.dupe(u8, value) else null,
+        .unmatch_pattern = if (template.unmatch_pattern) |value| try alloc.dupe(u8, value) else null,
+        .path_match = try scopedPatternAlloc(alloc, scope_path, template.path_match, true),
+        .path_unmatch = try scopedPatternAlloc(alloc, scope_path, template.path_unmatch, false),
+        .match_mapping_type = if (template.match_mapping_type) |value| try alloc.dupe(u8, value) else null,
+        .mapping = .{
+            .field_type = field_type,
+            .do_index = template.do_index orelse true,
+            .store = template.store orelse false,
+            .doc_values = template.doc_values orelse false,
+            .include_in_all = template.include_in_all orelse false,
+            .analyzer = try alloc.dupe(u8, template.analyzer orelse defaultDynamicTemplateAnalyzer(field_type)),
+        },
+    };
+}
+
+fn scopedPatternAlloc(
+    alloc: std.mem.Allocator,
+    scope_path: ?[]const u8,
+    pattern: ?[]const u8,
+    default_to_scope: bool,
+) !?[]u8 {
+    const scope = scope_path orelse return if (pattern) |value| try alloc.dupe(u8, value) else null;
+    if (pattern) |value| return try std.fmt.allocPrint(alloc, "{s}.{s}", .{ scope, value });
+    if (default_to_scope) return try std.fmt.allocPrint(alloc, "{s}.*", .{scope});
+    return null;
+}
+
+/// Derive the relational typed-column catalog from a parsed table schema. One
+/// column per declared top-level property; nested objects/arrays and json-typed
+/// fields become `json` columns (indexed as document subtrees); embeddings are
+/// skipped. Mirrors schema_capability.relationalColumnType, but emits runtime
+/// AntflyType values for the runtime schema consumed by document_mapper.
+fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(storage_schema.RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |column| freeRuntimeRelationalColumn(alloc, column);
+        columns.deinit(alloc);
+    }
+
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            const field_type = runtimeRelationalColumnType(property) orelse continue;
+            const nullable = !requiredFieldsContain(document_schema.required_fields, property.name);
+            if (property.collation != null and !runtimeRelationalPropertySupportsCollation(property, field_type)) return error.InvalidSchemaUpdateRequest;
+            try validateRuntimeRelationalDefault(alloc, property.default_value, field_type);
+            try validateRuntimeRelationalOnUpdate(property.on_update_value, field_type);
+            const name = try alloc.dupe(u8, property.name);
+            var name_owned = true;
+            errdefer if (name_owned) alloc.free(name);
+            const path = try alloc.dupe(u8, property.name);
+            var path_owned = true;
+            errdefer if (path_owned) alloc.free(path);
+            var column: storage_schema.RelationalColumn = .{
+                .name = name,
+                .path = path,
+                .field_type = field_type,
+                .array_item_type = runtimeRelationalArrayItemType(property),
+                .nullable = nullable,
+                .collation = if (property.collation) |collation| try alloc.dupe(u8, collation) else null,
+                .indexed = if (property.antfly_index) |indexed| indexed else true,
+                .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
+                .index_generation = property.index_generation orelse 0,
+            };
+            name_owned = false;
+            path_owned = false;
+            var column_owned = true;
+            errdefer if (column_owned) freeRuntimeRelationalColumn(alloc, column);
+            column.index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
+            column.index_include_columns = try cloneStringSlice(alloc, property.index_include_columns);
+            column.index_keys = try cloneRelationalIndexKeys(alloc, property.index_keys);
+            column.default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null;
+            column.on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null;
+            column.generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null;
+            column.index_where = try cloneUniquePredicates(alloc, property.index_where);
+            column.index_where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, property.index_where_expressions);
+            try columns.append(alloc, column);
+            column_owned = false;
+        }
+    }
+
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn runtimeRelationalColumnSupportsCollation(field_type: storage_schema.AntflyType) bool {
+    return switch (field_type) {
+        .keyword, .text => true,
+        else => false,
+    };
+}
+
+fn runtimeRelationalPropertySupportsCollation(property: anytype, field_type: storage_schema.AntflyType) bool {
+    if (runtimeRelationalColumnSupportsCollation(field_type)) return true;
+    if (field_type != .array) return false;
+    const item_type = runtimeRelationalArrayItemType(property) orelse return false;
+    return runtimeRelationalColumnSupportsCollation(item_type);
+}
+
+fn validateRuntimeRelationalDefault(
+    alloc: std.mem.Allocator,
+    default_value: ?impl.RelationalDefaultValue,
+    field_type: storage_schema.AntflyType,
+) !void {
+    const value = default_value orelse return;
+    switch (value.kind) {
+        .literal => try validateRuntimeRelationalLiteralDefault(alloc, value.value_json, field_type),
+        .now_ns => switch (field_type) {
+            .numeric, .datetime => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+        .current_date_ns => switch (field_type) {
+            .numeric, .datetime => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+        .uuid_v4 => switch (field_type) {
+            .keyword, .text, .link => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+        .sequence_next => switch (field_type) {
+            .numeric => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+    }
+}
+
+fn validateRuntimeRelationalLiteralDefault(
+    alloc: std.mem.Allocator,
+    value_json: []const u8,
+    field_type: storage_schema.AntflyType,
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidSchemaUpdateRequest;
+    defer parsed.deinit();
+    if (parsed.value == .null) return;
+    switch (field_type) {
+        .keyword, .text, .link, .blob, .datetime => {
+            if (parsed.value != .string) return error.InvalidSchemaUpdateRequest;
+        },
+        .numeric => switch (parsed.value) {
+            .integer, .float => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+        .boolean => {
+            if (parsed.value != .bool) return error.InvalidSchemaUpdateRequest;
+        },
+        .json => {},
+        .array => {
+            if (parsed.value != .array) return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn validateRuntimeRelationalOnUpdate(on_update_value: ?impl.RelationalDefaultValue, field_type: storage_schema.AntflyType) !void {
+    const value = on_update_value orelse return;
+    switch (value.kind) {
+        .now_ns => switch (field_type) {
+            .numeric, .datetime => {},
+            else => return error.InvalidSchemaUpdateRequest,
+        },
+        .literal, .current_date_ns, .uuid_v4, .sequence_next => return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn freeRuntimeRelationalColumns(alloc: std.mem.Allocator, columns: []storage_schema.RelationalColumn) void {
+    for (columns) |column| {
+        freeRuntimeRelationalColumn(alloc, column);
+    }
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn freeRuntimeRelationalColumn(alloc: std.mem.Allocator, column: storage_schema.RelationalColumn) void {
+    alloc.free(column.name);
+    alloc.free(column.path);
+    if (column.collation) |collation| alloc.free(collation);
+    if (column.index_name) |index_name| alloc.free(index_name);
+    for (column.index_include_columns) |field_name| alloc.free(field_name);
+    if (column.index_include_columns.len > 0) alloc.free(column.index_include_columns);
+    storage_schema.freeRelationalIndexKeySlice(alloc, column.index_keys);
+    if (column.default_value) |value| alloc.free(value.value_json);
+    if (column.on_update_value) |value| alloc.free(value.value_json);
+    if (column.generated) |value| freeRuntimeRelationalGeneratedValue(alloc, value);
+    for (column.index_where) |predicate| {
+        alloc.free(predicate.field);
+        if (predicate.value_json) |value| alloc.free(value);
+    }
+    if (column.index_where.len > 0) alloc.free(column.index_where);
+    freeRelationalRowsExpressionConditions(alloc, column.index_where_expressions);
+}
+
+fn cloneRelationalDefaultValue(
+    alloc: std.mem.Allocator,
+    value: impl.RelationalDefaultValue,
+) !storage_schema.RelationalDefaultValue {
+    return .{
+        .kind = switch (value.kind) {
+            .literal => .literal,
+            .now_ns => .now_ns,
+            .current_date_ns => .current_date_ns,
+            .uuid_v4 => .uuid_v4,
+            .sequence_next => .sequence_next,
+        },
+        .value_json = try alloc.dupe(u8, value.value_json),
+    };
+}
+
+fn cloneRelationalGeneratedValue(
+    alloc: std.mem.Allocator,
+    value: impl.RelationalGeneratedValue,
+) !storage_schema.RelationalGeneratedValue {
+    return .{
+        .op = switch (value.op) {
+            .lower => .lower,
+            .upper => .upper,
+            .md5 => .md5,
+            .concat => .concat,
+            .concat_ws => .concat_ws,
+            .expression => .expression,
+        },
+        .field = if (value.field) |field| try alloc.dupe(u8, field) else null,
+        .fields = try cloneStringSlice(alloc, value.fields),
+        .separator = try alloc.dupe(u8, value.separator),
+        .expression = if (value.expression) |expression| try cloneRelationalRowsExpressionAlloc(alloc, expression) else null,
+    };
+}
+
+fn freeRuntimeRelationalGeneratedValue(alloc: std.mem.Allocator, value: storage_schema.RelationalGeneratedValue) void {
+    if (value.field) |field| alloc.free(field);
+    for (value.fields) |field| alloc.free(field);
+    if (value.fields.len > 0) alloc.free(value.fields);
+    alloc.free(value.separator);
+    if (value.expression) |expression| freeRelationalRowsExpression(alloc, expression);
+}
+
+fn deriveRuntimePrimaryKey(alloc: std.mem.Allocator, schema: ParsedTableSchema) !?storage_schema.PrimaryKey {
+    const primary_key = schema.primary_key orelse return null;
+    const name = if (primary_key.name) |key_name| try alloc.dupe(u8, key_name) else null;
+    errdefer if (name) |key_name| alloc.free(key_name);
+    const columns = try cloneStringSlice(alloc, primary_key.columns);
+    errdefer {
+        for (columns) |column| alloc.free(column);
+        if (columns.len > 0) alloc.free(columns);
+    }
+    const include_columns = try cloneStringSlice(alloc, primary_key.include_columns);
+    errdefer {
+        for (include_columns) |column| alloc.free(column);
+        if (include_columns.len > 0) alloc.free(include_columns);
+    }
+    const without_overlaps_period = if (primary_key.without_overlaps_period) |period| try alloc.dupe(u8, period) else null;
+    return .{
+        .name = name,
+        .columns = columns,
+        .include_columns = include_columns,
+        .without_overlaps_period = without_overlaps_period,
+        .deferrable = primary_key.deferrable,
+        .timing = switch (primary_key.timing) {
+            .immediate => .immediate,
+            .deferred => .deferred,
+        },
+    };
+}
+
+fn freeRuntimePrimaryKey(alloc: std.mem.Allocator, primary_key: storage_schema.PrimaryKey) void {
+    if (primary_key.name) |name| alloc.free(name);
+    for (primary_key.columns) |column| alloc.free(column);
+    if (primary_key.columns.len > 0) alloc.free(primary_key.columns);
+    for (primary_key.include_columns) |column| alloc.free(column);
+    if (primary_key.include_columns.len > 0) alloc.free(primary_key.include_columns);
+    if (primary_key.without_overlaps_period) |period| alloc.free(period);
+}
+
+fn deriveRuntimePeriods(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.RelationalPeriod {
+    if (schema.periods.len == 0) return &.{};
+    const periods = try alloc.alloc(storage_schema.RelationalPeriod, schema.periods.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (periods[0..initialized]) |period| {
+            alloc.free(period.name);
+            alloc.free(period.start_column);
+            alloc.free(period.end_column);
+        }
+        alloc.free(periods);
+    }
+    for (schema.periods) |period| {
+        periods[initialized] = .{
+            .name = try alloc.dupe(u8, period.name),
+            .start_column = try alloc.dupe(u8, period.start_column),
+            .end_column = try alloc.dupe(u8, period.end_column),
+            .range_type = period.range_type,
+        };
+        initialized += 1;
+    }
+    return periods;
+}
+
+fn freeRuntimePeriods(alloc: std.mem.Allocator, periods: []storage_schema.RelationalPeriod) void {
+    for (periods) |period| {
+        alloc.free(period.name);
+        alloc.free(period.start_column);
+        alloc.free(period.end_column);
+    }
+    if (periods.len > 0) alloc.free(periods);
+}
+
+fn deriveRuntimeForeignKeys(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.ForeignKey {
+    if (schema.foreign_keys.len == 0) return &.{};
+    const foreign_keys = try alloc.alloc(storage_schema.ForeignKey, schema.foreign_keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        if (initialized > 0) {
+            freeRuntimeForeignKeys(alloc, foreign_keys[0..initialized]);
+        } else {
+            alloc.free(foreign_keys);
+        }
+    }
+    for (schema.foreign_keys) |foreign_key| {
+        foreign_keys[initialized] = .{
+            .name = try alloc.dupe(u8, foreign_key.name),
+            .child_columns = try cloneStringSlice(alloc, foreign_key.columns),
+            .child_period = if (foreign_key.period) |period| try alloc.dupe(u8, period) else null,
+            .parent_table = try alloc.dupe(u8, foreign_key.references.table),
+            .parent_columns = try cloneStringSlice(alloc, foreign_key.references.columns),
+            .parent_period = if (foreign_key.references.period) |period| try alloc.dupe(u8, period) else null,
+            .on_delete = switch (foreign_key.on_delete) {
+                .restrict => .restrict,
+                .no_action => .no_action,
+                .set_null => .set_null,
+                .cascade => .cascade,
+            },
+            .on_update = switch (foreign_key.on_update) {
+                .restrict => .restrict,
+                .no_action => .no_action,
+                .set_null => .set_null,
+                .cascade => .cascade,
+            },
+            .timing = switch (foreign_key.timing) {
+                .immediate => .immediate,
+                .deferred => .deferred,
+            },
+            .deferrable = foreign_key.deferrable,
+            .match = switch (foreign_key.match) {
+                .simple => .simple,
+                .full => .full,
+                .partial => .partial,
+            },
+            .validation_state = switch (foreign_key.validation_state) {
+                .enforced => .enforced,
+                .unvalidated => .unvalidated,
+                .validating => .validating,
+                .invalid => .invalid,
+            },
+        };
+        initialized += 1;
+    }
+    return foreign_keys;
+}
+
+fn freeRuntimeForeignKeys(alloc: std.mem.Allocator, foreign_keys: []storage_schema.ForeignKey) void {
+    for (foreign_keys) |foreign_key| {
+        alloc.free(foreign_key.name);
+        for (foreign_key.child_columns) |column| alloc.free(column);
+        if (foreign_key.child_columns.len > 0) alloc.free(foreign_key.child_columns);
+        if (foreign_key.child_period) |period| alloc.free(period);
+        alloc.free(foreign_key.parent_table);
+        for (foreign_key.parent_columns) |column| alloc.free(column);
+        if (foreign_key.parent_columns.len > 0) alloc.free(foreign_key.parent_columns);
+        if (foreign_key.parent_period) |period| alloc.free(period);
+    }
+    if (foreign_keys.len > 0) alloc.free(foreign_keys);
+}
+
+fn deriveRuntimeUniqueConstraints(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.UniqueConstraint {
+    if (schema.unique_constraints.len == 0) return &.{};
+    const constraints = try alloc.alloc(storage_schema.UniqueConstraint, schema.unique_constraints.len);
+    var initialized: usize = 0;
+    errdefer {
+        if (initialized > 0) {
+            freeRuntimeUniqueConstraints(alloc, constraints[0..initialized]);
+        } else {
+            alloc.free(constraints);
+        }
+    }
+    for (schema.unique_constraints) |constraint| {
+        constraints[initialized] = .{
+            .name = try alloc.dupe(u8, constraint.name),
+            .columns = try cloneStringSlice(alloc, constraint.columns),
+            .expressions = try cloneUniqueExpressions(alloc, constraint.expressions),
+            .include_columns = try cloneStringSlice(alloc, constraint.include_columns),
+            .index_keys = try cloneRelationalIndexKeys(alloc, constraint.index_keys),
+            .without_overlaps_period = if (constraint.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
+            .nulls_not_distinct = constraint.nulls_not_distinct,
+            .deferrable = constraint.deferrable,
+            .timing = switch (constraint.timing) {
+                .immediate => .immediate,
+                .deferred => .deferred,
+            },
+            .where = try cloneUniquePredicates(alloc, constraint.where),
+            .where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, constraint.where_expressions),
+            .validation_state = switch (constraint.validation_state) {
+                .enforced => .enforced,
+                .unvalidated => .unvalidated,
+                .validating => .validating,
+                .invalid => .invalid,
+            },
+        };
+        initialized += 1;
+    }
+    return constraints;
+}
+
+fn freeRuntimeUniqueConstraints(alloc: std.mem.Allocator, constraints: []storage_schema.UniqueConstraint) void {
+    for (constraints) |constraint| {
+        alloc.free(constraint.name);
+        for (constraint.columns) |column| alloc.free(column);
+        if (constraint.columns.len > 0) alloc.free(constraint.columns);
+        for (constraint.expressions) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
+        if (constraint.expressions.len > 0) alloc.free(constraint.expressions);
+        for (constraint.include_columns) |column| alloc.free(column);
+        if (constraint.include_columns.len > 0) alloc.free(constraint.include_columns);
+        storage_schema.freeRelationalIndexKeySlice(alloc, constraint.index_keys);
+        if (constraint.without_overlaps_period) |period| alloc.free(period);
+        for (constraint.where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        if (constraint.where.len > 0) alloc.free(constraint.where);
+        freeRelationalRowsExpressionConditions(alloc, constraint.where_expressions);
+    }
+    if (constraints.len > 0) alloc.free(constraints);
+}
+
+fn deriveRuntimeRelationalChecks(alloc: std.mem.Allocator, schema: ParsedTableSchema) ![]storage_schema.RelationalCheck {
+    if (schema.checks.len == 0) return &.{};
+    const checks = try alloc.alloc(storage_schema.RelationalCheck, schema.checks.len);
+    var initialized: usize = 0;
+    errdefer {
+        if (initialized > 0) {
+            freeRuntimeRelationalChecks(alloc, checks[0..initialized]);
+        } else {
+            alloc.free(checks);
+        }
+    }
+    for (schema.checks) |check| {
+        checks[initialized] = .{
+            .name = try alloc.dupe(u8, check.name),
+            .field = try alloc.dupe(u8, check.field),
+            .op = switch (check.op) {
+                .is_null => .is_null,
+                .is_not_null => .is_not_null,
+                .is_distinct => .is_distinct,
+                .is_not_distinct => .is_not_distinct,
+                .eq => .eq,
+                .ne => .ne,
+                .gt => .gt,
+                .gte => .gte,
+                .lt => .lt,
+                .lte => .lte,
+            },
+            .value_json = if (check.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+            .collation = if (check.collation) |collation| try alloc.dupe(u8, collation) else null,
+            .validation_state = switch (check.validation_state) {
+                .enforced => .enforced,
+                .unvalidated => .unvalidated,
+                .validating => .validating,
+                .invalid => .invalid,
+            },
+            .expression = if (check.expression) |expression| try cloneRelationalRowsExpressionConditionAlloc(alloc, expression) else null,
+        };
+        initialized += 1;
+    }
+    return checks;
+}
+
+fn freeRuntimeRelationalChecks(alloc: std.mem.Allocator, checks: []storage_schema.RelationalCheck) void {
+    for (checks) |check| {
+        alloc.free(check.name);
+        alloc.free(check.field);
+        if (check.value_json) |value_json| alloc.free(value_json);
+        if (check.collation) |collation| alloc.free(collation);
+        if (check.expression) |expression| freeRelationalRowsExpressionCondition(alloc, expression);
+    }
+    if (checks.len > 0) alloc.free(checks);
+}
+
+fn cloneRelationalRowsExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    condition: storage_schema.RelationalRowsExpressionCondition,
+) anyerror!storage_schema.RelationalRowsExpressionCondition {
+    const lhs = try cloneRelationalRowsExpressionAlloc(alloc, condition.lhs);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeRelationalRowsExpression(alloc, lhs);
+    const rhs = try alloc.alloc(storage_schema.RelationalRowsExpression, condition.rhs.len);
+    var rhs_initialized: usize = 0;
+    errdefer {
+        for (rhs[0..rhs_initialized]) |expression| freeRelationalRowsExpression(alloc, expression);
+        if (rhs.len > 0) alloc.free(rhs);
+    }
+    for (condition.rhs) |expression| {
+        rhs[rhs_initialized] = try cloneRelationalRowsExpressionAlloc(alloc, expression);
+        rhs_initialized += 1;
+    }
+    lhs_transferred = true;
+    return .{ .lhs = lhs, .op = condition.op, .rhs = rhs };
+}
+
+fn cloneRelationalRowsExpressionConditionsAlloc(
+    alloc: std.mem.Allocator,
+    conditions: []const storage_schema.RelationalRowsExpressionCondition,
+) anyerror![]const storage_schema.RelationalRowsExpressionCondition {
+    if (conditions.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalRowsExpressionCondition, conditions.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        alloc.free(out);
+    }
+    for (conditions) |condition| {
+        out[initialized] = try cloneRelationalRowsExpressionConditionAlloc(alloc, condition);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeRelationalRowsExpressionConditions(
+    alloc: std.mem.Allocator,
+    conditions: []const storage_schema.RelationalRowsExpressionCondition,
+) void {
+    for (conditions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+    if (conditions.len > 0) alloc.free(conditions);
+}
+
+fn cloneRelationalRowsExpressionAlloc(
+    alloc: std.mem.Allocator,
+    expression: storage_schema.RelationalRowsExpression,
+) anyerror!storage_schema.RelationalRowsExpression {
+    const field = try alloc.dupe(u8, expression.field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const value_json = try alloc.dupe(u8, expression.value_json);
+    var value_transferred = false;
+    errdefer if (!value_transferred) alloc.free(value_json);
+    const json_path = try alloc.dupe(u8, expression.json_path);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(json_path);
+
+    const operands = try alloc.alloc(storage_schema.RelationalRowsExpression, expression.operands.len);
+    var operands_initialized: usize = 0;
+    errdefer {
+        for (operands[0..operands_initialized]) |operand| freeRelationalRowsExpression(alloc, operand);
+        if (operands.len > 0) alloc.free(operands);
+    }
+    for (expression.operands) |operand| {
+        operands[operands_initialized] = try cloneRelationalRowsExpressionAlloc(alloc, operand);
+        operands_initialized += 1;
+    }
+
+    const branches = try alloc.alloc(storage_schema.RelationalRowsExpressionCaseBranch, expression.case_branches.len);
+    var branches_initialized: usize = 0;
+    errdefer {
+        for (branches[0..branches_initialized]) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+        if (branches.len > 0) alloc.free(branches);
+    }
+    for (expression.case_branches) |branch| {
+        const when = try cloneRelationalRowsExpressionConditionAlloc(alloc, branch.when);
+        var when_transferred = false;
+        errdefer if (!when_transferred) freeRelationalRowsExpressionCondition(alloc, when);
+        const then = try cloneRelationalRowsExpressionAlloc(alloc, branch.then);
+        var then_transferred = false;
+        errdefer if (!then_transferred) freeRelationalRowsExpression(alloc, then);
+        branches[branches_initialized] = .{ .when = when, .then = then };
+        when_transferred = true;
+        then_transferred = true;
+        branches_initialized += 1;
+    }
+
+    const fallback = try alloc.alloc(storage_schema.RelationalRowsExpression, expression.case_else.len);
+    var fallback_initialized: usize = 0;
+    errdefer {
+        for (fallback[0..fallback_initialized]) |item| freeRelationalRowsExpression(alloc, item);
+        if (fallback.len > 0) alloc.free(fallback);
+    }
+    for (expression.case_else) |item| {
+        fallback[fallback_initialized] = try cloneRelationalRowsExpressionAlloc(alloc, item);
+        fallback_initialized += 1;
+    }
+
+    field_transferred = true;
+    value_transferred = true;
+    path_transferred = true;
+    return .{
+        .kind = expression.kind,
+        .field = field,
+        .field_source = expression.field_source,
+        .value_json = value_json,
+        .json_path = json_path,
+        .json_as_text = expression.json_as_text,
+        .operands = operands,
+        .cast_type = expression.cast_type,
+        .case_branches = branches,
+        .case_else = fallback,
+    };
+}
+
+fn freeRelationalRowsExpressionCondition(
+    alloc: std.mem.Allocator,
+    condition: storage_schema.RelationalRowsExpressionCondition,
+) void {
+    freeRelationalRowsExpression(alloc, condition.lhs);
+    for (condition.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
+    if (condition.rhs.len > 0) alloc.free(condition.rhs);
+}
+
+fn freeRelationalRowsExpressionCaseBranch(
+    alloc: std.mem.Allocator,
+    branch: storage_schema.RelationalRowsExpressionCaseBranch,
+) void {
+    freeRelationalRowsExpressionCondition(alloc, branch.when);
+    freeRelationalRowsExpression(alloc, branch.then);
+}
+
+fn freeRelationalRowsExpression(
+    alloc: std.mem.Allocator,
+    expression: storage_schema.RelationalRowsExpression,
+) void {
+    alloc.free(expression.field);
+    alloc.free(expression.value_json);
+    alloc.free(expression.json_path);
+    for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
+    if (expression.operands.len > 0) alloc.free(expression.operands);
+    for (expression.case_branches) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+    if (expression.case_branches.len > 0) alloc.free(expression.case_branches);
+    for (expression.case_else) |fallback| freeRelationalRowsExpression(alloc, fallback);
+    if (expression.case_else.len > 0) alloc.free(expression.case_else);
+}
+
+fn cloneUniqueExpressions(alloc: std.mem.Allocator, values: []const impl.UniqueExpression) ![]const storage_schema.UniqueExpression {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniqueExpression, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        const field = try alloc.dupe(u8, value.field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const row_expression = if (value.expression) |expression| try cloneRelationalRowsExpressionAlloc(alloc, expression) else null;
+        errdefer if (row_expression) |expression| freeRelationalRowsExpression(alloc, expression);
+        out[initialized] = .{
+            .op = switch (value.op) {
+                .lower => .lower,
+                .upper => .upper,
+                .md5 => .md5,
+                .expression => .expression,
+            },
+            .field = field,
+            .expression = row_expression,
+        };
+        field_transferred = true;
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneUniquePredicates(alloc: std.mem.Allocator, values: []const impl.UniquePredicate) ![]const storage_schema.UniquePredicate {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.UniquePredicate, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, value.field),
+            .op = switch (value.op) {
+                .is_null => .is_null,
+                .is_not_null => .is_not_null,
+                .eq => .eq,
+                .ne => .ne,
+            },
+            .value_json = if (value.value_json) |value_json| try alloc.dupe(u8, value_json) else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneStringSlice(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn cloneRelationalIndexKeys(alloc: std.mem.Allocator, values: []const storage_schema.RelationalIndexKey) ![]const storage_schema.RelationalIndexKey {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc(storage_schema.RelationalIndexKey, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(value.column);
+        alloc.free(out);
+    }
+    for (values) |value| {
+        out[initialized] = .{
+            .column = try alloc.dupe(u8, value.column),
+            .direction = value.direction,
+            .nulls = value.nulls,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn runtimeRelationalColumnType(property: anytype) ?storage_schema.AntflyType {
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string")) return .keyword;
+        if (std.mem.eql(u8, field_type, "text")) return .text;
+        if (std.mem.eql(u8, field_type, "html")) return .html;
+        if (std.mem.eql(u8, field_type, "search_as_you_type")) return .search_as_you_type;
+        if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
+        if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
+        if (std.mem.eql(u8, field_type, "integer") or
+            std.mem.eql(u8, field_type, "numeric") or
+            std.mem.eql(u8, field_type, "number")) return .numeric;
+        if (std.mem.eql(u8, field_type, "geopoint")) return .geopoint;
+        if (std.mem.eql(u8, field_type, "geoshape")) return .geoshape;
+        if (std.mem.eql(u8, field_type, "blob")) return .blob;
+        if (std.mem.eql(u8, field_type, "array")) return .array;
+        if (std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object")) return .json;
+        if (std.mem.eql(u8, field_type, "embedding")) return null;
+        if (property.integer_only) return .numeric;
+        return null;
+    }
+    if (property.integer_only) return .numeric;
+    if (property.properties.len > 0 or
+        property.item != null or
+        (property.additional_properties_allowed orelse false) or
+        property.additional_properties_schema != null or
+        property.pattern_properties.len > 0 or
+        property.dynamic_infer_types) return .json;
+    if (property.const_value != null or property.enum_values.len > 0) return .keyword;
+    return null;
+}
+
+fn runtimeRelationalArrayItemType(property: anytype) ?storage_schema.AntflyType {
+    if (property.field_type == null or !std.mem.eql(u8, property.field_type.?, "array")) return null;
+    const item = property.item orelse return null;
+    return runtimeRelationalColumnType(item.*);
+}
+
+fn runtimeRelationalIndexLifecycle(lifecycle: ?impl.RelationalIndexLifecycle) storage_schema.RelationalIndexLifecycle {
+    return switch (lifecycle orelse .ready) {
+        .ready => .ready,
+        .building => .building,
+        .invalid => .invalid,
+        .dropping => .dropping,
+    };
+}
+
+fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return true;
+    }
+    return false;
 }
 
 fn parseRuntimeFieldType(field_type: []const u8) storage_schema.AntflyType {
@@ -262,6 +1158,11 @@ fn deriveRuntimeFullTextProperty(
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
 
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextProperty(alloc, path, embedded_schema.*, embedded_schema.include_in_all_fields, fields);
+        return;
+    }
+
     if (property.item) |item| {
         if (item.antfly_index != null and !item.antfly_index.?) return;
         if (item.properties.len > 0) {
@@ -351,6 +1252,11 @@ fn deriveRuntimeFullTextDynamicProperty(
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
 
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextDynamicProperty(alloc, path, embedded_schema.*, rules);
+        return;
+    }
+
     if (property.additional_properties_schema) |additional_properties| {
         try appendDynamicRuleFromProperty(alloc, path, null, additional_properties.*, rules);
     }
@@ -393,6 +1299,11 @@ fn deriveRuntimeFullTextOpenDynamicProperty(
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
 
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextOpenDynamicProperty(alloc, path, embedded_schema.*, open_dynamic_paths);
+        return;
+    }
+
     if (!property.dynamic_infer_types and (property.additional_properties_allowed orelse false) and property.additional_properties_schema == null) {
         try appendUniqueOwnedPath(alloc, open_dynamic_paths, path);
     }
@@ -428,6 +1339,11 @@ fn deriveRuntimeFullTextInferTypeDynamicProperty(
     infer_type_dynamic_paths: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     if (property.antfly_index != null and !property.antfly_index.?) return;
+
+    if (property.embedded_schema) |embedded_schema| {
+        try deriveRuntimeFullTextInferTypeDynamicProperty(alloc, path, embedded_schema.*, infer_type_dynamic_paths);
+        return;
+    }
 
     if (property.dynamic_infer_types and (property.additional_properties_allowed orelse false) and property.additional_properties_schema == null) {
         try appendUniqueOwnedPath(alloc, infer_type_dynamic_paths, path);
@@ -661,4 +1577,273 @@ fn appendUniqueOwnedPath(
 fn fieldNameFromPath(path: []const u8) []const u8 {
     const idx = std.mem.lastIndexOfScalar(u8, path, '.') orelse return path;
     return path[idx + 1 ..];
+}
+
+fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?storage_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return column;
+    }
+    return null;
+}
+
+test "deriveRuntimeTableSchema carries external lake base source binding" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","credentials":{"ref":"prod-lake-read","scope":"events"},"snapshot":{"mode":"snapshot_id","id":"iceberg-123"},"schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"},"attrs":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.external_base_source != null);
+    try std.testing.expectEqualStrings("events", parsed.external_base_source.?.table_id);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expect(runtime.external_base_source != null);
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(storage_schema.ExternalBaseFormat.iceberg, runtime.external_base_source.?.format);
+    try std.testing.expectEqualStrings("events", runtime.external_base_source.?.table_id);
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/events", runtime.external_base_source.?.source_uri);
+    try std.testing.expect(runtime.external_base_source.?.credential_ref != null);
+    try std.testing.expectEqualStrings("prod-lake-read", runtime.external_base_source.?.credential_ref.?.ref_id);
+    try std.testing.expectEqualStrings("events", runtime.external_base_source.?.credential_ref.?.scope);
+    try std.testing.expectEqualStrings("iceberg-123", runtime.external_base_source.?.snapshot_mode.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", runtime.external_base_source.?.schema_fingerprint);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","schema_fingerprint":"schema-v1"},"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
+}
+
+test "deriveRuntimeTableSchema carries relational system-versioned marker" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":6,"storage_mode":"relational","default_type":"row","enforce_types":true,"system_versioned":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["id","valid_from","valid_to"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}]}
+    );
+    defer parsed.deinit(alloc);
+    try std.testing.expect(parsed.system_versioned);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expect(runtime.system_versioned);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","system_versioned":true,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}}}}}}
+    ));
+}
+
+test "deriveRuntimeTableSchema carries relational storage mode and column catalog" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","collation":"C"},"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword","x-antfly-index-lifecycle":"building","x-antfly-index-generation":99,"x-antfly-index-name":"customer_idx","x-antfly-index-keys":[{"column":"customer_id","direction":"desc","nulls":"last"},{"column":"tenant_id","direction":"asc","nulls":"first"}],"x-antfly-index-where":{"all":[{"field":"tenant_id","op":"is_not_null"}]}},"amount":{"type":"numeric","x-antfly-index":false},"created_at":{"type":"datetime","x-antfly-on-update":{"op":"now_ns"}},"tags":{"type":"array","items":{"type":"keyword"}},"attrs":{"type":"object","properties":{"k":{"type":"keyword"}}},"payload":{"type":"json"}},"required":["id","tenant_id"],"additionalProperties":false}}},"primary_key":{"name":"orders_pkey","columns":["tenant_id","id"],"include_columns":["created_at","customer_id"]},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict","on_update":"no_action"}],"checks":[{"name":"tenant_case_match","field":"tenant_id","op":"eq","value":"TENANT","collation":"antfly.case_insensitive"}]}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 8), runtime.relational_columns.len);
+
+    const id = findRuntimeColumn(runtime, "id").?;
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, id.field_type);
+    try std.testing.expectEqualStrings("id", id.path);
+    try std.testing.expectEqualStrings("C", id.collation.?);
+    try std.testing.expect(!id.nullable); // required
+    try std.testing.expect(id.indexed);
+    const customer_id = findRuntimeColumn(runtime, "customer_id").?;
+    try std.testing.expectEqualStrings("customer_idx", customer_id.index_name.?);
+    try std.testing.expectEqual(@as(usize, 2), customer_id.index_keys.len);
+    try std.testing.expectEqualStrings("customer_id", customer_id.index_keys[0].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.desc, customer_id.index_keys[0].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.last, customer_id.index_keys[0].nulls);
+    try std.testing.expectEqualStrings("tenant_id", customer_id.index_keys[1].column);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyDirection.asc, customer_id.index_keys[1].direction);
+    try std.testing.expectEqual(storage_schema.RelationalIndexKeyNulls.first, customer_id.index_keys[1].nulls);
+    try std.testing.expectEqual(@as(usize, 1), customer_id.index_where.len);
+    try std.testing.expectEqual(storage_schema.RelationalIndexLifecycle.building, customer_id.index_lifecycle);
+    try std.testing.expectEqual(@as(u64, 99), customer_id.index_generation);
+    try std.testing.expectEqualStrings("tenant_id", customer_id.index_where[0].field);
+    try std.testing.expectEqual(storage_schema.UniquePredicateOp.is_not_null, customer_id.index_where[0].op);
+    try std.testing.expect(runtime.primary_key != null);
+    try std.testing.expectEqualStrings("orders_pkey", runtime.primary_key.?.name.?);
+    try std.testing.expectEqual(@as(usize, 2), runtime.primary_key.?.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", runtime.primary_key.?.columns[0]);
+    try std.testing.expectEqualStrings("id", runtime.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), runtime.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("created_at", runtime.primary_key.?.include_columns[0]);
+    try std.testing.expectEqualStrings("customer_id", runtime.primary_key.?.include_columns[1]);
+    try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
+    try std.testing.expect(findRuntimeColumn(runtime, "amount").?.nullable);
+    try std.testing.expect(!findRuntimeColumn(runtime, "amount").?.indexed);
+    try std.testing.expectEqual(storage_schema.AntflyType.datetime, findRuntimeColumn(runtime, "created_at").?.field_type);
+    try std.testing.expect(findRuntimeColumn(runtime, "created_at").?.on_update_value != null);
+    try std.testing.expectEqual(storage_schema.RelationalDefaultKind.now_ns, findRuntimeColumn(runtime, "created_at").?.on_update_value.?.kind);
+    try std.testing.expectEqual(storage_schema.AntflyType.array, findRuntimeColumn(runtime, "tags").?.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, findRuntimeColumn(runtime, "tags").?.array_item_type.?);
+    // nested object and json field both become json columns
+    try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "attrs").?.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.json, findRuntimeColumn(runtime, "payload").?.field_type);
+    try std.testing.expectEqual(@as(usize, 1), runtime.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", runtime.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customer_id", runtime.foreign_keys[0].child_columns[0]);
+    try std.testing.expectEqualStrings("customers", runtime.foreign_keys[0].parent_table);
+    try std.testing.expectEqualStrings("_id", runtime.foreign_keys[0].parent_columns[0]);
+    try std.testing.expectEqual(storage_schema.ForeignKeyAction.no_action, runtime.foreign_keys[0].on_update);
+    try std.testing.expectEqual(storage_schema.ForeignKeyMatch.simple, runtime.foreign_keys[0].match);
+    try std.testing.expectEqual(@as(usize, 1), runtime.checks.len);
+    try std.testing.expectEqualStrings("tenant_case_match", runtime.checks[0].name);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", runtime.checks[0].collation.?);
+}
+
+test "deriveRuntimeTableSchema rejects relational collation on non text columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","collation":"C"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, parsed));
+}
+
+test "deriveRuntimeTableSchema carries relational array item collation" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tags":{"type":"array","items":{"type":"keyword"},"collation":"antfly.case_insensitive"}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const tags = findRuntimeColumn(runtime, "tags") orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(storage_schema.AntflyType.array, tags.field_type);
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, tags.array_item_type.?);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", tags.collation.?);
+}
+
+test "deriveRuntimeTableSchema validates relational literal default types" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","default":"00000000-0000-0000-0000-000000000000"},"amount":{"type":"numeric","default":0},"enabled":{"type":"boolean","default":true},"tags":{"type":"array","items":{"type":"keyword"},"default":[]},"payload":{"type":"json","default":{"source":"schema"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.AntflyType.numeric, findRuntimeColumn(runtime, "amount").?.field_type);
+    try std.testing.expectEqualStrings("0", findRuntimeColumn(runtime, "amount").?.default_value.?.value_json);
+    try std.testing.expectEqual(storage_schema.AntflyType.boolean, findRuntimeColumn(runtime, "enabled").?.field_type);
+    try std.testing.expectEqualStrings("true", findRuntimeColumn(runtime, "enabled").?.default_value.?.value_json);
+
+    var invalid_numeric = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric","default":"0"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer invalid_numeric.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, invalid_numeric));
+
+    var invalid_boolean = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"enabled":{"type":"boolean","default":"true"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer invalid_boolean.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, invalid_boolean));
+}
+
+test "deriveRuntimeTableSchema carries sequence-backed relational defaults" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"numeric","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq","database":"tenant","schema":"billing"}},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const id = findRuntimeColumn(runtime, "id").?;
+    try std.testing.expect(id.default_value != null);
+    try std.testing.expectEqual(storage_schema.RelationalDefaultKind.sequence_next, id.default_value.?.kind);
+    try std.testing.expectEqualStrings("{\"sequence\":\"usage_id_seq\",\"database\":\"tenant\",\"schema\":\"billing\"}", id.default_value.?.value_json);
+
+    var invalid_text = try parseValidatedTableSchema(alloc,
+        \\{"version":3,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","x-antfly-default":{"op":"sequence_next","sequence":"usage_id_seq"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    );
+    defer invalid_text.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, invalid_text));
+}
+
+test "deriveRuntimeTableSchema projects embedded json schema as prefixed document fields" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"},"plan":{"type":"keyword"}},"additionalProperties":true},"dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric","doc_values":true}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.relational, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), runtime.full_text_documents.len);
+    try std.testing.expect(findRuntimeFullTextField(runtime.full_text_documents[0], "attrs.title") != null);
+    try std.testing.expect(findRuntimeFullTextField(runtime.full_text_documents[0], "attrs.plan") != null);
+    try std.testing.expectEqual(@as(usize, 1), runtime.full_text_documents[0].open_dynamic_paths.len);
+    try std.testing.expectEqualStrings("attrs", runtime.full_text_documents[0].open_dynamic_paths[0]);
+    try std.testing.expectEqual(@as(usize, 1), runtime.dynamic_templates.len);
+    try std.testing.expectEqualStrings("attrs.metric", runtime.dynamic_templates[0].name);
+    try std.testing.expectEqualStrings("attrs.metrics.*", runtime.dynamic_templates[0].path_match.?);
+}
+
+test "relational embedded document schema is scoped to explicit json columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"json","schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true},"dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric"}}}}},"required":["id"],"additionalProperties":false}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    try std.testing.expect(parsed.document_schemas[0].properties[1].embedded_schema != null);
+    try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas[0].properties[1].embedded_dynamic_templates.len);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(alloc,
+            \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword","schema":{"type":"object"}}},"required":["id"],"additionalProperties":false}}}}
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(alloc,
+            \\{"version":4,"storage_mode":"relational","default_type":"row","document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"attrs":{"type":"object","dynamic_templates":{"metric":{"path_match":"metrics.*","mapping":{"type":"numeric"}}}}},"required":["id"],"additionalProperties":false}}}}
+        ),
+    );
+}
+
+test "relational schema is physically single document schema" {
+    const alloc = std.testing.allocator;
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseValidatedTableSchema(alloc,
+            \\{"version":4,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}},"other":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+        ),
+    );
+}
+
+test "deriveRuntimeTableSchema defaults to document mode with no relational columns" {
+    const alloc = std.testing.allocator;
+    var parsed = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
+    );
+    defer parsed.deinit(alloc);
+
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    try std.testing.expectEqual(storage_schema.StorageMode.document, runtime.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), runtime.relational_columns.len);
+    try std.testing.expectEqual(storage_schema.AntflyType.text, findRuntimeColumn(runtime, "title").?.field_type);
+}
+
+fn findRuntimeFullTextField(document: storage_schema.FullTextDocument, path: []const u8) ?storage_schema.FullTextField {
+    for (document.fields) |field| {
+        if (std.mem.eql(u8, field.path, path)) return field;
+    }
+    return null;
 }

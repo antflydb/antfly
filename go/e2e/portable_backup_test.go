@@ -63,7 +63,7 @@ func TestE2E_PortableBackupRestore(t *testing.T) {
 		"delta":   {"title": "Delta Document", "content": "Fourth document for portable backup test"},
 		"epsilon": {"title": "Epsilon Document", "content": "Fifth document for portable backup test"},
 	}
-	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelFullText)
+	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelQuery)
 
 	// Step 3: Verify document count before backup
 	countBefore := getDocumentCount(t, ctx, swarm.Client, tableName)

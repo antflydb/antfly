@@ -15,6 +15,8 @@
 const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const batch_api = @import("batch.zig");
+const catalog_resources = @import("catalog_resources.zig");
+const sql_catalog_apply = @import("../sql/catalog_apply.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const distributed_txn = @import("distributed_txn.zig");
 const docstore_mod = @import("../storage/docstore.zig");
@@ -62,10 +64,16 @@ pub const TableCommitRequest = struct {
     batch: batch_api.OwnedBatchRequest = .{},
     predicates: std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate) = .empty,
     txn_writes: []db_mod.types.TransactionWrite = &.{},
+    preimages: []db_mod.types.TransactionWrite = &.{},
 
     pub fn deinit(self: *TableCommitRequest, alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         if (self.txn_writes.len > 0) alloc.free(self.txn_writes);
+        for (self.preimages) |preimage| {
+            alloc.free(@constCast(preimage.key));
+            alloc.free(@constCast(preimage.value));
+        }
+        if (self.preimages.len > 0) alloc.free(self.preimages);
         for (self.predicates.items) |predicate| alloc.free(@constCast(predicate.key));
         self.predicates.deinit(alloc);
         self.batch.deinit(alloc);
@@ -79,6 +87,7 @@ pub const TableCommitRequest = struct {
         errdefer out.deinit(alloc);
         out.batch = try cloneBatchRequest(alloc, self.batch);
         try clonePredicatesInto(alloc, &out.predicates, self.predicates.items);
+        try appendTransactionWrites(alloc, &out.preimages, self.preimages);
         return out;
     }
 
@@ -87,6 +96,7 @@ pub const TableCommitRequest = struct {
         try appendBatchDeletes(alloc, &self.batch, other.batch.deletes);
         try appendBatchTransforms(alloc, &self.batch, other.batch.transforms);
         try appendPredicates(alloc, &self.predicates, other.predicates.items);
+        try appendTransactionWrites(alloc, &self.preimages, other.preimages);
         syncAndClear(self, alloc);
     }
 
@@ -171,6 +181,7 @@ pub const OwnedTransactionCommitRequest = struct {
                 .deletes = table.batch.deletes,
                 .transforms = table.batch.transforms,
                 .predicates = table.predicates.items,
+                .preimages = table.preimages,
             };
         }
         return out;
@@ -323,6 +334,7 @@ pub const SessionDetails = struct {
     tables: []SessionTableDetail,
     read_snapshots: []SessionReadSnapshot,
     savepoint_ids: []u64,
+    sql_session: ?SqlCatalogSessionState = null,
 
     pub fn deinit(self: *SessionDetails, alloc: std.mem.Allocator) void {
         for (self.tables) |*table| table.deinit(alloc);
@@ -330,6 +342,7 @@ pub const SessionDetails = struct {
         for (self.read_snapshots) |*snapshot| snapshot.deinit(alloc);
         if (self.read_snapshots.len > 0) alloc.free(self.read_snapshots);
         if (self.savepoint_ids.len > 0) alloc.free(self.savepoint_ids);
+        if (self.sql_session) |*sql_session| sql_session.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -368,6 +381,21 @@ pub const SessionTableDetailResponse = struct {
     staged_predicate_count: usize,
 };
 
+pub const SqlSessionSettingResponse = struct {
+    name: []const u8,
+    value: []const u8,
+};
+
+pub const SqlCatalogSessionResponse = struct {
+    current_database_name: []const u8,
+    search_path: []const []const u8,
+    settings: []const SqlSessionSettingResponse,
+    transaction_local_search_path: bool,
+    transaction_local_search_path_base: ?[]const []const u8 = null,
+    transaction_local_settings: bool,
+    transaction_local_settings_base: ?[]const SqlSessionSettingResponse = null,
+};
+
 pub const SessionDetailsResponse = struct {
     transaction_id: []const u8,
     owner_node_id: u64,
@@ -388,6 +416,7 @@ pub const SessionDetailsResponse = struct {
     tables: []const SessionTableDetailResponse,
     read_snapshots: []const SessionReadSnapshotResponse,
     savepoint_ids: []const u64,
+    sql_session: ?SqlCatalogSessionResponse = null,
 };
 
 pub const SessionListResponse = struct {
@@ -470,14 +499,114 @@ pub const SavepointInfo = struct {
     savepoint_id: u64,
 };
 
+pub const SqlCatalogSessionState = struct {
+    current_database_name: []const u8,
+    search_path: []const []const u8 = &.{},
+    settings: []const catalog_resources.SqlSessionSetting = &.{},
+    transaction_local_search_path_base: ?[]const []const u8 = null,
+    transaction_local_settings_base: ?[]const catalog_resources.SqlSessionSetting = null,
+    transaction_local_search_path: bool = false,
+    transaction_local_settings: bool = false,
+    in_sql_transaction: bool = false,
+    sql_transaction_failed: bool = false,
+
+    pub fn fromSessionAlloc(
+        alloc: std.mem.Allocator,
+        catalog_session: catalog_resources.SqlCatalogSession,
+    ) !SqlCatalogSessionState {
+        return .{
+            .current_database_name = try alloc.dupe(u8, catalog_session.currentDatabase()),
+            .search_path = try cloneStringSliceConst(alloc, if (catalog_session.search_path.len == 0) &.{catalog_resources.default_namespace_name} else catalog_session.search_path),
+            .settings = try cloneSqlSessionSettings(alloc, catalog_session.settings),
+        };
+    }
+
+    pub fn clone(self: SqlCatalogSessionState, alloc: std.mem.Allocator) !SqlCatalogSessionState {
+        var out: SqlCatalogSessionState = .{
+            .current_database_name = try alloc.dupe(u8, self.current_database_name),
+        };
+        errdefer out.deinit(alloc);
+        out.search_path = try cloneStringSliceConst(alloc, self.search_path);
+        out.settings = try cloneSqlSessionSettings(alloc, self.settings);
+        if (self.transaction_local_search_path_base) |base| {
+            out.transaction_local_search_path_base = try cloneStringSliceConst(alloc, base);
+        }
+        if (self.transaction_local_settings_base) |base| {
+            out.transaction_local_settings_base = try cloneSqlSessionSettings(alloc, base);
+        }
+        out.transaction_local_search_path = self.transaction_local_search_path;
+        out.transaction_local_settings = self.transaction_local_settings;
+        out.in_sql_transaction = self.in_sql_transaction;
+        out.sql_transaction_failed = self.sql_transaction_failed;
+        return out;
+    }
+
+    pub fn session(self: SqlCatalogSessionState) catalog_resources.SqlCatalogSession {
+        return .{
+            .current_database_name = self.current_database_name,
+            .search_path = self.search_path,
+            .settings = self.settings,
+        };
+    }
+
+    pub fn fromOwnedSqlCatalogSessionAlloc(
+        alloc: std.mem.Allocator,
+        owned_session: sql_catalog_apply.OwnedSqlCatalogSession,
+    ) !SqlCatalogSessionState {
+        var state = try fromSessionAlloc(alloc, owned_session.session());
+        errdefer state.deinit(alloc);
+        if (owned_session.transaction_local_search_path_base) |base| {
+            state.transaction_local_search_path_base = try cloneStringSliceConst(alloc, base);
+        }
+        if (owned_session.transaction_local_settings_base) |base| {
+            state.transaction_local_settings_base = try cloneSqlSessionSettings(alloc, base);
+        }
+        state.transaction_local_search_path = owned_session.transaction_local_search_path;
+        state.transaction_local_settings = owned_session.transaction_local_settings;
+        state.in_sql_transaction = owned_session.in_sql_transaction;
+        state.sql_transaction_failed = owned_session.sql_transaction_failed;
+        return state;
+    }
+
+    pub fn toOwnedSqlCatalogSessionAlloc(
+        self: SqlCatalogSessionState,
+        alloc: std.mem.Allocator,
+    ) !sql_catalog_apply.OwnedSqlCatalogSession {
+        var owned = try sql_catalog_apply.OwnedSqlCatalogSession.fromSessionAlloc(alloc, self.session());
+        errdefer owned.deinit(alloc);
+        if (self.transaction_local_search_path_base) |base| {
+            owned.transaction_local_search_path_base = try cloneStringSliceConst(alloc, base);
+        }
+        if (self.transaction_local_settings_base) |base| {
+            owned.transaction_local_settings_base = try cloneSqlSessionSettings(alloc, base);
+        }
+        owned.transaction_local_search_path = self.transaction_local_search_path;
+        owned.transaction_local_settings = self.transaction_local_settings;
+        owned.in_sql_transaction = self.in_sql_transaction;
+        owned.sql_transaction_failed = self.sql_transaction_failed;
+        return owned;
+    }
+
+    pub fn deinit(self: *SqlCatalogSessionState, alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.current_database_name));
+        freeStringSliceConst(alloc, self.search_path);
+        freeSqlSessionSettings(alloc, self.settings);
+        if (self.transaction_local_search_path_base) |base| freeStringSliceConst(alloc, base);
+        if (self.transaction_local_settings_base) |base| freeSqlSessionSettings(alloc, base);
+        self.* = undefined;
+    }
+};
+
 pub const Savepoint = struct {
     id: u64,
     snapshot: OwnedTransactionCommitRequest,
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
+    sql_session: ?SqlCatalogSessionState = null,
 
     pub fn deinit(self: *Savepoint, alloc: std.mem.Allocator) void {
         self.snapshot.deinit(alloc);
         deinitReadSnapshotMap(alloc, &self.read_snapshots);
+        if (self.sql_session) |*sql_session| sql_session.deinit(alloc);
         self.* = undefined;
     }
 };
@@ -492,6 +621,7 @@ pub const Session = struct {
     read_snapshots: std.StringArrayHashMapUnmanaged(SessionReadSnapshot) = .empty,
     next_savepoint_id: u64 = 1,
     savepoints: std.AutoHashMapUnmanaged(u64, Savepoint) = .empty,
+    sql_session: ?SqlCatalogSessionState = null,
 
     pub fn info(self: Session) SessionInfo {
         return .{
@@ -507,9 +637,60 @@ pub const Session = struct {
         var it = self.savepoints.iterator();
         while (it.next()) |entry| entry.value_ptr.deinit(alloc);
         self.savepoints.deinit(alloc);
+        if (self.sql_session) |*sql_session| sql_session.deinit(alloc);
         self.* = undefined;
     }
 };
+
+fn cloneStringSliceConst(alloc: std.mem.Allocator, values: []const []const u8) ![]const []const u8 {
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, i| {
+        out[i] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeStringSliceConst(alloc: std.mem.Allocator, values: []const []const u8) void {
+    for (values) |value| alloc.free(@constCast(value));
+    if (values.len > 0) alloc.free(values);
+}
+
+fn cloneSqlSessionSettings(
+    alloc: std.mem.Allocator,
+    values: []const catalog_resources.SqlSessionSetting,
+) ![]const catalog_resources.SqlSessionSetting {
+    const out = try alloc.alloc(catalog_resources.SqlSessionSetting, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |setting| {
+            alloc.free(@constCast(setting.name));
+            alloc.free(@constCast(setting.value));
+        }
+        alloc.free(out);
+    }
+    for (values, 0..) |setting, i| {
+        out[i] = .{
+            .name = try alloc.dupe(u8, setting.name),
+            .value = try alloc.dupe(u8, setting.value),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeSqlSessionSettings(alloc: std.mem.Allocator, values: []const catalog_resources.SqlSessionSetting) void {
+    for (values) |setting| {
+        alloc.free(@constCast(setting.name));
+        alloc.free(@constCast(setting.value));
+    }
+    if (values.len > 0) alloc.free(values);
+}
 
 pub const DurableSessionStore = struct {
     alloc: std.mem.Allocator,
@@ -791,6 +972,7 @@ pub const SessionRegistry = struct {
             .id = savepoint_id,
             .snapshot = snapshot,
             .read_snapshots = try cloneReadSnapshotMap(alloc, session.read_snapshots),
+            .sql_session = if (session.sql_session) |sql_session| try sql_session.clone(alloc) else null,
         });
         touchSession(session);
         try self.renewLeaseLocked(txn_id, session.owner_node_id);
@@ -807,10 +989,47 @@ pub const SessionRegistry = struct {
         session.staged = try savepoint.snapshot.clone(alloc);
         deinitReadSnapshotMap(alloc, &session.read_snapshots);
         session.read_snapshots = try cloneReadSnapshotMap(alloc, savepoint.read_snapshots);
+        if (session.sql_session) |*sql_session| sql_session.deinit(alloc);
+        session.sql_session = if (savepoint.sql_session) |sql_session| try sql_session.clone(alloc) else null;
         touchSession(session);
         try self.renewLeaseLocked(txn_id, session.owner_node_id);
         try self.persistLocked(session.*);
         return .{ .txn_id = txn_id, .savepoint_id = savepoint_id };
+    }
+
+    pub fn getSqlCatalogSessionState(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+    ) !?SqlCatalogSessionState {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        return if (session.sql_session) |sql_session|
+            try sql_session.clone(alloc)
+        else
+            try SqlCatalogSessionState.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
+    }
+
+    pub fn updateSqlCatalogSessionState(
+        self: *SessionRegistry,
+        alloc: std.mem.Allocator,
+        txn_id: db_mod.types.TxnId,
+        state: SqlCatalogSessionState,
+    ) !?SessionInfo {
+        self.mutex.lock();
+        defer self.mutex.unlock();
+        const session = (try self.loadIntoCacheLocked(alloc, txn_id)) orelse return null;
+        var next = try state.clone(alloc);
+        var next_transferred = false;
+        errdefer if (!next_transferred) next.deinit(alloc);
+        if (session.sql_session) |*sql_session| sql_session.deinit(alloc);
+        session.sql_session = next;
+        next_transferred = true;
+        touchSession(session);
+        try self.renewLeaseLocked(txn_id, session.owner_node_id);
+        try self.persistLocked(session.*);
+        return session.info();
     }
 
     pub fn getStatus(self: *SessionRegistry, alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) !?SessionStatus {
@@ -829,6 +1048,7 @@ pub const SessionRegistry = struct {
             .tables = try sessionTableDetails(alloc, session.staged),
             .read_snapshots = try sessionReadSnapshots(alloc, session),
             .savepoint_ids = try sessionSavepointIds(alloc, session),
+            .sql_session = if (session.sql_session) |sql_session| try sql_session.clone(alloc) else null,
         };
     }
 
@@ -1228,6 +1448,35 @@ fn buildSessionReadSnapshotResponse(
     };
 }
 
+fn buildSqlSessionSettingResponses(
+    alloc: std.mem.Allocator,
+    settings: []const catalog_resources.SqlSessionSetting,
+) ![]const SqlSessionSettingResponse {
+    const out = try alloc.alloc(SqlSessionSettingResponse, settings.len);
+    for (settings, 0..) |setting, i| {
+        out[i] = .{
+            .name = setting.name,
+            .value = setting.value,
+        };
+    }
+    return out;
+}
+
+fn buildSqlCatalogSessionResponse(
+    alloc: std.mem.Allocator,
+    state: SqlCatalogSessionState,
+) !SqlCatalogSessionResponse {
+    return .{
+        .current_database_name = state.current_database_name,
+        .search_path = state.search_path,
+        .settings = try buildSqlSessionSettingResponses(alloc, state.settings),
+        .transaction_local_search_path = state.transaction_local_search_path,
+        .transaction_local_search_path_base = state.transaction_local_search_path_base,
+        .transaction_local_settings = state.transaction_local_settings,
+        .transaction_local_settings_base = if (state.transaction_local_settings_base) |base| try buildSqlSessionSettingResponses(alloc, base) else null,
+    };
+}
+
 pub fn buildSessionDetailsResponse(alloc: std.mem.Allocator, details: SessionDetails) !SessionDetailsResponse {
     const status = try buildSessionStatusResponse(alloc, details.status);
     const tables = try alloc.alloc(SessionTableDetailResponse, details.tables.len);
@@ -1269,6 +1518,7 @@ pub fn buildSessionDetailsResponse(alloc: std.mem.Allocator, details: SessionDet
         .tables = tables,
         .read_snapshots = read_snapshots,
         .savepoint_ids = savepoint_ids,
+        .sql_session = if (details.sql_session) |sql_session| try buildSqlCatalogSessionResponse(alloc, sql_session) else null,
     };
 }
 
@@ -2183,6 +2433,44 @@ fn appendBatchWrites(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchReque
     batch.writes = next;
 }
 
+fn appendTransactionWrites(
+    alloc: std.mem.Allocator,
+    target: *[]db_mod.types.TransactionWrite,
+    writes: []const db_mod.types.TransactionWrite,
+) !void {
+    if (writes.len == 0) return;
+    const old = target.*;
+    var next = try alloc.alloc(db_mod.types.TransactionWrite, old.len + writes.len);
+    var copied: usize = 0;
+    errdefer {
+        for (next[0..copied]) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        alloc.free(next);
+    }
+    for (old) |write| {
+        next[copied] = .{
+            .key = try alloc.dupe(u8, write.key),
+            .value = try alloc.dupe(u8, write.value),
+        };
+        copied += 1;
+    }
+    for (writes) |write| {
+        next[copied] = .{
+            .key = try alloc.dupe(u8, write.key),
+            .value = try alloc.dupe(u8, write.value),
+        };
+        copied += 1;
+    }
+    for (old) |write| {
+        alloc.free(@constCast(write.key));
+        alloc.free(@constCast(write.value));
+    }
+    if (old.len > 0) alloc.free(old);
+    target.* = next;
+}
+
 fn appendBatchDeletes(alloc: std.mem.Allocator, batch: *batch_api.OwnedBatchRequest, deletes: []const []const u8) !void {
     if (deletes.len == 0) return;
     const old_len = batch.deletes.len;
@@ -2515,6 +2803,66 @@ fn makeSessionLeaseKey(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId) ![]
     return try std.fmt.allocPrint(alloc, "{s}{s}", .{ session_lease_prefix, &txn_hex });
 }
 
+fn appendSqlCatalogSessionStateJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    state: SqlCatalogSessionState,
+) !void {
+    try out.appendSlice(alloc, "{\"current_database_name\":");
+    try appendJsonString(alloc, out, state.current_database_name);
+    try out.appendSlice(alloc, ",\"search_path\":");
+    try appendStringArrayJson(alloc, out, state.search_path);
+    try out.appendSlice(alloc, ",\"settings\":");
+    try appendSqlSessionSettingsJson(alloc, out, state.settings);
+    try out.appendSlice(alloc, ",\"transaction_local_search_path\":");
+    try out.appendSlice(alloc, if (state.transaction_local_search_path) "true" else "false");
+    try out.appendSlice(alloc, ",\"transaction_local_search_path_base\":");
+    if (state.transaction_local_search_path_base) |base| {
+        try appendStringArrayJson(alloc, out, base);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.appendSlice(alloc, ",\"transaction_local_settings\":");
+    try out.appendSlice(alloc, if (state.transaction_local_settings) "true" else "false");
+    try out.appendSlice(alloc, ",\"in_sql_transaction\":");
+    try out.appendSlice(alloc, if (state.in_sql_transaction) "true" else "false");
+    try out.appendSlice(alloc, ",\"sql_transaction_failed\":");
+    try out.appendSlice(alloc, if (state.sql_transaction_failed) "true" else "false");
+    try out.appendSlice(alloc, ",\"transaction_local_settings_base\":");
+    if (state.transaction_local_settings_base) |base| {
+        try appendSqlSessionSettingsJson(alloc, out, base);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
+    try out.append(alloc, '}');
+}
+
+fn appendStringArrayJson(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), values: []const []const u8) !void {
+    try out.append(alloc, '[');
+    for (values, 0..) |value, i| {
+        if (i != 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, out, value);
+    }
+    try out.append(alloc, ']');
+}
+
+fn appendSqlSessionSettingsJson(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    settings: []const catalog_resources.SqlSessionSetting,
+) !void {
+    try out.append(alloc, '[');
+    for (settings, 0..) |setting, i| {
+        if (i != 0) try out.append(alloc, ',');
+        try out.appendSlice(alloc, "{\"name\":");
+        try appendJsonString(alloc, out, setting.name);
+        try out.appendSlice(alloc, ",\"value\":");
+        try appendJsonString(alloc, out, setting.value);
+        try out.append(alloc, '}');
+    }
+    try out.append(alloc, ']');
+}
+
 fn ownerLeaseId(alloc: std.mem.Allocator, owner_node_id: u64) ![]u8 {
     return try std.fmt.allocPrint(alloc, "node:{d}", .{owner_node_id});
 }
@@ -2537,6 +2885,12 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
     try appendJsonString(alloc, &out, syncLevelText(session.sync_level));
     try out.appendSlice(alloc, ",\"next_savepoint_id\":");
     try out.print(alloc, "{d}", .{session.next_savepoint_id});
+    try out.appendSlice(alloc, ",\"sql_session\":");
+    if (session.sql_session) |sql_session| {
+        try appendSqlCatalogSessionStateJson(alloc, &out, sql_session);
+    } else {
+        try out.appendSlice(alloc, "null");
+    }
     try out.appendSlice(alloc, ",\"staged\":");
     if (session.staged) |staged| {
         const encoded = try encodeCommitRequest(alloc, staged);
@@ -2575,6 +2929,12 @@ fn encodeSessionRecord(alloc: std.mem.Allocator, session: Session) ![]u8 {
             try appendReadSnapshotJson(alloc, &out, snapshot_entry.value_ptr.*);
         }
         try out.append(alloc, ']');
+        try out.appendSlice(alloc, ",\"sql_session\":");
+        if (entry.value_ptr.sql_session) |sql_session| {
+            try appendSqlCatalogSessionStateJson(alloc, &out, sql_session);
+        } else {
+            try out.appendSlice(alloc, "null");
+        }
         try out.append(alloc, '}');
     }
     try out.appendSlice(alloc, "]}");
@@ -2622,6 +2982,9 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
     if (obj.get("read_snapshots")) |snapshots_value| {
         try decodeReadSnapshotsInto(alloc, snapshots_value, &session.read_snapshots);
     }
+    if (obj.get("sql_session")) |sql_session_value| {
+        if (sql_session_value != .null) session.sql_session = try parseSqlCatalogSessionStateValue(alloc, sql_session_value);
+    }
     const savepoints_value = obj.get("savepoints") orelse return error.InvalidTransactionSessionRecord;
     const savepoints = switch (savepoints_value) {
         .array => |arr| arr,
@@ -2642,13 +3005,116 @@ fn decodeSessionRecord(alloc: std.mem.Allocator, txn_id: db_mod.types.TxnId, bod
         if (entry_obj.get("read_snapshots")) |read_snapshots_value| {
             try decodeReadSnapshotsInto(alloc, read_snapshots_value, &read_snapshots);
         }
+        var sql_session = if (entry_obj.get("sql_session")) |sql_session_value|
+            if (sql_session_value == .null) null else try parseSqlCatalogSessionStateValue(alloc, sql_session_value)
+        else
+            null;
+        var sql_session_transferred = false;
+        errdefer if (!sql_session_transferred) if (sql_session) |*state| state.deinit(alloc);
         try session.savepoints.put(alloc, id, .{
             .id = id,
             .snapshot = snapshot,
             .read_snapshots = read_snapshots,
+            .sql_session = sql_session,
         });
+        sql_session_transferred = true;
     }
     return session;
+}
+
+fn parseSqlCatalogSessionStateValue(alloc: std.mem.Allocator, value: std.json.Value) !SqlCatalogSessionState {
+    const obj = switch (value) {
+        .object => |obj| obj,
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    const current_database_name = requireString(obj, "current_database_name");
+    if (current_database_name.len == 0) return error.InvalidTransactionSessionRecord;
+
+    var state: SqlCatalogSessionState = .{
+        .current_database_name = try alloc.dupe(u8, current_database_name),
+        .search_path = try parseStringArrayValueAlloc(alloc, obj.get("search_path") orelse return error.InvalidTransactionSessionRecord),
+        .settings = try parseSqlSessionSettingsValueAlloc(alloc, obj.get("settings") orelse return error.InvalidTransactionSessionRecord),
+        .transaction_local_search_path = (try optionalBool(obj, "transaction_local_search_path")) orelse false,
+        .transaction_local_settings = (try optionalBool(obj, "transaction_local_settings")) orelse false,
+        .in_sql_transaction = (try optionalBool(obj, "in_sql_transaction")) orelse false,
+        .sql_transaction_failed = (try optionalBool(obj, "sql_transaction_failed")) orelse false,
+    };
+    errdefer state.deinit(alloc);
+
+    if (obj.get("transaction_local_search_path_base")) |base_value| {
+        if (base_value != .null) state.transaction_local_search_path_base = try parseStringArrayValueAlloc(alloc, base_value);
+    }
+    if (obj.get("transaction_local_settings_base")) |base_value| {
+        if (base_value != .null) state.transaction_local_settings_base = try parseSqlSessionSettingsValueAlloc(alloc, base_value);
+    }
+    if (state.transaction_local_search_path and state.transaction_local_search_path_base == null) return error.InvalidTransactionSessionRecord;
+    if (state.transaction_local_settings and state.transaction_local_settings_base == null) return error.InvalidTransactionSessionRecord;
+    return state;
+}
+
+fn parseStringArrayValueAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]const []const u8 {
+    const arr = switch (value) {
+        .array => |arr| arr,
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    const out = try alloc.alloc([]const u8, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(@constCast(item));
+        alloc.free(out);
+    }
+    for (arr.items, 0..) |item, i| {
+        const text = switch (item) {
+            .string => |text| text,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+        if (text.len == 0) return error.InvalidTransactionSessionRecord;
+        out[i] = try alloc.dupe(u8, text);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseSqlSessionSettingsValueAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const catalog_resources.SqlSessionSetting {
+    const arr = switch (value) {
+        .array => |arr| arr,
+        else => return error.InvalidTransactionSessionRecord,
+    };
+    const out = try alloc.alloc(catalog_resources.SqlSessionSetting, arr.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |setting| {
+            alloc.free(@constCast(setting.name));
+            alloc.free(@constCast(setting.value));
+        }
+        alloc.free(out);
+    }
+    for (arr.items, 0..) |item, i| {
+        const obj = switch (item) {
+            .object => |entry_obj| entry_obj,
+            else => return error.InvalidTransactionSessionRecord,
+        };
+        const name = requireString(obj, "name");
+        const setting_value = requireString(obj, "value");
+        if (name.len == 0) return error.InvalidTransactionSessionRecord;
+        out[i] = .{
+            .name = try alloc.dupe(u8, name),
+            .value = try alloc.dupe(u8, setting_value),
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn optionalBool(obj: std.json.ObjectMap, key: []const u8) !?bool {
+    const value = obj.get(key) orelse return null;
+    return switch (value) {
+        .bool => |flag| flag,
+        else => error.InvalidTransactionSessionRecord,
+    };
 }
 
 fn newSessionTxnId(owner_node_id: u64) db_mod.types.TxnId {
@@ -2715,6 +3181,81 @@ test "transaction session registry begins and removes sessions" {
     try std.testing.expectEqual(@as(u64, 7), sessionOwnerNodeId(session.txn_id));
     try std.testing.expect(registry.remove(std.testing.allocator, session.txn_id));
     try std.testing.expect(registry.getInfo(session.txn_id) == null);
+}
+
+test "transaction session registry persists SQL catalog session state and savepoints restore it" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/txn-session-sql-catalog-state", .{tmp.sub_path});
+    defer alloc.free(path);
+    const path_z = try alloc.dupeZ(u8, path);
+    defer alloc.free(path_z);
+
+    var store = try docstore_mod.DocStore.open(alloc, path_z, .{});
+    defer store.close();
+    var durable = DurableSessionStore.init(alloc, &store);
+
+    var writer = SessionRegistry.init(&durable);
+    defer writer.deinit(alloc);
+    const session = try writer.begin(alloc, .{ .sync_level = .write }, 9);
+
+    var default_sql_session = (try writer.getSqlCatalogSessionState(alloc, session.txn_id)) orelse return error.TestUnexpectedResult;
+    defer default_sql_session.deinit(alloc);
+    try std.testing.expectEqualStrings(catalog_resources.default_database_name, default_sql_session.session().currentDatabase());
+    try std.testing.expectEqualStrings(catalog_resources.default_namespace_name, default_sql_session.session().primarySearchPathNamespace());
+
+    const base_settings = [_]catalog_resources.SqlSessionSetting{
+        .{ .name = "app.tenant_id", .value = "tenant-a" },
+    };
+    var base_sql_session = try SqlCatalogSessionState.fromSessionAlloc(alloc, .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{ "analytics", "public" },
+        .settings = &base_settings,
+    });
+    defer base_sql_session.deinit(alloc);
+    _ = (try writer.updateSqlCatalogSessionState(alloc, session.txn_id, base_sql_session)) orelse return error.TestUnexpectedResult;
+
+    var reloader = SessionRegistry.init(&durable);
+    defer reloader.deinit(alloc);
+    var reloaded_sql_session = (try reloader.getSqlCatalogSessionState(alloc, session.txn_id)) orelse return error.TestUnexpectedResult;
+    defer reloaded_sql_session.deinit(alloc);
+    try std.testing.expectEqualStrings("tenant_ops", reloaded_sql_session.session().currentDatabase());
+    try std.testing.expectEqualStrings("analytics", reloaded_sql_session.session().primarySearchPathNamespace());
+    try std.testing.expectEqualStrings("tenant-a", reloaded_sql_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    _ = (try writer.createSavepoint(alloc, session.txn_id)) orelse return error.TestUnexpectedResult;
+
+    const local_settings = [_]catalog_resources.SqlSessionSetting{
+        .{ .name = "app.tenant_id", .value = "tenant-b" },
+    };
+    var local_sql_session = try SqlCatalogSessionState.fromSessionAlloc(alloc, .{
+        .current_database_name = "tenant_ops",
+        .search_path = &.{ "tenant_schema", "public" },
+        .settings = &local_settings,
+    });
+    defer local_sql_session.deinit(alloc);
+    local_sql_session.transaction_local_search_path = true;
+    local_sql_session.transaction_local_search_path_base = try cloneStringSliceConst(alloc, base_sql_session.search_path);
+    local_sql_session.transaction_local_settings = true;
+    local_sql_session.transaction_local_settings_base = try cloneSqlSessionSettings(alloc, base_sql_session.settings);
+    _ = (try writer.updateSqlCatalogSessionState(alloc, session.txn_id, local_sql_session)) orelse return error.TestUnexpectedResult;
+
+    var changed_sql_session = (try writer.getSqlCatalogSessionState(alloc, session.txn_id)) orelse return error.TestUnexpectedResult;
+    defer changed_sql_session.deinit(alloc);
+    try std.testing.expect(changed_sql_session.transaction_local_search_path);
+    try std.testing.expect(changed_sql_session.transaction_local_settings);
+    try std.testing.expectEqualStrings("tenant_schema", changed_sql_session.session().primarySearchPathNamespace());
+    try std.testing.expectEqualStrings("tenant-b", changed_sql_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
+
+    _ = (try writer.rollbackToSavepoint(alloc, session.txn_id, 1)) orelse return error.TestUnexpectedResult;
+    var restored_sql_session = (try reloader.getSqlCatalogSessionState(alloc, session.txn_id)) orelse return error.TestUnexpectedResult;
+    defer restored_sql_session.deinit(alloc);
+    try std.testing.expect(!restored_sql_session.transaction_local_search_path);
+    try std.testing.expect(!restored_sql_session.transaction_local_settings);
+    try std.testing.expectEqualStrings("analytics", restored_sql_session.session().primarySearchPathNamespace());
+    try std.testing.expectEqualStrings("tenant-a", restored_sql_session.session().settingValue("app.tenant_id") orelse return error.TestUnexpectedResult);
 }
 
 test "transaction session registry adopts durable session ownership" {

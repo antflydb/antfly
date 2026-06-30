@@ -14,7 +14,7 @@
 
 const std = @import("std");
 const api_http_client = @import("../api/http_client.zig");
-const api_table_catalog = @import("../api/table_catalog.zig");
+const catalog_source = @import("../metadata/catalog/source.zig");
 const api_table_router = @import("../api/table_router.zig");
 const metadata_mod = @import("../metadata/mod.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -34,7 +34,7 @@ const RollbackMerge = @FieldType(metadata_mod.TransitionAction, "rollback_merge"
 
 pub const HostedShardOperationAdapter = struct {
     alloc: std.mem.Allocator,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source.CatalogSource,
     router: api_table_router.HostedGroupRouter,
     data_router: api_table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
@@ -42,7 +42,7 @@ pub const HostedShardOperationAdapter = struct {
 
     pub fn init(
         alloc: std.mem.Allocator,
-        catalog: api_table_catalog.CatalogSource,
+        catalog: catalog_source.CatalogSource,
         router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
         local_ops: ?shard_ops.ShardOperationAdapter,
@@ -52,7 +52,7 @@ pub const HostedShardOperationAdapter = struct {
 
     pub fn initWithRouters(
         alloc: std.mem.Allocator,
-        catalog: api_table_catalog.CatalogSource,
+        catalog: catalog_source.CatalogSource,
         placement_router: api_table_router.HostedGroupRouter,
         data_router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
@@ -200,14 +200,14 @@ pub const HostedShardOperationAdapter = struct {
 
 pub const HostedShardDbAdapter = struct {
     alloc: std.mem.Allocator,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source.CatalogSource,
     router: api_table_router.HostedGroupRouter,
     executor: http_common.RequestExecutor,
     local_db: ?metadata_mod.ShardDbAdapter = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
-        catalog: api_table_catalog.CatalogSource,
+        catalog: catalog_source.CatalogSource,
         router: api_table_router.HostedGroupRouter,
         executor: http_common.RequestExecutor,
         local_db: ?metadata_mod.ShardDbAdapter,
@@ -337,7 +337,7 @@ test "hosted shard operation adapter uses local shard ops when preferred leader 
     const raft_reconciler = @import("reconciler.zig");
 
     const FakeCatalog = struct {
-        fn iface() api_table_catalog.CatalogSource {
+        fn iface() catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{
@@ -509,7 +509,7 @@ test "hosted shard db adapter routes median key to remote leader" {
     const std_http_listener = @import("transport/std_http_listener.zig");
 
     const FakeCatalog = struct {
-        fn iface() api_table_catalog.CatalogSource {
+        fn iface() catalog_source.CatalogSource {
             return .{
                 .ptr = undefined,
                 .vtable = &.{

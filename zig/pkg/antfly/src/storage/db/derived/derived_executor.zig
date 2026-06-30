@@ -14,6 +14,7 @@
 
 const std = @import("std");
 const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const Allocator = std.mem.Allocator;
 const replay_source_mod = @import("replay_source.zig");
 const derived_types = @import("derived_types.zig");
@@ -407,7 +408,7 @@ const ManualRuntime = struct {
                 worker.applied_sequence;
             if (caught_up_sequence > worker.applied_sequence) {
                 while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    std.atomic.spinLoopHint();
+                    platform.time.yieldBriefly();
                 }
                 worker.applied_sequence = caught_up_sequence;
             }
@@ -437,7 +438,7 @@ const ManualRuntime = struct {
                 worker.applied_sequence;
             if (caught_up_sequence > worker.applied_sequence) {
                 while (!try self.persist_fn(self.ctx, worker.name, caught_up_sequence, true)) {
-                    std.atomic.spinLoopHint();
+                    platform.time.yieldBriefly();
                 }
                 worker.applied_sequence = caught_up_sequence;
             }

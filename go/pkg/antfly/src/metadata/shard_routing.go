@@ -31,6 +31,7 @@ import (
 	client "github.com/antflydb/antfly/go/pkg/antfly/src/store/client"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/store/db/indexes"
+	"github.com/antflydb/antfly/go/pkg/antfly/src/store/storeutils"
 	"github.com/antflydb/antfly/go/pkg/antfly/src/tablemgr"
 	json "github.com/antflydb/antfly/go/pkg/libaf/json"
 	"github.com/sethvargo/go-retry"
@@ -779,7 +780,24 @@ func (ms *MetadataStore) rerouteReadShardOnLookupMiss(
 	if err != nil {
 		return 0, fmt.Errorf("loading shard statuses for shard %s: %w", shardID, err)
 	}
-	return findReadShardForKeyWithStatuses(table, shardStatuses, key)
+	readShardID, err := findReadShardForKeyWithStatuses(table, shardStatuses, key)
+	if err != nil || readShardID != shardID {
+		return readShardID, err
+	}
+
+	writeShardID, err := findWriteShardForKeyWithStatuses(table, shardStatuses, key)
+	if err != nil || writeShardID == shardID {
+		return readShardID, nil
+	}
+	writeStatus := shardStatuses[writeShardID]
+	keyBytes := storeutils.KeyRangeStart([]byte(key))
+	if writeStatus != nil &&
+		writeStatus.Table == table.Name &&
+		writeStatus.ByteRange.Contains(keyBytes) &&
+		writeStatus.CanInitiateSplitCutover() {
+		return writeShardID, nil
+	}
+	return readShardID, nil
 }
 
 // forwardBatchToShard sends a batch request to the leader node of a specific shard.
@@ -906,7 +924,7 @@ func (ms *MetadataStore) forwardLookupToShardWithVersion(
 			effectiveShardID == shardID {
 			reroutedShardID, rerouteErr := ms.rerouteReadShardOnLookupMiss(shardID, key)
 			if rerouteErr == nil && reroutedShardID != shardID {
-				reroutedEffectiveShardID, reroutedClient, reroutedClientErr := ms.leaderClientForShardWithEffectiveID(ctx, reroutedShardID)
+				reroutedEffectiveShardID, reroutedClient, reroutedClientErr := ms.leaderClientForShardNoFallback(ctx, reroutedShardID)
 				if reroutedClientErr == nil {
 					reroutedResult, reroutedVersion, reroutedLookupErr := reroutedClient.LookupWithVersion(ctx, reroutedEffectiveShardID, key)
 					if reroutedLookupErr == nil {

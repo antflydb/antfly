@@ -2204,6 +2204,15 @@ pub const Backend = struct {
         self.scheduleMaintenanceJobIfNeededLocked();
     }
 
+    pub fn forceFlushMutable(self: *Backend) !void {
+        if (self.options.backend.read_only) return error.ReadOnly;
+        const locked = runtime_mod.lockBackend(Backend, self);
+        defer runtime_mod.unlockBackend(Backend, self, locked);
+        try self.flushMutable();
+        try self.enforceWalRetentionHardPressureGuarded();
+        self.scheduleMaintenanceJobIfNeededLocked();
+    }
+
     fn shouldDeferCommitFlush(self: *const Backend) bool {
         if (self.root_dir == null) return false;
         if (!self.options.wal_enabled) return false;

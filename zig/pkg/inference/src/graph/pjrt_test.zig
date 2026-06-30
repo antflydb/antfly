@@ -63,17 +63,15 @@ fn initClient() ?pjrt_lib.pjrt.Client {
     };
 }
 
-fn pjrtHloSerializationUnavailable(
+fn expectPjrtHloSerializationAvailable(
     allocator: std.mem.Allocator,
     graph: *const Graph,
     part: *const Partition,
     cb: *const ComputeBackend,
-) !bool {
+) !void {
     var compile_result = try compiler.compilePartition(allocator, graph, part, cb);
     defer compile_result.deinit();
-    if (compile_result.hlo_bytes.len > 0) return false;
-    std.debug.print("Skipping PJRT execution test (xla_proto serializer stub produced empty HLO)\n", .{});
-    return true;
+    try std.testing.expect(compile_result.hlo_bytes.len > 0);
 }
 
 /// Create a native WeightStore populated with named f32 weights.
@@ -217,11 +215,7 @@ test "pjrt_compiler: linear partition compiles to valid HLO" {
     var compile_result = try compiler.compilePartition(allocator, &g, part, &cb);
     defer compile_result.deinit();
 
-    // Verify HLO bytes are non-empty when the real xla_proto serializer is present.
-    if (compile_result.hlo_bytes.len == 0) {
-        std.debug.print("Skipping PJRT compile validation (xla_proto serializer stub produced empty HLO)\n", .{});
-        return;
-    }
+    try std.testing.expect(compile_result.hlo_bytes.len > 0);
     try std.testing.expect(compile_result.input_node_ids.len > 0);
     try std.testing.expect(compile_result.output_node_ids.len > 0);
 
@@ -285,7 +279,7 @@ test "pjrt_executor: linear layer end-to-end" {
         }
     }
     const part_idx = pjrt_part_idx orelse return error.NoPjrtPartition;
-    if (try pjrtHloSerializationUnavailable(allocator, &g, &plan.partitions[part_idx], &cb)) return;
+    try expectPjrtHloSerializationAvailable(allocator, &g, &plan.partitions[part_idx], &cb);
 
     // Create executor
     var exec = try pjrt_executor.createExecutor(
@@ -552,7 +546,7 @@ test "pjrt_model_runtime: decode uses single token id" {
         if (pjrt_part_idx != null) break;
     }
     const part_idx = pjrt_part_idx orelse return error.NoPjrtPartition;
-    if (try pjrtHloSerializationUnavailable(allocator, &g, &plan.partitions[part_idx], &cb)) return;
+    try expectPjrtHloSerializationAvailable(allocator, &g, &plan.partitions[part_idx], &cb);
 
     var model_executor_ctx = try pjrt_executor.createModelExecutor(
         allocator,
@@ -616,7 +610,7 @@ test "pjrt_executor: gelu activation end-to-end" {
         }
     }
     const part_idx = pjrt_part_idx orelse return error.NoPjrtPartition;
-    if (try pjrtHloSerializationUnavailable(allocator, &g, &plan.partitions[part_idx], &cb)) return;
+    try expectPjrtHloSerializationAvailable(allocator, &g, &plan.partitions[part_idx], &cb);
 
     var exec = try pjrt_executor.createExecutor(
         allocator,
@@ -731,7 +725,7 @@ test "pjrt_executor: linear + rms_norm + gelu pipeline" {
 
     for (plan.partitions) |*part| {
         if (part.backend != .pjrt) continue;
-        if (try pjrtHloSerializationUnavailable(allocator, &g, part, &cb)) return;
+        try expectPjrtHloSerializationAvailable(allocator, &g, part, &cb);
 
         try populateExternalInputs(values, &g, part, &cb, &x_data, allocator);
 
@@ -860,7 +854,7 @@ test "pjrt_executor: element-wise add end-to-end" {
         }
     }
     const part_idx = pjrt_part_idx orelse return error.NoPjrtPartition;
-    if (try pjrtHloSerializationUnavailable(allocator, &g, &plan.partitions[part_idx], &cb)) return;
+    try expectPjrtHloSerializationAvailable(allocator, &g, &plan.partitions[part_idx], &cb);
 
     var exec = try pjrt_executor.createExecutor(
         allocator,

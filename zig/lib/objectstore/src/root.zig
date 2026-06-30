@@ -21,6 +21,9 @@ pub const gcs = @import("gcs.zig");
 pub const s3_compat = @import("s3_compat.zig");
 
 pub const ObjectMetadata = types.ObjectMetadata;
+pub const ObjectChecksum = types.ObjectChecksum;
+pub const ObjectChecksumAlgorithm = types.ObjectChecksumAlgorithm;
+pub const ObjectChecksumScope = types.ObjectChecksumScope;
 pub const PutOptions = types.PutOptions;
 pub const GetOptions = types.GetOptions;
 pub const DeleteOptions = types.DeleteOptions;

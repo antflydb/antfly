@@ -173,7 +173,7 @@ def _write_single_doc(stateful_api, table_name: str, key: str, *, title: str, co
                 "content": content,
             }
         },
-        sync_level="full_text",
+        sync_level="query",
     )
     assert batch["inserted"] == 1
 
@@ -478,7 +478,7 @@ def test_table_backup_restore_round_trip(backup_api):
             "content": "Raft coordinates leaders and followers to keep replicated logs consistent.",
         },
     }
-    batch = backup_api.batch_write(table_name, inserts=docs, sync_level="full_text")
+    batch = backup_api.batch_write(table_name, inserts=docs, sync_level="query")
     assert batch["inserted"] == len(docs)
     assert wait_until(
         lambda: _top_hit(backup_api, table_name, "distributed consensus", "doc:db"),
@@ -672,7 +672,7 @@ def test_cluster_backup_restore_round_trip(backup_api):
                     "content": f"{title} survives backup and restore.",
                 }
             },
-            sync_level="full_text",
+            sync_level="query",
         )
         assert batch["inserted"] == 1
         assert wait_until(
@@ -804,7 +804,7 @@ def test_cluster_backup_restore_round_trip_remote_backend(backup_api, backend: s
                     "content": f"{title} survives remote backup and restore.",
                 }
             },
-            sync_level="full_text",
+            sync_level="query",
         )
         assert batch["inserted"] == 1
         assert wait_until(

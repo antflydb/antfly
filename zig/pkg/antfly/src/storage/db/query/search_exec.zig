@@ -83,6 +83,12 @@ pub const SearchTextQueryExecutor = struct {
         doc_key: []const u8,
         raw: []const u8,
     ) anyerror![]u8,
+    load_projected_document: *const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        req: types.SearchRequest,
+        key: []const u8,
+    ) anyerror!?[]u8,
     resolve_doc_set_doc_ids: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -95,6 +101,13 @@ pub const SearchTextQueryExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -306,6 +319,13 @@ pub const DenseSearchExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -441,6 +461,13 @@ pub const SparseSearchExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -529,6 +556,13 @@ pub const MatchAllExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -555,6 +589,7 @@ pub const MatchAllExecutor = struct {
 
 pub const MatchAllCandidateCollector = struct {
     ctx: ?*anyopaque,
+    relational_base_rows: bool = false,
     scan_store_range: *const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -573,6 +608,13 @@ pub const MatchAllCandidateCollector = struct {
         generation: ?u64,
     ) anyerror!?doc_set.DocOrdinal = null,
 };
+
+fn visibleBaseDocumentRowKey(relational_base_rows: bool, key: []const u8) bool {
+    return if (relational_base_rows)
+        internal_keys.isRelationalRowKey(key)
+    else
+        internal_keys.isPrimaryDocumentKey(key);
+}
 
 pub const ComposedSearchExecutor = struct {
     ctx: ?*anyopaque,
@@ -1285,6 +1327,13 @@ pub const StructuredFilterResolverExecutor = struct {
         doc_ids: []const []const u8,
         generation: ?u64,
     ) anyerror!doc_set.ResolvedDocSet = null,
+    resolve_relational_filter_doc_set: ?*const fn (
+        ctx: ?*anyopaque,
+        alloc: Allocator,
+        runtime_schema: runtime_schema_mod.TableSchema,
+        query: search_mod.SearchQuery,
+        generation: ?u64,
+    ) anyerror!?doc_set.ResolvedDocSet = null,
     live_filter_doc_set: ?*const fn (
         ctx: ?*anyopaque,
         alloc: Allocator,
@@ -2207,7 +2256,33 @@ fn collectStructuredFilterResolvedDocSetAlloc(
     if (patternFilterValueHasRole(parsed.value)) return null;
     const search_query = patternFilterValueToSearchQuery(arena_alloc, parsed.value, text_entry.text_analysis, text_entry.runtime_schema) catch return null;
 
+    if (executor.resolve_relational_filter_doc_set) |resolve_relational| {
+        if (text_entry.runtime_schema) |rs| {
+            if (rs.storage_mode == .relational and rs.relational_columns.len > 0) {
+                if (try resolve_relational(executor.ctx, alloc, rs, search_query, executor.identity_read_generation)) |resolved| {
+                    return resolved;
+                }
+            }
+        }
+    }
+
     return try collectSearchQueryResolvedDocSetAlloc(alloc, arena_alloc, executor, text_entry, search_query);
+}
+
+/// Names of the relational keyword columns for a table, so exact-match `.term`
+/// predicates on them route to a columnar `typed_term` scan. Returns an empty
+/// slice for document-mode tables (no relational routing). Arena-allocated.
+fn relationalKeywordColumnNamesAlloc(
+    arena_alloc: Allocator,
+    runtime_schema: ?runtime_schema_mod.TableSchema,
+) ![]const []const u8 {
+    const rs = runtime_schema orelse return &.{};
+    if (rs.storage_mode != .relational or rs.relational_columns.len == 0) return &.{};
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    for (rs.relational_columns) |column| {
+        if (column.field_type == .keyword) try names.append(arena_alloc, column.name);
+    }
+    return try names.toOwnedSlice(arena_alloc);
 }
 
 fn collectSearchQueryResolvedDocSetAlloc(
@@ -2237,7 +2312,8 @@ fn collectSearchQueryResolvedDocSetAlloc(
     if (bench_profile) capability_ns = platform_time.monotonicNs() - capability_start_ns;
 
     const filter_compile_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
-    const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    const keyword_columns = relationalKeywordColumnNamesAlloc(arena_alloc, text_entry.runtime_schema) catch return null;
+    const filter = search_mod.searchQueryToFilterArenaRelational(arena_alloc, search_query, keyword_columns) catch return null;
     if (bench_profile) filter_compile_ns = platform_time.monotonicNs() - filter_compile_start_ns;
     const execute_start_ns = if (bench_profile) platform_time.monotonicNs() else 0;
     const doc_nums = try snapshot.executeFilter(alloc, filter);
@@ -2293,6 +2369,9 @@ fn collectStructuredFilterTextDocNumsAlloc(
     filter_query_json: []const u8,
 ) !?TextDocNumSet {
     const text_entry = try resolveFilterTextIndexEntry(executor, req.primary_text_index_name, req.index_name) orelse return null;
+    if (text_entry.runtime_schema) |rs| {
+        if (rs.storage_mode == .relational and rs.relational_columns.len > 0) return null;
+    }
 
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
@@ -2309,7 +2388,8 @@ fn collectStructuredFilterTextDocNumsAlloc(
         text_entry.runtime_schema,
     ))) return null;
 
-    const filter = search_mod.searchQueryToFilterArena(arena_alloc, search_query) catch return null;
+    const keyword_columns = relationalKeywordColumnNamesAlloc(arena_alloc, text_entry.runtime_schema) catch return null;
+    const filter = search_mod.searchQueryToFilterArenaRelational(arena_alloc, search_query, keyword_columns) catch return null;
     const doc_nums = try snapshot.executeFilter(alloc, filter);
     if (doc_nums.len == 0) {
         alloc.free(doc_nums);
@@ -2425,6 +2505,8 @@ fn searchQueryCanUseSnapshot(
         .doc_id,
         .doc_num,
         => true,
+        .array_any => false,
+        .json_contains => false,
         .knn => false,
         .hybrid => false,
         .match => |item| try snapshot.hasInvertedField(item.field),
@@ -2635,6 +2717,20 @@ fn patternFilterValueToSearchQuery(
         }
         return .{ .bool_query = .{ .should = should, .min_should = 1 } };
     }
+    if (value.object.get("array_any")) |array_any| {
+        const field_value = try singleFieldJsonValue(alloc, array_any);
+        return .{ .array_any = .{
+            .field = field_value.field,
+            .value = field_value.value,
+        } };
+    }
+    if (value.object.get("json_contains")) |json_contains| {
+        const field_value = try singleFieldJsonValue(alloc, json_contains);
+        return .{ .json_contains = .{
+            .field = field_value.field,
+            .value = field_value.value,
+        } };
+    }
     if (value.object.get("match")) |match| {
         const field_value = try singleFieldString(match, "text");
         return .{ .match = .{
@@ -2672,6 +2768,40 @@ fn patternFilterValueToSearchQuery(
     if (value.object.get("geo_distance")) |geo_query| return .{ .geo_distance = try parseGeoDistanceQuery(geo_query) };
     if (value.object.get("geo_bbox")) |geo_query| return .{ .geo_bbox = try parseGeoBBoxQuery(geo_query) };
     return error.UnsupportedQueryRequest;
+}
+
+const FieldJsonValue = struct {
+    field: []const u8,
+    value: std.json.Value,
+};
+
+fn singleFieldJsonValue(alloc: Allocator, value: std.json.Value) !FieldJsonValue {
+    if (value != .object) return error.InvalidArgument;
+    const field = if (value.object.get("field")) |field_value| blk: {
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidArgument;
+        break :blk field_value.string;
+    } else if (value.object.get("path")) |path_value|
+        try patternPathValueToFieldAlloc(alloc, path_value)
+    else
+        return error.InvalidArgument;
+    const wanted = value.object.get("value") orelse return error.InvalidArgument;
+    return .{ .field = field, .value = wanted };
+}
+
+fn patternPathValueToFieldAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+    if (value == .string) {
+        if (value.string.len == 0) return error.InvalidArgument;
+        return value.string;
+    }
+    if (value != .array or value.array.items.len == 0) return error.InvalidArgument;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (value.array.items, 0..) |item, i| {
+        if (item != .string or item.string.len == 0) return error.InvalidArgument;
+        if (i != 0) try out.append(alloc, '.');
+        try out.appendSlice(alloc, item.string);
+    }
+    return try out.toOwnedSlice(alloc);
 }
 
 fn patternBoolFilterToSearchQuery(
@@ -3075,6 +3205,7 @@ fn deriveNativeDenseConstraintsAlloc(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = apply_broad_live_docs,
@@ -3521,7 +3652,7 @@ pub fn searchTextQuery(
     var arena = std.heap.ArenaAllocator.init(alloc);
     defer arena.deinit();
     const arena_alloc = arena.allocator();
-    const base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
+    var base_search_query = try textQueryToSearchQuery(arena_alloc, text_query, text_entry.text_analysis, text_entry.runtime_schema);
     const snapshot = text_index.snapshot();
     const constraints_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var constraint_req = effective_req;
@@ -3532,6 +3663,7 @@ pub fn searchTextQuery(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .text_snapshot_for_doc_num_projection = snapshot,
@@ -3550,10 +3682,35 @@ pub fn searchTextQuery(
             .text_index_entry = executor.text_index_entry,
             .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
             .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+            .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
             .live_filter_doc_set = executor.live_filter_doc_set,
             .project_ordinals_to_doc_ids = false,
             .identity_read_generation = effective_req.identity_read_generation,
         });
+    }
+    if (executor.resolve_relational_filter_doc_set) |resolve_relational| {
+        if (text_entry.runtime_schema) |rs| {
+            if (rs.storage_mode == .relational and rs.relational_columns.len > 0) {
+                if (try resolve_relational(executor.ctx, alloc, rs, base_search_query, effective_req.identity_read_generation)) |resolved| {
+                    var owned_resolved = resolved;
+                    defer owned_resolved.deinit(alloc);
+                    const filter = doc_set.ResolvedDocFilter{
+                        .include = owned_resolved,
+                        .exclude = .none,
+                    };
+                    try applyResolvedDocFilterToTextDocNumsAlloc(alloc, snapshot, &native_constraints, &filter, .{
+                        .ctx = executor.ctx,
+                        .text_index_entry = executor.text_index_entry,
+                        .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
+                        .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+                        .live_filter_doc_set = executor.live_filter_doc_set,
+                        .project_ordinals_to_doc_ids = false,
+                        .identity_read_generation = effective_req.identity_read_generation,
+                    });
+                    base_search_query = .{ .match_all = {} };
+                }
+            }
+        }
     }
     const resolved_filter_ns = if (bench_query_profile) platform_time.monotonicNs() - resolved_filter_start_ns else 0;
     const convert_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
@@ -3573,7 +3730,12 @@ pub fn searchTextQuery(
 
     const execute_start_ns = if (bench_query_profile) platform_time.monotonicNs() else 0;
     var result = if (effective_req.count_only)
-        try search_mod.executeCountCandidates(alloc, snapshot, search_query)
+        try search_mod.executeCountCandidatesRelational(
+            alloc,
+            snapshot,
+            search_query,
+            try relationalKeywordColumnNamesAlloc(arena_alloc, text_entry.runtime_schema),
+        )
     else
         try search_mod.execute(alloc, snapshot, .{
             .query = search_query,
@@ -3599,6 +3761,18 @@ pub fn searchTextQuery(
         }
     }
 
+    // Relational stored data is loaded from the synchronous base-row store, not
+    // from duplicated segment typed_doc_values. Document-mode tables keep using
+    // the segment stored-doc blob.
+    const relational_base_stored: bool =
+        if (effective_req.include_stored)
+            if (text_entry.runtime_schema) |rs|
+                rs.storage_mode == .relational and rs.relational_columns.len > 0
+            else
+                false
+        else
+            false;
+
     for (result.hits, 0..) |hit, i| {
         const doc_ordinal = try snapshot.docOrdinal(hit.doc_id);
         const id = hit.id orelse {
@@ -3618,19 +3792,22 @@ pub fn searchTextQuery(
             continue;
         };
 
+        const stored_data: ?[]u8 = if (relational_base_stored)
+            try executor.load_projected_document(executor.ctx, alloc, effective_req, id)
+        else if (effective_req.include_stored and hit.stored_data != null)
+            try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
+        else
+            null;
+
         var materialized = types.SearchHit{
             .id = try alloc.dupe(u8, id),
             .doc_ordinal = doc_ordinal,
             .score = hit.score,
-            .stored_data = null,
+            .stored_data = stored_data,
         };
         var assigned = false;
         errdefer if (!assigned) materialized.deinit(alloc);
         materialized.index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
-        materialized.stored_data = if (effective_req.include_stored and hit.stored_data != null)
-            try executor.project_stored_search(executor.ctx, alloc, effective_req, id, hit.stored_data.?)
-        else
-            null;
         hits[i] = materialized;
         assigned = true;
         initialized += 1;
@@ -4603,7 +4780,13 @@ fn searchDenseInternal(
             !unresolved_stored_filters;
         if (load_stored_before_postprocess) {
             const load_start = platform_time.monotonicNs();
-            stored_data = try executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key);
+            stored_data = executor.load_projected_document(executor.ctx, alloc, postprocess_req, doc_key) catch |err| switch (err) {
+                error.StoredDocMissing => {
+                    if (doc_key_owned) alloc.free(doc_key);
+                    continue;
+                },
+                else => return err,
+            };
             stored_data_owned = true;
             profile.load_projected_document_ns += platform_time.monotonicNs() - load_start;
         }
@@ -4703,7 +4886,10 @@ fn loadMissingProjectedDenseHitDocuments(
 ) !void {
     for (hits) |*hit| {
         if (hit.stored_data != null) continue;
-        hit.stored_data = try executor.load_projected_document(executor.ctx, alloc, req, hit.id);
+        hit.stored_data = executor.load_projected_document(executor.ctx, alloc, req, hit.id) catch |err| switch (err) {
+            error.StoredDocMissing => continue,
+            else => return err,
+        };
     }
 }
 
@@ -5020,6 +5206,7 @@ pub fn searchSparse(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .lookup_doc_nums_for_ordinals = executor.lookup_doc_nums_for_ordinals,
         .doc_num_index_name = req.index_name orelse entry.config.name,
@@ -5258,6 +5445,7 @@ pub fn searchMatchAll(
         .text_index_entry = executor.text_index_entry,
         .resolve_doc_set_doc_ids = executor.resolve_doc_set_doc_ids,
         .resolve_doc_ids_to_doc_set = executor.resolve_doc_ids_to_doc_set,
+        .resolve_relational_filter_doc_set = executor.resolve_relational_filter_doc_set,
         .live_filter_doc_set = executor.live_filter_doc_set,
         .project_ordinals_to_doc_ids = false,
         .apply_live_all_docs = true,
@@ -5421,8 +5609,8 @@ pub fn collectMatchAllCandidates(
     }
 
     for (docs) |doc| {
-        if (!internal_keys.isPrimaryDocumentKey(doc.key)) continue;
-        const raw_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, doc.key)) orelse continue;
+        if (!visibleBaseDocumentRowKey(collector.relational_base_rows, doc.key)) continue;
+        const raw_key = (try internal_keys.decodeStoredDocumentRowKeyAlloc(alloc, doc.key)) orelse continue;
         errdefer alloc.free(raw_key);
         if (try collector.is_expired_key(collector.ctx, alloc, raw_key)) {
             alloc.free(raw_key);
@@ -6154,7 +6342,7 @@ test "native dense constraints preserve empty positive algebraic candidate sets"
     try std.testing.expectEqual(@as(usize, 0), intersected.filter_ids.len);
 }
 
-test "native dense constraints fail closed without ordinal vector mapping" {
+test "db query result shape native dense constraints fail closed without ordinal vector mapping" {
     const alloc = std.testing.allocator;
     var filter = doc_set.ResolvedDocFilter{
         .include = try doc_set.fromOrdinalsAlloc(alloc, &.{2}),

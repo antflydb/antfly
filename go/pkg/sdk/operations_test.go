@@ -169,6 +169,81 @@ func TestReadSSEEventsEarlyTermination(t *testing.T) {
 	}
 }
 
+func TestExecuteSQLSendsStatementAndParsesResponse(t *testing.T) {
+	var gotPath string
+	var gotBody string
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		gotPath = r.URL.Path
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			t.Errorf("ReadAll request body: %v", err)
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		gotBody = string(body)
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"kind":"read","session_id":42,"statement_kind":"select","result":{"rows":[{"id":"doc-1"}]}}`))
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	result, err := client.ExecuteSQL(context.Background(), SqlStatementRequest{
+		Sql:       "select * from documents",
+		SessionId: 41,
+		Database:  "main",
+		Namespace: "public",
+		ReadOnly:  true,
+	})
+	if err != nil {
+		t.Fatalf("ExecuteSQL: %v", err)
+	}
+	if gotPath != "/db/v1/sql" {
+		t.Fatalf("path = %q, want /db/v1/sql", gotPath)
+	}
+	for _, want := range []string{
+		`"sql":"select * from documents"`,
+		`"session_id":41`,
+		`"database":"main"`,
+		`"namespace":"public"`,
+		`"read_only":true`,
+	} {
+		if !strings.Contains(gotBody, want) {
+			t.Fatalf("request body = %q, missing %s", gotBody, want)
+		}
+	}
+	if result.Kind != SqlStatementResponseKindRead {
+		t.Fatalf("Kind = %q, want %q", result.Kind, SqlStatementResponseKindRead)
+	}
+	if result.SessionId != 42 {
+		t.Fatalf("SessionId = %d, want 42", result.SessionId)
+	}
+	if result.StatementKind != "select" {
+		t.Fatalf("StatementKind = %q, want select", result.StatementKind)
+	}
+}
+
+func TestExecuteSQLWrapsErrorResponse(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = io.Copy(io.Discard, r.Body)
+		http.Error(w, "syntax error at SELECT", http.StatusBadRequest)
+	}))
+	defer server.Close()
+
+	client, err := NewAntflyClientWithOptions(server.URL, oapi.WithHTTPClient(server.Client()))
+	if err != nil {
+		t.Fatalf("NewAntflyClientWithOptions: %v", err)
+	}
+
+	_, err = client.ExecuteSQL(context.Background(), SqlStatementRequest{Sql: "select"})
+	if err == nil || !strings.Contains(err.Error(), "sql execution failed") || !strings.Contains(err.Error(), "syntax error") {
+		t.Fatalf("ExecuteSQL error = %v, want wrapped syntax error", err)
+	}
+}
+
 func TestBatchSendsContentLengthRequestAndParsesResponse(t *testing.T) {
 	var gotPath string
 	var gotBody string

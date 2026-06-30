@@ -40,6 +40,7 @@ from .auth_subject_kind import AuthSubjectKind
 from .backup_info import BackupInfo
 from .backup_info_format import BackupInfoFormat
 from .backup_list_response import BackupListResponse
+from .backup_namespace_table_response_201 import BackupNamespaceTableResponse201
 from .backup_request import BackupRequest
 from .backup_request_format import BackupRequestFormat
 from .backup_table_response_201 import BackupTableResponse201
@@ -55,6 +56,8 @@ from .brave_search_config import BraveSearchConfig
 from .brave_search_config_freshness import BraveSearchConfigFreshness
 from .calendar_interval import CalendarInterval
 from .capability import Capability
+from .cardinality_mode import CardinalityMode
+from .catalog_tablespace_binding_request import CatalogTablespaceBindingRequest
 from .cdc_connection import CdcConnection
 from .chain_condition import ChainCondition
 from .chain_link import ChainLink
@@ -100,11 +103,13 @@ from .connection_status import ConnectionStatus
 from .connections_response import ConnectionsResponse
 from .create_api_key_request import CreateApiKeyRequest
 from .create_api_key_request_row_filter_type_0 import CreateApiKeyRequestRowFilterType0
+from .create_tablespace_request import CreateTablespaceRequest
 from .create_user_request import CreateUserRequest
 from .create_user_request_metadata_type_0 import CreateUserRequestMetadataType0
 from .credentials import Credentials
 from .data_shape_decl import DataShapeDecl
 from .data_shape_kind import DataShapeKind
+from .database_catalog_record import DatabaseCatalogRecord
 from .date_range_string_query import DateRangeStringQuery
 from .delete_artifact_enrichment_response_201 import DeleteArtifactEnrichmentResponse201
 from .disjunction_query import DisjunctionQuery
@@ -166,6 +171,7 @@ from .evaluator_score import EvaluatorScore
 from .evaluator_score_metadata import EvaluatorScoreMetadata
 from .exa_search_config import ExaSearchConfig
 from .exa_search_config_search_type import ExaSearchConfigSearchType
+from .execute_graph_metric_action_action import ExecuteGraphMetricActionAction
 from .extension_error import ExtensionError
 from .extension_member import ExtensionMember
 from .extension_object_decl import ExtensionObjectDecl
@@ -204,6 +210,12 @@ from .filter_spec import FilterSpec
 from .filter_spec_operator import FilterSpecOperator
 from .followup_step_config import FollowupStepConfig
 from .foreign_column import ForeignColumn
+from .foreign_key import ForeignKey
+from .foreign_key_match import ForeignKeyMatch
+from .foreign_key_on_delete import ForeignKeyOnDelete
+from .foreign_key_on_update import ForeignKeyOnUpdate
+from .foreign_key_reference import ForeignKeyReference
+from .foreign_key_validation_state import ForeignKeyValidationState
 from .foreign_source import ForeignSource
 from .foreign_source_type import ForeignSourceType
 from .full_text_index_config import FullTextIndexConfig
@@ -230,15 +242,41 @@ from .graph_index_stats_algebraic_graph import GraphIndexStatsAlgebraicGraph
 from .graph_index_stats_algebraic_graph_traversal import GraphIndexStatsAlgebraicGraphTraversal
 from .graph_index_stats_edge_types import GraphIndexStatsEdgeTypes
 from .graph_index_stats_index_type import GraphIndexStatsIndexType
+from .graph_metric_action_response import GraphMetricActionResponse
+from .graph_metric_build_page_status import GraphMetricBuildPageStatus
+from .graph_metric_build_page_status_range_kind import GraphMetricBuildPageStatusRangeKind
+from .graph_metric_build_page_status_state import GraphMetricBuildPageStatusState
+from .graph_metric_edge_filter_status import GraphMetricEdgeFilterStatus
+from .graph_metric_edge_filter_status_mode import GraphMetricEdgeFilterStatusMode
+from .graph_metric_event import GraphMetricEvent
+from .graph_metric_event_kind import GraphMetricEventKind
+from .graph_metric_filter import GraphMetricFilter
+from .graph_metric_filter_op import GraphMetricFilterOp
+from .graph_metric_order import GraphMetricOrder
+from .graph_metric_order_direction import GraphMetricOrderDirection
+from .graph_metric_order_nulls import GraphMetricOrderNulls
+from .graph_metric_profile import GraphMetricProfile
+from .graph_metric_rerank import GraphMetricRerank
+from .graph_metric_rerank_metric_freshness import GraphMetricRerankMetricFreshness
+from .graph_metric_rerank_score_details import GraphMetricRerankScoreDetails
+from .graph_metric_result import GraphMetricResult
+from .graph_metric_runtime_stats import GraphMetricRuntimeStats
+from .graph_metric_runtime_stats_role import GraphMetricRuntimeStatsRole
+from .graph_metric_score import GraphMetricScore
+from .graph_metric_status import GraphMetricStatus
+from .graph_metric_status_phase import GraphMetricStatusPhase
 from .graph_node_selector import GraphNodeSelector
 from .graph_query import GraphQuery
+from .graph_query_metric_freshness import GraphQueryMetricFreshness
 from .graph_query_params import GraphQueryParams
 from .graph_query_params_algorithm_params import GraphQueryParamsAlgorithmParams
 from .graph_query_result import GraphQueryResult
+from .graph_query_result_metric_status import GraphQueryResultMetricStatus
 from .graph_query_type import GraphQueryType
 from .graph_result_node import GraphResultNode
 from .graph_result_node_document import GraphResultNodeDocument
 from .graph_result_node_evidence import GraphResultNodeEvidence
+from .graph_result_node_metrics import GraphResultNodeMetrics
 from .ground_truth import GroundTruth
 from .image_url import ImageURL
 from .image_url_content_part import ImageURLContentPart
@@ -394,6 +432,7 @@ from .list_document_artifact_manifests_detail import ListDocumentArtifactManifes
 from .list_users_response_200_item import ListUsersResponse200Item
 from .lookup_key_consistency import LookupKeyConsistency
 from .lookup_key_response_200 import LookupKeyResponse200
+from .lookup_namespace_table_document_response_200 import LookupNamespaceTableDocumentResponse200
 from .lsm_storage_status import LsmStorageStatus
 from .match_all_query import MatchAllQuery
 from .match_all_query_match_all import MatchAllQueryMatchAll
@@ -416,6 +455,7 @@ from .multi_match_body import MultiMatchBody
 from .multi_match_body_type import MultiMatchBodyType
 from .multi_match_query import MultiMatchQuery
 from .multi_phrase_query import MultiPhraseQuery
+from .namespace_catalog_record import NamespaceCatalogRecord
 from .node_filter import NodeFilter
 from .node_filter_filter_query import NodeFilterFilterQuery
 from .numeric_range_query import NumericRangeQuery
@@ -447,6 +487,7 @@ from .permission import Permission
 from .permission_type import PermissionType
 from .phrase_query import PhraseQuery
 from .prefix_query import PrefixQuery
+from .primary_key import PrimaryKey
 from .prune_stats import PruneStats
 from .pruner import Pruner
 from .put_artifact_enrichment_response_201 import PutArtifactEnrichmentResponse201
@@ -467,10 +508,14 @@ from .query_responses import QueryResponses
 from .query_result import QueryResult
 from .query_result_aggregations import QueryResultAggregations
 from .query_result_analyses import QueryResultAnalyses
+from .query_result_graph_metric_results import QueryResultGraphMetricResults
 from .query_result_graph_results import QueryResultGraphResults
+from .query_score_details import QueryScoreDetails
 from .query_strategy import QueryStrategy
 from .query_string_query import QueryStringQuery
 from .regexp_query import RegexpQuery
+from .relational_period import RelationalPeriod
+from .relational_period_range_type import RelationalPeriodRangeType
 from .replication_source_action_hint import ReplicationSourceActionHint
 from .replication_source_status import ReplicationSourceStatus
 from .replication_transform_op import ReplicationTransformOp
@@ -478,6 +523,7 @@ from .reranker_config import RerankerConfig
 from .reranker_profile import RerankerProfile
 from .reranker_provider import RerankerProvider
 from .resource_type import ResourceType
+from .restore_namespace_table_response_202 import RestoreNamespaceTableResponse202
 from .restore_table_response_202 import RestoreTableResponse202
 from .retrieval_agent_result import RetrievalAgentResult
 from .retrieval_agent_steps import RetrievalAgentSteps
@@ -489,6 +535,112 @@ from .role_assignment import RoleAssignment
 from .route_type import RouteType
 from .row_filter_entry import RowFilterEntry
 from .row_filter_entry_filter import RowFilterEntryFilter
+from .row_operation import RowOperation
+from .row_operation_op import RowOperationOp
+from .row_primary_selector import RowPrimarySelector
+from .row_unique_selector import RowUniqueSelector
+from .row_unique_selector_values import RowUniqueSelectorValues
+from .rows_aggregate_having import RowsAggregateHaving
+from .rows_aggregate_having_predicate import RowsAggregateHavingPredicate
+from .rows_aggregate_having_predicate_op import RowsAggregateHavingPredicateOp
+from .rows_aggregate_plan_request import RowsAggregatePlanRequest
+from .rows_aggregate_request import RowsAggregateRequest
+from .rows_aggregate_result_set import RowsAggregateResultSet
+from .rows_aggregate_result_set_rows_item import RowsAggregateResultSetRowsItem
+from .rows_aggregate_spec import RowsAggregateSpec
+from .rows_aggregate_spec_op import RowsAggregateSpecOp
+from .rows_aggregate_spec_percentile_order import RowsAggregateSpecPercentileOrder
+from .rows_array_length_projection import RowsArrayLengthProjection
+from .rows_array_update_transform import RowsArrayUpdateTransform
+from .rows_array_update_transform_op import RowsArrayUpdateTransformOp
+from .rows_batch_request import RowsBatchRequest
+from .rows_coalesce_field_operand import RowsCoalesceFieldOperand
+from .rows_coalesce_projection import RowsCoalesceProjection
+from .rows_coalesce_value_operand import RowsCoalesceValueOperand
+from .rows_conflict_unique_target import RowsConflictUniqueTarget
+from .rows_cte import RowsCte
+from .rows_expression_array_contains_predicate import RowsExpressionArrayContainsPredicate
+from .rows_expression_assignment_map import RowsExpressionAssignmentMap
+from .rows_expression_case_branch import RowsExpressionCaseBranch
+from .rows_expression_condition import RowsExpressionCondition
+from .rows_expression_condition_group import RowsExpressionConditionGroup
+from .rows_expression_condition_op import RowsExpressionConditionOp
+from .rows_expression_field import RowsExpressionField
+from .rows_expression_field_source import RowsExpressionFieldSource
+from .rows_expression_operator import RowsExpressionOperator
+from .rows_expression_operator_op import RowsExpressionOperatorOp
+from .rows_expression_operator_to import RowsExpressionOperatorTo
+from .rows_expression_projection import RowsExpressionProjection
+from .rows_expression_value import RowsExpressionValue
+from .rows_field_alias_projection import RowsFieldAliasProjection
+from .rows_field_patch import RowsFieldPatch
+from .rows_get_request import RowsGetRequest
+from .rows_get_result import RowsGetResult
+from .rows_get_result_row import RowsGetResultRow
+from .rows_get_result_set import RowsGetResultSet
+from .rows_insert_source_assignment import RowsInsertSourceAssignment
+from .rows_insert_source_request import RowsInsertSourceRequest
+from .rows_insert_source_request_op import RowsInsertSourceRequestOp
+from .rows_join_on import RowsJoinOn
+from .rows_join_plan_request import RowsJoinPlanRequest
+from .rows_join_projection import RowsJoinProjection
+from .rows_join_projection_side import RowsJoinProjectionSide
+from .rows_join_request import RowsJoinRequest
+from .rows_join_request_join_type import RowsJoinRequestJoinType
+from .rows_join_strategy import RowsJoinStrategy
+from .rows_join_strategy_selection import RowsJoinStrategySelection
+from .rows_joined_mutation_source_assignment import RowsJoinedMutationSourceAssignment
+from .rows_joined_mutation_source_assignment_side import RowsJoinedMutationSourceAssignmentSide
+from .rows_joined_mutation_source_request import RowsJoinedMutationSourceRequest
+from .rows_joined_mutation_source_request_op import RowsJoinedMutationSourceRequestOp
+from .rows_joined_mutation_source_request_target_side import RowsJoinedMutationSourceRequestTargetSide
+from .rows_json_extract_projection import RowsJsonExtractProjection
+from .rows_json_set_transform import RowsJsonSetTransform
+from .rows_lateral_correlation import RowsLateralCorrelation
+from .rows_lateral_plan_request import RowsLateralPlanRequest
+from .rows_lateral_request import RowsLateralRequest
+from .rows_mutation_source_request import RowsMutationSourceRequest
+from .rows_mutation_source_request_op import RowsMutationSourceRequestOp
+from .rows_mutation_source_result_set import RowsMutationSourceResultSet
+from .rows_mutation_source_result_set_returning_item import RowsMutationSourceResultSetReturningItem
+from .rows_numeric_increment import RowsNumericIncrement
+from .rows_on_conflict import RowsOnConflict
+from .rows_on_conflict_action import RowsOnConflictAction
+from .rows_query_order_expression import RowsQueryOrderExpression
+from .rows_query_order_expression_direction import RowsQueryOrderExpressionDirection
+from .rows_query_order_expression_null_test import RowsQueryOrderExpressionNullTest
+from .rows_query_order_field import RowsQueryOrderField
+from .rows_query_order_field_direction import RowsQueryOrderFieldDirection
+from .rows_query_order_field_null_test import RowsQueryOrderFieldNullTest
+from .rows_query_plan_request import RowsQueryPlanRequest
+from .rows_query_request import RowsQueryRequest
+from .rows_query_result_set import RowsQueryResultSet
+from .rows_query_result_set_rows_item import RowsQueryResultSetRowsItem
+from .rows_result_column import RowsResultColumn
+from .rows_row_claim import RowsRowClaim
+from .rows_row_claim_mode import RowsRowClaimMode
+from .rows_row_claim_wait_policy import RowsRowClaimWaitPolicy
+from .rows_row_document import RowsRowDocument
+from .rows_stream_result_set import RowsStreamResultSet
+from .rows_stream_result_set_rows_item import RowsStreamResultSetRowsItem
+from .rows_temporal_portion import RowsTemporalPortion
+from .rows_unique_predicate import RowsUniquePredicate
+from .rows_unique_predicate_group import RowsUniquePredicateGroup
+from .rows_unique_predicate_op import RowsUniquePredicateOp
+from .rows_where_atom import RowsWhereAtom
+from .rows_where_atom_op import RowsWhereAtomOp
+from .rows_where_branch_all import RowsWhereBranchAll
+from .rows_where_branch_atom import RowsWhereBranchAtom
+from .rows_where_branch_atom_op import RowsWhereBranchAtomOp
+from .rows_where_type_0 import RowsWhereType0
+from .rows_where_type_0_op import RowsWhereType0Op
+from .rows_window_frame import RowsWindowFrame
+from .rows_window_frame_end import RowsWindowFrameEnd
+from .rows_window_frame_start import RowsWindowFrameStart
+from .rows_window_frame_unit import RowsWindowFrameUnit
+from .rows_window_plan_request import RowsWindowPlanRequest
+from .rows_window_request import RowsWindowRequest
+from .rows_window_spec import RowsWindowSpec
 from .runtime_decl import RuntimeDecl
 from .runtime_decl_mode import RuntimeDeclMode
 from .secret_entry import SecretEntry
@@ -506,6 +658,11 @@ from .shard_config import ShardConfig
 from .shards_profile import ShardsProfile
 from .significance_algorithm import SignificanceAlgorithm
 from .sort_field import SortField
+from .sql_statement_request import SqlStatementRequest
+from .sql_statement_response import SqlStatementResponse
+from .sql_statement_response_applied import SqlStatementResponseApplied
+from .sql_statement_response_kind import SqlStatementResponseKind
+from .sql_statement_response_result_type_0 import SqlStatementResponseResultType0
 from .sse_error import SSEError
 from .sse_event import SSEEvent
 from .sse_step_completed import SSEStepCompleted
@@ -526,8 +683,10 @@ from .table_restore_status import TableRestoreStatus
 from .table_restore_status_status import TableRestoreStatusStatus
 from .table_schema import TableSchema
 from .table_schema_document_schemas import TableSchemaDocumentSchemas
+from .table_schema_storage_mode import TableSchemaStorageMode
 from .table_statistics import TableStatistics
 from .table_statistics_field_stats import TableStatisticsFieldStats
+from .tablespace_catalog_record import TablespaceCatalogRecord
 from .tavily_search_config import TavilySearchConfig
 from .tavily_search_config_search_depth import TavilySearchConfigSearchDepth
 from .template_field_mapping import TemplateFieldMapping
@@ -571,6 +730,10 @@ from .traversal_result_document import TraversalResultDocument
 from .traversal_rules import TraversalRules
 from .traverse_response import TraverseResponse
 from .tree_search_config import TreeSearchConfig
+from .unique_constraint import UniqueConstraint
+from .unique_constraint_expressions_item import UniqueConstraintExpressionsItem
+from .unique_constraint_expressions_item_op import UniqueConstraintExpressionsItemOp
+from .unique_constraint_validation_state import UniqueConstraintValidationState
 from .update_extension_request import UpdateExtensionRequest
 from .update_manifest_ref import UpdateManifestRef
 from .update_password_request import UpdatePasswordRequest
@@ -628,6 +791,7 @@ __all__ = (
     "BackupInfo",
     "BackupInfoFormat",
     "BackupListResponse",
+    "BackupNamespaceTableResponse201",
     "BackupRequest",
     "BackupRequestFormat",
     "BackupTableResponse201",
@@ -643,6 +807,8 @@ __all__ = (
     "BraveSearchConfigFreshness",
     "CalendarInterval",
     "Capability",
+    "CardinalityMode",
+    "CatalogTablespaceBindingRequest",
     "CdcConnection",
     "ChainCondition",
     "ChainLink",
@@ -688,9 +854,11 @@ __all__ = (
     "ConnectionStatus",
     "CreateApiKeyRequest",
     "CreateApiKeyRequestRowFilterType0",
+    "CreateTablespaceRequest",
     "CreateUserRequest",
     "CreateUserRequestMetadataType0",
     "Credentials",
+    "DatabaseCatalogRecord",
     "DataShapeDecl",
     "DataShapeKind",
     "DateRangeStringQuery",
@@ -752,6 +920,7 @@ __all__ = (
     "EvaluatorScoreMetadata",
     "ExaSearchConfig",
     "ExaSearchConfigSearchType",
+    "ExecuteGraphMetricActionAction",
     "ExtensionError",
     "ExtensionMember",
     "ExtensionObjectDecl",
@@ -790,6 +959,12 @@ __all__ = (
     "FilterSpecOperator",
     "FollowupStepConfig",
     "ForeignColumn",
+    "ForeignKey",
+    "ForeignKeyMatch",
+    "ForeignKeyOnDelete",
+    "ForeignKeyOnUpdate",
+    "ForeignKeyReference",
+    "ForeignKeyValidationState",
     "ForeignSource",
     "ForeignSourceType",
     "FullTextIndexConfig",
@@ -816,15 +991,41 @@ __all__ = (
     "GraphIndexStatsAlgebraicGraphTraversal",
     "GraphIndexStatsEdgeTypes",
     "GraphIndexStatsIndexType",
+    "GraphMetricActionResponse",
+    "GraphMetricBuildPageStatus",
+    "GraphMetricBuildPageStatusRangeKind",
+    "GraphMetricBuildPageStatusState",
+    "GraphMetricEdgeFilterStatus",
+    "GraphMetricEdgeFilterStatusMode",
+    "GraphMetricEvent",
+    "GraphMetricEventKind",
+    "GraphMetricFilter",
+    "GraphMetricFilterOp",
+    "GraphMetricOrder",
+    "GraphMetricOrderDirection",
+    "GraphMetricOrderNulls",
+    "GraphMetricProfile",
+    "GraphMetricRerank",
+    "GraphMetricRerankMetricFreshness",
+    "GraphMetricRerankScoreDetails",
+    "GraphMetricResult",
+    "GraphMetricRuntimeStats",
+    "GraphMetricRuntimeStatsRole",
+    "GraphMetricScore",
+    "GraphMetricStatus",
+    "GraphMetricStatusPhase",
     "GraphNodeSelector",
     "GraphQuery",
+    "GraphQueryMetricFreshness",
     "GraphQueryParams",
     "GraphQueryParamsAlgorithmParams",
     "GraphQueryResult",
+    "GraphQueryResultMetricStatus",
     "GraphQueryType",
     "GraphResultNode",
     "GraphResultNodeDocument",
     "GraphResultNodeEvidence",
+    "GraphResultNodeMetrics",
     "GroundTruth",
     "ImageURL",
     "ImageURLContentPart",
@@ -980,6 +1181,7 @@ __all__ = (
     "ListUsersResponse200Item",
     "LookupKeyConsistency",
     "LookupKeyResponse200",
+    "LookupNamespaceTableDocumentResponse200",
     "LsmStorageStatus",
     "MatchAllQuery",
     "MatchAllQueryMatchAll",
@@ -1002,6 +1204,7 @@ __all__ = (
     "MultiMatchBodyType",
     "MultiMatchQuery",
     "MultiPhraseQuery",
+    "NamespaceCatalogRecord",
     "NodeFilter",
     "NodeFilterFilterQuery",
     "NumericRangeQuery",
@@ -1033,6 +1236,7 @@ __all__ = (
     "PermissionType",
     "PhraseQuery",
     "PrefixQuery",
+    "PrimaryKey",
     "Pruner",
     "PruneStats",
     "PutArtifactEnrichmentResponse201",
@@ -1053,10 +1257,14 @@ __all__ = (
     "QueryResult",
     "QueryResultAggregations",
     "QueryResultAnalyses",
+    "QueryResultGraphMetricResults",
     "QueryResultGraphResults",
+    "QueryScoreDetails",
     "QueryStrategy",
     "QueryStringQuery",
     "RegexpQuery",
+    "RelationalPeriod",
+    "RelationalPeriodRangeType",
     "ReplicationSourceActionHint",
     "ReplicationSourceStatus",
     "ReplicationTransformOp",
@@ -1064,6 +1272,7 @@ __all__ = (
     "RerankerProfile",
     "RerankerProvider",
     "ResourceType",
+    "RestoreNamespaceTableResponse202",
     "RestoreTableResponse202",
     "RetrievalAgentResult",
     "RetrievalAgentSteps",
@@ -1075,6 +1284,112 @@ __all__ = (
     "RouteType",
     "RowFilterEntry",
     "RowFilterEntryFilter",
+    "RowOperation",
+    "RowOperationOp",
+    "RowPrimarySelector",
+    "RowsAggregateHaving",
+    "RowsAggregateHavingPredicate",
+    "RowsAggregateHavingPredicateOp",
+    "RowsAggregatePlanRequest",
+    "RowsAggregateRequest",
+    "RowsAggregateResultSet",
+    "RowsAggregateResultSetRowsItem",
+    "RowsAggregateSpec",
+    "RowsAggregateSpecOp",
+    "RowsAggregateSpecPercentileOrder",
+    "RowsArrayLengthProjection",
+    "RowsArrayUpdateTransform",
+    "RowsArrayUpdateTransformOp",
+    "RowsBatchRequest",
+    "RowsCoalesceFieldOperand",
+    "RowsCoalesceProjection",
+    "RowsCoalesceValueOperand",
+    "RowsConflictUniqueTarget",
+    "RowsCte",
+    "RowsExpressionArrayContainsPredicate",
+    "RowsExpressionAssignmentMap",
+    "RowsExpressionCaseBranch",
+    "RowsExpressionCondition",
+    "RowsExpressionConditionGroup",
+    "RowsExpressionConditionOp",
+    "RowsExpressionField",
+    "RowsExpressionFieldSource",
+    "RowsExpressionOperator",
+    "RowsExpressionOperatorOp",
+    "RowsExpressionOperatorTo",
+    "RowsExpressionProjection",
+    "RowsExpressionValue",
+    "RowsFieldAliasProjection",
+    "RowsFieldPatch",
+    "RowsGetRequest",
+    "RowsGetResult",
+    "RowsGetResultRow",
+    "RowsGetResultSet",
+    "RowsInsertSourceAssignment",
+    "RowsInsertSourceRequest",
+    "RowsInsertSourceRequestOp",
+    "RowsJoinedMutationSourceAssignment",
+    "RowsJoinedMutationSourceAssignmentSide",
+    "RowsJoinedMutationSourceRequest",
+    "RowsJoinedMutationSourceRequestOp",
+    "RowsJoinedMutationSourceRequestTargetSide",
+    "RowsJoinOn",
+    "RowsJoinPlanRequest",
+    "RowsJoinProjection",
+    "RowsJoinProjectionSide",
+    "RowsJoinRequest",
+    "RowsJoinRequestJoinType",
+    "RowsJoinStrategy",
+    "RowsJoinStrategySelection",
+    "RowsJsonExtractProjection",
+    "RowsJsonSetTransform",
+    "RowsLateralCorrelation",
+    "RowsLateralPlanRequest",
+    "RowsLateralRequest",
+    "RowsMutationSourceRequest",
+    "RowsMutationSourceRequestOp",
+    "RowsMutationSourceResultSet",
+    "RowsMutationSourceResultSetReturningItem",
+    "RowsNumericIncrement",
+    "RowsOnConflict",
+    "RowsOnConflictAction",
+    "RowsQueryOrderExpression",
+    "RowsQueryOrderExpressionDirection",
+    "RowsQueryOrderExpressionNullTest",
+    "RowsQueryOrderField",
+    "RowsQueryOrderFieldDirection",
+    "RowsQueryOrderFieldNullTest",
+    "RowsQueryPlanRequest",
+    "RowsQueryRequest",
+    "RowsQueryResultSet",
+    "RowsQueryResultSetRowsItem",
+    "RowsResultColumn",
+    "RowsRowClaim",
+    "RowsRowClaimMode",
+    "RowsRowClaimWaitPolicy",
+    "RowsRowDocument",
+    "RowsStreamResultSet",
+    "RowsStreamResultSetRowsItem",
+    "RowsTemporalPortion",
+    "RowsUniquePredicate",
+    "RowsUniquePredicateGroup",
+    "RowsUniquePredicateOp",
+    "RowsWhereAtom",
+    "RowsWhereAtomOp",
+    "RowsWhereBranchAll",
+    "RowsWhereBranchAtom",
+    "RowsWhereBranchAtomOp",
+    "RowsWhereType0",
+    "RowsWhereType0Op",
+    "RowsWindowFrame",
+    "RowsWindowFrameEnd",
+    "RowsWindowFrameStart",
+    "RowsWindowFrameUnit",
+    "RowsWindowPlanRequest",
+    "RowsWindowRequest",
+    "RowsWindowSpec",
+    "RowUniqueSelector",
+    "RowUniqueSelectorValues",
     "RuntimeDecl",
     "RuntimeDeclMode",
     "SecretEntry",
@@ -1092,6 +1407,11 @@ __all__ = (
     "ShardsProfile",
     "SignificanceAlgorithm",
     "SortField",
+    "SqlStatementRequest",
+    "SqlStatementResponse",
+    "SqlStatementResponseApplied",
+    "SqlStatementResponseKind",
+    "SqlStatementResponseResultType0",
     "SSEError",
     "SSEEvent",
     "SSEStepCompleted",
@@ -1112,6 +1432,8 @@ __all__ = (
     "TableRestoreStatusStatus",
     "TableSchema",
     "TableSchemaDocumentSchemas",
+    "TableSchemaStorageMode",
+    "TablespaceCatalogRecord",
     "TableStatistics",
     "TableStatisticsFieldStats",
     "TavilySearchConfig",
@@ -1157,6 +1479,10 @@ __all__ = (
     "TraversalRules",
     "TraverseResponse",
     "TreeSearchConfig",
+    "UniqueConstraint",
+    "UniqueConstraintExpressionsItem",
+    "UniqueConstraintExpressionsItemOp",
+    "UniqueConstraintValidationState",
     "UpdateExtensionRequest",
     "UpdateManifestRef",
     "UpdatePasswordRequest",

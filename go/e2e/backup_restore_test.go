@@ -49,7 +49,7 @@ func TestE2E_BackupRestore_Embeddings(t *testing.T) {
 	// Step 3: Insert test documents
 	t.Log("Inserting test documents...")
 	testDocs := getTestDocuments()
-	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelAknn)
+	insertTestDocuments(t, ctx, swarm.Client, tableName, testDocs, antfly.SyncLevelFullIndex)
 
 	// Step 4: Wait for embeddings to be generated
 	t.Log("Waiting for embeddings to be generated...")
@@ -264,8 +264,8 @@ func TestE2E_ClusterBackupRestore(t *testing.T) {
 		"docA": {"title": "Table 2 Doc A", "content": "Content for table 2 document A"},
 		"docB": {"title": "Table 2 Doc B", "content": "Content for table 2 document B"},
 	}
-	insertTestDocuments(t, ctx, swarm.Client, table1Name, table1Docs, antfly.SyncLevelFullText)
-	insertTestDocuments(t, ctx, swarm.Client, table2Name, table2Docs, antfly.SyncLevelFullText)
+	insertTestDocuments(t, ctx, swarm.Client, table1Name, table1Docs, antfly.SyncLevelQuery)
+	insertTestDocuments(t, ctx, swarm.Client, table2Name, table2Docs, antfly.SyncLevelQuery)
 
 	// Step 4: Verify document counts before backup
 	count1Before := getDocumentCount(t, ctx, swarm.Client, table1Name)

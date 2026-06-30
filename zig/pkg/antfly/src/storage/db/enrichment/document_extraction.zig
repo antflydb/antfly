@@ -103,6 +103,14 @@ pub fn validateInlineSourceSize(remote_content: ?*const scraping.RemoteContentCo
     if (try inlineDataUriSourceTooLarge(remote_content, source_text)) return error.StreamTooLong;
 }
 
+test "document extraction inline source size uses remote content limit" {
+    const security = scraping.ContentSecurityConfig{ .max_download_size_bytes = 4 };
+    var remote_content = scraping.RemoteContentConfig{ .security = security };
+    try std.testing.expect(try inlineDataUriSourceTooLarge(&remote_content, "data:text/plain;base64,aGVsbG8="));
+    try std.testing.expect(!try inlineDataUriSourceTooLarge(&remote_content, "data:text/plain;base64,Zm9v"));
+    try std.testing.expect(!try inlineDataUriSourceTooLarge(&remote_content, "data:"));
+}
+
 pub const TextRegion = struct {
     span: [2]u32,
     bbox: [4]f64,

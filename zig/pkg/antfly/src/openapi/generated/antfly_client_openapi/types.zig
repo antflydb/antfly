@@ -7,6 +7,33 @@ pub const Error = struct {
     @"error": []const u8,
 };
 
+/// Synchronous SQL statement request. `session_id` is optional on the first request and should be reused from prior responses when SQL session state must persist across requests.
+pub const SqlStatementRequest = struct {
+    /// SQL statement text to execute.
+    sql: []const u8,
+    /// Logical SQL session id returned by an earlier SQL response.
+    session_id: ?i64 = null,
+    /// Optional current database override for this request.
+    database: ?[]const u8 = null,
+    /// Optional single search-path namespace override for this request.
+    namespace: ?[]const u8 = null,
+    /// Execute this statement under a server-enforced PostgreSQL-style read-only transaction guard.
+    read_only: ?bool = null,
+};
+
+/// Synchronous SQL statement result metadata. Catalog/session/control statements route through the typed DDL/session execution path. Read statements lower through the same typed row-plan executor used by the JSON relational rows APIs. Point write statements lower through the typed row-batch mutation path, and insert-from-source statements lower through the typed row-read plus row-batch mutation path.
+pub const SqlStatementResponse = struct {
+    kind: []const u8,
+    session_id: i64,
+    noop: ?bool = null,
+    /// Applied DDL/session result record.
+    applied: ?std.json.Value = null,
+    /// Lowered read or write statement family for data responses.
+    statement_kind: ?[]const u8 = null,
+    /// Typed relational row-plan, row-batch, or mutation-source response for data statements.
+    result: ?std.json.Value = null,
+};
+
 /// Sort direction for a single field. true = descending, false = ascending.
 pub const SortDirection = bool;
 
@@ -503,22 +530,20 @@ pub const SecretWriteRequest = struct {
 
 pub const ByteRange = []const []const u8;
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable) - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "query": Wait until affected documents are visible to query paths such as full-text search - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
-    full_text,
+    query,
     enrichments,
-    aknn,
     full_index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
             .propose => "propose",
             .write => "write",
-            .full_text => "full_text",
+            .query => "query",
             .enrichments => "enrichments",
-            .aknn => "aknn",
             .full_index => "full_index",
         };
         try jw.write(s);
@@ -532,9 +557,8 @@ pub const SyncLevel = enum {
         const map = std.StaticStringMap(@This()).initComptime(.{
             .{ "propose", .propose },
             .{ "write", .write },
-            .{ "full_text", .full_text },
+            .{ "query", .query },
             .{ "enrichments", .enrichments },
-            .{ "aknn", .aknn },
             .{ "full_index", .full_index },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -594,6 +618,57 @@ pub const AntflyType = enum {
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Database catalog object. Tables and namespaces resolve under a database before authorization and routing.
+pub const DatabaseCatalogRecord = struct {
+    /// Stable database catalog identifier.
+    database_id: i64,
+    /// Database name.
+    name: []const u8,
+    /// JSON-encoded database settings owned by the catalog.
+    settings_json: []const u8,
+    /// Optional durable tablespace binding inherited by new namespace/table placement policy.
+    tablespace_name: ?[]const u8 = null,
+};
+
+/// Namespace catalog object inside a database. PostgreSQL schemas map to Antfly namespaces.
+pub const NamespaceCatalogRecord = struct {
+    /// Stable namespace catalog identifier.
+    namespace_id: i64,
+    /// Parent database identifier.
+    database_id: i64,
+    /// Parent database name.
+    database_name: []const u8,
+    /// Namespace name.
+    name: []const u8,
+    /// Optional durable tablespace binding inherited by new table placement policy in this namespace.
+    tablespace_name: ?[]const u8 = null,
+};
+
+pub const CatalogTablespaceBindingRequest = struct {
+    /// Existing tablespace name to bind to the catalog object.
+    tablespace_name: []const u8,
+};
+
+/// Tablespace catalog object. SQL `CREATE TABLESPACE` maps to this lifecycle surface.
+pub const TablespaceCatalogRecord = struct {
+    /// Stable tablespace catalog identifier.
+    tablespace_id: i64,
+    /// Tablespace name.
+    name: []const u8,
+    /// JSON-encoded location descriptor. String locations are encoded as JSON strings.
+    location_json: []const u8,
+    /// JSON-encoded placement policy reserved for native placement planning.
+    placement_policy_json: []const u8,
+};
+
+/// Tablespace creation request. Placement policy is fail-closed until native placement planning consumes it.
+pub const CreateTablespaceRequest = struct {
+    /// JSON-encoded location descriptor. Defaults to `null`.
+    location_json: ?[]const u8 = null,
+    /// JSON-encoded placement policy. Only `{}` is accepted until native placement support lands.
+    placement_policy_json: ?[]const u8 = null,
 };
 
 /// Type of aggregation to compute: - Metrics: sum, avg, min, max, count, sumsquares, stats, cardinality - Bucketing: terms, range, date_range, histogram, date_histogram - Geo: geohash_grid, geo_distance - Analytics: significant_terms
@@ -659,6 +734,35 @@ pub const AggregationType = enum {
             .{ "geohash_grid", .geohash_grid },
             .{ "geo_distance", .geo_distance },
             .{ "significant_terms", .significant_terms },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Exact-vs-approximate selection for a cardinality aggregation: - auto: use a materialized HyperLogLog sketch when one applies and is current, else an exact distinct scan (default). - exact: always compute an exact distinct count. - approximate: require a matching sketch; error if none applies.
+pub const CardinalityMode = enum {
+    auto,
+    exact,
+    approximate,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .exact => "exact",
+            .approximate => "approximate",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "exact", .exact },
+            .{ "approximate", .approximate },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -966,6 +1070,275 @@ pub const BatchResponse = struct {
     deleted: ?i64 = null,
     /// Number of documents successfully transformed
     transformed: ?i64 = null,
+};
+
+/// Structured primary-key identity. Keys are the declared `primary_key.columns`; values are JSON scalar values coerced with the table's relational column types.
+pub const RowPrimarySelector = struct {};
+
+/// Structured unique-key selector. The server encodes `values` with the same relational tuple encoder used by storage, routes to the durable unique-owner range, and reads the owner row to resolve the physical row identity. This is a point lookup, not a query scan. The selector object is exact: only `name` and `values` are accepted.
+pub const RowUniqueSelector = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    /// Values for the declared unique-constraint columns.
+    values: std.json.Value,
+};
+
+/// Full relational row document. Keys are declared relational columns and values are JSON values coerced through the table schema before storage.
+pub const RowsRowDocument = struct {};
+
+/// Static field patch for top-level relational columns. Primary-key fields are rejected by the server.
+pub const RowsFieldPatch = struct {};
+
+/// Numeric increment map keyed by declared numeric columns.
+pub const RowsNumericIncrement = struct {};
+
+/// Array transform for a declared `array` column.
+pub const RowsArrayUpdateTransform = struct {
+    /// Declared `array` column to update.
+    field: []const u8,
+    op: []const u8,
+    /// JSON value to append, remove, or add if absent.
+    value: std.json.Value,
+};
+
+/// Predicate atom that must match a partial unique constraint definition.
+pub const RowsUniquePredicate = struct {
+    field: []const u8,
+    op: []const u8,
+    /// Predicate comparison value. Omit for null-test operators.
+    value: ?std.json.Value = null,
+};
+
+/// Application-time temporal slice for update/delete mutation-source plans.
+pub const RowsTemporalPortion = struct {
+    /// Period name declared on the relational table schema.
+    period: []const u8,
+    /// Inclusive lower bound encoded as the period start column's JSON type.
+    from: std.json.Value,
+    /// Exclusive upper bound encoded as the period end column's JSON type.
+    to: std.json.Value,
+};
+
+/// Source-side assignment for joined mutation-source updates.
+pub const RowsJoinedMutationSourceAssignment = struct {
+    /// Declared target-side relational field to assign.
+    target_field: []const u8,
+    /// Join side that supplies the source field. Must be the non-target side.
+    side: []const u8,
+    /// Declared relational field to copy from the source side.
+    field: []const u8,
+};
+
+pub const RowsMutationSourceResultSet = struct {
+    /// Number of source rows that matched before lock/limit selection.
+    matched: ?i64 = null,
+    /// Number of rows staged into the claimed transaction.
+    staged: ?i64 = null,
+    /// Optional returning rows from the staged mutation.
+    returning: ?[]const std.json.Value = null,
+};
+
+pub const RowsQueryOrderField = struct {
+    /// Output/base field to order by. Mutually exclusive with `expr`.
+    field: []const u8,
+    null_test: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+};
+
+/// Lockable base-row claim metadata. Public row-plan endpoints reject this field; it is only accepted by `rows/mutation-source` lockable base-row sources and internal/coordinator execution paths. `transaction_id` is the canonical field name.
+pub const RowsRowClaim = struct {
+    mode: ?[]const u8 = null,
+    wait_policy: ?[]const u8 = null,
+    skip_locked: ?bool = null,
+    lease_ms: ?i64 = null,
+    owner_id: ?[]const u8 = null,
+    /// Canonical 16-byte transaction id encoded as 32 hex characters.
+    transaction_id: ?[]const u8 = null,
+};
+
+/// Physical row-key range selector used by routed typed row plans after durable range ownership is known. At least one of `start` or `end` must be present, and a bounded range must have `start < end`.
+pub const RowsDocKeyRange = struct {
+    /// Inclusive physical row-key lower bound.
+    start: ?[]const u8 = null,
+    /// Exclusive physical row-key upper bound.
+    end: ?[]const u8 = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.start) |value| {
+            try jw.objectField("start");
+            try jw.write(value);
+        }
+        if (self.end) |value| {
+            try jw.objectField("end");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+pub const RowsExpressionField = struct {
+    field: []const u8,
+    source: ?[]const u8 = null,
+};
+
+pub const RowsExpressionValue = struct {
+    /// Literal JSON value for a value node.
+    value: std.json.Value,
+};
+
+/// Compact JSON path projection over a declared `json` column.
+pub const RowsJsonExtractProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared `json` column to read.
+    field: []const u8,
+    /// Non-empty JSON path, encoded as a dot path string or array of path components.
+    path: std.json.Value,
+    /// Return the extracted value as text, matching SQL `->>` behavior.
+    as_text: ?bool = null,
+};
+
+/// Compact array-length projection over a declared `array` column.
+pub const RowsArrayLengthProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared `array` column to measure.
+    field: []const u8,
+};
+
+pub const RowsCoalesceFieldOperand = struct {
+    /// Declared column to read.
+    field: []const u8,
+};
+
+pub const RowsCoalesceValueOperand = struct {
+    /// Literal JSON fallback value.
+    value: std.json.Value,
+};
+
+/// Compact field alias projection over a declared column.
+pub const RowsFieldAliasProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    /// Declared column to project.
+    field: []const u8,
+};
+
+/// Typed scalar, array, JSON, or text-pattern row predicate atom over a declared relational column. Null-test operators omit `value`; value operators carry one JSON value; `in` and `not_in` carry an array value; JSON path operators carry `path`; text-pattern operators carry `pattern` and optional flags. The server validates column type and operator-specific fields against the table schema.
+pub const RowsWhereAtom = struct {
+    /// Declared relational column.
+    field: []const u8,
+    op: []const u8,
+    /// JSON comparison value or array operand for operators that require one.
+    value: ?std.json.Value = null,
+    /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+    path: ?std.json.Value = null,
+    /// SQL LIKE pattern for `text_pattern`.
+    pattern: ?[]const u8 = null,
+    /// ASCII case-insensitive matching for `text_pattern`.
+    case_insensitive: ?bool = null,
+    /// Negates `text_pattern`.
+    negated: ?bool = null,
+};
+
+pub const RowsWhereBranchAtom = struct {
+    /// Declared relational column for a single-atom branch.
+    field: []const u8,
+    op: []const u8,
+    /// JSON comparison value or array operand for operators that require one.
+    value: ?std.json.Value = null,
+    /// Non-empty JSON path for `json_path_eq` and `json_path_exists`, encoded as a dot path string or array of path components.
+    path: ?std.json.Value = null,
+    /// SQL LIKE pattern for `text_pattern`.
+    pattern: ?[]const u8 = null,
+    /// ASCII case-insensitive matching for `text_pattern`.
+    case_insensitive: ?bool = null,
+    /// Negates `text_pattern`.
+    negated: ?bool = null,
+};
+
+/// Predicate over emitted aggregate output fields, evaluated after grouping.
+pub const RowsAggregateHavingPredicate = struct {
+    /// Emitted aggregate output field name, usually an aggregation `name`, group key, or expression group alias.
+    field: []const u8,
+    op: []const u8,
+    /// Comparison value. Omit for `is_null` and `is_not_null`.
+    value: ?std.json.Value = null,
+};
+
+pub const RowsWindowFrame = struct {
+    unit: []const u8,
+    start: []const u8,
+    start_offset: ?i64 = null,
+    end: []const u8,
+    end_offset: ?i64 = null,
+};
+
+pub const RowsJoinOn = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+pub const RowsJoinProjection = struct {
+    as: []const u8,
+    side: []const u8,
+    field: []const u8,
+};
+
+/// Physical join strategy requested by the typed plan. `auto` lets Antfly choose from proven local/routed capabilities; `merge` requires both join inputs to be proven ordered by the leading join keys.
+pub const RowsJoinStrategy = enum {
+    auto,
+    lookup,
+    hash,
+    merge,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .lookup => "lookup",
+            .hash => "hash",
+            .merge => "merge",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "lookup", .lookup },
+            .{ "hash", .hash },
+            .{ "merge", .merge },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+pub const RowsLateralCorrelation = struct {
+    left_field: []const u8,
+    right_field: []const u8,
+};
+
+/// Typed column metadata emitted by a native relational read plan.
+pub const RowsResultColumn = struct {
+    /// Unique public result-object field name.
+    name: []const u8,
+    /// Optional SQL/display label for the result column. This value may be non-unique; use `name` as the stable object key.
+    display_name: ?[]const u8 = null,
+    /// Source path represented by this result field.
+    path: []const u8,
+    /// Antfly scalar/container type for the result field.
+    type: []const u8,
+    /// Item type when `type` is `array`.
+    array_item_type: ?[]const u8 = null,
+    /// Optional source collation metadata for source-backed text or keyword result fields.
+    collation: ?[]const u8 = null,
+    /// Whether the result field may be null.
+    nullable: bool,
 };
 
 /// A key that was read as part of an OCC transaction, along with the version observed at read time. Used to detect conflicts at commit time.
@@ -1554,19 +1927,27 @@ pub const AnalysesResult = struct {
     tsne: ?[]const f32 = null,
 };
 
-/// A single query result hit
-pub const QueryHit = struct {
-    /// ID of the record.
-    _id: []const u8,
-    /// Relevance score of the hit.
-    _score: f32,
-    /// Scores partitioned by index when using RRF search.
-    _index_scores: ?std.json.Value = null,
-    _source: ?std.json.Value = null,
-    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
-    hierarchy: ?std.json.Value = null,
-    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
-    _sort: ?[]const []const u8 = null,
+pub const GraphMetricRerankScoreDetails = struct {
+    /// Graph index that provided the metric score.
+    index_name: []const u8,
+    /// Graph metric used as a score feature.
+    metric_name: []const u8,
+    /// Hit score before graph metric rerank composition.
+    base_score: f64,
+    /// Weight applied to the base score.
+    base_weight: f64,
+    /// Published metric score for this hit, or null when the hit was missing from the metric generation.
+    metric_score: ?f64 = null,
+    /// Metric feature value used in the formula after applying missing_score fallback if needed.
+    metric_score_used: f64,
+    /// Weight applied to the metric score feature.
+    metric_weight: f64,
+    /// True when metric_score was missing and the request's missing_score fallback was used.
+    missing_score_used: bool,
+    /// Final hit score after graph metric rerank composition.
+    final_score: f64,
+    /// Published graph metric score generation used for this hit.
+    published_generation: i64,
 };
 
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
@@ -1753,15 +2134,21 @@ pub const User = struct {
     metadata: ?std.json.ArrayHashMap(std.json.Value) = null,
 };
 
-/// Type of the resource, e.g., table, user, or global ('*').
+/// Type of the resource, e.g., database, namespace, table, tablespace, user, or global ('*').
 pub const ResourceType = enum {
+    database,
+    namespace,
     table,
+    tablespace,
     user,
     @"*",
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
+            .database => "database",
+            .namespace => "namespace",
             .table => "table",
+            .tablespace => "tablespace",
             .user => "user",
             .@"*" => "*",
         };
@@ -1774,7 +2161,10 @@ pub const ResourceType = enum {
             else => return error.UnexpectedToken,
         };
         const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "database", .database },
+            .{ "namespace", .namespace },
             .{ "table", .table },
+            .{ "tablespace", .tablespace },
             .{ "user", .user },
             .{ "*", .@"*" },
         });
@@ -2375,7 +2765,7 @@ pub const IndexType = enum {
 pub const DocumentSchema = struct {
     /// A description of the document type.
     description: ?[]const u8 = null,
-    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types.
+    /// A valid JSON Schema defining the document's structure. This is used to infer indexing rules and field types. Relational-mode scalar properties may include optional `collation` metadata. The metadata is preserved in the durable relational column catalog and reported on result schemas for source-backed text/keyword fields.
     schema: ?std.json.Value = null,
 };
 
@@ -2393,6 +2783,7 @@ pub const AntflyType2 = enum {
     blob,
     link,
     search_as_you_type,
+    json,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -2408,6 +2799,7 @@ pub const AntflyType2 = enum {
             .blob => "blob",
             .link => "link",
             .search_as_you_type => "search_as_you_type",
+            .json => "json",
         };
         try jw.write(s);
     }
@@ -2430,9 +2822,42 @@ pub const AntflyType2 = enum {
             .{ "blob", .blob },
             .{ "link", .link },
             .{ "search_as_you_type", .search_as_you_type },
+            .{ "json", .json },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
+};
+
+/// Parent side of a relational foreign-key constraint.
+pub const ForeignKeyReference = struct {
+    /// Referenced relational table name.
+    table: ?[]const u8 = null,
+    /// Referenced parent columns. Use ["_id"] for the document-key primary key, or an ordered column tuple backed by a declared unique constraint.
+    columns: ?[]const []const u8 = null,
+    /// Parent application-time period name for temporal `REFERENCES (..., PERIOD period)` constraints.
+    period: ?[]const u8 = null,
+};
+
+/// Application-time period over a start and end column.
+pub const RelationalPeriod = struct {
+    /// Period name used by temporal constraints and `FOR PORTION OF` mutation-source plans.
+    name: []const u8,
+    /// Inclusive period start column.
+    start_column: []const u8,
+    /// Exclusive period end column.
+    end_column: []const u8,
+    /// Optional PostgreSQL range type that produced this period when lowering range-column temporal DDL.
+    range_type: ?[]const u8 = null,
+};
+
+/// Relational primary-key constraint.
+pub const PrimaryKey = struct {
+    /// Optional durable primary-key constraint name used by DDL and conflict-target resolution.
+    name: ?[]const u8 = null,
+    /// Primary-key columns. One or more ordered required non-json relational columns are supported.
+    columns: ?[]const []const u8 = null,
+    /// Application-time period name for primary-key `WITHOUT OVERLAPS` temporal uniqueness.
+    without_overlaps_period: ?[]const u8 = null,
 };
 
 /// A floating-point number used to decrease or increase the relevance scores of a query.
@@ -2539,47 +2964,52 @@ pub const EmbeddingsIndexStats = struct {
     backfill_items_processed: ?i64 = null,
 };
 
-/// Discriminator for the index stats variant.
-pub const GraphIndexStatsIndexType = enum {
-    graph,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .graph => "graph",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "graph", .graph },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Statistics for graph index
-pub const GraphIndexStats = struct {
-    /// Discriminator for the index stats variant.
-    index_type: GraphIndexStatsIndexType,
-    /// Error message if stats could not be retrieved
-    @"error": ?[]const u8 = null,
-    /// Total number of edges in the graph
-    total_edges: ?i64 = null,
-    /// Count of edges per edge type
-    edge_types: ?std.json.ArrayHashMap(i64) = null,
-    /// Whether the index is currently rebuilding
-    rebuilding: ?bool = null,
-    /// Rebuild progress as a ratio from 0.0 to 1.0
-    backfill_progress: ?f64 = null,
-    /// Number of edges indexed during current rebuild
-    backfill_items_processed: ?i64 = null,
-    /// Algebraic graph execution health for bounded semiring traversal.
-    algebraic_graph: ?std.json.Value = null,
+/// Summarized graph metric maintenance runtime state. Identity fields are stable hashes, not raw process or owner identifiers.
+pub const GraphMetricRuntimeStats = struct {
+    enabled: ?bool = null,
+    role: ?[]const u8 = null,
+    runtime_id_hash: ?i64 = null,
+    owner_id_hash: ?i64 = null,
+    lease_key_hash: ?i64 = null,
+    worker_id_hash: ?i64 = null,
+    worker_count: ?i64 = null,
+    lease_owned: ?bool = null,
+    has_lease: ?bool = null,
+    acquisition_count: ?i64 = null,
+    takeover_count: ?i64 = null,
+    lease_acquire_failures: ?i64 = null,
+    lost_leases: ?i64 = null,
+    last_acquired_ms: ?i64 = null,
+    started: ?bool = null,
+    shutdown: ?bool = null,
+    notified: ?bool = null,
+    ticks_started: ?i64 = null,
+    ticks_completed: ?i64 = null,
+    durable_progress_ticks: ?i64 = null,
+    idle_ticks: ?i64 = null,
+    error_ticks: ?i64 = null,
+    last_error_name: ?[]const u8 = null,
+    total_metrics_scanned: ?i64 = null,
+    total_active_builds: ?i64 = null,
+    total_builds_started: ?i64 = null,
+    total_worker_steps: ?i64 = null,
+    total_coordinator_steps: ?i64 = null,
+    total_pages_claimed: ?i64 = null,
+    total_pages_completed: ?i64 = null,
+    total_phases_advanced: ?i64 = null,
+    total_published: ?i64 = null,
+    total_failed_builds: ?i64 = null,
+    last_metrics_scanned: ?i64 = null,
+    last_active_builds: ?i64 = null,
+    last_builds_started: ?i64 = null,
+    last_worker_steps: ?i64 = null,
+    last_coordinator_steps: ?i64 = null,
+    last_pages_claimed: ?i64 = null,
+    last_pages_completed: ?i64 = null,
+    last_phases_advanced: ?i64 = null,
+    last_published: ?i64 = null,
+    last_failed_builds: ?i64 = null,
+    last_budget_exhausted: ?bool = null,
 };
 
 /// Discriminator for the index stats variant.
@@ -2647,6 +3077,42 @@ pub const AlgebraicIndexStats = struct {
     active_progress_lifecycle: ?[]const u8 = null,
     active_progress_rows_processed: ?i64 = null,
     active_progress_target_rows: ?i64 = null,
+};
+
+pub const GraphMetricEdgeFilterStatus = struct {
+    mode: []const u8,
+    types: ?[]const []const u8 = null,
+};
+
+pub const GraphMetricBuildPageStatus = struct {
+    phase: []const u8,
+    iteration: i64,
+    page_id: i64,
+    state: []const u8,
+    range_kind: []const u8,
+    /// Worker id that owns or last failed this page.
+    worker_id: ?[]const u8 = null,
+    /// Unix epoch milliseconds when the page lease expires, or 0 when not leased.
+    lease_expires_at_ms: ?i64 = null,
+    /// Current attempt number for this page.
+    attempt: ?i64 = null,
+    /// Opaque resumable cursor for this page.
+    cursor: ?[]const u8 = null,
+    /// Completed work units for this page.
+    completed_units: ?i64 = null,
+    /// Estimated total work units for this page.
+    total_units: ?i64 = null,
+    /// Last page-level error.
+    last_error: ?[]const u8 = null,
+};
+
+pub const GraphMetricEvent = struct {
+    sequence: i64,
+    kind: []const u8,
+    at_ms: i64,
+    target_edge_generation: i64,
+    published_generation: i64,
+    score_count: i64,
 };
 
 /// Available tool names for retrieval agents. - add_filter: Add search filters (field constraints) - ask_clarification: Ask user for clarification - web_search: Search the web (requires web_search_connection or web_search_config) - fetch: Fetch URL content (subject to security controls) - semantic_search: Execute semantic/vector search against an index - full_text_search: Execute full-text BM25 search against an index - tree_search: Execute tree search with beam search navigation - graph_search: Execute graph traversal search - aggregate: Execute aggregations against an index
@@ -3152,6 +3618,21 @@ pub const VertexRerankerConfig = struct {
     top_n: ?i64 = null,
 };
 
+pub const GraphMetricRerank = struct {
+    /// Graph index that owns the published metric.
+    index: []const u8,
+    /// Graph metric name to blend into the search hit score.
+    metric: []const u8,
+    /// Multiplier applied to the existing hit score before adding the graph metric feature.
+    base_weight: ?f64 = null,
+    /// Multiplier applied to the graph metric score before it is added to the existing hit score.
+    weight: ?f64 = null,
+    /// Metric feature value to use for hits that do not have a score in the published metric generation.
+    missing_score: ?f64 = null,
+    /// Whether stale published generations are acceptable or the metric must be fresh.
+    metric_freshness: ?[]const u8 = null,
+};
+
 /// Type of graph query to execute
 pub const GraphQueryType = enum {
     traverse,
@@ -3224,6 +3705,18 @@ pub const PathWeightMode = enum {
     }
 };
 
+pub const GraphMetricOrder = struct {
+    metric: []const u8,
+    direction: ?[]const u8 = null,
+    nulls: ?[]const u8 = null,
+};
+
+pub const GraphMetricFilter = struct {
+    metric: []const u8,
+    op: []const u8,
+    value: f64,
+};
+
 /// Configuration for pruning search results based on score quality. Helps filter out low-relevance results in RAG pipelines by detecting score gaps or deviations from top results.
 pub const Pruner = struct {
     /// Keep only results with score >= max_score * min_score_ratio. For example, 0.5 keeps results scoring at least half of the top result. Applied after fusion scoring.
@@ -3236,6 +3729,11 @@ pub const Pruner = struct {
     require_multi_index: ?bool = null,
     /// Keep results within N standard deviations below the mean score. For example, 1.0 keeps results with score >= mean - 1*stddev. Useful for statistical outlier detection in result sets.
     std_dev_threshold: ?f64 = null,
+};
+
+pub const GraphMetricScore = struct {
+    node: []const u8,
+    score: f64,
 };
 
 pub const InferenceError = struct {
@@ -4253,6 +4751,108 @@ pub const TransactionCommitResponse = struct {
     tables: ?std.json.ArrayHashMap(BatchResponse) = null,
 };
 
+/// Structured row selector. `primary` addresses declared primary-key tables directly. `unique` addresses a declared unique constraint through durable unique-owner rows. The selector is exact and accepts exactly one of `primary` or `unique`.
+pub const RowSelector = struct {
+    primary: ?RowPrimarySelector = null,
+    unique: ?RowUniqueSelector = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.unique) |value| {
+            try jw.objectField("unique");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Conjunction of partial-unique predicate atoms.
+pub const RowsUniquePredicateGroup = struct {
+    all: []const RowsUniquePredicate,
+};
+
+/// Compact COALESCE operand. Exactly one of `field` or `value` is accepted by the server.
+pub const RowsCoalesceOperand = union(enum) {
+    rows_coalesce_field_operand: *RowsCoalesceFieldOperand,
+    rows_coalesce_value_operand: *RowsCoalesceValueOperand,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+        })) {
+            if (try parseStructuralVariant(RowsCoalesceFieldOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_field_operand = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsCoalesceValueOperand, allocator, source, options)) |parsed| return .{ .rows_coalesce_value_operand = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_coalesce_field_operand => |v| try jw.write(v.*),
+            .rows_coalesce_value_operand => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsWhereBranchAll = struct {
+    /// Conjunction of typed atoms for this branch.
+    all: []const RowsWhereAtom,
+};
+
+/// Conjunction of emitted aggregate-output predicates for HAVING.
+pub const RowsAggregateHaving = struct {
+    all: []const RowsAggregateHavingPredicate,
+};
+
+/// Join strategy admission metadata returned by native join execution.
+pub const RowsJoinStrategySelection = struct {
+    requested: RowsJoinStrategy,
+    selected: RowsJoinStrategy,
+};
+
+pub const RowsQueryResultSet = struct {
+    total: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
+pub const RowsAggregateResultSet = struct {
+    total_groups: ?i64 = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 pub const TransactionStageReadResponse = struct {
     status: []const u8,
     transaction_id: []const u8,
@@ -4421,13 +5021,10 @@ pub const TableStatistics = struct {
     last_updated: ?[]const u8 = null,
 };
 
-/// A list of query hits.
-pub const QueryHits = struct {
-    /// Total number of hits available.
-    total: ?i64 = null,
-    hits: ?[]const QueryHit = null,
-    /// Maximum score of the results.
-    max_score: ?f32 = null,
+/// Optional score provenance for ranking features that changed the final hit score.
+pub const QueryScoreDetails = struct {
+    /// Score contribution from an explicit graph_metric_rerank request.
+    graph_metric_rerank: ?GraphMetricRerankScoreDetails = null,
 };
 
 pub const LinearMergeResult = struct {
@@ -4546,6 +5143,8 @@ pub const GraphResultNode = struct {
     path_edges: ?[]const PathEdge = null,
     /// Algebraic provenance labels folded into this result, when requested by an algebraic graph executor
     provenance: ?[]const []const u8 = null,
+    /// Projected graph metric scores keyed by metric name. Values are numbers or null when a requested metric has no score for the node.
+    metrics: ?std.json.Value = null,
     /// Parsed evidence envelope for provenance labels and edge metadata
     evidence: ?std.json.Value = null,
     /// Connected edges (when include_edges=true)
@@ -4692,6 +5291,29 @@ pub const TemplateFieldMapping = struct {
     include_in_all: ?bool = null,
     /// Whether to enable doc values for sorting/faceting
     doc_values: ?bool = null,
+};
+
+/// Relational foreign-key constraint.
+pub const ForeignKey = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Child columns. A single scalar column is supported for ["_id"] references; ordered scalar tuples are supported when references.columns names a unique constraint column tuple.
+    columns: ?[]const []const u8 = null,
+    /// Child application-time period name for temporal `FOREIGN KEY (..., PERIOD period)` constraints.
+    period: ?[]const u8 = null,
+    references: ?ForeignKeyReference = null,
+    /// Delete action. "no_action" is normalized to immediate restrictive behavior; "set_null" requires nullable child columns; "set_null" and "cascade" are bounded in local execution.
+    on_delete: ?[]const u8 = null,
+    /// Update action. "restrict" and "no_action" are enforced as parent-key update checks; "set_null" and "cascade" are supported for bounded local/scheduled mutating FK action execution where owner topology is configured.
+    on_update: ?[]const u8 = null,
+    /// Constraint timing. Canonical values are "immediate" and "deferred"; SQL-shaped aliases such as "INITIALLY DEFERRED" and combined deferrability clauses are accepted and normalized by schema parsing.
+    timing: ?[]const u8 = null,
+    /// Whether transaction-level timing overrides may change this constraint's effective timing. Accepts JSON booleans and SQL-shaped strings such as "DEFERRABLE", "NOT DEFERRABLE", and "DEFERRABLE INITIALLY DEFERRED". Omitted defaults to false unless timing is "deferred" for compatibility.
+    deferrable: ?std.json.Value = null,
+    /// Match mode. "simple" is the default and means any null or absent child component creates no reference. "full" requires all child components to be present or all absent. MATCH PARTIAL is reserved until row-subset parent matching is implemented.
+    match: ?[]const u8 = null,
+    /// Constraint validation state. Public schema validation accepts enforced constraints and local unvalidated adoption entries; online job-owned states are reserved for hosted migration jobs.
+    validation_state: ?[]const u8 = null,
 };
 
 pub const TermQuery = struct {
@@ -4853,43 +5475,99 @@ pub const GeoShapeGeometry = struct {
     relation: []const u8,
 };
 
-/// Statistics for an index
-pub const IndexStats = union(enum) {
-    full_text_index_stats: FullTextIndexStats,
-    embeddings_index_stats: EmbeddingsIndexStats,
-    graph_index_stats: GraphIndexStats,
-    algebraic_index_stats: AlgebraicIndexStats,
-
-    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
-        if (source != .object) return error.UnexpectedToken;
-        const disc_val = source.object.get("index_type") orelse return error.MissingField;
-        const disc_str = switch (disc_val) {
-            .string => |s| s,
-            else => return error.UnexpectedToken,
-        };
-        if (std.mem.eql(u8, disc_str, "full_text")) {
-            return .{ .full_text_index_stats = try std.json.parseFromValue(FullTextIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "embeddings")) {
-            return .{ .embeddings_index_stats = try std.json.parseFromValue(EmbeddingsIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "graph")) {
-            return .{ .graph_index_stats = try std.json.parseFromValue(GraphIndexStats, allocator, source, options) };
-        }
-        if (std.mem.eql(u8, disc_str, "algebraic")) {
-            return .{ .algebraic_index_stats = try std.json.parseFromValue(AlgebraicIndexStats, allocator, source, options) };
-        }
-        return error.UnexpectedToken;
-    }
+/// Discriminator for the index stats variant.
+pub const GraphIndexStatsIndexType = enum {
+    graph,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        switch (self) {
-            .full_text_index_stats => |v| try jw.write(v),
-            .embeddings_index_stats => |v| try jw.write(v),
-            .graph_index_stats => |v| try jw.write(v),
-            .algebraic_index_stats => |v| try jw.write(v),
-        }
+        const s = switch (self) {
+            .graph => "graph",
+        };
+        try jw.write(s);
     }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "graph", .graph },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Statistics for graph index
+pub const GraphIndexStats = struct {
+    /// Discriminator for the index stats variant.
+    index_type: GraphIndexStatsIndexType,
+    /// Error message if stats could not be retrieved
+    @"error": ?[]const u8 = null,
+    /// Total number of edges in the graph
+    total_edges: ?i64 = null,
+    /// Count of edges per edge type
+    edge_types: ?std.json.ArrayHashMap(i64) = null,
+    /// Whether the index is currently rebuilding
+    rebuilding: ?bool = null,
+    /// Rebuild progress as a ratio from 0.0 to 1.0
+    backfill_progress: ?f64 = null,
+    /// Number of edges indexed during current rebuild
+    backfill_items_processed: ?i64 = null,
+    /// Algebraic graph execution health for bounded semiring traversal.
+    algebraic_graph: ?std.json.Value = null,
+    graph_metric_runtime: ?GraphMetricRuntimeStats = null,
+};
+
+pub const GraphMetricStatus = struct {
+    state: []const u8,
+    phase: []const u8,
+    edge_filter: ?GraphMetricEdgeFilterStatus = null,
+    /// Version of the published graph metric metadata schema.
+    metadata_version: ?i64 = null,
+    maintenance_paused: ?bool = null,
+    /// Whether a local or distributed build is queued after the currently published or building generation.
+    build_queued: bool,
+    published_generation: i64,
+    edge_generation: i64,
+    target_edge_generation: i64,
+    /// Pending edge generation waiting to build, or 0 when no build is queued.
+    queued_generation: ?i64 = null,
+    /// Edge generation currently held by an active build lease, or 0 when idle.
+    building_generation: ?i64 = null,
+    /// Durable identifier for the active graph metric build job, or 0 when idle.
+    build_job_id: ?i64 = null,
+    /// Unix epoch milliseconds when the active graph metric build started, or 0 when idle.
+    build_started_at_ms: ?i64 = null,
+    /// Iteration number reported by the active build lease, or 0 when idle or not iterative.
+    build_iteration: ?i64 = null,
+    /// Unix epoch milliseconds when the active build lease expires, or 0 when idle.
+    build_lease_expires_at_ms: ?i64 = null,
+    /// Worker id that owns the active build lease. Local builds use `local`.
+    build_worker_id: ?[]const u8 = null,
+    /// Opaque resumable cursor for the active build phase. Empty or omitted when idle or when the phase has no cursor.
+    build_cursor: ?[]const u8 = null,
+    /// Completed work units for the active graph metric build, or 0 when idle or unknown.
+    build_completed_units: ?i64 = null,
+    /// Estimated total work units for the active graph metric build, or 0 when idle or unknown.
+    build_total_units: ?i64 = null,
+    /// Active leased or failed build pages for the current build phase, capped and ordered by durable page key.
+    build_pages: ?[]const GraphMetricBuildPageStatus = null,
+    /// Whether build_pages was capped before every active page could be included.
+    build_pages_truncated: ?bool = null,
+    /// Number of consecutive failed build attempts for the current target generation, or 0 when no failure applies.
+    retry_count: ?i64 = null,
+    /// Last build error for the current failed target generation.
+    last_error: ?[]const u8 = null,
+    /// Build progress for the target edge generation, from 0.0 to 1.0
+    progress: f64,
+    converged: bool,
+    iterations_completed: i64,
+    delta: f64,
+    computed_at_ms: i64,
+    last_event: ?GraphMetricEvent = null,
+    /// Recent graph metric events, newest first.
+    recent_events: ?[]const GraphMetricEvent = null,
 };
 
 /// A unified configuration for web search providers. Each provider has specific configuration requirements. Use the appropriate provider-specific config or set common options at the top level. **Environment Variables (fallbacks):** - EXA_API_KEY - SERPER_API_KEY - TAVILY_API_KEY - BRAVE_API_KEY - YOU_API_KEY - LINKUP_API_KEY - GOOGLE_APPLICATION_CREDENTIALS, GOOGLE_CLOUD_PROJECT, GOOGLE_CLOUD_LOCATION
@@ -5381,7 +6059,109 @@ pub const TransactionSessionCommitResponse = struct {
     transaction_id: []const u8,
 };
 
+pub const RowsGetRequest = struct {
+    keys: []const RowSelector,
+    /// Include the diagnostic storage-owned physical key in each result.
+    include_physical_key: ?bool = null,
+};
+
+pub const RowsGetResult = struct {
+    identity: ?RowSelector = null,
+    found: ?bool = null,
+    row: ?std.json.Value = null,
+    version: ?i64 = null,
+    /// Diagnostic storage-owned physical key. Null when a unique selector did not resolve. Do not persist as public row identity.
+    physical_key: ?[]const u8 = null,
+};
+
+/// Compact COALESCE projection.
+pub const RowsCoalesceProjection = struct {
+    /// Output field name.
+    as: []const u8,
+    operands: []const RowsCoalesceOperand,
+};
+
+/// Predicate branch used by `where.any` and `where.not`; exactly one typed atom or an `all`-only conjunction of typed atoms.
+pub const RowsWhereBranch = union(enum) {
+    rows_where_branch_atom: *RowsWhereBranchAtom,
+    rows_where_branch_all: *RowsWhereBranchAll,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "op",
+            "value",
+            "path",
+            "pattern",
+            "case_insensitive",
+            "negated",
+        })) {
+            if (try parseStructuralVariant(RowsWhereBranchAtom, allocator, source, options)) |parsed| return .{ .rows_where_branch_atom = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "all",
+        })) {
+            if (try parseStructuralVariant(RowsWhereBranchAll, allocator, source, options)) |parsed| return .{ .rows_where_branch_all = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_where_branch_atom => |v| try jw.write(v.*),
+            .rows_where_branch_all => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsStreamResultSet = struct {
+    total_rows: ?i64 = null,
+    join_strategy: ?RowsJoinStrategySelection = null,
+    result_schema: ?[]const RowsResultColumn = null,
+    rows: ?[]const std.json.Value = null,
+};
+
 pub const SSEStepCompleted = AgentStep;
+
+/// A single query result hit
+pub const QueryHit = struct {
+    /// ID of the record.
+    _id: []const u8,
+    /// Relevance score of the hit.
+    _score: f32,
+    /// Scores partitioned by index when using RRF search.
+    _index_scores: ?std.json.Value = null,
+    /// Optional explain-style score provenance for score features applied to this hit.
+    _score_details: ?QueryScoreDetails = null,
+    _source: ?std.json.Value = null,
+    /// Stable ancestry envelope for derived document hierarchy hits. Present when the hit is a derived unit/chunk/embedding artifact or when a source-level rollup includes child chunks. Standard fields include `level`, `parent_doc_key`, optional `parent_unit_id`, `artifact`, `chunks`, and `ancestors` with response-local or requested DB-backed source/unit context when available.
+    hierarchy: ?std.json.Value = null,
+    /// Sort key values for this hit. Pass as search_after or search_before to paginate to the next/previous page. Only present when order_by is specified.
+    _sort: ?[]const []const u8 = null,
+};
 
 pub const TraverseResponse = struct {
     results: ?[]const TraversalResult = null,
@@ -5585,6 +6365,76 @@ pub const GeoShapeQuery = struct {
     geometry: GeoShapeGeometry,
     field: ?[]const u8 = null,
     boost: ?Boost = null,
+};
+
+/// Statistics for an index
+pub const IndexStats = union(enum) {
+    full_text_index_stats: FullTextIndexStats,
+    embeddings_index_stats: EmbeddingsIndexStats,
+    graph_index_stats: GraphIndexStats,
+    algebraic_index_stats: AlgebraicIndexStats,
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        const disc_val = source.object.get("index_type") orelse return error.MissingField;
+        const disc_str = switch (disc_val) {
+            .string => |s| s,
+            else => return error.UnexpectedToken,
+        };
+        if (std.mem.eql(u8, disc_str, "full_text")) {
+            return .{ .full_text_index_stats = try std.json.parseFromValueLeaky(FullTextIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "embeddings")) {
+            return .{ .embeddings_index_stats = try std.json.parseFromValueLeaky(EmbeddingsIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "graph")) {
+            return .{ .graph_index_stats = try std.json.parseFromValueLeaky(GraphIndexStats, allocator, source, options) };
+        }
+        if (std.mem.eql(u8, disc_str, "algebraic")) {
+            return .{ .algebraic_index_stats = try std.json.parseFromValueLeaky(AlgebraicIndexStats, allocator, source, options) };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .full_text_index_stats => |v| try jw.write(v),
+            .embeddings_index_stats => |v| try jw.write(v),
+            .graph_index_stats => |v| try jw.write(v),
+            .algebraic_index_stats => |v| try jw.write(v),
+        }
+    }
+};
+
+pub const GraphMetricActionResponse = struct {
+    status: GraphMetricStatus,
+};
+
+pub const GraphMetricProfile = struct {
+    /// Name of the graph query or graph metric query that used the metric.
+    query_name: []const u8,
+    /// Profile source, such as `graph_query`, `graph_metric`, or `graph_metric_rerank`.
+    source: []const u8,
+    /// Graph index that owns the metric.
+    index_name: []const u8,
+    /// Graph metric name within the index.
+    metric_name: []const u8,
+    /// Effective freshness mode requested for this metric use.
+    freshness: []const u8,
+    /// Published generation and freshness status observed by the query.
+    status: GraphMetricStatus,
+};
+
+pub const GraphMetricResult = struct {
+    index_name: []const u8,
+    metric: []const u8,
+    scores: []const GraphMetricScore,
+    status: GraphMetricStatus,
 };
 
 /// Configuration for Exa neural/semantic web search. Exa is optimized for semantic web search, highlights, and retrieved page contents for RAG and agent workflows. **Setup:** 1. Sign up at https://exa.ai 2. Get API key from dashboard **Docs:** https://docs.exa.ai
@@ -5877,12 +6727,12 @@ pub const ContentPart = union(enum) {
     text_content_part: *TextContentPart,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -5915,6 +6765,11 @@ pub const ContentPart = union(enum) {
             if (try parseStructuralVariant(TextContentPart, allocator, source, options)) |parsed| return .{ .text_content_part = parsed };
         }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -5955,18 +6810,6 @@ pub const EvalResult = struct {
     summary: ?EvalSummary = null,
     /// Total evaluation duration in milliseconds
     duration_ms: ?i64 = null,
-};
-
-/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
-pub const QueryProfile = struct {
-    /// Shard-level execution statistics.
-    shards: ?ShardsProfile = null,
-    /// Join execution statistics (present when query used a join).
-    join: ?JoinProfile = null,
-    /// Reranking statistics (present when a reranker was used).
-    reranker: ?RerankerProfile = null,
-    /// Result merge statistics (present for hybrid search).
-    merge: ?MergeProfile = null,
 };
 
 pub const InferencePredictorsResponse = struct {
@@ -6155,6 +6998,51 @@ pub const BatchRequest = struct {
     sync_level: ?SyncLevel = null,
 };
 
+pub const RowsGetResultSet = struct {
+    rows: ?[]const RowsGetResult = null,
+};
+
+/// Canonical row predicate tree. A top-level `where` is one predicate atom, an `all` conjunction of atoms, `any` / `not` branch groups, or an `all` conjunction plus branch groups. Branches may contain scalar, membership, array, JSON, and text-pattern atoms; the server stores branches containing structured atoms in native mixed access predicate groups and keeps scalar-only branches in scalar predicate groups.
+pub const RowsWhere = union(enum) {
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(_: std.mem.Allocator, source: std.json.Value, _: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(_: @This(), _: anytype) !void {}
+};
+
+/// A list of query hits.
+pub const QueryHits = struct {
+    /// Total number of hits available.
+    total: ?i64 = null,
+    hits: ?[]const QueryHit = null,
+    /// Maximum score of the results.
+    max_score: ?f32 = null,
+};
+
 /// Declarative graph query to execute after full-text/vector searches
 pub const GraphQuery = struct {
     type: GraphQueryType,
@@ -6176,6 +7064,16 @@ pub const GraphQuery = struct {
     include_edges: ?bool = null,
     /// Which fields to return from documents
     fields: ?[]const []const u8 = null,
+    /// Graph metric names to project onto result nodes
+    metrics: ?[]const []const u8 = null,
+    /// Sort graph result nodes by graph metric scores
+    order_by: ?[]const GraphMetricOrder = null,
+    /// Filter graph result nodes by graph metric scores
+    where_metric: ?[]const GraphMetricFilter = null,
+    /// Freshness mode for projected, ordered, and filtered graph metrics
+    metric_freshness: ?[]const u8 = null,
+    /// Include graph metric status metadata in the graph result
+    include_metric_status: ?bool = null,
 };
 
 /// Results of a graph query
@@ -6191,6 +7089,8 @@ pub const GraphQueryResult = struct {
     total: i64,
     /// Query execution time
     took: ?i64 = null,
+    /// Graph metric status metadata keyed by metric name
+    metric_status: ?std.json.ArrayHashMap(GraphMetricStatus) = null,
 };
 
 /// API key creation response including the cleartext secret (shown once).
@@ -6292,22 +7192,18 @@ pub const ChunkerConfig = struct {
     full_text_index: ?std.json.Value = null,
 };
 
-/// Schema definition for a table with multiple document types
-pub const TableSchema = struct {
-    /// Version of the schema. Used for migrations.
-    version: ?i64 = null,
-    /// Default type to use from the document_types.
-    default_type: ?[]const u8 = null,
-    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
-    enforce_types: ?bool = null,
-    /// A map of type names to their document json schemas.
-    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
-    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
-    ttl_field: ?[]const u8 = null,
-    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
-    ttl_duration: ?[]const u8 = null,
-    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
-    dynamic_templates: ?[]const DynamicTemplate = null,
+/// Detailed execution profiling for a query. Present in the response when the request sets `profile: true`.
+pub const QueryProfile = struct {
+    /// Shard-level execution statistics.
+    shards: ?ShardsProfile = null,
+    /// Join execution statistics (present when query used a join).
+    join: ?JoinProfile = null,
+    /// Reranking statistics (present when a reranker was used).
+    reranker: ?RerankerProfile = null,
+    /// Result merge statistics (present for hybrid search).
+    merge: ?MergeProfile = null,
+    /// Graph metric freshness and generation details for metric-aware query work.
+    graph_metrics: ?[]const GraphMetricProfile = null,
 };
 
 /// Configuration for the retrieval step. Retrieval tools are constrained by the top-level request tools policy when both are present.
@@ -6466,12 +7362,6 @@ pub const EmbeddingsIndexConfig = struct {
     min_weight: ?f32 = null,
     /// Number of documents per posting list chunk (sparse only)
     chunk_size: ?i64 = null,
-};
-
-/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
-pub const TableMigration = struct {
-    state: []const u8,
-    read_schema: TableSchema,
 };
 
 /// Configuration for the retrieval agent's pipeline steps and tool-use behavior. Each step can have its own generator (or chain of generators) and step-specific options. If a step is not configured, it is skipped (retrieval always runs).
@@ -6816,16 +7706,22 @@ pub const CreateTableRequest = struct {
     description: ?[]const u8 = null,
     /// Map of index name to index configuration. Indexes enable different query capabilities: - Full-text indexes for BM25 search - Vector indexes for semantic similarity - Multimodal indexes for images/audio/video You can add multiple indexes to support different query patterns.
     indexes: ?std.json.ArrayHashMap(IndexConfig) = null,
+    /// Table-level typed document path metadata used by SQL planning for JSON/path scalar comparison semantics. This is not a physical index and does not imply indexed lookup, rebuild, catch-up, compaction, or PostgreSQL `CREATE INDEX` behavior. Use real index definitions for physical access paths. Keys are scalar type names such as `keyword`, `numeric`, `boolean`, or `datetime`; values are a path string or an array of path strings.
+    typed_paths: ?std.json.Value = null,
     /// Optional schema definition specifying field types, primary key, and TTL configuration. While optional, defining a schema provides type safety, optimized indexing, and better search performance. **Schema Features:** - **Field Types**: Define document structure using JSON Schema with `x-antfly-types` extensions - **Document TTL**: Configure automatic expiration via `ttl_duration` and optional `ttl_field` - **Primary Keys**: Specify unique identifier fields - **Validation**: Enforce schema constraints on writes **TTL Example:** ```json { "ttl_duration": "7d", "ttl_field": "_timestamp", "document_schemas": {...} } ``` See the Table Management documentation for comprehensive TTL configuration and use cases.
     schema: ?TableSchema = null,
     /// PostgreSQL CDC replication sources. Streams INSERT/UPDATE/DELETE changes from PostgreSQL tables into this Antfly table via logical replication. Multiple sources can feed into a single table (e.g., `users` + `scores` → Antfly `users`). Each source uses `on_update`/`on_delete` transforms to control how PG events map to Antfly document operations. Requires `wal_level=logical` on the PostgreSQL source.
     replication_sources: ?[]const ReplicationSource = null,
+    /// Optional tablespace binding for the table. When set, the named tablespace must exist and cannot be dropped while the table references it.
+    tablespace_name: ?[]const u8 = null,
 };
 
 pub const Table = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
+    /// Optional durable tablespace binding for this table.
+    tablespace_name: ?[]const u8 = null,
     indexes: std.json.ArrayHashMap(IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?TableSchema = null,
@@ -6835,10 +7731,18 @@ pub const Table = struct {
     replication_sources: ?[]const ReplicationSource = null,
 };
 
+/// Describes an in-progress schema migration. The table serves reads from read_schema while rebuilding full-text indexes for the new schema.
+pub const TableMigration = struct {
+    state: []const u8,
+    read_schema: TableSchema,
+};
+
 pub const AggregationRequest = struct {
     type: AggregationType,
     /// Field to aggregate on. Required unless `fields` is supplied for a multi-field terms aggregation.
     field: ?[]const u8 = null,
+    /// Selection mode for a cardinality aggregation. `auto` (default) uses a materialized HyperLogLog sketch when one applies and is current, else falls back to an exact distinct scan. `exact` always scans. `approximate` requires a sketch and errors if none applies. Ignored for other types.
+    mode: ?std.json.Value = null,
     /// Ordered field list for multi-field terms aggregations. Bucket keys are returned as JSON arrays in the same order.
     fields: ?[]const []const u8 = null,
     /// Maximum number of buckets to return (for bucketing aggregations)
@@ -6897,6 +7801,10 @@ pub const AggregationBucket = struct {
 pub const AggregationResult = struct {
     /// Single value for metric aggregations (sum, avg, min, max, count, cardinality)
     value: ?f32 = null,
+    /// For cardinality aggregations, whether the value is an approximate estimate from a HyperLogLog sketch (true) or an exact distinct count (false). Absent for non-cardinality aggregations.
+    approximate: ?bool = null,
+    /// For an approximate cardinality value, the relative standard error of the estimate (e.g. 0.0081 for ~0.8%). Present only when approximate is true.
+    relative_error: ?f32 = null,
     /// Document count for stats aggregations
     count: ?i64 = null,
     /// Minimum value for stats aggregations
@@ -6921,6 +7829,8 @@ pub const TableStatus = struct {
     name: []const u8,
     /// Optional description of the table.
     description: ?[]const u8 = null,
+    /// Optional durable tablespace binding for this table.
+    tablespace_name: ?[]const u8 = null,
     indexes: std.json.ArrayHashMap(IndexConfig),
     shards: std.json.ArrayHashMap(ShardConfig),
     schema: ?TableSchema = null,
@@ -6949,6 +7859,632 @@ pub const ScanKeysRequest = struct {
     filter_query: ?std.json.Value = null,
     /// Maximum number of results to return. If not specified, returns all matching keys in the range. Useful for pagination or sampling.
     limit: ?i64 = null,
+};
+
+/// Field-to-expression assignment map over the shared row-expression AST.
+pub const RowsExpressionAssignmentMap = struct {};
+
+/// JSON path assignment for a declared `json` column. Exactly one of `value` or `expr` must be supplied.
+pub const RowsJsonSetTransform = struct {
+    /// Declared `json` column to update.
+    field: []const u8,
+    /// Non-empty path under the JSON column.
+    path: []const []const u8,
+    /// JSON value to write at the path.
+    value: ?std.json.Value = null,
+    /// Expression value to evaluate at mutation time and write at the path.
+    expr: ?RowsExpression = null,
+};
+
+/// Declared unique constraint target for `ON CONFLICT`.
+pub const RowsConflictUniqueTarget = struct {
+    /// Unique constraint name.
+    name: []const u8,
+    where: ?RowsUniquePredicateGroup = null,
+    /// Expression predicates for expression-partial unique conflict targets. When present, the list must exactly match the named unique constraint's stored expression predicate metadata.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+};
+
+/// Primary-key or named unique constraint conflict target.
+pub const RowsConflictTarget = struct {
+    /// Set to `true` to target the declared primary key.
+    primary: ?bool = null,
+    unique: ?RowsConflictUniqueTarget = null,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        try jw.beginObject();
+        if (self.primary) |value| {
+            try jw.objectField("primary");
+            try jw.write(value);
+        }
+        if (self.unique) |value| {
+            try jw.objectField("unique");
+            try jw.write(value);
+        }
+        try jw.endObject();
+    }
+};
+
+/// Typed conflict action for insert operations. `nothing` skips the insert when the target already exists. `update` applies the same typed update operators as ordinary row updates, with expression sources allowed to reference `existing` and `proposed` row images.
+pub const RowsOnConflict = struct {
+    target: RowsConflictTarget,
+    action: []const u8,
+    patch: ?RowsFieldPatch = null,
+    increment: ?RowsNumericIncrement = null,
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    json_set: ?[]const RowsJsonSetTransform = null,
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    where_expression: ?RowsExpressionCondition = null,
+};
+
+/// Structured relational row mutation. `insert` fails if the primary identity already exists, `upsert` overwrites or creates, `update` applies a non-upsert patch by primary or unique identity, and `delete` removes by primary or unique identity. `update.patch` cannot change primary-key components. Missing unique selectors fail the write request rather than falling back to scans. The operation envelope is exact and operation-specific: unsupported fields for the selected `op` fail validation instead of being ignored.
+pub const RowOperation = struct {
+    op: []const u8,
+    /// Full row document for insert/upsert. Must include primary-key columns.
+    row: ?RowsRowDocument = null,
+    where: ?RowSelector = null,
+    /// Top-level field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    increment: ?RowsNumericIncrement = null,
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    json_set: ?[]const RowsJsonSetTransform = null,
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    on_conflict: ?RowsOnConflict = null,
+    /// Fields to return from the committed mutation image. `*` returns the full row and cannot be combined with expression projections.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections from the committed mutation image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+    /// Optional optimistic-concurrency predicate for update/delete. The predicate applies to the physical row resolved from primary or unique identity.
+    expected_version: ?i64 = null,
+};
+
+pub const RowsBatchRequest = struct {
+    operations: []const RowOperation,
+    sync_level: ?SyncLevel = null,
+};
+
+/// Typed relational mutation-source plan. The `source` is a lockable base row-query request with `row_claim.transaction_id` and no `source_cte` or `doc_key_range`; update/delete intents are staged into that transaction using committed-version predicates from the selected preimages. Claims over physical ranges, CTEs, joins, aggregates, windows, and lateral outputs are rejected until those stages expose an explicit lockable base-row contract.
+pub const RowsMutationSourceRequest = struct {
+    op: []const u8,
+    source: RowsQueryRequest,
+    /// Top-level static field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    /// Numeric increments for update operations.
+    increment: ?RowsNumericIncrement = null,
+    /// Field-to-expression assignments evaluated over the selected row image.
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    /// Field-to-expression numeric deltas evaluated over the selected row image.
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    /// JSON path transforms for update operations.
+    json_set: ?[]const RowsJsonSetTransform = null,
+    /// Array transforms for update operations.
+    array_update: ?[]const RowsArrayUpdateTransform = null,
+    /// Application-time `FOR PORTION OF` slice for temporal update/delete mutation-source plans.
+    temporal_portion: ?RowsTemporalPortion = null,
+    /// Fields to return from the final update image or deleted row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the final update image or deleted row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Target-column assignment for a typed insert-source plan.
+pub const RowsInsertSourceAssignment = struct {
+    /// Declared target-table relational field to populate.
+    target_field: []const u8,
+    /// Typed expression evaluated over each source row. A field expression copies a source field; operator expressions build generated insert values without carrying SQL text.
+    expr: RowsExpression,
+};
+
+/// Typed relational insert-source plan. The `source` is a read-only row query over `source_table` or, when omitted, the target table named in the path. Each selected source row is projected through `assignments` into a target insert row, then optional conflict handling and `RETURNING` projection run through the same row-batch semantics as ordinary inserts. Execution is fail-closed until the storage/runtime layer implements source-to-target routing, duplicate-target detection, and owner-local insert staging for this native plan.
+pub const RowsInsertSourceRequest = struct {
+    op: []const u8,
+    /// Optional source table name. Omit or set to the target table for same-table insert-source plans; cross-table execution requires routed source/target ownership support.
+    source_table: ?[]const u8 = null,
+    source: RowsQueryRequest,
+    /// Ordered target-field assignments used to build each proposed insert row from the source row.
+    assignments: []const RowsInsertSourceAssignment,
+    on_conflict: ?RowsOnConflict = null,
+    /// Fields to return from the committed inserted or conflict-updated row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the committed inserted or conflict-updated row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Typed relational joined mutation-source plan. The target side of the `join` must carry a lockable `row_claim.transaction_id`; the non-target side is read-only input. Update plans can copy same-typed values from the source side through `source_assignments` and can apply target-local patches or expression assignments. Delete plans reject update assignments. Execution must stage intents only for claimed target rows.
+pub const RowsJoinedMutationSourceRequest = struct {
+    op: []const u8,
+    /// Optional source table name for cross-table joined mutation-source plans. Omit or set to the target table for same-table joined mutation sources. Catalog-routed execution reads source rows through the source table's owner ranges and stages only target-row intents through the target table's owner ranges.
+    source_table: ?[]const u8 = null,
+    target_side: []const u8,
+    join: RowsJoinRequest,
+    /// Post-match computed predicates over the target row and joined source row. Unqualified fields bind to the target row; fields with `source: source` bind to the source row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the target row and joined source row.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the target row and joined source row.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the target row and joined source row.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    /// Source-side assignments that copy values from the read-only joined source side into the claimed target side.
+    source_assignments: ?[]const RowsJoinedMutationSourceAssignment = null,
+    /// Target-local static field patch for update operations.
+    patch: ?RowsFieldPatch = null,
+    /// Target-local numeric increments for update operations.
+    increment: ?RowsNumericIncrement = null,
+    /// Target-local field-to-expression assignments evaluated over the target row image.
+    patch_expr: ?RowsExpressionAssignmentMap = null,
+    /// Target-local field-to-expression numeric deltas evaluated over the target row image.
+    increment_expr: ?RowsExpressionAssignmentMap = null,
+    /// Fields to return from the final target update image or deleted target row image. `*` returns the full row.
+    returning: ?[]const []const u8 = null,
+    /// Typed row-expression projections over the final target update image or deleted target row image.
+    returning_expressions: ?[]const RowsExpressionProjection = null,
+};
+
+/// Ordered row-stream key. Exactly one of `field` or `expr` is required. `field` names an output/base field; `expr` carries a typed row-expression AST for computed ordering.
+pub const RowsQueryOrder = union(enum) {
+    rows_query_order_expression: *RowsQueryOrderExpression,
+    rows_query_order_field: *RowsQueryOrderField,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "expr",
+            "null_test",
+            "direction",
+        })) {
+            if (try parseStructuralVariant(RowsQueryOrderExpression, allocator, source, options)) |parsed| return .{ .rows_query_order_expression = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "null_test",
+            "direction",
+        })) {
+            if (try parseStructuralVariant(RowsQueryOrderField, allocator, source, options)) |parsed| return .{ .rows_query_order_field = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_query_order_expression => |v| try jw.write(v.*),
+            .rows_query_order_field => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsQueryOrderExpression = struct {
+    /// Typed row-expression AST for computed ordering. Mutually exclusive with `field`.
+    expr: RowsExpression,
+    null_test: ?[]const u8 = null,
+    direction: ?[]const u8 = null,
+};
+
+/// Shared typed row-expression AST. A node is exactly one of `{ "field": "name" }`, `{ "value": ... }`, or an operator node such as `{ "op": "lower", "args": [{ "field": "email" }] }`. Supported operators are the shared row-local expression surface used by schema predicates, mutation expressions, query projections, filters, grouping, ordering, and SQL lowering. Mutation expressions may set `source` to `existing` or `proposed`; query expressions use the default row source.
+pub const RowsExpression = union(enum) {
+    rows_expression_operator: *RowsExpressionOperator,
+    rows_expression_field: *RowsExpressionField,
+    rows_expression_value: *RowsExpressionValue,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "op",
+            "args",
+            "to",
+            "path",
+            "as_text",
+            "cases",
+            "else",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionOperator, allocator, source, options)) |parsed| return .{ .rows_expression_operator = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "field",
+            "source",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionField, allocator, source, options)) |parsed| return .{ .rows_expression_field = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "value",
+        })) {
+            if (try parseStructuralVariant(RowsExpressionValue, allocator, source, options)) |parsed| return .{ .rows_expression_value = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_expression_operator => |v| try jw.write(v.*),
+            .rows_expression_field => |v| try jw.write(v.*),
+            .rows_expression_value => |v| try jw.write(v.*),
+        }
+    }
+};
+
+pub const RowsExpressionOperator = struct {
+    op: []const u8,
+    /// Operand expressions for operator nodes.
+    args: ?[]const RowsExpression = null,
+    /// Cast target for `cast`.
+    to: ?[]const u8 = null,
+    /// Structured JSON path for `json_extract` and `json_path_exists`.
+    path: ?std.json.Value = null,
+    /// Return JSON path extraction as text.
+    as_text: ?bool = null,
+    /// Searched case branches, each with `when` and `then`.
+    cases: ?[]const RowsExpressionCaseBranch = null,
+    /// Fallback expression for searched `case`.
+    @"else": ?std.json.Value = null,
+};
+
+pub const RowsExpressionCaseBranch = struct {
+    when: RowsExpressionCondition,
+    then: RowsExpression,
+};
+
+/// Computed expression predicate over the shared row-expression AST.
+pub const RowsExpressionCondition = struct {
+    lhs: RowsExpression,
+    op: []const u8,
+    rhs: ?RowsExpression = null,
+};
+
+pub const RowsExpressionConditionGroup = struct {
+    all: []const RowsExpressionCondition,
+};
+
+pub const RowsExpressionArrayContainsPredicate = struct {
+    expr: RowsExpression,
+    value: []const std.json.Value,
+};
+
+pub const RowsExpressionProjection = struct {
+    as: []const u8,
+    expr: RowsExpression,
+};
+
+/// Typed relational row-query plan. Predicate and expression arrays carry Antfly row-expression AST nodes; SQL syntax is adapter sugar over this native request shape.
+pub const RowsQueryRequest = struct {
+    /// Optional ordered CTE name to read instead of the base table.
+    source_cte: ?[]const u8 = null,
+    /// Typed scalar, array, JSON, text-pattern, OR, and NOT predicates.
+    where: ?RowsWhere = null,
+    /// All computed expression predicates that must pass.
+    expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of computed expression predicates.
+    expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of computed expression predicates.
+    expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Computed array-containment predicates.
+    expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    select: ?[]const []const u8 = null,
+    json_extract: ?[]const RowsJsonExtractProjection = null,
+    array_length: ?[]const RowsArrayLengthProjection = null,
+    coalesce: ?[]const RowsCoalesceProjection = null,
+    field_aliases: ?[]const RowsFieldAliasProjection = null,
+    /// Typed row-expression projections.
+    expressions: ?[]const RowsExpressionProjection = null,
+    /// Ordered field keys used to keep the first row per key after order_by and before pagination. The leading order_by fields must match. Field-only shorthand for `distinct_on_expressions`.
+    distinct_on: ?[]const []const u8 = null,
+    /// Ordered typed row-expression keys used to keep the first row per computed key after order_by and before pagination. The leading order_by expression keys must match.
+    distinct_on_expressions: ?[]const RowsExpression = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+    row_claim: ?RowsRowClaim = null,
+    doc_key_range: ?RowsDocKeyRange = null,
+};
+
+/// Ordered named row-query subplan. Later CTEs and final plan stages can reference earlier names through `source_cte`. `max_rows` and `max_bytes` are optional materialization bounds; execution fails closed when the CTE would produce more rows or serialized row bytes than declared.
+pub const RowsCte = struct {
+    name: []const u8,
+    max_rows: ?i64 = null,
+    max_bytes: ?i64 = null,
+    query: RowsQueryRequest,
+};
+
+pub const RowsAggregateSpec = struct {
+    name: []const u8,
+    op: []const u8,
+    field: ?[]const u8 = null,
+    expr: ?RowsExpression = null,
+    distinct: ?bool = null,
+    distinct_max_items: ?i64 = null,
+    /// Fraction for percentile_cont and percentile_disc aggregate specs.
+    percentile: ?f64 = null,
+    /// Fractions for array-valued percentile_cont and percentile_disc aggregate specs.
+    percentiles: ?[]const f64 = null,
+    /// Maximum bounded per-group sample count for percentile_cont and percentile_disc.
+    percentile_max_items: ?i64 = null,
+    /// Ordered-set sample direction for percentile_cont and percentile_disc; deterministic tie-break direction for mode.
+    percentile_order: ?[]const u8 = null,
+    array_max_items: ?i64 = null,
+    array_order_by: ?[]const RowsQueryOrder = null,
+    /// Delimiter for string_agg aggregate specs.
+    delimiter: ?[]const u8 = null,
+    filter: ?RowsWhere = null,
+    /// Conjunctive declared-array element-match filters for this aggregate. Each item must use `op: array_any`.
+    filter_array_any: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-array containment filters for this aggregate. Each item must use `op: array_contains`.
+    filter_array_contains: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-array equality filters for this aggregate. Each item must use `op: array_eq`.
+    filter_array_eq: ?[]const RowsWhereAtom = null,
+    /// Conjunctive scalar membership filters for this aggregate. Each item must use `op: in` or `op: not_in`.
+    filter_in: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON containment filters for this aggregate. Each item must use `op: json_contains`.
+    filter_json_contains: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON path equality filters for this aggregate. Each item must use `op: json_path_eq`.
+    filter_json_path_eq: ?[]const RowsWhereAtom = null,
+    /// Conjunctive declared-JSON path-existence filters for this aggregate. Each item must use `op: json_path_exists`.
+    filter_json_path_exists: ?[]const RowsWhereAtom = null,
+    /// Conjunctive text-pattern filters for this aggregate. Each item must use `op: text_pattern`.
+    filter_text_patterns: ?[]const RowsWhereAtom = null,
+    filter_expressions: ?[]const RowsExpressionCondition = null,
+    /// Conjunctive computed array-containment filters for this aggregate.
+    filter_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    /// Disjunction of input-row expression predicate groups for this aggregate. Each group is a conjunction; the aggregate consumes a row when at least one group matches.
+    filter_any: ?[]const RowsExpressionConditionGroup = null,
+    /// Negated input-row expression predicate groups for this aggregate. The aggregate skips a row when any group matches.
+    filter_not: ?[]const RowsExpressionConditionGroup = null,
+};
+
+pub const RowsAggregateRequest = struct {
+    source: RowsQueryRequest,
+    group_by: ?[]const []const u8 = null,
+    /// Named expression group keys. These are evaluated for each source row, included in the grouping key, and emitted under their `as` names in aggregate result rows.
+    group_expressions: ?[]const RowsExpressionProjection = null,
+    /// Metric specs to compute for each group. May be empty or omitted only when group_by or group_expressions is non-empty, which returns one row per distinct group key.
+    aggregations: ?[]const RowsAggregateSpec = null,
+    having: ?RowsAggregateHaving = null,
+    /// Expression predicates over aggregate output fields, evaluated after grouping. Field references bind to group keys or aggregation names.
+    having_expressions: ?[]const RowsExpressionCondition = null,
+    /// Disjunction of aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row passes when at least one group matches.
+    having_any: ?[]const RowsExpressionConditionGroup = null,
+    /// Negated aggregate-output expression predicate groups. Each group is a conjunction; the aggregate row is rejected when any group matches.
+    having_not: ?[]const RowsExpressionConditionGroup = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+pub const RowsWindowSpec = struct {
+    as: []const u8,
+    /// Window function name. Supported values are `row_number`, `rank`, `dense_rank`, `percent_rank`, `cume_dist`, `ntile`, `lag`, `lead`, `first_value`, `last_value`, `nth_value`, `count`, `sum`, `avg`, `min`, and `max`.
+    function: []const u8,
+    partition_by: ?[]const []const u8 = null,
+    order_by: []const RowsQueryOrder,
+    expr: ?RowsExpression = null,
+    offset: ?i64 = null,
+    default: ?std.json.Value = null,
+    frame: ?RowsWindowFrame = null,
+};
+
+pub const RowsWindowRequest = struct {
+    source: RowsQueryRequest,
+    windows: []const RowsWindowSpec,
+    select: ?[]const []const u8 = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Typed equality join plan. Each side is a full row-query request and can read an ordered CTE through `source_cte`.
+pub const RowsJoinRequest = struct {
+    left: RowsQueryRequest,
+    right: RowsQueryRequest,
+    on: []const RowsJoinOn,
+    /// Post-match computed predicates over the joined rows. Unqualified fields bind to the left row; fields with `source: source` bind to the right row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the joined rows.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the joined rows.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the joined rows.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    join_type: ?[]const u8 = null,
+    strategy: ?RowsJoinStrategy = null,
+    select: ?[]const RowsJoinProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Typed bounded lateral plan. The right side must include a limit and can read an ordered CTE through `source_cte`.
+pub const RowsLateralRequest = struct {
+    left: RowsQueryRequest,
+    right: RowsQueryRequest,
+    correlations: []const RowsLateralCorrelation,
+    /// Post-match computed predicates over the left row and each bounded right row. Unqualified fields bind to the left row; fields with `source: source` bind to the right row.
+    match_expression_where: ?[]const RowsExpressionCondition = null,
+    /// OR groups of post-match computed predicates over the left row and each bounded right row.
+    match_expression_any: ?[]const RowsExpressionConditionGroup = null,
+    /// NOT groups of post-match computed predicates over the left row and each bounded right row.
+    match_expression_not: ?[]const RowsExpressionConditionGroup = null,
+    /// Post-match computed array-containment predicates over the left row and each bounded right row.
+    match_expression_array_contains: ?[]const RowsExpressionArrayContainsPredicate = null,
+    select: ?[]const RowsJoinProjection = null,
+    order_by: ?[]const RowsQueryOrder = null,
+    limit: ?i64 = null,
+    offset: ?i64 = null,
+};
+
+/// Generic typed relational row plan envelope. It is exactly one operation-specific envelope: query, aggregate, window, join, or lateral. Query, aggregate, and window plans use `ranges`; join and lateral plans use paired `left_ranges` and `right_ranges`.
+pub const RowsPlanRequest = union(enum) {
+    rows_join_plan_request: *RowsJoinPlanRequest,
+    rows_lateral_plan_request: *RowsLateralPlanRequest,
+    rows_aggregate_plan_request: *RowsAggregatePlanRequest,
+    rows_query_plan_request: *RowsQueryPlanRequest,
+    rows_window_plan_request: *RowsWindowPlanRequest,
+
+    fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        const value = try allocator.create(T);
+        value.* = parsed;
+        return value;
+    }
+
+    fn objectHasAnyKey(object: std.json.ObjectMap, comptime keys: []const []const u8) bool {
+        inline for (keys) |key| {
+            if (object.contains(key)) return true;
+        }
+        return false;
+    }
+
+    pub fn jsonParseFromValue(allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !@This() {
+        if (source != .object) return error.UnexpectedToken;
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "left_table",
+            "right_table",
+            "left_ranges",
+            "right_ranges",
+            "join",
+        })) {
+            if (try parseStructuralVariant(RowsJoinPlanRequest, allocator, source, options)) |parsed| return .{ .rows_join_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "left_table",
+            "right_table",
+            "left_ranges",
+            "right_ranges",
+            "lateral",
+        })) {
+            if (try parseStructuralVariant(RowsLateralPlanRequest, allocator, source, options)) |parsed| return .{ .rows_lateral_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "aggregate",
+        })) {
+            if (try parseStructuralVariant(RowsAggregatePlanRequest, allocator, source, options)) |parsed| return .{ .rows_aggregate_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "query",
+        })) {
+            if (try parseStructuralVariant(RowsQueryPlanRequest, allocator, source, options)) |parsed| return .{ .rows_query_plan_request = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "ctes",
+            "ranges",
+            "window",
+        })) {
+            if (try parseStructuralVariant(RowsWindowPlanRequest, allocator, source, options)) |parsed| return .{ .rows_window_plan_request = parsed };
+        }
+        return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
+    }
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        switch (self) {
+            .rows_join_plan_request => |v| try jw.write(v.*),
+            .rows_lateral_plan_request => |v| try jw.write(v.*),
+            .rows_aggregate_plan_request => |v| try jw.write(v.*),
+            .rows_query_plan_request => |v| try jw.write(v.*),
+            .rows_window_plan_request => |v| try jw.write(v.*),
+        }
+    }
+};
+
+/// Typed row-query plan envelope. Accepts exactly `query` plus optional ordered `ctes` and declared `ranges`.
+pub const RowsQueryPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
+    query: RowsQueryRequest,
+};
+
+/// Typed row-aggregate plan envelope. Accepts exactly `aggregate` plus optional ordered `ctes` and declared `ranges`.
+pub const RowsAggregatePlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
+    aggregate: RowsAggregateRequest,
+};
+
+/// Typed row-window plan envelope. Accepts exactly `window` plus optional ordered `ctes` and declared `ranges`.
+pub const RowsWindowPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    ranges: ?[]const RowsDocKeyRange = null,
+    window: RowsWindowRequest,
+};
+
+/// Typed row-join plan envelope. Accepts exactly `join` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
+pub const RowsJoinPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
+    left_ranges: ?[]const RowsDocKeyRange = null,
+    right_ranges: ?[]const RowsDocKeyRange = null,
+    join: RowsJoinRequest,
+};
+
+/// Typed row-lateral plan envelope. Accepts exactly `lateral` plus optional ordered `ctes`, optional left/right table names, and paired `left_ranges` and `right_ranges`.
+pub const RowsLateralPlanRequest = struct {
+    ctes: ?[]const RowsCte = null,
+    /// Optional source table for the left side. Omitted or empty uses the endpoint table.
+    left_table: ?[]const u8 = null,
+    /// Optional source table for the right side. Omitted or empty uses the endpoint table.
+    right_table: ?[]const u8 = null,
+    left_ranges: ?[]const RowsDocKeyRange = null,
+    right_ranges: ?[]const RowsDocKeyRange = null,
+    lateral: RowsLateralRequest,
 };
 
 pub const QueryBuilderResult = struct {
@@ -7036,6 +8572,8 @@ pub const RetrievalQueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
@@ -7188,6 +8726,8 @@ pub const QueryRequest = struct {
     profile: ?bool = null,
     /// Optional reranker configuration to improve result relevance. Rerankers use cross-encoder models that score query-document pairs directly, providing more accurate relevance scores than embedding similarity alone. **When to use:** - Results need high precision (e.g., RAG, question answering) - You have semantic or hybrid search results to refine - Latency trade-off is acceptable (reranking adds 100-500ms typically) **Best practice:** Retrieve more results (limit: 50-100) then rerank to final size. Example: ```json { "provider": "antfly", "model": "cross-encoder/ms-marco-MiniLM-L-6-v2", "field": "content" } ```
     reranker: ?RerankerConfig = null,
+    /// Optional graph metric score feature to blend into ordinary search hit ranking. The metric must have a published generation. With `metric_freshness: fresh`, the request fails if graph writes have made the published generation stale.
+    graph_metric_rerank: ?GraphMetricRerank = null,
     analyses: ?Analyses = null,
     /// Declarative graph queries to execute after full-text/vector searches. Results can reference search results using node selectors like $full_text_results.
     graph_searches: ?std.json.ArrayHashMap(GraphQuery) = null,
@@ -7245,6 +8785,8 @@ pub const QueryResult = struct {
     analyses: ?std.json.ArrayHashMap(AnalysesResult) = null,
     /// Results from declarative graph queries.
     graph_results: ?std.json.ArrayHashMap(GraphQueryResult) = null,
+    /// Results from direct graph metric reads.
+    graph_metric_results: ?std.json.ArrayHashMap(GraphMetricResult) = null,
     /// Detailed execution profile (present when `profile: true` in request).
     profile: ?std.json.Value = null,
     /// Duration of the query in milliseconds.
@@ -7297,6 +8839,52 @@ pub const ReplicationRoute = struct {
     on_delete: ?[]const ReplicationTransformOp = null,
 };
 
+/// Relational unique constraint.
+pub const UniqueConstraint = struct {
+    /// Constraint name, unique within the table schema.
+    name: ?[]const u8 = null,
+    /// Unique columns. One or more ordered non-json relational columns are supported.
+    columns: ?[]const []const u8 = null,
+    /// Stable expression keys supported by unique-owner maintenance.
+    expressions: ?[]const std.json.Value = null,
+    /// Application-time period name for `WITHOUT OVERLAPS` temporal uniqueness.
+    without_overlaps_period: ?[]const u8 = null,
+    /// Field-only partial unique predicate shorthand.
+    where: ?RowsUniquePredicateGroup = null,
+    /// Deterministic row-expression predicates that decide whether a row participates in this unique constraint.
+    where_expressions: ?[]const RowsExpressionCondition = null,
+    /// Unique validation state. Unvalidated constraints are durable metadata but do not enforce writes until promoted.
+    validation_state: ?[]const u8 = null,
+};
+
+/// Schema definition for a table with multiple document types
+pub const TableSchema = struct {
+    /// Version of the schema. Used for migrations.
+    version: ?i64 = null,
+    /// Storage profile for the table. - "document" (default): schemaless JSON documents with optional, soft schema validation. All indexes are derived from the document. - "relational": required closed schema with typed columns. Documents must match a declared type; declared scalar properties are stored as typed columns for columnar predicate pushdown and aggregation. A field typed "json" stores a subtree that is still indexed like a document. Implies enforce_types and closed document types.
+    storage_mode: ?[]const u8 = null,
+    /// Default type to use from the document_types.
+    default_type: ?[]const u8 = null,
+    /// Whether to enforce that documents must match one of the provided document types. If false, documents not matching any type will be accepted but not indexed.
+    enforce_types: ?bool = null,
+    /// A map of type names to their document json schemas.
+    document_schemas: ?std.json.ArrayHashMap(DocumentSchema) = null,
+    /// The field containing the timestamp for TTL expiration (optional). Defaults to "_timestamp" if ttl_duration is specified but ttl_field is not.
+    ttl_field: ?[]const u8 = null,
+    /// The duration after which documents should expire, based on the ttl_field timestamp (optional). Uses Go duration format (e.g., '24h', '7d', '168h').
+    ttl_duration: ?[]const u8 = null,
+    /// Rules for mapping dynamically detected fields. When a document contains fields that don't have explicit mappings and dynamic mapping is enabled, templates are evaluated in order to determine how those fields should be indexed.
+    dynamic_templates: ?[]const DynamicTemplate = null,
+    /// Relational-mode referential constraints. Supported targets are a parent table's `_id` document key or a same-table declared unique parent column tuple with `on_delete: "restrict"` / `on_delete: "no_action"` or bounded local nullable-column `on_delete: "set_null"`, plus bounded local `on_delete: "cascade"`. `on_update: "restrict"` and `on_update: "no_action"` are accepted as parent-key update checks, and mutating `set_null`/`cascade` update actions are supported where owner topology is configured. Temporal foreign keys with `period` on both child and parent references accept restrictive actions plus bounded delete-side `set_null` / `cascade` actions through remaining-coverage proofs. Mutating temporal update actions are rejected because changing a parent interval/key requires update-side period action semantics broader than a scalar child-row rewrite. `match: "simple"` is the default; `full` is accepted for composite nullable references, and `partial` is rejected until row-subset parent matching is implemented. Cross-table unique targets require routed parent-table unique participants. Unsupported shapes are rejected during schema validation.
+    foreign_keys: ?[]const ForeignKey = null,
+    /// Application-time period declarations over two numeric or datetime relational columns. SQL `PERIOD FOR name (start, end)` and range column temporal DDL lower into this metadata.
+    periods: ?[]const RelationalPeriod = null,
+    /// Relational-mode primary key over one or more ordered declared non-json relational columns. Every component must be required and present on every row. When omitted, `_id` remains the document-key primary identity. `_id` cannot be mixed into a declared composite primary-key tuple.
+    primary_key: ?PrimaryKey = null,
+    /// Relational-mode unique constraints over one or more ordered declared non-json relational columns. Present scalar tuples are enforced by committed integrity rows; rows with any absent nullable component do not create unique rows.
+    unique_constraints: ?[]const UniqueConstraint = null,
+};
+
 pub const ConjunctionQuery = struct {
     conjuncts: []const Query,
     boost: ?Boost = null,
@@ -7319,38 +8907,38 @@ pub const BooleanQuery = struct {
 pub const Query = union(enum) {
     date_range_string_query: *DateRangeStringQuery,
     match_query: *MatchQuery,
-    boolean_query: *BooleanQuery,
     numeric_range_query: *NumericRangeQuery,
     term_range_query: *TermRangeQuery,
+    boolean_query: *BooleanQuery,
     fuzzy_query: *FuzzyQuery,
     match_phrase_query: *MatchPhraseQuery,
-    disjunction_query: *DisjunctionQuery,
     geo_bounding_box_query: *GeoBoundingBoxQuery,
     geo_distance_query: *GeoDistanceQuery,
     multi_phrase_query: *MultiPhraseQuery,
     phrase_query: *PhraseQuery,
     bool_field_query: *BoolFieldQuery,
-    conjunction_query: *ConjunctionQuery,
-    doc_id_query: *DocIdQuery,
+    disjunction_query: *DisjunctionQuery,
     geo_bounding_polygon_query: *GeoBoundingPolygonQuery,
     geo_shape_query: *GeoShapeQuery,
     ip_range_query: *IPRangeQuery,
-    match_all_query: *MatchAllQuery,
-    match_none_query: *MatchNoneQuery,
-    multi_match_query: *MultiMatchQuery,
     prefix_query: *PrefixQuery,
-    query_string_query: *QueryStringQuery,
     regexp_query: *RegexpQuery,
     term_query: *TermQuery,
     wildcard_query: *WildcardQuery,
+    conjunction_query: *ConjunctionQuery,
+    doc_id_query: *DocIdQuery,
+    match_all_query: *MatchAllQuery,
+    match_none_query: *MatchNoneQuery,
+    multi_match_query: *MultiMatchQuery,
+    query_string_query: *QueryStringQuery,
 
     fn parseStructuralVariant(comptime T: type, allocator: std.mem.Allocator, source: std.json.Value, options: std.json.ParseOptions) !?*T {
-        const parsed = std.json.parseFromValue(T, allocator, source, options) catch |err| switch (err) {
+        const parsed = std.json.parseFromValueLeaky(T, allocator, source, options) catch |err| switch (err) {
             error.OutOfMemory => return err,
             else => return null,
         };
         const value = try allocator.create(T);
-        value.* = parsed.value;
+        value.* = parsed;
         return value;
     }
 
@@ -7368,18 +8956,38 @@ pub const Query = union(enum) {
             "end",
             "inclusive_start",
             "inclusive_end",
+            "field",
             "datetime_parser",
         })) {
             if (try parseStructuralVariant(DateRangeStringQuery, allocator, source, options)) |parsed| return .{ .date_range_string_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "match",
+            "field",
             "analyzer",
             "prefix_length",
             "fuzziness",
             "operator",
         })) {
             if (try parseStructuralVariant(MatchQuery, allocator, source, options)) |parsed| return .{ .match_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+            "field",
+        })) {
+            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "min",
+            "max",
+            "inclusive_min",
+            "inclusive_max",
+            "field",
+        })) {
+            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "must",
@@ -7390,34 +8998,54 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(BooleanQuery, allocator, source, options)) |parsed| return .{ .boolean_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "min",
-            "max",
-            "inclusive_min",
-            "inclusive_max",
-        })) {
-            if (try parseStructuralVariant(NumericRangeQuery, allocator, source, options)) |parsed| return .{ .numeric_range_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "min",
-            "max",
-            "inclusive_min",
-            "inclusive_max",
-        })) {
-            if (try parseStructuralVariant(TermRangeQuery, allocator, source, options)) |parsed| return .{ .term_range_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "term",
             "prefix_length",
             "fuzziness",
+            "field",
         })) {
             if (try parseStructuralVariant(FuzzyQuery, allocator, source, options)) |parsed| return .{ .fuzzy_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "match_phrase",
+            "field",
             "analyzer",
             "fuzziness",
         })) {
             if (try parseStructuralVariant(MatchPhraseQuery, allocator, source, options)) |parsed| return .{ .match_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "top_left",
+            "bottom_right",
+            "field",
+        })) {
+            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "location",
+            "distance",
+            "field",
+        })) {
+            if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "field",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(MultiPhraseQuery, allocator, source, options)) |parsed| return .{ .multi_phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "terms",
+            "field",
+            "fuzziness",
+        })) {
+            if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "bool",
+            "field",
+        })) {
+            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "disjuncts",
@@ -7426,33 +9054,46 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(DisjunctionQuery, allocator, source, options)) |parsed| return .{ .disjunction_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "top_left",
-            "bottom_right",
+            "polygon_points",
+            "field",
         })) {
-            if (try parseStructuralVariant(GeoBoundingBoxQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_box_query = parsed };
+            if (try parseStructuralVariant(GeoBoundingPolygonQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_polygon_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "location",
-            "distance",
+            "geometry",
+            "field",
         })) {
-            if (try parseStructuralVariant(GeoDistanceQuery, allocator, source, options)) |parsed| return .{ .geo_distance_query = parsed };
+            if (try parseStructuralVariant(GeoShapeQuery, allocator, source, options)) |parsed| return .{ .geo_shape_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "terms",
-            "fuzziness",
+            "cidr",
+            "field",
         })) {
-            if (try parseStructuralVariant(MultiPhraseQuery, allocator, source, options)) |parsed| return .{ .multi_phrase_query = parsed };
+            if (try parseStructuralVariant(IPRangeQuery, allocator, source, options)) |parsed| return .{ .ip_range_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "terms",
-            "fuzziness",
+            "prefix",
+            "field",
         })) {
-            if (try parseStructuralVariant(PhraseQuery, allocator, source, options)) |parsed| return .{ .phrase_query = parsed };
+            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "bool",
+            "regexp",
+            "field",
         })) {
-            if (try parseStructuralVariant(BoolFieldQuery, allocator, source, options)) |parsed| return .{ .bool_field_query = parsed };
+            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "term",
+            "field",
+        })) {
+            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
+        }
+        if (objectHasAnyKey(source.object, &.{
+            "wildcard",
+            "field",
+        })) {
+            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "conjuncts",
@@ -7463,21 +9104,6 @@ pub const Query = union(enum) {
             "ids",
         })) {
             if (try parseStructuralVariant(DocIdQuery, allocator, source, options)) |parsed| return .{ .doc_id_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "polygon_points",
-        })) {
-            if (try parseStructuralVariant(GeoBoundingPolygonQuery, allocator, source, options)) |parsed| return .{ .geo_bounding_polygon_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "geometry",
-        })) {
-            if (try parseStructuralVariant(GeoShapeQuery, allocator, source, options)) |parsed| return .{ .geo_shape_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "cidr",
-        })) {
-            if (try parseStructuralVariant(IPRangeQuery, allocator, source, options)) |parsed| return .{ .ip_range_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
             "match_all",
@@ -7495,61 +9121,46 @@ pub const Query = union(enum) {
             if (try parseStructuralVariant(MultiMatchQuery, allocator, source, options)) |parsed| return .{ .multi_match_query = parsed };
         }
         if (objectHasAnyKey(source.object, &.{
-            "prefix",
-        })) {
-            if (try parseStructuralVariant(PrefixQuery, allocator, source, options)) |parsed| return .{ .prefix_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
             "query",
         })) {
             if (try parseStructuralVariant(QueryStringQuery, allocator, source, options)) |parsed| return .{ .query_string_query = parsed };
         }
-        if (objectHasAnyKey(source.object, &.{
-            "regexp",
-        })) {
-            if (try parseStructuralVariant(RegexpQuery, allocator, source, options)) |parsed| return .{ .regexp_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "term",
-        })) {
-            if (try parseStructuralVariant(TermQuery, allocator, source, options)) |parsed| return .{ .term_query = parsed };
-        }
-        if (objectHasAnyKey(source.object, &.{
-            "wildcard",
-        })) {
-            if (try parseStructuralVariant(WildcardQuery, allocator, source, options)) |parsed| return .{ .wildcard_query = parsed };
-        }
         return error.UnexpectedToken;
+    }
+
+    pub fn jsonParse(allocator: std.mem.Allocator, source: anytype, options: std.json.ParseOptions) !@This() {
+        const value = try std.json.Value.jsonParse(allocator, source, options);
+        return try jsonParseFromValue(allocator, value, options);
     }
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         switch (self) {
             .date_range_string_query => |v| try jw.write(v.*),
             .match_query => |v| try jw.write(v.*),
-            .boolean_query => |v| try jw.write(v.*),
             .numeric_range_query => |v| try jw.write(v.*),
             .term_range_query => |v| try jw.write(v.*),
+            .boolean_query => |v| try jw.write(v.*),
             .fuzzy_query => |v| try jw.write(v.*),
             .match_phrase_query => |v| try jw.write(v.*),
-            .disjunction_query => |v| try jw.write(v.*),
             .geo_bounding_box_query => |v| try jw.write(v.*),
             .geo_distance_query => |v| try jw.write(v.*),
             .multi_phrase_query => |v| try jw.write(v.*),
             .phrase_query => |v| try jw.write(v.*),
             .bool_field_query => |v| try jw.write(v.*),
-            .conjunction_query => |v| try jw.write(v.*),
-            .doc_id_query => |v| try jw.write(v.*),
+            .disjunction_query => |v| try jw.write(v.*),
             .geo_bounding_polygon_query => |v| try jw.write(v.*),
             .geo_shape_query => |v| try jw.write(v.*),
             .ip_range_query => |v| try jw.write(v.*),
-            .match_all_query => |v| try jw.write(v.*),
-            .match_none_query => |v| try jw.write(v.*),
-            .multi_match_query => |v| try jw.write(v.*),
             .prefix_query => |v| try jw.write(v.*),
-            .query_string_query => |v| try jw.write(v.*),
             .regexp_query => |v| try jw.write(v.*),
             .term_query => |v| try jw.write(v.*),
             .wildcard_query => |v| try jw.write(v.*),
+            .conjunction_query => |v| try jw.write(v.*),
+            .doc_id_query => |v| try jw.write(v.*),
+            .match_all_query => |v| try jw.write(v.*),
+            .match_none_query => |v| try jw.write(v.*),
+            .multi_match_query => |v| try jw.write(v.*),
+            .query_string_query => |v| try jw.write(v.*),
         }
     }
 };

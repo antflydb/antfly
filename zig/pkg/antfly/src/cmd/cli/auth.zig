@@ -266,6 +266,8 @@ fn parsePermission(args: *std.process.Args.Iterator) antfly_client.types.Permiss
 }
 
 fn parseResourceType(raw: []const u8) antfly_client.types.ResourceType {
+    if (std.mem.eql(u8, raw, "database")) return .database;
+    if (std.mem.eql(u8, raw, "namespace")) return .namespace;
     if (std.mem.eql(u8, raw, "table")) return .table;
     if (std.mem.eql(u8, raw, "user")) return .user;
     if (std.mem.eql(u8, raw, "*")) return .@"*";

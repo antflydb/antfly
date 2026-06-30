@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const builtin = @import("builtin");
+const platform = @import("antfly_platform");
 const resource_manager_mod = @import("../../resource_manager.zig");
 const index_manager_mod = @import("../catalog/index_manager.zig");
 const derived_worker = @import("derived_worker.zig");
@@ -30,8 +30,7 @@ const dense_replay_default_window_bytes: u64 = 64 * 1024 * 1024;
 const dense_replay_max_window_bytes: u64 = 256 * 1024 * 1024;
 
 fn getenv(name: [*:0]const u8) ?[*:0]u8 {
-    if (!builtin.link_libc) return null;
-    return std.c.getenv(name);
+    return platform.env.getenvZ(name);
 }
 
 pub const Policy = struct {

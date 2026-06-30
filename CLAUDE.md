@@ -37,7 +37,7 @@ See `docs/architecture.mdx` for full details.
 - `go/pkg/antfly/src/raft/`: Raft consensus wrapping etcd/raft
 - `go/pkg/antfly/src/tablemgr/`: Table and shard management
 - `go/pkg/antfly/lib/multirafthttp/`: HTTP transport for multi-raft communication
-- `docs/`: Hand-written documentation (synced into colony/frontend/apps/www-antfly at build time)
+- `docs/`: Hand-written documentation for the Antfly website.
 
 **Data Organization**:
 - **Shards**: Horizontal partitions by key range (`common.Range`)

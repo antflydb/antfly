@@ -210,28 +210,34 @@ func (sc *StoreClient) Backup(ctx context.Context, shardID types.ID, loc, id str
 		if format == common.BackupFormatPortable {
 			backupFileName = common.ShardPortableBackupFileName(backupReq.BackupID, shardID)
 		}
-		filePath := path.Join(loc, backupFileName)
-		file, err := os.Create(filepath.Clean(filePath))
+		filePath := filepath.Clean(path.Join(loc, backupFileName))
+		tempFile, err := os.CreateTemp(loc, "."+backupFileName+".tmp-*")
 		if err != nil {
-			return fmt.Errorf("creating file: %w", err)
+			return fmt.Errorf("creating temp backup file: %w", err)
 		}
-		defer func() { _ = file.Close() }()
+		tempPath := tempFile.Name()
+		committed := false
+		defer func() {
+			_ = tempFile.Close()
+			if !committed {
+				_ = os.Remove(tempPath)
+			}
+		}()
 
-		// Copy the response body to the file in chunks
-		buffer := make([]byte, 4096)
-		for {
-			n, err := resp.Body.Read(buffer)
-			if err != nil && err != io.EOF {
-				return fmt.Errorf("reading response body: %w", err)
-			}
-			if n == 0 {
-				break // End of stream
-			}
-			_, err = file.Write(buffer[:n])
-			if err != nil {
-				return fmt.Errorf("writing to file: %w", err)
-			}
+		written, err := io.CopyBuffer(tempFile, resp.Body, make([]byte, 4096))
+		if err != nil {
+			return fmt.Errorf("reading response body: %w", err)
 		}
+		if err := tempFile.Close(); err != nil {
+			return fmt.Errorf("closing temp backup file: %w", err)
+		}
+		if written == 0 && resp.ContentLength == 0 {
+			return nil
+		}
+		if err := os.Rename(tempPath, filePath); err != nil {
+			return fmt.Errorf("moving streamed backup into place: %w", err)
+		}
+		committed = true
 	}
 
 	return nil

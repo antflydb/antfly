@@ -97,7 +97,8 @@ API keys should have explicit semantics:
 
 ## Supported First Slice
 
-The implemented auth references resolve username, inherited roles, and user metadata in stored row filters:
+The implemented auth references resolve username, inherited roles, user
+metadata, and native role settings in stored row filters:
 
 ```json
 { "term": { "owner": { "$auth": "username" } } }
@@ -108,10 +109,18 @@ The implemented auth references resolve username, inherited roles, and user meta
 ```
 
 ```json
+{ "term": { "tenant_id": { "$auth": "settings.app.tenant_id" } } }
+```
+
+```json
 { "terms": { "acl.roles": { "$auth": "roles" } } }
 ```
 
-Metadata and roles come from the authenticated user. API-key authentication currently inherits the API-key owner's user metadata and roles.
+Metadata and roles come from the authenticated user. API-key authentication
+inherits the API-key owner's user metadata, roles, and native role settings.
+Trusted-principal authentication also hydrates roles and native role settings
+when the trusted `sub` exactly matches an Antfly user; external subjects that do
+not map to a local user remain token-scoped.
 
 Do not add aliases such as `user.username` or `_user.username` unless a future auth-context field needs that distinction. Keeping the first DSL surface to `username` makes stored policy easier to read, validate, and migrate.
 

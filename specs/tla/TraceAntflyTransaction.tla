@@ -186,7 +186,14 @@ WriteIntentOnShardIfLogged(t, s) ==
 
 WriteIntentFailsIfLogged(t, s) ==
     /\ LoglineIsTxnShardEvent("WriteIntentFails", t, s)
-    /\ WriteIntentFails(t, s)
+    \* Segmented traces may not include the earlier committed version or
+    \* concurrent intent that caused the logged storage-layer failure.
+    /\ txnStatus[t] = "predicatesChecked"
+    /\ s \in TxnShards[t]
+    /\ intents[t, s] = "none"
+    /\ txnStatus' = [txnStatus EXCEPT ![t] = "aborting"]
+    /\ UNCHANGED <<clock, txnTimestamp, txnRecords, resolvedParts,
+                   intents, dataStore, intentShards, predicateSnapshot>>
     /\ StepToNextTrace
 
 CommitTransactionIfLogged(t) ==

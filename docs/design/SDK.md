@@ -65,8 +65,8 @@ Configuration has one required base URL and an optional inference override:
 - When the inference override is empty, inference uses the same base URL.
 
 Hosted inference is the exception: it may serve only `/ai/v1`. SDK constructors
-accept legacy base URLs ending in `/db/v1` or `/ai/v1` and normalize them to the
-server root before issuing requests to the joined paths.
+take the joined server root as their canonical base URL, and hosted inference
+uses the explicit inference override when it does not share that root.
 
 ## Generation Rule
 

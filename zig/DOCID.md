@@ -390,7 +390,7 @@ the canonical internal identity, but query-time sets should remain adaptive:
 const ResolvedDocSet = union(enum) {
     all,
     none,
-    doc_keys: []const []const u8,       // tiny sets and compatibility fallback
+    doc_keys: []const []const u8,       // tiny or public-ID-backed sets
     ordinals: []const DocOrdinal,       // small resolved ordinal sets
     ordinal_bitmap: RoaringBitmap,      // large dense or reusable sets
 };
@@ -1044,9 +1044,9 @@ Status as of 2026-05-19:
   referenced documents have ordinal coverage. DB vector/sparse filter bridging
   now uses this boundary directly for resolvable algebraic filter JSON, so
   ordinal-backed filters can flow into vector constraints without first
-  materializing public document IDs. The existing public-doc-ID bridge remains
-  the compatibility fallback for binding-heavy or mixed-coverage cases that
-  cannot be safely combined as document sets yet.
+  materializing public document IDs. The public-doc-ID bridge remains the
+  explicit path for binding-heavy or mixed-coverage cases that cannot be safely
+  combined as document sets yet.
 - Algebraic scalar doc-fact postings and adaptive path-dictionary promotion now
   write ordinal posting rows alongside the existing document-key posting rows
   when identity coverage is available. Scalar term/bool filters and
@@ -1414,8 +1414,8 @@ Status as of 2026-05-19:
   reached the exhausted sentinel, lifecycle planning fails closed until repair,
   reassignment, or rebuild establishes a safe identity boundary.
   Focused coverage exercises that
-  fail-closed behavior for `propose`, `write`, `full_text`, `enrichments`,
-  `aknn`, and `full_index` sync levels plus direct and request-shaped
+  fail-closed behavior for `propose`, `write`, `query`, `enrichments`, and
+  `full_index` sync levels plus direct and request-shaped
   transaction intent writes. The focused DOCID gate now includes both the
   all-sync-level batch exhaustion regression and the transaction-intent
   exhaustion regression. Diagnostic scans also publish min/max
@@ -1450,112 +1450,24 @@ Status as of 2026-05-19:
   ordinal-native. The focused DOCID gate now includes the ordinal-bitmap
   promotion regression, so the large-set representation and promotion counter
   remain covered alongside the query execution boundaries. `zig build
-  docid-doc-set-bench` now provides a repeatable ReleaseFast benchmark for raw
-  sorted `u32` ordinal arrays, direct roaring bitmaps, the current compact
-  ordinal-list/bitmap document-set operators, sorted sparse `u64` IDs, and
-  public DOCID-key baselines across small, medium, large, dense, and sparse
-  layouts. `zig build docid-write-bench` measures insert, update, and delete
-  phases across write consistency levels and reports the isolated
-  extraction, artifact-cleanup, identity-capacity, identity-metadata,
-  derived-payload, and store-write timings from `BatchProfile` alongside
-  resulting identity-table stats. `zig build docid-query-bench` now benchmarks
-  direct DB query shapes that exercise the real filter bridges: match-all with a
-  doc filter, full-text with a doc filter, and sparse-vector search with a doc
-  filter. Each shape runs `public_ids` mode, where public document IDs are
-  resolved on every query, and `ordinal_docset` mode, where the benchmark
-  pre-resolves the request-local ShardDocSet-style ordinal filter at a stamped
-  identity generation. Output includes checksums, hit counts, elapsed/average
-  nanoseconds, per-shape `docid_query_bench_summary` rows, and doc-set planning
-  counter deltas so correctness and projection work are visible together. The
-  benchmark now fails correctness mismatches by default; `--allow-mismatch`
-  keeps exploratory runs non-fatal, `--max-ordinal-ratio <ratio>` turns the
-  ordinal/public timing comparison into an optional performance guard, and
-  `--require-public-resolution-delta` asserts that the public-ID path still
-  exercises request-time doc-set resolution while the pre-resolved ordinal path
-  does not. It also emits a separate `sparse_id_projection` proxy for sorted
-  sparse-ID intersection cost instead of pretending sparse native IDs are a
-  public DB search mode. A local smoke sample (`docs=1024`, `queries=8`,
-  `repeats=4`, `filter_size=128`) matched public-ID checksums for every real
-  query shape, avoided 64 per-query doc-set resolutions per shape in ordinal
-  mode, and showed ordinal-mode DB time roughly 8-12% lower on that small
-  single-process run. A smaller guarded smoke
-  (`docs=128`, `queries=3`, `repeats=2`, `filter_size=16`,
-  `--max-ordinal-ratio 2.0`, `--require-public-resolution-delta`) passed with
-  matching checksums/hit counts, public `resolved_set_delta=12`, ordinal
-  `resolved_set_delta=0`, and ordinal/public ratios around 0.84-0.88 across the
-  real DB shapes. These benchmarks are now the first pass/fail evidence hooks
-  for validating whether the compact ordinal machinery is still earning its
-  complexity as sparse-ID alternatives evolve. `scripts/run_docid_query_matrix.sh`
-  wraps that benchmark into timestamped evidence runs under
-  `bench/results/docid-query-matrix/`, preserving `environment.txt`,
-  `commands.txt`, `status.tsv`, per-case stdout/stderr/JSONL, a combined
-  `docid-query-matrix-combined.jsonl`, and a summary-only
-  `docid-query-matrix-summary.jsonl`. Set `DOCID_QUERY_MATRIX_SMOKE=1` for a
-  fast local matrix; the default non-smoke matrix is a bounded developer
-  evidence run, and larger release-scale runs should override the
-  `DOCID_QUERY_MATRIX_*` case sizes and `DOCID_QUERY_MATRIX_MAX_ORDINAL_RATIO`.
-  `zig build docid-lifecycle-test` is now the durable focused hardening target
-  for lifecycle cutover, mixed-version, distributed snapshot, cache, compaction,
-  and near-capacity boundary coverage. `scripts/run_docid_lifecycle_matrix.sh`
-  wraps that target, focused DB/storage checks, and the DOCID query matrix into
-  timestamped evidence under `bench/results/docid-lifecycle-matrix/`; it
-  defaults to smoke-sized query evidence and can be expanded with
-  `DOCID_LIFECYCLE_MATRIX_SMOKE=0`.
-  `zig build docid-operational-hardening-test` is the broader operational
-  evidence target: it chains the focused lifecycle gate with metadata
-  split/merge restart/partition chaos, public split/merge traffic chaos, and
-  LSM backend compaction chaos. `scripts/run_docid_operational_hardening_matrix.sh`
-  wraps the same work into timestamped logs under
-  `bench/results/docid-operational-hardening/`; set
-  `DOCID_OPERATIONAL_MATRIX_RUN_SCALE=1` to add the large public-query
-  performance matrix, and set `DOCID_OPERATIONAL_MATRIX_RUN_FULL_TARGET=1` when
-  a single build-step invocation is preferred over per-bucket logs. A local
-  operational pass at
-  `bench/results/docid-operational-hardening/20260525T173023Z/` completed all
-  four buckets: focused DOCID lifecycle, metadata split/merge transition chaos,
-  public split/merge traffic chaos, and LSM backend compaction chaos.
-  `scripts/run_docid_production_readiness_matrix.sh` is the release-evidence
-  wrapper for the remaining production-readiness questions. It always runs the
-  focused lifecycle and operational hardening gates, can add a 300k-scale DOCID
-  performance matrix with `DOCID_PRODUCTION_MATRIX_RUN_SCALE=1`, can run the
-  current auth e2e guard with `DOCID_PRODUCTION_MATRIX_RUN_E2E=1`, and can run
-  old/new binary compatibility smoke checks with
-  `DOCID_PRODUCTION_MATRIX_RUN_OLD_NEW=1` plus explicit
-  `DOCID_PRODUCTION_MATRIX_OLD_ANTFLY_BIN` and
-  `DOCID_PRODUCTION_MATRIX_NEW_ANTFLY_BIN` paths. It records environment,
-  commands, status, and per-case logs under
-  `bench/results/docid-production-readiness/`.
-  The scripted cases cover the existing medium baseline, a selective
-  small-filter shape, and a broad large-filter shape so future evidence is not
-  limited to one favorable filter size. A local smoke matrix passed all three
-  cases and produced 9 summary rows: the tiny and selective cases stayed below
-  the `1.25` ordinal/public ratio guard, while the broad-filter case showed
-  stronger benefit from skipping per-query public-ID resolution (`0.67`, `0.67`,
-  and `0.81` ratios for match-all, full-text, and sparse search). A bounded
-  default matrix run (`1024`/`2048` docs across the three cases) completed in
-  roughly three minutes, matched correctness for all 9 shape/case summaries, and
-  produced ordinal/public ratios of about `0.89-0.92` for the medium baseline,
-  `0.96-0.98` for selective small filters, and `0.68-0.78` for broad filters.
-  An attempted 8k release-scale selective run was intentionally left as an
-  override-only profile because that single case ran past 10 minutes locally.
-  A direct 100k-doc attempt exposed a degenerate setup path: with per-batch
-  `full_index`, only 5k loaded after about 101s and the cost was degrading; with
-  `--defer-full-index-load` but giant 10k write batches, the first 10k docs
-  still took about 156s before the final full-index wait. The healthier setup is
-  deferred indexing with smaller write batches: a 10k-doc run with 1k batches
-  loaded in about 13s, then spent about 86s in the one-time `full_index` wait and
-  about 17s preparing the resolved filter. The resulting single-query
-  ordinal/public ratios were about `0.94`, `0.89`, and `0.96` for match-all,
-  full-text, and sparse search. Follow-up profiling with
-  `ANTFLY_BENCH_METRICS=1` showed where that time is going: the 10k deferred
-  write/load stage spent about 13.6s of 14.0s in primary `store_write_ns`; the
-  one-time index wait spent about 4.6s applying full-text and about 89.6s
-  applying sparse-vector replay, with about 1.1s of replay-window collection per
-  index. The benchmark therefore now has
-  `--progress-every <docs>` and `--defer-full-index-load` to make large-load
-  setup measurable, but 100k real full-text+sparse query evidence should use
-  deferred indexing with bounded batches or a dedicated bulk-load path rather
-  than repeated per-batch full-index barriers.
+  docid-test` is the durable focused hardening target for lifecycle cutover,
+  mixed-version, distributed snapshot, cache, compaction, query projection, and
+  near-capacity boundary coverage. API boundary tests that mention DOCID remain
+  under the API aggregates, and transition-runtime coverage lives under
+  `raft-test`. `zig build docid-bench` runs the bounded ReleaseFast DOCID
+  benchmark set: raw doc-set representation comparisons, write-path identity
+  metadata overhead, and direct DB query shapes that exercise public-ID
+  resolution versus pre-resolved ordinal doc sets. The query benchmark output
+  includes checksums, hit counts, elapsed/average nanoseconds, summary rows, and
+  doc-set planning counter deltas so correctness and projection work are
+  visible together.
+  Release evidence should compose `zig build docid-test`, `zig build
+  docid-bench`, operational chaos buckets, current auth e2e checks, and old/new
+  binary compatibility smokes directly.
+  Historical larger-scale DOCID profiles showed that 100k real
+  full-text+sparse query evidence should use deferred indexing with bounded
+  batches or a dedicated bulk-load path rather than repeated per-batch
+  full-index barriers.
   Sparse-vector replay now has an internal bulk append path wired through
   backend batch options and resource-manager accounting. The path preserves the
   existing sparse on-disk layout but groups postings by term, writes complete
@@ -2099,15 +2011,13 @@ Status as of 2026-05-19:
   --query-shape hybrid-filter-exclude-project` profile, these changes moved the
   handler path from roughly 570ms before this pass to roughly 55ms while
   preserving the filled `k=20` correctness guardrail.
-  `scripts/run_docid_perf_matrix.sh` now captures a broader 100k public-query
-  evidence pass across full-text, dense-filter, sparse-filter, graph expansion,
-  algebraic-filter, and hybrid-composed shapes. The default wrapper no longer
-  requires symbolic dense profile rows because handler/local guardrail runs do
-  not currently expose dense/HBC profile counters for dense-filter or
-  hybrid-composed requests; set
-  `DOCID_PERF_MATRIX_REQUIRE_SYMBOLIC_PROFILE=1` only when using a route that is
-  expected to emit those profiles. A 100k handler-mode pass on this branch
-  showed query-side full-text is no longer the visible query bottleneck
+  Use `zig build public-query-guardrail -- <args>` directly for 100k
+  public-query evidence across full-text, dense-filter, sparse-filter, graph
+  expansion, algebraic-filter, and hybrid-composed shapes. Symbolic dense
+  profile requirements should be passed explicitly only when using a route that
+  is expected to emit dense/HBC profile counters for dense-filter or
+  hybrid-composed requests. A 100k handler-mode pass on this branch showed
+  query-side full-text is no longer the visible query bottleneck
   (`~15.6ms` DB, `~16.3ms` handler), dense-filter is fast through the public
   handler (`~22ms`, with direct DB-search still varying between `~43-107ms`),
   sparse-filter is about `~126-128ms`, algebraic-filter is still expensive

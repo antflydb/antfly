@@ -1,0 +1,404 @@
+{
+  "summary_format": 1,
+  "cases": [
+    {
+      "name": "explain write kind suffix does not satisfy write assertions",
+      "entry": {
+        "family": "explain",
+        "summary": { "returning": 1 },
+        "plan": "explain:kind=write_extra:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0",
+        "sql": "EXPLAIN INSERT INTO usage_records (id) VALUES ('u1') RETURNING id"
+      },
+      "expect_false": [
+        "allows_returning",
+        "explain_plan_has_write_kind",
+        "explain_write_inner_insert"
+      ]
+    },
+    {
+      "name": "duplicate explain inner token does not satisfy write inner assertion",
+      "entry": {
+        "family": "explain",
+        "summary": { "returning": 1 },
+        "plan": "explain:kind=write:analyze=false:inner=insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:inner=update_source:table=usage_records",
+        "sql": "EXPLAIN INSERT INTO usage_records (id) VALUES ('u1') RETURNING id"
+      },
+      "expect_false": [
+        "explain_write_inner_insert"
+      ]
+    },
+    {
+      "name": "explain read kind suffix does not satisfy read assertion",
+      "entry": {
+        "family": "explain",
+        "plan": "explain:kind=read_extra:analyze=false:inner=read:query:query:table=usage_records:ctes=0:pred=0:select=1:order=0:limit=none:claim=none",
+        "sql": "EXPLAIN SELECT id FROM usage_records"
+      },
+      "expect_false": [
+        "read_plan_has_query_prefix"
+      ]
+    },
+    {
+      "name": "stray read prefix does not satisfy wrapped read assertion",
+      "entry": {
+        "family": "explain",
+        "plan": "explain:kind=read:analyze=false:detail=read:query:inner=read:join:join:type=inner:left=usage_records:right=customer_records:left_pred=0:right_pred=0:on=1:select=2:order=0:limit=none",
+        "sql": "EXPLAIN SELECT usage_records.id FROM usage_records JOIN customer_records ON customer_records.id = usage_records.customer_id"
+      },
+      "expect_false": [
+        "read_plan_has_query_prefix"
+      ]
+    },
+    {
+      "name": "explain option exact tokens are structured",
+      "entry": {
+        "family": "explain",
+        "plan": "explain:kind=read:analyze=true_extra:inner=read:query:query:table=usage_records:format=:verbose=1:costs=0",
+        "sql": "EXPLAIN SELECT id FROM usage_records"
+      },
+      "expect_true": [
+        "explain_plan_has_read_kind",
+        "plan_costs_present",
+        "plan_verbose_present"
+      ],
+      "expect_false": [
+        "plan_analyze_true_token",
+        "plan_format_present"
+      ]
+    },
+    {
+      "name": "ddl operation count summaries match structured plans",
+      "entry": {
+        "name": "create table",
+        "sql": "CREATE TABLE usage_records (id text PRIMARY KEY)",
+        "family": "ddl",
+        "summary": { "ddl_tag": "create_table", "operations": 3 },
+        "plan": "ddl:create_table:table=usage_records:columns=2:unique=1:fk=1:checks=1:if_not_exists=false:pk=1"
+      },
+      "expect_true": [
+        "operations_matches_3"
+      ],
+      "expect_false": [
+        "operations_matches_2"
+      ]
+    },
+    {
+      "name": "insert returning summaries match structured plans",
+      "entry": {
+        "name": "insert returning",
+        "sql": "INSERT INTO usage_records (id) VALUES ('u1') RETURNING *",
+        "family": "insert",
+        "summary": {
+          "returning": 1,
+          "returning_all": true,
+          "conflict_where": false
+        },
+        "plan": "insert:table=usage_records:writes=1:transforms=0:ops=0:deletes=0:returning_rows=1:returning_expr=0:returning_all=1"
+      },
+      "expect_true": [
+        "allows_conflict_where",
+        "allows_returning",
+        "conflict_where_matches_false",
+        "returning_all_matches_true",
+        "returning_matches_1"
+      ]
+    },
+    {
+      "name": "insert source conflict transform summaries match structured plans",
+      "entry": {
+        "name": "insert source conflict transform",
+        "sql": "INSERT INTO usage_records SELECT * FROM staged_records ON CONFLICT DO UPDATE SET count = count + 1",
+        "family": "insert_source",
+        "summary": {
+          "patch_expressions": 1,
+          "increment_expressions": 1,
+          "json_set_expressions": 1
+        },
+        "plan": "insert_source:table=usage_records:source_table=staged_records:assignments=2:conflict=1:returning=0:returning_expr=0:returning_all=0:conflict_patch_expr=1:conflict_increment_expr=1:conflict_json_set_expr=1"
+      },
+      "expect_true": [
+        "allows_mutation_transform",
+        "transform_matches_plan"
+      ]
+    },
+    {
+      "name": "joined update source assignment summaries match structured plans",
+      "entry": {
+        "name": "joined update source assignments",
+        "sql": "UPDATE usage_records SET status = staged.status FROM staged_records staged WHERE usage_records.id = staged.id",
+        "family": "update_joined_source",
+        "summary": { "source_assignments": 2 },
+        "plan": "update_joined_source:target=usage_records:source=staged_records:left_pred=0:right_pred=0:on=1:ops=1:source_assignments=2:returning=0:returning_expr=0"
+      },
+      "expect_true": [
+        "allows_source_assignments",
+        "source_assignments_match_2"
+      ]
+    },
+    {
+      "name": "merge arm summaries match structured plans",
+      "entry": {
+        "name": "merge arms",
+        "sql": "MERGE INTO usage_records USING staged_records ON usage_records.id = staged_records.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN DO NOTHING",
+        "family": "merge_mutation",
+        "summary": {
+          "matched_predicates": 1,
+          "matched_delete": true,
+          "matched_do_nothing": false,
+          "not_matched_predicates": 0,
+          "not_matched_do_nothing": true
+        },
+        "plan": "merge_mutation:target=usage_records:source=staged_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0"
+      },
+      "expect_true": [
+        "allows_merge_arm",
+        "merge_arm_matches_plan"
+      ]
+    },
+    {
+      "name": "explain merge write plans expose structured inner merge",
+      "entry": {
+        "name": "explain merge",
+        "sql": "EXPLAIN MERGE INTO usage_records USING staged_records ON usage_records.id = staged_records.id WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN DO NOTHING",
+        "family": "explain",
+        "summary": {
+          "explain_subject": "write",
+          "explain_inner_kind": "merge_mutation",
+          "matched_predicates": 1,
+          "matched_delete": true,
+          "not_matched_predicates": 0,
+          "not_matched_do_nothing": true
+        },
+        "plan": "explain:kind=write:analyze=false:inner=merge_mutation:target=usage_records:source=staged_records:match=1:matched_pred=1:matched_update=0:matched_delete=1:matched_noop=0:not_matched_pred=0:not_matched_insert=0:not_matched_noop=1:returning=0:returning_expr=0:returning_all=0"
+      },
+      "expect_true": [
+        "allows_merge_arm",
+        "explain_plan_has_write_kind",
+        "explain_write_inner_merge",
+        "merge_arm_matches_plan"
+      ],
+      "expect_false": [
+        "explain_write_inner_insert"
+      ]
+    },
+    {
+      "name": "aggregate summaries match structured plans",
+      "entry": {
+        "name": "aggregate",
+        "sql": "SELECT tenant_id, count(*) FROM usage_records GROUP BY tenant_id",
+        "family": "aggregate",
+        "summary": {
+          "group_by": 1,
+          "group_expressions": 0,
+          "aggregations": 1,
+          "filter_groups": 0,
+          "having": 0,
+          "having_expressions": 0,
+          "having_any": 0,
+          "having_not": 0
+        },
+        "plan": "aggregate:table=usage_records:group=1:group_expr=0:aggs=1:having=0"
+      },
+      "expect_true": [
+        "aggregate_matches_plan",
+        "allows_aggregate"
+      ]
+    },
+    {
+      "name": "ddl select and predicate summaries match expression index plans",
+      "entry": {
+        "name": "create index expression",
+        "sql": "CREATE INDEX usage_records_expr_idx ON usage_records (status, lower(id)) WHERE status = 'active'",
+        "family": "ddl",
+        "summary": {
+          "ddl_tag": "create_index",
+          "select": 2,
+          "predicates": 1
+        },
+        "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=1:unique=false:if_not_exists=false"
+      },
+      "expect_true": [
+        "ddl_predicate_matches",
+        "ddl_select_matches"
+      ]
+    },
+    {
+      "name": "stale ddl expression count does not match select summary",
+      "entry": {
+        "name": "stale index expression",
+        "sql": "CREATE INDEX usage_records_expr_idx ON usage_records (status, lower(id)) WHERE status = 'active'",
+        "family": "ddl",
+        "summary": {
+          "ddl_tag": "create_index",
+          "select": 2,
+          "predicates": 1
+        },
+        "plan": "ddl:create_index:table=usage_records:columns=1:expr=0:generated_expr=0:where=1:unique=false:if_not_exists=false"
+      },
+      "expect_true": [
+        "ddl_predicate_matches"
+      ],
+      "expect_false": [
+        "ddl_select_matches"
+      ]
+    },
+    {
+      "name": "stale ddl where count does not match predicate summary",
+      "entry": {
+        "name": "stale index predicate",
+        "sql": "CREATE INDEX usage_records_expr_idx ON usage_records (status, lower(id)) WHERE status = 'active'",
+        "family": "ddl",
+        "summary": {
+          "ddl_tag": "create_index",
+          "select": 2,
+          "predicates": 1
+        },
+        "plan": "ddl:create_index:table=usage_records:columns=1:expr=1:generated_expr=0:where=0:unique=false:if_not_exists=false"
+      },
+      "expect_true": [
+        "ddl_select_matches"
+      ],
+      "expect_false": [
+        "ddl_predicate_matches"
+      ]
+    },
+    {
+      "name": "session ddl without select still satisfies ddl summary checks",
+      "entry": {
+        "name": "session ddl without select",
+        "sql": "DISCARD ALL",
+        "family": "ddl",
+        "summary": { "ddl_tag": "discard_all" },
+        "plan": "ddl:session:discard_all"
+      },
+      "expect_true": [
+        "ddl_predicate_matches",
+        "ddl_select_matches"
+      ]
+    },
+    {
+      "name": "query shape summaries match structured plans",
+      "entry": {
+        "name": "query summaries",
+        "sql": "SELECT DISTINCT ON (tenant_id) id, status FROM usage_records WHERE attrs @> '{}' ORDER BY tenant_id LIMIT 10 OFFSET 2 FOR UPDATE SKIP LOCKED",
+        "family": "query",
+        "summary": {
+          "predicates": 1,
+          "json_contains": 1,
+          "select": 2,
+          "select_all": true,
+          "distinct_on": 1,
+          "order_by": 1,
+          "limit": 10,
+          "offset": 2,
+          "row_claim_skip_locked": true
+        },
+        "plan": "query:table=usage_records:pred=1:json_contains=1:select=2:select_all=1:distinct_on=1:order=1:limit=10:offset=2:claim=skip_locked"
+      },
+      "expect_true": [
+        "access_matches",
+        "allows_access",
+        "allows_full_query_output",
+        "allows_pagination",
+        "allows_predicate",
+        "allows_row_claim",
+        "full_query_output_matches",
+        "pagination_matches",
+        "predicate_matches",
+        "row_claim_matches",
+        "select_matches"
+      ]
+    },
+    {
+      "name": "join summaries match structured plans",
+      "entry": {
+        "name": "join summaries",
+        "sql": "SELECT usage_records.id FROM usage_records JOIN users ON usage_records.user_id = users.id",
+        "family": "join",
+        "summary": {
+          "predicates": 2,
+          "text_patterns": 3,
+          "join_select": 1,
+          "join_on": 1,
+          "row_claim_skip_locked": false
+        },
+        "plan": "join:left=usage_records:right=users:left_pred=1:right_pred=1:left_text=1:right_text=2:select=1:on=1:claim=nowait"
+      },
+      "expect_true": [
+        "access_matches",
+        "allows_access",
+        "allows_join_on",
+        "allows_join_select",
+        "allows_predicate",
+        "allows_row_claim",
+        "join_on_matches_1",
+        "join_select_matches_1",
+        "predicate_matches",
+        "row_claim_matches"
+      ]
+    },
+    {
+      "name": "wrapped window summaries match structured plans",
+      "entry": {
+        "name": "wrapped window summaries",
+        "sql": "SELECT id, row_number() OVER (PARTITION BY tenant_id) FROM usage_records",
+        "family": "read",
+        "summary": {
+          "predicates": 1,
+          "json_path_eq": 1,
+          "select": 2,
+          "windows": 1
+        },
+        "plan": "read:window:table=usage_records:source_pred=1:source_json_eq=1:select=2:windows=1"
+      },
+      "expect_true": [
+        "access_matches",
+        "allows_access",
+        "allows_predicate",
+        "allows_window",
+        "predicate_matches",
+        "select_matches",
+        "window_matches_1"
+      ]
+    },
+    {
+      "name": "lateral summaries match structured plans",
+      "entry": {
+        "name": "lateral summaries",
+        "sql": "SELECT usage_records.id FROM usage_records JOIN LATERAL (...) l ON true",
+        "family": "lateral",
+        "summary": {
+          "expression_array_contains": 2,
+          "join_select": 1,
+          "lateral_correlations": 1,
+          "right_offset": 4
+        },
+        "plan": "lateral:left=usage_records:right=usage_events:left_expr_array=1:right_expr_array=1:select=1:corr=1:right_offset=4"
+      },
+      "expect_true": [
+        "access_matches",
+        "allows_access",
+        "allows_join_select",
+        "allows_lateral",
+        "join_select_matches_1",
+        "lateral_matches"
+      ]
+    },
+    {
+      "name": "stale pagination summary does not match structured plan",
+      "entry": {
+        "name": "stale pagination",
+        "sql": "SELECT DISTINCT ON (tenant_id) id, status FROM usage_records WHERE attrs @> '{}' ORDER BY tenant_id LIMIT 10 OFFSET 2 FOR UPDATE SKIP LOCKED",
+        "family": "query",
+        "summary": { "limit": 5 },
+        "plan": "query:table=usage_records:limit=10"
+      },
+      "expect_true": [
+        "allows_pagination"
+      ],
+      "expect_false": [
+        "pagination_matches"
+      ]
+    }
+  ]
+}

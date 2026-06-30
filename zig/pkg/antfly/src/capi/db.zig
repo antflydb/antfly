@@ -2089,13 +2089,26 @@ fn resetOutBuffer(out_buf: ?*capi.Buffer) ?*capi.Buffer {
     return out;
 }
 
+fn capabilitiesForHandle(handle: *Handle) lite_backend.Capabilities {
+    const profile = handle.lite_profile orelse .native;
+    if (handle.lite_inference_status) |inference| {
+        return lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference);
+    }
+    return lite_backend.capabilitiesForProfile(profile);
+}
+
+pub export fn antfly_db_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
+    const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
+    const handle = asHandle(handle_ptr) orelse return .invalid_argument;
+    out.* = stringifyJson(capabilitiesForHandle(handle)) catch return .internal;
+    return .ok;
+}
+
 pub export fn antfly_lite_capabilities_json(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer) capi.ErrorCode {
     const out = resetOutBuffer(out_buf) orelse return .invalid_argument;
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
     if (handle.owned_lite_backend == null) return .invalid_argument;
-    const profile = handle.lite_profile orelse .native;
-    const inference = handle.lite_inference_status orelse lite_backend.inferenceStatusForProfile(profile);
-    out.* = stringifyJson(lite_backend.capabilitiesForProfileWithInferenceStatus(profile, inference)) catch return .internal;
+    out.* = stringifyJson(capabilitiesForHandle(handle)) catch return .internal;
     return .ok;
 }
 
@@ -2132,8 +2145,8 @@ pub export fn antfly_lite_backup(handle_ptr: ?*anyopaque, out_buf: ?*capi.Buffer
 
     var out = std.ArrayList(u8).empty;
     defer out.deinit(handle.alloc);
-    portable_backup.exportPortable(handle.alloc, handle.db.core.store, &out) catch |err| return capi.mapError(err);
-    portable_backup.validatePortable(handle.alloc, out.items) catch |err| return capi.mapError(err);
+    portable_backup.exportPortableDb(handle.alloc, &handle.db, &out) catch |err| return capi.mapError(err);
+    portable_backup.validatePortableDb(handle.alloc, out.items) catch |err| return capi.mapError(err);
     const bytes = out.toOwnedSlice(handle.alloc) catch return .internal;
     out = .empty;
     out_buf_ptr.* = .{ .ptr = bytes.ptr, .len = bytes.len };
@@ -2327,7 +2340,7 @@ fn restorePortableBackupToLiteFile(
 ) !void {
     if (!lite_backend.isAflitePath(dest_path)) return error.InvalidArgument;
     if (backup.len == 0) return error.InvalidArgument;
-    try portable_backup.validatePortable(alloc, backup);
+    try portable_backup.validatePortableDb(alloc, backup);
 
     const dest_exists = liteCapiPathExists(io, dest_path);
     if (dest_exists and !replace) return error.PathAlreadyExists;
@@ -3393,8 +3406,117 @@ pub export fn antfly_db_set_schema_json(
     schema_json: capi.Slice,
 ) capi.ErrorCode {
     const handle = asHandle(handle_ptr) orelse return .invalid_argument;
-    handle.db.setSchemaJson(handle.alloc, schema_json.bytes()) catch |err| return capi.mapError(err);
+    const table_schema_json = schemaJsonForCapiSetSchemaAlloc(handle.alloc, schema_json.bytes()) catch |err| switch (err) {
+        error.OutOfMemory => return .internal,
+        else => return .invalid_argument,
+    };
+    defer handle.alloc.free(table_schema_json);
+
+    handle.db.applyTableSchemaJson(handle.alloc, table_schema_json, .{}) catch |err| return capi.mapError(err);
     return .ok;
+}
+
+fn schemaJsonForCapiSetSchemaAlloc(alloc: Allocator, schema_json: []const u8) ![]u8 {
+    var parsed_value = try std.json.parseFromSlice(std.json.Value, alloc, schema_json, .{});
+    defer parsed_value.deinit();
+    const root = switch (parsed_value.value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+
+    if (root.get("document_schemas") != null or root.get("storage_mode") != null) {
+        return try alloc.dupe(u8, schema_json);
+    }
+    if (root.get("dynamic_templates")) |templates| {
+        if (templates == .object) return try alloc.dupe(u8, schema_json);
+    }
+
+    const LegacyRequest = struct {
+        version: u32 = 0,
+        default_type: []const u8 = "_default",
+        ttl_duration_ns: u64 = 0,
+        ttl_field: []const u8 = "_timestamp",
+        enforce_types: bool = false,
+        dynamic_templates: []const struct {
+            name: []const u8 = "",
+            match_pattern: ?[]const u8 = null,
+            path_match: ?[]const u8 = null,
+            mapping: struct {
+                field_type: []const u8 = "text",
+                do_index: bool = true,
+                store: bool = true,
+                doc_values: bool = false,
+                include_in_all: bool = false,
+                analyzer: []const u8 = "standard",
+            } = .{},
+        } = &.{},
+    };
+    var parsed_legacy = try std.json.parseFromSlice(LegacyRequest, alloc, schema_json, .{});
+    defer parsed_legacy.deinit();
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"version\":");
+    try appendUnsignedJson(alloc, &out, parsed_legacy.value.version);
+    try out.appendSlice(alloc, ",\"default_type\":");
+    try appendJsonString(alloc, &out, parsed_legacy.value.default_type);
+    try out.appendSlice(alloc, ",\"ttl_duration_ns\":");
+    try appendUnsignedJson(alloc, &out, parsed_legacy.value.ttl_duration_ns);
+    try out.appendSlice(alloc, ",\"ttl_field\":");
+    try appendJsonString(alloc, &out, parsed_legacy.value.ttl_field);
+    try out.appendSlice(alloc, ",\"enforce_types\":");
+    try out.appendSlice(alloc, if (parsed_legacy.value.enforce_types) "true" else "false");
+    try out.appendSlice(alloc, ",\"dynamic_templates\":{");
+    for (parsed_legacy.value.dynamic_templates, 0..) |template, i| {
+        if (template.name.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (i > 0) try out.append(alloc, ',');
+        try appendJsonString(alloc, &out, template.name);
+        try out.appendSlice(alloc, ":{");
+        var field_count: usize = 0;
+        if (template.match_pattern) |pattern| {
+            try appendJsonObjectSeparator(alloc, &out, &field_count);
+            try out.appendSlice(alloc, "\"match\":");
+            try appendJsonString(alloc, &out, pattern);
+        }
+        if (template.path_match) |pattern| {
+            try appendJsonObjectSeparator(alloc, &out, &field_count);
+            try out.appendSlice(alloc, "\"path_match\":");
+            try appendJsonString(alloc, &out, pattern);
+        }
+        try appendJsonObjectSeparator(alloc, &out, &field_count);
+        try out.appendSlice(alloc, "\"mapping\":{\"type\":");
+        try appendJsonString(alloc, &out, template.mapping.field_type);
+        try out.appendSlice(alloc, ",\"index\":");
+        try out.appendSlice(alloc, if (template.mapping.do_index) "true" else "false");
+        try out.appendSlice(alloc, ",\"store\":");
+        try out.appendSlice(alloc, if (template.mapping.store) "true" else "false");
+        try out.appendSlice(alloc, ",\"doc_values\":");
+        try out.appendSlice(alloc, if (template.mapping.doc_values) "true" else "false");
+        try out.appendSlice(alloc, ",\"include_in_all\":");
+        try out.appendSlice(alloc, if (template.mapping.include_in_all) "true" else "false");
+        try out.appendSlice(alloc, ",\"analyzer\":");
+        try appendJsonString(alloc, &out, template.mapping.analyzer);
+        try out.appendSlice(alloc, "}}");
+    }
+    try out.appendSlice(alloc, "}}");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendJsonString(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: []const u8) !void {
+    const escaped = try std.fmt.allocPrint(alloc, "{f}", .{std.json.fmt(value, .{})});
+    defer alloc.free(escaped);
+    try out.appendSlice(alloc, escaped);
+}
+
+fn appendUnsignedJson(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), value: anytype) !void {
+    const rendered = try std.fmt.allocPrint(alloc, "{d}", .{value});
+    defer alloc.free(rendered);
+    try out.appendSlice(alloc, rendered);
+}
+
+fn appendJsonObjectSeparator(alloc: Allocator, out: *std.ArrayListUnmanaged(u8), field_count: *usize) !void {
+    if (field_count.* > 0) try out.append(alloc, ',');
+    field_count.* += 1;
 }
 
 pub export fn antfly_db_run_until_idle(handle_ptr: ?*anyopaque) capi.ErrorCode {
@@ -6955,6 +7077,10 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"no_inference_configured_ok\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"caller_supplied_artifacts\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"relational\":{\"tables\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"portable_backup\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"sql\":{\"adapter\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"embedded_exec\":true") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"raft_replication\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cluster_placement\":false") != null);
     try std.testing.expect(std.mem.indexOf(u8, capabilities_json, "\"cross_node_joins\":false") != null);
@@ -6969,6 +7095,13 @@ test "capi lite opens exports imports checks and vacuums aflite" {
     try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"inference_mode\":\"local_embedded\"" else "\"inference_mode\":\"caller_supplied_or_disabled\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"local_embedded\",\"disabled_deferred\"]" else "\"available_inference_modes\":[\"caller_supplied_artifacts\",\"remote_provider\",\"disabled_deferred\"]") != null);
     try std.testing.expect(std.mem.indexOf(u8, local_capabilities_json, if (native_local_runtime_available) "\"local_inference_runtime\":true" else "\"local_inference_runtime\":false") != null);
+
+    var generic_capabilities: capi.Buffer = .{};
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_capabilities_json(src_handle, &generic_capabilities));
+    defer antfly_db_buffer_free(generic_capabilities.ptr, generic_capabilities.len);
+    const generic_capabilities_json = generic_capabilities.ptr.?[0..generic_capabilities.len];
+    try std.testing.expect(std.mem.indexOf(u8, generic_capabilities_json, "\"relational\":{\"tables\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, generic_capabilities_json, "\"sql\":{\"adapter\":true") != null);
 
     var pending: capi.Buffer = .{};
     try std.testing.expectEqual(capi.ErrorCode.ok, antfly_lite_pending_work_stats_json(src_handle, &pending));
@@ -7742,6 +7875,50 @@ test "capi lite open options validate and configure ttl cleanup" {
     }
     defer antfly_db_buffer_free(stats.ptr, stats.len);
     try std.testing.expect(attempts < 200);
+}
+
+test "capi schema json uses table schema lifecycle" {
+    const alloc = std.testing.allocator;
+    const path = try tempTestPath(alloc, "capi-schema-test");
+    defer alloc.free(path);
+    var handle_ptr: ?*anyopaque = null;
+    cleanupTestDir(path);
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_open(path, &handle_ptr));
+    defer cleanupTestDir(path);
+    defer antfly_db_close(handle_ptr);
+
+    const legacy_schema =
+        \\{
+        \\  "version": 7,
+        \\  "default_type": "doc",
+        \\  "dynamic_templates": [
+        \\    {
+        \\      "name": "ids",
+        \\      "match_pattern": "*_id",
+        \\      "mapping": {"field_type": "keyword", "doc_values": true}
+        \\    }
+        \\  ]
+        \\}
+    ;
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_set_schema_json(handle_ptr, .{
+        .ptr = legacy_schema.ptr,
+        .len = legacy_schema.len,
+    }));
+
+    const handle = asHandle(handle_ptr).?;
+    const stored_schema_json = (try handle.db.getSchemaJson(alloc)) orelse return error.TestUnexpectedResult;
+    defer alloc.free(stored_schema_json);
+    try std.testing.expect(std.mem.indexOf(u8, stored_schema_json, "\"dynamic_templates\":{\"ids\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, stored_schema_json, "\"match\":\"*_id\"") != null);
+
+    const writes = [_]capi.WriteIntent{
+        .{
+            .key = .{ .ptr = "doc:capi-schema", .len = "doc:capi-schema".len },
+            .value = .{ .ptr = "{\"user_id\":\"u1\"}", .len = "{\"user_id\":\"u1\"}".len },
+            .is_delete = false,
+        },
+    };
+    try std.testing.expectEqual(capi.ErrorCode.ok, antfly_db_batch(handle_ptr, &writes, writes.len, null, 0, 1_000, 0));
 }
 
 test "capi execute graph queries honors identity read generation" {

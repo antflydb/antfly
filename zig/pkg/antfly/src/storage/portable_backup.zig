@@ -20,9 +20,11 @@ const backup_codec = @import("backup_codec.zig");
 const internal_keys = @import("internal_keys.zig");
 const docstore_mod = @import("docstore.zig");
 const doc_identity = @import("db/doc_identity.zig");
+const db_mod = @import("db/mod.zig");
 const db_types = @import("db/types.zig");
 const artifact_ids = @import("db/artifact_ids.zig");
 const enrichment_artifact_codec = @import("db/enrichment/artifact_codec.zig");
+const relational_row_codec = @import("db/algebraic/relational_row_codec.zig");
 const DocStore = docstore_mod.DocStore;
 const KeyEncoder = docstore_mod.KeyEncoder;
 const KVPair = docstore_mod.KVPair;
@@ -50,6 +52,25 @@ const ResolutionArtifactRef = struct {
 /// The caller provides an allocator for temporary buffers. The output is
 /// appended to `out`.
 pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !void {
+    return try exportPortableWithOptions(alloc, store, out, .{});
+}
+
+const ExportOptions = struct {
+    allow_relational_schema: bool = false,
+    logical_relational_rows: bool = false,
+};
+
+pub fn exportPortableDb(alloc: Allocator, db: anytype, out: *ArrayList(u8)) !void {
+    const schema_json = try db.getSchemaJson(alloc);
+    defer if (schema_json) |json| alloc.free(json);
+    const relational = if (schema_json) |json| try portableJsonDeclaresRelationalSchema(alloc, json) else false;
+    try exportPortableWithOptions(alloc, db.core.store, out, .{
+        .allow_relational_schema = relational,
+        .logical_relational_rows = relational,
+    });
+}
+
+fn exportPortableWithOptions(alloc: Allocator, store: *DocStore, out: *ArrayList(u8), opts: ExportOptions) !void {
     const pairs = try store.scanRange(alloc, "", "");
     defer DocStore.freeResults(alloc, pairs);
 
@@ -60,6 +81,8 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
         document_timestamps.deinit(alloc);
     }
     for (pairs) |kv| {
+        if (internal_keys.isRelationalPhysicalTableDataKey(kv.key) and !opts.logical_relational_rows) return error.UnsupportedPortableRelationalTable;
+        if ((try portableMetadataDeclaresRelationalSchema(alloc, kv.key, kv.value)) and !opts.allow_relational_schema) return error.UnsupportedPortableRelationalTable;
         if (!internal_keys.isTtlKey(kv.key) or kv.value.len < 8) continue;
         const doc_key = (try internal_keys.decodeDocumentComponentAlloc(alloc, kv.key)) orelse continue;
         errdefer alloc.free(doc_key);
@@ -159,6 +182,7 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
 
     for (pairs) |kv| {
         if (isPortableMetadataKey(kv.key)) {
+            if ((try portableMetadataDeclaresRelationalSchema(alloc, kv.key, kv.value)) and !opts.allow_relational_schema) return error.UnsupportedPortableRelationalTable;
             try metadata_batch.append(alloc, .{
                 .key = try alloc.dupe(u8, kv.key),
                 .value = try alloc.dupe(u8, kv.value),
@@ -186,7 +210,28 @@ pub fn exportPortable(alloc: Allocator, store: *DocStore, out: *ArrayList(u8)) !
 
         // Binary internal keys (0x01 prefix)
         if (internal_keys.isInternalUserKey(kv.key)) {
-            if (internal_keys.isPrimaryDocumentKey(kv.key)) {
+            if (internal_keys.isRelationalRowKey(kv.key)) {
+                if (!opts.logical_relational_rows) return error.UnsupportedPortableRelationalTable;
+                const user_key = (try internal_keys.decodeRelationalRowKeyAlloc(alloc, kv.key)) orelse continue;
+                defer alloc.free(user_key);
+                const json_value = try relational_row_codec.reconstructValueAlloc(alloc, kv.value);
+                errdefer alloc.free(json_value);
+
+                try doc_batch.append(alloc, .{
+                    .key = try alloc.dupe(u8, user_key),
+                    .value_flags = 0,
+                    .value = json_value,
+                    .timestamp_ns = document_timestamps.get(user_key) orelse 0,
+                });
+                doc_batch_bytes += user_key.len + json_value.len;
+
+                if (doc_batch_bytes >= batch_target_bytes) {
+                    try flushDocBatch(alloc, out, &doc_batch, &counts);
+                    doc_batch_bytes = 0;
+                }
+            } else if (internal_keys.isRelationalPhysicalTableDataKey(kv.key)) {
+                if (!opts.logical_relational_rows) return error.UnsupportedPortableRelationalTable;
+            } else if (internal_keys.isPrimaryDocumentKey(kv.key)) {
                 const user_key = (try internal_keys.decodePrimaryDocumentKeyAlloc(alloc, kv.key)) orelse continue;
                 defer alloc.free(user_key);
 
@@ -545,6 +590,51 @@ fn isPortableMetadataKey(key: []const u8) bool {
         std.mem.eql(u8, key, "\x00\x00__metadata__:resolvers");
 }
 
+fn isPortableSchemaMetadataKey(key: []const u8) bool {
+    return std.mem.eql(u8, key, "\x00\x00__metadata__:schema") or
+        std.mem.startsWith(u8, key, "\x00\x00__metadata__:schema_v") or
+        std.mem.eql(u8, key, "\x00\x00__metadata__:schema_json");
+}
+
+fn portableMetadataDeclaresRelationalSchema(alloc: Allocator, key: []const u8, value: []const u8) !bool {
+    if (!isPortableSchemaMetadataKey(key)) return false;
+    return try portableJsonDeclaresRelationalSchema(alloc, value);
+}
+
+fn portableJsonDeclaresRelationalSchema(alloc: Allocator, value: []const u8) !bool {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value, .{}) catch |err| switch (err) {
+        error.OutOfMemory => return err,
+        else => return false,
+    };
+    defer parsed.deinit();
+    return jsonValueDeclaresRelationalSchema(parsed.value);
+}
+
+fn jsonValueDeclaresRelationalSchema(value: std.json.Value) bool {
+    switch (value) {
+        .object => |object| {
+            if (object.get("storage_mode")) |storage_mode| {
+                if (storage_mode == .string and std.mem.eql(u8, storage_mode.string, "relational")) return true;
+            }
+            var it = object.iterator();
+            while (it.next()) |entry| {
+                if (jsonValueDeclaresRelationalSchema(entry.value_ptr.*)) return true;
+            }
+        },
+        .array => |array| {
+            for (array.items) |item| {
+                if (jsonValueDeclaresRelationalSchema(item)) return true;
+            }
+        },
+        else => {},
+    }
+    return false;
+}
+
+fn validatePortableManifestPayload(alloc: Allocator, payload: []const u8, opts: ImportOptions) !void {
+    if ((try portableJsonDeclaresRelationalSchema(alloc, payload)) and !opts.allow_relational_schema) return error.UnsupportedPortableRelationalTable;
+}
+
 fn appendChunkArtifactEntry(
     alloc: Allocator,
     batch: *std.ArrayListUnmanaged(backup_codec.KeyValueEntry),
@@ -803,6 +893,7 @@ pub const ImportOptions = struct {
     prefer_existing_identity_namespace: bool = false,
     import_derived_indexes: bool = true,
     embedding_source_fields: []const EmbeddingSourceField = &.{},
+    allow_relational_schema: bool = false,
 };
 
 /// Import AFB data into the DocStore.
@@ -812,6 +903,64 @@ pub fn importPortable(alloc: Allocator, store: *DocStore, data: []const u8) !voi
 
 pub fn validatePortable(alloc: Allocator, data: []const u8) !void {
     try validatePortableImportBlocks(alloc, data, .{});
+}
+
+pub fn validatePortableDb(alloc: Allocator, data: []const u8) !void {
+    try validatePortableImportBlocks(alloc, data, .{ .allow_relational_schema = true });
+}
+
+pub fn importPortableDb(alloc: Allocator, db: anytype, data: []const u8) !void {
+    const relational_schema_json = try relationalSchemaJsonFromPortableAlloc(alloc, data);
+    defer if (relational_schema_json) |schema_json| alloc.free(schema_json);
+
+    if (relational_schema_json == null) {
+        try importPortable(alloc, db.core.store, data);
+        return;
+    }
+
+    try validatePortableImportBlocks(alloc, data, .{ .allow_relational_schema = true });
+    try db.setSchemaJson(alloc, relational_schema_json.?);
+
+    var reader = backup_codec.SliceReader.init(data);
+    _ = try reader.readHeader();
+    var imported_identity = false;
+
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+
+        switch (block.block_type) {
+            .document_batch => try importDocumentBatchIntoDb(alloc, db, block.payload),
+            .doc_identity_batch => {
+                try importIdentityBatch(alloc, db.core.store, block.payload);
+                imported_identity = true;
+            },
+            .metadata_batch => try importMetadataBatchWithOptions(alloc, db.core.store, block.payload, .{ .allow_relational_schema = true }),
+            .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
+            else => {},
+        }
+    }
+
+    if (imported_identity) {
+        try doc_identity.validateStoreAlloc(alloc, db.core.store);
+    }
+
+    var derived_reader = backup_codec.SliceReader.init(data);
+    _ = try derived_reader.readHeader();
+    while (derived_reader.pos < derived_reader.data.len) {
+        const block = try derived_reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+
+        switch (block.block_type) {
+            .chunk_batch => try importChunkBatch(alloc, db.core.store, block.payload),
+            .artifact_batch => try importPublicArtifactBatch(alloc, db.core.store, block.payload, .asset),
+            .resolution_batch => try importResolutionArtifactBatch(alloc, db.core.store, block.payload),
+            .embedding_batch => try importEmbeddingBatch(alloc, db.core.store, block.payload, &.{}),
+            .sparse_batch => try importSparseBatch(alloc, db.core.store, block.payload, &.{}),
+            .edge_batch => try importEdgeBatch(alloc, db.core.store, block.payload),
+            else => {},
+        }
+    }
 }
 
 pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []const u8, opts: ImportOptions) !void {
@@ -831,7 +980,7 @@ pub fn importPortableWithOptions(alloc: Allocator, store: *DocStore, data: []con
                 try importIdentityBatch(alloc, store, block.payload);
                 imported_identity = true;
             },
-            .metadata_batch => try importMetadataBatch(alloc, store, block.payload),
+            .metadata_batch => try importMetadataBatchWithOptions(alloc, store, block.payload, opts),
             // Skip: derived indexes in the first pass; they are restored after documents.
             .cluster_manifest, .table_manifest, .shard_header, .shard_footer, .file_footer => {},
             else => {},
@@ -877,7 +1026,7 @@ fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec
     switch (block_type) {
         .document_batch => try validateDocumentBatchPayload(alloc, payload),
         .doc_identity_batch => try validateIdentityBatchPayload(alloc, payload),
-        .metadata_batch => try validateMetadataBatchPayload(alloc, payload),
+        .metadata_batch => try validateMetadataBatchPayloadWithOptions(alloc, payload, opts),
         .chunk_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .chunk),
         .artifact_batch => if (opts.import_derived_indexes) try validatePublicArtifactBatchPayload(alloc, payload, .asset),
         .resolution_batch => if (opts.import_derived_indexes) try validateResolutionArtifactBatchPayload(alloc, payload),
@@ -892,8 +1041,78 @@ fn validatePortableImportBlockPayload(alloc: Allocator, block_type: backup_codec
         },
         .shard_footer => _ = try backup_codec.decodeShardFooter(payload),
         .file_footer => _ = try backup_codec.decodeFileFooter(payload),
-        .cluster_manifest, .table_manifest, .summary_batch, .transaction_batch => {},
+        .cluster_manifest, .table_manifest => try validatePortableManifestPayload(alloc, payload, opts),
+        .summary_batch, .transaction_batch => {},
         else => {},
+    }
+}
+
+fn relationalSchemaJsonFromPortableAlloc(alloc: Allocator, data: []const u8) !?[]u8 {
+    var reader = backup_codec.SliceReader.init(data);
+    _ = try reader.readHeader();
+    var manifest_declares_relational = false;
+
+    while (reader.pos < reader.data.len) {
+        const block = try reader.readBlock(alloc);
+        defer alloc.free(block.payload);
+
+        switch (block.block_type) {
+            .metadata_batch => {
+                const entries = try backup_codec.decodeKeyValueBatch(alloc, block.payload);
+                defer freeKeyValueEntries(alloc, entries);
+                for (entries) |entry| {
+                    if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
+                    const relational = try portableMetadataDeclaresRelationalSchema(alloc, entry.key, entry.value);
+                    if (relational and std.mem.eql(u8, entry.key, "\x00\x00__metadata__:schema_json")) {
+                        return try alloc.dupe(u8, entry.value);
+                    }
+                    manifest_declares_relational = manifest_declares_relational or relational;
+                }
+            },
+            .cluster_manifest, .table_manifest => {
+                manifest_declares_relational = manifest_declares_relational or try portableJsonDeclaresRelationalSchema(alloc, block.payload);
+            },
+            else => {},
+        }
+    }
+
+    if (manifest_declares_relational) return error.UnsupportedPortableRelationalTable;
+    return null;
+}
+
+fn importDocumentBatchIntoDb(alloc: Allocator, db: anytype, payload: []const u8) !void {
+    const entries = try backup_codec.decodeDocumentBatch(alloc, payload);
+    defer {
+        for (entries) |e| {
+            alloc.free(e.key);
+            alloc.free(e.value);
+        }
+        alloc.free(entries);
+    }
+
+    var writes = std.ArrayListUnmanaged(db_types.BatchWrite).empty;
+    defer writes.deinit(alloc);
+    var owned_values = std.ArrayListUnmanaged([]u8).empty;
+    defer {
+        for (owned_values.items) |value| alloc.free(value);
+        owned_values.deinit(alloc);
+    }
+
+    for (entries) |entry| {
+        const value = if (entry.value_flags & backup_codec.doc_value_flag_compressed != 0)
+            try backup_codec.decompressZstd(alloc, entry.value)
+        else
+            try alloc.dupe(u8, entry.value);
+        errdefer alloc.free(value);
+        try owned_values.append(alloc, value);
+        try writes.append(alloc, .{
+            .key = entry.key,
+            .value = value,
+        });
+    }
+
+    if (writes.items.len > 0) {
+        try db.batch(.{ .writes = writes.items });
     }
 }
 
@@ -919,10 +1138,15 @@ fn validateIdentityBatchPayload(alloc: Allocator, payload: []const u8) !void {
 }
 
 fn validateMetadataBatchPayload(alloc: Allocator, payload: []const u8) !void {
+    try validateMetadataBatchPayloadWithOptions(alloc, payload, .{});
+}
+
+fn validateMetadataBatchPayloadWithOptions(alloc: Allocator, payload: []const u8, opts: ImportOptions) !void {
     const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
     defer freeKeyValueEntries(alloc, entries);
     for (entries) |entry| {
         if (!isPortableMetadataKey(entry.key)) return error.InvalidMetadataBatch;
+        if ((try portableMetadataDeclaresRelationalSchema(alloc, entry.key, entry.value)) and !opts.allow_relational_schema) return error.UnsupportedPortableRelationalTable;
     }
 }
 
@@ -1059,6 +1283,10 @@ fn importIdentityBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
 }
 
 fn importMetadataBatch(alloc: Allocator, store: *DocStore, payload: []const u8) !void {
+    return try importMetadataBatchWithOptions(alloc, store, payload, .{});
+}
+
+fn importMetadataBatchWithOptions(alloc: Allocator, store: *DocStore, payload: []const u8, opts: ImportOptions) !void {
     const entries = try backup_codec.decodeKeyValueBatch(alloc, payload);
     defer {
         for (entries) |e| {
@@ -1073,6 +1301,7 @@ fn importMetadataBatch(alloc: Allocator, store: *DocStore, payload: []const u8) 
 
     for (entries) |e| {
         if (!isPortableMetadataKey(e.key)) return error.InvalidMetadataBatch;
+        if ((try portableMetadataDeclaresRelationalSchema(alloc, e.key, e.value)) and !opts.allow_relational_schema) return error.UnsupportedPortableRelationalTable;
         try writes.append(alloc, .{ .key = e.key, .value = e.value });
     }
 
@@ -1501,6 +1730,12 @@ fn openTestStore(alloc: Allocator, tmp: *std.testing.TmpDir) !DocStore {
     return DocStore.open(alloc, path_z, .{});
 }
 
+fn openTestDb(alloc: Allocator, tmp: *std.testing.TmpDir) !db_mod.DB {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, ".zig-cache/tmp/{s}", .{tmp.sub_path});
+    return try db_mod.DB.open(alloc, path, .{});
+}
+
 fn freeAllocatedKVPairs(alloc: Allocator, pairs: *std.ArrayListUnmanaged(KVPair)) void {
     for (pairs.items) |pair| {
         alloc.free(pair.key);
@@ -1568,6 +1803,183 @@ test "export and import documents round trip" {
         defer alloc.free(val);
         try std.testing.expectEqualStrings(expected, val);
     }
+}
+
+test "exportPortable rejects relational physical rows" {
+    const alloc = std.testing.allocator;
+
+    const relational_keys = [_][]u8{
+        try internal_keys.relationalRowKeyAlloc(alloc, "row:a"),
+        try internal_keys.relationalColumnKeyAlloc(alloc, "row:a", "status"),
+        try internal_keys.relationalColumnIndexKeyAlloc(alloc, "status", "row:a"),
+        try internal_keys.relationalArrayElementIndexKeyAlloc(alloc, "tags", "hot", "row:a"),
+        try internal_keys.relationalArrayValueIndexKeyAlloc(alloc, "tags", "[hot]", "row:a"),
+        try internal_keys.relationalJsonValueIndexKeyAlloc(alloc, "attrs", "billing.plan", "\"pro\"", "row:a"),
+        try internal_keys.relationalJsonPathIndexKeyAlloc(alloc, "attrs", "billing.plan", "row:a"),
+        try internal_keys.relationalColumnIndexByDocKeyAlloc(alloc, "row:a", "status"),
+        try internal_keys.relationalForeignKeyRefKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a", "orders", "row:a"),
+        try internal_keys.relationalUniqueKeyAlloc(alloc, "orders_external_id_key", "external:a"),
+        try internal_keys.relationalTemporalUniqueKeyAlloc(alloc, "prices_sku_valid_time_key", "sku:a", "10", "20", "row:a"),
+        try internal_keys.relationalForeignKeyConflictKeyAlloc(alloc, "orders_customer_id_fkey", "customers", "customer:a"),
+    };
+    defer {
+        for (relational_keys) |key| alloc.free(key);
+    }
+
+    for (relational_keys) |key| {
+        var tmp_src = std.testing.tmpDir(.{});
+        defer tmp_src.cleanup();
+        var src = try openTestStore(alloc, &tmp_src);
+        defer src.close();
+
+        try src.putBatch(&.{.{ .key = key, .value = "relational-physical-data" }}, &.{});
+
+        var out: ArrayList(u8) = .empty;
+        defer out.deinit(alloc);
+        try std.testing.expectError(error.UnsupportedPortableRelationalTable, exportPortable(alloc, &src, &out));
+        try std.testing.expectEqual(@as(usize, 0), out.items.len);
+    }
+}
+
+test "exportPortable rejects relational schema metadata" {
+    const alloc = std.testing.allocator;
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestStore(alloc, &tmp_src);
+    defer src.close();
+
+    const relational_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    try src.putBatch(&.{.{ .key = "\x00\x00__metadata__:schema_json", .value = relational_schema_json }}, &.{});
+
+    var out: ArrayList(u8) = .empty;
+    defer out.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, exportPortable(alloc, &src, &out));
+    try std.testing.expectEqual(@as(usize, 0), out.items.len);
+}
+
+test "importPortable rejects relational schema metadata" {
+    const alloc = std.testing.allocator;
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try backup_codec.writeHeader(&portable, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+
+    const relational_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const metadata_payload = try backup_codec.encodeKeyValueBatch(alloc, &.{.{
+        .key = "\x00\x00__metadata__:schema_json",
+        .value = relational_schema_json,
+    }});
+    defer alloc.free(metadata_payload);
+    try backup_codec.writeBlock(&portable, alloc, .metadata_batch, metadata_payload);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, validatePortable(alloc, portable.items));
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, importPortable(alloc, &dst, portable.items));
+    try std.testing.expectError(error.NotFound, dst.get(alloc, "\x00\x00__metadata__:schema_json"));
+}
+
+test "importPortable rejects relational schema manifests" {
+    const alloc = std.testing.allocator;
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try backup_codec.writeHeader(&portable, alloc, .{
+        .format_version = backup_codec.format_version,
+        .flags = 0,
+        .created_at_ns = 0,
+        .backup_id = [_]u8{0} ** 16,
+        .table_count = 1,
+        .shard_count = 1,
+    });
+
+    const relational_manifest =
+        \\{"tables":[{"name":"orders","schema":{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}}]}
+    ;
+    try backup_codec.writeBlock(&portable, alloc, .table_manifest, relational_manifest);
+
+    const good_doc = try backup_codec.encodeDocumentBatch(alloc, &.{
+        .{
+            .key = "doc:manifest-before-doc",
+            .value_flags = 0,
+            .value = "{\"title\":\"must not import\"}",
+            .timestamp_ns = 0,
+        },
+    });
+    defer alloc.free(good_doc);
+    try backup_codec.writeBlock(&portable, alloc, .document_batch, good_doc);
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestStore(alloc, &tmp_dst);
+    defer dst.close();
+
+    const store_key = try internal_keys.documentKeyAlloc(alloc, "doc:manifest-before-doc");
+    defer alloc.free(store_key);
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, validatePortable(alloc, portable.items));
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, importPortable(alloc, &dst, portable.items));
+    try std.testing.expectError(error.NotFound, dst.get(alloc, store_key));
+}
+
+test "db portable backup restores relational rows through typed write path" {
+    const alloc = std.testing.allocator;
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"title":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id","title"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const row_json = "{\"id\":\"row:a\",\"title\":\"alpha\",\"amount\":42}";
+
+    var tmp_src = std.testing.tmpDir(.{});
+    defer tmp_src.cleanup();
+    var src = try openTestDb(alloc, &tmp_src);
+    defer src.close();
+    try src.setSchemaJson(alloc, schema_json);
+    try src.batch(.{ .writes = &.{.{ .key = "row:a", .value = row_json }} });
+
+    var raw_out: ArrayList(u8) = .empty;
+    defer raw_out.deinit(alloc);
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, exportPortable(alloc, src.core.store, &raw_out));
+
+    var portable: ArrayList(u8) = .empty;
+    defer portable.deinit(alloc);
+    try exportPortableDb(alloc, &src, &portable);
+    try validatePortableDb(alloc, portable.items);
+    try std.testing.expectError(error.UnsupportedPortableRelationalTable, validatePortable(alloc, portable.items));
+
+    var tmp_dst = std.testing.tmpDir(.{});
+    defer tmp_dst.cleanup();
+    var dst = try openTestDb(alloc, &tmp_dst);
+    defer dst.close();
+    try importPortableDb(alloc, &dst, portable.items);
+
+    var restored = (try dst.lookup(alloc, "row:a", .{})) orelse return error.TestExpectedEqual;
+    defer restored.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"title\":\"alpha\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, restored.json, "\"amount\":42") != null);
+
+    const relational_key = try internal_keys.relationalRowKeyAlloc(alloc, "row:a");
+    defer alloc.free(relational_key);
+    const relational_value = try dst.core.store.get(alloc, relational_key);
+    defer alloc.free(relational_value);
+
+    const primary_key = try internal_keys.documentKeyAlloc(alloc, "row:a");
+    defer alloc.free(primary_key);
+    try std.testing.expectError(error.NotFound, dst.core.store.get(alloc, primary_key));
 }
 
 test "import preflights full portable envelope before mutating destination" {

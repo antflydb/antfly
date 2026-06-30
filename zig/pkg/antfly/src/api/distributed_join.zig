@@ -24,13 +24,13 @@ const metadata_api = @import("../metadata/api.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const metadata_reconciler = @import("../metadata/reconciler.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
-const tables_api = @import("tables.zig");
+const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const platform_time = @import("../platform/time.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const public_table_http = @import("public_table_http.zig");
 const join_model = @import("join_model.zig");
-const json_helpers = @import("json_helpers.zig");
+const json_helpers = @import("../common/json_helpers.zig");
 const unmatched_right_join_group_chunk_limit: u32 = 128;
 
 // ---------------------------------------------------------------------------

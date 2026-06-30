@@ -57,6 +57,22 @@ pub const PrimaryBackend = union(enum) {
     lsm: lsm_backend_mod.Options,
 };
 
+pub fn openModeRequiresReadOnlyBackends(open_mode: anytype) bool {
+    return open_mode == .query_readonly or open_mode == .status_only;
+}
+
+pub fn openModeAllowsReplay(open_mode: anytype) bool {
+    return open_mode == .writer;
+}
+
+pub fn openModeAllowsIndexWorkers(open_mode: anytype) bool {
+    return open_mode == .writer or open_mode == .writer_no_replay;
+}
+
+pub fn openModeAllowsOptionalRuntimes(open_mode: anytype) bool {
+    return open_mode == .writer or open_mode == .writer_no_replay;
+}
+
 pub const primary_lsm_options_default = lsm_backend_mod.Options{
     .flush_threshold_bytes = 32 * 1024 * 1024,
     .read_snapshot_rotate_mutable_bytes = 32 * 1024 * 1024,

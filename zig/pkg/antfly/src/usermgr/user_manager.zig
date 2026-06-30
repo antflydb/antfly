@@ -25,19 +25,36 @@ pub const default_rbac_model_text =
     \\[policy_definition]
     \\p = sub, typ, obj, act
     \\p2 = sub, obj, filter
+    \\p3 = sub, setting, value
+    \\p4 = table
+    \\p5 = sub, database, setting, value
+    \\p6 = sub, database, setting, value
+    \\p7 = sub, table, target
+    \\p8 = sub, obj, filter
     \\[role_definition]
     \\g = _, _
     \\[matchers]
     \\m = g(r.sub, p.sub) && (r.typ == p.typ || p.typ == "*") && (r.obj == p.obj || p.obj == "*") && (r.act == p.act || p.act == "*")
 ;
 
+const sql_role_catalog_subject = "__antfly_sql_role_catalog__";
+const sql_row_security_policy_subject_prefix = "__antfly_sql_rls_policy__:";
+const sql_row_security_no_targets_subject = "__antfly_sql_rls_no_targets__";
+const global_runtime_role_setting_database = "*";
+
 pub const ResourceType = enum {
+    database,
+    namespace,
     table,
+    tablespace,
     user,
     @"*",
 
     pub fn fromSlice(raw: []const u8) !ResourceType {
+        if (std.mem.eql(u8, raw, "database")) return .database;
+        if (std.mem.eql(u8, raw, "namespace")) return .namespace;
         if (std.mem.eql(u8, raw, "table")) return .table;
+        if (std.mem.eql(u8, raw, "tablespace")) return .tablespace;
         if (std.mem.eql(u8, raw, "user")) return .user;
         if (std.mem.eql(u8, raw, "*")) return .@"*";
         return error.InvalidResourceType;
@@ -45,7 +62,10 @@ pub const ResourceType = enum {
 
     pub fn slice(self: ResourceType) []const u8 {
         return switch (self) {
+            .database => "database",
+            .namespace => "namespace",
             .table => "table",
+            .tablespace => "tablespace",
             .user => "user",
             .@"*" => "*",
         };
@@ -93,6 +113,17 @@ pub const Permission = struct {
     }
 };
 
+pub const PermissionChangeKind = enum {
+    grant,
+    revoke,
+};
+
+pub const PermissionChange = struct {
+    subject: []const u8,
+    permission: Permission,
+    kind: PermissionChangeKind,
+};
+
 pub const User = struct {
     username: []u8,
     password_hash: []u8,
@@ -131,6 +162,119 @@ pub const RowFilterEntry = struct {
         self.* = undefined;
     }
 };
+
+pub const RoleSetting = struct {
+    name: []u8,
+    value: []u8,
+
+    pub fn initOwned(alloc: Allocator, name: []const u8, value: []const u8) !RoleSetting {
+        return .{
+            .name = try alloc.dupe(u8, name),
+            .value = try alloc.dupe(u8, value),
+        };
+    }
+
+    pub fn deinit(self: *RoleSetting, alloc: Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub const RuntimeRoleSetting = struct {
+    database_name: ?[]u8 = null,
+    name: []u8,
+    value: []u8,
+
+    pub fn initOwned(alloc: Allocator, database_name: ?[]const u8, name: []const u8, value: []const u8) !RuntimeRoleSetting {
+        return .{
+            .database_name = if (database_name) |db| try alloc.dupe(u8, db) else null,
+            .name = try alloc.dupe(u8, name),
+            .value = try alloc.dupe(u8, value),
+        };
+    }
+
+    pub fn deinit(self: *RuntimeRoleSetting, alloc: Allocator) void {
+        if (self.database_name) |database_name| alloc.free(database_name);
+        alloc.free(self.name);
+        alloc.free(self.value);
+        self.* = undefined;
+    }
+};
+
+pub fn validateRoleSettingName(name: []const u8) !void {
+    if (!std.mem.startsWith(u8, name, "app.") or name.len == "app.".len) return error.UnsupportedRoleSetting;
+    var segments = std.mem.splitScalar(u8, name, '.');
+    var seen: usize = 0;
+    while (segments.next()) |segment| : (seen += 1) {
+        if (segment.len == 0) return error.UnsupportedRoleSetting;
+    }
+    if (seen < 2) return error.UnsupportedRoleSetting;
+}
+
+pub fn validateRoleSettingValue(value: []const u8) !void {
+    if (value.len == 0) return error.InvalidRoleSetting;
+}
+
+pub fn validateRoleSettingDatabaseName(database_name: []const u8) !void {
+    if (database_name.len == 0 or std.mem.eql(u8, database_name, global_runtime_role_setting_database)) return error.InvalidRoleSetting;
+}
+
+pub fn validateRuntimeRoleSettingName(name: []const u8) !void {
+    if (std.mem.eql(u8, name, "statement_timeout")) return;
+    if (std.mem.eql(u8, name, "timezone")) return;
+    if (std.mem.eql(u8, name, "search_path")) return;
+    return error.UnsupportedRoleSetting;
+}
+
+pub fn validateRuntimeRoleSettingValue(name: []const u8, value: []const u8) !void {
+    if (value.len == 0) return error.InvalidRoleSetting;
+    if (std.mem.eql(u8, name, "statement_timeout")) return try validateStatementTimeoutSettingValue(value);
+    if (std.mem.eql(u8, name, "search_path")) return try validateSearchPathSettingValue(value);
+    if (std.mem.eql(u8, name, "timezone")) return try validateTimezoneSettingValue(value);
+    return error.UnsupportedRoleSetting;
+}
+
+fn validateStatementTimeoutSettingValue(value: []const u8) !void {
+    var digit_count: usize = 0;
+    while (digit_count < value.len and std.ascii.isDigit(value[digit_count])) : (digit_count += 1) {}
+    if (digit_count == 0) return error.InvalidRoleSetting;
+    _ = std.fmt.parseUnsigned(u64, value[0..digit_count], 10) catch return error.InvalidRoleSetting;
+    const unit = value[digit_count..];
+    if (unit.len == 0) return;
+    if (std.mem.eql(u8, unit, "us")) return;
+    if (std.mem.eql(u8, unit, "ms")) return;
+    if (std.mem.eql(u8, unit, "s")) return;
+    if (std.mem.eql(u8, unit, "min")) return;
+    if (std.mem.eql(u8, unit, "h")) return;
+    return error.InvalidRoleSetting;
+}
+
+fn validateSearchPathSettingValue(value: []const u8) !void {
+    var iter = std.mem.splitScalar(u8, value, ',');
+    var count: usize = 0;
+    while (iter.next()) |part| : (count += 1) {
+        const trimmed = std.mem.trim(u8, part, " \t\r\n");
+        if (trimmed.len == 0) return error.InvalidRoleSetting;
+        const normalized = if (trimmed.len >= 2 and trimmed[0] == '"' and trimmed[trimmed.len - 1] == '"')
+            trimmed[1 .. trimmed.len - 1]
+        else
+            trimmed;
+        if (normalized.len == 0) return error.InvalidRoleSetting;
+        for (normalized) |c| {
+            if (std.ascii.isAlphanumeric(c) or c == '_' or c == '$') continue;
+            return error.InvalidRoleSetting;
+        }
+    }
+    if (count == 0) return error.InvalidRoleSetting;
+}
+
+fn validateTimezoneSettingValue(value: []const u8) !void {
+    for (value) |c| {
+        if (std.ascii.isAlphanumeric(c) or c == '_' or c == '/' or c == '+' or c == '-' or c == ':' or c == '.') continue;
+        return error.InvalidRoleSetting;
+    }
+}
 
 pub const AuthSubjectKind = enum {
     user,
@@ -259,6 +403,8 @@ pub const ValidatedApiKey = struct {
     row_filter: []RowFilterEntry,
     metadata_json: []u8 = &.{},
     roles: [][]u8 = &.{},
+    role_settings: []RoleSetting = &.{},
+    role_runtime_settings: []RoleSetting = &.{},
 
     pub fn deinit(self: *ValidatedApiKey, alloc: Allocator) void {
         alloc.free(self.username);
@@ -268,6 +414,10 @@ pub const ValidatedApiKey = struct {
         alloc.free(self.row_filter);
         if (self.metadata_json.len > 0) alloc.free(self.metadata_json);
         freeOwnedStrings(alloc, self.roles);
+        for (self.role_settings) |*setting| setting.deinit(alloc);
+        if (self.role_settings.len > 0) alloc.free(self.role_settings);
+        for (self.role_runtime_settings) |*setting| setting.deinit(alloc);
+        if (self.role_runtime_settings.len > 0) alloc.free(self.role_runtime_settings);
         self.* = undefined;
     }
 };
@@ -627,6 +777,10 @@ pub const UserManager = struct {
         _ = try self.enforcer.removeFilteredPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{username});
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{username});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p7", 2, &.{username});
     }
 
     pub fn listUsers(self: *const UserManager) ![][]u8 {
@@ -638,6 +792,10 @@ pub const UserManager = struct {
             out[i] = try self.alloc.dupe(u8, username.*);
         }
         return out;
+    }
+
+    pub fn hasUser(self: *const UserManager, username: []const u8) bool {
+        return self.users.contains(username);
     }
 
     pub fn enforce(
@@ -658,6 +816,63 @@ pub const UserManager = struct {
             permission.resource,
             permission.type.slice(),
         });
+    }
+
+    pub fn subjectHasPermissionExact(self: *const UserManager, subject: []const u8, permission: Permission) !bool {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p", 0, &.{
+            subject,
+            permission.resource_type.slice(),
+            permission.resource,
+            permission.type.slice(),
+        });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        return rules.len > 0;
+    }
+
+    pub fn removePermissionFromSubjectExact(self: *UserManager, subject: []const u8, permission: Permission) !void {
+        _ = try self.enforcer.removeFilteredPolicy(0, &.{
+            subject,
+            permission.resource_type.slice(),
+            permission.resource,
+            permission.type.slice(),
+        });
+    }
+
+    pub fn applyPermissionChangesAtomically(self: *UserManager, changes: []const PermissionChange) !void {
+        if (changes.len == 0) return;
+        const existed_before = try self.alloc.alloc(bool, changes.len);
+        defer self.alloc.free(existed_before);
+        for (changes, 0..) |change, i| {
+            existed_before[i] = try self.subjectHasPermissionExact(change.subject, change.permission);
+        }
+
+        var applied: usize = 0;
+        errdefer {
+            var i = applied;
+            while (i > 0) {
+                i -= 1;
+                const change = changes[i];
+                switch (change.kind) {
+                    .grant => {
+                        if (!existed_before[i]) self.removePermissionFromSubjectExact(change.subject, change.permission) catch {};
+                    },
+                    .revoke => {
+                        if (existed_before[i]) self.addPermissionToSubject(change.subject, change.permission) catch {};
+                    },
+                }
+            }
+        }
+
+        for (changes) |change| {
+            switch (change.kind) {
+                .grant => try self.addPermissionToSubject(change.subject, change.permission),
+                .revoke => try self.removePermissionFromSubjectExact(change.subject, change.permission),
+            }
+            applied += 1;
+        }
     }
 
     pub fn addPermissionToUser(self: *UserManager, username: []const u8, permission: Permission) !void {
@@ -707,6 +922,796 @@ pub const UserManager = struct {
     pub fn addRoleToSubject(self: *UserManager, subject: []const u8, role: []const u8) !void {
         if (subject.len == 0 or role.len == 0) return error.InvalidRole;
         _ = try self.enforcer.addNamedPolicy("g", &.{ subject, role });
+    }
+
+    pub fn createRoleSubject(self: *UserManager, role_subject: []const u8) !void {
+        if (role_subject.len == 0) return error.InvalidRole;
+        if (try self.roleSubjectExists(role_subject)) return error.RoleExists;
+        _ = try self.enforcer.addNamedPolicy("g", &.{ sql_role_catalog_subject, role_subject });
+    }
+
+    pub fn dropRoleSubject(self: *UserManager, role_subject: []const u8) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        if (try self.roleSubjectHasDependencies(role_subject)) return error.RoleInUse;
+        _ = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{ sql_role_catalog_subject, role_subject });
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{role_subject});
+    }
+
+    pub fn dropRoleSubjectCascade(self: *UserManager, role_subject: []const u8) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        try self.removeSqlRowSecurityPolicyTargetCascade(role_subject);
+        _ = try self.enforcer.removeFilteredPolicy(0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredGroupingPolicy(0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("g", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("g", 1, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p8", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{role_subject});
+        _ = try self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{role_subject});
+    }
+
+    const SqlRowSecurityPolicyTargetRef = struct {
+        policy_subject: []u8,
+        table: []u8,
+
+        fn deinit(self: *@This(), alloc: Allocator) void {
+            alloc.free(self.policy_subject);
+            alloc.free(self.table);
+            self.* = undefined;
+        }
+    };
+
+    fn removeSqlRowSecurityPolicyTargetCascade(self: *UserManager, role_subject: []const u8) !void {
+        const target_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p7", 2, &.{role_subject});
+        defer {
+            for (target_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(target_rules);
+        }
+
+        var affected = std.ArrayList(SqlRowSecurityPolicyTargetRef).empty;
+        defer {
+            for (affected.items) |*entry| entry.deinit(self.alloc);
+            affected.deinit(self.alloc);
+        }
+        for (target_rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            try affected.append(self.alloc, .{
+                .policy_subject = try self.alloc.dupe(u8, rule.fields[0]),
+                .table = try self.alloc.dupe(u8, rule.fields[1]),
+            });
+        }
+
+        _ = try self.enforcer.removeFilteredNamedPolicy("p7", 2, &.{role_subject});
+        for (affected.items) |entry| {
+            const remaining = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p7", 0, &.{ entry.policy_subject, entry.table });
+            defer {
+                for (remaining) |*rule| rule.deinit(self.alloc);
+                self.alloc.free(remaining);
+            }
+            if (remaining.len == 0) {
+                _ = try self.enforcer.addNamedPolicy("p7", &.{ entry.policy_subject, entry.table, sql_row_security_no_targets_subject });
+            }
+        }
+    }
+
+    pub fn roleSubjectHasDependencies(self: *const UserManager, role_subject: []const u8) !bool {
+        if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p8", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p7", 2, role_subject)) return true;
+        if (try self.hasFilteredPolicy("g", 0, role_subject)) return true;
+
+        const inbound_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "g", 1, &.{role_subject});
+        defer {
+            for (inbound_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(inbound_rules);
+        }
+        for (inbound_rules) |rule| {
+            if (rule.fields.len < 2) continue;
+            if (std.mem.eql(u8, rule.fields[0], sql_role_catalog_subject)) continue;
+            return true;
+        }
+        return false;
+    }
+
+    pub fn roleSubjectExists(self: *const UserManager, role_subject: []const u8) !bool {
+        if (role_subject.len == 0) return false;
+        if (self.users.contains(role_subject)) return true;
+        if (try self.hasFilteredPolicy("p", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p2", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p8", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p5", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p6", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("p7", 2, role_subject)) return true;
+        if (try self.hasFilteredPolicy("g", 0, role_subject)) return true;
+        if (try self.hasFilteredPolicy("g", 1, role_subject)) return true;
+        return false;
+    }
+
+    fn hasFilteredPolicy(self: *const UserManager, ptype: []const u8, field_index: usize, value: []const u8) !bool {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, ptype, field_index, &.{value});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        return rules.len > 0;
+    }
+
+    pub fn setRoleSetting(self: *UserManager, role_subject: []const u8, setting_name: []const u8, setting_value: []const u8) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        try validateRoleSettingName(setting_name);
+        try validateRoleSettingValue(setting_value);
+
+        const existing_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{ role_subject, setting_name });
+        defer {
+            for (existing_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(existing_rules);
+        }
+
+        var setting_present = false;
+        for (existing_rules) |rule| {
+            if (rule.fields.len >= 3 and std.mem.eql(u8, rule.fields[2], setting_value)) {
+                setting_present = true;
+                break;
+            }
+        }
+        const inserted_new = if (setting_present)
+            false
+        else
+            try self.enforcer.addNamedPolicy("p3", &.{ role_subject, setting_name, setting_value });
+        errdefer if (inserted_new) {
+            _ = self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, setting_value }) catch {};
+        };
+
+        var removed_old_values = std.ArrayList([]const u8).empty;
+        defer removed_old_values.deinit(self.alloc);
+        try removed_old_values.ensureTotalCapacity(self.alloc, existing_rules.len);
+        errdefer {
+            for (removed_old_values.items) |old_value| {
+                _ = self.enforcer.addNamedPolicy("p3", &.{ role_subject, setting_name, old_value }) catch {};
+            }
+        }
+
+        for (existing_rules) |rule| {
+            if (rule.fields.len < 3 or std.mem.eql(u8, rule.fields[2], setting_value)) continue;
+            if (try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name, rule.fields[2] })) {
+                removed_old_values.appendAssumeCapacity(rule.fields[2]);
+            }
+        }
+    }
+
+    pub fn getRoleSetting(self: *const UserManager, role_subject: []const u8, setting_name: []const u8) ![]u8 {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{ role_subject, setting_name });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 3) return error.RoleSettingNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[2]);
+    }
+
+    pub fn removeRoleSetting(self: *UserManager, role_subject: []const u8, setting_name: []const u8) !void {
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p3", 0, &.{ role_subject, setting_name });
+        if (!removed) return error.RoleSettingNotFound;
+    }
+
+    pub fn setRoleDatabaseSetting(
+        self: *UserManager,
+        role_subject: []const u8,
+        database_name: []const u8,
+        setting_name: []const u8,
+        setting_value: []const u8,
+    ) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        try validateRoleSettingDatabaseName(database_name);
+        try validateRoleSettingName(setting_name);
+        try validateRoleSettingValue(setting_value);
+
+        const existing_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p6", 0, &.{ role_subject, database_name, setting_name });
+        defer {
+            for (existing_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(existing_rules);
+        }
+
+        var setting_present = false;
+        for (existing_rules) |rule| {
+            if (rule.fields.len >= 4 and std.mem.eql(u8, rule.fields[3], setting_value)) {
+                setting_present = true;
+                break;
+            }
+        }
+        const inserted_new = if (setting_present)
+            false
+        else
+            try self.enforcer.addNamedPolicy("p6", &.{ role_subject, database_name, setting_name, setting_value });
+        errdefer if (inserted_new) {
+            _ = self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{ role_subject, database_name, setting_name, setting_value }) catch {};
+        };
+
+        var removed_old_values = std.ArrayList([]const u8).empty;
+        defer removed_old_values.deinit(self.alloc);
+        try removed_old_values.ensureTotalCapacity(self.alloc, existing_rules.len);
+        errdefer {
+            for (removed_old_values.items) |old_value| {
+                _ = self.enforcer.addNamedPolicy("p6", &.{ role_subject, database_name, setting_name, old_value }) catch {};
+            }
+        }
+
+        for (existing_rules) |rule| {
+            if (rule.fields.len < 4 or std.mem.eql(u8, rule.fields[3], setting_value)) continue;
+            if (try self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{ role_subject, database_name, setting_name, rule.fields[3] })) {
+                removed_old_values.appendAssumeCapacity(rule.fields[3]);
+            }
+        }
+    }
+
+    pub fn getRoleDatabaseSetting(self: *const UserManager, role_subject: []const u8, database_name: []const u8, setting_name: []const u8) ![]u8 {
+        try validateRoleSettingDatabaseName(database_name);
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p6", 0, &.{ role_subject, database_name, setting_name });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 4) return error.RoleSettingNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[3]);
+    }
+
+    pub fn removeRoleDatabaseSetting(self: *UserManager, role_subject: []const u8, database_name: []const u8, setting_name: []const u8) !void {
+        try validateRoleSettingDatabaseName(database_name);
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p6", 0, &.{ role_subject, database_name, setting_name });
+        if (!removed) return error.RoleSettingNotFound;
+    }
+
+    pub fn setRoleRuntimeSetting(
+        self: *UserManager,
+        role_subject: []const u8,
+        database_name: ?[]const u8,
+        setting_name: []const u8,
+        setting_value: []const u8,
+    ) !void {
+        if (!(try self.roleSubjectExists(role_subject))) return error.RoleNotFound;
+        if (database_name) |db| if (db.len == 0 or std.mem.eql(u8, db, global_runtime_role_setting_database)) return error.InvalidRoleSetting;
+        try validateRuntimeRoleSettingName(setting_name);
+        try validateRuntimeRoleSettingValue(setting_name, setting_value);
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+
+        const existing_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ role_subject, database_key, setting_name });
+        defer {
+            for (existing_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(existing_rules);
+        }
+
+        var setting_present = false;
+        for (existing_rules) |rule| {
+            if (rule.fields.len >= 4 and std.mem.eql(u8, rule.fields[3], setting_value)) {
+                setting_present = true;
+                break;
+            }
+        }
+        const inserted_new = if (setting_present)
+            false
+        else
+            try self.enforcer.addNamedPolicy("p5", &.{ role_subject, database_key, setting_name, setting_value });
+        errdefer if (inserted_new) {
+            _ = self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name, setting_value }) catch {};
+        };
+
+        var removed_old_values = std.ArrayList([]const u8).empty;
+        defer removed_old_values.deinit(self.alloc);
+        try removed_old_values.ensureTotalCapacity(self.alloc, existing_rules.len);
+        errdefer {
+            for (removed_old_values.items) |old_value| {
+                _ = self.enforcer.addNamedPolicy("p5", &.{ role_subject, database_key, setting_name, old_value }) catch {};
+            }
+        }
+
+        for (existing_rules) |rule| {
+            if (rule.fields.len < 4 or std.mem.eql(u8, rule.fields[3], setting_value)) continue;
+            if (try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name, rule.fields[3] })) {
+                removed_old_values.appendAssumeCapacity(rule.fields[3]);
+            }
+        }
+    }
+
+    pub fn getRoleRuntimeSetting(self: *const UserManager, role_subject: []const u8, database_name: ?[]const u8, setting_name: []const u8) ![]u8 {
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ role_subject, database_key, setting_name });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 4) return error.RoleSettingNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[3]);
+    }
+
+    pub fn removeRoleRuntimeSetting(self: *UserManager, role_subject: []const u8, database_name: ?[]const u8, setting_name: []const u8) !void {
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+        const removed = try self.enforcer.removeFilteredNamedPolicy("p5", 0, &.{ role_subject, database_key, setting_name });
+        if (!removed) return error.RoleSettingNotFound;
+    }
+
+    pub fn listRoleRuntimeSettingsForSubject(self: *const UserManager, subject: []const u8, database_name: ?[]const u8) ![]RoleSetting {
+        const database_key = runtimeRoleSettingDatabaseKey(database_name);
+        if (database_name) |db| try validateRoleSettingDatabaseName(db);
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p5", 0, &.{ subject, database_key });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 4) continue;
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, rule.fields[2], rule.fields[3]));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listRoleSettingsForSubject(self: *const UserManager, subject: []const u8) ![]RoleSetting {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p3", 0, &.{subject});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, rule.fields[1], rule.fields[2]));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn listRoleDatabaseSettingsForSubject(self: *const UserManager, subject: []const u8, database_name: []const u8) ![]RoleSetting {
+        try validateRoleSettingDatabaseName(database_name);
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p6", 0, &.{ subject, database_name });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        for (rules) |rule| {
+            if (rule.fields.len < 4) continue;
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, rule.fields[2], rule.fields[3]));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    fn runtimeRoleSettingDatabaseKey(database_name: ?[]const u8) []const u8 {
+        return database_name orelse global_runtime_role_setting_database;
+    }
+
+    pub fn getEffectiveRoleSettings(self: *const UserManager, username: []const u8) ![]RoleSetting {
+        return try self.getEffectiveRoleSettingsForDatabase(username, null);
+    }
+
+    pub fn getEffectiveRoleSettingsForDatabase(self: *const UserManager, username: []const u8, database_name: ?[]const u8) ![]RoleSetting {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        if (database_name) |db| try validateRoleSettingDatabaseName(db);
+        const roles = try self.getRolesForUser(username);
+        defer freeOwnedStrings(self.alloc, roles);
+        const direct_settings = try self.listRoleSettingsForSubject(username);
+        defer {
+            for (direct_settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(direct_settings);
+        }
+        const direct_database_settings: []RoleSetting = if (database_name) |db|
+            try self.listRoleDatabaseSettingsForSubject(username, db)
+        else
+            &.{};
+        defer {
+            for (direct_database_settings) |*setting| setting.deinit(self.alloc);
+            if (direct_database_settings.len > 0) self.alloc.free(direct_database_settings);
+        }
+
+        var merged = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = merged.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            merged.deinit(self.alloc);
+        }
+
+        for (roles) |role| try self.mergeInheritedRoleSettingsForSubject(&merged, role, direct_settings, direct_database_settings, database_name);
+        for (direct_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
+        for (direct_database_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
+
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var it = merged.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    pub fn getEffectiveRoleRuntimeSettings(self: *const UserManager, username: []const u8) ![]RoleSetting {
+        return try self.getEffectiveRoleRuntimeSettingsForDatabase(username, null);
+    }
+
+    pub fn getEffectiveRoleRuntimeSettingsForDatabase(self: *const UserManager, username: []const u8, database_name: ?[]const u8) ![]RoleSetting {
+        if (!self.users.contains(username)) return error.UserNotFound;
+        if (database_name) |db| try validateRoleSettingDatabaseName(db);
+        const roles = try self.getRolesForUser(username);
+        defer freeOwnedStrings(self.alloc, roles);
+        const direct_settings = try self.listRoleRuntimeSettingsForSubject(username, null);
+        defer {
+            for (direct_settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(direct_settings);
+        }
+        const direct_database_settings: []RoleSetting = if (database_name) |db|
+            try self.listRoleRuntimeSettingsForSubject(username, db)
+        else
+            &.{};
+        defer {
+            for (direct_database_settings) |*setting| setting.deinit(self.alloc);
+            if (direct_database_settings.len > 0) self.alloc.free(direct_database_settings);
+        }
+
+        var merged = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = merged.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            merged.deinit(self.alloc);
+        }
+
+        for (roles) |role| try self.mergeInheritedRuntimeRoleSettingsForSubject(&merged, role, direct_settings, direct_database_settings, database_name);
+        for (direct_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
+        for (direct_database_settings) |setting| try putRoleSetting(&merged, self.alloc, setting.name, setting.value, .replace);
+
+        var out = std.ArrayList(RoleSetting).empty;
+        errdefer {
+            for (out.items) |*setting| setting.deinit(self.alloc);
+            out.deinit(self.alloc);
+        }
+        var it = merged.iterator();
+        while (it.next()) |entry| {
+            try out.append(self.alloc, try RoleSetting.initOwned(self.alloc, entry.key_ptr.*, entry.value_ptr.*));
+        }
+        return try out.toOwnedSlice(self.alloc);
+    }
+
+    const RoleSettingMergeMode = enum {
+        require_same_value,
+        replace,
+    };
+
+    fn mergeInheritedRoleSettingsForSubject(
+        self: *const UserManager,
+        merged: *std.StringArrayHashMapUnmanaged([]u8),
+        subject: []const u8,
+        direct_settings: []const RoleSetting,
+        direct_database_settings: []const RoleSetting,
+        database_name: ?[]const u8,
+    ) !void {
+        var subject_settings = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = subject_settings.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            subject_settings.deinit(self.alloc);
+        }
+
+        const settings = try self.listRoleSettingsForSubject(subject);
+        defer {
+            for (settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(settings);
+        }
+        for (settings) |setting| {
+            if (roleSettingsContainName(direct_settings, setting.name) or roleSettingsContainName(direct_database_settings, setting.name)) continue;
+            try putRoleSetting(&subject_settings, self.alloc, setting.name, setting.value, .replace);
+        }
+        if (database_name) |db| {
+            const database_settings = try self.listRoleDatabaseSettingsForSubject(subject, db);
+            defer {
+                for (database_settings) |*setting| setting.deinit(self.alloc);
+                self.alloc.free(database_settings);
+            }
+            for (database_settings) |setting| {
+                if (roleSettingsContainName(direct_settings, setting.name) or roleSettingsContainName(direct_database_settings, setting.name)) continue;
+                try putRoleSetting(&subject_settings, self.alloc, setting.name, setting.value, .replace);
+            }
+        }
+
+        var it = subject_settings.iterator();
+        while (it.next()) |entry| {
+            try putRoleSetting(merged, self.alloc, entry.key_ptr.*, entry.value_ptr.*, .require_same_value);
+        }
+    }
+
+    fn mergeInheritedRuntimeRoleSettingsForSubject(
+        self: *const UserManager,
+        merged: *std.StringArrayHashMapUnmanaged([]u8),
+        subject: []const u8,
+        direct_settings: []const RoleSetting,
+        direct_database_settings: []const RoleSetting,
+        database_name: ?[]const u8,
+    ) !void {
+        var subject_settings = std.StringArrayHashMapUnmanaged([]u8){};
+        defer {
+            var it = subject_settings.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                self.alloc.free(entry.value_ptr.*);
+            }
+            subject_settings.deinit(self.alloc);
+        }
+
+        const settings = try self.listRoleRuntimeSettingsForSubject(subject, null);
+        defer {
+            for (settings) |*setting| setting.deinit(self.alloc);
+            self.alloc.free(settings);
+        }
+        for (settings) |setting| {
+            if (roleSettingsContainName(direct_settings, setting.name) or roleSettingsContainName(direct_database_settings, setting.name)) continue;
+            try putRoleSetting(&subject_settings, self.alloc, setting.name, setting.value, .replace);
+        }
+        if (database_name) |db| {
+            const database_settings = try self.listRoleRuntimeSettingsForSubject(subject, db);
+            defer {
+                for (database_settings) |*setting| setting.deinit(self.alloc);
+                self.alloc.free(database_settings);
+            }
+            for (database_settings) |setting| {
+                if (roleSettingsContainName(direct_settings, setting.name) or roleSettingsContainName(direct_database_settings, setting.name)) continue;
+                try putRoleSetting(&subject_settings, self.alloc, setting.name, setting.value, .replace);
+            }
+        }
+
+        var it = subject_settings.iterator();
+        while (it.next()) |entry| {
+            try putRoleSetting(merged, self.alloc, entry.key_ptr.*, entry.value_ptr.*, .require_same_value);
+        }
+    }
+
+    fn roleSettingsContainName(settings: []const RoleSetting, name: []const u8) bool {
+        for (settings) |setting| {
+            if (std.mem.eql(u8, setting.name, name)) return true;
+        }
+        return false;
+    }
+
+    fn putRoleSetting(
+        merged: *std.StringArrayHashMapUnmanaged([]u8),
+        alloc: Allocator,
+        name: []const u8,
+        value: []const u8,
+        mode: RoleSettingMergeMode,
+    ) !void {
+        if (merged.get(name)) |existing| {
+            switch (mode) {
+                .require_same_value => {
+                    if (!std.mem.eql(u8, existing, value)) return error.RoleSettingConflict;
+                    return;
+                },
+                .replace => {},
+            }
+        }
+        if (merged.fetchOrderedRemove(name)) |removed| {
+            alloc.free(removed.key);
+            alloc.free(removed.value);
+        }
+        try merged.put(
+            alloc,
+            try alloc.dupe(u8, name),
+            try alloc.dupe(u8, value),
+        );
+    }
+
+    pub fn enableSqlRowSecurity(self: *UserManager, table: []const u8) !void {
+        if (table.len == 0) return error.InvalidRowFilter;
+        if (try self.sqlRowSecurityEnabled(table)) return;
+        _ = try self.enforcer.addNamedPolicy("p4", &.{table});
+    }
+
+    pub fn disableSqlRowSecurity(self: *UserManager, table: []const u8) !void {
+        if (table.len == 0) return error.InvalidRowFilter;
+        if (!(try self.sqlRowSecurityEnabled(table))) return;
+        _ = try self.enforcer.removeFilteredNamedPolicy("p4", 0, &.{table});
+    }
+
+    pub fn sqlRowSecurityEnabled(self: *const UserManager, table: []const u8) !bool {
+        if (table.len == 0) return false;
+        return try self.hasFilteredPolicy("p4", 0, table);
+    }
+
+    pub fn createSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8) !void {
+        try self.createSqlRowSecurityPolicyWithTargets(policy_name, table, filter_json, &.{});
+    }
+
+    pub fn createSqlRowSecurityPolicyWithTargets(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, role_targets: []const []const u8) !void {
+        try self.createSqlRowSecurityPolicyWithTargetsAndCheck(policy_name, table, filter_json, filter_json, role_targets);
+    }
+
+    pub fn createSqlRowSecurityPolicyWithTargetsAndCheck(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, check_filter_json: []const u8, role_targets: []const []const u8) !void {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        if (self.getSubjectRowFilter(subject, table)) |existing| {
+            self.alloc.free(existing);
+            return error.PolicyExists;
+        } else |err| switch (err) {
+            error.RowFilterNotFound => {},
+            else => return err,
+        }
+        try self.setSubjectRowFilter(subject, table, filter_json);
+        errdefer self.removeSubjectRowFilter(subject, table) catch {};
+        try self.setSubjectSqlRowSecurityCheckFilter(subject, table, check_filter_json);
+        try self.replaceSqlRowSecurityPolicyTargets(subject, table, role_targets);
+    }
+
+    pub fn replaceSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8) !void {
+        try self.replaceSqlRowSecurityPolicyWithTargets(policy_name, table, filter_json, &.{});
+    }
+
+    pub fn replaceSqlRowSecurityPolicyWithTargets(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, role_targets: []const []const u8) !void {
+        try self.replaceSqlRowSecurityPolicyWithTargetsAndCheck(policy_name, table, filter_json, filter_json, role_targets);
+    }
+
+    pub fn replaceSqlRowSecurityPolicyWithTargetsAndCheck(self: *UserManager, policy_name: []const u8, table: []const u8, filter_json: []const u8, check_filter_json: []const u8, role_targets: []const []const u8) !void {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        const existing = try self.getSubjectRowFilter(subject, table);
+        self.alloc.free(existing);
+        try self.setSubjectRowFilter(subject, table, filter_json);
+        try self.setSubjectSqlRowSecurityCheckFilter(subject, table, check_filter_json);
+        try self.replaceSqlRowSecurityPolicyTargets(subject, table, role_targets);
+    }
+
+    pub fn dropSqlRowSecurityPolicy(self: *UserManager, policy_name: []const u8, table: []const u8) !void {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        try self.removeSubjectRowFilter(subject, table);
+        _ = try self.enforcer.removeFilteredNamedPolicy("p8", 0, &.{ subject, table });
+        _ = try self.enforcer.removeFilteredNamedPolicy("p7", 0, &.{ subject, table });
+    }
+
+    pub fn getSqlRowSecurityPolicy(self: *const UserManager, policy_name: []const u8, table: []const u8) ![]u8 {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        return try self.getSubjectRowFilter(subject, table);
+    }
+
+    pub fn getSqlRowSecurityPolicyCheck(self: *const UserManager, policy_name: []const u8, table: []const u8) ![]u8 {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        return try self.getSubjectSqlRowSecurityCheckFilter(subject, table);
+    }
+
+    pub fn getSqlRowSecurityPolicyTargets(self: *const UserManager, policy_name: []const u8, table: []const u8) ![]const []const u8 {
+        const subject = try sqlRowSecurityPolicySubjectAlloc(self.alloc, policy_name);
+        defer self.alloc.free(subject);
+        const existing = try self.getSubjectRowFilter(subject, table);
+        self.alloc.free(existing);
+        const target_rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p7", 0, &.{ subject, table });
+        defer {
+            for (target_rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(target_rules);
+        }
+        var targets = std.ArrayList([]const u8).empty;
+        errdefer {
+            for (targets.items) |target| self.alloc.free(@constCast(target));
+            targets.deinit(self.alloc);
+        }
+        for (target_rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            const target = try self.alloc.dupe(u8, rule.fields[2]);
+            errdefer self.alloc.free(target);
+            try targets.append(self.alloc, target);
+        }
+        return try targets.toOwnedSlice(self.alloc);
+    }
+
+    fn replaceSqlRowSecurityPolicyTargets(self: *UserManager, policy_subject: []const u8, table: []const u8, role_targets: []const []const u8) !void {
+        _ = try self.enforcer.removeFilteredNamedPolicy("p7", 0, &.{ policy_subject, table });
+        for (role_targets) |target| {
+            if (target.len == 0) return error.InvalidRole;
+            _ = try self.enforcer.addNamedPolicy("p7", &.{ policy_subject, table, target });
+        }
+    }
+
+    fn mergeSqlRowSecurityPolicyFilters(self: *const UserManager, username: []const u8, roles: []const []const u8, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+        return try self.mergeSqlRowSecurityPolicyFiltersFromPolicy("p2", username, roles, merged);
+    }
+
+    fn mergeSqlRowSecurityPolicyCheckFilters(self: *const UserManager, username: []const u8, roles: []const []const u8, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+        return try self.mergeSqlRowSecurityPolicyFiltersFromPolicy("p8", username, roles, merged);
+    }
+
+    fn mergeSqlRowSecurityPolicyFiltersFromPolicy(self: *const UserManager, ptype: []const u8, username: []const u8, roles: []const []const u8, merged: *std.StringArrayHashMapUnmanaged([]u8)) !void {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, ptype, 0, &.{});
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+
+        var sql_filters = std.StringArrayHashMapUnmanaged(std.ArrayListUnmanaged([]u8)){};
+        defer {
+            var it = sql_filters.iterator();
+            while (it.next()) |entry| {
+                self.alloc.free(entry.key_ptr.*);
+                for (entry.value_ptr.items) |filter| self.alloc.free(filter);
+                entry.value_ptr.deinit(self.alloc);
+            }
+            sql_filters.deinit(self.alloc);
+        }
+
+        for (rules) |rule| {
+            if (rule.fields.len < 3) continue;
+            if (!isSqlRowSecurityPolicySubject(rule.fields[0])) continue;
+            if (!(try self.sqlRowSecurityEnabled(rule.fields[1]))) continue;
+            if (!(try self.sqlRowSecurityPolicyAppliesToUser(rule.fields[0], rule.fields[1], username, roles))) continue;
+            const gop = try sql_filters.getOrPut(self.alloc, rule.fields[1]);
+            if (!gop.found_existing) {
+                gop.key_ptr.* = try self.alloc.dupe(u8, rule.fields[1]);
+                gop.value_ptr.* = .empty;
+            }
+            const filter = try self.alloc.dupe(u8, rule.fields[2]);
+            errdefer self.alloc.free(filter);
+            try gop.value_ptr.append(self.alloc, filter);
+        }
+
+        var it = sql_filters.iterator();
+        while (it.next()) |entry| {
+            const filter = try sqlRowSecurityPermissiveFilterJsonAlloc(self.alloc, entry.value_ptr.items);
+            defer self.alloc.free(filter);
+            try mergeRowFilter(self.alloc, merged, entry.key_ptr.*, filter);
+        }
+    }
+
+    fn sqlRowSecurityPermissiveFilterJsonAlloc(alloc: Allocator, filters: []const []const u8) ![]u8 {
+        if (filters.len == 0) return error.InvalidRowFilter;
+        if (filters.len == 1) return try alloc.dupe(u8, filters[0]);
+
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "{\"disjuncts\":[");
+        for (filters, 0..) |filter, i| {
+            if (i != 0) try out.append(alloc, ',');
+            try out.appendSlice(alloc, filter);
+        }
+        try out.appendSlice(alloc, "]}");
+        return try out.toOwnedSlice(alloc);
+    }
+
+    fn sqlRowSecurityPolicyAppliesToUser(self: *const UserManager, policy_subject: []const u8, table: []const u8, username: []const u8, roles: []const []const u8) !bool {
+        const targets = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p7", 0, &.{ policy_subject, table });
+        defer {
+            for (targets) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(targets);
+        }
+        if (targets.len == 0) return true;
+        for (targets) |target| {
+            if (target.fields.len < 3) continue;
+            if (std.mem.eql(u8, target.fields[2], sql_row_security_no_targets_subject)) continue;
+            if (std.mem.eql(u8, target.fields[2], username)) return true;
+            for (roles) |role| {
+                if (std.mem.eql(u8, target.fields[2], role)) return true;
+            }
+        }
+        return false;
     }
 
     pub fn addRoleToUser(self: *UserManager, username: []const u8, role: []const u8) !void {
@@ -793,6 +1798,8 @@ pub const UserManager = struct {
 
         try self.collectAuthSubjectsFromPolicy(&subjects, "p");
         try self.collectAuthSubjectsFromPolicy(&subjects, "p2");
+        try self.collectAuthSubjectsFromPolicy(&subjects, "p8");
+        try self.collectAuthSubjectsFromPolicy(&subjects, "p7");
         try self.collectAuthSubjectsFromPolicy(&subjects, "g");
 
         var out = std.ArrayList(AuthSubjectEntry).empty;
@@ -823,6 +1830,9 @@ pub const UserManager = struct {
             if (std.mem.eql(u8, ptype, "g") and rule.fields.len >= 2) {
                 try putAuthSubject(self.alloc, subjects, rule.fields[1], inferAuthSubjectKind(rule.fields[1]));
             }
+            if (std.mem.eql(u8, ptype, "p7") and rule.fields.len >= 3) {
+                try putAuthSubject(self.alloc, subjects, rule.fields[2], inferAuthSubjectKind(rule.fields[2]));
+            }
         }
     }
 
@@ -831,6 +1841,13 @@ pub const UserManager = struct {
         parsed.deinit();
         _ = try self.enforcer.removeFilteredNamedPolicy("p2", 0, &.{ subject, table });
         _ = try self.enforcer.addNamedPolicy("p2", &.{ subject, table, filter_json });
+    }
+
+    fn setSubjectSqlRowSecurityCheckFilter(self: *UserManager, subject: []const u8, table: []const u8, filter_json: []const u8) !void {
+        var parsed = try std.json.parseFromSlice(std.json.Value, self.alloc, filter_json, .{});
+        parsed.deinit();
+        _ = try self.enforcer.removeFilteredNamedPolicy("p8", 0, &.{ subject, table });
+        _ = try self.enforcer.addNamedPolicy("p8", &.{ subject, table, filter_json });
     }
 
     pub fn setRowFilter(self: *UserManager, username: []const u8, table: []const u8, filter_json: []const u8) !void {
@@ -850,6 +1867,16 @@ pub const UserManager = struct {
 
     pub fn getSubjectRowFilter(self: *const UserManager, subject: []const u8, table: []const u8) ![]u8 {
         const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p2", 0, &.{ subject, table });
+        defer {
+            for (rules) |*rule| rule.deinit(self.alloc);
+            self.alloc.free(rules);
+        }
+        if (rules.len == 0 or rules[0].fields.len < 3) return error.RowFilterNotFound;
+        return try self.alloc.dupe(u8, rules[0].fields[2]);
+    }
+
+    fn getSubjectSqlRowSecurityCheckFilter(self: *const UserManager, subject: []const u8, table: []const u8) ![]u8 {
+        const rules = try self.enforcer.getFilteredNamedPolicy(self.alloc, "p8", 0, &.{ subject, table });
         defer {
             for (rules) |*rule| rule.deinit(self.alloc);
             self.alloc.free(rules);
@@ -887,6 +1914,19 @@ pub const UserManager = struct {
     }
 
     pub fn getRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        return try self.getEffectiveRowFiltersFromSqlPolicy(username, .read);
+    }
+
+    pub fn getWriteRowFilters(self: *const UserManager, username: []const u8) ![]RowFilterEntry {
+        return try self.getEffectiveRowFiltersFromSqlPolicy(username, .write);
+    }
+
+    const SqlRowSecurityFilterMode = enum {
+        read,
+        write,
+    };
+
+    fn getEffectiveRowFiltersFromSqlPolicy(self: *const UserManager, username: []const u8, mode: SqlRowSecurityFilterMode) ![]RowFilterEntry {
         if (!self.users.contains(username)) return error.UserNotFound;
         const listed = try self.listSubjectRowFilters(username);
         defer {
@@ -908,6 +1948,11 @@ pub const UserManager = struct {
 
         for (listed) |entry| {
             try mergeRowFilterEntry(self.alloc, &merged, entry);
+        }
+
+        switch (mode) {
+            .read => try self.mergeSqlRowSecurityPolicyFilters(username, roles, &merged),
+            .write => try self.mergeSqlRowSecurityPolicyCheckFilters(username, roles, &merged),
         }
 
         for (roles) |role| {
@@ -1026,6 +2071,8 @@ pub const UserManager = struct {
             .row_filter = try combineLayeredRowFilters(self.alloc, owner_row_filter, record.key.row_filter),
             .metadata_json = try self.alloc.dupe(u8, self.user_metadata.get(record.key.username) orelse "{}"),
             .roles = try self.getRolesForUser(record.key.username),
+            .role_settings = try self.getEffectiveRoleSettings(record.key.username),
+            .role_runtime_settings = try self.getEffectiveRoleRuntimeSettings(record.key.username),
         };
     }
 
@@ -1139,17 +2186,26 @@ fn mergeRowFilterEntry(
     merged: *std.StringArrayHashMapUnmanaged([]u8),
     entry: RowFilterEntry,
 ) !void {
-    const gop = try merged.getOrPut(alloc, entry.table);
+    try mergeRowFilter(alloc, merged, entry.table, entry.filter);
+}
+
+fn mergeRowFilter(
+    alloc: Allocator,
+    merged: *std.StringArrayHashMapUnmanaged([]u8),
+    table: []const u8,
+    filter: []const u8,
+) !void {
+    const gop = try merged.getOrPut(alloc, table);
     if (!gop.found_existing) {
-        gop.key_ptr.* = try alloc.dupe(u8, entry.table);
-        gop.value_ptr.* = try alloc.dupe(u8, entry.filter);
+        gop.key_ptr.* = try alloc.dupe(u8, table);
+        gop.value_ptr.* = try alloc.dupe(u8, filter);
         return;
     }
 
     const combined = try std.fmt.allocPrint(
         alloc,
         "{{\"conjuncts\":[{s},{s}]}}",
-        .{ gop.value_ptr.*, entry.filter },
+        .{ gop.value_ptr.*, filter },
     );
     alloc.free(gop.value_ptr.*);
     gop.value_ptr.* = combined;
@@ -1176,6 +2232,9 @@ fn putAuthSubject(
     kind: AuthSubjectKind,
 ) !void {
     if (subject.len == 0) return;
+    if (std.mem.eql(u8, subject, sql_role_catalog_subject)) return;
+    if (std.mem.eql(u8, subject, sql_row_security_no_targets_subject)) return;
+    if (isSqlRowSecurityPolicySubject(subject)) return;
     const owned_subject = try alloc.dupe(u8, subject);
     errdefer alloc.free(owned_subject);
     const gop = try subjects.getOrPut(alloc, owned_subject);
@@ -1188,6 +2247,15 @@ fn putAuthSubject(
     }
     gop.key_ptr.* = owned_subject;
     gop.value_ptr.* = kind;
+}
+
+fn sqlRowSecurityPolicySubjectAlloc(alloc: Allocator, policy_name: []const u8) ![]u8 {
+    if (policy_name.len == 0) return error.InvalidRole;
+    return try std.fmt.allocPrint(alloc, "{s}{s}", .{ sql_row_security_policy_subject_prefix, policy_name });
+}
+
+fn isSqlRowSecurityPolicySubject(subject: []const u8) bool {
+    return std.mem.startsWith(u8, subject, sql_row_security_policy_subject_prefix);
 }
 
 fn combineLayeredRowFilters(
@@ -1439,6 +2507,211 @@ test "usermgr default admin seed is idempotent and grants admin" {
     try std.testing.expect(try manager.enforce("admin", .@"*", "*", .admin));
 }
 
+test "usermgr role settings are native app settings only and replace durably" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    try manager.createRoleSubject("role:app_writer");
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleSetting("role:app_writer", "statement_timeout", "5s"));
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleSetting("role:app_writer", "app.", "acme"));
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleSetting("role:app_writer", "app..tenant_id", "acme"));
+
+    try manager.setRoleSetting("role:app_writer", "app.tenant_id", "acme");
+    try manager.setRoleSetting("role:app_writer", "app.tenant_id", "other");
+    const setting = try manager.getRoleSetting("role:app_writer", "app.tenant_id");
+    defer alloc.free(setting);
+    try std.testing.expectEqualStrings("other", setting);
+
+    const settings = try manager.listRoleSettingsForSubject("role:app_writer");
+    defer {
+        for (settings) |*entry| entry.deinit(alloc);
+        alloc.free(settings);
+    }
+    try std.testing.expectEqual(@as(usize, 1), settings.len);
+    try std.testing.expectEqualStrings("app.tenant_id", settings[0].name);
+    try std.testing.expectEqualStrings("other", settings[0].value);
+}
+
+test "usermgr database scoped app role settings override global settings durably" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try manager.createRoleSubject("role:app_writer");
+    try manager.createRoleSubject("role:app_reader");
+    try manager.addRoleToUser("alice", "role:app_writer");
+    try manager.addRoleToUser("alice", "role:app_reader");
+
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleDatabaseSetting("role:app_writer", "", "app.tenant_id", "acme"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleDatabaseSetting("role:app_writer", "*", "app.tenant_id", "acme"));
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleDatabaseSetting("role:app_writer", "appdb", "statement_timeout", "5s"));
+
+    try manager.setRoleSetting("role:app_writer", "app.tenant_id", "global-role");
+    try manager.setRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id", "scoped-role");
+    try manager.setRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id", "scoped-role-replaced");
+    const scoped = try manager.getRoleDatabaseSetting("role:app_writer", "appdb", "app.tenant_id");
+    defer alloc.free(scoped);
+    try std.testing.expectEqualStrings("scoped-role-replaced", scoped);
+
+    const global_effective = try manager.getEffectiveRoleSettings("alice");
+    defer {
+        for (global_effective) |*setting| setting.deinit(alloc);
+        alloc.free(global_effective);
+    }
+    try std.testing.expectEqual(@as(usize, 1), global_effective.len);
+    try std.testing.expectEqualStrings("app.tenant_id", global_effective[0].name);
+    try std.testing.expectEqualStrings("global-role", global_effective[0].value);
+
+    const scoped_effective = try manager.getEffectiveRoleSettingsForDatabase("alice", "appdb");
+    defer {
+        for (scoped_effective) |*setting| setting.deinit(alloc);
+        alloc.free(scoped_effective);
+    }
+    try std.testing.expectEqual(@as(usize, 1), scoped_effective.len);
+    try std.testing.expectEqualStrings("app.tenant_id", scoped_effective[0].name);
+    try std.testing.expectEqualStrings("scoped-role-replaced", scoped_effective[0].value);
+
+    try manager.setRoleDatabaseSetting("role:app_reader", "appdb", "app.tenant_id", "conflict");
+    try std.testing.expectError(error.RoleSettingConflict, manager.getEffectiveRoleSettingsForDatabase("alice", "appdb"));
+
+    try manager.setRoleDatabaseSetting("alice", "appdb", "app.tenant_id", "direct-scoped");
+    const direct_scoped_effective = try manager.getEffectiveRoleSettingsForDatabase("alice", "appdb");
+    defer {
+        for (direct_scoped_effective) |*setting| setting.deinit(alloc);
+        alloc.free(direct_scoped_effective);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_scoped_effective.len);
+    try std.testing.expectEqualStrings("direct-scoped", direct_scoped_effective[0].value);
+
+    try manager.removeRoleDatabaseSetting("alice", "appdb", "app.tenant_id");
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleDatabaseSetting("alice", "appdb", "app.tenant_id"));
+}
+
+test "usermgr runtime role settings are native role defaults with optional database scope" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    try manager.createRoleSubject("role:app_writer");
+    try std.testing.expectError(error.UnsupportedRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "unknown_guc", "on"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", "", "statement_timeout", "5s"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", "*", "statement_timeout", "5s"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "five seconds"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5fortnights"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "search_path", "public,,analytics"));
+    try std.testing.expectError(error.InvalidRoleSetting, manager.setRoleRuntimeSetting("role:app_writer", null, "timezone", "UTC;DROP"));
+
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5s");
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "10s");
+    const global_setting = try manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout");
+    defer alloc.free(global_setting);
+    try std.testing.expectEqualStrings("10s", global_setting);
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "timezone", "America/Los_Angeles");
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "search_path", "analytics, public");
+
+    try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
+    const scoped_setting = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer alloc.free(scoped_setting);
+    try std.testing.expectEqualStrings("1ms", scoped_setting);
+
+    try manager.removeRoleRuntimeSetting("role:app_writer", null, "statement_timeout");
+    try std.testing.expectError(error.RoleSettingNotFound, manager.getRoleRuntimeSetting("role:app_writer", null, "statement_timeout"));
+    const scoped_after_global_reset = try manager.getRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout");
+    defer alloc.free(scoped_after_global_reset);
+    try std.testing.expectEqualStrings("1ms", scoped_after_global_reset);
+}
+
+test "usermgr effective runtime role settings merge direct database overrides and inherited conflicts" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var user = try manager.createUser("alice", "secret", &.{});
+    defer user.deinit(alloc);
+    try manager.createRoleSubject("role:app_writer");
+    try manager.createRoleSubject("role:app_reader");
+    try manager.addRoleToUser("alice", "role:app_writer");
+    try manager.addRoleToUser("alice", "role:app_reader");
+
+    try manager.setRoleRuntimeSetting("role:app_writer", null, "statement_timeout", "5s");
+    try manager.setRoleRuntimeSetting("role:app_reader", null, "statement_timeout", "5s");
+    const inherited = try manager.getEffectiveRoleRuntimeSettings("alice");
+    defer {
+        for (inherited) |*setting| setting.deinit(alloc);
+        alloc.free(inherited);
+    }
+    try std.testing.expectEqual(@as(usize, 1), inherited.len);
+    try std.testing.expectEqualStrings("statement_timeout", inherited[0].name);
+    try std.testing.expectEqualStrings("5s", inherited[0].value);
+
+    try manager.setRoleRuntimeSetting("role:app_writer", "appdb", "statement_timeout", "1ms");
+    try manager.setRoleRuntimeSetting("role:app_reader", "appdb", "statement_timeout", "1ms");
+    const scoped = try manager.getEffectiveRoleRuntimeSettingsForDatabase("alice", "appdb");
+    defer {
+        for (scoped) |*setting| setting.deinit(alloc);
+        alloc.free(scoped);
+    }
+    try std.testing.expectEqual(@as(usize, 1), scoped.len);
+    try std.testing.expectEqualStrings("statement_timeout", scoped[0].name);
+    try std.testing.expectEqualStrings("1ms", scoped[0].value);
+
+    try manager.setRoleRuntimeSetting("alice", "appdb", "statement_timeout", "500us");
+    const direct_scoped = try manager.getEffectiveRoleRuntimeSettingsForDatabase("alice", "appdb");
+    defer {
+        for (direct_scoped) |*setting| setting.deinit(alloc);
+        alloc.free(direct_scoped);
+    }
+    try std.testing.expectEqual(@as(usize, 1), direct_scoped.len);
+    try std.testing.expectEqualStrings("500us", direct_scoped[0].value);
+
+    try manager.removeRoleRuntimeSetting("alice", "appdb", "statement_timeout");
+    try manager.setRoleRuntimeSetting("role:app_reader", "appdb", "statement_timeout", "2ms");
+    try std.testing.expectError(error.RoleSettingConflict, manager.getEffectiveRoleRuntimeSettingsForDatabase("alice", "appdb"));
+}
+
 test "usermgr permissions and row filters mirror go semantics" {
     const alloc = std.testing.allocator;
 
@@ -1561,6 +2834,147 @@ test "usermgr roles inherit permissions and row filters" {
     }
     try std.testing.expectEqual(@as(usize, 1), direct.len);
     try std.testing.expect(std.mem.indexOf(u8, direct[0].filter, "\"owner\"") != null);
+}
+
+test "usermgr SQL row security policy targets follow role membership durably" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var alice = try manager.createUser("alice", "secret", &.{});
+    defer alice.deinit(alloc);
+    var bob = try manager.createUser("bob", "secret", &.{});
+    defer bob.deinit(alloc);
+    try manager.createRoleSubject("role:tenant_reader");
+    try manager.createRoleSubject("role:tenant_writer");
+    try manager.addRoleToUser("alice", "role:tenant_reader");
+
+    try manager.enableSqlRowSecurity("default.public.docs");
+    try manager.createSqlRowSecurityPolicyWithTargets(
+        "tenant_only",
+        "default.public.docs",
+        "{\"term\":{\"tenant_id\":\"acme\"}}",
+        &.{"role:tenant_reader"},
+    );
+    try manager.createSqlRowSecurityPolicyWithTargets(
+        "public_visibility",
+        "default.public.docs",
+        "{\"term\":{\"visibility\":\"public\"}}",
+        &.{},
+    );
+
+    const alice_filters = try manager.getRowFilters("alice");
+    defer {
+        for (alice_filters) |*entry| entry.deinit(alloc);
+        alloc.free(alice_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"disjuncts\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"conjuncts\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"tenant_id\":\"acme\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"visibility\":\"public\"") != null);
+
+    const bob_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bob_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, bob_filters[0].filter, "\"tenant_id\":\"acme\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, bob_filters[0].filter, "\"visibility\":\"public\"") != null);
+
+    try std.testing.expectError(error.RoleInUse, manager.dropRoleSubject("role:tenant_reader"));
+    try manager.dropRoleSubjectCascade("role:tenant_reader");
+    const alice_after_cascade = try manager.getRowFilters("alice");
+    defer {
+        for (alice_after_cascade) |*entry| entry.deinit(alloc);
+        alloc.free(alice_after_cascade);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_after_cascade.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_after_cascade[0].filter, "\"tenant_id\":\"acme\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_after_cascade[0].filter, "\"visibility\":\"public\"") != null);
+}
+
+test "usermgr SQL row security policy target replacement updates effective filters" {
+    const alloc = std.testing.allocator;
+
+    var store = MemoryStore.init(alloc);
+    defer store.deinit();
+    var policy_store = casbin.MemoryAdapter.init(alloc);
+    defer policy_store.deinit();
+    var manager = try UserManager.init(
+        alloc,
+        store.iface(),
+        try initDefaultEnforcer(alloc, policy_store.iface()),
+    );
+    defer manager.deinit();
+
+    var alice = try manager.createUser("alice", "secret", &.{});
+    defer alice.deinit(alloc);
+    var bob = try manager.createUser("bob", "secret", &.{});
+    defer bob.deinit(alloc);
+
+    try manager.createRoleSubject("role:app_reader");
+    try manager.createRoleSubject("role:app_writer");
+    try manager.enableSqlRowSecurity("docs");
+    try manager.addRoleToUser("alice", "role:app_reader");
+    try manager.addRoleToUser("bob", "role:app_writer");
+
+    try manager.createSqlRowSecurityPolicyWithTargets(
+        "docs_reader_policy",
+        "docs",
+        "{\"term\":{\"tenant_id\":\"reader\"}}",
+        &.{"role:app_reader"},
+    );
+    try manager.createSqlRowSecurityPolicyWithTargets(
+        "docs_public_policy",
+        "docs",
+        "{\"term\":{\"visibility\":\"public\"}}",
+        &.{},
+    );
+
+    try manager.replaceSqlRowSecurityPolicyWithTargets(
+        "docs_reader_policy",
+        "docs",
+        "{\"term\":{\"tenant_id\":\"reader\"}}",
+        &.{"role:app_writer"},
+    );
+
+    const targets = try manager.getSqlRowSecurityPolicyTargets("docs_reader_policy", "docs");
+    defer {
+        for (targets) |target| alloc.free(@constCast(target));
+        alloc.free(targets);
+    }
+    try std.testing.expectEqual(@as(usize, 1), targets.len);
+    try std.testing.expectEqualStrings("role:app_writer", targets[0]);
+
+    const alice_filters = try manager.getRowFilters("alice");
+    defer {
+        for (alice_filters) |*entry| entry.deinit(alloc);
+        alloc.free(alice_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), alice_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"visibility\":\"public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, alice_filters[0].filter, "\"tenant_id\":\"reader\"") == null);
+
+    const bob_filters = try manager.getRowFilters("bob");
+    defer {
+        for (bob_filters) |*entry| entry.deinit(alloc);
+        alloc.free(bob_filters);
+    }
+    try std.testing.expectEqual(@as(usize, 1), bob_filters.len);
+    try std.testing.expect(std.mem.indexOf(u8, bob_filters[0].filter, "\"visibility\":\"public\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, bob_filters[0].filter, "\"tenant_id\":\"reader\"") != null);
 }
 
 test "usermgr api keys validate and persist creator-scoped permissions" {

@@ -26,6 +26,7 @@ const segment_mod = @import("../segment/mod.zig");
 const wal_mod = @import("../wal/mod.zig");
 const builder_mod = @import("../build/builder.zig");
 const impact_planner = @import("../build/impact_planner.zig");
+const external_source_manifest = @import("../build/external_source_manifest.zig");
 const publication_plan = @import("../build/publication_plan.zig");
 const enrichment_pipeline = @import("../enrichment/pipeline.zig");
 const api_codec = @import("../api/codec.zig");
@@ -33,7 +34,7 @@ const api_types = @import("../api/types.zig");
 const search_sources = @import("../search_sources.zig");
 const vector_segment_mod = @import("../vector_segment/mod.zig");
 const vector_index = @import("../build/vector_index.zig");
-const tables_api = @import("../../api/tables.zig");
+const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const full_text_indexes = @import("../../api/full_text_indexes.zig");
 const shared_vector = @import("antfly_vector").vector;
 
@@ -45,6 +46,7 @@ pub const CatalogService = struct {
     wal: *wal_mod.WalStore,
     builder: *builder_mod.Builder,
     store: *catalog_store.CatalogStore,
+    external_source_plan_resolver: ?publication_plan.ExternalSourcePlanResolver = null,
 
     pub fn init(
         alloc: Allocator,
@@ -63,11 +65,19 @@ pub const CatalogService = struct {
             .wal = wal,
             .builder = builder,
             .store = store,
+            .external_source_plan_resolver = null,
         };
     }
 
     pub fn deinit(self: *CatalogService) void {
         self.* = undefined;
+    }
+
+    pub fn setExternalSourcePlanResolver(
+        self: *CatalogService,
+        resolver: ?publication_plan.ExternalSourcePlanResolver,
+    ) void {
+        self.external_source_plan_resolver = resolver;
     }
 
     pub fn ensureNamespace(self: *CatalogService, name: []const u8, created_at_ns: u64) !bool {
@@ -675,6 +685,21 @@ pub const CatalogService = struct {
         return try self.alloc.dupe(u8, table_name);
     }
 
+    fn externalSourcePlanForTableAlloc(
+        self: *CatalogService,
+        namespace: []const u8,
+        table: catalog_types.TableNamespaceRecord,
+    ) !?external_source_manifest.Plan {
+        const resolver = self.external_source_plan_resolver orelse return null;
+        var binding = (try publication_plan.externalBindingFromSchemaJsonAlloc(self.alloc, table.schema_json)) orelse return null;
+        defer binding.deinit(self.alloc);
+        return try resolver.resolveAlloc(self.alloc, .{
+            .namespace = namespace,
+            .table_name = table.table_name,
+            .binding = binding.binding,
+        });
+    }
+
     fn publicationPlanForNamespaceAlloc(
         self: *CatalogService,
         namespace: []const u8,
@@ -685,7 +710,7 @@ pub const CatalogService = struct {
         for (tables) |table| {
             if (!std.mem.eql(u8, table.namespace, namespace)) continue;
             const effective_policy = effectivePolicyForTable(policy, table.indexes_json) catch return error.InvalidTableIndexMetadata;
-            const targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
+            var targets: builder_mod.Builder.PublicationTargets = if (table.indexes_json.len == 0 or std.mem.eql(u8, table.indexes_json, "{}"))
                 .{
                     .published_search_sources = try search_sources.clonePublishedSearchSourcesAlloc(self.alloc, search_sources.defaultPublishedSearchSources()),
                     .include_graph = true,
@@ -700,6 +725,7 @@ pub const CatalogService = struct {
                     ),
                     .include_graph = true,
                 };
+            errdefer search_sources.deinitPublishedSearchSources(self.alloc, &targets.published_search_sources);
 
             var metadata_republish: publication_plan.MetadataRepublishReasons = .{};
             var published_head = try self.loadPublishedHeadAlloc(namespace);
@@ -826,15 +852,21 @@ pub const CatalogService = struct {
                     else
                         .recompute,
                 };
+                var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                    self.alloc,
+                    table.schema_json,
+                    table.read_schema_json,
+                    table.indexes_json,
+                );
+                errdefer table_definition.deinit(self.alloc);
+                var external_source_plan = try self.externalSourcePlanForTableAlloc(namespace, table);
+                errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
                 return .{
                     .targets = targets,
                     .policy = effective_policy,
-                    .table_definition = .{
-                        .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                        .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                        .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                    },
+                    .table_definition = table_definition,
+                    .external_source_plan = external_source_plan,
                     .metadata_republish = metadata_republish,
                     .artifact_actions = artifact_actions,
                     .full_text_index_actions = full_text_index_actions,
@@ -877,15 +909,21 @@ pub const CatalogService = struct {
                 0,
             );
             errdefer freeNamedArtifactActions(self.alloc, graph_index_actions);
+            var table_definition = try publication_plan.tableDefinitionSnapshotAlloc(
+                self.alloc,
+                table.schema_json,
+                table.read_schema_json,
+                table.indexes_json,
+            );
+            errdefer table_definition.deinit(self.alloc);
+            var external_source_plan = try self.externalSourcePlanForTableAlloc(namespace, table);
+            errdefer if (external_source_plan) |*plan| plan.deinit(self.alloc);
 
             return .{
                 .targets = targets,
                 .policy = effective_policy,
-                .table_definition = .{
-                    .schema_json = try self.alloc.dupe(u8, table.schema_json),
-                    .read_schema_json = try self.alloc.dupe(u8, table.read_schema_json),
-                    .indexes_json = try self.alloc.dupe(u8, table.indexes_json),
-                },
+                .table_definition = table_definition,
+                .external_source_plan = external_source_plan,
                 .metadata_republish = metadata_republish,
                 .artifact_actions = .{
                     .document_segment = .rebuild,
@@ -2571,6 +2609,133 @@ test "catalog service exposes table records over serving namespaces" {
     defer after_build.deinit(alloc);
     try std.testing.expectEqualStrings("semantic_idx", after_build.materialized_search_sources.findVector().?.index_name);
     try std.testing.expectEqualStrings("sparse_idx", after_build.materialized_search_sources.findSparse().?.index_name);
+}
+
+test "catalog service resolves current external table source during publication" {
+    const alloc = std.testing.allocator;
+
+    var artifact_root_buf: [256]u8 = undefined;
+    var manifest_root_buf: [256]u8 = undefined;
+    var wal_root_buf: [256]u8 = undefined;
+    var catalog_root_buf: [256]u8 = undefined;
+    const artifact_root = tmpPath(&artifact_root_buf, "artifacts-external-plan-resolver");
+    const manifest_root = tmpPath(&manifest_root_buf, "manifests-external-plan-resolver");
+    const wal_root = tmpPath(&wal_root_buf, "wal-external-plan-resolver");
+    const catalog_root = tmpPath(&catalog_root_buf, "catalog-external-plan-resolver");
+    defer cleanupTmp(artifact_root);
+    defer cleanupTmp(manifest_root);
+    defer cleanupTmp(wal_root);
+    defer cleanupTmp(catalog_root);
+
+    var fs_artifacts = try artifacts_mod.FsStore.init(alloc, std.mem.span(artifact_root));
+    var artifact_store = fs_artifacts.artifactStore();
+    defer artifact_store.deinit();
+
+    var fs_manifests = try manifest_mod.FsStore.init(alloc, std.mem.span(manifest_root));
+    var manifest_store = fs_manifests.manifestStore();
+    defer manifest_store.deinit();
+
+    var fs_progress = try @import("fs_progress_store.zig").FsProgressStore.init(alloc, std.mem.span(manifest_root));
+    var progress_store = fs_progress.progressStore();
+    defer progress_store.deinit();
+
+    var fs_wal = try wal_mod.FsStore.init(alloc, std.mem.span(wal_root));
+    var wal_store = fs_wal.walStore();
+    defer wal_store.deinit();
+
+    var fs_catalog = try @import("fs_store.zig").FsStore.init(alloc, std.mem.span(catalog_root));
+    var fs_catalog_store = fs_catalog.catalogStore();
+    defer fs_catalog_store.deinit();
+
+    const inventory_payload =
+        \\{"snapshot_id":"iceberg-123","files":[{"path":"s3://bucket/warehouse/events/data-0001.parquet","rows":1}]}
+    ;
+    var inventory_artifact = try artifact_store.put(inventory_payload);
+    defer inventory_artifact.deinit(alloc);
+
+    const Resolver = struct {
+        artifact: artifacts_mod.ArtifactMetadata,
+
+        fn asResolver(self: *@This()) publication_plan.ExternalSourcePlanResolver {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .resolve = resolve,
+                },
+            };
+        }
+
+        fn resolve(
+            ptr: *anyopaque,
+            plan_alloc: Allocator,
+            request: publication_plan.ExternalSourcePlanResolveRequest,
+        ) !?external_source_manifest.Plan {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("events", request.namespace);
+            try std.testing.expectEqualStrings("events", request.table_name);
+            try std.testing.expectEqualStrings("s3://bucket/warehouse/events", request.binding.source_uri);
+            switch (request.binding.snapshot_mode) {
+                .current => {},
+                else => return error.TestExpectedCurrentSnapshot,
+            }
+            return try external_source_manifest.planAlloc(
+                plan_alloc,
+                request.binding.manifestFormat(),
+                request.binding.source_uri,
+                "iceberg-123",
+                request.binding.schema_fingerprint,
+                .{
+                    .artifact_id = self.artifact.artifact_id,
+                    .byte_len = self.artifact.byte_len,
+                    .checksum = self.artifact.checksum,
+                    .name = "events.external-files",
+                },
+            );
+        }
+    };
+    var resolver = Resolver{ .artifact = inventory_artifact };
+
+    var builder = builder_mod.Builder.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store);
+    var catalog = CatalogService.init(alloc, &artifact_store, &manifest_store, &progress_store, &wal_store, &builder, &fs_catalog_store);
+    defer catalog.deinit();
+    catalog.setExternalSourcePlanResolver(resolver.asResolver());
+
+    const external_schema_json =
+        \\{"version":5,"storage_mode":"relational","default_type":"row","enforce_types":true,"base_source":{"kind":"external","table_id":"events","format":"iceberg","uri":"s3://bucket/warehouse/events","snapshot":"current","schema_fingerprint":"schema-v5","write_policy":"read_only"},"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"text":{"type":"text"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}";
+    try std.testing.expect(try catalog.ensureTableWithDefinition(
+        "events",
+        100,
+        .{},
+        external_schema_json,
+        "",
+        indexes_json,
+    ));
+
+    var api = @import("../api/service.zig").Service.init(alloc, &wal_store, &builder);
+    const mutations = [_]api_types.DocumentMutation{
+        .{ .kind = .upsert, .doc_id = "evt-1", .body = "{\"id\":\"evt-1\",\"text\":\"alpha\"}" },
+    };
+    var ingest = try api.ingestBatch(.{ .namespace = "events", .timestamp_ns = 123, .mutations = &mutations });
+    defer ingest.deinit(alloc);
+
+    var build = try catalog.buildTable("events");
+    defer build.deinit(alloc);
+    try std.testing.expect(build.published);
+
+    var manifest = try manifest_store.getAlloc("events", build.version);
+    defer manifest.deinit(alloc);
+    const base_source = manifest.base_source orelse return error.TestExpectedBaseSource;
+    try std.testing.expectEqual(manifest_mod.BaseSourceKind.external_iceberg, std.meta.activeTag(base_source));
+    try std.testing.expectEqualStrings("s3://bucket/warehouse/events", base_source.external_iceberg.source_uri);
+    try std.testing.expectEqualStrings("iceberg-123", base_source.external_iceberg.snapshot_id);
+    try std.testing.expectEqualStrings("schema-v5", base_source.external_iceberg.schema_fingerprint);
+    try std.testing.expectEqualStrings(inventory_artifact.artifact_id, base_source.external_iceberg.file_inventory_artifact.?);
+
+    const external_artifact = manifest.artifacts[findArtifactIndex(manifest, .external_base_source).?];
+    try std.testing.expectEqualStrings(inventory_artifact.artifact_id, external_artifact.artifact_id);
+    try std.testing.expectEqualStrings("events.external-files", external_artifact.name);
 }
 
 test "catalog service republishes head when table index metadata changes without new wal" {

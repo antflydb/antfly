@@ -28,12 +28,15 @@ const metadata_table_workflow = @import("table_workflow.zig");
 const api_http_client = @import("../api/http_client.zig");
 const api_http_routes = @import("../api/http_routes.zig");
 const api_http_server = @import("../api/http_server.zig");
-const api_table_catalog = @import("../api/table_catalog.zig");
+const catalog_source_mod = @import("catalog/routing.zig");
+const catalog_jobs = @import("catalog/jobs.zig");
+const catalog_resources = @import("catalog/resources.zig");
 const api_table_reads = @import("../api/table_reads.zig");
+const api_relational_rows = @import("../sql/relational_rows.zig");
 const api_table_router = @import("../api/table_router.zig");
 const test_contract_helpers = @import("../api/test_contract_helpers.zig");
 const api_table_writes = @import("../api/table_writes.zig");
-const api_tables = @import("../api/tables.zig");
+const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const raft_catalog = @import("../raft/catalog.zig");
 const raft_host = @import("../raft/host.zig");
@@ -54,6 +57,8 @@ const std_http_listener = @import("../raft/transport/std_http_listener.zig");
 const docstore_mod = @import("../storage/docstore.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const internal_keys = @import("../storage/internal_keys.zig");
+const schema_mod = @import("../schema/mod.zig");
+const storage_schema = @import("../storage/schema.zig");
 const platform_clock = @import("../platform/clock.zig");
 const platform_time = @import("../platform/time.zig");
 const usermgr = @import("../usermgr/mod.zig");
@@ -1062,13 +1067,274 @@ const AutomaticMergePublicTrafficScenario = struct {
 
 fn expectBodyContainsAll(body: []const u8, needles: []const []const u8) !void {
     for (needles) |needle| {
-        try std.testing.expect(std.mem.indexOf(u8, body, needle) != null);
+        if (std.mem.indexOf(u8, body, needle) == null) {
+            std.debug.print("response body missing needle={s} body={s}\n", .{ needle, body });
+            return error.TestUnexpectedResult;
+        }
     }
+}
+
+fn relationalPhysicalKeyForRowAlloc(alloc: std.mem.Allocator, schema_json: []const u8, row_json: []const u8) ![]u8 {
+    var parsed = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, schema);
+    return try api_relational_rows.physicalPrimaryKeyFromRowJsonAlloc(alloc, schema, row_json);
+}
+
+fn fetchPublicRowsRequest(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    suffix: []const u8,
+    body: []const u8,
+    expected_status: u16,
+) !api_http_client.QueryResponse {
+    const path = try std.fmt.allocPrint(client.alloc, "{s}{s}{s}", .{
+        api_http_routes.Routes.tables_prefix,
+        table_name,
+        suffix,
+    });
+    defer client.alloc.free(path);
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, path);
+    defer client.alloc.free(uri);
+
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer resp.deinit(client.alloc);
+    if (resp.status != expected_status) {
+        std.debug.print("public rows request unexpected status={d} uri={s} body={s}\n", .{ resp.status, uri, resp.body });
+        return error.UnexpectedHttpStatus;
+    }
+    return .{ .body = try client.alloc.dupe(u8, resp.body) };
+}
+
+fn fetchPublicRowsGet(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_get_suffix, body, 200);
+}
+
+fn fetchPublicRowsQuery(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_query_suffix, body, 200);
+}
+
+fn waitForPublicRowsGetContains(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    needles: []const []const u8,
+    rounds: usize,
+) !api_http_client.QueryResponse {
+    var last_body: ?[]u8 = null;
+    defer if (last_body) |body_copy| client.alloc.free(body_copy);
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        var resp = fetchPublicRowsGet(client, base_uri, table_name, body) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => {
+                try cluster.stepAll();
+                continue;
+            },
+            else => return err,
+        };
+        var matched = true;
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, resp.body, needle) == null) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            if (last_body) |body_copy| {
+                client.alloc.free(body_copy);
+                last_body = null;
+            }
+            return resp;
+        }
+        if (last_body) |body_copy| client.alloc.free(body_copy);
+        last_body = try client.alloc.dupe(u8, resp.body);
+        resp.deinit(std.heap.page_allocator);
+        try cluster.stepAll();
+    }
+
+    if (last_body) |body_copy| {
+        try expectBodyContainsAll(body_copy, needles);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn waitForPublicRowsQueryContains(
+    cluster: *MetadataHttpClusterSimulation,
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    needles: []const []const u8,
+    rounds: usize,
+) !api_http_client.QueryResponse {
+    var last_body: ?[]u8 = null;
+    defer if (last_body) |body_copy| client.alloc.free(body_copy);
+
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        var resp = fetchPublicRowsQuery(client, base_uri, table_name, body) catch |err| switch (err) {
+            error.UnexpectedHttpStatus => {
+                try cluster.stepAll();
+                continue;
+            },
+            else => return err,
+        };
+        var matched = true;
+        for (needles) |needle| {
+            if (std.mem.indexOf(u8, resp.body, needle) == null) {
+                matched = false;
+                break;
+            }
+        }
+        if (matched) {
+            if (last_body) |body_copy| {
+                client.alloc.free(body_copy);
+                last_body = null;
+            }
+            return resp;
+        }
+        if (last_body) |body_copy| client.alloc.free(body_copy);
+        last_body = try client.alloc.dupe(u8, resp.body);
+        resp.deinit(std.heap.page_allocator);
+        try cluster.stepAll();
+    }
+
+    if (last_body) |body_copy| {
+        try expectBodyContainsAll(body_copy, needles);
+    }
+    return error.TestUnexpectedResult;
+}
+
+fn fetchPublicRowsBatchExpectStatus(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    expected_status: u16,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_batch_suffix, body, expected_status);
+}
+
+fn fetchPublicRowsMutationSourceExpectStatus(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    table_name: []const u8,
+    body: []const u8,
+    expected_status: u16,
+) !api_http_client.QueryResponse {
+    return try fetchPublicRowsRequest(client, base_uri, table_name, api_http_routes.Routes.rows_mutation_source_suffix, body, expected_status);
+}
+
+fn fetchPublicTransactionBegin(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+) !api_http_client.TransactionResponse {
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, api_http_routes.Routes.transactions_begin);
+    defer client.alloc.free(uri);
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = "{\"sync_level\":\"write\"}",
+    });
+    defer resp.deinit(client.alloc);
+    return .{
+        .status = resp.status,
+        .body = try client.alloc.dupe(u8, resp.body),
+    };
+}
+
+fn fetchPublicTransactionSessionCommitRaw(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    txn_id_hex: []const u8,
+) !api_http_client.TransactionResponse {
+    const path = try std.fmt.allocPrint(client.alloc, "{s}{s}{s}", .{
+        api_http_routes.Routes.transactions_prefix,
+        txn_id_hex,
+        api_http_routes.Routes.transactions_commit_suffix,
+    });
+    defer client.alloc.free(path);
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, path);
+    defer client.alloc.free(uri);
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .body = "",
+    });
+    defer resp.deinit(client.alloc);
+    return .{
+        .status = resp.status,
+        .body = try client.alloc.dupe(u8, resp.body),
+    };
+}
+
+fn fetchPublicTransactionCommitRaw(
+    client: *api_http_client.ApiHttpClient,
+    base_uri: []const u8,
+    body: []const u8,
+) !api_http_client.TransactionResponse {
+    const uri = try raft_transport.Routes.join(client.alloc, base_uri, api_http_routes.Routes.transactions_commit);
+    defer client.alloc.free(uri);
+    var resp = try client.executor.execute(client.alloc, .{
+        .method = .POST,
+        .uri = uri,
+        .content_type = "application/json",
+        .body = body,
+    });
+    defer resp.deinit(client.alloc);
+    return .{
+        .status = resp.status,
+        .body = try client.alloc.dupe(u8, resp.body),
+    };
+}
+
+fn waitForUniqueOwnerGroupActive(
+    cluster: *MetadataHttpClusterSimulation,
+    table_id: u64,
+    constraint_name: []const u8,
+    rounds: usize,
+) !u64 {
+    var round: usize = 0;
+    while (round < rounds) : (round += 1) {
+        const leader_index = currentMetadataLeaderIndex(cluster) orelse 0;
+        var snapshot = try cluster.node(leader_index).adminSnapshot();
+        defer cluster.node(leader_index).freeAdminSnapshot(&snapshot);
+        for (snapshot.unique_constraint_ranges) |range| {
+            if (range.table_id != table_id) continue;
+            if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+            if (!metadata_table_manager.uniqueConstraintRangeRoutable(range)) continue;
+            _ = try waitForSingleActiveGroupHost(cluster, range.group_id, 8);
+            return range.group_id;
+        }
+        try cluster.stepAll();
+    }
+    return error.TestExpectedEqual;
 }
 
 fn waitForSplitResolvedGroups(
     cluster: *MetadataHttpClusterSimulation,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     route_rounds: usize,
 ) !SplitResolvedGroups {
@@ -1081,7 +1347,7 @@ fn waitForSplitResolvedGroups(
 }
 
 const SplitResolvedGroupsProgressContext = struct {
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     result: SplitResolvedGroups = .{ .left_group = 0, .right_group = 0 },
 };
@@ -1089,13 +1355,13 @@ const SplitResolvedGroupsProgressContext = struct {
 fn splitResolvedGroupsProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *SplitResolvedGroupsProgressContext = @ptrCast(@alignCast(ptr));
-    ctx.result.left_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:a")) orelse 0;
-    ctx.result.right_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:z")) orelse 0;
+    ctx.result.left_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:a")) orelse 0;
+    ctx.result.right_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, "doc:z")) orelse 0;
     return ctx.result.left_group != 0 and ctx.result.right_group != 0 and ctx.result.left_group != ctx.result.right_group;
 }
 
 const ResolvedGroupForKeyProgressContext = struct {
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
@@ -1105,13 +1371,13 @@ const ResolvedGroupForKeyProgressContext = struct {
 fn resolvedGroupForKeyProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     _ = cluster;
     const ctx: *ResolvedGroupForKeyProgressContext = @ptrCast(@alignCast(ptr));
-    ctx.resolved_group_id = try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, ctx.key);
+    ctx.resolved_group_id = try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.catalog, ctx.table_name, ctx.key);
     return ctx.resolved_group_id == ctx.expected_group_id;
 }
 
 fn waitForResolvedGroupForKey(
     cluster: *MetadataHttpClusterSimulation,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
@@ -1198,8 +1464,8 @@ fn publicSplitRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, pt
     const query_index = currentMetadataLeaderIndex(cluster) orelse ctx.fallback_index;
     if (query_index >= ctx.catalog_sources.len) return false;
     const catalog = ctx.catalog_sources[query_index].iface();
-    ctx.left_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:a")) orelse 0;
-    ctx.right_group = (try api_table_catalog.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:z")) orelse 0;
+    ctx.left_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:a")) orelse 0;
+    ctx.right_group = (try catalog_source_mod.resolveGroupForKey(std.testing.allocator, catalog, ctx.table_name, "doc:z")) orelse 0;
     if (ctx.left_group == 0 or ctx.right_group == 0 or ctx.left_group == ctx.right_group) return false;
 
     ctx.client_index = null;
@@ -1229,7 +1495,7 @@ fn waitForPublicSplitRoute(
 }
 
 const PublicMergedRouteProgressContext = struct {
-    catalog_source: api_table_catalog.CatalogSource,
+    metadata_catalog_source: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
@@ -1238,7 +1504,7 @@ const PublicMergedRouteProgressContext = struct {
 
 fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, ptr: *anyopaque) anyerror!bool {
     const ctx: *PublicMergedRouteProgressContext = @ptrCast(@alignCast(ptr));
-    const merged_group = try api_table_catalog.resolveGroupForKey(std.testing.allocator, ctx.catalog_source, ctx.table_name, ctx.key);
+    const merged_group = try catalog_source_mod.resolveGroupForKey(std.testing.allocator, ctx.metadata_catalog_source, ctx.table_name, ctx.key);
     if (merged_group != ctx.expected_group_id) return false;
     ctx.client_index = null;
     for (0..cluster.cluster.nodes.len) |i| {
@@ -1252,14 +1518,14 @@ fn publicMergedRouteProgressPredicate(cluster: *MetadataHttpClusterSimulation, p
 
 fn waitForPublicMergedRoute(
     cluster: *MetadataHttpClusterSimulation,
-    catalog_source: api_table_catalog.CatalogSource,
+    metadata_catalog_source: catalog_source_mod.CatalogSource,
     table_name: []const u8,
     key: []const u8,
     expected_group_id: u64,
     max_rounds: usize,
 ) !usize {
     var ctx = PublicMergedRouteProgressContext{
-        .catalog_source = catalog_source,
+        .metadata_catalog_source = metadata_catalog_source,
         .table_name = table_name,
         .key = key,
         .expected_group_id = expected_group_id,
@@ -1301,7 +1567,7 @@ fn verifySplitPublicTraffic(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     client_base: []const u8,
     table_name: []const u8,
     roots: []const []const u8,
@@ -1318,8 +1584,8 @@ fn verifySplitPublicTraffic(
 
     _ = (try waitForGroupLeaderIndex(cluster, groups.left_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
     _ = (try waitForGroupLeaderIndex(cluster, groups.right_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.left_group, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, groups.right_group, catalog_table_ddl.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const split_groups = [_]u64{ groups.left_group, groups.right_group };
     try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, split_groups[0..]);
@@ -1353,7 +1619,7 @@ fn verifyMergePublicTraffic(
     cluster: *MetadataHttpClusterSimulation,
     client: *api_http_client.ApiHttpClient,
     api_base_uris: []const []const u8,
-    catalog: api_table_catalog.CatalogSource,
+    catalog: catalog_source_mod.CatalogSource,
     client_base: []const u8,
     table_name: []const u8,
     roots: []const []const u8,
@@ -1371,7 +1637,7 @@ fn verifyMergePublicTraffic(
     try mirrorGroupBatchToActiveReplicas(cluster, client, api_base_uris, merged_group, table_name, merge_seed_right_batch_body);
 
     _ = (try waitForGroupLeaderIndex(cluster, merged_group, cfg.leader_rounds)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(cluster, roots, merged_group, catalog_table_ddl.default_full_text_index_name, 40);
     const status_index = currentMetadataLeaderIndex(cluster) orelse 0;
     const merge_groups = [_]u64{merged_group};
     try reportRuntimeDocIdentityForActiveReplicas(cluster, cluster.node(status_index), roots, table_name, merge_groups[0..]);
@@ -1480,7 +1746,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
         .table_id = cfg.table_id,
         .name = "docs",
         .description = cfg.description,
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], cfg.range_create_rounds);
@@ -1498,7 +1764,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, initial_group_id, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[client_index];
-    try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[client_index], initial_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, client_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
 
     var pre_split_batch = try client.fetchBatch(client_base, "docs", split_seed_batch_body);
@@ -1513,7 +1779,7 @@ fn runAutomaticSplitPublicTrafficScenario(cfg: AutomaticSplitPublicTrafficScenar
     };
     if (cfg.ensure_source_group_text_index_before_transition) {
         const source_leader_index = source_leader orelse return error.TestExpectedEqual;
-        try ensureGroupTextIndex(&cluster, roots[source_leader_index], initial_group_id, api_tables.default_full_text_index_name, 40);
+        try ensureGroupTextIndex(&cluster, roots[source_leader_index], initial_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     }
 
     try reportSplitCandidateStatus(cluster.node(leader_index), initial_group_id, 256, 180, "doc:m");
@@ -1641,7 +1907,7 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
         .table_id = cfg.table_id,
         .name = "docs",
         .description = cfg.description,
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 2,
     }, initial_ranges[0..], cfg.range_create_rounds);
@@ -1662,8 +1928,8 @@ fn runAutomaticMergePublicTrafficScenario(cfg: AutomaticMergePublicTrafficScenar
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group_id, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[left_leader_index];
     try std.testing.expect(try waitForNodeProjectedTableFieldContains(&cluster, left_leader_index, "docs", .indexes_json, "\"full_text_index_v0\"", true, cfg.projected_index_rounds));
-    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group_id, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group_id, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group_id, catalog_table_ddl.default_full_text_index_name, 40);
 
     var pre_merge_batch = try client.fetchBatch(client_base, "docs", merge_seed_batch_body);
     defer pre_merge_batch.deinit(std.heap.page_allocator);
@@ -1971,7 +2237,7 @@ fn projectedTablePresenceProgressPredicate(cluster: *MetadataHttpClusterSimulati
         const node = cluster.node(i);
         const tables = try node.listProjectedTables(cluster.alloc);
         defer node.freeProjectedTables(cluster.alloc, tables);
-        const table = api_tables.findTableByName(&.{
+        const table = catalog_table_ddl.findTableByName(&.{
             .status = .{ .metadata_group_id = cluster.metadata_group_id, .metrics = .{} },
             .tables = tables,
             .ranges = &.{},
@@ -1996,7 +2262,7 @@ fn projectedTableFieldContainsOnAllNodes(
         const node = cluster.node(i);
         const tables = try node.listProjectedTables(cluster.alloc);
         defer node.freeProjectedTables(cluster.alloc, tables);
-        const table = api_tables.findTableByName(&.{
+        const table = catalog_table_ddl.findTableByName(&.{
             .status = .{ .metadata_group_id = cluster.metadata_group_id, .metrics = .{} },
             .tables = tables,
             .ranges = &.{},
@@ -2086,7 +2352,7 @@ fn projectedTableFieldContainsOnNode(
     const node = cluster.node(node_index);
     const tables = try node.listProjectedTables(cluster.alloc);
     defer node.freeProjectedTables(cluster.alloc, tables);
-    const table = api_tables.findTableByName(&.{
+    const table = catalog_table_ddl.findTableByName(&.{
         .status = .{ .metadata_group_id = cluster.metadata_group_id, .metrics = .{} },
         .tables = tables,
         .ranges = &.{},
@@ -2487,6 +2753,26 @@ pub const MetadataHttpNodeSimulation = struct {
         store.freeRanges(alloc, records);
     }
 
+    pub fn listProjectedForeignKeyReferenceRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.ForeignKeyReferenceRangeRecord {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        return try store.listForeignKeyReferenceRanges(alloc, self.cluster.metadata_group_id);
+    }
+
+    pub fn freeProjectedForeignKeyReferenceRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.ForeignKeyReferenceRangeRecord) void {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
+        store.freeForeignKeyReferenceRanges(alloc, records);
+    }
+
+    pub fn listProjectedUniqueConstraintRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]metadata_table_manager.UniqueConstraintRangeRecord {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
+        return try store.listUniqueConstraintRanges(alloc, self.cluster.metadata_group_id);
+    }
+
+    pub fn freeProjectedUniqueConstraintRanges(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator, records: []metadata_table_manager.UniqueConstraintRangeRecord) void {
+        const store = self.sim().runtime.svc.host.owned_metadata_store orelse return;
+        store.freeUniqueConstraintRanges(alloc, records);
+    }
+
     pub fn listProjectedPlacementIntents(self: MetadataHttpNodeSimulation, alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
         const store = self.sim().runtime.svc.host.owned_metadata_store orelse return error.MissingMetadataStore;
         return try store.listPlacementIntents(alloc, self.cluster.metadata_group_id);
@@ -2655,6 +2941,90 @@ pub const MetadataHttpNodeSimulation = struct {
         try self.proposeTransitionCommand(.{ .remove_range = .{ .group_id = group_id } });
     }
 
+    pub fn upsertForeignKeyReferenceRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.ForeignKeyReferenceRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_foreign_key_ref_range = record });
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: MetadataHttpNodeSimulation,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_foreign_key_ref_range = .{
+            .child_table_id = child_table_id,
+            .constraint_name = constraint_name,
+            .parent_table_id = parent_table_id,
+            .start_parent_key = start_parent_key,
+        } });
+    }
+
+    pub fn upsertUniqueConstraintRange(self: MetadataHttpNodeSimulation, record: metadata_table_manager.UniqueConstraintRangeRecord) !void {
+        try self.proposeTransitionCommand(.{ .upsert_unique_constraint_range = record });
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: MetadataHttpNodeSimulation,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !void {
+        try self.proposeTransitionCommand(.{ .remove_unique_constraint_range = .{
+            .table_id = table_id,
+            .constraint_name = constraint_name,
+            .start_encoded_value = start_encoded_value,
+        } });
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_split = request });
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_split = request });
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_merge = request });
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.UniqueConstraintRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_merge = request });
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.UniqueConstraintRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_unique_constraint_range_rebuild = selector });
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_split = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_split = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(self: MetadataHttpNodeSimulation, request: metadata_table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_merge = request });
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .begin_foreign_key_ref_range_rebuild = selector });
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(self: MetadataHttpNodeSimulation, selector: metadata_table_manager.ForeignKeyReferenceRangeSelector) !void {
+        try self.proposeTransitionCommand(.{ .finish_foreign_key_ref_range_rebuild = selector });
+    }
+
     pub fn upsertSplitTransition(self: MetadataHttpNodeSimulation, record: transition_state.SplitTransitionRecord) !void {
         try self.proposeTransitionCommand(.{ .upsert_split_transition = record });
     }
@@ -2702,6 +3072,8 @@ pub const MetadataHttpNodeSimulation = struct {
         }
         for (plan.table_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_table = record });
         for (plan.range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_range = record });
+        for (plan.foreign_key_ref_range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_foreign_key_ref_range = record });
+        for (plan.unique_constraint_range_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_unique_constraint_range = record });
         for (plan.split_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_split_transition = record });
         for (plan.merge_upserts) |record| try commands.append(self.cluster.alloc, .{ .upsert_merge_transition = record });
         for (plan.placement_removals) |record| {
@@ -2712,6 +3084,17 @@ pub const MetadataHttpNodeSimulation = struct {
                 .local_node_id = record.local_node_id,
             } });
         }
+        for (plan.foreign_key_ref_range_removals) |record| try commands.append(self.cluster.alloc, .{ .remove_foreign_key_ref_range = .{
+            .child_table_id = record.child_table_id,
+            .constraint_name = record.constraint_name,
+            .parent_table_id = record.parent_table_id,
+            .start_parent_key = record.start_parent_key,
+        } });
+        for (plan.unique_constraint_range_removals) |record| try commands.append(self.cluster.alloc, .{ .remove_unique_constraint_range = .{
+            .table_id = record.table_id,
+            .constraint_name = record.constraint_name,
+            .start_encoded_value = record.start_encoded_value,
+        } });
         for (plan.table_removals) |table_id| try commands.append(self.cluster.alloc, .{ .remove_table = .{ .table_id = table_id } });
         for (plan.range_removals) |group_id| try commands.append(self.cluster.alloc, .{ .remove_range = .{ .group_id = group_id } });
         for (plan.split_removals) |transition_id| try commands.append(self.cluster.alloc, .{ .remove_split_transition = .{ .transition_id = transition_id } });
@@ -3953,13 +4336,18 @@ fn currentMetadataMutationNode(node: MetadataHttpNodeSimulation) MetadataHttpNod
 fn applyCreateTableMutation(
     node: MetadataHttpNodeSimulation,
     table_name: []const u8,
-    req: api_tables.CreateTableRequest,
+    req: catalog_table_ddl.CreateTableRequest,
 ) !void {
     const target = currentMetadataMutationNode(node);
     var workflow = metadata_table_workflow.TableWorkflow.init(node.cluster.alloc);
     defer workflow.deinit();
-    const table = api_tables.deriveTableRecord(table_name, req);
-    _ = try workflow.createTable(&target, table, api_tables.deriveInitialRange(table));
+    var normalized_req = req;
+    const indexes_json = req.indexes_json orelse catalog_table_ddl.default_indexes_json;
+    const prepared_indexes_json = try catalog_table_ddl.prepareTableIndexesForSchemaAlloc(node.cluster.alloc, table_name, indexes_json, catalog_table_ddl.effectiveSchemaJson(req.schema_json));
+    defer node.cluster.alloc.free(prepared_indexes_json);
+    normalized_req.indexes_json = prepared_indexes_json;
+    const table = catalog_table_ddl.deriveTableRecord(table_name, normalized_req);
+    _ = try workflow.createTable(&target, table, catalog_table_ddl.deriveInitialRange(table));
     try target.runRound();
 }
 
@@ -3971,7 +4359,7 @@ fn applyDropTableMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
     for (snapshot.ranges) |record| {
         if (record.table_id != table.table_id) continue;
         try target.removeRange(record.group_id);
@@ -3990,9 +4378,9 @@ fn applyUpdateSchemaMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
-    const updated = try api_tables.applySchemaUpdateRecord(alloc, table, schema_json);
+    const updated = try catalog_table_ddl.applySchemaUpdateRecord(alloc, table, schema_json);
     defer metadata_table_manager.freeTable(alloc, updated);
     try target.upsertTable(updated);
     try target.runRound();
@@ -4008,7 +4396,7 @@ fn applyCreateIndexMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
     var updated = table.*;
     updated.indexes_json = try @import("../api/indexes.zig").addIndexToTableIndexesJson(alloc, table.indexes_json, index_name, index_json);
@@ -4026,7 +4414,7 @@ fn applyDropIndexMutation(
     const target = currentMetadataMutationNode(node);
     var snapshot = try target.adminSnapshot();
     defer target.freeAdminSnapshot(&snapshot);
-    const table = api_tables.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
+    const table = catalog_table_ddl.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
 
     const next = (try @import("../api/indexes.zig").removeIndexFromTableIndexesJson(alloc, table.indexes_json, index_name)) orelse return error.IndexNotFound;
     defer alloc.free(next);
@@ -4088,7 +4476,7 @@ const PublicApiStatusSource = struct {
         self.metadataNode().freeAdminSnapshot(snapshot);
     }
 
-    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: api_tables.CreateTableRequest) !void {
+    fn createTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: catalog_table_ddl.CreateTableRequest) !void {
         const self: *@This() = @ptrCast(@alignCast(ptr));
         _ = alloc;
         try applyCreateTableMutation(self.node, table_name, req);
@@ -4249,7 +4637,7 @@ const PublicApiCatalogSource = struct {
         };
     }
 
-    fn iface(self: *@This()) api_table_catalog.CatalogSource {
+    fn iface(self: *@This()) catalog_source_mod.CatalogSource {
         return .{
             .ptr = self,
             .vtable = &.{
@@ -4941,7 +5329,7 @@ fn metadataVoprCreateTableWithRanges(
     while (rounds < max_rounds) : (rounds += 1) {
         const leader_index = try metadataVoprLeaderIndex(cluster);
         return workflow.createTableWithRanges(&cluster.node(leader_index), table, ranges) catch |err| switch (err) {
-            error.NotLeader => {
+            error.NotLeader, error.ReconcileLeaseNotHeld => {
                 try cluster.stepAll();
                 continue;
             },
@@ -4969,6 +5357,130 @@ fn metadataVoprAddRange(
         };
     }
     return error.NotLeader;
+}
+
+fn metadataVoprRequireUniqueOwnerRange(
+    cluster: *MetadataHttpClusterSimulation,
+    table_id: u64,
+    constraint_name: []const u8,
+) !void {
+    const leader_index = try metadataVoprLeaderIndex(cluster);
+    const ranges = try cluster.node(leader_index).listProjectedUniqueConstraintRanges(cluster.alloc);
+    defer cluster.node(leader_index).freeProjectedUniqueConstraintRanges(cluster.alloc, ranges);
+    for (ranges) |range| {
+        if (range.table_id != table_id) continue;
+        if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+        if (!std.mem.eql(u8, range.start_encoded_value, "")) continue;
+        if (range.end_encoded_value != null) continue;
+        if (!metadata_table_manager.uniqueConstraintRangeRoutable(range)) continue;
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+fn metadataVoprRequireForeignKeyReferenceRange(
+    cluster: *MetadataHttpClusterSimulation,
+    child_table_id: u64,
+    constraint_name: []const u8,
+    parent_table_id: u64,
+) !void {
+    const leader_index = try metadataVoprLeaderIndex(cluster);
+    const ranges = try cluster.node(leader_index).listProjectedForeignKeyReferenceRanges(cluster.alloc);
+    defer cluster.node(leader_index).freeProjectedForeignKeyReferenceRanges(cluster.alloc, ranges);
+    for (ranges) |range| {
+        if (range.child_table_id != child_table_id) continue;
+        if (range.parent_table_id != parent_table_id) continue;
+        if (!std.mem.eql(u8, range.constraint_name, constraint_name)) continue;
+        if (!std.mem.eql(u8, range.start_parent_key, "")) continue;
+        if (range.end_parent_key != null) continue;
+        if (!metadata_table_manager.foreignKeyReferenceRangeRoutable(range)) continue;
+        return;
+    }
+    return error.TestExpectedEqual;
+}
+
+const MetadataVoprCatalogJobOwner = struct {
+    alloc: std.mem.Allocator,
+    manager: *metadata_table_manager.TableManager,
+    reset_calls: usize = 0,
+
+    pub fn adminSnapshot(self: *@This()) !metadata_api.AdminSnapshot {
+        var snapshot = metadata_api.AdminSnapshot{
+            .status = .{ .metadata_group_id = 1, .metrics = .{} },
+            .tables = &.{},
+            .ranges = &.{},
+            .stores = &.{},
+            .placement_intents = &.{},
+            .split_transitions = &.{},
+            .merge_transitions = &.{},
+        };
+        errdefer self.freeAdminSnapshot(&snapshot);
+        snapshot.tables = try self.manager.listTables(self.alloc);
+        snapshot.ranges = try self.manager.listRanges(self.alloc);
+        snapshot.table_emptying_jobs = try self.manager.listTableEmptyingJobs(self.alloc);
+        return snapshot;
+    }
+
+    pub fn freeAdminSnapshot(self: *@This(), snapshot: *metadata_api.AdminSnapshot) void {
+        self.manager.freeTables(self.alloc, snapshot.tables);
+        self.manager.freeRanges(self.alloc, snapshot.ranges);
+        if (snapshot.table_emptying_jobs.len > 0) self.manager.freeTableEmptyingJobs(self.alloc, snapshot.table_emptying_jobs);
+        snapshot.* = undefined;
+    }
+
+    pub fn upsertTableEmptyingJob(self: *@This(), record: metadata_table_manager.TableEmptyingJobRecord) !void {
+        try self.manager.upsertTableEmptyingJob(record);
+    }
+
+    pub fn beginTableEmptyingJob(self: *@This(), request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+        try self.manager.beginTableEmptyingJob(request);
+    }
+
+    pub fn finishTableEmptyingJob(self: *@This(), request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+        try self.manager.finishTableEmptyingJob(request);
+    }
+
+    pub fn promoteTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingBarrierPromotionRequest) !void {
+        var restart_identity = false;
+        if (request.job_ids.len > 0) {
+            const jobs = try self.manager.listTableEmptyingJobs(self.alloc);
+            defer self.manager.freeTableEmptyingJobs(self.alloc, jobs);
+            for (jobs) |job| {
+                if (job.job_id != request.job_ids[0]) continue;
+                restart_identity = job.restart_identity;
+                break;
+            }
+        }
+        try self.manager.promoteTableEmptyingBarrier(request);
+        if (restart_identity) self.reset_calls += 1;
+    }
+
+    pub fn resetIdentityAllocatorsForTableEmptyingBarrier(self: *@This(), request: metadata_table_manager.TableEmptyingIdentityAllocatorResetRequest) !void {
+        _ = try self.manager.resetIdentityAllocatorsForTableEmptyingBarrier(self.alloc, request);
+        self.reset_calls += 1;
+    }
+};
+
+fn metadataVoprCompleteTableEmptyingJobs(owner: *MetadataVoprCatalogJobOwner, expected_jobs: usize) !void {
+    const jobs = try owner.manager.listTableEmptyingJobs(owner.alloc);
+    defer owner.manager.freeTableEmptyingJobs(owner.alloc, jobs);
+    try std.testing.expectEqual(expected_jobs, jobs.len);
+    for (jobs, 0..) |job, i| {
+        try std.testing.expect(job.range_id != 0);
+        const lease_owner = "metadata-vopr-rel-empty";
+        try owner.beginTableEmptyingJob(.{
+            .job_id = job.job_id,
+            .lease_owner = lease_owner,
+            .now_ms = @intCast(i),
+            .lease_expires_at_ms = @intCast(i + 10_000),
+        });
+        try owner.finishTableEmptyingJob(.{
+            .job_id = job.job_id,
+            .lease_owner = lease_owner,
+            .completed_row_count = @intCast(i + 1),
+            .progress_row_key = job.end_row_key orelse "",
+        });
+    }
 }
 
 fn metadataVoprRunLivenessWorkload(
@@ -5066,19 +5578,18 @@ fn metadataVoprRunExpandedLivenessWorkload(
         .start_key = "doc:a",
         .end_key = "doc:m",
     }};
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
     _ = try metadataVoprCreateTableWithRanges(cluster, &merge_workflow, .{
         .table_id = merge_table_id,
         .name = "vopr-merge",
         .desired_replica_count = 1,
         .min_ranges = 2,
-    }, merge_left_range[0..], 16);
+    }, merge_left_range[0..], 96);
     _ = try metadataVoprAddRange(cluster, &merge_workflow, .{
         .group_id = merge_right_group,
         .table_id = merge_table_id,
         .start_key = "doc:m",
         .end_key = "doc:z",
-    }, 16);
+    }, 96);
     try std.testing.expect(try cluster.waitForGroupStatusCount(merge_left_group, .active, 1, 64));
     try std.testing.expect(try cluster.waitForGroupStatusCount(merge_right_group, .active, 1, 64));
     const merge_leader_index = try metadataVoprLeaderIndex(cluster);
@@ -5097,16 +5608,15 @@ fn metadataVoprRunExpandedLivenessWorkload(
     try metadataVoprHealAll(cluster, state);
 
     const topo_leader_index = try metadataVoprLeaderIndex(cluster);
-    try metadataVoprStartFollowerLinkPartition(cluster, state);
     try cluster.node(topo_leader_index).upsertNode(.{ .node_id = 3, .role = "maintenance" });
     try cluster.node(topo_leader_index).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = false });
     try metadataVoprHealAll(cluster, state);
     var store_down_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = false };
-    try cluster.assertProgress("metadata-vopr-store-down", 32, &store_down_ctx, voprStoreLiveProgressPredicate);
+    try cluster.assertProgress("metadata-vopr-store-down", 96, &store_down_ctx, voprStoreLiveProgressPredicate);
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertNode(.{ .node_id = 3, .role = "data" });
     try cluster.node(try metadataVoprLeaderIndex(cluster)).upsertStore(.{ .store_id = 3, .node_id = 3, .role = "data", .live = true });
     var store_up_ctx = VoprStoreLiveProgressContext{ .store_id = 3, .expected_live = true };
-    try cluster.assertProgress("metadata-vopr-store-up", 32, &store_up_ctx, voprStoreLiveProgressPredicate);
+    try cluster.assertProgress("metadata-vopr-store-up", 96, &store_up_ctx, voprStoreLiveProgressPredicate);
     try metadataVoprRunRandomTransportActions(cluster, random, cfg, state, operation_index, phase_fault_actions);
     try metadataVoprHealAll(cluster, state);
 
@@ -5200,6 +5710,133 @@ fn runMetadataVoprCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignCo
     try metadataVoprHealAll(&cluster, &campaign_state);
 }
 
+fn runMetadataVoprRelationalIdentityCampaign(alloc: std.mem.Allocator, cfg: MetadataVoprCampaignConfig) !void {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-a", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-b", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-c", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(root_c);
+    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-a.txt", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-b.txt", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-vopr-rel-{x}-c.txt", .{ tmp.sub_path, cfg.seed });
+    defer alloc.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, cfg.metadata_group_id, root_a, cat_a),
+        makeHostSimConfig(2, cfg.metadata_group_id, root_b, cat_b),
+        makeHostSimConfig(3, cfg.metadata_group_id, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(alloc, cfg.metadata_group_id, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    defer cluster.stopAll();
+
+    _ = try startBootstrappedMetadataCluster(&cluster, 48, true);
+
+    var prng = std.Random.DefaultPrng.init(cfg.seed);
+    const random = prng.random();
+    var campaign_state = MetadataVoprCampaignState{};
+    var operation_index: usize = 0;
+    try metadataVoprRunAction(&cluster, random, cfg, &campaign_state, operation_index, .delay_next);
+    operation_index += 1;
+    try metadataVoprRunAction(&cluster, random, cfg, &campaign_state, operation_index, .duplicate_next);
+    operation_index += 1;
+    try metadataVoprStartFollowerPartition(&cluster, &campaign_state);
+    try metadataVoprHealAll(&cluster, &campaign_state);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"email":{"type":"keyword"},"name":{"type":"keyword"}},"required":["tenant_id","customer_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","customer_id"]},"unique_constraints":[{"name":"vopr_customers_email_key","columns":["tenant_id","email"]}]}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"customer_id":{"type":"keyword"},"customer_email":{"type":"keyword"}},"required":["tenant_id","order_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id"]},"foreign_keys":[{"name":"vopr_orders_customer_fkey","columns":["tenant_id","customer_id"],"references":{"table":"vopr-rel-parent","columns":["tenant_id","customer_id"]},"on_delete":"restrict","on_update":"restrict","match":"full","timing":"immediate","validation_state":"enforced"},{"name":"vopr_orders_customer_email_fkey","columns":["tenant_id","customer_email"],"references":{"table":"vopr-rel-parent","columns":["tenant_id","email"]},"on_delete":"restrict","on_update":"restrict","match":"simple","timing":"immediate","validation_state":"enforced"}]}
+    ;
+    const grandchild_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"order_id":{"type":"keyword"},"line_id":{"type":"keyword"},"sku":{"type":"keyword"}},"required":["tenant_id","order_id","line_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","order_id","line_id"]},"foreign_keys":[{"name":"vopr_lines_order_fkey","columns":["tenant_id","order_id"],"references":{"table":"vopr-rel-child","columns":["tenant_id","order_id"]},"on_delete":"cascade","on_update":"restrict","match":"full","timing":"immediate","validation_state":"enforced"}]}
+    ;
+    const leader_index = try metadataVoprLeaderIndex(&cluster);
+    try workflow.bootstrapDesiredFromCommitted(cluster.node(leader_index));
+    try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id, .name = "vopr-rel-parent", .schema_json = parent_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
+    try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id, .table_id = cfg.table_id, .start_key = "doc:a", .end_key = "doc:z" });
+    try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id + 1, .name = "vopr-rel-child", .schema_json = child_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
+    try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id + 1, .table_id = cfg.table_id + 1, .start_key = "doc:a", .end_key = "doc:z" });
+    try workflow.controlLoop().stateRef().tableManager().upsertTable(.{ .table_id = cfg.table_id + 2, .name = "vopr-rel-grandchild", .schema_json = grandchild_schema, .desired_replica_count = 2, .min_ranges = 1, .placement_role = "data" });
+    try workflow.controlLoop().stateRef().tableManager().upsertRange(.{ .group_id = cfg.range_group_id + 2, .table_id = cfg.table_id + 2, .start_key = "doc:a", .end_key = "doc:z" });
+    _ = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
+    try metadataVoprHealAll(&cluster, &campaign_state);
+
+    try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id, .active, 2, 64));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id + 1, .active, 2, 64));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(cfg.range_group_id + 2, .active, 2, 64));
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id, "vopr_customers_email_key");
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id + 1, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireUniqueOwnerRange(&cluster, cfg.table_id + 2, db_mod.relational_store.primary_key_constraint_name);
+    try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_fkey", cfg.table_id);
+    try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 1, "vopr_orders_customer_email_fkey", cfg.table_id);
+    try metadataVoprRequireForeignKeyReferenceRange(&cluster, cfg.table_id + 2, "vopr_lines_order_fkey", cfg.table_id + 1);
+
+    var job_owner = MetadataVoprCatalogJobOwner{
+        .alloc = alloc,
+        .manager = workflow.controlLoop().stateRef().tableManager(),
+    };
+    var admission = try catalog_jobs.scheduleTableEmptyingBarrierForTargetsOnServiceWithSessionAlloc(
+        alloc,
+        &job_owner,
+        "vopr-rel-parent",
+        &.{},
+        true,
+        true,
+        catalog_resources.SqlCatalogSession.default(),
+    );
+    defer admission.applied.deinit(alloc);
+    defer admission.deinitAffectedTables(alloc);
+    try std.testing.expectEqual(@as(usize, 3), admission.affected_tables.len);
+    try std.testing.expectEqual(@as(usize, 3), admission.scheduled_jobs);
+    try metadataVoprCompleteTableEmptyingJobs(&job_owner, admission.scheduled_jobs);
+
+    const promoted_jobs = try catalog_jobs.promoteCompletedTableEmptyingBarriersForTableOnServiceAlloc(alloc, &job_owner, "vopr-rel-parent");
+    try std.testing.expectEqual(admission.scheduled_jobs, promoted_jobs);
+    try std.testing.expectEqual(@as(usize, 1), job_owner.reset_calls);
+    const promoted_tables = try job_owner.manager.listTables(alloc);
+    defer job_owner.manager.freeTables(alloc, promoted_tables);
+    for (admission.affected_tables) |table| {
+        const promoted = blk: {
+            for (promoted_tables) |candidate| {
+                if (candidate.table_id == table.table_id) break :blk candidate;
+            }
+            return error.TestExpectedEqual;
+        };
+        try std.testing.expectEqual(table.data_generation + 1, promoted.data_generation);
+    }
+    const remaining_jobs = try job_owner.manager.listTableEmptyingJobs(alloc);
+    defer job_owner.manager.freeTableEmptyingJobs(alloc, remaining_jobs);
+    try std.testing.expectEqual(@as(usize, 0), remaining_jobs.len);
+}
+
 test "metadata VOPR seeded smoke campaign" {
     try runMetadataVoprCampaign(std.testing.allocator, .{
         .seed = 0xA17F_0001,
@@ -5221,6 +5858,19 @@ test "metadata VOPR expanded generated workload campaign" {
         .range_group_id = 6202,
         .split_group_id = 6203,
         .split_transition_id = 6204,
+        .workload = .expanded,
+    });
+}
+
+test "metadata VOPR relational identity owner topology campaign" {
+    try runMetadataVoprRelationalIdentityCampaign(std.testing.allocator, .{
+        .seed = 0xA17F_0003,
+        .operation_count = 24,
+        .metadata_group_id = 6300,
+        .table_id = 6301,
+        .range_group_id = 6302,
+        .split_group_id = 6304,
+        .split_transition_id = 6305,
         .workload = .expanded,
     });
 }
@@ -5444,7 +6094,7 @@ test "metadata http cluster simulation serves public lifecycle from a non-host n
     const client_base = api_base_uris[client_index];
 
     const group_leader_index = (try waitForGroupLeaderIndex(&cluster, group_id, 96)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[group_leader_index], group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[group_leader_index], group_id, catalog_table_ddl.default_full_text_index_name, 40);
 
     const TableListEntry = struct { name: []const u8 };
 
@@ -5750,7 +6400,7 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
     const source_group_id = created_range.group_id;
     try std.testing.expect(table_id != 0);
     try std.testing.expect(source_group_id != 0);
-    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     try reportSplitCandidateStatus(&cluster.node(leader_index), source_group_id, 12, 4096, "doc:m");
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":486101,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
@@ -5783,8 +6433,8 @@ test "metadata http cluster simulation forwards public split flow from a non-hos
 
     const left_leader_index = (try waitForGroupLeaderIndex(&cluster, left_group, 96)) orelse return error.TestExpectedEqual;
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group, 96)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, catalog_table_ddl.default_full_text_index_name, 40);
     try reportMergeCandidateStatuses(&cluster.node(leader_index), left_group, 16, 4096, right_group, 12, 3072);
 
     var batch = try client.fetchBatch(client_base, "docs",
@@ -5949,7 +6599,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     const source_group_id = created_range.group_id;
     try std.testing.expect(table_id != 0);
     try std.testing.expect(source_group_id != 0);
-    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndexOnActiveReplicas(&cluster, roots[0..], source_group_id, catalog_table_ddl.default_full_text_index_name, 40);
     try reportSplitCandidateStatus(&cluster.node(leader_index), source_group_id, 12, 4096, "doc:m");
 
     const split_body = try std.fmt.allocPrint(std.testing.allocator, "{{\"transition_id\":486201,\"source_group_id\":{d},\"destination_group_id\":{d},\"split_key\":\"doc:m\"}}", .{
@@ -5982,8 +6632,8 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
 
     const left_leader_index = (try waitForGroupLeaderIndex(&cluster, left_group, 96)) orelse return error.TestExpectedEqual;
     const right_leader_index = (try waitForGroupLeaderIndex(&cluster, right_group, 96)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left_leader_index], left_group, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right_leader_index], right_group, catalog_table_ddl.default_full_text_index_name, 40);
     try reportMergeCandidateStatuses(&cluster.node(leader_index), left_group, 16, 4096, right_group, 12, 3072);
 
     var pre_merge_batch = try client.fetchBatch(api_base_uris[0], "docs",
@@ -6017,7 +6667,7 @@ test "metadata http cluster simulation forwards public merge flow from a non-hos
     const client_base = api_base_uris[routed_client_index];
 
     const merged_leader_index = (try waitForGroupLeaderIndex(&cluster, left_group, 48)) orelse return error.TestExpectedEqual;
-    try ensureGroupTextIndex(&cluster, roots[merged_leader_index], left_group, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[merged_leader_index], left_group, catalog_table_ddl.default_full_text_index_name, 40);
 
     var post_merge_batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:z":{"title":"zeta","body":"hello merged right side"}}}
@@ -6647,7 +7297,7 @@ test "metadata http cluster simulation uses live median key for automatic split 
     try createActiveTableRanges(&workflow, &cluster, leader_index, .{
         .table_id = 4512,
         .name = "docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], 32);
@@ -6665,7 +7315,7 @@ test "metadata http cluster simulation uses live median key for automatic split 
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, 45112, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[client_index];
-    try ensureGroupTextIndex(&cluster, roots[client_index], 45112, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[client_index], 45112, catalog_table_ddl.default_full_text_index_name, 40);
 
     var batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:a":{"title":"alpha","body":"left"},"doc:m":{"title":"mid","body":"middle"},"doc:z":{"title":"zeta","body":"right"}}}
@@ -6758,7 +7408,7 @@ test "metadata http cluster simulation uses remote live median key when metadata
     try createActiveTableRanges(&workflow, &cluster, initial_leader, .{
         .table_id = 4513,
         .name = "docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 3,
         .min_ranges = 1,
     }, initial_ranges[0..], 48);
@@ -6789,7 +7439,7 @@ test "metadata http cluster simulation uses remote live median key when metadata
     var client = public_api.client;
     const client_index = (try waitForGroupLeaderIndex(&cluster, 45113, 64)) orelse return error.TestExpectedEqual;
     const client_base = public_api.api_base_uris[client_index];
-    try ensureGroupTextIndex(&cluster, roots[client_index], 45113, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[client_index], 45113, catalog_table_ddl.default_full_text_index_name, 40);
 
     var batch = try client.fetchBatch(client_base, "docs",
         \\{"inserts":{"doc:a":{"title":"alpha","body":"left"},"doc:m":{"title":"mid","body":"middle"},"doc:z":{"title":"zeta","body":"right"}}}
@@ -9169,7 +9819,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     const TestCatalogSource = struct {
         node: MetadataHttpNodeSimulation,
 
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source_mod.CatalogSource {
             return .{
                 .ptr = self,
                 .vtable = &.{
@@ -9300,7 +9950,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
         .table_id = 483,
         .name = "docs",
         .description = "forwarded docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 1,
         .min_ranges = 1,
     }, initial_ranges[0..], 40);
@@ -9372,7 +10022,7 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     defer batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":4") != null);
 
-    try ensureGroupTextIndex(&cluster, roots[actual_host_index], 4831, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[actual_host_index], 4831, catalog_table_ddl.default_full_text_index_name, 40);
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
     defer lookup.deinit(std.heap.page_allocator);
@@ -9432,6 +10082,357 @@ test "metadata http cluster simulation forwards public table io from a non-host 
     try std.testing.expectError(error.UnexpectedHttpStatus, client.fetchLookup(client_base, "docs", "doc:z", null));
 }
 
+test "metadata http cluster simulation resolves relational unique selectors across hosted storage restart" {
+    const alloc = std.testing.allocator;
+    const users_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"user_id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["tenant_id","user_id"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_id","user_id"]},"unique_constraints":[{"name":"users_tenant_email_key","columns":["tenant_id","email"]}]}
+    ;
+    const prices_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"sku":{"type":"keyword"},"parent_sku":{"type":"keyword"},"valid_from":{"type":"numeric"},"valid_to":{"type":"numeric"},"price":{"type":"numeric"},"delta":{"type":"numeric"}},"required":["sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_period_fkey","columns":["parent_sku"],"period":"valid_time","references":{"table":"row","columns":["sku"],"period":"valid_time"}}]}
+    ;
+    const ada_row = "{\"tenant_id\":\"t1\",\"user_id\":\"user:ada\",\"email\":\"ada@example.test\",\"status\":\"new\"}";
+    const grace_row = "{\"tenant_id\":\"t1\",\"user_id\":\"user:grace\",\"email\":\"grace@example.test\",\"status\":\"new\"}";
+    const price_v1_row = "{\"sku\":\"sku:a\",\"valid_from\":0,\"valid_to\":10,\"price\":10}";
+    const price_v2_row = "{\"sku\":\"sku:a\",\"valid_from\":10,\"valid_to\":20,\"price\":12}";
+    const price_adjustment_row = "{\"sku\":\"adj:rebate\",\"parent_sku\":\"sku:a\",\"valid_from\":12,\"valid_to\":18,\"delta\":-2}";
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    var store_a = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_a.deinit();
+    var store_b = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_b.deinit();
+    var store_c = raft_engine.core.MemoryStorage.init(alloc);
+    defer store_c.deinit();
+
+    var factory_a = TestDescriptorFactory{ .alloc = alloc, .store = &store_a, .peers = &.{ 1, 2, 3 } };
+    var factory_b = TestDescriptorFactory{ .alloc = alloc, .store = &store_b, .peers = &.{ 1, 2, 3 } };
+    var factory_c = TestDescriptorFactory{ .alloc = alloc, .store = &store_c, .peers = &.{ 1, 2, 3 } };
+
+    const root_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-a", .{tmp.sub_path});
+    defer alloc.free(root_a);
+    const root_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-b", .{tmp.sub_path});
+    defer alloc.free(root_b);
+    const root_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-c", .{tmp.sub_path});
+    defer alloc.free(root_c);
+    factory_a.split_runtime.replica_root_dir = root_a;
+    factory_b.split_runtime.replica_root_dir = root_b;
+    factory_c.split_runtime.replica_root_dir = root_c;
+    const cat_a = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-a.txt", .{tmp.sub_path});
+    defer alloc.free(cat_a);
+    const cat_b = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-b.txt", .{tmp.sub_path});
+    defer alloc.free(cat_b);
+    const cat_c = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/meta-sim-rel-unique-c.txt", .{tmp.sub_path});
+    defer alloc.free(cat_c);
+
+    const configs = [_]raft_sim.ManagedHttpHostSimulationConfig{
+        makeHostSimConfig(1, 4860, root_a, cat_a),
+        makeHostSimConfig(2, 4860, root_b, cat_b),
+        makeHostSimConfig(3, 4860, root_c, cat_c),
+    };
+    const deps = [_]raft_sim.ManagedHttpHostSimulationDeps{
+        makeHostSimDeps(&factory_a),
+        makeHostSimDeps(&factory_b),
+        makeHostSimDeps(&factory_c),
+    };
+
+    var cluster = try MetadataHttpClusterSimulation.init(alloc, 4860, configs[0..], deps[0..]);
+    defer cluster.deinit();
+    defer cluster.stopAll();
+    const leader_index = try startBootstrappedMetadataCluster(&cluster, 32, true);
+
+    var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
+    defer workflow.deinit();
+    const initial_ranges = [_]metadata_table_manager.RangeRecord{
+        .{
+            .group_id = 4861,
+            .table_id = 486,
+            .start_key = "",
+            .end_key = "\xff",
+        },
+        .{
+            .group_id = 4862,
+            .table_id = 486,
+            .start_key = "\xff",
+            .end_key = null,
+        },
+    };
+    const create_summary = try workflow.createTableWithRanges(&cluster.node(leader_index), .{
+        .table_id = 486,
+        .name = "users",
+        .description = "relational unique selector cluster users",
+        .schema_json = users_schema,
+        .desired_replica_count = 1,
+        .min_ranges = 1,
+    }, initial_ranges[0..]);
+    try std.testing.expect(create_summary.table_upserts > 0);
+    const price_ranges = [_]metadata_table_manager.RangeRecord{.{
+        .group_id = 4871,
+        .table_id = 487,
+        .start_key = "",
+        .end_key = null,
+    }};
+    const price_create_summary = try workflow.createTableWithRanges(&cluster.node(leader_index), .{
+        .table_id = 487,
+        .name = "prices",
+        .description = "temporal relational selector cluster prices",
+        .schema_json = prices_schema,
+        .desired_replica_count = 1,
+        .min_ranges = 1,
+    }, price_ranges[0..]);
+    try std.testing.expect(price_create_summary.table_upserts > 0);
+    try std.testing.expect(try cluster.waitForGroupStatusCount(4861, .active, 1, 48));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(4862, .active, 1, 48));
+    try std.testing.expect(try cluster.waitForGroupStatusCount(4871, .active, 1, 48));
+    try std.testing.expect(try waitForProjectedTablePresenceOnAllNodes(&cluster, "users", 48));
+    try std.testing.expect(try waitForProjectedTablePresenceOnAllNodes(&cluster, "prices", 48));
+    const primary_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 486, db_mod.relational_store.primary_key_constraint_name, 48);
+    const email_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 486, "users_tenant_email_key", 48);
+    const temporal_primary_owner_group = try waitForUniqueOwnerGroupActive(&cluster, 487, db_mod.relational_store.primary_key_constraint_name, 48);
+    try std.testing.expect(primary_owner_group != 0);
+    try std.testing.expect(email_owner_group != 0);
+    try std.testing.expect(temporal_primary_owner_group != 0);
+
+    var rig: PublicApiTestRig(3) = undefined;
+    try rig.initLeaderBackedInPlace(alloc, &cluster, .{ root_a, root_b, root_c });
+    defer rig.deinit();
+
+    const ada_key = try relationalPhysicalKeyForRowAlloc(alloc, users_schema, ada_row);
+    defer alloc.free(ada_key);
+    const price_v2_key = try relationalPhysicalKeyForRowAlloc(alloc, prices_schema, price_v2_row);
+    defer alloc.free(price_v2_key);
+    const price_adjustment_key = try relationalPhysicalKeyForRowAlloc(alloc, prices_schema, price_adjustment_row);
+    defer alloc.free(price_adjustment_key);
+    const row_group = (try catalog_source_mod.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "users", ada_key)) orelse return error.TestExpectedEqual;
+    const temporal_row_group = (try catalog_source_mod.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_v2_key)) orelse return error.TestExpectedEqual;
+    const adjustment_row_group = (try catalog_source_mod.resolveGroupForKey(alloc, rig.catalog_sources[0].iface(), "prices", price_adjustment_key)) orelse return error.TestExpectedEqual;
+
+    const row_host = try waitForSingleActiveGroupHost(&cluster, row_group, 48);
+    const temporal_row_host = try waitForSingleActiveGroupHost(&cluster, temporal_row_group, 48);
+    const adjustment_row_host = try waitForSingleActiveGroupHost(&cluster, adjustment_row_group, 48);
+    const client_index = (row_host + 1) % 3;
+    const temporal_client_index = (temporal_row_host + 1) % 3;
+    const adjustment_client_index = (adjustment_row_host + 1) % 3;
+    const client_base = rig.api_base_uris[client_index];
+    const temporal_client_base = rig.api_base_uris[temporal_client_index];
+    const temporal_owner_base = rig.api_base_uris[temporal_row_host];
+    const adjustment_client_base = rig.api_base_uris[adjustment_client_index];
+    try std.testing.expect(cluster.node(client_index).status(row_group) != .active);
+    try std.testing.expect(cluster.node(temporal_client_index).status(temporal_row_group) != .active);
+    try std.testing.expect(cluster.node(adjustment_client_index).status(adjustment_row_group) != .active);
+
+    const insert_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sync_level\":\"write\",\"operations\":[{{\"op\":\"insert\",\"row\":{s}}},{{\"op\":\"insert\",\"row\":{s}}}]}}",
+        .{ ada_row, grace_row },
+    );
+    defer alloc.free(insert_body);
+    var inserted = try fetchPublicRowsBatchExpectStatus(&rig.client, client_base, "users", insert_body, 201);
+    defer inserted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, inserted.body, "\"inserted\":2") != null);
+
+    const price_insert_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sync_level\":\"write\",\"operations\":[{{\"op\":\"insert\",\"row\":{s}}},{{\"op\":\"insert\",\"row\":{s}}}]}}",
+        .{ price_v1_row, price_v2_row },
+    );
+    defer alloc.free(price_insert_body);
+    var prices_inserted = try fetchPublicRowsBatchExpectStatus(&rig.client, temporal_client_base, "prices", price_insert_body, 201);
+    defer prices_inserted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, prices_inserted.body, "\"inserted\":2") != null);
+
+    const adjustment_insert_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"sync_level\":\"write\",\"operations\":[{{\"op\":\"insert\",\"row\":{s}}}]}}",
+        .{price_adjustment_row},
+    );
+    defer alloc.free(adjustment_insert_body);
+    var adjustment_inserted = try fetchPublicRowsBatchExpectStatus(&rig.client, adjustment_client_base, "prices", adjustment_insert_body, 201);
+    defer adjustment_inserted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, adjustment_inserted.body, "\"inserted\":1") != null);
+
+    var initial_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        client_base,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"user_id\":\"user:ada\"", "\"physical_key\"" },
+        32,
+    );
+    defer initial_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(initial_get.body, &.{ "\"found\":true", "\"user_id\":\"user:ada\"", "\"physical_key\"" });
+
+    var initial_temporal_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"price\":12", "\"physical_key\"" },
+        32,
+    );
+    defer initial_temporal_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(initial_temporal_get.body, &.{ "\"found\":true", "\"price\":12", "\"physical_key\"" });
+
+    var initial_adjustment_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        adjustment_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"adj:rebate\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"delta\":-2", "\"physical_key\"" },
+        32,
+    );
+    defer initial_adjustment_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(initial_adjustment_get.body, &.{ "\"found\":true", "\"delta\":-2", "\"physical_key\"" });
+
+    try cluster.restartNode(row_host);
+    _ = try waitForSingleActiveGroupHost(&cluster, row_group, 96);
+    if (temporal_row_host != row_host) {
+        try cluster.restartNode(temporal_row_host);
+    }
+    _ = try waitForSingleActiveGroupHost(&cluster, temporal_row_group, 96);
+    if (adjustment_row_host != row_host and adjustment_row_host != temporal_row_host) {
+        try cluster.restartNode(adjustment_row_host);
+    }
+    _ = try waitForSingleActiveGroupHost(&cluster, adjustment_row_group, 96);
+    try cluster.stepAll();
+
+    var update = try fetchPublicRowsBatchExpectStatus(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}},\"patch\":{\"status\":\"active\"}}]}",
+        201,
+    );
+    defer update.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, update.body, "\"transformed\":1") != null);
+
+    var temporal_update = try fetchPublicRowsBatchExpectStatus(
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"operations\":[{\"op\":\"update\",\"where\":{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}},\"patch\":{\"price\":13}}]}",
+        201,
+    );
+    defer temporal_update.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, temporal_update.body, "\"transformed\":1") != null);
+
+    var updated_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        client_base,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}]}",
+        &.{ "\"found\":true", "\"status\":\"active\"" },
+        32,
+    );
+    defer updated_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(updated_get.body, &.{ "\"found\":true", "\"status\":\"active\"" });
+
+    var updated_temporal_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}]}",
+        &.{ "\"found\":true", "\"price\":13" },
+        32,
+    );
+    defer updated_temporal_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(updated_temporal_get.body, &.{ "\"found\":true", "\"price\":13" });
+
+    var temporal_begin = try fetchPublicTransactionBegin(&rig.client, temporal_owner_base);
+    defer temporal_begin.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 201), temporal_begin.status);
+    var parsed_temporal_begin = try std.json.parseFromSlice(std.json.Value, alloc, temporal_begin.body, .{ .allocate = .alloc_always });
+    defer parsed_temporal_begin.deinit();
+    const temporal_txn_value = parsed_temporal_begin.value.object.get("transaction_id") orelse return error.TestUnexpectedResult;
+    if (temporal_txn_value != .string) return error.TestUnexpectedResult;
+    const temporal_txn_id = temporal_txn_value.string;
+
+    const temporal_portion_body = try std.fmt.allocPrint(
+        alloc,
+        "{{\"op\":\"update\",\"source\":{{\"where\":{{\"field\":\"sku\",\"op\":\"eq\",\"value\":\"sku:a\"}},\"row_claim\":{{\"mode\":\"for_update\",\"owner_id\":\"metadata-temporal-chaos\",\"transaction_id\":\"{s}\"}}}},\"patch\":{{\"price\":15}},\"temporal_portion\":{{\"period\":\"valid_time\",\"from\":12,\"to\":16}},\"returning\":[\"*\"]}}",
+        .{temporal_txn_id},
+    );
+    defer alloc.free(temporal_portion_body);
+    var temporal_portion_update = try fetchPublicRowsMutationSourceExpectStatus(
+        &rig.client,
+        temporal_owner_base,
+        "prices",
+        temporal_portion_body,
+        200,
+    );
+    defer temporal_portion_update.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(temporal_portion_update.body, &.{ "\"matched\":2", "\"staged\":1", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15" });
+
+    var temporal_commit = try fetchPublicTransactionSessionCommitRaw(&rig.client, temporal_owner_base, temporal_txn_id);
+    defer temporal_commit.deinit(std.heap.page_allocator);
+    try std.testing.expectEqual(@as(u16, 200), temporal_commit.status);
+    try expectBodyContainsAll(temporal_commit.body, &.{"\"status\":\"committed\""});
+
+    _ = try requireLeasedReconcile(cluster.node(leader_index), workflow.controlLoop());
+    try cluster.stepAll();
+
+    var temporal_fragment_query = try waitForPublicRowsQueryContains(
+        &cluster,
+        &rig.client,
+        temporal_owner_base,
+        "prices",
+        "{\"query\":{\"where\":{\"field\":\"sku\",\"op\":\"eq\",\"value\":\"sku:a\"},\"select\":[\"sku\",\"valid_from\",\"valid_to\",\"price\"],\"order_by\":[{\"field\":\"valid_from\",\"direction\":\"asc\"}]}}",
+        &.{ "\"total\":4", "\"valid_from\":0", "\"valid_to\":10", "\"price\":10", "\"valid_from\":10", "\"valid_to\":12", "\"price\":13", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15", "\"valid_from\":16", "\"valid_to\":20" },
+        32,
+    );
+    defer temporal_fragment_query.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(temporal_fragment_query.body, &.{ "\"total\":4", "\"valid_from\":0", "\"valid_to\":10", "\"price\":10", "\"valid_from\":10", "\"valid_to\":12", "\"price\":13", "\"valid_from\":12", "\"valid_to\":16", "\"price\":15", "\"valid_from\":16", "\"valid_to\":20" });
+
+    var split_temporal_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        temporal_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"sku:a\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}],\"include_physical_key\":true}",
+        &.{ "\"found\":true", "\"price\":15", "\"physical_key\"" },
+        32,
+    );
+    defer split_temporal_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(split_temporal_get.body, &.{ "\"found\":true", "\"price\":15", "\"physical_key\"" });
+
+    var updated_adjustment_get = try waitForPublicRowsGetContains(
+        &cluster,
+        &rig.client,
+        adjustment_client_base,
+        "prices",
+        "{\"keys\":[{\"primary\":{\"values\":{\"sku\":\"adj:rebate\"},\"period\":{\"name\":\"valid_time\",\"at\":15}}}]}",
+        &.{ "\"found\":true", "\"delta\":-2" },
+        32,
+    );
+    defer updated_adjustment_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(updated_adjustment_get.body, &.{ "\"found\":true", "\"delta\":-2" });
+
+    var deleted = try fetchPublicRowsBatchExpectStatus(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"operations\":[{\"op\":\"delete\",\"where\":{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}}]}",
+        201,
+    );
+    defer deleted.deinit(std.heap.page_allocator);
+    try std.testing.expect(std.mem.indexOf(u8, deleted.body, "\"deleted\":1") != null);
+
+    var missing_get = try fetchPublicRowsGet(
+        &rig.client,
+        client_base,
+        "users",
+        "{\"keys\":[{\"unique\":{\"name\":\"users_tenant_email_key\",\"values\":{\"tenant_id\":\"t1\",\"email\":\"ada@example.test\"}}}],\"include_physical_key\":true}",
+    );
+    defer missing_get.deinit(std.heap.page_allocator);
+    try expectBodyContainsAll(missing_get.body, &.{ "\"found\":false", "\"physical_key\":null" });
+}
+
 test "metadata http cluster simulation forwards public table io across split ranges from a non-host node" {
     const TestStatusSource = struct {
         node: MetadataHttpNodeSimulation,
@@ -9453,7 +10454,7 @@ test "metadata http cluster simulation forwards public table io across split ran
     };
     const TestCatalogSource = struct {
         node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source_mod.CatalogSource {
             return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
         }
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -9560,7 +10561,7 @@ test "metadata http cluster simulation forwards public table io across split ran
         .table_id = 484,
         .name = "docs",
         .description = "split forwarded docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 1,
         .min_ranges = 1,
     }, initial_ranges[0..], 40);
@@ -9653,8 +10654,8 @@ test "metadata http cluster simulation forwards public table io across split ran
     defer batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":5") != null);
 
-    try ensureGroupTextIndex(&cluster, roots[left], 4841, api_tables.default_full_text_index_name, 40);
-    try ensureGroupTextIndex(&cluster, roots[right], 4842, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[left], 4841, catalog_table_ddl.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[right], 4842, catalog_table_ddl.default_full_text_index_name, 40);
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
     defer lookup.deinit(std.heap.page_allocator);
@@ -9732,7 +10733,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     };
     const TestCatalogSource = struct {
         node: MetadataHttpNodeSimulation,
-        fn iface(self: *@This()) api_table_catalog.CatalogSource {
+        fn iface(self: *@This()) catalog_source_mod.CatalogSource {
             return .{ .ptr = self, .vtable = &.{ .admin_snapshot = adminSnapshot, .free_admin_snapshot = freeAdminSnapshot } };
         }
         fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
@@ -9847,7 +10848,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
         .table_id = 485,
         .name = "docs",
         .description = "merge forwarded docs",
-        .indexes_json = api_tables.default_indexes_json,
+        .indexes_json = catalog_table_ddl.default_indexes_json,
         .desired_replica_count = 1,
         .min_ranges = 2,
     }, initial_ranges[0..], 40);
@@ -9934,7 +10935,7 @@ test "metadata http cluster simulation forwards public table io after merge fina
     defer batch.deinit(std.heap.page_allocator);
     try std.testing.expect(std.mem.indexOf(u8, batch.body, "\"inserted\":1") != null);
 
-    try ensureGroupTextIndex(&cluster, roots[host], 4851, api_tables.default_full_text_index_name, 40);
+    try ensureGroupTextIndex(&cluster, roots[host], 4851, catalog_table_ddl.default_full_text_index_name, 40);
 
     var lookup = try client.fetchLookup(client_base, "docs", "doc:z", null);
     defer lookup.deinit(std.heap.page_allocator);

@@ -258,11 +258,12 @@ CommitTransaction(t) ==
 
 (*
   Action 6: AbortTransaction(t)
-  Orchestrator aborts on coordinator (either from OCC failure or crash).
+  Orchestrator aborts on coordinator (either directly before prepare writes,
+  after OCC failure, or while unwinding another error).
   Maps to: store/db/helpers.go:148 (finalizeTransaction with status=2)
 *)
 AbortTransaction(t) ==
-    /\ txnStatus[t] = "aborting"
+    /\ txnStatus[t] \in {"preparing", "predicatesChecked", "aborting"}
     /\ txnStatus'  = [txnStatus  EXCEPT ![t] = "aborted"]
     /\ txnRecords' = [txnRecords EXCEPT ![t] = "aborted"]
     /\ UNCHANGED <<clock, txnTimestamp, resolvedParts, intents,

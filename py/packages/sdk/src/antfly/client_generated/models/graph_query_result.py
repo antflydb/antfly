@@ -10,6 +10,7 @@ from ..models.graph_query_type import GraphQueryType
 from ..types import UNSET, Unset
 
 if TYPE_CHECKING:
+    from ..models.graph_query_result_metric_status import GraphQueryResultMetricStatus
     from ..models.graph_result_node import GraphResultNode
     from ..models.path import Path
     from ..models.pattern_match import PatternMatch
@@ -29,6 +30,7 @@ class GraphQueryResult:
         paths (list[Path] | Unset): Result paths (for pathfinding queries)
         matches (list[PatternMatch] | Unset): Pattern matches (for pattern queries)
         took (int | Unset): Query execution time
+        metric_status (GraphQueryResultMetricStatus | Unset): Graph metric status metadata keyed by metric name
     """
 
     type_: GraphQueryType
@@ -37,6 +39,7 @@ class GraphQueryResult:
     paths: list[Path] | Unset = UNSET
     matches: list[PatternMatch] | Unset = UNSET
     took: int | Unset = UNSET
+    metric_status: GraphQueryResultMetricStatus | Unset = UNSET
     additional_properties: dict[str, Any] = _attrs_field(init=False, factory=dict)
 
     def to_dict(self) -> dict[str, Any]:
@@ -67,6 +70,10 @@ class GraphQueryResult:
 
         took = self.took
 
+        metric_status: dict[str, Any] | Unset = UNSET
+        if not isinstance(self.metric_status, Unset):
+            metric_status = self.metric_status.to_dict()
+
         field_dict: dict[str, Any] = {}
         field_dict.update(self.additional_properties)
         field_dict.update(
@@ -83,11 +90,14 @@ class GraphQueryResult:
             field_dict["matches"] = matches
         if took is not UNSET:
             field_dict["took"] = took
+        if metric_status is not UNSET:
+            field_dict["metric_status"] = metric_status
 
         return field_dict
 
     @classmethod
     def from_dict(cls: type[T], src_dict: Mapping[str, Any]) -> T:
+        from ..models.graph_query_result_metric_status import GraphQueryResultMetricStatus
         from ..models.graph_result_node import GraphResultNode
         from ..models.path import Path
         from ..models.pattern_match import PatternMatch
@@ -126,6 +136,13 @@ class GraphQueryResult:
 
         took = d.pop("took", UNSET)
 
+        _metric_status = d.pop("metric_status", UNSET)
+        metric_status: GraphQueryResultMetricStatus | Unset
+        if isinstance(_metric_status, Unset):
+            metric_status = UNSET
+        else:
+            metric_status = GraphQueryResultMetricStatus.from_dict(_metric_status)
+
         graph_query_result = cls(
             type_=type_,
             total=total,
@@ -133,6 +150,7 @@ class GraphQueryResult:
             paths=paths,
             matches=matches,
             took=took,
+            metric_status=metric_status,
         )
 
         graph_query_result.additional_properties = d

@@ -14,15 +14,50 @@
 
 const std = @import("std");
 const schema_regex = @import("antfly_regex");
+const storage_schema = @import("../storage/schema.zig");
+
+pub const StorageMode = enum {
+    document,
+    relational,
+
+    pub fn fromString(text: []const u8) ?StorageMode {
+        if (std.mem.eql(u8, text, "document")) return .document;
+        if (std.mem.eql(u8, text, "relational")) return .relational;
+        return null;
+    }
+};
+
+pub const RelationalIndexLifecycle = enum {
+    ready,
+    building,
+    invalid,
+    dropping,
+
+    pub fn fromString(text: []const u8) ?RelationalIndexLifecycle {
+        if (std.mem.eql(u8, text, "ready")) return .ready;
+        if (std.mem.eql(u8, text, "building")) return .building;
+        if (std.mem.eql(u8, text, "invalid")) return .invalid;
+        if (std.mem.eql(u8, text, "dropping")) return .dropping;
+        return null;
+    }
+};
 
 pub const TableSchema = struct {
     version: u32 = 0,
+    storage_mode: StorageMode = .document,
     default_type: []const u8 = "",
     ttl_duration_ns: u64 = 0,
     ttl_field: []const u8 = "_timestamp",
     enforce_types: bool = false,
     document_schemas: []DocumentSchema = &.{},
     dynamic_templates: []DynamicTemplate = &.{},
+    primary_key: ?PrimaryKey = null,
+    periods: []RelationalPeriod = &.{},
+    foreign_keys: []ForeignKey = &.{},
+    unique_constraints: []UniqueConstraint = &.{},
+    checks: []RelationalCheck = &.{},
+    external_base_source: ?storage_schema.ExternalBaseSource = null,
+    system_versioned: bool = false,
 
     pub fn deinit(self: *TableSchema, alloc: std.mem.Allocator) void {
         alloc.free(self.default_type);
@@ -31,6 +66,416 @@ pub const TableSchema = struct {
         if (self.document_schemas.len > 0) alloc.free(self.document_schemas);
         for (self.dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
         if (self.dynamic_templates.len > 0) alloc.free(self.dynamic_templates);
+        if (self.primary_key) |*primary_key| primary_key.deinit(alloc);
+        for (self.periods) |*period| period.deinit(alloc);
+        if (self.periods.len > 0) alloc.free(self.periods);
+        for (self.foreign_keys) |*foreign_key| foreign_key.deinit(alloc);
+        if (self.foreign_keys.len > 0) alloc.free(self.foreign_keys);
+        for (self.unique_constraints) |*constraint| constraint.deinit(alloc);
+        if (self.unique_constraints.len > 0) alloc.free(self.unique_constraints);
+        for (self.checks) |*check| check.deinit(alloc);
+        if (self.checks.len > 0) alloc.free(self.checks);
+        if (self.external_base_source) |source| storage_schema.freeExternalBaseSource(alloc, source);
+        self.* = undefined;
+    }
+};
+
+pub const PrimaryKey = struct {
+    name: ?[]const u8 = null,
+    columns: [][]const u8 = &.{},
+    include_columns: [][]const u8 = &.{},
+    without_overlaps_period: ?[]const u8 = null,
+    deferrable: bool = false,
+    timing: ForeignKeyTiming = .immediate,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.name) |name| alloc.free(name);
+        for (self.columns) |column| alloc.free(column);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        for (self.include_columns) |column| alloc.free(column);
+        if (self.include_columns.len > 0) alloc.free(self.include_columns);
+        if (self.without_overlaps_period) |period| alloc.free(period);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalPeriod = struct {
+    name: []const u8,
+    start_column: []const u8,
+    end_column: []const u8,
+    range_type: ?storage_schema.RelationalPeriodRangeType = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.start_column);
+        alloc.free(self.end_column);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKeyAction = enum {
+    restrict,
+    no_action,
+    set_null,
+    cascade,
+
+    pub fn fromString(text: []const u8) ?ForeignKeyAction {
+        if (enumTokenEql(text, "restrict") or enumTokenEql(text, "delete_restrict") or enumTokenEql(text, "update_restrict") or enumTokenEql(text, "on_delete_restrict") or enumTokenEql(text, "on_update_restrict")) return .restrict;
+        if (enumTokenEql(text, "no_action") or enumTokenEql(text, "delete_no_action") or enumTokenEql(text, "update_no_action") or enumTokenEql(text, "on_delete_no_action") or enumTokenEql(text, "on_update_no_action")) return .no_action;
+        if (enumTokenEql(text, "set_null") or enumTokenEql(text, "delete_set_null") or enumTokenEql(text, "update_set_null") or enumTokenEql(text, "on_delete_set_null") or enumTokenEql(text, "on_update_set_null")) return .set_null;
+        if (enumTokenEql(text, "cascade") or enumTokenEql(text, "delete_cascade") or enumTokenEql(text, "update_cascade") or enumTokenEql(text, "on_delete_cascade") or enumTokenEql(text, "on_update_cascade")) return .cascade;
+        return null;
+    }
+};
+
+pub const ForeignKeyTiming = enum {
+    immediate,
+    deferred,
+
+    pub fn fromString(text: []const u8) ?ForeignKeyTiming {
+        if (enumTokenEql(text, "immediate") or
+            enumTokenEql(text, "initially_immediate") or
+            enumTokenEql(text, "deferrable_initially_immediate") or
+            enumTokenEql(text, "not_deferrable_initially_immediate"))
+        {
+            return .immediate;
+        }
+        if (enumTokenEql(text, "deferred") or
+            enumTokenEql(text, "initially_deferred") or
+            enumTokenEql(text, "deferrable_initially_deferred") or
+            enumTokenEql(text, "not_deferrable_initially_deferred"))
+        {
+            return .deferred;
+        }
+        return null;
+    }
+};
+
+pub const ForeignKeyMatch = enum {
+    simple,
+    full,
+    partial,
+
+    pub fn fromString(text: []const u8) ?ForeignKeyMatch {
+        if (enumTokenEql(text, "simple") or enumTokenEql(text, "match_simple")) return .simple;
+        if (enumTokenEql(text, "full") or enumTokenEql(text, "match_full")) return .full;
+        if (enumTokenEql(text, "partial") or enumTokenEql(text, "match_partial")) return .partial;
+        return null;
+    }
+};
+
+pub const ForeignKeyValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
+
+    pub fn fromString(text: []const u8) ?ForeignKeyValidationState {
+        if (enumTokenEql(text, "enforced")) return .enforced;
+        if (enumTokenEql(text, "unvalidated") or enumTokenEql(text, "not_valid")) return .unvalidated;
+        if (enumTokenEql(text, "validating")) return .validating;
+        if (enumTokenEql(text, "invalid")) return .invalid;
+        return null;
+    }
+};
+
+pub const UniqueConstraintValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
+
+    pub fn fromString(text: []const u8) ?UniqueConstraintValidationState {
+        if (enumTokenEql(text, "enforced")) return .enforced;
+        if (enumTokenEql(text, "unvalidated") or enumTokenEql(text, "not_valid")) return .unvalidated;
+        if (enumTokenEql(text, "validating")) return .validating;
+        if (enumTokenEql(text, "invalid")) return .invalid;
+        return null;
+    }
+};
+
+fn foreignKeyDeferrableFromValue(value: std.json.Value) ?bool {
+    return if (foreignKeyDeferrabilityFromValue(value)) |clause| clause.deferrable else null;
+}
+
+const ForeignKeyDeferrability = struct {
+    deferrable: bool,
+    timing: ?ForeignKeyTiming = null,
+};
+
+const ForeignKeyTimingClause = struct {
+    timing: ForeignKeyTiming,
+    deferrable: ?bool = null,
+};
+
+fn foreignKeyTimingClauseFromString(text: []const u8) ?ForeignKeyTimingClause {
+    const timing = ForeignKeyTiming.fromString(text) orelse return null;
+    const deferrable = if (foreignKeyDeferrableFromString(text)) |clause| clause.deferrable else null;
+    return .{ .timing = timing, .deferrable = deferrable };
+}
+
+fn foreignKeyDeferrabilityFromValue(value: std.json.Value) ?ForeignKeyDeferrability {
+    return switch (value) {
+        .bool => |enabled| .{ .deferrable = enabled },
+        .string => |text| foreignKeyDeferrableFromString(text),
+        else => null,
+    };
+}
+
+fn foreignKeyDeferrableFromString(text: []const u8) ?ForeignKeyDeferrability {
+    if (enumTokenEql(text, "deferrable")) return .{ .deferrable = true };
+    if (enumTokenEql(text, "not_deferrable")) return .{ .deferrable = false };
+    if (enumTokenEql(text, "deferrable_initially_immediate")) return .{ .deferrable = true, .timing = .immediate };
+    if (enumTokenEql(text, "deferrable_initially_deferred")) return .{ .deferrable = true, .timing = .deferred };
+    if (enumTokenEql(text, "not_deferrable_initially_immediate")) return .{ .deferrable = false, .timing = .immediate };
+    if (enumTokenEql(text, "not_deferrable_initially_deferred")) return .{ .deferrable = false, .timing = .deferred };
+    return null;
+}
+
+const ConstraintTimingMetadata = struct {
+    timing: ForeignKeyTiming = .immediate,
+    deferrable: bool = false,
+};
+
+fn constraintTimingMetadataFromObject(object: std.json.ObjectMap) !ConstraintTimingMetadata {
+    const timing_clause = if (object.get("timing")) |timing_value|
+        foreignKeyTimingClauseFromString(timing_value.string).?
+    else
+        null;
+    const explicit_timing = if (timing_clause) |clause| clause.timing else null;
+    const deferrability = if (object.get("deferrable")) |deferrable_value|
+        foreignKeyDeferrabilityFromValue(deferrable_value).?
+    else
+        null;
+    const timing_from_deferrability = if (deferrability) |clause| clause.timing else null;
+    if (explicit_timing != null and timing_from_deferrability != null and explicit_timing.? != timing_from_deferrability.?) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    const explicit_deferrable = if (timing_clause) |clause| clause.deferrable else null;
+    const deferrable_from_deferrability = if (deferrability) |clause| clause.deferrable else null;
+    if (explicit_deferrable != null and deferrable_from_deferrability != null and explicit_deferrable.? != deferrable_from_deferrability.?) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    const timing = explicit_timing orelse timing_from_deferrability orelse ForeignKeyTiming.immediate;
+    const deferrable = explicit_deferrable orelse deferrable_from_deferrability orelse (timing == .deferred);
+    if (timing == .deferred and !deferrable) return error.InvalidSchemaUpdateRequest;
+    return .{ .timing = timing, .deferrable = deferrable };
+}
+
+fn enumTokenEql(actual: []const u8, expected: []const u8) bool {
+    var actual_index: usize = 0;
+    var expected_index: usize = 0;
+    while (true) {
+        while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+        while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+        if (actual_index == actual.len or expected_index == expected.len) break;
+        if (std.ascii.toLower(actual[actual_index]) != std.ascii.toLower(expected[expected_index])) return false;
+        actual_index += 1;
+        expected_index += 1;
+    }
+    while (actual_index < actual.len and enumTokenSeparator(actual[actual_index])) actual_index += 1;
+    while (expected_index < expected.len and enumTokenSeparator(expected[expected_index])) expected_index += 1;
+    return actual_index == actual.len and expected_index == expected.len;
+}
+
+fn enumTokenSeparator(ch: u8) bool {
+    return std.ascii.isWhitespace(ch) or ch == '_' or ch == '-';
+}
+
+pub const ForeignKeyReference = struct {
+    table: []const u8,
+    columns: [][]const u8 = &.{},
+    period: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table);
+        for (self.columns) |column| alloc.free(column);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        if (self.period) |period| alloc.free(period);
+        self.* = undefined;
+    }
+};
+
+pub const ForeignKey = struct {
+    name: []const u8,
+    columns: [][]const u8 = &.{},
+    period: ?[]const u8 = null,
+    references: ForeignKeyReference,
+    on_delete: ForeignKeyAction = .restrict,
+    on_update: ForeignKeyAction = .restrict,
+    timing: ForeignKeyTiming = .immediate,
+    deferrable: bool = false,
+    match: ForeignKeyMatch = .simple,
+    validation_state: ForeignKeyValidationState = .enforced,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        for (self.columns) |column| alloc.free(column);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        if (self.period) |period| alloc.free(period);
+        self.references.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const UniqueConstraint = struct {
+    name: []const u8,
+    columns: [][]const u8 = &.{},
+    expressions: []UniqueExpression = &.{},
+    include_columns: [][]const u8 = &.{},
+    index_keys: []storage_schema.RelationalIndexKey = &.{},
+    without_overlaps_period: ?[]const u8 = null,
+    nulls_not_distinct: bool = false,
+    deferrable: bool = false,
+    timing: ForeignKeyTiming = .immediate,
+    where: []UniquePredicate = &.{},
+    where_expressions: []storage_schema.RelationalRowsExpressionCondition = &.{},
+    validation_state: UniqueConstraintValidationState = .enforced,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        for (self.columns) |column| alloc.free(column);
+        if (self.columns.len > 0) alloc.free(self.columns);
+        for (self.expressions) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
+        if (self.expressions.len > 0) alloc.free(self.expressions);
+        for (self.include_columns) |column| alloc.free(column);
+        if (self.include_columns.len > 0) alloc.free(self.include_columns);
+        freeRelationalIndexKeys(alloc, self.index_keys);
+        if (self.without_overlaps_period) |period| alloc.free(period);
+        for (self.where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        if (self.where.len > 0) alloc.free(self.where);
+        for (self.where_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.where_expressions.len > 0) alloc.free(self.where_expressions);
+        self.* = undefined;
+    }
+};
+
+pub const UniqueExpressionOp = enum {
+    lower,
+    upper,
+    md5,
+    expression,
+};
+
+fn freeRelationalIndexKeys(alloc: std.mem.Allocator, keys: []const storage_schema.RelationalIndexKey) void {
+    for (keys) |key| alloc.free(key.column);
+    if (keys.len > 0) alloc.free(keys);
+}
+
+pub const UniqueExpression = struct {
+    op: UniqueExpressionOp,
+    field: []const u8 = "",
+    expression: ?storage_schema.RelationalRowsExpression = null,
+};
+
+pub const UniquePredicateOp = enum {
+    is_null,
+    is_not_null,
+    eq,
+    ne,
+};
+
+pub const UniquePredicate = struct {
+    field: []const u8,
+    op: UniquePredicateOp,
+    value_json: ?[]const u8 = null,
+};
+
+pub const RelationalCheckOp = enum {
+    is_null,
+    is_not_null,
+    is_distinct,
+    is_not_distinct,
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+};
+
+pub const RelationalCheck = struct {
+    name: []const u8,
+    field: []const u8 = "",
+    op: RelationalCheckOp = .eq,
+    value_json: ?[]const u8 = null,
+    collation: ?[]const u8 = null,
+    validation_state: RelationalCheckValidationState = .enforced,
+    expression: ?storage_schema.RelationalRowsExpressionCondition = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.field);
+        if (self.value_json) |value| alloc.free(value);
+        if (self.collation) |value| alloc.free(value);
+        if (self.expression) |expression| freeRelationalRowsExpressionCondition(alloc, expression);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalCheckValidationState = enum {
+    enforced,
+    unvalidated,
+    validating,
+    invalid,
+};
+
+const RelationalRowsExpressionType = enum {
+    text,
+    numeric,
+    boolean,
+    datetime,
+    json,
+    array,
+    null,
+};
+
+pub const RelationalGeneratedOp = enum {
+    lower,
+    upper,
+    md5,
+    concat,
+    concat_ws,
+    expression,
+};
+
+pub const RelationalDefaultKind = enum {
+    literal,
+    now_ns,
+    current_date_ns,
+    uuid_v4,
+    sequence_next,
+};
+
+pub const RelationalDefaultValue = struct {
+    kind: RelationalDefaultKind = .literal,
+    value_json: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.value_json);
+        self.* = undefined;
+    }
+};
+
+pub const RelationalGeneratedValue = struct {
+    op: RelationalGeneratedOp,
+    field: ?[]const u8 = null,
+    fields: [][]const u8 = &.{},
+    separator: []const u8 = "",
+    expression: ?storage_schema.RelationalRowsExpression = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.field) |field| alloc.free(field);
+        for (self.fields) |field| alloc.free(field);
+        if (self.fields.len > 0) alloc.free(self.fields);
+        alloc.free(self.separator);
+        if (self.expression) |expression| freeRelationalRowsExpression(alloc, expression);
         self.* = undefined;
     }
 };
@@ -126,7 +571,13 @@ pub const DocumentProperty = struct {
     field_type: ?[]const u8 = null,
     antfly_types: [][]const u8 = &.{},
     analyzer: ?[]const u8 = null,
+    collation: ?[]const u8 = null,
     antfly_index: ?bool = null,
+    index_lifecycle: ?RelationalIndexLifecycle = null,
+    index_generation: ?u64 = null,
+    index_name: ?[]const u8 = null,
+    index_include_columns: [][]const u8 = &.{},
+    index_keys: []storage_schema.RelationalIndexKey = &.{},
     integer_only: bool = false,
     format: ?[]const u8 = null,
     allows_null: bool = false,
@@ -172,6 +623,13 @@ pub const DocumentProperty = struct {
     item: ?*DocumentProperty = null,
     unevaluated_items_allowed: ?bool = null,
     unevaluated_items_schema: ?*DocumentProperty = null,
+    embedded_schema: ?*DocumentProperty = null,
+    embedded_dynamic_templates: []DynamicTemplate = &.{},
+    default_value: ?RelationalDefaultValue = null,
+    on_update_value: ?RelationalDefaultValue = null,
+    generated: ?RelationalGeneratedValue = null,
+    index_where: []UniquePredicate = &.{},
+    index_where_expressions: []storage_schema.RelationalRowsExpressionCondition = &.{},
 
     pub fn deinit(self: *DocumentProperty, alloc: std.mem.Allocator) void {
         alloc.free(self.name);
@@ -179,6 +637,11 @@ pub const DocumentProperty = struct {
         for (self.antfly_types) |antfly_type| alloc.free(antfly_type);
         if (self.antfly_types.len > 0) alloc.free(self.antfly_types);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
+        if (self.collation) |collation| alloc.free(collation);
+        if (self.index_name) |index_name| alloc.free(index_name);
+        for (self.index_include_columns) |field_name| alloc.free(field_name);
+        if (self.index_include_columns.len > 0) alloc.free(self.index_include_columns);
+        freeRelationalIndexKeys(alloc, self.index_keys);
         if (self.format) |format| alloc.free(format);
         if (self.const_value) |const_value| alloc.free(const_value);
         if (self.pattern) |pattern| alloc.free(pattern);
@@ -253,6 +716,22 @@ pub const DocumentProperty = struct {
             unevaluated_items_schema.deinit(alloc);
             alloc.destroy(unevaluated_items_schema);
         }
+        if (self.embedded_schema) |embedded_schema| {
+            embedded_schema.deinit(alloc);
+            alloc.destroy(embedded_schema);
+        }
+        for (self.embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
+        if (self.embedded_dynamic_templates.len > 0) alloc.free(self.embedded_dynamic_templates);
+        if (self.default_value) |*value| value.deinit(alloc);
+        if (self.on_update_value) |*value| value.deinit(alloc);
+        if (self.generated) |*generated| generated.deinit(alloc);
+        for (self.index_where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        if (self.index_where.len > 0) alloc.free(self.index_where);
+        for (self.index_where_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (self.index_where_expressions.len > 0) alloc.free(self.index_where_expressions);
         self.* = undefined;
     }
 };
@@ -373,6 +852,10 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{});
     defer parsed.deinit();
     try validateSchemaValue(parsed.value);
+    var schema = try parseTableSchemaValue(alloc, parsed.value);
+    defer schema.deinit(alloc);
+    try validateParsedTtlSchema(schema);
+    try validateParsedRelationalSchema(schema);
     return try stringifyJsonValue(alloc, parsed.value);
 }
 
@@ -393,6 +876,7 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         owned.deinit(alloc);
     }
     try validateParsedTtlSchema(schema);
+    try validateParsedRelationalSchema(schema);
     return schema;
 }
 
@@ -603,6 +1087,12 @@ fn validateSchemaValue(value: std.json.Value) !void {
     };
 
     if (root.get("version")) |version| if (version != .null) try validateNonNegativeInteger(version);
+    if (root.get("storage_mode")) |storage_mode| if (storage_mode != .null) switch (storage_mode) {
+        .string => |text| {
+            if (StorageMode.fromString(text) == null) return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    };
     if (root.get("default_type")) |default_type| if (default_type != .null and default_type != .string) return error.InvalidSchemaUpdateRequest;
     if (root.get("ttl_duration_ns")) |ttl_duration_ns| if (ttl_duration_ns != .null) try validateNonNegativeInteger(ttl_duration_ns);
     if (root.get("ttl_field")) |ttl_field| if (ttl_field != .null) switch (ttl_field) {
@@ -614,6 +1104,462 @@ fn validateSchemaValue(value: std.json.Value) !void {
     if (root.get("enforce_types")) |enforce_types| if (enforce_types != .null and enforce_types != .bool) return error.InvalidSchemaUpdateRequest;
     if (root.get("document_schemas")) |document_schemas| if (document_schemas != .null) try validateDocumentSchemas(document_schemas);
     if (root.get("dynamic_templates")) |dynamic_templates| if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
+    if (root.get("primary_key")) |primary_key| if (primary_key != .null) try validatePrimaryKey(primary_key);
+    if (root.get("periods")) |periods| if (periods != .null) try validateRelationalPeriodsValue(periods);
+    if (root.get("foreign_keys")) |foreign_keys| if (foreign_keys != .null) try validateForeignKeys(foreign_keys);
+    if (root.get("unique_constraints")) |constraints| if (constraints != .null) try validateUniqueConstraints(constraints);
+    if (root.get("checks")) |checks| if (checks != .null) try validateRelationalChecksValue(checks);
+    if (root.get("system_versioned")) |system_versioned| if (system_versioned != .null and system_versioned != .bool) return error.InvalidSchemaUpdateRequest;
+    if (root.get("base_source") != null and root.get("external_base_source") != null) return error.InvalidSchemaUpdateRequest;
+    if (root.get("base_source")) |base_source| if (base_source != .null) try validateExternalBaseSource(base_source);
+    if (root.get("external_base_source")) |base_source| if (base_source != .null) try validateExternalBaseSource(base_source);
+}
+
+fn validateExternalBaseSource(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (object.get("kind")) |kind| switch (kind) {
+        .string => |text| if (!enumTokenEql(text, "external")) return error.InvalidSchemaUpdateRequest,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const table_id = object.get("table_id") orelse return error.InvalidSchemaUpdateRequest;
+    if (table_id != .string or table_id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    const format = object.get("format") orelse return error.InvalidSchemaUpdateRequest;
+    if (format != .string or parseExternalBaseFormat(format.string) == null) return error.InvalidSchemaUpdateRequest;
+    const uri = object.get("uri") orelse object.get("source_uri") orelse return error.InvalidSchemaUpdateRequest;
+    if (uri != .string or uri.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("credentials")) |credentials| try validateExternalCredentialRef(credentials);
+    if (object.get("credential_ref")) |credentials| try validateExternalCredentialRef(credentials);
+    if (object.get("snapshot")) |snapshot| try validateExternalSnapshotMode(snapshot);
+    if (object.get("snapshot_mode")) |snapshot| try validateExternalSnapshotMode(snapshot);
+    const schema_fingerprint = object.get("schema_fingerprint") orelse return error.InvalidSchemaUpdateRequest;
+    if (schema_fingerprint != .string or schema_fingerprint.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("write_policy")) |write_policy| {
+        if (write_policy != .string or parseExternalWritePolicy(write_policy.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateExternalCredentialRef(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const ref_id = object.get("ref") orelse object.get("ref_id") orelse return error.InvalidSchemaUpdateRequest;
+    if (ref_id != .string or ref_id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (object.get("scope")) |scope| {
+        if (scope != .string) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateExternalSnapshotMode(value: std.json.Value) !void {
+    switch (value) {
+        .string => |text| {
+            if (!enumTokenEql(text, "current") and !enumTokenEql(text, "iceberg_current")) return error.InvalidSchemaUpdateRequest;
+        },
+        .object => |object| {
+            const mode = object.get("mode") orelse return error.InvalidSchemaUpdateRequest;
+            if (mode != .string) return error.InvalidSchemaUpdateRequest;
+            if (enumTokenEql(mode.string, "current") or enumTokenEql(mode.string, "iceberg_current")) return;
+            if (enumTokenEql(mode.string, "snapshot_id") or enumTokenEql(mode.string, "snapshot")) {
+                const id = object.get("id") orelse object.get("snapshot_id") orelse return error.InvalidSchemaUpdateRequest;
+                if (id != .string or id.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                return;
+            }
+            if (enumTokenEql(mode.string, "object_version_digest") or enumTokenEql(mode.string, "raw_parquet_digest")) {
+                const digest = object.get("digest") orelse object.get("object_version_digest") orelse return error.InvalidSchemaUpdateRequest;
+                if (digest != .string or digest.string.len == 0) return error.InvalidSchemaUpdateRequest;
+                return;
+            }
+            return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn validatePrimaryKey(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var field_it = object.iterator();
+    while (field_it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
+            !std.mem.eql(u8, entry.key_ptr.*, "columns") and
+            !std.mem.eql(u8, entry.key_ptr.*, "include_columns") and
+            !std.mem.eql(u8, entry.key_ptr.*, "without_overlaps_period") and
+            !std.mem.eql(u8, entry.key_ptr.*, "timing") and
+            !std.mem.eql(u8, entry.key_ptr.*, "deferrable"))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    if (object.get("name")) |name| {
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+    const columns = object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
+    try validateStringArray(columns, true);
+    if (object.get("include_columns")) |include_columns| try validateStringArray(include_columns, false);
+    if (object.get("without_overlaps_period")) |period| {
+        if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("timing")) |timing| {
+        if (timing != .string or foreignKeyTimingClauseFromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("deferrable")) |deferrable| {
+        if (foreignKeyDeferrabilityFromValue(deferrable) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    _ = try constraintTimingMetadataFromObject(object);
+}
+
+fn validateRelationalPeriodsValue(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
+                !std.mem.eql(u8, entry.key_ptr.*, "start_column") and
+                !std.mem.eql(u8, entry.key_ptr.*, "end_column") and
+                !std.mem.eql(u8, entry.key_ptr.*, "range_type"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        const start_column = object.get("start_column") orelse return error.InvalidSchemaUpdateRequest;
+        const end_column = object.get("end_column") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (start_column != .string or start_column.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (end_column != .string or end_column.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (std.mem.eql(u8, start_column.string, end_column.string)) return error.InvalidSchemaUpdateRequest;
+        if (object.get("range_type")) |range_type| {
+            if (range_type != .string) return error.InvalidSchemaUpdateRequest;
+            _ = parseRelationalPeriodRangeType(range_type.string) orelse return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateForeignKeys(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var field_it = object.iterator();
+        while (field_it.next()) |entry| {
+            if (!isAllowedForeignKeyField(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+        }
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const columns = object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
+        try validateStringArray(columns, true);
+        const references = object.get("references") orelse return error.InvalidSchemaUpdateRequest;
+        const references_object = switch (references) {
+            .object => |references_object| references_object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var references_field_it = references_object.iterator();
+        while (references_field_it.next()) |entry| {
+            if (!isAllowedForeignKeyReferenceField(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+        }
+        const parent_table = references_object.get("table") orelse return error.InvalidSchemaUpdateRequest;
+        if (parent_table != .string or parent_table.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const parent_columns = references_object.get("columns") orelse return error.InvalidSchemaUpdateRequest;
+        try validateStringArray(parent_columns, true);
+        if (object.get("period")) |period| {
+            if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        }
+        if (references_object.get("period")) |period| {
+            if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("on_delete")) |on_delete| {
+            if (on_delete != .string or ForeignKeyAction.fromString(on_delete.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("on_update")) |on_update| {
+            if (on_update != .string or ForeignKeyAction.fromString(on_update.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("timing")) |timing| {
+            if (timing != .string or foreignKeyTimingClauseFromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("deferrable")) |deferrable| {
+            if (foreignKeyDeferrableFromValue(deferrable) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("match")) |match| {
+            if (match != .string or ForeignKeyMatch.fromString(match.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("validation_state")) |validation_state| {
+            if (validation_state != .string or ForeignKeyValidationState.fromString(validation_state.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn isAllowedForeignKeyField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "name") or
+        std.mem.eql(u8, field, "columns") or
+        std.mem.eql(u8, field, "period") or
+        std.mem.eql(u8, field, "references") or
+        std.mem.eql(u8, field, "on_delete") or
+        std.mem.eql(u8, field, "on_update") or
+        std.mem.eql(u8, field, "timing") or
+        std.mem.eql(u8, field, "deferrable") or
+        std.mem.eql(u8, field, "match") or
+        std.mem.eql(u8, field, "validation_state");
+}
+
+fn isAllowedForeignKeyReferenceField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "table") or
+        std.mem.eql(u8, field, "columns") or
+        std.mem.eql(u8, field, "period");
+}
+
+fn validateUniqueConstraints(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var field_it = object.iterator();
+        while (field_it.next()) |entry| {
+            if (!isAllowedUniqueConstraintField(entry.key_ptr.*)) return error.InvalidSchemaUpdateRequest;
+        }
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const columns = object.get("columns");
+        const expressions = object.get("expressions");
+        if (columns == null and expressions == null) return error.InvalidSchemaUpdateRequest;
+        if (columns) |columns_value| try validateStringArray(columns_value, false);
+        if (expressions) |expressions_value| try validateUniqueExpressionArray(expressions_value);
+        if (object.get("include_columns")) |include_columns| try validateStringArray(include_columns, false);
+        if (object.get("index_keys")) |index_keys| try validateRelationalIndexKeysJson(index_keys);
+        const column_count = if (columns) |columns_value| columns_value.array.items.len else 0;
+        const expression_count = if (expressions) |expressions_value| expressions_value.array.items.len else 0;
+        if (column_count + expression_count == 0) return error.InvalidSchemaUpdateRequest;
+        if (object.get("without_overlaps_period")) |period| {
+            if (period != .string or period.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("nulls_not_distinct")) |nulls_not_distinct| {
+            if (nulls_not_distinct != .bool) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("where")) |where| {
+            try validateUniquePredicateDefinition(where);
+        }
+        if (object.get("where_expressions")) |where_expressions| {
+            try validateRelationalRowsExpressionConditionArrayJson(where_expressions);
+        }
+        if (object.get("validation_state")) |validation_state| {
+            if (validation_state != .string or UniqueConstraintValidationState.fromString(validation_state.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("timing")) |timing| {
+            if (timing != .string or foreignKeyTimingClauseFromString(timing.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("deferrable")) |deferrable| {
+            if (foreignKeyDeferrabilityFromValue(deferrable) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        _ = try constraintTimingMetadataFromObject(object);
+    }
+}
+
+fn isAllowedUniqueConstraintField(field: []const u8) bool {
+    return std.mem.eql(u8, field, "name") or
+        std.mem.eql(u8, field, "columns") or
+        std.mem.eql(u8, field, "expressions") or
+        std.mem.eql(u8, field, "include_columns") or
+        std.mem.eql(u8, field, "index_keys") or
+        std.mem.eql(u8, field, "without_overlaps_period") or
+        std.mem.eql(u8, field, "nulls_not_distinct") or
+        std.mem.eql(u8, field, "timing") or
+        std.mem.eql(u8, field, "deferrable") or
+        std.mem.eql(u8, field, "where") or
+        std.mem.eql(u8, field, "where_expressions") or
+        std.mem.eql(u8, field, "validation_state");
+}
+
+fn validateStringArray(value: std.json.Value, require_non_empty: bool) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (require_non_empty and array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |item| {
+        if (item != .string or item.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn validateRelationalIndexKeysJson(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "column") and
+                !std.mem.eql(u8, entry.key_ptr.*, "direction") and
+                !std.mem.eql(u8, entry.key_ptr.*, "nulls"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        const column = object.get("column") orelse return error.InvalidSchemaUpdateRequest;
+        if (column != .string or column.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (object.get("direction")) |direction| {
+            if (direction != .string or relationalIndexKeyDirectionFromString(direction.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+        if (object.get("nulls")) |nulls| {
+            if (nulls != .string or relationalIndexKeyNullsFromString(nulls.string) == null) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateUniqueExpressionArray(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "op") and
+                !std.mem.eql(u8, entry.key_ptr.*, "field") and
+                !std.mem.eql(u8, entry.key_ptr.*, "expression"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+        if (op != .string) return error.InvalidSchemaUpdateRequest;
+        if (enumTokenEql(op.string, "expression")) {
+            if (object.get("field") != null) return error.InvalidSchemaUpdateRequest;
+            const expression = object.get("expression") orelse return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionJson(expression);
+        } else {
+            if (!enumTokenEql(op.string, "lower") and !enumTokenEql(op.string, "upper") and !enumTokenEql(op.string, "md5")) return error.InvalidSchemaUpdateRequest;
+            if (object.get("expression") != null) return error.InvalidSchemaUpdateRequest;
+            const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+            if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateUniquePredicateDefinition(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "all")) return error.InvalidSchemaUpdateRequest;
+    }
+    const all = object.get("all") orelse return error.InvalidSchemaUpdateRequest;
+    const array = switch (all) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (array.items) |item| try validateUniquePredicateAtom(item);
+}
+
+fn validateUniquePredicateAtom(value: std.json.Value) !void {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        if (!std.mem.eql(u8, entry.key_ptr.*, "field") and
+            !std.mem.eql(u8, entry.key_ptr.*, "op") and
+            !std.mem.eql(u8, entry.key_ptr.*, "value"))
+        {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+    const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (op != .string) return error.InvalidSchemaUpdateRequest;
+    const needs_value = enumTokenEql(op.string, "eq") or enumTokenEql(op.string, "ne");
+    const forbids_value = enumTokenEql(op.string, "is_null") or enumTokenEql(op.string, "is_not_null");
+    if (!needs_value and !forbids_value) return error.InvalidSchemaUpdateRequest;
+    if (needs_value and object.get("value") == null) return error.InvalidSchemaUpdateRequest;
+    if (forbids_value and object.get("value") != null) return error.InvalidSchemaUpdateRequest;
+}
+
+fn validateRelationalChecksValue(value: std.json.Value) !void {
+    const array = switch (value) {
+        .array => |array| array,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    for (array.items) |item| {
+        const object = switch (item) {
+            .object => |object| object,
+            else => return error.InvalidSchemaUpdateRequest,
+        };
+        var it = object.iterator();
+        while (it.next()) |entry| {
+            if (!std.mem.eql(u8, entry.key_ptr.*, "name") and
+                !std.mem.eql(u8, entry.key_ptr.*, "field") and
+                !std.mem.eql(u8, entry.key_ptr.*, "op") and
+                !std.mem.eql(u8, entry.key_ptr.*, "value") and
+                !std.mem.eql(u8, entry.key_ptr.*, "collation") and
+                !std.mem.eql(u8, entry.key_ptr.*, "expression") and
+                !std.mem.eql(u8, entry.key_ptr.*, "validation_state"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        const name = object.get("name") orelse return error.InvalidSchemaUpdateRequest;
+        if (name != .string or name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (object.get("expression")) |expression| {
+            if (object.get("field") != null or object.get("op") != null or object.get("value") != null or object.get("collation") != null) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionConditionJson(expression);
+        } else {
+            const field = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+            const op = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+            if (field != .string or field.string.len == 0) return error.InvalidSchemaUpdateRequest;
+            if (op != .string) return error.InvalidSchemaUpdateRequest;
+            const needs_value =
+                enumTokenEql(op.string, "eq") or enumTokenEql(op.string, "ne") or
+                enumTokenEql(op.string, "gt") or enumTokenEql(op.string, "gte") or
+                enumTokenEql(op.string, "lt") or enumTokenEql(op.string, "lte") or
+                enumTokenEql(op.string, "is_distinct") or enumTokenEql(op.string, "is_not_distinct");
+            const forbids_value = enumTokenEql(op.string, "is_null") or enumTokenEql(op.string, "is_not_null");
+            if (!needs_value and !forbids_value) return error.InvalidSchemaUpdateRequest;
+            if (needs_value and object.get("value") == null) return error.InvalidSchemaUpdateRequest;
+            if (forbids_value and object.get("value") != null) return error.InvalidSchemaUpdateRequest;
+            if (object.get("collation")) |collation| {
+                if (collation != .string or collation.string.len == 0) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        if (object.get("validation_state")) |validation_state| {
+            if (validation_state != .string) return error.InvalidSchemaUpdateRequest;
+            _ = try parseRelationalCheckValidationState(validation_state.string);
+        }
+    }
 }
 
 fn validateDocumentSchemas(value: std.json.Value) !void {
@@ -673,6 +1619,12 @@ fn validateDocumentSchemaKeywords(context: SchemaContext, object: std.json.Objec
     }
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
         if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
+    }
+    if (object.get("schema")) |embedded_schema| {
+        if (embedded_schema != .null) try validateDocumentSchemaDefinition(embedded_schema);
+    }
+    if (object.get("dynamic_templates")) |dynamic_templates| {
+        if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
     }
     if (object.get("$defs")) |definitions| {
         if (definitions != .null) try validateDefinitionsDefinition(context, definitions);
@@ -854,11 +1806,45 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     if (object.get("x-antfly-analyzer")) |analyzer| {
         if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
     }
+    if (object.get("collation")) |collation| {
+        if (collation != .null and collation != .string) return error.InvalidSchemaUpdateRequest;
+        if (collation == .string and collation.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
     if (object.get("x-antfly-index")) |antfly_index| {
         if (antfly_index != .null and antfly_index != .bool) return error.InvalidSchemaUpdateRequest;
     }
+    if (object.get("x-antfly-index-lifecycle")) |index_lifecycle| {
+        if (index_lifecycle != .null and index_lifecycle != .string) return error.InvalidSchemaUpdateRequest;
+        if (index_lifecycle == .string and RelationalIndexLifecycle.fromString(index_lifecycle.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-generation")) |index_generation| {
+        if (index_generation != .null and index_generation != .integer) return error.InvalidSchemaUpdateRequest;
+        if (index_generation == .integer and index_generation.integer <= 0) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-name")) |index_name| {
+        if (index_name != .null and index_name != .string) return error.InvalidSchemaUpdateRequest;
+        if (index_name == .string and index_name.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    }
+    if (object.get("x-antfly-index-include")) |index_include| {
+        if (index_include != .null) try validateAntflyIncludeInAllDefinition(index_include);
+    }
+    if (object.get("x-antfly-index-keys")) |index_keys| {
+        if (index_keys != .null) try validateRelationalIndexKeysJson(index_keys);
+    }
+    if (object.get("x-antfly-index-where")) |index_where| {
+        if (index_where != .null) try validateUniquePredicateDefinition(index_where);
+    }
+    if (object.get("x-antfly-index-where-expressions")) |index_where_expressions| {
+        if (index_where_expressions != .null) try validateRelationalRowsExpressionConditionArrayJson(index_where_expressions);
+    }
     if (object.get("x-antfly-include-in-all")) |include_in_all| {
         if (include_in_all != .null) try validateAntflyIncludeInAllDefinition(include_in_all);
+    }
+    if (object.get("schema")) |embedded_schema| {
+        if (embedded_schema != .null) try validateDocumentSchemaDefinition(embedded_schema);
+    }
+    if (object.get("dynamic_templates")) |dynamic_templates| {
+        if (dynamic_templates != .null) try validateDynamicTemplates(dynamic_templates);
     }
     if (object.get("$defs")) |definitions| {
         if (definitions != .null) try validateDefinitionsDefinition(context, definitions);
@@ -1180,8 +2166,11 @@ fn validateTypeName(schema_type_name: []const u8, require_object_only: bool) ![]
         std.mem.eql(u8, schema_type_name, "integer") or
         std.mem.eql(u8, schema_type_name, "null") or
         std.mem.eql(u8, schema_type_name, "numeric") or
+        std.mem.eql(u8, schema_type_name, "embedding") or
         std.mem.eql(u8, schema_type_name, "boolean") or
         std.mem.eql(u8, schema_type_name, "datetime") or
+        std.mem.eql(u8, schema_type_name, "geopoint") or
+        std.mem.eql(u8, schema_type_name, "json") or
         std.mem.eql(u8, schema_type_name, "object") or
         std.mem.eql(u8, schema_type_name, "array"))
     {
@@ -1361,6 +2350,12 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("version")) |version| {
         if (version != .null) parsed.version = std.math.cast(u32, version.integer) orelse return error.InvalidSchemaUpdateRequest;
     }
+    if (root.get("storage_mode")) |storage_mode| {
+        if (storage_mode != .null) {
+            if (storage_mode != .string) return error.InvalidSchemaUpdateRequest;
+            parsed.storage_mode = StorageMode.fromString(storage_mode.string) orelse return error.InvalidSchemaUpdateRequest;
+        }
+    }
     if (root.get("default_type")) |default_type| {
         if (default_type != .null) {
             alloc.free(parsed.default_type);
@@ -1386,6 +2381,35 @@ fn parseTableSchemaValue(alloc: std.mem.Allocator, value: std.json.Value) !Table
     if (root.get("dynamic_templates")) |dynamic_templates| {
         if (dynamic_templates != .null) parsed.dynamic_templates = try parseDynamicTemplates(alloc, dynamic_templates);
     }
+    if (root.get("primary_key")) |primary_key| {
+        if (primary_key != .null) parsed.primary_key = try parsePrimaryKey(alloc, primary_key);
+    }
+    if (root.get("periods")) |periods| {
+        if (periods != .null) parsed.periods = try parseRelationalPeriods(alloc, periods);
+    }
+    if (root.get("foreign_keys")) |foreign_keys| {
+        if (foreign_keys != .null) parsed.foreign_keys = try parseForeignKeys(alloc, foreign_keys);
+    }
+    if (root.get("unique_constraints")) |constraints| {
+        if (constraints != .null) parsed.unique_constraints = try parseUniqueConstraints(alloc, constraints);
+    }
+    if (root.get("checks")) |checks| {
+        if (checks != .null) parsed.checks = try parseRelationalChecks(alloc, checks);
+    }
+    if (root.get("system_versioned")) |system_versioned| {
+        if (system_versioned != .null) parsed.system_versioned = system_versioned.bool;
+    }
+    if (root.get("base_source")) |base_source| {
+        if (base_source != .null) parsed.external_base_source = try parseExternalBaseSource(alloc, base_source);
+    } else if (root.get("external_base_source")) |base_source| {
+        if (base_source != .null) parsed.external_base_source = try parseExternalBaseSource(alloc, base_source);
+    }
+    if (parsed.storage_mode == .relational) {
+        if (root.get("enforce_types")) |enforce_types| {
+            if (enforce_types != .null and !enforce_types.bool) return error.InvalidSchemaUpdateRequest;
+        }
+        parsed.enforce_types = true;
+    }
     return parsed;
 }
 
@@ -1401,6 +2425,1035 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
             }
         }
     }
+}
+
+fn validateParsedRelationalSchema(schema: TableSchema) !void {
+    if (schema.storage_mode != .relational) {
+        if (schema.primary_key != null or schema.periods.len != 0 or schema.foreign_keys.len != 0 or schema.unique_constraints.len != 0 or schema.checks.len != 0 or schema.external_base_source != null or schema.system_versioned) return error.InvalidSchemaUpdateRequest;
+        return;
+    }
+    if (!schema.enforce_types) return error.InvalidSchemaUpdateRequest;
+    if (schema.dynamic_templates.len > 0) return error.InvalidSchemaUpdateRequest;
+    if (schema.document_schemas.len != 1) return error.InvalidSchemaUpdateRequest;
+
+    var relational_columns: usize = 0;
+    for (schema.document_schemas) |document_schema| {
+        if (document_schema.additional_properties_schema != null) return error.InvalidSchemaUpdateRequest;
+        if (document_schema.additional_properties_allowed orelse false) return error.InvalidSchemaUpdateRequest;
+        if (document_schema.pattern_properties.len > 0) return error.InvalidSchemaUpdateRequest;
+        if (document_schema.dynamic_infer_types) return error.InvalidSchemaUpdateRequest;
+
+        for (document_schema.properties) |property| {
+            try validateRelationalEmbeddedJsonProperty(property);
+            try validateRelationalGeneratedProperty(schema, document_schema, property);
+            try validateRelationalPartialIndexProperty(schema, property);
+            if (isRelationalStorageProperty(property)) relational_columns += 1;
+        }
+    }
+
+    if (relational_columns == 0) return error.InvalidSchemaUpdateRequest;
+    try validateRelationalPeriods(schema);
+    try validateRelationalPrimaryKey(schema);
+    try validateRelationalUniqueConstraints(schema);
+    try validateRelationalChecks(schema);
+    try validateRelationalForeignKeys(schema);
+}
+
+fn validateRelationalPrimaryKey(schema: TableSchema) !void {
+    const primary_key = schema.primary_key orelse return;
+    if (primary_key.timing == .deferred and !primary_key.deferrable) return error.InvalidSchemaUpdateRequest;
+    if (primary_key.name) |name| {
+        for (schema.unique_constraints) |constraint| {
+            if (std.mem.eql(u8, constraint.name, name)) return error.InvalidSchemaUpdateRequest;
+        }
+        for (schema.foreign_keys) |foreign_key| {
+            if (std.mem.eql(u8, foreign_key.name, name)) return error.InvalidSchemaUpdateRequest;
+        }
+        for (schema.checks) |check| {
+            if (std.mem.eql(u8, check.name, name)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    if (primary_key.without_overlaps_period) |period| try validateRelationalPeriodReference(schema, period);
+    for (primary_key.columns, 0..) |column, column_index| {
+        if (std.mem.eql(u8, column, "_id")) return error.InvalidSchemaUpdateRequest;
+        const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
+        if (!requiredFieldsContain(schema.document_schemas[0].required_fields, column)) return error.InvalidSchemaUpdateRequest;
+        for (primary_key.columns[0..column_index]) |previous_column| {
+            if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    for (primary_key.include_columns, 0..) |column, column_index| {
+        if (stringSlicesContains(primary_key.columns, column)) return error.InvalidSchemaUpdateRequest;
+        const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
+        for (primary_key.include_columns[0..column_index]) |previous_column| {
+            if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateRelationalPeriods(schema: TableSchema) !void {
+    for (schema.periods, 0..) |period, i| {
+        if (period.name.len == 0 or period.start_column.len == 0 or period.end_column.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (std.mem.eql(u8, period.start_column, period.end_column)) return error.InvalidSchemaUpdateRequest;
+        const start_property = findDocumentProperty(schema.document_schemas[0].properties, period.start_column) orelse return error.InvalidSchemaUpdateRequest;
+        const end_property = findDocumentProperty(schema.document_schemas[0].properties, period.end_column) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalPeriodColumn(start_property) or !isRelationalPeriodColumn(end_property)) return error.InvalidSchemaUpdateRequest;
+        if (!relationalConstraintColumnTypesCompatible(start_property, end_property)) return error.InvalidSchemaUpdateRequest;
+        if (period.range_type) |range_type| try validateRelationalPeriodRangeType(range_type, start_property, end_property);
+        for (schema.periods[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, period.name)) return error.InvalidSchemaUpdateRequest;
+            if (std.mem.eql(u8, previous.start_column, period.start_column) or
+                std.mem.eql(u8, previous.start_column, period.end_column) or
+                std.mem.eql(u8, previous.end_column, period.start_column) or
+                std.mem.eql(u8, previous.end_column, period.end_column))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        }
+    }
+}
+
+fn validateRelationalPeriodReference(schema: TableSchema, period_name: []const u8) !void {
+    _ = findRelationalPeriod(schema.periods, period_name) orelse return error.InvalidSchemaUpdateRequest;
+}
+
+fn findRelationalPeriod(periods: []const RelationalPeriod, name: []const u8) ?RelationalPeriod {
+    for (periods) |period| {
+        if (std.mem.eql(u8, period.name, name)) return period;
+    }
+    return null;
+}
+
+fn isRelationalPeriodColumn(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "numeric") or
+        std.mem.eql(u8, field_type, "number") or
+        std.mem.eql(u8, field_type, "integer") or
+        std.mem.eql(u8, field_type, "datetime");
+}
+
+fn validateRelationalForeignKeys(schema: TableSchema) !void {
+    for (schema.foreign_keys, 0..) |foreign_key, i| {
+        if (foreign_key.columns.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.references.columns.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.validation_state == .validating or foreign_key.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.on_update != .restrict and foreign_key.on_update != .no_action and foreign_key.on_update != .set_null and foreign_key.on_update != .cascade) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.timing == .deferred and !foreign_key.deferrable) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.match == .partial) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.period) |period| try validateRelationalPeriodReference(schema, period);
+        if ((foreign_key.period == null) != (foreign_key.references.period == null)) return error.InvalidSchemaUpdateRequest;
+        if (foreign_key.references.period) |period| {
+            if (!foreignKeyActionSupportsTemporalUpdate(foreign_key.on_update)) return error.InvalidSchemaUpdateRequest;
+            const same_table_parent = std.mem.eql(u8, foreign_key.references.table, schema.default_type);
+            if (same_table_parent) try validateRelationalPeriodReference(schema, period);
+        }
+        if (foreignKeyReferencesPrimaryKey(foreign_key)) {
+            if (foreign_key.columns.len != 1) return error.InvalidSchemaUpdateRequest;
+            const child_property = findDocumentProperty(schema.document_schemas[0].properties, foreign_key.columns[0]) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalForeignKeyColumn(child_property)) return error.InvalidSchemaUpdateRequest;
+        } else {
+            if (foreignKeyReferencesPrimaryKeyComponent(foreign_key)) return error.InvalidSchemaUpdateRequest;
+            if (foreign_key.columns.len != foreign_key.references.columns.len) return error.InvalidSchemaUpdateRequest;
+            const same_table_parent = std.mem.eql(u8, foreign_key.references.table, schema.default_type);
+            const parent_primary = same_table_parent and primaryKeyColumnsEqual(schema.primary_key, foreign_key.references.columns);
+            const parent_unique = if (same_table_parent and !parent_primary) findUniqueConstraintByColumns(schema.unique_constraints, foreign_key.references.columns) orelse return error.InvalidSchemaUpdateRequest else null;
+            for (foreign_key.columns, foreign_key.references.columns) |child_column, parent_column| {
+                const child_property = findDocumentProperty(schema.document_schemas[0].properties, child_column) orelse return error.InvalidSchemaUpdateRequest;
+                if (!isRelationalUniqueConstraintColumn(child_property)) return error.InvalidSchemaUpdateRequest;
+                if (parent_unique != null or parent_primary) {
+                    const parent_property = findDocumentProperty(schema.document_schemas[0].properties, parent_column) orelse return error.InvalidSchemaUpdateRequest;
+                    if (!relationalConstraintColumnTypesCompatible(child_property, parent_property)) return error.InvalidSchemaUpdateRequest;
+                }
+            }
+        }
+        if (foreign_key.on_delete == .set_null or foreign_key.on_update == .set_null) {
+            for (foreign_key.columns) |column| {
+                if (requiredFieldsContain(schema.document_schemas[0].required_fields, column)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        for (foreign_key.columns, 0..) |column, column_index| {
+            for (foreign_key.columns[0..column_index]) |previous_column| {
+                if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        for (schema.foreign_keys[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, foreign_key.name)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn foreignKeyActionIsRestrictive(action: ForeignKeyAction) bool {
+    return action == .restrict or action == .no_action;
+}
+
+fn foreignKeyActionSupportsTemporalUpdate(action: ForeignKeyAction) bool {
+    return foreignKeyActionIsRestrictive(action) or action == .set_null or action == .cascade;
+}
+
+fn foreignKeyReferencesPrimaryKey(foreign_key: ForeignKey) bool {
+    return foreign_key.references.columns.len == 1 and std.mem.eql(u8, foreign_key.references.columns[0], "_id");
+}
+
+fn foreignKeyReferencesPrimaryKeyComponent(foreign_key: ForeignKey) bool {
+    for (foreign_key.references.columns) |column| {
+        if (std.mem.eql(u8, column, "_id")) return true;
+    }
+    return false;
+}
+
+fn primaryKeyColumnsEqual(primary_key: ?PrimaryKey, columns: []const []const u8) bool {
+    const key = primary_key orelse return false;
+    return stringSlicesEqual(key.columns, columns);
+}
+
+fn requiredFieldsContain(required_fields: []const []const u8, name: []const u8) bool {
+    for (required_fields) |field_name| {
+        if (std.mem.eql(u8, field_name, name)) return true;
+    }
+    return false;
+}
+
+fn findUniqueConstraintByColumns(constraints: []const UniqueConstraint, columns: []const []const u8) ?UniqueConstraint {
+    for (constraints) |constraint| {
+        if (constraint.where.len != 0) continue;
+        if (constraint.expressions.len != 0) continue;
+        if (stringSlicesEqual(constraint.columns, columns)) return constraint;
+    }
+    return null;
+}
+
+fn relationalConstraintColumnTypesCompatible(child: DocumentProperty, parent: DocumentProperty) bool {
+    const child_type = child.field_type orelse return false;
+    const parent_type = parent.field_type orelse return false;
+    return std.mem.eql(u8, child_type, parent_type);
+}
+
+fn validateRelationalUniqueConstraints(schema: TableSchema) !void {
+    for (schema.unique_constraints, 0..) |constraint, i| {
+        if (constraint.timing == .deferred and !constraint.deferrable) return error.InvalidSchemaUpdateRequest;
+        if (constraint.columns.len + constraint.expressions.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (constraint.validation_state == .validating or constraint.validation_state == .invalid) return error.InvalidSchemaUpdateRequest;
+        if (constraint.without_overlaps_period) |period| try validateRelationalPeriodReference(schema, period);
+        if (constraint.nulls_not_distinct and constraint.without_overlaps_period != null) return error.InvalidSchemaUpdateRequest;
+        if (constraint.index_keys.len > 0) {
+            if (constraint.expressions.len != 0) return error.InvalidSchemaUpdateRequest;
+            if (constraint.index_keys.len != constraint.columns.len) return error.InvalidSchemaUpdateRequest;
+        }
+        for (constraint.columns, 0..) |column, column_index| {
+            const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
+            if (constraint.index_keys.len > 0 and !std.mem.eql(u8, constraint.index_keys[column_index].column, column)) return error.InvalidSchemaUpdateRequest;
+            for (constraint.columns[0..column_index]) |previous_column| {
+                if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        try validateRelationalIndexKeys(schema, constraint.index_keys);
+        for (constraint.expressions, 0..) |expression, expression_index| {
+            try validateRelationalUniqueConstraintExpression(schema, expression);
+            for (constraint.expressions[0..expression_index]) |previous_expression| {
+                if (uniqueExpressionsEqual(previous_expression, expression)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        for (constraint.include_columns, 0..) |column, column_index| {
+            if (stringSlicesContains(constraint.columns, column)) return error.InvalidSchemaUpdateRequest;
+            const property = findDocumentProperty(schema.document_schemas[0].properties, column) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+            for (constraint.include_columns[0..column_index]) |previous_column| {
+                if (std.mem.eql(u8, previous_column, column)) return error.InvalidSchemaUpdateRequest;
+            }
+        }
+        for (constraint.where) |predicate| try validateRelationalUniquePredicate(schema, predicate);
+        for (constraint.where_expressions) |condition| try validateRelationalUniquePredicateExpression(schema, condition);
+        for (schema.unique_constraints[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, constraint.name)) return error.InvalidSchemaUpdateRequest;
+            if (uniqueConstraintsEquivalent(previous, constraint)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateRelationalUniqueConstraintExpression(schema: TableSchema, expression: UniqueExpression) !void {
+    switch (expression.op) {
+        .lower, .upper, .md5 => {
+            if (expression.field.len == 0 or expression.expression != null) return error.InvalidSchemaUpdateRequest;
+            const property = findDocumentProperty(schema.document_schemas[0].properties, expression.field) orelse return error.InvalidSchemaUpdateRequest;
+            const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
+            if (!std.mem.eql(u8, field_type, "keyword") and
+                !std.mem.eql(u8, field_type, "link") and
+                !std.mem.eql(u8, field_type, "string") and
+                !std.mem.eql(u8, field_type, "text"))
+            {
+                return error.InvalidSchemaUpdateRequest;
+            }
+        },
+        .expression => {
+            if (expression.field.len != 0) return error.InvalidSchemaUpdateRequest;
+            const row_expression = expression.expression orelse return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionDeterministic(row_expression)) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionAgainstSchema(schema, row_expression);
+            switch (try relationalRowsExpressionType(schema, row_expression)) {
+                .text, .numeric, .boolean, .datetime => {},
+                .json, .array, .null => return error.InvalidSchemaUpdateRequest,
+            }
+        },
+    }
+}
+
+fn validateRelationalIndexKeys(schema: TableSchema, keys: []const storage_schema.RelationalIndexKey) !void {
+    for (keys, 0..) |key, key_index| {
+        if (key.column.len == 0) return error.InvalidSchemaUpdateRequest;
+        const property = findDocumentProperty(schema.document_schemas[0].properties, key.column) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        for (keys[0..key_index]) |previous| {
+            if (std.mem.eql(u8, previous.column, key.column)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateRelationalUniquePredicate(schema: TableSchema, predicate: UniquePredicate) !void {
+    const property = findDocumentProperty(schema.document_schemas[0].properties, predicate.field) orelse return error.InvalidSchemaUpdateRequest;
+    if (!isRelationalUniqueConstraintColumn(property)) return error.InvalidSchemaUpdateRequest;
+    switch (predicate.op) {
+        .is_null, .is_not_null => if (predicate.value_json != null) return error.InvalidSchemaUpdateRequest,
+        .eq, .ne => if (predicate.value_json == null) return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn validateRelationalUniquePredicateExpression(
+    schema: TableSchema,
+    condition: storage_schema.RelationalRowsExpressionCondition,
+) !void {
+    try validateRelationalRowsExpressionConditionAgainstSchema(schema, condition);
+    if (!relationalRowsExpressionDeterministic(condition.lhs)) return error.InvalidSchemaUpdateRequest;
+    for (condition.rhs) |rhs| {
+        if (!relationalRowsExpressionDeterministic(rhs)) return error.InvalidSchemaUpdateRequest;
+    }
+}
+
+fn relationalRowsExpressionDeterministic(expression: storage_schema.RelationalRowsExpression) bool {
+    if (expression.field_source != .row) return false;
+    if (expression.kind == .now or expression.kind == .uuid_v4) return false;
+    for (expression.operands) |operand| {
+        if (!relationalRowsExpressionDeterministic(operand)) return false;
+    }
+    for (expression.case_branches) |branch| {
+        if (!relationalRowsExpressionConditionDeterministic(branch.when)) return false;
+        if (!relationalRowsExpressionDeterministic(branch.then)) return false;
+    }
+    for (expression.case_else) |case_else| {
+        if (!relationalRowsExpressionDeterministic(case_else)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionDeterministic(condition: storage_schema.RelationalRowsExpressionCondition) bool {
+    if (!relationalRowsExpressionDeterministic(condition.lhs)) return false;
+    for (condition.rhs) |rhs| {
+        if (!relationalRowsExpressionDeterministic(rhs)) return false;
+    }
+    return true;
+}
+
+fn validateRelationalChecks(schema: TableSchema) !void {
+    for (schema.checks, 0..) |check, i| {
+        if (check.expression) |expression| {
+            if (check.field.len != 0 or check.value_json != null or check.collation != null) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionConditionAgainstSchema(schema, expression);
+        } else {
+            const property = findDocumentProperty(schema.document_schemas[0].properties, check.field) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+            if (check.collation != null and !isRelationalTextLikeProperty(property)) return error.InvalidSchemaUpdateRequest;
+            switch (check.op) {
+                .is_null, .is_not_null => if (check.value_json != null) return error.InvalidSchemaUpdateRequest,
+                .is_distinct, .is_not_distinct, .eq, .ne => {
+                    const value_json = check.value_json orelse return error.InvalidSchemaUpdateRequest;
+                    const field_type = try relationalRowsExpressionTypeForProperty(property);
+                    const value_type = try relationalRowsExpressionTypeForLiteralJson(value_json);
+                    if (!relationalRowsExpressionTypesComparable(field_type, value_type)) return error.InvalidSchemaUpdateRequest;
+                },
+                .gt, .gte, .lt, .lte => {
+                    const value_json = check.value_json orelse return error.InvalidSchemaUpdateRequest;
+                    const field_type = try relationalRowsExpressionTypeForProperty(property);
+                    const value_type = try relationalRowsExpressionTypeForLiteralJson(value_json);
+                    if (!relationalRowsExpressionTypesComparable(field_type, value_type)) return error.InvalidSchemaUpdateRequest;
+                    if (!relationalRowsExpressionTypeOrderable(field_type) or !relationalRowsExpressionTypeOrderable(value_type)) return error.InvalidSchemaUpdateRequest;
+                },
+            }
+        }
+        for (schema.checks[0..i]) |previous| {
+            if (std.mem.eql(u8, previous.name, check.name)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn validateRelationalRowsExpressionConditionAgainstSchema(
+    schema: TableSchema,
+    condition: storage_schema.RelationalRowsExpressionCondition,
+) anyerror!void {
+    switch (condition.op) {
+        .is_null, .is_not_null => if (condition.rhs.len != 0) return error.InvalidSchemaUpdateRequest,
+        .is_distinct, .is_not_distinct, .eq, .ne, .gt, .gte, .lt, .lte => if (condition.rhs.len != 1) return error.InvalidSchemaUpdateRequest,
+    }
+    const lhs_type = try relationalRowsExpressionType(schema, condition.lhs);
+    if (condition.rhs.len == 0) return;
+    const rhs_type = try relationalRowsExpressionType(schema, condition.rhs[0]);
+    if (!relationalRowsExpressionTypesComparable(lhs_type, rhs_type)) return error.InvalidSchemaUpdateRequest;
+    switch (condition.op) {
+        .gt, .gte, .lt, .lte => if (!relationalRowsExpressionTypeOrderable(lhs_type) or !relationalRowsExpressionTypeOrderable(rhs_type)) return error.InvalidSchemaUpdateRequest,
+        else => {},
+    }
+}
+
+fn validateRelationalRowsExpressionAgainstSchema(
+    schema: TableSchema,
+    expression: storage_schema.RelationalRowsExpression,
+) anyerror!void {
+    _ = try relationalRowsExpressionType(schema, expression);
+}
+
+fn relationalRowsExpressionContainsInterval(expression: storage_schema.RelationalRowsExpression) bool {
+    if (expression.kind == .interval_ns or expression.kind == .interval_months) return true;
+    for (expression.operands) |operand| {
+        if (relationalRowsExpressionContainsInterval(operand)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (relationalRowsExpressionContainsInterval(branch.then)) return true;
+        if (relationalRowsExpressionContainsInterval(branch.when.lhs)) return true;
+        for (branch.when.rhs) |rhs| {
+            if (relationalRowsExpressionContainsInterval(rhs)) return true;
+        }
+    }
+    for (expression.case_else) |case_else| {
+        if (relationalRowsExpressionContainsInterval(case_else)) return true;
+    }
+    return false;
+}
+
+fn validateRelationalRowsDateBinStrideExpression(
+    schema: TableSchema,
+    expression: storage_schema.RelationalRowsExpression,
+) anyerror!void {
+    switch (expression.kind) {
+        .interval_ns => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            if (relationalRowsExpressionContainsInterval(expression.operands[0])) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .numeric) return error.InvalidSchemaUpdateRequest;
+        },
+        .interval_months => return error.InvalidSchemaUpdateRequest,
+        else => {
+            if (relationalRowsExpressionContainsInterval(expression)) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression)) != .numeric) return error.InvalidSchemaUpdateRequest;
+        },
+    }
+}
+
+fn relationalRowsExpressionType(
+    schema: TableSchema,
+    expression: storage_schema.RelationalRowsExpression,
+) anyerror!RelationalRowsExpressionType {
+    if (expression.field_source != .row) return error.InvalidSchemaUpdateRequest;
+    if (expression.kind == .field) {
+        const property = findDocumentProperty(schema.document_schemas[0].properties, expression.field) orelse return error.InvalidSchemaUpdateRequest;
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        return relationalRowsExpressionTypeForProperty(property);
+    }
+    if (expression.kind == .value) return relationalRowsExpressionTypeForLiteralJson(expression.value_json);
+
+    for (expression.case_branches) |branch| try validateRelationalRowsExpressionConditionAgainstSchema(schema, branch.when);
+
+    switch (expression.kind) {
+        .field, .value => unreachable,
+        .now => return .datetime,
+        .uuid_v4 => return .text,
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .replace, .translate, .reverse, .md5, .concat, .concat_ws => {
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .text;
+        },
+        .regexp_replace, .regexp_substr => {
+            if (expression.kind == .regexp_replace and expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidSchemaUpdateRequest;
+            if (expression.kind == .regexp_substr and expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .text;
+        },
+        .regexp_count, .regexp_instr => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .numeric;
+        },
+        .substring => {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[1])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            if (expression.operands.len == 3 and (try relationalRowsExpressionType(schema, expression.operands[2])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .overlay => {
+            if (expression.operands.len != 3 and expression.operands.len != 4) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[1]))) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[2])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            if (expression.operands.len == 4 and (try relationalRowsExpressionType(schema, expression.operands[3])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .split_part => {
+            if (expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[1]))) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[2])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .left, .right, .repeat => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[1])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .lpad, .rpad => {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[1])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            if (expression.operands.len == 3 and !relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[2]))) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .chr => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .length, .octet_length, .bit_length, .ascii => {
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .numeric;
+        },
+        .strpos => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .numeric;
+        },
+        .starts_with, .ends_with, .like, .ilike => {
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .boolean;
+        },
+        .regexp_match => {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            for (expression.operands[0..2]) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            if (expression.operands.len == 3 and (try relationalRowsExpressionType(schema, expression.operands[2])) != .boolean) return error.InvalidSchemaUpdateRequest;
+            return .boolean;
+        },
+        .bool_and, .bool_or, .bool_not => {
+            for (expression.operands) |operand| {
+                if ((try relationalRowsExpressionType(schema, operand)) != .boolean) return error.InvalidSchemaUpdateRequest;
+            }
+            return .boolean;
+        },
+        .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .power, .mul, .div, .mod, .interval_ns, .interval_months => {
+            for (expression.operands) |operand| {
+                if ((try relationalRowsExpressionType(schema, operand)) != .numeric) return error.InvalidSchemaUpdateRequest;
+            }
+            return .numeric;
+        },
+        .add, .sub => {
+            var saw_datetime = false;
+            for (expression.operands) |operand| {
+                const operand_type = try relationalRowsExpressionType(schema, operand);
+                if (operand_type == .datetime) saw_datetime = true else if (operand_type != .numeric) return error.InvalidSchemaUpdateRequest;
+            }
+            return if (saw_datetime) .datetime else .numeric;
+        },
+        .date_trunc => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            const value_type = try relationalRowsExpressionType(schema, expression.operands[1]);
+            if (value_type != .datetime and value_type != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .datetime;
+        },
+        .date_bin => {
+            if (expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsDateBinStrideExpression(schema, expression.operands[0]);
+            const source_type = try relationalRowsExpressionType(schema, expression.operands[1]);
+            if (source_type != .datetime and source_type != .numeric) return error.InvalidSchemaUpdateRequest;
+            const origin_type = try relationalRowsExpressionType(schema, expression.operands[2]);
+            if (origin_type != .datetime and origin_type != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .datetime;
+        },
+        .date_part => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[0]))) return error.InvalidSchemaUpdateRequest;
+            const value_type = try relationalRowsExpressionType(schema, expression.operands[1]);
+            if (value_type != .datetime and value_type != .numeric) return error.InvalidSchemaUpdateRequest;
+            return .numeric;
+        },
+        .cast => return switch (expression.cast_type orelse return error.InvalidSchemaUpdateRequest) {
+            .text => .text,
+            .numeric => .numeric,
+            .bool => .boolean,
+            .datetime => .datetime,
+        },
+        .json_extract => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            const source_type = try relationalRowsExpressionType(schema, expression.operands[0]);
+            if (source_type != .json) return error.InvalidSchemaUpdateRequest;
+            return if (expression.json_as_text) .text else .json;
+        },
+        .json_path_exists => {
+            if (expression.operands.len != 1 or expression.json_path.len == 0) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .json) return error.InvalidSchemaUpdateRequest;
+            return .boolean;
+        },
+        .json_typeof => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .json) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .json_array_length => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .json) return error.InvalidSchemaUpdateRequest;
+            return .numeric;
+        },
+        .json_build_object => {
+            if (expression.operands.len % 2 != 0) return error.InvalidSchemaUpdateRequest;
+            var index: usize = 0;
+            while (index < expression.operands.len) : (index += 2) {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[index]))) return error.InvalidSchemaUpdateRequest;
+                _ = try relationalRowsExpressionType(schema, expression.operands[index + 1]);
+            }
+            return .json;
+        },
+        .to_jsonb => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            _ = try relationalRowsExpressionType(schema, expression.operands[0]);
+            return .json;
+        },
+        .array_length => {
+            if (expression.operands.len != 1) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .array) return error.InvalidSchemaUpdateRequest;
+            return .numeric;
+        },
+        .array_position => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .array) return error.InvalidSchemaUpdateRequest;
+            _ = try relationalRowsExpressionType(schema, expression.operands[1]);
+            return .numeric;
+        },
+        .array_positions => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .array) return error.InvalidSchemaUpdateRequest;
+            _ = try relationalRowsExpressionType(schema, expression.operands[1]);
+            return .array;
+        },
+        .array_append, .array_prepend, .array_cat, .array_remove => {
+            if (expression.operands.len != 2) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .array) return error.InvalidSchemaUpdateRequest;
+            if (expression.kind == .array_cat and (try relationalRowsExpressionType(schema, expression.operands[1])) != .array) return error.InvalidSchemaUpdateRequest;
+            if (expression.kind != .array_cat) _ = try relationalRowsExpressionType(schema, expression.operands[1]);
+            return .array;
+        },
+        .array_replace => {
+            if (expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .array) return error.InvalidSchemaUpdateRequest;
+            _ = try relationalRowsExpressionType(schema, expression.operands[1]);
+            _ = try relationalRowsExpressionType(schema, expression.operands[2]);
+            return .array;
+        },
+        .array_to_string => {
+            if (expression.operands.len != 2 and expression.operands.len != 3) return error.InvalidSchemaUpdateRequest;
+            if ((try relationalRowsExpressionType(schema, expression.operands[0])) != .array) return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[1]))) return error.InvalidSchemaUpdateRequest;
+            if (expression.operands.len == 3 and !relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, expression.operands[2]))) return error.InvalidSchemaUpdateRequest;
+            return .text;
+        },
+        .string_to_array => {
+            for (expression.operands) |operand| {
+                if (!relationalRowsExpressionTypeTextLike(try relationalRowsExpressionType(schema, operand))) return error.InvalidSchemaUpdateRequest;
+            }
+            return .array;
+        },
+        .coalesce, .nullif, .greatest, .least => return try relationalRowsExpressionCommonType(schema, expression.operands),
+        .case => {
+            if (expression.case_else.len != 1) return error.InvalidSchemaUpdateRequest;
+            var candidate = try relationalRowsExpressionType(schema, expression.case_else[0]);
+            for (expression.case_branches) |branch| {
+                const branch_type = try relationalRowsExpressionType(schema, branch.then);
+                if (!relationalRowsExpressionTypesComparable(candidate, branch_type)) return error.InvalidSchemaUpdateRequest;
+                if (candidate == .null) candidate = branch_type;
+            }
+            return candidate;
+        },
+    }
+}
+
+fn relationalRowsExpressionCommonType(schema: TableSchema, expressions: []const storage_schema.RelationalRowsExpression) anyerror!RelationalRowsExpressionType {
+    if (expressions.len == 0) return error.InvalidSchemaUpdateRequest;
+    var candidate = try relationalRowsExpressionType(schema, expressions[0]);
+    for (expressions[1..]) |expression| {
+        const expression_type = try relationalRowsExpressionType(schema, expression);
+        if (!relationalRowsExpressionTypesComparable(candidate, expression_type)) return error.InvalidSchemaUpdateRequest;
+        if (candidate == .null) candidate = expression_type;
+    }
+    return candidate;
+}
+
+fn relationalRowsExpressionTypeForProperty(property: DocumentProperty) !RelationalRowsExpressionType {
+    const field_type = property.field_type orelse return error.InvalidSchemaUpdateRequest;
+    if (std.mem.eql(u8, field_type, "boolean")) return .boolean;
+    if (std.mem.eql(u8, field_type, "datetime")) return .datetime;
+    if (std.mem.eql(u8, field_type, "integer") or std.mem.eql(u8, field_type, "numeric") or std.mem.eql(u8, field_type, "number")) return .numeric;
+    if (std.mem.eql(u8, field_type, "json") or std.mem.eql(u8, field_type, "object")) return .json;
+    if (std.mem.eql(u8, field_type, "array")) return .array;
+    if (isRelationalTextLikeProperty(property) or
+        std.mem.eql(u8, field_type, "html") or
+        std.mem.eql(u8, field_type, "search_as_you_type") or
+        std.mem.eql(u8, field_type, "blob") or
+        std.mem.eql(u8, field_type, "geoshape") or
+        std.mem.eql(u8, field_type, "geopoint"))
+    {
+        return .text;
+    }
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn relationalRowsExpressionTypeForLiteralJson(value_json: []const u8) !RelationalRowsExpressionType {
+    if (std.mem.eql(u8, value_json, "null")) return .null;
+    if (std.mem.eql(u8, value_json, "true") or std.mem.eql(u8, value_json, "false")) return .boolean;
+    if (value_json.len == 0) return error.InvalidSchemaUpdateRequest;
+    return switch (value_json[0]) {
+        '"' => .text,
+        '[' => .array,
+        '{' => .json,
+        '-', '0'...'9' => .numeric,
+        else => error.InvalidSchemaUpdateRequest,
+    };
+}
+
+fn relationalRowsExpressionTypesComparable(lhs: RelationalRowsExpressionType, rhs: RelationalRowsExpressionType) bool {
+    if (lhs == .null or rhs == .null) return true;
+    if (relationalRowsExpressionTypeTextLike(lhs) and relationalRowsExpressionTypeTextLike(rhs)) return true;
+    if ((lhs == .datetime and rhs == .numeric) or (lhs == .numeric and rhs == .datetime)) return true;
+    return lhs == rhs;
+}
+
+fn relationalRowsExpressionTypeTextLike(expression_type: RelationalRowsExpressionType) bool {
+    return expression_type == .text;
+}
+
+fn relationalRowsExpressionTypeOrderable(expression_type: RelationalRowsExpressionType) bool {
+    return expression_type == .text or expression_type == .numeric or expression_type == .datetime or expression_type == .boolean;
+}
+
+fn validateRelationalGeneratedProperty(schema: TableSchema, document_schema: DocumentSchema, property: DocumentProperty) !void {
+    const generated = property.generated orelse return;
+    if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+    if (requiredFieldsContain(document_schema.required_fields, property.name)) return error.InvalidSchemaUpdateRequest;
+    switch (generated.op) {
+        .lower, .upper, .md5 => {
+            const source_name = generated.field orelse return error.InvalidSchemaUpdateRequest;
+            if (std.mem.eql(u8, source_name, property.name)) return error.InvalidSchemaUpdateRequest;
+            const source = findDocumentProperty(schema.document_schemas[0].properties, source_name) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(source)) return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(property)) return error.InvalidSchemaUpdateRequest;
+        },
+        .concat => {
+            if (generated.fields.len == 0) return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(property)) return error.InvalidSchemaUpdateRequest;
+            for (generated.fields) |source_name| {
+                if (std.mem.eql(u8, source_name, property.name)) return error.InvalidSchemaUpdateRequest;
+                const source = findDocumentProperty(schema.document_schemas[0].properties, source_name) orelse return error.InvalidSchemaUpdateRequest;
+                if (!isRelationalStorageProperty(source)) return error.InvalidSchemaUpdateRequest;
+            }
+        },
+        .concat_ws => {
+            if (generated.fields.len == 0) return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalTextLikeProperty(property)) return error.InvalidSchemaUpdateRequest;
+            for (generated.fields) |source_name| {
+                if (std.mem.eql(u8, source_name, property.name)) return error.InvalidSchemaUpdateRequest;
+                const source = findDocumentProperty(schema.document_schemas[0].properties, source_name) orelse return error.InvalidSchemaUpdateRequest;
+                if (!isRelationalTextLikeProperty(source)) return error.InvalidSchemaUpdateRequest;
+            }
+        },
+        .expression => {
+            const expression = generated.expression orelse return error.InvalidSchemaUpdateRequest;
+            if (!relationalRowsExpressionDeterministic(expression)) return error.InvalidSchemaUpdateRequest;
+            if (relationalRowsExpressionReferencesField(expression, property.name)) return error.InvalidSchemaUpdateRequest;
+            try validateRelationalRowsExpressionAgainstSchema(schema, expression);
+            if (!relationalGeneratedExpressionTypeMatchesProperty(try relationalRowsExpressionType(schema, expression), property)) return error.InvalidSchemaUpdateRequest;
+        },
+    }
+}
+
+fn relationalRowsExpressionReferencesField(expression: storage_schema.RelationalRowsExpression, field: []const u8) bool {
+    if (expression.kind == .field and std.mem.eql(u8, expression.field, field)) return true;
+    for (expression.operands) |operand| {
+        if (relationalRowsExpressionReferencesField(operand, field)) return true;
+    }
+    for (expression.case_branches) |branch| {
+        if (relationalRowsExpressionConditionReferencesField(branch.when, field)) return true;
+        if (relationalRowsExpressionReferencesField(branch.then, field)) return true;
+    }
+    for (expression.case_else) |case_else| {
+        if (relationalRowsExpressionReferencesField(case_else, field)) return true;
+    }
+    return false;
+}
+
+fn relationalRowsExpressionConditionReferencesField(condition: storage_schema.RelationalRowsExpressionCondition, field: []const u8) bool {
+    if (relationalRowsExpressionReferencesField(condition.lhs, field)) return true;
+    for (condition.rhs) |rhs| {
+        if (relationalRowsExpressionReferencesField(rhs, field)) return true;
+    }
+    return false;
+}
+
+fn relationalGeneratedExpressionTypeMatchesProperty(expression_type: RelationalRowsExpressionType, property: DocumentProperty) bool {
+    const property_type = relationalRowsExpressionTypeForProperty(property) catch return false;
+    return relationalRowsExpressionTypesComparable(property_type, expression_type);
+}
+
+fn validateRelationalPartialIndexProperty(schema: TableSchema, property: DocumentProperty) !void {
+    if (property.index_lifecycle != null) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    }
+    if (property.index_generation != null) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    }
+    if (property.index_name != null) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    }
+    if (property.index_include_columns.len > 0) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+        if (property.index_name == null) return error.InvalidSchemaUpdateRequest;
+        for (property.index_include_columns) |field_name| {
+            if (std.mem.eql(u8, field_name, property.name)) return error.InvalidSchemaUpdateRequest;
+            const source = findDocumentProperty(schema.document_schemas[0].properties, field_name) orelse return error.InvalidSchemaUpdateRequest;
+            if (!isRelationalStorageProperty(source)) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+    if (property.index_keys.len > 0) {
+        if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+        if (property.index_name == null) return error.InvalidSchemaUpdateRequest;
+        try validateRelationalIndexKeys(schema, property.index_keys);
+        var contains_property = false;
+        for (property.index_keys) |key| {
+            if (std.mem.eql(u8, key.column, property.name)) contains_property = true;
+        }
+        if (!contains_property) return error.InvalidSchemaUpdateRequest;
+    }
+    if (property.index_where.len == 0 and property.index_where_expressions.len == 0) return;
+    if (!isRelationalStorageProperty(property)) return error.InvalidSchemaUpdateRequest;
+    if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+    for (property.index_where) |predicate| try validateRelationalUniquePredicate(schema, predicate);
+    for (property.index_where_expressions) |condition| try validateRelationalUniquePredicateExpression(schema, condition);
+}
+
+fn isRelationalTextLikeProperty(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "keyword") or
+        std.mem.eql(u8, field_type, "link") or
+        std.mem.eql(u8, field_type, "string") or
+        std.mem.eql(u8, field_type, "text");
+}
+
+fn uniqueConstraintsEquivalent(a: UniqueConstraint, b: UniqueConstraint) bool {
+    if (!stringSlicesEqual(a.columns, b.columns)) return false;
+    if (!uniqueExpressionSlicesEqual(a.expressions, b.expressions)) return false;
+    if (!stringSlicesEqual(a.include_columns, b.include_columns)) return false;
+    if (!storage_schema.relationalIndexKeySlicesEqual(a.index_keys, b.index_keys)) return false;
+    if (a.nulls_not_distinct != b.nulls_not_distinct) return false;
+    if (a.deferrable != b.deferrable) return false;
+    if (a.timing != b.timing) return false;
+    return uniquePredicateSlicesEqual(a.where, b.where) and
+        relationalRowsExpressionConditionSlicesEqual(a.where_expressions, b.where_expressions);
+}
+
+fn uniqueExpressionSlicesEqual(a: []const UniqueExpression, b: []const UniqueExpression) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!uniqueExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn uniqueExpressionsEqual(a: UniqueExpression, b: UniqueExpression) bool {
+    if (a.op != b.op) return false;
+    if (!std.mem.eql(u8, a.field, b.field)) return false;
+    if (a.expression == null and b.expression == null) return true;
+    if (a.expression == null or b.expression == null) return false;
+    return relationalRowsExpressionsEqual(a.expression.?, b.expression.?);
+}
+
+fn uniquePredicateSlicesEqual(a: []const UniquePredicate, b: []const UniquePredicate) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (left.op != right.op) return false;
+        if (!std.mem.eql(u8, left.field, right.field)) return false;
+        if (!optionalStringsEqual(left.value_json, right.value_json)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionSlicesEqual(
+    a: []const storage_schema.RelationalRowsExpressionCondition,
+    b: []const storage_schema.RelationalRowsExpressionCondition,
+) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!relationalRowsExpressionConditionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionConditionsEqual(
+    a: storage_schema.RelationalRowsExpressionCondition,
+    b: storage_schema.RelationalRowsExpressionCondition,
+) bool {
+    if (a.op != b.op or a.rhs.len != b.rhs.len) return false;
+    if (!relationalRowsExpressionsEqual(a.lhs, b.lhs)) return false;
+    for (a.rhs, b.rhs) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn relationalRowsExpressionsEqual(
+    a: storage_schema.RelationalRowsExpression,
+    b: storage_schema.RelationalRowsExpression,
+) bool {
+    if (a.kind != b.kind or
+        !std.mem.eql(u8, a.field, b.field) or
+        a.field_source != b.field_source or
+        !std.mem.eql(u8, a.value_json, b.value_json) or
+        !std.mem.eql(u8, a.json_path, b.json_path) or
+        a.json_as_text != b.json_as_text or
+        a.cast_type != b.cast_type or
+        a.operands.len != b.operands.len or
+        a.case_branches.len != b.case_branches.len or
+        a.case_else.len != b.case_else.len)
+    {
+        return false;
+    }
+    for (a.operands, b.operands) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    for (a.case_branches, b.case_branches) |left, right| {
+        if (!relationalRowsExpressionConditionsEqual(left.when, right.when)) return false;
+        if (!relationalRowsExpressionsEqual(left.then, right.then)) return false;
+    }
+    for (a.case_else, b.case_else) |left, right| {
+        if (!relationalRowsExpressionsEqual(left, right)) return false;
+    }
+    return true;
+}
+
+fn optionalStringsEqual(a: ?[]const u8, b: ?[]const u8) bool {
+    if (a == null and b == null) return true;
+    if (a == null or b == null) return false;
+    return std.mem.eql(u8, a.?, b.?);
+}
+
+fn stringSlicesEqual(a: []const []const u8, b: []const []const u8) bool {
+    if (a.len != b.len) return false;
+    for (a, b) |left, right| {
+        if (!std.mem.eql(u8, left, right)) return false;
+    }
+    return true;
+}
+
+fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {
+    for (values) |candidate| {
+        if (std.mem.eql(u8, candidate, value)) return true;
+    }
+    return false;
+}
+
+fn isRelationalUniqueConstraintColumn(property: DocumentProperty) bool {
+    if (isExplicitJsonProperty(property)) return false;
+    return isRelationalStorageProperty(property);
+}
+
+fn isRelationalForeignKeyColumn(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "keyword") or
+        std.mem.eql(u8, field_type, "link") or
+        std.mem.eql(u8, field_type, "string") or
+        std.mem.eql(u8, field_type, "text");
+}
+
+fn validateRelationalEmbeddedJsonProperty(property: DocumentProperty) !void {
+    const has_embedded_document_config = property.embedded_schema != null or property.embedded_dynamic_templates.len > 0;
+    if (has_embedded_document_config and !isExplicitJsonProperty(property)) return error.InvalidSchemaUpdateRequest;
+
+    if (property.embedded_schema) |embedded_schema| try validateRelationalEmbeddedJsonProperty(embedded_schema.*);
+    if (property.item) |item| try validateRelationalEmbeddedJsonProperty(item.*);
+    for (property.properties) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.prefix_items) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.pattern_properties) |child| try validateRelationalEmbeddedJsonProperty(child.property.*);
+    if (property.additional_properties_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.unevaluated_properties_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.unevaluated_items_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    for (property.dependent_schemas) |dependent| try validateRelationalEmbeddedJsonProperty(dependent.schema.*);
+    for (property.any_of) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.one_of) |child| try validateRelationalEmbeddedJsonProperty(child);
+    for (property.all_of) |child| try validateRelationalEmbeddedJsonProperty(child);
+    if (property.not_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.if_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.then_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.else_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+    if (property.contains_schema) |child| try validateRelationalEmbeddedJsonProperty(child.*);
+}
+
+fn isExplicitJsonProperty(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "json");
+}
+
+fn isRelationalStorageProperty(property: DocumentProperty) bool {
+    if (property.field_type) |field_type| {
+        if (std.mem.eql(u8, field_type, "embedding")) return false;
+        if (std.mem.eql(u8, field_type, "keyword") or
+            std.mem.eql(u8, field_type, "link") or
+            std.mem.eql(u8, field_type, "string") or
+            std.mem.eql(u8, field_type, "text") or
+            std.mem.eql(u8, field_type, "html") or
+            std.mem.eql(u8, field_type, "search_as_you_type") or
+            std.mem.eql(u8, field_type, "boolean") or
+            std.mem.eql(u8, field_type, "datetime") or
+            std.mem.eql(u8, field_type, "integer") or
+            std.mem.eql(u8, field_type, "numeric") or
+            std.mem.eql(u8, field_type, "number") or
+            std.mem.eql(u8, field_type, "geopoint") or
+            std.mem.eql(u8, field_type, "geoshape") or
+            std.mem.eql(u8, field_type, "blob") or
+            std.mem.eql(u8, field_type, "json") or
+            std.mem.eql(u8, field_type, "object") or
+            std.mem.eql(u8, field_type, "array")) return true;
+        return property.integer_only;
+    }
+    if (property.integer_only) return true;
+    if (property.properties.len > 0 or
+        property.item != null or
+        (property.additional_properties_allowed orelse false) or
+        property.additional_properties_schema != null or
+        property.pattern_properties.len > 0 or
+        property.dynamic_infer_types) return true;
+    return property.const_value != null or property.enum_values.len > 0;
 }
 
 fn parseDocumentSchemas(alloc: std.mem.Allocator, value: std.json.Value) ![]DocumentSchema {
@@ -1670,6 +3723,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     else
         null;
     errdefer if (analyzer) |owned| alloc.free(owned);
+    const collation = if (object.get("collation")) |collation_value|
+        switch (collation_value) {
+            .string => |name| if (name.len > 0) try alloc.dupe(u8, name) else return error.InvalidSchemaUpdateRequest,
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    errdefer if (collation) |owned| alloc.free(owned);
     const antfly_index = if (object.get("x-antfly-index")) |index_value|
         switch (index_value) {
             .bool => |enabled| enabled,
@@ -1678,6 +3740,45 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         }
     else
         null;
+    const index_lifecycle = if (object.get("x-antfly-index-lifecycle")) |lifecycle_value|
+        switch (lifecycle_value) {
+            .string => |value| RelationalIndexLifecycle.fromString(value) orelse return error.InvalidSchemaUpdateRequest,
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    const index_generation = if (object.get("x-antfly-index-generation")) |generation_value|
+        switch (generation_value) {
+            .integer => |value| if (value > 0) @as(u64, @intCast(value)) else return error.InvalidSchemaUpdateRequest,
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    const index_name = if (object.get("x-antfly-index-name")) |index_name_value|
+        switch (index_name_value) {
+            .string => |value| try alloc.dupe(u8, value),
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    errdefer if (index_name) |value| alloc.free(value);
+    const index_include_columns: [][]const u8 = if (object.get("x-antfly-index-include")) |include_value| switch (include_value) {
+        .array => |array| try parseRequiredFields(alloc, array),
+        .null => &[_][]const u8{},
+        else => return error.InvalidSchemaUpdateRequest,
+    } else &[_][]const u8{};
+    errdefer {
+        for (index_include_columns) |field_name| alloc.free(field_name);
+        if (index_include_columns.len > 0) alloc.free(index_include_columns);
+    }
+    const index_keys: []storage_schema.RelationalIndexKey = if (object.get("x-antfly-index-keys")) |keys_value|
+        if (keys_value == .null) &.{} else try parseRelationalIndexKeysAlloc(alloc, keys_value)
+    else
+        &.{};
+    errdefer freeRelationalIndexKeys(alloc, index_keys);
     const include_in_all_fields: [][]const u8 = if (object.get("x-antfly-include-in-all")) |include_value|
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
@@ -1685,6 +3786,74 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     errdefer {
         for (include_in_all_fields) |field_name| alloc.free(field_name);
         if (include_in_all_fields.len > 0) alloc.free(include_in_all_fields);
+    }
+    if (object.get("default") != null and object.get("x-antfly-default") != null) return error.InvalidSchemaUpdateRequest;
+    const default_value = if (object.get("x-antfly-default")) |server_default_value| blk: {
+        if (server_default_value == .null) break :blk null;
+        break :blk try parseRelationalDefaultValue(alloc, server_default_value);
+    } else if (object.get("default")) |literal_default| RelationalDefaultValue{
+        .kind = .literal,
+        .value_json = try stringifyJsonValue(alloc, literal_default),
+    } else null;
+    errdefer if (default_value) |owned_default| {
+        var mutable_default = owned_default;
+        mutable_default.deinit(alloc);
+    };
+    const on_update_value = if (object.get("x-antfly-on-update")) |server_update_value| blk: {
+        if (server_update_value == .null) break :blk null;
+        break :blk try parseRelationalDefaultValue(alloc, server_update_value);
+    } else null;
+    errdefer if (on_update_value) |owned_update| {
+        var mutable_update = owned_update;
+        mutable_update.deinit(alloc);
+    };
+    const generated = if (object.get("generated")) |generated_value| blk: {
+        if (generated_value == .null) break :blk null;
+        break :blk try parseRelationalGeneratedValue(alloc, generated_value);
+    } else null;
+    errdefer if (generated) |owned_generated| {
+        var mutable_generated = owned_generated;
+        mutable_generated.deinit(alloc);
+    };
+    const index_where: []UniquePredicate = if (object.get("x-antfly-index-where")) |where_value|
+        if (where_value == .null) &.{} else try parseUniquePredicates(alloc, where_value)
+    else
+        &.{};
+    errdefer {
+        for (index_where) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value| alloc.free(value);
+        }
+        if (index_where.len > 0) alloc.free(index_where);
+    }
+    const index_where_expressions: []storage_schema.RelationalRowsExpressionCondition = if (object.get("x-antfly-index-where-expressions")) |where_value|
+        if (where_value == .null) &.{} else try parseRelationalRowsExpressionConditionsAlloc(alloc, where_value)
+    else
+        &.{};
+    errdefer {
+        for (index_where_expressions) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        if (index_where_expressions.len > 0) alloc.free(index_where_expressions);
+    }
+    const embedded_schema = if (object.get("schema")) |schema_value| blk: {
+        if (schema_value == .null) break :blk null;
+        if (schema_value != .object) return error.InvalidSchemaUpdateRequest;
+        const embedded_context: SchemaContext = .{
+            .document_root = schema_value.object,
+            .scope_schema = schema_value.object,
+        };
+        break :blk try parseAnonymousProperty(alloc, embedded_context, schema_value.object);
+    } else null;
+    errdefer if (embedded_schema) |owned| {
+        owned.deinit(alloc);
+        alloc.destroy(owned);
+    };
+    const embedded_dynamic_templates: []DynamicTemplate = if (object.get("dynamic_templates")) |dynamic_templates|
+        if (dynamic_templates == .null) &[_]DynamicTemplate{} else try parseDynamicTemplates(alloc, dynamic_templates)
+    else
+        &[_]DynamicTemplate{};
+    errdefer {
+        for (embedded_dynamic_templates) |*dynamic_template| dynamic_template.deinit(alloc);
+        if (embedded_dynamic_templates.len > 0) alloc.free(embedded_dynamic_templates);
     }
     const prefix_items: []DocumentProperty = if (object.get("prefixItems")) |prefix_items_value|
         if (prefix_items_value == .array) try parsePropertyVariants(alloc, context, prefix_items_value.array) else &[_]DocumentProperty{}
@@ -1913,7 +4082,13 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .field_type = field_type,
         .antfly_types = antfly_types,
         .analyzer = analyzer,
+        .collation = collation,
         .antfly_index = antfly_index,
+        .index_lifecycle = index_lifecycle,
+        .index_generation = index_generation,
+        .index_name = index_name,
+        .index_include_columns = index_include_columns,
+        .index_keys = index_keys,
         .integer_only = type_spec.integer_only,
         .format = format,
         .allows_null = allows_null,
@@ -1959,6 +4134,13 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .item = item,
         .unevaluated_items_allowed = unevaluated_items_allowed,
         .unevaluated_items_schema = unevaluated_items_schema,
+        .embedded_schema = embedded_schema,
+        .embedded_dynamic_templates = embedded_dynamic_templates,
+        .default_value = default_value,
+        .on_update_value = on_update_value,
+        .generated = generated,
+        .index_where = index_where,
+        .index_where_expressions = index_where_expressions,
     };
     if (property.dynamic_infer_types and (!(property.additional_properties_allowed orelse false) or property.additional_properties_schema != null)) {
         return error.InvalidSchemaUpdateRequest;
@@ -2334,6 +4516,970 @@ fn parseDynamicTemplate(alloc: std.mem.Allocator, default_name: []const u8, valu
             else => null,
         } else null,
     };
+}
+
+fn parseForeignKeys(alloc: std.mem.Allocator, value: std.json.Value) ![]ForeignKey {
+    const array = value.array;
+    const foreign_keys = try alloc.alloc(ForeignKey, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (foreign_keys[0..initialized]) |*foreign_key| foreign_key.deinit(alloc);
+        alloc.free(foreign_keys);
+    }
+
+    for (array.items) |item| {
+        const object = item.object;
+        const references = object.get("references").?.object;
+        const timing_clause = if (object.get("timing")) |timing_value|
+            foreignKeyTimingClauseFromString(timing_value.string).?
+        else
+            null;
+        const explicit_timing = if (timing_clause) |clause| clause.timing else null;
+        const deferrability = if (object.get("deferrable")) |deferrable_value|
+            foreignKeyDeferrabilityFromValue(deferrable_value).?
+        else
+            null;
+        const timing_from_deferrability = if (deferrability) |clause| clause.timing else null;
+        if (explicit_timing != null and timing_from_deferrability != null and explicit_timing.? != timing_from_deferrability.?) {
+            return error.InvalidSchemaUpdateRequest;
+        }
+        const explicit_deferrable = if (timing_clause) |clause| clause.deferrable else null;
+        const deferrable_from_deferrability = if (deferrability) |clause| clause.deferrable else null;
+        if (explicit_deferrable != null and deferrable_from_deferrability != null and explicit_deferrable.? != deferrable_from_deferrability.?) {
+            return error.InvalidSchemaUpdateRequest;
+        }
+        const timing = explicit_timing orelse timing_from_deferrability orelse ForeignKeyTiming.immediate;
+        const deferrable = explicit_deferrable orelse deferrable_from_deferrability orelse (timing == .deferred);
+        foreign_keys[initialized] = .{
+            .name = try alloc.dupe(u8, object.get("name").?.string),
+            .columns = try parseStringArrayAlloc(alloc, object.get("columns").?),
+            .period = if (object.get("period")) |period| try alloc.dupe(u8, period.string) else null,
+            .references = .{
+                .table = try alloc.dupe(u8, references.get("table").?.string),
+                .columns = try parseStringArrayAlloc(alloc, references.get("columns").?),
+                .period = if (references.get("period")) |period| try alloc.dupe(u8, period.string) else null,
+            },
+            .on_delete = if (object.get("on_delete")) |on_delete|
+                ForeignKeyAction.fromString(on_delete.string).?
+            else
+                .restrict,
+            .on_update = if (object.get("on_update")) |on_update|
+                ForeignKeyAction.fromString(on_update.string).?
+            else
+                .restrict,
+            .timing = timing,
+            .deferrable = deferrable,
+            .match = if (object.get("match")) |match|
+                ForeignKeyMatch.fromString(match.string).?
+            else
+                .simple,
+            .validation_state = if (object.get("validation_state")) |validation_state|
+                ForeignKeyValidationState.fromString(validation_state.string).?
+            else
+                .enforced,
+        };
+        initialized += 1;
+    }
+    return foreign_keys;
+}
+
+fn parsePrimaryKey(alloc: std.mem.Allocator, value: std.json.Value) !PrimaryKey {
+    const object = value.object;
+    const name = if (object.get("name")) |name| try alloc.dupe(u8, name.string) else null;
+    errdefer if (name) |value_name| alloc.free(value_name);
+    const columns = try parseStringArrayAlloc(alloc, object.get("columns").?);
+    errdefer {
+        for (columns) |column| alloc.free(column);
+        if (columns.len > 0) alloc.free(columns);
+    }
+    const include_columns: [][]const u8 = if (object.get("include_columns")) |include_columns_value| try parseStringArrayAlloc(alloc, include_columns_value) else &.{};
+    errdefer {
+        for (include_columns) |column| alloc.free(column);
+        if (include_columns.len > 0) alloc.free(include_columns);
+    }
+    const without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null;
+    const timing = try constraintTimingMetadataFromObject(object);
+    return .{
+        .name = name,
+        .columns = columns,
+        .include_columns = include_columns,
+        .without_overlaps_period = without_overlaps_period,
+        .deferrable = timing.deferrable,
+        .timing = timing.timing,
+    };
+}
+
+fn parseExternalBaseSource(alloc: std.mem.Allocator, value: std.json.Value) !storage_schema.ExternalBaseSource {
+    try validateExternalBaseSource(value);
+    const object = value.object;
+    const table_id_value = object.get("table_id") orelse return error.InvalidSchemaUpdateRequest;
+    const table_id = try alloc.dupe(u8, table_id_value.string);
+    errdefer alloc.free(table_id);
+    const format = parseExternalBaseFormat(object.get("format").?.string) orelse return error.InvalidSchemaUpdateRequest;
+    const source_uri_value = object.get("uri") orelse object.get("source_uri") orelse return error.InvalidSchemaUpdateRequest;
+    const source_uri = try alloc.dupe(u8, source_uri_value.string);
+    errdefer alloc.free(source_uri);
+    const credential_ref = if (object.get("credentials") orelse object.get("credential_ref")) |credentials|
+        try parseExternalCredentialRef(alloc, credentials)
+    else
+        null;
+    errdefer if (credential_ref) |credential| {
+        alloc.free(credential.ref_id);
+        alloc.free(credential.scope);
+    };
+    const snapshot_mode = if (object.get("snapshot") orelse object.get("snapshot_mode")) |snapshot|
+        try parseExternalSnapshotMode(alloc, snapshot)
+    else
+        storage_schema.ExternalSnapshotMode.current;
+    errdefer switch (snapshot_mode) {
+        .current => {},
+        .snapshot_id => |snapshot_id| alloc.free(snapshot_id),
+        .object_version_digest => |digest| alloc.free(digest),
+    };
+    const schema_fingerprint_value = object.get("schema_fingerprint") orelse return error.InvalidSchemaUpdateRequest;
+    const schema_fingerprint = try alloc.dupe(u8, schema_fingerprint_value.string);
+    errdefer alloc.free(schema_fingerprint);
+    return .{
+        .table_id = table_id,
+        .format = format,
+        .source_uri = source_uri,
+        .credential_ref = credential_ref,
+        .snapshot_mode = snapshot_mode,
+        .schema_fingerprint = schema_fingerprint,
+        .write_policy = if (object.get("write_policy")) |write_policy|
+            parseExternalWritePolicy(write_policy.string) orelse return error.InvalidSchemaUpdateRequest
+        else
+            .read_only,
+    };
+}
+
+fn parseExternalCredentialRef(alloc: std.mem.Allocator, value: std.json.Value) !storage_schema.ExternalCredentialRef {
+    try validateExternalCredentialRef(value);
+    const object = value.object;
+    const ref_value = object.get("ref") orelse object.get("ref_id") orelse return error.InvalidSchemaUpdateRequest;
+    const ref_id = try alloc.dupe(u8, ref_value.string);
+    errdefer alloc.free(ref_id);
+    const scope = if (object.get("scope")) |scope_value|
+        try alloc.dupe(u8, scope_value.string)
+    else
+        try alloc.dupe(u8, "");
+    errdefer alloc.free(scope);
+    return .{ .ref_id = ref_id, .scope = scope };
+}
+
+fn parseExternalSnapshotMode(alloc: std.mem.Allocator, value: std.json.Value) !storage_schema.ExternalSnapshotMode {
+    try validateExternalSnapshotMode(value);
+    switch (value) {
+        .string => return .current,
+        .object => |object| {
+            const mode = object.get("mode").?.string;
+            if (enumTokenEql(mode, "current") or enumTokenEql(mode, "iceberg_current")) return .current;
+            if (enumTokenEql(mode, "snapshot_id") or enumTokenEql(mode, "snapshot")) {
+                const id = object.get("id") orelse object.get("snapshot_id") orelse return error.InvalidSchemaUpdateRequest;
+                return .{ .snapshot_id = try alloc.dupe(u8, id.string) };
+            }
+            if (enumTokenEql(mode, "object_version_digest") or enumTokenEql(mode, "raw_parquet_digest")) {
+                const digest = object.get("digest") orelse object.get("object_version_digest") orelse return error.InvalidSchemaUpdateRequest;
+                return .{ .object_version_digest = try alloc.dupe(u8, digest.string) };
+            }
+            return error.InvalidSchemaUpdateRequest;
+        },
+        else => return error.InvalidSchemaUpdateRequest,
+    }
+}
+
+fn parseExternalBaseFormat(text: []const u8) ?storage_schema.ExternalBaseFormat {
+    if (enumTokenEql(text, "parquet") or enumTokenEql(text, "parquet_prefix") or enumTokenEql(text, "raw_parquet")) return .parquet;
+    if (enumTokenEql(text, "iceberg")) return .iceberg;
+    if (enumTokenEql(text, "lance")) return .lance;
+    return null;
+}
+
+fn parseExternalWritePolicy(text: []const u8) ?storage_schema.ExternalWritePolicy {
+    if (enumTokenEql(text, "read_only")) return .read_only;
+    if (enumTokenEql(text, "materialized_overlay")) return .materialized_overlay;
+    if (enumTokenEql(text, "iceberg_writer")) return .iceberg_writer;
+    if (enumTokenEql(text, "lake_native_relational")) return .lake_native_relational;
+    return null;
+}
+
+fn parseRelationalPeriods(alloc: std.mem.Allocator, value: std.json.Value) ![]RelationalPeriod {
+    const array = value.array;
+    if (array.items.len == 0) return &.{};
+    const out = try alloc.alloc(RelationalPeriod, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*period| period.deinit(alloc);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        out[initialized] = .{
+            .name = try alloc.dupe(u8, object.get("name").?.string),
+            .start_column = try alloc.dupe(u8, object.get("start_column").?.string),
+            .end_column = try alloc.dupe(u8, object.get("end_column").?.string),
+            .range_type = if (object.get("range_type")) |range_type| parseRelationalPeriodRangeType(range_type.string) orelse return error.InvalidSchemaUpdateRequest else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRelationalPeriodRangeType(text: []const u8) ?storage_schema.RelationalPeriodRangeType {
+    if (enumTokenEql(text, "numrange")) return .numrange;
+    if (enumTokenEql(text, "daterange")) return .daterange;
+    if (enumTokenEql(text, "tsrange")) return .tsrange;
+    if (enumTokenEql(text, "tstzrange")) return .tstzrange;
+    return null;
+}
+
+fn validateRelationalPeriodRangeType(range_type: storage_schema.RelationalPeriodRangeType, start_property: DocumentProperty, end_property: DocumentProperty) !void {
+    const start_type = start_property.field_type orelse return error.InvalidSchemaUpdateRequest;
+    const end_type = end_property.field_type orelse return error.InvalidSchemaUpdateRequest;
+    switch (range_type) {
+        .numrange => {
+            if (!relationalPeriodRangeTypeIsNumeric(start_type) or !relationalPeriodRangeTypeIsNumeric(end_type)) return error.InvalidSchemaUpdateRequest;
+        },
+        .daterange, .tsrange, .tstzrange => {
+            if (!std.mem.eql(u8, start_type, "datetime") or !std.mem.eql(u8, end_type, "datetime")) return error.InvalidSchemaUpdateRequest;
+        },
+    }
+}
+
+fn relationalPeriodRangeTypeIsNumeric(field_type: []const u8) bool {
+    return std.mem.eql(u8, field_type, "numeric") or
+        std.mem.eql(u8, field_type, "number") or
+        std.mem.eql(u8, field_type, "integer");
+}
+
+fn parseRelationalDefaultValue(alloc: std.mem.Allocator, value: std.json.Value) !RelationalDefaultValue {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const op_value = object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (op_value != .string) return error.InvalidSchemaUpdateRequest;
+    const op_text = op_value.string;
+    if (enumTokenEql(op_text, "now_ns")) {
+        return .{ .kind = .now_ns, .value_json = try alloc.dupe(u8, "") };
+    }
+    if (enumTokenEql(op_text, "current_date_ns")) {
+        return .{ .kind = .current_date_ns, .value_json = try alloc.dupe(u8, "") };
+    }
+    if (enumTokenEql(op_text, "uuid_v4")) {
+        return .{ .kind = .uuid_v4, .value_json = try alloc.dupe(u8, "") };
+    }
+    if (enumTokenEql(op_text, "sequence_next")) {
+        const sequence_value = object.get("sequence") orelse return error.InvalidSchemaUpdateRequest;
+        if (sequence_value != .string or sequence_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const database_value = object.get("database");
+        if (database_value) |actual| if (actual != .string or actual.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        const schema_value = object.get("schema");
+        if (schema_value) |actual| if (actual != .string or actual.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        try writer.print("\"sequence\":{f}", .{std.json.fmt(sequence_value.string, .{})});
+        if (database_value) |actual| try writer.print(",\"database\":{f}", .{std.json.fmt(actual.string, .{})});
+        if (schema_value) |actual| try writer.print(",\"schema\":{f}", .{std.json.fmt(actual.string, .{})});
+        try writer.writeByte('}');
+        return .{ .kind = .sequence_next, .value_json = try out.toOwnedSlice() };
+    }
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn parseRelationalGeneratedValue(alloc: std.mem.Allocator, value: std.json.Value) !RelationalGeneratedValue {
+    const object = switch (value) {
+        .object => |object| object,
+        else => return error.InvalidSchemaUpdateRequest,
+    };
+    const op_value = object.get("op");
+    if (op_value) |actual| {
+        if (actual != .string) return error.InvalidSchemaUpdateRequest;
+    }
+    const op_text = if (op_value) |actual| actual.string else "";
+    if ((op_value == null or enumTokenEql(op_text, "expression")) and object.get("expression") != null) {
+        const expression = try parseRelationalRowsExpressionAlloc(alloc, object.get("expression").?);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeRelationalRowsExpression(alloc, expression);
+        const separator = try alloc.dupe(u8, "");
+        var separator_transferred = false;
+        errdefer if (!separator_transferred) alloc.free(separator);
+        expression_transferred = true;
+        separator_transferred = true;
+        return .{
+            .op = .expression,
+            .separator = separator,
+            .expression = expression,
+        };
+    }
+    if (op_value == null) return error.InvalidSchemaUpdateRequest;
+    if (enumTokenEql(op_text, "lower") or enumTokenEql(op_text, "upper") or enumTokenEql(op_text, "md5")) {
+        const field_value = object.get("field") orelse return error.InvalidSchemaUpdateRequest;
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        return .{
+            .op = if (enumTokenEql(op_text, "lower")) .lower else if (enumTokenEql(op_text, "upper")) .upper else .md5,
+            .field = try alloc.dupe(u8, field_value.string),
+            .separator = try alloc.dupe(u8, ""),
+        };
+    }
+    if (enumTokenEql(op_text, "concat") or enumTokenEql(op_text, "concat_ws")) {
+        const fields_value = object.get("fields") orelse return error.InvalidSchemaUpdateRequest;
+        if (fields_value != .array or fields_value.array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+        const separator = if (object.get("separator")) |separator_value| blk: {
+            if (separator_value != .string) return error.InvalidSchemaUpdateRequest;
+            break :blk separator_value.string;
+        } else "";
+        return .{
+            .op = if (enumTokenEql(op_text, "concat_ws")) .concat_ws else .concat,
+            .fields = try parseStringArrayAlloc(alloc, fields_value),
+            .separator = try alloc.dupe(u8, separator),
+        };
+    }
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn parseRelationalChecks(alloc: std.mem.Allocator, value: std.json.Value) ![]RelationalCheck {
+    const array = value.array;
+    if (array.items.len == 0) return &.{};
+    const out = try alloc.alloc(RelationalCheck, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |*check| check.deinit(alloc);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        const name = try alloc.dupe(u8, object.get("name").?.string);
+        var name_transferred = false;
+        errdefer if (!name_transferred) alloc.free(name);
+        const validation_state = if (object.get("validation_state")) |state| try parseRelationalCheckValidationState(state.string) else .enforced;
+        if (object.get("expression")) |expression_value| {
+            const expression = try parseRelationalRowsExpressionConditionAlloc(alloc, expression_value);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeRelationalRowsExpressionCondition(alloc, expression);
+            const field = try alloc.dupe(u8, "");
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            out[initialized] = .{
+                .name = name,
+                .field = field,
+                .validation_state = validation_state,
+                .expression = expression,
+            };
+            name_transferred = true;
+            field_transferred = true;
+            expression_transferred = true;
+        } else {
+            const field = try alloc.dupe(u8, object.get("field").?.string);
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            const value_json = if (object.get("value")) |check_value| try stringifyJsonValue(alloc, check_value) else null;
+            var value_transferred = false;
+            errdefer if (!value_transferred) if (value_json) |json| alloc.free(json);
+            const collation = if (object.get("collation")) |collation_value| try alloc.dupe(u8, collation_value.string) else null;
+            var collation_transferred = false;
+            errdefer if (!collation_transferred) if (collation) |collation_text| alloc.free(collation_text);
+            out[initialized] = .{
+                .name = name,
+                .field = field,
+                .op = try parseRelationalCheckOp(object.get("op").?.string),
+                .value_json = value_json,
+                .collation = collation,
+                .validation_state = validation_state,
+            };
+            name_transferred = true;
+            field_transferred = true;
+            value_transferred = true;
+            collation_transferred = true;
+        }
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRelationalCheckOp(op_text: []const u8) !RelationalCheckOp {
+    if (enumTokenEql(op_text, "is_null")) return .is_null;
+    if (enumTokenEql(op_text, "is_not_null")) return .is_not_null;
+    if (enumTokenEql(op_text, "is_distinct")) return .is_distinct;
+    if (enumTokenEql(op_text, "is_not_distinct")) return .is_not_distinct;
+    if (enumTokenEql(op_text, "eq")) return .eq;
+    if (enumTokenEql(op_text, "ne")) return .ne;
+    if (enumTokenEql(op_text, "gt")) return .gt;
+    if (enumTokenEql(op_text, "gte")) return .gte;
+    if (enumTokenEql(op_text, "lt")) return .lt;
+    if (enumTokenEql(op_text, "lte")) return .lte;
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn parseRelationalCheckValidationState(state_text: []const u8) !RelationalCheckValidationState {
+    if (enumTokenEql(state_text, "enforced")) return .enforced;
+    if (enumTokenEql(state_text, "unvalidated")) return .unvalidated;
+    if (enumTokenEql(state_text, "validating")) return .validating;
+    if (enumTokenEql(state_text, "invalid")) return .invalid;
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn relationalCheckOpToStorage(op: RelationalCheckOp) storage_schema.RelationalCheckOp {
+    return switch (op) {
+        .is_null => .is_null,
+        .is_not_null => .is_not_null,
+        .is_distinct => .is_distinct,
+        .is_not_distinct => .is_not_distinct,
+        .eq => .eq,
+        .ne => .ne,
+        .gt => .gt,
+        .gte => .gte,
+        .lt => .lt,
+        .lte => .lte,
+    };
+}
+
+fn validateRelationalRowsExpressionConditionJson(value: std.json.Value) anyerror!void {
+    if (value != .object) return error.InvalidSchemaUpdateRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "lhs", "op", "rhs" });
+    const lhs = value.object.get("lhs") orelse return error.InvalidSchemaUpdateRequest;
+    const op = value.object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (op != .string) return error.InvalidSchemaUpdateRequest;
+    const check_op = try parseRelationalCheckOp(op.string);
+    const rhs = value.object.get("rhs");
+    switch (check_op) {
+        .is_null, .is_not_null => if (rhs != null) return error.InvalidSchemaUpdateRequest,
+        .is_distinct, .is_not_distinct, .eq, .ne, .gt, .gte, .lt, .lte => if (rhs == null) return error.InvalidSchemaUpdateRequest,
+    }
+    try validateRelationalRowsCatalogExpressionJson(lhs);
+    if (rhs) |rhs_value| try validateRelationalRowsCatalogExpressionJson(rhs_value);
+}
+
+fn validateRelationalRowsExpressionConditionArrayJson(value: std.json.Value) anyerror!void {
+    if (value != .array or value.array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    for (value.array.items) |item| try validateRelationalRowsExpressionConditionJson(item);
+}
+
+fn validateRelationalRowsExpressionJson(value: std.json.Value) anyerror!void {
+    if (value != .object) return error.InvalidSchemaUpdateRequest;
+    try requireJsonObjectOnlyKeys(value.object, &.{ "field", "source", "value", "op", "args", "to", "path", "as_text", "cases", "else" });
+    const field = value.object.get("field");
+    const literal = value.object.get("value");
+    const op = value.object.get("op");
+    const present_count: u8 = (if (field != null) @as(u8, 1) else 0) + (if (literal != null) @as(u8, 1) else 0) + (if (op != null) @as(u8, 1) else 0);
+    if (present_count != 1) return error.InvalidSchemaUpdateRequest;
+    if (value.object.get("source")) |source| {
+        if (field == null or source != .string or !std.mem.eql(u8, source.string, "row")) return error.InvalidSchemaUpdateRequest;
+    }
+    if (field) |field_value| {
+        if (field_value != .string or field_value.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        try requireJsonObjectOnlyKeys(value.object, &.{ "field", "source" });
+        return;
+    }
+    if (literal != null) {
+        try requireJsonObjectOnlyKeys(value.object, &.{"value"});
+        return;
+    }
+    if (op.?.string.len == 0) return error.InvalidSchemaUpdateRequest;
+    if (std.mem.eql(u8, op.?.string, "case")) {
+        try requireJsonObjectOnlyKeys(value.object, &.{ "op", "cases", "else" });
+        const cases = value.object.get("cases") orelse return error.InvalidSchemaUpdateRequest;
+        if (cases != .array or cases.array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+        for (cases.array.items) |branch| {
+            if (branch != .object) return error.InvalidSchemaUpdateRequest;
+            try requireJsonObjectOnlyKeys(branch.object, &.{ "when", "then" });
+            try validateRelationalRowsExpressionConditionJson(branch.object.get("when") orelse return error.InvalidSchemaUpdateRequest);
+            try validateRelationalRowsExpressionJson(branch.object.get("then") orelse return error.InvalidSchemaUpdateRequest);
+        }
+        try validateRelationalRowsExpressionJson(value.object.get("else") orelse return error.InvalidSchemaUpdateRequest);
+        return;
+    }
+    const args = value.object.get("args") orelse return error.InvalidSchemaUpdateRequest;
+    if (args != .array) return error.InvalidSchemaUpdateRequest;
+    const expression_kind = try parseRelationalRowsExpressionKind(op.?.string);
+    switch (expression_kind) {
+        .cast => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args", "to" }),
+        .json_extract => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args", "path", "as_text" }),
+        .json_path_exists => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args", "path" }),
+        else => try requireJsonObjectOnlyKeys(value.object, &.{ "op", "args" }),
+    }
+    try validateRelationalRowsExpressionArity(expression_kind, args.array.items.len);
+    if (expression_kind == .cast) {
+        const to = value.object.get("to") orelse return error.InvalidSchemaUpdateRequest;
+        if (to != .string or parseRelationalRowsExpressionCastType(to.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
+    if (expression_kind == .json_extract or expression_kind == .json_path_exists) {
+        const path = value.object.get("path") orelse return error.InvalidSchemaUpdateRequest;
+        if (path != .string or path.string.len == 0) return error.InvalidSchemaUpdateRequest;
+        if (expression_kind == .json_extract) if (value.object.get("as_text")) |as_text| if (as_text != .bool) return error.InvalidSchemaUpdateRequest;
+    }
+    for (args.array.items) |arg| try validateRelationalRowsExpressionJson(arg);
+}
+
+fn validateRelationalRowsCatalogExpressionJson(value: std.json.Value) anyerror!void {
+    try validateRelationalRowsExpressionJson(value);
+    try validateRelationalRowsCatalogExpressionDeterministicJson(value);
+}
+
+fn validateRelationalRowsCatalogExpressionDeterministicJson(value: std.json.Value) anyerror!void {
+    if (value != .object) return error.InvalidSchemaUpdateRequest;
+    if (value.object.get("field") != null or value.object.get("value") != null) return;
+    const op = value.object.get("op") orelse return error.InvalidSchemaUpdateRequest;
+    if (op != .string) return error.InvalidSchemaUpdateRequest;
+    if (std.mem.eql(u8, op.string, "now") or std.mem.eql(u8, op.string, "uuid_v4")) {
+        return error.InvalidSchemaUpdateRequest;
+    }
+    if (std.mem.eql(u8, op.string, "case")) {
+        const cases = value.object.get("cases") orelse return error.InvalidSchemaUpdateRequest;
+        for (cases.array.items) |branch| {
+            try validateRelationalRowsExpressionConditionJson(branch.object.get("when") orelse return error.InvalidSchemaUpdateRequest);
+            try validateRelationalRowsCatalogExpressionDeterministicJson(branch.object.get("then") orelse return error.InvalidSchemaUpdateRequest);
+        }
+        try validateRelationalRowsCatalogExpressionDeterministicJson(value.object.get("else") orelse return error.InvalidSchemaUpdateRequest);
+        return;
+    }
+    const args = value.object.get("args") orelse return error.InvalidSchemaUpdateRequest;
+    for (args.array.items) |arg| try validateRelationalRowsCatalogExpressionDeterministicJson(arg);
+}
+
+fn parseRelationalRowsExpressionConditionAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) anyerror!storage_schema.RelationalRowsExpressionCondition {
+    try validateRelationalRowsExpressionConditionJson(value);
+    const lhs = try parseRelationalRowsExpressionAlloc(alloc, value.object.get("lhs").?);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeRelationalRowsExpression(alloc, lhs);
+    const op = relationalCheckOpToStorage(try parseRelationalCheckOp(value.object.get("op").?.string));
+    const rhs = if (value.object.get("rhs")) |rhs_value| blk: {
+        const out = try alloc.alloc(storage_schema.RelationalRowsExpression, 1);
+        var out_transferred = false;
+        errdefer if (!out_transferred) alloc.free(out);
+        out[0] = try parseRelationalRowsExpressionAlloc(alloc, rhs_value);
+        out_transferred = true;
+        break :blk out;
+    } else &.{};
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred and rhs.len > 0) {
+        for (rhs) |expression| freeRelationalRowsExpression(alloc, expression);
+        alloc.free(rhs);
+    };
+    lhs_transferred = true;
+    rhs_transferred = true;
+    return .{ .lhs = lhs, .op = op, .rhs = rhs };
+}
+
+fn parseRelationalRowsExpressionConditionsAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) anyerror![]storage_schema.RelationalRowsExpressionCondition {
+    try validateRelationalRowsExpressionConditionArrayJson(value);
+    const out = try alloc.alloc(storage_schema.RelationalRowsExpressionCondition, value.array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |condition| freeRelationalRowsExpressionCondition(alloc, condition);
+        alloc.free(out);
+    }
+    for (value.array.items) |item| {
+        out[initialized] = try parseRelationalRowsExpressionConditionAlloc(alloc, item);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseRelationalRowsExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) anyerror!storage_schema.RelationalRowsExpression {
+    try validateRelationalRowsExpressionJson(value);
+    if (value.object.get("field")) |field| {
+        return .{ .kind = .field, .field = try alloc.dupe(u8, field.string) };
+    }
+    if (value.object.get("value")) |literal| {
+        return .{ .kind = .value, .value_json = try stringifyJsonValue(alloc, literal) };
+    }
+
+    const op = value.object.get("op").?.string;
+    if (std.mem.eql(u8, op, "case")) return try parseRelationalRowsCaseExpressionAlloc(alloc, value);
+    if (std.mem.eql(u8, op, "now")) {
+        return .{ .kind = .now, .value_json = try alloc.dupe(u8, "0") };
+    }
+    if (std.mem.eql(u8, op, "uuid_v4")) {
+        return .{ .kind = .uuid_v4 };
+    }
+
+    const expression_kind = try parseRelationalRowsExpressionKind(op);
+    const args = value.object.get("args").?.array.items;
+    const operands = try alloc.alloc(storage_schema.RelationalRowsExpression, args.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (operands[0..initialized]) |operand| freeRelationalRowsExpression(alloc, operand);
+        if (operands.len > 0) alloc.free(operands);
+    }
+    for (args) |arg| {
+        operands[initialized] = try parseRelationalRowsExpressionAlloc(alloc, arg);
+        initialized += 1;
+    }
+    const cast_type = if (expression_kind == .cast)
+        parseRelationalRowsExpressionCastType(value.object.get("to").?.string).?
+    else
+        null;
+    const json_path = if (expression_kind == .json_extract or expression_kind == .json_path_exists)
+        try alloc.dupe(u8, value.object.get("path").?.string)
+    else
+        "";
+    var json_path_transferred = false;
+    errdefer if (!json_path_transferred and json_path.len > 0) alloc.free(json_path);
+    const json_as_text = if (expression_kind == .json_extract and value.object.get("as_text") != null)
+        value.object.get("as_text").?.bool
+    else
+        false;
+    json_path_transferred = true;
+    return .{
+        .kind = expression_kind,
+        .operands = operands,
+        .cast_type = cast_type,
+        .json_path = json_path,
+        .json_as_text = json_as_text,
+    };
+}
+
+fn parseRelationalRowsCaseExpressionAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) anyerror!storage_schema.RelationalRowsExpression {
+    const cases = value.object.get("cases").?.array.items;
+    const branches = try alloc.alloc(storage_schema.RelationalRowsExpressionCaseBranch, cases.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (branches[0..initialized]) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+        if (branches.len > 0) alloc.free(branches);
+    }
+    for (cases) |branch_value| {
+        const when = try parseRelationalRowsExpressionConditionAlloc(alloc, branch_value.object.get("when").?);
+        var when_transferred = false;
+        errdefer if (!when_transferred) freeRelationalRowsExpressionCondition(alloc, when);
+        const then = try parseRelationalRowsExpressionAlloc(alloc, branch_value.object.get("then").?);
+        var then_transferred = false;
+        errdefer if (!then_transferred) freeRelationalRowsExpression(alloc, then);
+        branches[initialized] = .{ .when = when, .then = then };
+        when_transferred = true;
+        then_transferred = true;
+        initialized += 1;
+    }
+    const fallback = try alloc.alloc(storage_schema.RelationalRowsExpression, 1);
+    var fallback_initialized = false;
+    errdefer {
+        if (fallback_initialized) freeRelationalRowsExpression(alloc, fallback[0]);
+        alloc.free(fallback);
+    }
+    fallback[0] = try parseRelationalRowsExpressionAlloc(alloc, value.object.get("else").?);
+    fallback_initialized = true;
+    return .{ .kind = .case, .case_branches = branches, .case_else = fallback };
+}
+
+fn parseRelationalRowsExpressionKind(op: []const u8) !storage_schema.RelationalRowsExpressionKind {
+    if (std.mem.eql(u8, op, "coalesce")) return .coalesce;
+    if (std.mem.eql(u8, op, "uuid_v4")) return .uuid_v4;
+    if (std.mem.eql(u8, op, "lower")) return .lower;
+    if (std.mem.eql(u8, op, "upper")) return .upper;
+    if (std.mem.eql(u8, op, "initcap")) return .initcap;
+    if (std.mem.eql(u8, op, "trim") or std.mem.eql(u8, op, "btrim")) return .trim;
+    if (std.mem.eql(u8, op, "ltrim")) return .ltrim;
+    if (std.mem.eql(u8, op, "rtrim")) return .rtrim;
+    if (std.mem.eql(u8, op, "replace")) return .replace;
+    if (std.mem.eql(u8, op, "regexp_replace")) return .regexp_replace;
+    if (std.mem.eql(u8, op, "regexp_substr")) return .regexp_substr;
+    if (std.mem.eql(u8, op, "translate")) return .translate;
+    if (std.mem.eql(u8, op, "substring") or std.mem.eql(u8, op, "substr")) return .substring;
+    if (std.mem.eql(u8, op, "overlay")) return .overlay;
+    if (std.mem.eql(u8, op, "split_part")) return .split_part;
+    if (std.mem.eql(u8, op, "strpos")) return .strpos;
+    if (std.mem.eql(u8, op, "left")) return .left;
+    if (std.mem.eql(u8, op, "right")) return .right;
+    if (std.mem.eql(u8, op, "lpad")) return .lpad;
+    if (std.mem.eql(u8, op, "rpad")) return .rpad;
+    if (std.mem.eql(u8, op, "repeat")) return .repeat;
+    if (std.mem.eql(u8, op, "reverse")) return .reverse;
+    if (std.mem.eql(u8, op, "starts_with")) return .starts_with;
+    if (std.mem.eql(u8, op, "ends_with")) return .ends_with;
+    if (std.mem.eql(u8, op, "ascii")) return .ascii;
+    if (std.mem.eql(u8, op, "chr")) return .chr;
+    if (std.mem.eql(u8, op, "md5")) return .md5;
+    if (std.mem.eql(u8, op, "like")) return .like;
+    if (std.mem.eql(u8, op, "ilike")) return .ilike;
+    if (std.mem.eql(u8, op, "regexp_match")) return .regexp_match;
+    if (std.mem.eql(u8, op, "regexp_count")) return .regexp_count;
+    if (std.mem.eql(u8, op, "regexp_instr")) return .regexp_instr;
+    if (std.mem.eql(u8, op, "and") or std.mem.eql(u8, op, "bool_and")) return .bool_and;
+    if (std.mem.eql(u8, op, "or") or std.mem.eql(u8, op, "bool_or")) return .bool_or;
+    if (std.mem.eql(u8, op, "not") or std.mem.eql(u8, op, "bool_not")) return .bool_not;
+    if (std.mem.eql(u8, op, "concat")) return .concat;
+    if (std.mem.eql(u8, op, "concat_ws")) return .concat_ws;
+    if (std.mem.eql(u8, op, "length")) return .length;
+    if (std.mem.eql(u8, op, "octet_length")) return .octet_length;
+    if (std.mem.eql(u8, op, "bit_length")) return .bit_length;
+    if (std.mem.eql(u8, op, "nullif")) return .nullif;
+    if (std.mem.eql(u8, op, "greatest")) return .greatest;
+    if (std.mem.eql(u8, op, "least")) return .least;
+    if (std.mem.eql(u8, op, "abs")) return .abs;
+    if (std.mem.eql(u8, op, "round")) return .round;
+    if (std.mem.eql(u8, op, "trunc")) return .trunc;
+    if (std.mem.eql(u8, op, "floor")) return .floor;
+    if (std.mem.eql(u8, op, "ceil")) return .ceil;
+    if (std.mem.eql(u8, op, "sqrt")) return .sqrt;
+    if (std.mem.eql(u8, op, "sign")) return .sign;
+    if (std.mem.eql(u8, op, "power")) return .power;
+    if (std.mem.eql(u8, op, "add")) return .add;
+    if (std.mem.eql(u8, op, "sub")) return .sub;
+    if (std.mem.eql(u8, op, "mul")) return .mul;
+    if (std.mem.eql(u8, op, "div")) return .div;
+    if (std.mem.eql(u8, op, "mod")) return .mod;
+    if (std.mem.eql(u8, op, "interval_ns")) return .interval_ns;
+    if (std.mem.eql(u8, op, "interval_months")) return .interval_months;
+    if (std.mem.eql(u8, op, "date_trunc")) return .date_trunc;
+    if (std.mem.eql(u8, op, "date_bin")) return .date_bin;
+    if (std.mem.eql(u8, op, "date_part") or std.mem.eql(u8, op, "extract")) return .date_part;
+    if (std.mem.eql(u8, op, "cast")) return .cast;
+    if (std.mem.eql(u8, op, "json_extract")) return .json_extract;
+    if (std.mem.eql(u8, op, "json_path_exists")) return .json_path_exists;
+    if (std.mem.eql(u8, op, "json_typeof") or std.mem.eql(u8, op, "jsonb_typeof")) return .json_typeof;
+    if (std.mem.eql(u8, op, "json_array_length") or std.mem.eql(u8, op, "jsonb_array_length")) return .json_array_length;
+    if (std.mem.eql(u8, op, "json_build_object") or std.mem.eql(u8, op, "jsonb_build_object")) return .json_build_object;
+    if (std.mem.eql(u8, op, "to_jsonb")) return .to_jsonb;
+    if (std.mem.eql(u8, op, "array_length")) return .array_length;
+    if (std.mem.eql(u8, op, "array_position")) return .array_position;
+    if (std.mem.eql(u8, op, "array_positions")) return .array_positions;
+    if (std.mem.eql(u8, op, "array_append")) return .array_append;
+    if (std.mem.eql(u8, op, "array_prepend")) return .array_prepend;
+    if (std.mem.eql(u8, op, "array_cat")) return .array_cat;
+    if (std.mem.eql(u8, op, "array_remove")) return .array_remove;
+    if (std.mem.eql(u8, op, "array_replace")) return .array_replace;
+    if (std.mem.eql(u8, op, "array_to_string")) return .array_to_string;
+    if (std.mem.eql(u8, op, "string_to_array")) return .string_to_array;
+    return error.InvalidSchemaUpdateRequest;
+}
+
+fn validateRelationalRowsExpressionArity(kind: storage_schema.RelationalRowsExpressionKind, len: usize) !void {
+    switch (kind) {
+        .now, .uuid_v4 => if (len != 0) return error.InvalidSchemaUpdateRequest,
+        .lower, .upper, .initcap, .length, .octet_length, .bit_length, .ascii, .chr, .md5, .reverse, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .interval_ns, .interval_months, .date_part, .date_trunc, .cast, .json_extract, .json_path_exists, .json_typeof, .json_array_length, .array_length, .to_jsonb => if (len != 1 and kind != .date_part and kind != .date_trunc) return error.InvalidSchemaUpdateRequest,
+        .power => if (len != 2) return error.InvalidSchemaUpdateRequest,
+        .date_bin => if (len != 3) return error.InvalidSchemaUpdateRequest,
+        .trim, .ltrim, .rtrim => if (len != 1 and len != 2) return error.InvalidSchemaUpdateRequest,
+        .replace, .translate, .split_part => if (len != 3) return error.InvalidSchemaUpdateRequest,
+        .regexp_replace => if (len != 3 and len != 4) return error.InvalidSchemaUpdateRequest,
+        .regexp_substr => if (len != 2) return error.InvalidSchemaUpdateRequest,
+        .substring => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
+        .overlay => if (len != 3 and len != 4) return error.InvalidSchemaUpdateRequest,
+        .json_build_object => if (len % 2 != 0) return error.InvalidSchemaUpdateRequest,
+        .strpos, .left, .right, .repeat, .starts_with, .ends_with, .like, .ilike, .regexp_count, .regexp_instr, .nullif, .sub, .div, .mod, .array_position, .array_positions, .array_append, .array_prepend, .array_cat, .array_remove, .string_to_array => if (len != 2) return error.InvalidSchemaUpdateRequest,
+        .regexp_match => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
+        .array_replace => if (len != 3) return error.InvalidSchemaUpdateRequest,
+        .array_to_string => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
+        .lpad, .rpad => if (len != 2 and len != 3) return error.InvalidSchemaUpdateRequest,
+        .bool_and, .bool_or, .concat_ws => if (len < 2) return error.InvalidSchemaUpdateRequest,
+        .bool_not => if (len != 1) return error.InvalidSchemaUpdateRequest,
+        .greatest, .least, .add, .mul, .coalesce, .concat => if (len == 0) return error.InvalidSchemaUpdateRequest,
+        .case, .field, .value => return error.InvalidSchemaUpdateRequest,
+    }
+    if ((kind == .date_part or kind == .date_trunc) and len != 2) return error.InvalidSchemaUpdateRequest;
+}
+
+fn parseRelationalRowsExpressionCastType(text: []const u8) ?storage_schema.RelationalRowsExpressionCastType {
+    if (std.mem.eql(u8, text, "text")) return .text;
+    if (std.mem.eql(u8, text, "numeric")) return .numeric;
+    if (std.mem.eql(u8, text, "bool") or std.mem.eql(u8, text, "boolean")) return .bool;
+    if (std.mem.eql(u8, text, "datetime")) return .datetime;
+    return null;
+}
+
+fn freeRelationalRowsExpressionCondition(alloc: std.mem.Allocator, condition: storage_schema.RelationalRowsExpressionCondition) void {
+    freeRelationalRowsExpression(alloc, condition.lhs);
+    for (condition.rhs) |rhs| freeRelationalRowsExpression(alloc, rhs);
+    if (condition.rhs.len > 0) alloc.free(condition.rhs);
+}
+
+fn requireJsonObjectOnlyKeys(object: std.json.ObjectMap, allowed: []const []const u8) !void {
+    var it = object.iterator();
+    while (it.next()) |entry| {
+        for (allowed) |key| {
+            if (std.mem.eql(u8, entry.key_ptr.*, key)) break;
+        } else {
+            return error.InvalidSchemaUpdateRequest;
+        }
+    }
+}
+
+fn freeRelationalRowsExpressionCaseBranch(alloc: std.mem.Allocator, branch: storage_schema.RelationalRowsExpressionCaseBranch) void {
+    freeRelationalRowsExpressionCondition(alloc, branch.when);
+    freeRelationalRowsExpression(alloc, branch.then);
+}
+
+fn freeRelationalRowsExpression(alloc: std.mem.Allocator, expression: storage_schema.RelationalRowsExpression) void {
+    if (expression.field.len > 0) alloc.free(expression.field);
+    if (expression.value_json.len > 0) alloc.free(expression.value_json);
+    if (expression.json_path.len > 0) alloc.free(expression.json_path);
+    for (expression.operands) |operand| freeRelationalRowsExpression(alloc, operand);
+    if (expression.operands.len > 0) alloc.free(expression.operands);
+    for (expression.case_branches) |branch| freeRelationalRowsExpressionCaseBranch(alloc, branch);
+    if (expression.case_branches.len > 0) alloc.free(expression.case_branches);
+    for (expression.case_else) |fallback| freeRelationalRowsExpression(alloc, fallback);
+    if (expression.case_else.len > 0) alloc.free(expression.case_else);
+}
+
+fn parseUniqueConstraints(alloc: std.mem.Allocator, value: std.json.Value) ![]UniqueConstraint {
+    const array = value.array;
+    const constraints = try alloc.alloc(UniqueConstraint, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (constraints[0..initialized]) |*constraint| constraint.deinit(alloc);
+        alloc.free(constraints);
+    }
+
+    for (array.items) |item| {
+        const object = item.object;
+        const timing = try constraintTimingMetadataFromObject(object);
+        constraints[initialized] = .{
+            .name = try alloc.dupe(u8, object.get("name").?.string),
+            .columns = if (object.get("columns")) |columns| try parseStringArrayAlloc(alloc, columns) else &.{},
+            .expressions = if (object.get("expressions")) |expressions| try parseUniqueExpressions(alloc, expressions) else &.{},
+            .include_columns = if (object.get("include_columns")) |include_columns| try parseStringArrayAlloc(alloc, include_columns) else &.{},
+            .index_keys = if (object.get("index_keys")) |index_keys| try parseRelationalIndexKeysAlloc(alloc, index_keys) else &.{},
+            .without_overlaps_period = if (object.get("without_overlaps_period")) |period| try alloc.dupe(u8, period.string) else null,
+            .nulls_not_distinct = if (object.get("nulls_not_distinct")) |flag| flag.bool else false,
+            .deferrable = timing.deferrable,
+            .timing = timing.timing,
+            .where = if (object.get("where")) |where| try parseUniquePredicates(alloc, where) else &.{},
+            .where_expressions = if (object.get("where_expressions")) |where_expressions| try parseRelationalRowsExpressionConditionsAlloc(alloc, where_expressions) else &.{},
+            .validation_state = if (object.get("validation_state")) |validation_state|
+                UniqueConstraintValidationState.fromString(validation_state.string).?
+            else
+                .enforced,
+        };
+        initialized += 1;
+    }
+    return constraints;
+}
+
+fn parseUniqueExpressions(alloc: std.mem.Allocator, value: std.json.Value) ![]UniqueExpression {
+    const array = value.array;
+    if (array.items.len == 0) return &.{};
+    const out = try alloc.alloc(UniqueExpression, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |expression| {
+            alloc.free(expression.field);
+            if (expression.expression) |row_expression| freeRelationalRowsExpression(alloc, row_expression);
+        }
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        const op = object.get("op").?.string;
+        if (enumTokenEql(op, "expression")) {
+            const field = try alloc.dupe(u8, "");
+            var field_transferred = false;
+            errdefer if (!field_transferred) alloc.free(field);
+            const row_expression = try parseRelationalRowsExpressionAlloc(alloc, object.get("expression").?);
+            var expression_transferred = false;
+            errdefer if (!expression_transferred) freeRelationalRowsExpression(alloc, row_expression);
+            out[initialized] = .{
+                .op = .expression,
+                .field = field,
+                .expression = row_expression,
+            };
+            field_transferred = true;
+            expression_transferred = true;
+        } else {
+            out[initialized] = .{
+                .op = if (enumTokenEql(op, "lower")) .lower else if (enumTokenEql(op, "upper")) .upper else if (enumTokenEql(op, "md5")) .md5 else return error.InvalidSchemaUpdateRequest,
+                .field = try alloc.dupe(u8, object.get("field").?.string),
+            };
+        }
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseUniquePredicates(alloc: std.mem.Allocator, value: std.json.Value) ![]UniquePredicate {
+    const array = value.object.get("all").?.array;
+    const out = try alloc.alloc(UniquePredicate, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |predicate| {
+            alloc.free(predicate.field);
+            if (predicate.value_json) |value_json| alloc.free(value_json);
+        }
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        const op_text = object.get("op").?.string;
+        const op: UniquePredicateOp = if (enumTokenEql(op_text, "is_null"))
+            .is_null
+        else if (enumTokenEql(op_text, "is_not_null"))
+            .is_not_null
+        else if (enumTokenEql(op_text, "eq"))
+            .eq
+        else if (enumTokenEql(op_text, "ne"))
+            .ne
+        else
+            return error.InvalidSchemaUpdateRequest;
+        out[initialized] = .{
+            .field = try alloc.dupe(u8, object.get("field").?.string),
+            .op = op,
+            .value_json = if (object.get("value")) |predicate_value| try stringifyJsonValue(alloc, predicate_value) else null,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn parseStringArrayAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![][]const u8 {
+    const array = value.array;
+    const out = try alloc.alloc([]const u8, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |item| alloc.free(item);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        out[initialized] = try alloc.dupe(u8, item.string);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn relationalIndexKeyDirectionFromString(value: []const u8) ?storage_schema.RelationalIndexKeyDirection {
+    if (std.mem.eql(u8, value, "asc")) return .asc;
+    if (std.mem.eql(u8, value, "desc")) return .desc;
+    return null;
+}
+
+fn relationalIndexKeyNullsFromString(value: []const u8) ?storage_schema.RelationalIndexKeyNulls {
+    if (std.mem.eql(u8, value, "default")) return .default;
+    if (std.mem.eql(u8, value, "first")) return .first;
+    if (std.mem.eql(u8, value, "last")) return .last;
+    return null;
+}
+
+fn parseRelationalIndexKeysAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]storage_schema.RelationalIndexKey {
+    const array = value.array;
+    if (array.items.len == 0) return error.InvalidSchemaUpdateRequest;
+    const out = try alloc.alloc(storage_schema.RelationalIndexKey, array.items.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |key| alloc.free(key.column);
+        alloc.free(out);
+    }
+    for (array.items) |item| {
+        const object = item.object;
+        out[initialized] = .{
+            .column = try alloc.dupe(u8, object.get("column").?.string),
+            .direction = if (object.get("direction")) |direction| relationalIndexKeyDirectionFromString(direction.string).? else .asc,
+            .nulls = if (object.get("nulls")) |nulls| relationalIndexKeyNullsFromString(nulls.string).? else .default,
+        };
+        initialized += 1;
+    }
+    return out;
 }
 
 fn resolveDocumentSchema(
@@ -3387,6 +6533,605 @@ test "parse schema and validate document writes" {
         error.InvalidBatchRequest,
         validateWritesAgainstSchema(std.testing.allocator, parsed, &.{.{ .value = "{\"title\":\"alpha\",\"body\":\"unexpected\"}" }}),
     );
+}
+
+test "relational embedded document schema is scoped to explicit json columns" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"attrs\":{\"type\":\"json\",\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true},\"dynamic_templates\":{\"metrics\":{\"path_match\":\"metrics.*\",\"mapping\":{\"type\":\"numeric\"}}}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(StorageMode.relational, parsed.storage_mode);
+    try std.testing.expectEqual(@as(usize, 1), parsed.document_schemas[0].properties[1].embedded_dynamic_templates.len);
+
+    var derived_index_shape = try parseSchema(
+        std.testing.allocator,
+        "{\"version\":4,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"body\":{\"type\":\"text\"},\"embedding\":{\"type\":\"embedding\"},\"source_doc\":{\"type\":\"keyword\"},\"target_doc\":{\"type\":\"keyword\"},\"edge_type\":{\"type\":\"keyword\"},\"confidence\":{\"type\":\"numeric\"},\"attrs\":{\"type\":\"json\",\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"plan\":{\"type\":\"keyword\"},\"source\":{\"type\":\"keyword\"},\"target\":{\"type\":\"keyword\"},\"edge_type\":{\"type\":\"keyword\"},\"confidence\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+    );
+    defer derived_index_shape.deinit(std.testing.allocator);
+    try std.testing.expectEqual(StorageMode.relational, derived_index_shape.storage_mode);
+    try std.testing.expectEqual(@as(usize, 8), derived_index_shape.document_schemas[0].properties.len);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\",\"schema\":{\"type\":\"object\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"attrs\":{\"type\":\"object\",\"dynamic_templates\":{\"metrics\":{\"path_match\":\"metrics.*\",\"mapping\":{\"type\":\"numeric\"}}}}},\"required\":[\"id\"],\"additionalProperties\":false}}}}",
+        ),
+    );
+}
+
+test "relational schema parses primary-key foreign keys and unique constraints" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\",\"on_update\":\"no_action\",\"timing\":\"immediate\",\"match\":\"simple\",\"validation_state\":\"enforced\"},{\"name\":\"orders_customer_email_fkey\",\"columns\":[\"customer_id\",\"email\"],\"references\":{\"table\":\"order\",\"columns\":[\"customer_id\",\"email\"]},\"on_delete\":\"no_action\",\"on_update\":\"restrict\"}],\"unique_constraints\":[{\"name\":\"orders_customer_email_key\",\"columns\":[\"customer_id\",\"email\"]}]}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), parsed.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_fkey", parsed.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("customers", parsed.foreign_keys[0].references.table);
+    try std.testing.expectEqualStrings("_id", parsed.foreign_keys[0].references.columns[0]);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed.foreign_keys[0].on_update);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed.foreign_keys[0].timing);
+    try std.testing.expectEqual(ForeignKeyMatch.simple, parsed.foreign_keys[0].match);
+    try std.testing.expectEqual(ForeignKeyValidationState.enforced, parsed.foreign_keys[0].validation_state);
+    try std.testing.expectEqualStrings("orders_customer_email_fkey", parsed.foreign_keys[1].name);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed.foreign_keys[1].on_delete);
+    try std.testing.expectEqual(@as(usize, 2), parsed.foreign_keys[1].columns.len);
+    try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[1].columns[0]);
+    try std.testing.expectEqualStrings("email", parsed.foreign_keys[1].columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.foreign_keys[1].references.columns.len);
+    try std.testing.expectEqualStrings("customer_id", parsed.foreign_keys[1].references.columns[0]);
+    try std.testing.expectEqualStrings("email", parsed.foreign_keys[1].references.columns[1]);
+    try std.testing.expectEqual(ForeignKeyAction.restrict, parsed.foreign_keys[1].on_update);
+    try std.testing.expectEqual(@as(usize, 1), parsed.unique_constraints.len);
+    try std.testing.expectEqualStrings("orders_customer_email_key", parsed.unique_constraints[0].name);
+    try std.testing.expectEqual(@as(usize, 2), parsed.unique_constraints[0].columns.len);
+    try std.testing.expectEqualStrings("customer_id", parsed.unique_constraints[0].columns[0]);
+    try std.testing.expectEqualStrings("email", parsed.unique_constraints[0].columns[1]);
+
+    var parsed_set_null = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"set_null\"}]}",
+    );
+    defer parsed_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_set_null.foreign_keys[0].on_delete);
+    var parsed_update_set_null = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_update\":\"set_null\"}]}",
+    );
+    defer parsed_update_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_update_set_null.foreign_keys[0].on_update);
+
+    var parsed_cascade = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"cascade\"}]}",
+    );
+    defer parsed_cascade.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_cascade.foreign_keys[0].on_delete);
+    var parsed_update_cascade = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"id\",\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_update\":\"cascade\"}]}",
+    );
+    defer parsed_update_cascade.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_update_cascade.foreign_keys[0].on_update);
+}
+
+test "relational schema parses application-time temporal constraints" {
+    var parsed = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to","range_type":"daterange"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time","deferrable":true,"timing":"deferred"},"unique_constraints":[{"name":"price_sku_time_key","columns":["sku"],"without_overlaps_period":"valid_time","deferrable":"DEFERRABLE INITIALLY DEFERRED"}],"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"}}]}
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(usize, 1), parsed.periods.len);
+    try std.testing.expectEqualStrings("valid_time", parsed.periods[0].name);
+    try std.testing.expectEqualStrings("valid_from", parsed.periods[0].start_column);
+    try std.testing.expectEqualStrings("valid_to", parsed.periods[0].end_column);
+    try std.testing.expectEqual(storage_schema.RelationalPeriodRangeType.daterange, parsed.periods[0].range_type.?);
+    try std.testing.expect(parsed.primary_key != null);
+    try std.testing.expectEqualStrings("valid_time", parsed.primary_key.?.without_overlaps_period.?);
+    try std.testing.expect(parsed.primary_key.?.deferrable);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed.primary_key.?.timing);
+    try std.testing.expectEqualStrings("valid_time", parsed.unique_constraints[0].without_overlaps_period.?);
+    try std.testing.expect(parsed.unique_constraints[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed.unique_constraints[0].timing);
+    try std.testing.expectEqualStrings("valid_time", parsed.foreign_keys[0].period.?);
+    try std.testing.expectEqualStrings("valid_time", parsed.foreign_keys[0].references.period.?);
+
+    var parsed_delete_cascade = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_delete":"cascade"}]}
+    );
+    defer parsed_delete_cascade.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_delete_cascade.foreign_keys[0].on_delete);
+
+    var parsed_delete_set_null = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"adjustment_id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["adjustment_id","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["adjustment_id"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_delete":"set_null"}]}
+    );
+    defer parsed_delete_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_delete_set_null.foreign_keys[0].on_delete);
+
+    var parsed_update_set_null = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"adjustment_id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["adjustment_id","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["adjustment_id"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"set_null"}]}
+    );
+    defer parsed_update_set_null.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_update_set_null.foreign_keys[0].on_update);
+
+    var parsed_update_cascade = try parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"sku":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","sku","valid_from","valid_to"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id","sku"],"without_overlaps_period":"valid_time"},"foreign_keys":[{"name":"price_parent_time_fkey","columns":["tenant_id","sku"],"period":"valid_time","references":{"table":"parent_prices","columns":["tenant_id","sku"],"period":"valid_time"},"on_update":"cascade"}]}
+    );
+    defer parsed_update_cascade.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_update_cascade.foreign_keys[0].on_update);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(std.testing.allocator,
+            \\{"storage_mode":"relational","default_type":"price","enforce_types":true,"document_schemas":{"price":{"schema":{"type":"object","properties":{"tenant_id":{"type":"keyword"},"valid_from":{"type":"datetime"},"valid_to":{"type":"datetime"}},"required":["tenant_id","valid_from"],"additionalProperties":false}}},"periods":[{"name":"valid_time","start_column":"valid_from","end_column":"valid_to"}],"primary_key":{"columns":["tenant_id"],"without_overlaps_period":"missing_time"}}
+        ),
+    );
+}
+
+test "relational schema parses and validates composite primary keys" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"orders_pkey\",\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"status\",\"customer_id\"]},\"foreign_keys\":[{\"name\":\"order_parent_fkey\",\"columns\":[\"tenant_id\",\"customer_id\"],\"references\":{\"table\":\"order\",\"columns\":[\"tenant_id\",\"order_id\"]},\"on_delete\":\"restrict\"}]}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+
+    try std.testing.expect(parsed.primary_key != null);
+    try std.testing.expectEqualStrings("orders_pkey", parsed.primary_key.?.name.?);
+    try std.testing.expectEqual(@as(usize, 2), parsed.primary_key.?.columns.len);
+    try std.testing.expectEqualStrings("tenant_id", parsed.primary_key.?.columns[0]);
+    try std.testing.expectEqualStrings("order_id", parsed.primary_key.?.columns[1]);
+    try std.testing.expectEqual(@as(usize, 2), parsed.primary_key.?.include_columns.len);
+    try std.testing.expectEqualStrings("status", parsed.primary_key.?.include_columns[0]);
+    try std.testing.expectEqualStrings("customer_id", parsed.primary_key.?.include_columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), parsed.foreign_keys.len);
+    try std.testing.expectEqualStrings("tenant_id", parsed.foreign_keys[0].references.columns[0]);
+    try std.testing.expectEqualStrings("order_id", parsed.foreign_keys[0].references.columns[1]);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"_id\",\"tenant_id\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"payload\":{\"type\":\"json\"}},\"required\":[\"tenant_id\",\"payload\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"payload\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"name\":\"orders_email_key\",\"columns\":[\"tenant_id\",\"order_id\"]},\"unique_constraints\":[{\"name\":\"orders_email_key\",\"columns\":[\"email\"]}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"tenant_id\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"status\",\"status\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"missing\"]}}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tenant_id\":{\"type\":\"keyword\"},\"order_id\":{\"type\":\"keyword\"},\"payload\":{\"type\":\"json\"}},\"required\":[\"tenant_id\",\"order_id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"tenant_id\",\"order_id\"],\"include_columns\":[\"payload\"]}}",
+        ),
+    );
+}
+
+test "relational schema accepts SQL foreign key enum spellings" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"SET NULL\",\"on_update\":\"NO ACTION\",\"timing\":\"INITIALLY DEFERRED\",\"match\":\"MATCH SIMPLE\",\"validation_state\":\"UNVALIDATED\"}]}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed.foreign_keys[0].on_update);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed.foreign_keys[0].timing);
+    try std.testing.expect(parsed.foreign_keys[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyMatch.simple, parsed.foreign_keys[0].match);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed.foreign_keys[0].validation_state);
+
+    var parsed_sql_not_valid = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"validation_state\":\"NOT VALID\"}]}",
+    );
+    defer parsed_sql_not_valid.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed_sql_not_valid.foreign_keys[0].validation_state);
+
+    var parsed_hyphenated = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"no-action\",\"on_update\":\"RESTRICT\",\"timing\":\"initially-immediate\",\"deferrable\":true,\"match\":\"match-full\",\"validation_state\":\"not-valid\"}]}",
+    );
+    defer parsed_hyphenated.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed_hyphenated.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.restrict, parsed_hyphenated.foreign_keys[0].on_update);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_hyphenated.foreign_keys[0].timing);
+    try std.testing.expect(parsed_hyphenated.foreign_keys[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyMatch.full, parsed_hyphenated.foreign_keys[0].match);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed_hyphenated.foreign_keys[0].validation_state);
+
+    var parsed_clause_actions = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"ON DELETE CASCADE\",\"on_update\":\"ON UPDATE SET NULL\"}]}",
+    );
+    defer parsed_clause_actions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_clause_actions.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_clause_actions.foreign_keys[0].on_update);
+
+    var parsed_non_mutating_clause_actions = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"ON DELETE NO ACTION\",\"on_update\":\"ON UPDATE RESTRICT\"}]}",
+    );
+    defer parsed_non_mutating_clause_actions.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.no_action, parsed_non_mutating_clause_actions.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.restrict, parsed_non_mutating_clause_actions.foreign_keys[0].on_update);
+
+    var parsed_whitespace_clause = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"ON\\tDELETE\\tCASCADE\",\"on_update\":\"ON\\nUPDATE\\nSET\\nNULL\",\"timing\":\"DEFERRABLE\\tINITIALLY\\tDEFERRED\",\"match\":\"MATCH\\nFULL\",\"validation_state\":\"NOT\\tVALID\"}]}",
+    );
+    defer parsed_whitespace_clause.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyAction.cascade, parsed_whitespace_clause.foreign_keys[0].on_delete);
+    try std.testing.expectEqual(ForeignKeyAction.set_null, parsed_whitespace_clause.foreign_keys[0].on_update);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed_whitespace_clause.foreign_keys[0].timing);
+    try std.testing.expect(parsed_whitespace_clause.foreign_keys[0].deferrable);
+    try std.testing.expectEqual(ForeignKeyMatch.full, parsed_whitespace_clause.foreign_keys[0].match);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed_whitespace_clause.foreign_keys[0].validation_state);
+
+    var parsed_sql_deferrable = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY IMMEDIATE\",\"deferrable\":\"DEFERRABLE\"}]}",
+    );
+    defer parsed_sql_deferrable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_sql_deferrable.foreign_keys[0].timing);
+    try std.testing.expect(parsed_sql_deferrable.foreign_keys[0].deferrable);
+
+    var parsed_sql_not_deferrable = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY IMMEDIATE\",\"deferrable\":\"NOT DEFERRABLE\"}]}",
+    );
+    defer parsed_sql_not_deferrable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_sql_not_deferrable.foreign_keys[0].timing);
+    try std.testing.expect(!parsed_sql_not_deferrable.foreign_keys[0].deferrable);
+
+    var parsed_combined_deferrable = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"deferrable\":\"DEFERRABLE INITIALLY DEFERRED\"}]}",
+    );
+    defer parsed_combined_deferrable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed_combined_deferrable.foreign_keys[0].timing);
+    try std.testing.expect(parsed_combined_deferrable.foreign_keys[0].deferrable);
+
+    var parsed_timing_deferrability = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"NOT DEFERRABLE INITIALLY IMMEDIATE\"}]}",
+    );
+    defer parsed_timing_deferrability.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_timing_deferrability.foreign_keys[0].timing);
+    try std.testing.expect(!parsed_timing_deferrability.foreign_keys[0].deferrable);
+
+    var parsed_timing_combined_deferrable = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"DEFERRABLE INITIALLY IMMEDIATE\"}]}",
+    );
+    defer parsed_timing_combined_deferrable.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.immediate, parsed_timing_combined_deferrable.foreign_keys[0].timing);
+    try std.testing.expect(parsed_timing_combined_deferrable.foreign_keys[0].deferrable);
+
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"SET DEFAULT\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"deferred\",\"deferrable\":false}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY DEFERRED\",\"deferrable\":\"NOT DEFERRABLE\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"INITIALLY IMMEDIATE\",\"deferrable\":\"DEFERRABLE INITIALLY DEFERRED\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"deferrable\":\"NOT DEFERRABLE INITIALLY DEFERRED\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"NOT DEFERRABLE INITIALLY DEFERRED\"}]}",
+        ),
+    );
+}
+
+test "relational schema rejects unsupported foreign key shapes" {
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"order\",\"columns\":[\"email\"]},\"on_delete\":\"restrict\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"orders_email_key\",\"columns\":[\"email\"]}],\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"order\",\"columns\":[\"missing_email\"]},\"on_delete\":\"restrict\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"numeric\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"restrict\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_delete\":\"set_null\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"on_update\":\"set_null\"}]}",
+        ),
+    );
+    var parsed_deferred = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"timing\":\"deferred\"}]}",
+    );
+    defer parsed_deferred.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyTiming.deferred, parsed_deferred.foreign_keys[0].timing);
+    try std.testing.expect(parsed_deferred.foreign_keys[0].deferrable);
+    var parsed_match_simple = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"simple\"}]}",
+    );
+    defer parsed_match_simple.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyMatch.simple, parsed_match_simple.foreign_keys[0].match);
+    var parsed_match_full = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"full\"}]}",
+    );
+    defer parsed_match_full.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyMatch.full, parsed_match_full.foreign_keys[0].match);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"match\":\"partial\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"],\"schema\":\"public\"}}]}",
+        ),
+    );
+    var parsed_unvalidated = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"validation_state\":\"unvalidated\"}]}",
+    );
+    defer parsed_unvalidated.deinit(std.testing.allocator);
+    try std.testing.expectEqual(ForeignKeyValidationState.unvalidated, parsed_unvalidated.foreign_keys[0].validation_state);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"validation_state\":\"validating\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]},\"validation_state\":\"invalid\"}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\",\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"},\"customer_email\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"bad\",\"columns\":[\"customer_id\",\"customer_email\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\",\"email\"]}}]}",
+        ),
+    );
+    var parsed_shared_columns = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_customers_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}},{\"name\":\"orders_customer_id_accounts_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"accounts\",\"columns\":[\"_id\"]}}]}",
+    );
+    defer parsed_shared_columns.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 2), parsed_shared_columns.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_id_customers_fkey", parsed_shared_columns.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("orders_customer_id_accounts_fkey", parsed_shared_columns.foreign_keys[1].name);
+    try std.testing.expectEqualStrings("customer_id", parsed_shared_columns.foreign_keys[0].columns[0]);
+    try std.testing.expectEqualStrings("customer_id", parsed_shared_columns.foreign_keys[1].columns[0]);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_id\":{\"type\":\"keyword\"}},\"required\":[\"customer_id\"],\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"customers\",\"columns\":[\"_id\"]}},{\"name\":\"orders_customer_id_fkey\",\"columns\":[\"customer_id\"],\"references\":{\"table\":\"accounts\",\"columns\":[\"_id\"]}}]}",
+        ),
+    );
+}
+
+test "relational schema admits cross-table unique foreign key targets for hosted resolution" {
+    var parsed = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"order\",\"enforce_types\":true,\"document_schemas\":{\"order\":{\"schema\":{\"type\":\"object\",\"properties\":{\"customer_email\":{\"type\":\"keyword\"},\"region\":{\"type\":\"keyword\"}},\"additionalProperties\":false}}},\"foreign_keys\":[{\"name\":\"orders_customer_email_fkey\",\"columns\":[\"customer_email\",\"region\"],\"references\":{\"table\":\"customers\",\"columns\":[\"email\",\"region\"]},\"on_delete\":\"restrict\"}]}",
+    );
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 1), parsed.foreign_keys.len);
+    try std.testing.expectEqualStrings("orders_customer_email_fkey", parsed.foreign_keys[0].name);
+    try std.testing.expectEqualStrings("customers", parsed.foreign_keys[0].references.table);
+    try std.testing.expectEqualStrings("email", parsed.foreign_keys[0].references.columns[0]);
+    try std.testing.expectEqualStrings("region", parsed.foreign_keys[0].references.columns[1]);
+}
+
+test "relational schema rejects unsupported unique constraint shapes" {
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\",\"email\"]}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"payload\":{\"type\":\"json\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\",\"payload\"]}]}",
+        ),
+    );
+    var parsed_partial = try parseSchema(
+        std.testing.allocator,
+        "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"display_name\":{\"type\":\"text\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"email_present_key\",\"columns\":[\"email\"],\"include_columns\":[\"status\",\"display_name\"],\"nulls_not_distinct\":true,\"where\":{\"all\":[{\"field\":\"email\",\"op\":\"is_not_null\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]}},{\"name\":\"email_lower_key\",\"expressions\":[{\"op\":\"lower\",\"field\":\"email\"}],\"validation_state\":\"unvalidated\"},{\"name\":\"email_upper_key\",\"expressions\":[{\"op\":\"upper\",\"field\":\"email\"}]},{\"name\":\"email_md5_key\",\"expressions\":[{\"op\":\"md5\",\"field\":\"email\"}]}]}",
+    );
+    defer parsed_partial.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 4), parsed_partial.unique_constraints.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].include_columns.len);
+    try std.testing.expectEqualStrings("status", parsed_partial.unique_constraints[0].include_columns[0]);
+    try std.testing.expectEqualStrings("display_name", parsed_partial.unique_constraints[0].include_columns[1]);
+    try std.testing.expect(parsed_partial.unique_constraints[0].nulls_not_distinct);
+    try std.testing.expectEqual(@as(usize, 2), parsed_partial.unique_constraints[0].where.len);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[0].where[0].field);
+    try std.testing.expectEqual(UniquePredicateOp.is_not_null, parsed_partial.unique_constraints[0].where[0].op);
+    try std.testing.expectEqualStrings("\"active\"", parsed_partial.unique_constraints[0].where[1].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[1].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.lower, parsed_partial.unique_constraints[1].expressions[0].op);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[1].expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[2].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.upper, parsed_partial.unique_constraints[2].expressions[0].op);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[2].expressions[0].field);
+    try std.testing.expectEqual(@as(usize, 1), parsed_partial.unique_constraints[3].expressions.len);
+    try std.testing.expectEqual(UniqueExpressionOp.md5, parsed_partial.unique_constraints[3].expressions[0].op);
+    try std.testing.expectEqualStrings("email", parsed_partial.unique_constraints[3].expressions[0].field);
+    try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[0].validation_state);
+    try std.testing.expectEqual(UniqueConstraintValidationState.unvalidated, parsed_partial.unique_constraints[1].validation_state);
+    try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[2].validation_state);
+    try std.testing.expectEqual(UniqueConstraintValidationState.enforced, parsed_partial.unique_constraints[3].validation_state);
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\"],\"include_columns\":[\"email\"]}]}",
+        ),
+    );
+    try std.testing.expectError(
+        error.InvalidSchemaUpdateRequest,
+        parseSchema(
+            std.testing.allocator,
+            "{\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"email\":{\"type\":\"keyword\"}},\"required\":[],\"additionalProperties\":false}}},\"unique_constraints\":[{\"name\":\"bad\",\"columns\":[\"email\"],\"validation_state\":\"validating\"}]}",
+        ),
+    );
+}
+
+test "relational schema validates expression check types" {
+    const valid_schema =
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"created_at_ns":{"type":"datetime"},"enabled":{"type":"boolean"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"status_case_match","field":"status","op":"eq","value":"OPEN","collation":"antfly.case_insensitive"},{"name":"amount_fee_nonnegative","expression":{"lhs":{"op":"add","args":[{"field":"amount"},{"field":"fee"}]},"op":"gte","rhs":{"value":0}}},{"name":"status_not_deleted","expression":{"lhs":{"op":"lower","args":[{"field":"status"}]},"op":"ne","rhs":{"value":"deleted"}}},{"name":"created_hour_bin_valid","expression":{"lhs":{"op":"date_bin","args":[{"op":"interval_ns","args":[{"value":3600000000000}]},{"field":"created_at_ns"},{"value":0}]},"op":"gte","rhs":{"value":0}}},{"name":"enabled_known","expression":{"lhs":{"field":"enabled"},"op":"is_not_null"}},{"name":"tag_count_nonnegative","expression":{"lhs":{"op":"array_length","args":[{"field":"tags"}]},"op":"gte","rhs":{"value":0}}},{"name":"metadata_source_present","expression":{"lhs":{"op":"json_extract","args":[{"field":"metadata"}],"path":"source","as_text":true},"op":"is_not_null"}}]}
+    ;
+    var parsed = try parseSchema(std.testing.allocator, valid_schema);
+    defer parsed.deinit(std.testing.allocator);
+    try std.testing.expectEqual(@as(usize, 7), parsed.checks.len);
+    try std.testing.expectEqualStrings("antfly.case_insensitive", parsed.checks[0].collation.?);
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"amount_text_mismatch","expression":{"lhs":{"field":"amount"},"op":"eq","rhs":{"value":"open"}}}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"numeric_collation","field":"amount","op":"eq","value":1,"collation":"antfly.case_insensitive"}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"expression_collation","expression":{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"open"}},"collation":"antfly.case_insensitive"}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"metadata":{"type":"json"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"json_not_orderable","expression":{"lhs":{"field":"metadata"},"op":"gt","rhs":{"value":{"source":"api"}}}}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"enabled":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"boolean_operand_mismatch","expression":{"lhs":{"op":"and","args":[{"field":"enabled"},{"field":"status"}]},"op":"eq","rhs":{"value":true}}}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"created_at_ns":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"calendar_bin_mismatch","expression":{"lhs":{"op":"date_bin","args":[{"op":"interval_months","args":[{"value":1}]},{"field":"created_at_ns"},{"value":0}]},"op":"gte","rhs":{"value":0}}}]}
+    ));
+}
+
+test "relational catalog expressions reject volatile functions" {
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"unique_constraints":[{"name":"email_key","columns":["email"],"where_expressions":[{"lhs":{"op":"uuid_v4","args":[]},"op":"is_not_null"}]}]}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword","x-antfly-index-where-expressions":[{"lhs":{"op":"coalesce","args":[{"op":"uuid_v4","args":[]},{"field":"status"}]},"op":"is_not_null"}]}},"required":["id"],"additionalProperties":false}}}}
+    ));
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseSchema(std.testing.allocator,
+        \\{"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"checks":[{"name":"volatile_case","expression":{"lhs":{"op":"case","cases":[{"when":{"lhs":{"field":"status"},"op":"eq","rhs":{"value":"open"}},"then":{"op":"uuid_v4","args":[]}}],"else":{"field":"status"}},"op":"is_not_null"}}]}
+    ));
 }
 
 test "parse dynamic template contract and validate selectors" {

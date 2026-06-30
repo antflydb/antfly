@@ -428,6 +428,12 @@ pub const TableRuntimeSnapshotCache = struct {
 };
 
 fn preserveArtifactVisibilityOnReplayRegression(previous: LocalTableRuntimeStatus, incoming: *LocalTableRuntimeStatus) void {
+    if (previous.stats.graph_metric_runtime.hasRuntimeFacts() and
+        !incoming.stats.graph_metric_runtime.hasRuntimeFacts())
+    {
+        incoming.stats.graph_metric_runtime = previous.stats.graph_metric_runtime;
+    }
+
     var preserved_visibility = false;
     for (incoming.stats.indexes) |*dst| {
         const cached = findMatchingIndexStatus(previous.stats.indexes, dst.name, dst.kind) orelse continue;
@@ -471,9 +477,11 @@ fn statusStatsHaveRuntimeFacts(stats: db_mod.types.DBStats) bool {
     if (stats.doc_count > 0) return true;
     if (docIdentityStatsHaveRuntimeFacts(stats.doc_identity)) return true;
     if (docSetPlanningStatsHaveRuntimeFacts(stats.doc_set_planning)) return true;
+    if (stats.foreign_keys.hasRuntimeFacts()) return true;
     if (stats.async_indexing.startup.active or stats.async_indexing.dense_catch_up.active) return true;
     if (stats.enrichment.enabled and (stats.enrichment.processed_requests > 0 or stats.enrichment.applied_sequence > 0 or stats.enrichment.target_sequence > 0 or stats.enrichment.retrying or stats.enrichment.worker_failed)) return true;
     if (stats.text_merge.pending_segments > 0 or stats.text_merge.in_flight_merges > 0 or stats.text_merge.completed_merges > 0 or stats.text_merge.failed_merges > 0) return true;
+    if (stats.graph_metric_runtime.hasRuntimeFacts()) return true;
     for (stats.indexes) |index| {
         if (indexHasArtifactVisibilityFacts(index)) return true;
         if (index.backfill_active or index.catch_up_active or index.replay_catch_up_required) return true;
@@ -561,6 +569,7 @@ fn mergeCachedStatusWithSyntheticPlaceholder(
     merged.stats.ttl_cleanup = previous.stats.ttl_cleanup;
     merged.stats.transaction_recovery = previous.stats.transaction_recovery;
     merged.stats.text_merge = previous.stats.text_merge;
+    merged.stats.graph_metric_runtime = previous.stats.graph_metric_runtime;
     merged.stats.term_doc_freq_cache_hits = previous.stats.term_doc_freq_cache_hits;
     merged.stats.term_doc_freq_cache_misses = previous.stats.term_doc_freq_cache_misses;
     merged.stats.async_indexing = previous.stats.async_indexing;
@@ -1036,6 +1045,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .indexes = indexes,
         .doc_identity = stats.doc_identity,
         .doc_set_planning = stats.doc_set_planning,
+        .foreign_keys = stats.foreign_keys,
         .enrichment = stats.enrichment,
         .resolution = stats.resolution,
         .promotion = stats.promotion,
@@ -1043,6 +1053,7 @@ pub fn cloneDBStats(alloc: std.mem.Allocator, stats: db_mod.types.DBStats) !db_m
         .ttl_cleanup = stats.ttl_cleanup,
         .transaction_recovery = stats.transaction_recovery,
         .text_merge = stats.text_merge,
+        .graph_metric_runtime = stats.graph_metric_runtime,
         .term_doc_freq_cache_hits = stats.term_doc_freq_cache_hits,
         .term_doc_freq_cache_misses = stats.term_doc_freq_cache_misses,
         .async_indexing = stats.async_indexing,
@@ -1328,6 +1339,7 @@ test "table runtime snapshot cache replaces snapshots while preserving one group
         .doc_count = 3,
     };
     const refresh = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(refresh);
     refresh[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = refresh_docs_items },
@@ -1523,7 +1535,6 @@ test "table runtime snapshot cache can clone a single group status" {
     defer cache.deinit();
 
     const statuses = try std.testing.allocator.alloc(LocalTableRuntimeStatus, 2);
-    defer std.testing.allocator.free(statuses);
     statuses[0] = .{
         .group_id = 7,
         .stats = .{ .doc_count = 1, .indexes = &.{} },
@@ -1784,6 +1795,75 @@ test "cached identity and doc set telemetry are runtime facts" {
     try std.testing.expect(statusHasRuntimeFacts(planning_status));
 }
 
+test "table runtime snapshot cache preserves graph metric runtime ownership telemetry" {
+    var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
+    defer cache.deinit();
+
+    var cached_status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{
+            .source = .live_writer_publish,
+            .freshness = .fresh,
+        },
+        .stats = .{
+            .graph_metric_runtime = .{
+                .enabled = true,
+                .role = .worker_pool,
+                .owner_id_hash = 0x1111,
+                .worker_id_hash = 0x2222,
+                .worker_count = 3,
+                .lease_owned = true,
+                .has_lease = true,
+                .acquisition_count = 2,
+                .takeover_count = 1,
+                .lost_leases = 1,
+                .ticks_started = 7,
+                .ticks_completed = 6,
+                .durable_progress_ticks = 5,
+                .total_pages_claimed = 4,
+                .total_pages_completed = 3,
+                .last_pages_claimed = 2,
+                .last_pages_completed = 1,
+            },
+        },
+    };
+    defer cached_status.deinit(std.testing.allocator);
+    try cache.upsertGroupStatus("docs", cached_status);
+
+    var incoming_status = LocalTableRuntimeStatus{
+        .group_id = 7,
+        .metadata = .{
+            .source = .background_refresh,
+            .freshness = .fresh,
+        },
+        .stats = .{},
+    };
+    defer incoming_status.deinit(std.testing.allocator);
+    try cache.upsertGroupStatus("docs", incoming_status);
+
+    var docs = (try cache.snapshot(std.testing.allocator, "docs")).?;
+    defer docs.deinit(std.testing.allocator);
+
+    const runtime = docs.items[0].stats.graph_metric_runtime;
+    try std.testing.expect(runtime.hasRuntimeFacts());
+    try std.testing.expectEqual(db_mod.types.GraphMetricRuntimeRole.worker_pool, runtime.role.?);
+    try std.testing.expectEqual(@as(u64, 0x1111), runtime.owner_id_hash);
+    try std.testing.expectEqual(@as(u64, 0x2222), runtime.worker_id_hash);
+    try std.testing.expectEqual(@as(u64, 3), runtime.worker_count);
+    try std.testing.expect(runtime.lease_owned);
+    try std.testing.expect(runtime.has_lease);
+    try std.testing.expectEqual(@as(u64, 2), runtime.acquisition_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.takeover_count);
+    try std.testing.expectEqual(@as(u64, 1), runtime.lost_leases);
+    try std.testing.expectEqual(@as(u64, 7), runtime.ticks_started);
+    try std.testing.expectEqual(@as(u64, 6), runtime.ticks_completed);
+    try std.testing.expectEqual(@as(u64, 5), runtime.durable_progress_ticks);
+    try std.testing.expectEqual(@as(u64, 4), runtime.total_pages_claimed);
+    try std.testing.expectEqual(@as(u64, 3), runtime.total_pages_completed);
+    try std.testing.expectEqual(@as(u64, 2), runtime.last_pages_claimed);
+    try std.testing.expectEqual(@as(u64, 1), runtime.last_pages_completed);
+}
+
 test "table runtime snapshot cache preserves generic artifact visibility on sequence-only refresh" {
     var cache = TableRuntimeSnapshotCache.init(std.testing.allocator);
     defer cache.deinit();
@@ -1863,6 +1943,7 @@ test "table runtime snapshot cache preserves existing status on replacement allo
                 .replay_catch_up_required = true,
             };
             const snapshots = try alloc.alloc(TableRuntimeSnapshot, 1);
+            defer alloc.free(snapshots);
             snapshots[0] = .{
                 .table_name = try alloc.dupe(u8, "docs"),
                 .statuses = .{ .items = initial_items },
@@ -1938,6 +2019,7 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
                 .doc_count = 2,
             };
             const initial = try alloc.alloc(TableRuntimeSnapshot, 2);
+            defer alloc.free(initial);
             initial[0] = .{
                 .table_name = try alloc.dupe(u8, "docs"),
                 .statuses = .{ .items = initial_docs_items },
@@ -1963,6 +2045,7 @@ test "table runtime snapshot cache preserves previous snapshots when replace pre
                 .doc_count = 99,
             };
             const refresh = try alloc.alloc(TableRuntimeSnapshot, 1);
+            defer alloc.free(refresh);
             refresh[0] = .{
                 .table_name = try alloc.dupe(u8, "docs"),
                 .statuses = .{ .items = refresh_docs_items },
@@ -2046,6 +2129,7 @@ test "table runtime snapshot cache summarizes replay debt" {
     };
 
     const snapshots = try std.testing.allocator.alloc(TableRuntimeSnapshot, 2);
+    defer std.testing.allocator.free(snapshots);
     snapshots[0] = .{
         .table_name = try std.testing.allocator.dupe(u8, "docs"),
         .statuses = .{ .items = docs_items },

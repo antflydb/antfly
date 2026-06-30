@@ -159,6 +159,56 @@ describe("AntflyClient", () => {
     });
   });
 
+  describe("sql", () => {
+    it("should execute SQL statements", async () => {
+      const mockResponse = {
+        kind: "read" as const,
+        session_id: 42,
+        statement_kind: "select",
+        result: { rows: [{ id: "doc-1" }] },
+      };
+
+      mockPost.mockResolvedValueOnce({
+        data: mockResponse,
+        error: undefined,
+      });
+
+      const request = {
+        sql: "select * from documents",
+        session_id: 41,
+        database: "main",
+        namespace: "public",
+        read_only: true,
+      };
+
+      const result = await client.sql.execute(request);
+      expect(result).toEqual(mockResponse);
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/sql", {
+        body: request,
+      });
+    });
+
+    it("should expose executeSql as an alias", async () => {
+      const mockResponse = {
+        kind: "write" as const,
+        session_id: 7,
+        statement_kind: "insert",
+        result: { inserted: 1 },
+      };
+
+      mockPost.mockResolvedValueOnce({
+        data: mockResponse,
+        error: undefined,
+      });
+
+      const request = { sql: "insert into documents values ('doc-1')" };
+      await expect(client.executeSql(request)).resolves.toEqual(mockResponse);
+      expect(mockPost).toHaveBeenCalledWith("/db/v1/sql", {
+        body: request,
+      });
+    });
+  });
+
   describe("tables", () => {
     it("should list tables", async () => {
       const mockTables: TableStatus[] = [

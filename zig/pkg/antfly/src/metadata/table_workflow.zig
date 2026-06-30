@@ -110,6 +110,171 @@ pub const TableWorkflow = struct {
         return try reconcileForService(&self.loop, service);
     }
 
+    pub fn upsertForeignKeyReferenceRange(
+        self: *TableWorkflow,
+        service: anytype,
+        record: table_manager.ForeignKeyReferenceRangeRecord,
+    ) !control_loop.ReconcileSummary {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().upsertForeignKeyReferenceRange(record);
+        return try reconcileForService(&self.loop, service);
+    }
+
+    pub fn removeForeignKeyReferenceRange(
+        self: *TableWorkflow,
+        service: anytype,
+        child_table_id: u64,
+        constraint_name: []const u8,
+        parent_table_id: u64,
+        start_parent_key: []const u8,
+    ) !control_loop.ReconcileSummary {
+        try self.bootstrapDesiredFromCommitted(service);
+        _ = self.loop.stateRef().tableManager().removeForeignKeyReferenceRange(child_table_id, constraint_name, parent_table_id, start_parent_key);
+        return try reconcileForService(&self.loop, service);
+    }
+
+    pub fn upsertUniqueConstraintRange(
+        self: *TableWorkflow,
+        service: anytype,
+        record: table_manager.UniqueConstraintRangeRecord,
+    ) !control_loop.ReconcileSummary {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().upsertUniqueConstraintRange(record);
+        return try reconcileForService(&self.loop, service);
+    }
+
+    pub fn removeUniqueConstraintRange(
+        self: *TableWorkflow,
+        service: anytype,
+        table_id: u64,
+        constraint_name: []const u8,
+        start_encoded_value: []const u8,
+    ) !control_loop.ReconcileSummary {
+        try self.bootstrapDesiredFromCommitted(service);
+        _ = self.loop.stateRef().tableManager().removeUniqueConstraintRange(table_id, constraint_name, start_encoded_value);
+        return try reconcileForService(&self.loop, service);
+    }
+
+    pub fn beginUniqueConstraintRangeSplit(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.UniqueConstraintRangeSplitRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().beginUniqueConstraintRangeSplit(request);
+        try service.beginUniqueConstraintRangeSplit(request);
+    }
+
+    pub fn finishUniqueConstraintRangeSplit(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.UniqueConstraintRangeSplitRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().finishUniqueConstraintRangeSplit(request);
+        try service.finishUniqueConstraintRangeSplit(request);
+    }
+
+    pub fn beginUniqueConstraintRangeMerge(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.UniqueConstraintRangeMergeRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().beginUniqueConstraintRangeMerge(request);
+        try service.beginUniqueConstraintRangeMerge(request);
+    }
+
+    pub fn finishUniqueConstraintRangeMerge(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.UniqueConstraintRangeMergeRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().finishUniqueConstraintRangeMerge(request);
+        try service.finishUniqueConstraintRangeMerge(request);
+    }
+
+    pub fn beginUniqueConstraintRangeRebuild(
+        self: *TableWorkflow,
+        service: anytype,
+        selector: table_manager.UniqueConstraintRangeSelector,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().beginUniqueConstraintRangeRebuild(selector);
+        try service.beginUniqueConstraintRangeRebuild(selector);
+    }
+
+    pub fn finishUniqueConstraintRangeRebuild(
+        self: *TableWorkflow,
+        service: anytype,
+        selector: table_manager.UniqueConstraintRangeSelector,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().finishUniqueConstraintRangeRebuild(selector);
+        try service.finishUniqueConstraintRangeRebuild(selector);
+    }
+
+    pub fn beginForeignKeyReferenceRangeSplit(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.ForeignKeyReferenceRangeSplitRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().beginForeignKeyReferenceRangeSplit(request);
+        try service.beginForeignKeyReferenceRangeSplit(request);
+    }
+
+    pub fn finishForeignKeyReferenceRangeSplit(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.ForeignKeyReferenceRangeSplitRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().finishForeignKeyReferenceRangeSplit(request);
+        try service.finishForeignKeyReferenceRangeSplit(request);
+    }
+
+    pub fn beginForeignKeyReferenceRangeMerge(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.ForeignKeyReferenceRangeMergeRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().beginForeignKeyReferenceRangeMerge(request);
+        try service.beginForeignKeyReferenceRangeMerge(request);
+    }
+
+    pub fn finishForeignKeyReferenceRangeMerge(
+        self: *TableWorkflow,
+        service: anytype,
+        request: table_manager.ForeignKeyReferenceRangeMergeRequest,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().finishForeignKeyReferenceRangeMerge(request);
+        try service.finishForeignKeyReferenceRangeMerge(request);
+    }
+
+    pub fn beginForeignKeyReferenceRangeRebuild(
+        self: *TableWorkflow,
+        service: anytype,
+        selector: table_manager.ForeignKeyReferenceRangeSelector,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().beginForeignKeyReferenceRangeRebuild(selector);
+        try service.beginForeignKeyReferenceRangeRebuild(selector);
+    }
+
+    pub fn finishForeignKeyReferenceRangeRebuild(
+        self: *TableWorkflow,
+        service: anytype,
+        selector: table_manager.ForeignKeyReferenceRangeSelector,
+    ) !void {
+        try self.bootstrapDesiredFromCommitted(service);
+        try self.loop.stateRef().tableManager().finishForeignKeyReferenceRangeRebuild(selector);
+        try service.finishForeignKeyReferenceRangeRebuild(selector);
+    }
+
     pub fn dropTable(
         self: *TableWorkflow,
         service: anytype,
@@ -126,6 +291,7 @@ pub const TableWorkflow = struct {
         local_node_id: u64,
         candidate_node_ids: []const u64,
     ) ![]raft_reconciler.PlacementIntent {
+        try self.loop.reconciler.syncAutomaticForeignKeyReferenceOwnerRanges(self.loop.stateRef().tableManager());
         var planner = placement_planner.PlacementPlanner.init(alloc);
         return try planner.planLocalIntents(self.loop.stateRef().tableManager(), local_node_id, candidate_node_ids);
     }
@@ -542,6 +708,277 @@ test "table workflow can build desired topology through the control loop seam" {
     try std.testing.expectEqual(@as(usize, 1), fake.range_upserts);
 }
 
+test "table workflow can reconcile foreign key reference owner ranges" {
+    const parent_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}}}
+    ;
+    const child_schema =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"customer_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"foreign_keys":[{"name":"orders_customer_id_fkey","columns":["customer_id"],"references":{"table":"customers","columns":["_id"]},"on_delete":"restrict"}]}
+    ;
+    const FakeService = struct {
+        foreign_key_ref_range_upserts: usize = 0,
+
+        pub fn listProjectedTables(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
+            const records = try alloc.alloc(table_manager.TableRecord, 2);
+            errdefer alloc.free(records);
+            records[0] = try table_manager.cloneTable(alloc, .{
+                .table_id = 10,
+                .name = "orders",
+                .description = "",
+                .schema_json = child_schema,
+                .read_schema_json = "",
+                .foreign_key_validation_json = "{}",
+                .indexes_json = "",
+                .replication_sources_json = "",
+                .placement_role = "data",
+            });
+            errdefer table_manager.freeTable(alloc, records[0]);
+            records[1] = try table_manager.cloneTable(alloc, .{
+                .table_id = 20,
+                .name = "customers",
+                .description = "",
+                .schema_json = parent_schema,
+                .read_schema_json = "",
+                .foreign_key_validation_json = "{}",
+                .indexes_json = "",
+                .replication_sources_json = "",
+                .placement_role = "data",
+            });
+            return records;
+        }
+
+        pub fn freeProjectedTables(_: *@This(), alloc: std.mem.Allocator, records: []table_manager.TableRecord) void {
+            for (records) |record| table_manager.freeTable(alloc, record);
+            alloc.free(records);
+        }
+
+        pub fn listProjectedRanges(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.RangeRecord {
+            return try alloc.alloc(table_manager.RangeRecord, 0);
+        }
+
+        pub fn freeProjectedRanges(_: *@This(), alloc: std.mem.Allocator, records: []table_manager.RangeRecord) void {
+            alloc.free(records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            alloc.free(intents);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), alloc: std.mem.Allocator) ![]@import("transition_state.zig").SplitTransitionRecord {
+            return try alloc.alloc(@import("transition_state.zig").SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), alloc: std.mem.Allocator, records: []@import("transition_state.zig").SplitTransitionRecord) void {
+            alloc.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), alloc: std.mem.Allocator) ![]@import("transition_state.zig").MergeTransitionRecord {
+            return try alloc.alloc(@import("transition_state.zig").MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), alloc: std.mem.Allocator, records: []@import("transition_state.zig").MergeTransitionRecord) void {
+            alloc.free(records);
+        }
+
+        pub fn observeSplitTransition(_: *@This(), _: u64) !?@import("transition_state.zig").SplitObservation {
+            return null;
+        }
+
+        pub fn observeMergeTransition(_: *@This(), _: u64) !?@import("transition_state.zig").MergeObservation {
+            return null;
+        }
+
+        pub fn applyReconciliationPlan(self: *@This(), plan: *const @import("reconciler.zig").ReconciliationPlan) !void {
+            self.foreign_key_ref_range_upserts += plan.foreign_key_ref_range_upserts.len;
+        }
+    };
+
+    var workflow = TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    var fake = FakeService{};
+
+    const summary = try workflow.upsertForeignKeyReferenceRange(&fake, .{
+        .group_id = 3001,
+        .child_table_id = 10,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 20,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .state = table_manager.foreign_key_ref_range_active,
+        .topology_epoch = 1,
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), summary.foreign_key_ref_range_upserts);
+    try std.testing.expectEqual(@as(usize, 1), fake.foreign_key_ref_range_upserts);
+}
+
+test "table workflow drives foreign key reference range lifecycle commands" {
+    const FakeService = struct {
+        manager: table_manager.TableManager,
+        begin_rebuilds: usize = 0,
+        finish_rebuilds: usize = 0,
+        begin_splits: usize = 0,
+        finish_splits: usize = 0,
+        begin_merges: usize = 0,
+        finish_merges: usize = 0,
+
+        fn init() @This() {
+            return .{ .manager = table_manager.TableManager.init(std.testing.allocator) };
+        }
+
+        fn deinit(self: *@This()) void {
+            self.manager.deinit();
+        }
+
+        pub fn listProjectedTables(self: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
+            return try self.manager.listTables(alloc);
+        }
+
+        pub fn freeProjectedTables(self: *@This(), alloc: std.mem.Allocator, records: []table_manager.TableRecord) void {
+            self.manager.freeTables(alloc, records);
+        }
+
+        pub fn listProjectedRanges(self: *@This(), alloc: std.mem.Allocator) ![]table_manager.RangeRecord {
+            return try self.manager.listRanges(alloc);
+        }
+
+        pub fn freeProjectedRanges(self: *@This(), alloc: std.mem.Allocator, records: []table_manager.RangeRecord) void {
+            self.manager.freeRanges(alloc, records);
+        }
+
+        pub fn listProjectedForeignKeyReferenceRanges(self: *@This(), alloc: std.mem.Allocator) ![]table_manager.ForeignKeyReferenceRangeRecord {
+            return try self.manager.listForeignKeyReferenceRanges(alloc);
+        }
+
+        pub fn freeProjectedForeignKeyReferenceRanges(self: *@This(), alloc: std.mem.Allocator, records: []table_manager.ForeignKeyReferenceRangeRecord) void {
+            self.manager.freeForeignKeyReferenceRanges(alloc, records);
+        }
+
+        pub fn listProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator) ![]raft_reconciler.PlacementIntent {
+            return try alloc.alloc(raft_reconciler.PlacementIntent, 0);
+        }
+
+        pub fn freeProjectedPlacementIntents(_: *@This(), alloc: std.mem.Allocator, intents: []raft_reconciler.PlacementIntent) void {
+            alloc.free(intents);
+        }
+
+        pub fn listProjectedSplitTransitions(_: *@This(), alloc: std.mem.Allocator) ![]@import("transition_state.zig").SplitTransitionRecord {
+            return try alloc.alloc(@import("transition_state.zig").SplitTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedSplitTransitions(_: *@This(), alloc: std.mem.Allocator, records: []@import("transition_state.zig").SplitTransitionRecord) void {
+            alloc.free(records);
+        }
+
+        pub fn listProjectedMergeTransitions(_: *@This(), alloc: std.mem.Allocator) ![]@import("transition_state.zig").MergeTransitionRecord {
+            return try alloc.alloc(@import("transition_state.zig").MergeTransitionRecord, 0);
+        }
+
+        pub fn freeProjectedMergeTransitions(_: *@This(), alloc: std.mem.Allocator, records: []@import("transition_state.zig").MergeTransitionRecord) void {
+            alloc.free(records);
+        }
+
+        pub fn observeSplitTransition(_: *@This(), _: u64) !?@import("transition_state.zig").SplitObservation {
+            return null;
+        }
+
+        pub fn observeMergeTransition(_: *@This(), _: u64) !?@import("transition_state.zig").MergeObservation {
+            return null;
+        }
+
+        pub fn beginForeignKeyReferenceRangeRebuild(self: *@This(), selector: table_manager.ForeignKeyReferenceRangeSelector) !void {
+            self.begin_rebuilds += 1;
+            try self.manager.beginForeignKeyReferenceRangeRebuild(selector);
+        }
+
+        pub fn finishForeignKeyReferenceRangeRebuild(self: *@This(), selector: table_manager.ForeignKeyReferenceRangeSelector) !void {
+            self.finish_rebuilds += 1;
+            try self.manager.finishForeignKeyReferenceRangeRebuild(selector);
+        }
+
+        pub fn beginForeignKeyReferenceRangeSplit(self: *@This(), request: table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+            self.begin_splits += 1;
+            try self.manager.beginForeignKeyReferenceRangeSplit(request);
+        }
+
+        pub fn finishForeignKeyReferenceRangeSplit(self: *@This(), request: table_manager.ForeignKeyReferenceRangeSplitRequest) !void {
+            self.finish_splits += 1;
+            try self.manager.finishForeignKeyReferenceRangeSplit(request);
+        }
+
+        pub fn beginForeignKeyReferenceRangeMerge(self: *@This(), request: table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+            self.begin_merges += 1;
+            try self.manager.beginForeignKeyReferenceRangeMerge(request);
+        }
+
+        pub fn finishForeignKeyReferenceRangeMerge(self: *@This(), request: table_manager.ForeignKeyReferenceRangeMergeRequest) !void {
+            self.finish_merges += 1;
+            try self.manager.finishForeignKeyReferenceRangeMerge(request);
+        }
+    };
+
+    var workflow = TableWorkflow.init(std.testing.allocator);
+    defer workflow.deinit();
+    var fake = FakeService.init();
+    defer fake.deinit();
+
+    try fake.manager.upsertTable(.{ .table_id = 10, .name = "orders" });
+    try fake.manager.upsertTable(.{ .table_id = 20, .name = "customers" });
+    try fake.manager.upsertForeignKeyReferenceRange(.{
+        .child_table_id = 10,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 20,
+        .start_parent_key = "",
+        .end_parent_key = null,
+        .group_id = 3001,
+    });
+    const selector: table_manager.ForeignKeyReferenceRangeSelector = .{
+        .child_table_id = 10,
+        .constraint_name = "orders_customer_id_fkey",
+        .parent_table_id = 20,
+        .start_parent_key = "",
+    };
+
+    try workflow.beginForeignKeyReferenceRangeRebuild(&fake, selector);
+    try workflow.finishForeignKeyReferenceRangeRebuild(&fake, selector);
+
+    const split_request: table_manager.ForeignKeyReferenceRangeSplitRequest = .{
+        .selector = selector,
+        .split_parent_key = "customer:m",
+        .left_group_id = 3001,
+        .right_group_id = 3002,
+    };
+    try workflow.beginForeignKeyReferenceRangeSplit(&fake, split_request);
+    try workflow.finishForeignKeyReferenceRangeSplit(&fake, split_request);
+
+    const merge_request: table_manager.ForeignKeyReferenceRangeMergeRequest = .{
+        .left_selector = selector,
+        .right_start_parent_key = "customer:m",
+        .merged_group_id = 3001,
+    };
+    try workflow.beginForeignKeyReferenceRangeMerge(&fake, merge_request);
+    try workflow.finishForeignKeyReferenceRangeMerge(&fake, merge_request);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), fake.finish_rebuilds);
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_splits);
+    try std.testing.expectEqual(@as(usize, 1), fake.finish_splits);
+    try std.testing.expectEqual(@as(usize, 1), fake.begin_merges);
+    try std.testing.expectEqual(@as(usize, 1), fake.finish_merges);
+
+    const ranges = try fake.manager.listForeignKeyReferenceRanges(std.testing.allocator);
+    defer fake.manager.freeForeignKeyReferenceRanges(std.testing.allocator, ranges);
+    try std.testing.expectEqual(@as(usize, 1), ranges.len);
+    try std.testing.expectEqualStrings("", ranges[0].start_parent_key);
+    try std.testing.expect(ranges[0].end_parent_key == null);
+    try std.testing.expectEqual(@as(u64, 3001), ranges[0].group_id);
+    try std.testing.expectEqualStrings(table_manager.foreign_key_ref_range_active, ranges[0].state);
+}
+
 test "table workflow create preserves existing projected topology" {
     const FakeService = struct {
         table_upserts: usize = 0,
@@ -551,16 +988,12 @@ test "table workflow create preserves existing projected topology" {
 
         pub fn listProjectedTables(_: *@This(), alloc: std.mem.Allocator) ![]table_manager.TableRecord {
             const records = try alloc.alloc(table_manager.TableRecord, 1);
-            records[0] = .{
+            errdefer alloc.free(records);
+            records[0] = try table_manager.cloneTable(alloc, .{
                 .table_id = 7,
-                .name = try alloc.dupe(u8, "docs"),
-                .description = try alloc.dupe(u8, ""),
-                .schema_json = try alloc.dupe(u8, ""),
-                .read_schema_json = try alloc.dupe(u8, ""),
-                .indexes_json = try alloc.dupe(u8, ""),
-                .replication_sources_json = try alloc.dupe(u8, ""),
-                .placement_role = try alloc.dupe(u8, "data"),
-            };
+                .name = "docs",
+                .placement_role = "data",
+            });
             return records;
         }
 

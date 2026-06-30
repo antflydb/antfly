@@ -745,6 +745,7 @@ pub const SegmentReader = struct {
     /// Read and decompress stored document data. Caller owns returned data.
     pub fn storedDocDecompressed(self: *const SegmentReader, doc_idx: u32) !?struct { id: []const u8, data: []u8 } {
         const raw = self.storedDoc(doc_idx) orelse return null;
+
         const ver = self.data[@intCast(self.stored_offset)];
         if (ver == stored_fields_version_block_compressed) {
             const loc = self.v4StoredDocLocation(@intCast(self.stored_offset + 1 + 4), doc_idx) orelse return null;
@@ -1380,7 +1381,12 @@ fn mergeTypedDocValuesSections(
                     .bool_val => if (try dv.getBool(doc_id)) |value| {
                         try writer.?.add(merged_doc_id, .{ .bool_val = value });
                     },
-                    .bytes_val => return error.UnsupportedTypedDocValues,
+                    .bytes_val => if (try dv.getBytes(doc_id)) |value| {
+                        // getBytes returns an owned dupe; writer.add dupes again,
+                        // so free the temporary after adding.
+                        defer alloc.free(value);
+                        try writer.?.add(merged_doc_id, .{ .bytes_val = value });
+                    },
                 }
             }
             merged_doc_id += 1;
