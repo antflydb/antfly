@@ -1878,7 +1878,7 @@ typedef struct termite_metal_sdpa_f32_params {
     uint32_t head_dim;
     uint32_t bias_mode;
     uint32_t has_mask;
-    uint32_t reserved0;
+    uint32_t layout;
     uint32_t reserved1;
 } termite_metal_sdpa_f32_params;
 
@@ -2022,7 +2022,7 @@ static NSString *termite_metal_shader_source(void) {
            "struct termite_metal_gliner_gru_combine_f32_params { uint rows; uint dim; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_argmax_axis_f32_params { uint outer; uint axis_dim; uint inner; uint reserved; };\n"
            "struct termite_metal_convert_dtype_f32_params { uint elem_count; uint kind; uint reserved0; uint reserved1; };\n"
-           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint reserved0; uint reserved1; };\n"
+           "struct termite_metal_sdpa_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint bias_mode; uint has_mask; uint layout; uint reserved1; };\n"
            "struct termite_metal_disentangled_relative_attention_f32_params { uint batch; uint seq_len; uint num_heads; uint head_dim; uint has_mask; uint reserved0; uint reserved1; uint reserved2; };\n"
            "struct termite_metal_deberta_relative_score_gemm_f32_params { uint batch; uint seq_len; uint rel_len; uint num_heads; uint head_dim; uint mode; uint reserved0; uint reserved1; };\n"
            "struct termite_metal_transpose_f32_params { uint rank; uint total; uint reserved0; uint reserved1; uint dims[8]; uint in_strides[8]; uint out_strides[8]; uint perm[8]; };\n"
@@ -3848,12 +3848,15 @@ static NSString *termite_metal_shader_source(void) {
            "}\n"
            "kernel void termite_sdpa_f32(device const float *q [[buffer(0)]], device const float *k [[buffer(1)]], device const float *v [[buffer(2)]], device const float *bias [[buffer(3)]], device const float *mask [[buffer(4)]], device float *output [[buffer(5)]], constant termite_metal_sdpa_f32_params &p [[buffer(6)]], uint gid [[thread_position_in_grid]]) {\n"
            "    uint total = p.batch * p.num_heads * p.seq_len * p.head_dim; if (gid >= total || p.seq_len == 0u || p.head_dim == 0u) return;\n"
-           "    uint d = gid % p.head_dim; uint tmp = gid / p.head_dim; uint qi = tmp % p.seq_len; uint bh = tmp / p.seq_len; uint b = bh / p.num_heads; uint h = bh - b * p.num_heads;\n"
-           "    uint q_base = (bh * p.seq_len + qi) * p.head_dim;\n"
+           "    uint d = gid % p.head_dim; uint tmp = gid / p.head_dim; uint h; uint qi; uint b;\n"
+           "    if (p.layout == 1u) { h = tmp % p.num_heads; tmp /= p.num_heads; qi = tmp % p.seq_len; b = tmp / p.seq_len; }\n"
+           "    else { qi = tmp % p.seq_len; uint bh0 = tmp / p.seq_len; b = bh0 / p.num_heads; h = bh0 - b * p.num_heads; }\n"
+           "    uint hidden = p.num_heads * p.head_dim; uint bh = b * p.num_heads + h;\n"
+           "    uint q_base = p.layout == 1u ? (b * p.seq_len + qi) * hidden + h * p.head_dim : (bh * p.seq_len + qi) * p.head_dim;\n"
            "    float scale = rsqrt(float(p.head_dim)); float best = -3.402823466e+38f;\n"
            "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
-           "        uint k_base = (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
+           "        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
            "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
            "        score *= scale;\n"
            "        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
@@ -3864,13 +3867,14 @@ static NSString *termite_metal_shader_source(void) {
            "    float sum = 0.0f; float accum = 0.0f;\n"
            "    for (uint ki = 0u; ki < p.seq_len; ++ki) {\n"
            "        bool allowed = p.has_mask == 0u || mask[b * p.seq_len + ki] != 0.0f; if (!allowed) continue;\n"
-           "        uint k_base = (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
+           "        uint k_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim; float score = 0.0f;\n"
            "        for (uint x = 0u; x < p.head_dim; ++x) score += q[q_base + x] * k[k_base + x];\n"
            "        score *= scale;\n"
            "        if (p.bias_mode == 1u) score += bias[(h * p.seq_len + qi) * p.seq_len + ki];\n"
            "        else if (p.bias_mode == 2u) score += bias[(bh * p.seq_len + qi) * p.seq_len + ki];\n"
            "        else if (p.bias_mode == 3u) score += bias[(b * p.seq_len + qi) * p.seq_len + ki];\n"
-           "        float w = exp(score - best); sum += w; accum += w * v[(bh * p.seq_len + ki) * p.head_dim + d];\n"
+           "        uint v_base = p.layout == 1u ? (b * p.seq_len + ki) * hidden + h * p.head_dim : (bh * p.seq_len + ki) * p.head_dim;\n"
+           "        float w = exp(score - best); sum += w; accum += w * v[v_base + d];\n"
            "    }\n"
            "    output[gid] = sum > 0.0f ? accum / sum : 0.0f;\n"
            "}\n"
@@ -23787,12 +23791,13 @@ int termite_metal_decode_runtime_sdpa_f32_device(
     size_t head_dim,
     uint32_t bias_mode,
     uint32_t has_mask,
+    uint32_t layout,
     void *output_handle,
     size_t output_offset
 ) {
     if (runtime == NULL || q_handle == NULL || k_handle == NULL || v_handle == NULL || output_handle == NULL) return -1;
     if (runtime->sdpa_f32_pipeline == nil) return -2;
-    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u) return -3;
+    if (batch == 0 || seq_len == 0 || num_heads == 0 || head_dim == 0 || bias_mode > 3u || has_mask > 1u || layout > 1u) return -3;
     if (bias_mode != 0u && bias_handle == NULL) return -4;
     if (has_mask != 0u && mask_handle == NULL) return -5;
     if (batch > UINT32_MAX || seq_len > UINT32_MAX || num_heads > UINT32_MAX || head_dim > UINT32_MAX) return -6;
@@ -23829,7 +23834,7 @@ int termite_metal_decode_runtime_sdpa_f32_device(
             .head_dim = (uint32_t)head_dim,
             .bias_mode = bias_mode,
             .has_mask = has_mask,
-            .reserved0 = 0,
+            .layout = layout,
             .reserved1 = 0,
         };
         bool frame_owned = true;

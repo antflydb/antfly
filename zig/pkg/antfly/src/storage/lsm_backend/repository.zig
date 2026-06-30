@@ -15,6 +15,7 @@
 const std = @import("std");
 const Allocator = std.mem.Allocator;
 const bloom = @import("bloom");
+const byte_copy = @import("../../common/byte_copy.zig");
 const lsm_manifest = @import("../lsm/manifest.zig");
 const lsm_table_file = @import("../lsm/table_file.zig");
 const resource_manager_mod = @import("../resource_manager.zig");
@@ -739,7 +740,7 @@ const BufferedAtomicTableSink = struct {
                 continue;
             }
             const n = @min(self.buffer.len - self.len_buffered, remaining.len);
-            @memcpy(self.buffer[self.len_buffered..][0..n], remaining[0..n]);
+            byte_copy.copyPossiblyAliased(self.buffer[self.len_buffered..][0..n], remaining[0..n]);
             self.len_buffered += n;
             remaining = remaining[n..];
         }
@@ -766,7 +767,7 @@ const BufferedAtomicTableSink = struct {
 
         if (src_offset < bytes.len) {
             const buffer_offset = offset + src_offset - self.len_flushed;
-            @memcpy(self.buffer[buffer_offset..][0 .. bytes.len - src_offset], bytes[src_offset..]);
+            byte_copy.copyPossiblyAliased(self.buffer[buffer_offset..][0 .. bytes.len - src_offset], bytes[src_offset..]);
         }
     }
 };

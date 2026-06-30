@@ -869,6 +869,7 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_failed", "gauge", "LSM-backed stores that failed startup open", stats.startup.lsm_open_failed);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_total_ns", "gauge", "Summed LSM open duration across startup stores", stats.startup.lsm_open_total_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_initializing_storage_ns", "gauge", "Summed LSM storage initialization duration during startup open", stats.startup.lsm_open_initializing_storage_ns);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_cleanup_ns", "gauge", "Summed recovered table temp file cleanup duration during startup open", stats.startup.lsm_open_recovered_temp_cleanup_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_manifest_ns", "gauge", "Summed LSM manifest load duration during startup open", stats.startup.lsm_open_manifest_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_ensuring_dirs_ns", "gauge", "Summed LSM directory creation duration during startup open", stats.startup.lsm_open_ensuring_dirs_ns);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_wal_replay_ns", "gauge", "Summed LSM WAL replay duration during startup open", stats.startup.lsm_open_wal_replay_ns);
@@ -877,6 +878,8 @@ fn writeAsyncIndexingMetrics(writer: *std.Io.Writer, stats: antfly.db.types.Asyn
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_obsolete_paths", "gauge", "LSM obsolete paths loaded during startup open", stats.startup.lsm_open_obsolete_paths);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay", "gauge", "LSM mutable entries after startup WAL replay", stats.startup.lsm_open_mutable_entries_after_replay);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_immutable_memtables_after_replay", "gauge", "LSM immutable memtables after startup WAL replay", stats.startup.lsm_open_immutable_memtables_after_replay);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_files_deleted", "gauge", "Recovered table temp files deleted during startup open", stats.startup.lsm_open_recovered_temp_files_deleted);
+    try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_lsm_open_recovered_temp_bytes_deleted", "gauge", "Recovered table temp bytes deleted during startup open", stats.startup.lsm_open_recovered_temp_bytes_deleted);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_records", "gauge", "Observed LSM WAL replay records during startup index open", stats.startup.wal_replay_records);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_entries", "gauge", "Observed LSM WAL replay entries during startup index open", stats.startup.wal_replay_entries);
     try health_metrics.appendPromMetric(writer, "antfly_async_index_startup_wal_replay_bytes", "gauge", "Observed LSM WAL replay bytes during startup index open", stats.startup.wal_replay_bytes);
@@ -1899,6 +1902,7 @@ pub const DataServer = struct {
     last_store_status_report_at_ms: u64 = 0,
     last_data_raft_metadata_sync_at_ms: u64 = 0,
     last_data_raft_placement_fingerprint: ?u64 = null,
+    last_data_raft_status_fingerprint: ?u64 = null,
     provision_ticks: usize = 0,
     last_provision_fingerprint: ?u64 = null,
     last_provision_metadata_epoch: ?u64 = null,
@@ -3342,7 +3346,10 @@ pub const DataServer = struct {
     fn localRaftStatusShouldBootstrapCampaign(status: ?raft_engine.core.Status, local_node_id: u64) bool {
         const raft_status = status orelse return false;
         if (raft_status.soft.leader_id != null) return false;
-        if (raft_status.soft.role != .follower) return false;
+        switch (raft_status.soft.role) {
+            .follower, .pre_candidate => {},
+            .candidate, .leader => return false,
+        }
         return localRaftStatusIsVoter(raft_status, local_node_id);
     }
 
@@ -3455,8 +3462,22 @@ pub const DataServer = struct {
         // forcing a local group-status refresh. The next runtime round should
         // publish promptly; otherwise slow debug builds can sit behind the
         // periodic tick gate even though fresh writer status is available.
+        self.markStoreStatusDirtyImmediate();
+    }
+
+    fn markStoreStatusDirtyImmediate(self: *DataServer) void {
         self.store_status_dirty = true;
         self.store_status_ticks = store_status_report_interval_ticks;
+    }
+
+    fn observeDataRaftStatusFingerprint(self: *DataServer, fingerprint: u64) void {
+        if (self.last_data_raft_status_fingerprint != null and
+            self.last_data_raft_status_fingerprint.? == fingerprint)
+        {
+            return;
+        }
+        self.last_data_raft_status_fingerprint = fingerprint;
+        self.markStoreStatusDirtyImmediate();
     }
 
     fn markRuntimeStatusDirty(
@@ -4581,7 +4602,7 @@ pub const DataServer = struct {
         if (placement_changed) {
             self.last_data_raft_placement_fingerprint = placement_fingerprint;
             self.invalidateLocalGroupStatusCache();
-            self.store_status_dirty = true;
+            self.markStoreStatusDirtyImmediate();
         }
 
         var updates = std.ArrayListUnmanaged(antfly.raft.MetadataUpdate).empty;
@@ -4640,6 +4661,8 @@ pub const DataServer = struct {
                 std.log.warn("data raft bootstrap campaign drive failed node_id={} err={}", .{ registration.node_id, err });
             };
         }
+
+        self.observeDataRaftStatusFingerprint(dataRaftLocalStatusFingerprint(raft, local_intents.items));
     }
 
     fn reportStoreStatusHeartbeat(self: *DataServer) !void {
@@ -8018,6 +8041,35 @@ fn dataRaftPlacementIntentsFingerprint(intents: []const antfly.raft.PlacementInt
     return hasher.final();
 }
 
+fn dataRaftLocalStatusFingerprint(
+    raft: *antfly.raft.ManagedHttpHostService,
+    intents: []const antfly.raft.PlacementIntent,
+) u64 {
+    var hasher = std.hash.Wyhash.init(0x4d2c_e31a_7f8b_2026);
+    hashU64(&hasher, intents.len);
+    for (intents) |intent| {
+        hashU64(&hasher, intent.record.group_id);
+        const status = raft.host.http_host.host.raftStatus(intent.record.group_id) orelse {
+            hashU64(&hasher, 0);
+            continue;
+        };
+        hashU64(&hasher, 1);
+        hashU64(&hasher, status.id);
+        hashU64(&hasher, @intFromEnum(status.soft.role));
+        if (status.soft.leader_id) |leader_id| {
+            hashU64(&hasher, 1);
+            hashU64(&hasher, leader_id);
+        } else {
+            hashU64(&hasher, 0);
+        }
+        hashU64(&hasher, status.conf_state.voters.len);
+        for (status.conf_state.voters) |node_id| hashU64(&hasher, node_id);
+        hashU64(&hasher, status.conf_state.voters_outgoing.len);
+        for (status.conf_state.voters_outgoing) |node_id| hashU64(&hasher, node_id);
+    }
+    return hasher.final();
+}
+
 fn hashU64(hasher: *std.hash.Wyhash, value: u64) void {
     hasher.update(std.mem.asBytes(&value));
 }
@@ -8964,6 +9016,36 @@ test "data runtime module compiles" {
     _ = GroupLeadershipSource;
 }
 
+test "data raft bootstrap campaign retries leaderless voter elections" {
+    var voters = [_]u64{ 1, 2, 3 };
+    var status = raft_engine.core.Status{
+        .id = 1,
+        .group_id = 7001,
+        .soft = .{ .leader_id = null, .role = .follower },
+        .hard = .{},
+        .conf_state = .{ .voters = voters[0..] },
+    };
+
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .pre_candidate;
+    try std.testing.expect(DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .candidate;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .leader;
+    status.soft.leader_id = 1;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.role = .follower;
+    status.soft.leader_id = 2;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 1));
+
+    status.soft.leader_id = null;
+    try std.testing.expect(!DataServer.localRaftStatusShouldBootstrapCampaign(status, 4));
+}
+
 test "data runtime live writer source follows raft apply ownership" {
     const Catalog = struct {
         fn iface() antfly.public_api.table_catalog.CatalogSource {
@@ -9682,6 +9764,49 @@ test "data runtime local group status provider collects and caches group statuse
     const empty_cached = (try server.cloneCachedLocalGroupStatuses(alloc, 3, 99)) orelse return error.TestUnexpectedResult;
     defer antfly.metadata.table_manager.freeGroupStatuses(alloc, empty_cached);
     try std.testing.expectEqual(@as(usize, 0), empty_cached.len);
+}
+
+test "data runtime raft status changes force immediate store status publication" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/data-runtime-raft-status-publication", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root_dir);
+
+    var server: DataServer = .{
+        .alloc = std.testing.allocator,
+        .provisioned_storage = antfly.public_api.ProvisionedGroupStorage.init(std.testing.allocator),
+        .read_source = antfly.public_api.ProvisionedTableReadSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+            antfly.raft.read_gate.noopReadableLeaseRequester(),
+        ),
+        .write_source = antfly.public_api.ProvisionedTableWriteSource.init(
+            replica_root_dir,
+            antfly.public_api.table_catalog.emptyCatalogSource(),
+        ),
+        .status_source = undefined,
+        .api_server_cfg = undefined,
+        .query_async_limit = .limited(8),
+        .listener_cfg = undefined,
+    };
+    defer server.deinit();
+
+    server.store_status_dirty = false;
+    server.store_status_ticks = 0;
+    server.observeDataRaftStatusFingerprint(11);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
+
+    server.store_status_dirty = false;
+    server.store_status_ticks = 0;
+    server.observeDataRaftStatusFingerprint(11);
+    try std.testing.expect(!server.store_status_dirty);
+    try std.testing.expectEqual(@as(usize, 0), server.store_status_ticks);
+
+    server.observeDataRaftStatusFingerprint(12);
+    try std.testing.expect(server.store_status_dirty);
+    try std.testing.expectEqual(store_status_report_interval_ticks, server.store_status_ticks);
 }
 
 test "data runtime local split fallback preserves source identity namespace" {
@@ -14401,10 +14526,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
                     .lsm_open_stores = 3,
                     .lsm_open_completed = 2,
                     .lsm_open_total_ns = 1000,
+                    .lsm_open_recovered_temp_cleanup_ns = 333,
                     .lsm_open_manifest_ns = 111,
                     .lsm_open_wal_replay_ns = 222,
                     .lsm_open_loaded_runs = 5,
                     .lsm_open_mutable_entries_after_replay = 7,
+                    .lsm_open_recovered_temp_files_deleted = 4,
+                    .lsm_open_recovered_temp_bytes_deleted = 2048,
                     .wal_replay_records = 8,
                     .wal_replay_entries = 9,
                     .wal_replay_bytes = 10,
@@ -14579,10 +14707,13 @@ test "data runtime health metrics include replay debt and provisioned warmup cou
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_stores 3") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_completed 2") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_total_ns 1000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_cleanup_ns 333") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_manifest_ns 111") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_wal_replay_ns 222") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_loaded_runs 5") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_mutable_entries_after_replay 7") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_files_deleted 4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_lsm_open_recovered_temp_bytes_deleted 2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_records 8") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_entries 9") != null);
     try std.testing.expect(std.mem.indexOf(u8, output, "antfly_async_index_startup_wal_replay_bytes 10") != null);

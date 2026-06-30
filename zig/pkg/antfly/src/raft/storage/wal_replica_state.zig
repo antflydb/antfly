@@ -18,6 +18,7 @@ const raft_engine = @import("raft_engine");
 const platform_time = @import("../../platform/time.zig");
 const wal_mod = @import("../../storage/wal.zig");
 const storage_mod = @import("mod.zig");
+const storage_iface = raft_engine.runtime.storage_iface;
 
 const magic: u32 = 0x41524654; // ARFT
 const version: u32 = 2;
@@ -149,6 +150,7 @@ pub const WalReplicaState = struct {
             .ptr = self,
             .vtable = &.{
                 .persist_ready = persistReady,
+                .persist_ready_diagnostics = persistReadyWithDiagnostics,
             },
         };
     }
@@ -209,16 +211,39 @@ pub const WalReplicaState = struct {
     }
 
     fn persistReady(ptr: *anyopaque, group_id: u64, ready: raft_engine.core.Ready) !void {
-        _ = group_id;
         const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        try self.persistReadyInternal(group_id, ready, null);
+    }
+
+    fn persistReadyWithDiagnostics(
+        ptr: *anyopaque,
+        group_id: u64,
+        ready: raft_engine.core.Ready,
+        diagnostics: *storage_iface.ReadyPersistenceDiagnostics,
+    ) !void {
+        const self: *WalReplicaState = @ptrCast(@alignCast(ptr));
+        try self.persistReadyInternal(group_id, ready, diagnostics);
+    }
+
+    fn persistReadyInternal(
+        self: *WalReplicaState,
+        group_id: u64,
+        ready: raft_engine.core.Ready,
+        diagnostics: ?*storage_iface.ReadyPersistenceDiagnostics,
+    ) !void {
+        _ = group_id;
         self.stats.persist_ready_calls += 1;
+
+        const storage_apply_started_ns = if (diagnostics != null) nowNs() else 0;
         if (ready.snapshot) |snapshot| {
             try self.store.applySnapshot(snapshot);
             if (snapshot.metadata.index > self.applied_index) self.applied_index = snapshot.metadata.index;
         }
         if (ready.hard_state) |hard_state| self.store.setHardState(hard_state);
         if (ready.entries.len > 0) try self.store.append(ready.entries);
-        try self.persistReadyDelta(ready);
+        if (diagnostics) |diag| diag.storage_apply_elapsed_ns += elapsedSince(storage_apply_started_ns);
+
+        try self.persistReadyDelta(ready, diagnostics);
     }
 
     fn load(self: *WalReplicaState) !void {
@@ -308,21 +333,41 @@ pub const WalReplicaState = struct {
         return try buffer.toOwnedSlice(self.alloc);
     }
 
-    fn persistReadyDelta(self: *WalReplicaState, ready: raft_engine.core.Ready) !void {
+    fn persistReadyDelta(
+        self: *WalReplicaState,
+        ready: raft_engine.core.Ready,
+        diagnostics: ?*storage_iface.ReadyPersistenceDiagnostics,
+    ) !void {
         const started_ns = nowNs();
         self.stats.ready_persist_calls += 1;
 
         const encode_started_ns = nowNs();
         const encoded = try self.encodeReadyDelta(ready);
-        self.stats.encode_ns += elapsedSince(encode_started_ns);
+        const encode_elapsed_ns = elapsedSince(encode_started_ns);
+        self.stats.encode_ns += encode_elapsed_ns;
+        if (diagnostics) |diag| diag.encode_elapsed_ns += encode_elapsed_ns;
         defer self.alloc.free(encoded);
         self.stats.encoded_bytes += encoded.len;
+        if (diagnostics) |diag| diag.encoded_bytes += encoded.len;
 
+        const wal_stats_before = if (diagnostics != null) self.wal.statsSnapshot() else null;
         const append_started_ns = nowNs();
         _ = try self.wal.append(encoded);
-        self.stats.wal_append_ns += elapsedSince(append_started_ns);
+        const wal_append_elapsed_ns = elapsedSince(append_started_ns);
+        self.stats.wal_append_ns += wal_append_elapsed_ns;
+        if (diagnostics) |diag| {
+            diag.wal_append_elapsed_ns += wal_append_elapsed_ns;
+            if (wal_stats_before) |before| {
+                const after = self.wal.statsSnapshot();
+                addWalStatsDelta(diag, before, after);
+            }
+        }
         self.stats.persist_ns += elapsedSince(started_ns);
         self.deltaRecordsPersisted(encoded.len);
+        if (diagnostics) |diag| {
+            diag.delta_records_since_checkpoint = self.delta_records_since_checkpoint;
+            diag.delta_bytes_since_checkpoint = self.delta_bytes_since_checkpoint;
+        }
     }
 
     fn persistConfStateDelta(self: *WalReplicaState) !void {
@@ -664,6 +709,24 @@ pub const WalReplicaState = struct {
         try encodeNodeList(alloc, out, conf_state.learners);
         try encodeNodeList(alloc, out, conf_state.learners_next);
         try appendBool(alloc, out, conf_state.auto_leave);
+    }
+
+    fn addWalStatsDelta(
+        diagnostics: *storage_iface.ReadyPersistenceDiagnostics,
+        before: wal_mod.WalStats,
+        after: wal_mod.WalStats,
+    ) void {
+        diagnostics.wal_wait_elapsed_ns += counterDelta(before.total_wait_ns, after.total_wait_ns);
+        diagnostics.wal_coalesce_elapsed_ns += counterDelta(before.total_coalesce_ns, after.total_coalesce_ns);
+        diagnostics.wal_txn_open_elapsed_ns += counterDelta(before.total_txn_open_ns, after.total_txn_open_ns);
+        diagnostics.wal_put_elapsed_ns += counterDelta(before.total_put_ns, after.total_put_ns);
+        diagnostics.wal_commit_elapsed_ns += counterDelta(before.total_commit_ns, after.total_commit_ns);
+        diagnostics.wal_physical_commits += counterDelta(before.physical_commits, after.physical_commits);
+    }
+
+    fn counterDelta(before: u64, after: u64) u64 {
+        if (after < before) return 0;
+        return after - before;
     }
 
     fn nowNs() u64 {

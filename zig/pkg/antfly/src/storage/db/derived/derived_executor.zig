@@ -399,9 +399,9 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
 
             const stats = try self.catchUpWorker(worker);
-            const caught_up_sequence = if (stats.last_sequence > worker.applied_sequence)
-                stats.last_sequence
-            else if (stats.last_sequence == 0 and worker.target_sequence > worker.applied_sequence and
+            const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
+                applied_sequence
+            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
                 try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
                 worker.target_sequence
             else
@@ -429,9 +429,9 @@ const ManualRuntime = struct {
             if (worker.target_sequence <= worker.applied_sequence) continue;
 
             const stats = try self.catchUpWorker(worker);
-            const caught_up_sequence = if (stats.last_sequence > worker.applied_sequence)
-                stats.last_sequence
-            else if (stats.last_sequence == 0 and worker.target_sequence > worker.applied_sequence and
+            const caught_up_sequence = if (stats.appliedSequenceAdvance(worker.applied_sequence)) |applied_sequence|
+                applied_sequence
+            else if (stats.shouldTryTargetAdvance(worker.applied_sequence, worker.target_sequence) and
                 try self.canAdvanceToTarget(worker, worker.applied_sequence, worker.target_sequence))
                 worker.target_sequence
             else

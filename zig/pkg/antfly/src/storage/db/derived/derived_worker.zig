@@ -42,7 +42,53 @@ pub const CatchUpStats = struct {
     last_sequence: u64 = 0,
     window_collect_ns: u64 = 0,
     apply_ns: u64 = 0,
+
+    pub fn appliedSequenceAdvance(self: @This(), from_sequence: u64) ?u64 {
+        if (self.applied_entries == 0) return null;
+        if (self.last_sequence <= from_sequence) return null;
+        return self.last_sequence;
+    }
+
+    pub fn shouldTryTargetAdvance(self: @This(), from_sequence: u64, target_sequence: u64) bool {
+        return self.applied_entries == 0 and target_sequence > from_sequence;
+    }
 };
+
+test "CatchUpStats target advance covers scanned zero-applied tail" {
+    const applied: u64 = 260;
+    const target_sequence: u64 = 273;
+
+    try std.testing.expect((CatchUpStats{
+        .scanned_entries = 13,
+        .applied_entries = 0,
+        .last_sequence = applied,
+    }).shouldTryTargetAdvance(applied, target_sequence));
+    try std.testing.expect((CatchUpStats{
+        .scanned_entries = 0,
+        .applied_entries = 0,
+        .last_sequence = applied,
+    }).shouldTryTargetAdvance(applied, target_sequence));
+    try std.testing.expect(!(CatchUpStats{
+        .scanned_entries = 13,
+        .applied_entries = 1,
+        .last_sequence = target_sequence,
+    }).shouldTryTargetAdvance(applied, target_sequence));
+    try std.testing.expect(!(CatchUpStats{
+        .scanned_entries = 13,
+        .applied_entries = 0,
+        .last_sequence = applied,
+    }).shouldTryTargetAdvance(target_sequence, target_sequence));
+    try std.testing.expectEqual(@as(?u64, null), (CatchUpStats{
+        .scanned_entries = 13,
+        .applied_entries = 0,
+        .last_sequence = target_sequence,
+    }).appliedSequenceAdvance(applied));
+    try std.testing.expectEqual(target_sequence, (CatchUpStats{
+        .scanned_entries = 13,
+        .applied_entries = 1,
+        .last_sequence = target_sequence,
+    }).appliedSequenceAdvance(applied).?);
+}
 
 pub const CatchUpProgress = struct {
     sequence: u64 = 0,
