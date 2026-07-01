@@ -77,14 +77,9 @@ pub const MetadataServer = struct {
         deps: MetadataServerDeps,
     ) !MetadataServer {
         var service_cfg = cfg.service;
-        var generated_internal_metadata_forward_token: ?[]u8 = null;
-        defer if (generated_internal_metadata_forward_token) |token| alloc.free(token);
-        if (service_cfg.internal_metadata_forward_token == null or
-            std.mem.trim(u8, service_cfg.internal_metadata_forward_token.?, " \t\r\n").len == 0)
-        {
-            generated_internal_metadata_forward_token = try generateInternalMetadataForwardToken(alloc);
-            service_cfg.internal_metadata_forward_token = generated_internal_metadata_forward_token.?;
-        }
+        const owned_internal_metadata_forward_token = try resolveInternalMetadataForwardToken(alloc, service_cfg);
+        defer alloc.free(owned_internal_metadata_forward_token);
+        service_cfg.internal_metadata_forward_token = owned_internal_metadata_forward_token;
 
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
@@ -571,6 +566,18 @@ const DataBearingStoreCandidate = struct {
     updated_at_millis: u64 = 0,
 };
 
+fn resolveInternalMetadataForwardToken(
+    alloc: std.mem.Allocator,
+    cfg: service.MetadataServiceConfig,
+) ![]u8 {
+    if (cfg.internal_metadata_forward_token) |token| {
+        const trimmed = std.mem.trim(u8, token, " \t\r\n");
+        if (trimmed.len > 0) return try alloc.dupe(u8, trimmed);
+    }
+    if (cfg.metadata_orchestration_urls.len > 0) return error.MissingMetadataForwardingToken;
+    return try generateInternalMetadataForwardToken(alloc);
+}
+
 fn bestDataBearingStoreCandidate(
     stores: []const metadata_mod.StoreRecord,
     placements: []const raft_reconciler.PlacementIntent,
@@ -836,7 +843,7 @@ test "metadata server wires hosted shard adapters by default" {
             },
         },
         .service = .{
-            .internal_metadata_forward_token = "configured-forward-token",
+            .internal_metadata_forward_token = " configured-forward-token \n",
         },
     }, .{
         .http = .{
@@ -856,6 +863,30 @@ test "metadata server wires hosted shard adapters by default" {
     try std.testing.expect(server.svc.routed_shard_db_adapter != null);
     try std.testing.expect(server.svc.raft.transition_svc != null);
     try std.testing.expectEqualStrings("configured-forward-token", server.svc.internal_metadata_forward_token.?);
+}
+
+test "metadata server requires shared forwarding token for orchestration peers" {
+    const urls = [_]service.MetadataOrchestrationUrl{.{
+        .node_id = 2,
+        .url = "http://127.0.0.1:7102",
+    }};
+
+    try std.testing.expectError(error.MissingMetadataForwardingToken, MetadataServer.init(std.testing.allocator, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .local_node_id = 1,
+                    .metadata_group_id = 1992,
+                },
+                .transport = .{
+                    .snapshot = .{ .root_dir = ".zig-cache/tmp/metadata-server-forward-token-required" },
+                },
+            },
+        },
+        .service = .{
+            .metadata_orchestration_urls = urls[0..],
+        },
+    }, .{}));
 }
 
 test "metadata server can expose admin listener endpoints" {

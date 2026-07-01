@@ -1396,9 +1396,7 @@ fn resolveMetadataForwardingToken(
 ) !?[]u8 {
     if (cfg) |loaded| {
         if (loaded.metadata.forwarding_token) |value| {
-            const token = try alloc.dupe(u8, value);
-            if (std.mem.trim(u8, token, " \t\r\n").len > 0) return token;
-            alloc.free(token);
+            return try canonicalizeMetadataRuntimeValue(alloc, try alloc.dupe(u8, value));
         }
     }
     return try resolveMetadataRuntimeSecretValue(alloc, secret_store, metadata_forwarding_token_key);
@@ -1425,9 +1423,7 @@ fn resolveMetadataRuntimeSecretValue(
 ) !?[]u8 {
     if (secret_store) |store| {
         if (try store.getOwned(alloc, key)) |value| {
-            if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
-            alloc.free(value);
-            return null;
+            return try canonicalizeMetadataRuntimeValue(alloc, value);
         }
         return null;
     }
@@ -1437,11 +1433,22 @@ fn resolveMetadataRuntimeSecretValue(
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
-        const raw = try alloc.dupe(u8, value);
-        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
-        alloc.free(raw);
+        return try canonicalizeMetadataRuntimeValue(alloc, try alloc.dupe(u8, value));
     }
     return null;
+}
+
+fn canonicalizeMetadataRuntimeValue(alloc: std.mem.Allocator, value: []u8) !?[]u8 {
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) {
+        alloc.free(value);
+        return null;
+    }
+    if (trimmed.len == value.len) return value;
+    errdefer alloc.free(value);
+    const canonical = try alloc.dupe(u8, trimmed);
+    alloc.free(value);
+    return canonical;
 }
 
 test "metadata runtime module compiles" {
@@ -1479,7 +1486,7 @@ test "metadata runtime resolves metadata forwarding token from config" {
         .readers = antfly.readers.Registry.init(alloc),
         .text_to_speech = antfly.synthesizing.Registry.init(alloc),
         .metadata = .{
-            .forwarding_token = try alloc.dupe(u8, "configured-forwarding-token"),
+            .forwarding_token = try alloc.dupe(u8, " configured-forwarding-token \n"),
         },
     };
     defer cfg.deinit();
@@ -1487,6 +1494,24 @@ test "metadata runtime resolves metadata forwarding token from config" {
     const token = try resolveMetadataForwardingToken(alloc, &cfg, null);
     defer alloc.free(token.?);
     try std.testing.expectEqualStrings("configured-forwarding-token", token.?);
+}
+
+test "metadata runtime resolves metadata forwarding token from secret store trimmed" {
+    const alloc = std.testing.allocator;
+    const store_path = ".zig-cache/test-metadata-forwarding-token-secrets.json";
+    defer {
+        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+        defer io_impl.deinit();
+        std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
+    }
+    var secret_store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+    var stored = try secret_store.put(alloc, metadata_forwarding_token_key, "\tstored-forwarding-token\n");
+    stored.deinit(alloc);
+
+    const token = try resolveMetadataForwardingToken(alloc, null, &secret_store);
+    defer alloc.free(token.?);
+    try std.testing.expectEqualStrings("stored-forwarding-token", token.?);
 }
 
 fn expectMetricPresent(output: []const u8, name: []const u8) !void {
