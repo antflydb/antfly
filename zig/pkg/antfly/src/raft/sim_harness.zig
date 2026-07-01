@@ -443,6 +443,7 @@ pub const VirtualHttpNetwork = struct {
                 .uri = owned_uri,
                 .headers = owned_headers,
                 .source_node_id = request.source_node_id,
+                .metadata_leader_forwarded = request.metadata_leader_forwarded,
                 .authorization = owned_authorization,
                 .content_type = owned_content_type,
                 .body = owned_body,

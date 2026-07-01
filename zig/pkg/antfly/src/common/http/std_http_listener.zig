@@ -282,7 +282,11 @@ pub const StdHttpListener = struct {
             return;
         };
         self.handleRequest(&request) catch |err| {
-            std.log.err("http request handler error: {}", .{err});
+            std.log.err("http request handler error method={s} target={s} err={}", .{
+                @tagName(request.head.method),
+                request.head.target,
+                err,
+            });
             _ = request.respond("internal server error", .{
                 .status = .internal_server_error,
                 .keep_alive = false,

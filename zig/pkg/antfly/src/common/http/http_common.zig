@@ -26,6 +26,7 @@ pub const HttpRequest = struct {
     uri: []const u8,
     headers: []const RequestHeader = &.{},
     source_node_id: ?u64 = null,
+    metadata_leader_forwarded: bool = false,
     authorization: ?[]const u8 = null,
     content_type: ?[]const u8 = null,
     timeout_ms: ?u32 = null,

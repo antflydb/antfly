@@ -2600,6 +2600,7 @@ pub const MetadataHttpService = struct {
             .uri = uri,
             .headers = headers,
             .source_node_id = local_node_id,
+            .metadata_leader_forwarded = true,
             .authorization = req.authorization,
             .content_type = req.content_type,
             .body = req.body,
@@ -2617,6 +2618,7 @@ pub const MetadataHttpService = struct {
             if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
             try out.append(alloc, header);
         }
+        if (out.items.len == 0) return &.{};
         return try out.toOwnedSlice(alloc);
     }
 

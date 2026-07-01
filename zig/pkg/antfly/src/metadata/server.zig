@@ -359,10 +359,10 @@ const MetadataAdminMux = struct {
         };
     }
 
-    fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
         if (isPublicApiRequest(req.uri)) return try self.public_api.handle(req);
-        return try self.admin.handle(req);
+        return try self.admin.executor().execute(alloc, req);
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {
@@ -951,6 +951,62 @@ test "metadata server can expose admin listener endpoints" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.value.tables[0].name);
+}
+
+test "metadata admin mux maps admin not leader through metadata executor" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) metadata_http_server.AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_mod.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_mod.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_mod.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn triggerReallocate(_: *anyopaque) !void {
+            return error.NotLeader;
+        }
+    };
+
+    var source = FakeSource{};
+    var admin = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var mux = MetadataAdminMux{
+        .admin = &admin,
+        .public_api = undefined,
+    };
+
+    var response = try mux.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "/internal/v1/reallocate",
+    });
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata leader unavailable") != null);
 }
 
 test "metadata admin mux routes public db v1 requests through public api server" {

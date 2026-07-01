@@ -1398,7 +1398,7 @@ pub const MetadataHttpServer = struct {
     }
 
     fn forwardMutationToLeader(self: *MetadataHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        if (req.source_node_id != null) return null;
+        if (isForwardedMetadataRequest(req)) return null;
         switch (req.method) {
             .POST, .PUT, .DELETE => {},
             .GET => return null,
@@ -1596,9 +1596,16 @@ pub const MetadataHttpServer = struct {
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        return self.handle(req) catch |err| switch (err) {
+            error.NotLeader => try notLeaderResponse(self.alloc),
+            else => return err,
+        };
     }
 };
+
+fn isForwardedMetadataRequest(req: http_common.HttpRequest) bool {
+    return req.metadata_leader_forwarded;
+}
 
 fn cloneValues(
     alloc: std.mem.Allocator,
@@ -2722,10 +2729,192 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
     };
 }
 
+fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, 2);
+    var initialized_headers: usize = 0;
+    errdefer {
+        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+        alloc.free(headers);
+    }
+
+    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
+    errdefer if (retry_after_name) |value| alloc.free(value);
+    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
+    errdefer if (retry_after_value) |value| alloc.free(value);
+    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
+    retry_after_name = null;
+    retry_after_value = null;
+    initialized_headers += 1;
+
+    var not_leader_name: ?[]u8 = try alloc.dupe(u8, "X-Antfly-Metadata-Not-Leader");
+    errdefer if (not_leader_name) |value| alloc.free(value);
+    var not_leader_value: ?[]u8 = try alloc.dupe(u8, "true");
+    errdefer if (not_leader_value) |value| alloc.free(value);
+    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
+    not_leader_name = null;
+    not_leader_value = null;
+    initialized_headers += 1;
+
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    errdefer alloc.free(body);
+    return .{
+        .status = 503,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
+    };
+}
+
 fn freeStoreStatusReport(alloc: std.mem.Allocator, report: metadata_table_manager.StoreStatusReport) void {
     alloc.free(report.health_class);
     metadata_table_manager.freeGroupStatuses(alloc, report.group_statuses);
     metadata_table_manager.freeRuntimeGroupStatusReports(alloc, report.runtime_statuses);
+}
+
+test "metadata http server forwards sourced mutations through raft leader forwarding" {
+    const FakeSource = struct {
+        forward_count: usize = 0,
+        last_source_node_id: ?u64 = null,
+        last_uri: []const u8 = "",
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                    .forward_metadata_request = forwardMetadataRequest,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn triggerReallocate(_: *anyopaque) !void {
+            return error.UnexpectedLocalMutation;
+        }
+
+        fn forwardMetadataRequest(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.forward_count += 1;
+            self.last_source_node_id = req.source_node_id;
+            self.last_uri = req.uri;
+            return try textResponse(alloc, 202, "forwarded");
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    const spoofed_headers = [_]http_common.RequestHeader{.{
+        .name = "X-Antfly-Metadata-Leader-Forwarded",
+        .value = "1",
+    }};
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = routes.Routes.internal_reallocate,
+        .headers = spoofed_headers[0..],
+        .source_node_id = 42,
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 202), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), source.forward_count);
+    try std.testing.expectEqual(@as(?u64, 42), source.last_source_node_id);
+    try std.testing.expectEqualStrings(routes.Routes.internal_reallocate, source.last_uri);
+}
+
+test "metadata http server maps already-forwarded not leader to retryable response" {
+    const FakeSource = struct {
+        forward_count: usize = 0,
+        reallocate_count: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                    .forward_metadata_request = forwardMetadataRequest,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn triggerReallocate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reallocate_count += 1;
+            return error.NotLeader;
+        }
+
+        fn forwardMetadataRequest(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.forward_count += 1;
+            return try textResponse(alloc, 500, "unexpected forward");
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var resp = try server.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = routes.Routes.internal_reallocate,
+        .metadata_leader_forwarded = true,
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    var has_retry_after = false;
+    for (resp.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) has_retry_after = true;
+    }
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqual(@as(usize, 0), source.forward_count);
+    try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
+    try std.testing.expect(std.mem.indexOf(u8, resp.body, "metadata leader unavailable") != null);
+    try std.testing.expect(has_retry_after);
 }
 
 test "metadata http server serves status and filtered admin routes" {
