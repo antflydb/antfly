@@ -15,7 +15,6 @@
 const std = @import("std");
 
 pub const metadata_leader_forwarded_header = "X-Antfly-Internal-Metadata-Leader-Forwarded";
-pub const metadata_leader_forwarded_value = "1";
 pub const metadata_not_leader_header = "X-Antfly-Metadata-Not-Leader";
 pub const metadata_not_leader_value = "true";
 

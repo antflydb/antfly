@@ -43,7 +43,7 @@ pub const StdHttpListenerConfig = struct {
     serve_in_connection_threads: bool = false,
     connection_thread_stack_size: usize = default_request_stack_size,
     max_connection_threads: u32 = 0,
-    trust_internal_request_metadata_headers: bool = false,
+    internal_request_metadata_token: ?[]const u8 = null,
 };
 
 pub const StdHttpListener = struct {
@@ -320,9 +320,11 @@ pub const StdHttpListener = struct {
         var header_it = request.iterateHeaders();
         while (header_it.next()) |header| {
             if (common.isInternalRequestMetadataHeader(header.name)) {
-                metadata_leader_forwarded = metadata_leader_forwarded or
-                    (self.cfg.trust_internal_request_metadata_headers and
-                        std.mem.eql(u8, std.mem.trim(u8, header.value, " \t\r\n"), common.metadata_leader_forwarded_value));
+                metadata_leader_forwarded = metadata_leader_forwarded or blk: {
+                    const token = self.cfg.internal_request_metadata_token orelse break :blk false;
+                    const value = std.mem.trim(u8, header.value, " \t\r\n");
+                    break :blk token.len > 0 and std.mem.eql(u8, value, token);
+                };
                 continue;
             }
             const name = try self.alloc.dupe(u8, header.name);
@@ -658,6 +660,7 @@ test "std http executor enforces request timeout while waiting for response" {
 
 test "std http transport carries trusted metadata forwarded marker" {
     const std_http_executor = @import("std_http_executor.zig");
+    const internal_token = "metadata-forward-token";
 
     const CaptureApp = struct {
         seen_forwarded: bool = false,
@@ -688,7 +691,7 @@ test "std http transport carries trusted metadata forwarded marker" {
 
     var app = CaptureApp{};
     var listener = StdHttpListener.init(std.testing.allocator, .{
-        .trust_internal_request_metadata_headers = true,
+        .internal_request_metadata_token = internal_token,
     }, app.iface());
     defer listener.deinit();
     try listener.start();
@@ -706,15 +709,30 @@ test "std http transport carries trusted metadata forwarded marker" {
     executor.initInPlace(std.testing.allocator, .{});
     defer executor.deinit();
 
-    var response = try executor.executor().execute(std.testing.allocator, .{
+    var spoofed_response = try executor.executor().execute(std.testing.allocator, .{
         .method = .POST,
         .uri = uri,
         .headers = headers[0..],
-        .metadata_leader_forwarded = true,
     });
-    defer response.deinit(std.testing.allocator);
+    defer spoofed_response.deinit(std.testing.allocator);
 
-    try std.testing.expectEqual(@as(u16, 200), response.status);
+    try std.testing.expectEqual(@as(u16, 200), spoofed_response.status);
+    try std.testing.expect(!app.seen_forwarded);
+    try std.testing.expect(app.seen_test_header);
+    try std.testing.expect(!app.seen_internal_header);
+
+    const valid_headers = [_]common.RequestHeader{
+        .{ .name = common.metadata_leader_forwarded_header, .value = internal_token },
+        .{ .name = "X-Test-Header", .value = "present" },
+    };
+    var trusted_response = try executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = uri,
+        .headers = valid_headers[0..],
+    });
+    defer trusted_response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 200), trusted_response.status);
     try std.testing.expect(app.seen_forwarded);
     try std.testing.expect(app.seen_test_header);
     try std.testing.expect(!app.seen_internal_header);

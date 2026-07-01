@@ -215,14 +215,7 @@ pub const StdHttpExecutor = struct {
                 .value = authorization,
             });
         }
-        if (req.metadata_leader_forwarded) {
-            try extra_headers.append(alloc, .{
-                .name = common.metadata_leader_forwarded_header,
-                .value = common.metadata_leader_forwarded_value,
-            });
-        }
         for (req.headers) |header| {
-            if (common.isInternalRequestMetadataHeader(header.name)) continue;
             try extra_headers.append(alloc, .{
                 .name = header.name,
                 .value = header.value,

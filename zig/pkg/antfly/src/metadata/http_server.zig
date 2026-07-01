@@ -2829,7 +2829,7 @@ test "metadata http server forwards sourced mutations through raft leader forwar
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
     const spoofed_headers = [_]http_common.RequestHeader{.{
         .name = http_common.metadata_leader_forwarded_header,
-        .value = http_common.metadata_leader_forwarded_value,
+        .value = "spoofed",
     }};
     var resp = try server.handle(.{
         .method = .POST,

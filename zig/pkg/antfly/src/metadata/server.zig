@@ -44,6 +44,19 @@ pub const MetadataServerDeps = struct {
     http: service.MetadataHttpServiceDeps = .{},
 };
 
+fn generateInternalMetadataForwardToken(alloc: std.mem.Allocator) ![]u8 {
+    var bytes: [32]u8 = undefined;
+    var io_impl = std.Io.Threaded.init(alloc, .{});
+    defer io_impl.deinit();
+    try io_impl.io().randomSecure(&bytes);
+    const token = try alloc.alloc(u8, bytes.len * 2);
+    for (bytes, 0..) |byte, idx| {
+        token[idx * 2] = std.fmt.digitToChar(byte >> 4, .lower);
+        token[idx * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
+    }
+    return token;
+}
+
 pub const MetadataServer = struct {
     alloc: std.mem.Allocator,
     svc: *service.MetadataHttpService,
@@ -63,9 +76,14 @@ pub const MetadataServer = struct {
         cfg: MetadataServerConfig,
         deps: MetadataServerDeps,
     ) !MetadataServer {
+        const internal_metadata_forward_token = try generateInternalMetadataForwardToken(alloc);
+        defer alloc.free(internal_metadata_forward_token);
+        var service_cfg = cfg.service;
+        service_cfg.internal_metadata_forward_token = internal_metadata_forward_token;
+
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
-        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, cfg.service);
+        svc.* = try service.MetadataHttpService.init(alloc, cfg.http, deps.http, service_cfg);
         errdefer svc.deinit();
 
         var owned_hosted_shard_ops: ?*raft_hosted_shard_ops.HostedShardOperationAdapter = null;
@@ -183,7 +201,7 @@ pub const MetadataServer = struct {
             owned_admin_mux = mux;
 
             var admin_listener_cfg = listener_cfg;
-            admin_listener_cfg.trust_internal_request_metadata_headers = true;
+            admin_listener_cfg.internal_request_metadata_token = svc.internal_metadata_forward_token;
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
                 raft_transport.StdHttpListener.initShared(alloc, admin_listener_cfg, mux.executor(), io_impl)

@@ -22,7 +22,6 @@ pub const RequestExecutor = common.RequestExecutor;
 pub const RequestHeader = common.RequestHeader;
 pub const isInternalRequestMetadataHeader = common.isInternalRequestMetadataHeader;
 pub const metadata_leader_forwarded_header = common.metadata_leader_forwarded_header;
-pub const metadata_leader_forwarded_value = common.metadata_leader_forwarded_value;
 pub const metadata_not_leader_header = common.metadata_not_leader_header;
 pub const metadata_not_leader_value = common.metadata_not_leader_value;
 pub const StreamWriter = common.StreamWriter;

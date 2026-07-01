@@ -414,6 +414,7 @@ pub const MetadataServiceConfig = struct {
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
+    internal_metadata_forward_token: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
 };
 
@@ -2351,6 +2352,7 @@ pub const MetadataHttpService = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
     metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
+    internal_metadata_forward_token: ?[]u8 = null,
     linearizable_read_tracker: *LinearizableMetadataReadTracker,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
@@ -2404,6 +2406,7 @@ pub const MetadataHttpService = struct {
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
             .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
+            .internal_metadata_forward_token = if (cfg.internal_metadata_forward_token) |token| try alloc.dupe(u8, token) else null,
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -2419,6 +2422,7 @@ pub const MetadataHttpService = struct {
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
+        if (self.internal_metadata_forward_token) |token| self.alloc.free(token);
         freeMetadataOrchestrationUrls(self.alloc, self.metadata_orchestration_urls);
         self.raft.deinit();
         self.linearizable_read_tracker.deinit();
@@ -2593,7 +2597,7 @@ pub const MetadataHttpService = struct {
         const base_uri = self.metadataOrchestrationUrlForNode(target_node_id) orelse return null;
         const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, req.uri });
         defer alloc.free(uri);
-        const headers = try filteredForwardHeaders(alloc, req.headers);
+        const headers = try forwardedMetadataHeaders(alloc, req.headers, self.internal_metadata_forward_token);
         defer if (headers.len > 0) alloc.free(headers);
         return try self.raft.host.http_host.request_executor.execute(alloc, .{
             .method = req.method,
@@ -2607,8 +2611,12 @@ pub const MetadataHttpService = struct {
         });
     }
 
-    fn filteredForwardHeaders(alloc: std.mem.Allocator, headers: []const http_common.RequestHeader) ![]http_common.RequestHeader {
-        if (headers.len == 0) return &.{};
+    fn forwardedMetadataHeaders(
+        alloc: std.mem.Allocator,
+        headers: []const http_common.RequestHeader,
+        internal_metadata_forward_token: ?[]const u8,
+    ) ![]http_common.RequestHeader {
+        if (headers.len == 0 and internal_metadata_forward_token == null) return &.{};
         var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
         errdefer out.deinit(alloc);
         for (headers) |header| {
@@ -2618,6 +2626,14 @@ pub const MetadataHttpService = struct {
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
             if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
             try out.append(alloc, header);
+        }
+        if (internal_metadata_forward_token) |token| {
+            if (token.len > 0) {
+                try out.append(alloc, .{
+                    .name = http_common.metadata_leader_forwarded_header,
+                    .value = token,
+                });
+            }
         }
         if (out.items.len == 0) return &.{};
         return try out.toOwnedSlice(alloc);
