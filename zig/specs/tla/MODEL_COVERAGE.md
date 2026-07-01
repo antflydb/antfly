@@ -75,13 +75,18 @@ Critique-specific repairs and remaining known weak spots are tracked in
 | OpenAPI compatibility | OpenAPI codegen model plus generated checks | stale generated public/internal API mismatch | keep the model-to-codegen target table current when generated package layout or public/internal API boundaries change |
 | ML graph runtime pass ordering | Partial graph pass/export/runtime gate model, bounded DAG CSE/DCE model, compiler publication model, and focused tests | invalid pass output can be published and consumed, especially around fused lower closure, DCE remapping, and fallback runtime gates | add pattern-specific fuse/shape rewrites or graph-pass trace fixtures if bugs justify the extra state space |
 
-Additional unmodeled control-plane surfaces found by the July 1 final
-critique (node drain lifecycle, table create/drop coordination, entity
-promotion single-owner, merge crash-recovery parity, WAL retention expiry ->
-reseed, index lifecycle outside split, distributed join leases, backup slot
-vs truncation, per-subsystem owner-job gating) are tracked with anchors and
-stakes in `TLA_CRITIQUE_REPAIR.md` under "New Coverage Backlog From The
-Final Critique".
+The control-plane surfaces found by the July 1 final critique are now all
+either modeled or explicitly routed away from TLA+ (see
+`TLA_CRITIQUE_REPAIR.md` "New Coverage Backlog ... RESOLVED"): node drain
+(`AntflyNodeDrainLifecycle`), table create/drop (`AntflyTableLifecycle`),
+WAL retention/reseed + backup slots (`AntflyHARetentionReseed`), entity
+promotion single-owner across split/merge (`AntflyPromotionOwnerHandoff`),
+and index lifecycle (`AntflyIndexLifecycle`). Distributed join leases are
+routed to the deterministic sim harness (advisory lease, continuous-time
+expiry, data-shaped dedup); per-subsystem owner-job gate composition is
+routed to Zig race tests (structural class already covered by
+`AntflyHAGateTransitions`); merge prepare->cutover rollback is not modeled
+because the implementation has no merge-abort path.
 
 Anchor note for `AntflyCdcCutover`: the snapshot -> stream cutover lifecycle
 (phase, cursors, checkpoint) is managed by the metadata service replication
@@ -148,6 +153,18 @@ mutants are future work.
 | `AntflySnapshotContent` | follower GC removes fetched content still needed for apply | `TargetContentNotGcBeforeApply` |
 | `AntflyLsmReserveCleanup` | publication proceeds without a cleanup reserve | `PublishedResourceHasCleanupReserve` / `Safety` |
 | `AntflyLsmReserveCleanup` | failed operation leaks temporary ownership | `NoTempLeakAfterFailure` / `Safety` |
+| `AntflyNodeDrainLifecycle` | finalize accepted while the node is still active | `FinalizeRequiresDrained` |
+| `AntflyNodeDrainLifecycle` | node re-registration clears lifecycle while stores keep drain flags | `DrainStateConsistent` |
+| `AntflyNodeDrainLifecycle` | safe_to_terminate reported while placement/hosted debt remains | `SafeReportMatchesDebt` |
+| `AntflyTableLifecycle` | desired range admitted without its table (UnknownTable guard removed) | `DesiredRangesHaveTable` |
+| `AntflyTableLifecycle` | placement intent planned for a range the desired topology dropped | `NoIntentPlannedForUndesiredRange` |
+| `AntflyHARetentionReseed` | WAL truncation floor skips an active slot the mark-reseed loop has not marked yet | `TruncationCoversUnmarkedActiveSlots` |
+| `AntflyHARetentionReseed` | backup end reports success after its slot was lost or its WAL truncated | `BackupEndFailsClosed` |
+| `AntflyPromotionOwnerHandoff` | child/receiver promotion owner attached while parent/donor still attached | `AtMostOneAttachedOwner` |
+| `AntflyPromotionOwnerHandoff` | promotion owner attached after handoff start but before range transfer | `AttachedImpliesRangeOwner` |
+| `AntflyPromotionOwnerHandoff` | promotion catch-up advances without the isLocalOwner predicate | `NoUnownedPromotion` |
+| `AntflyIndexLifecycle` | shadow index swaps in while its applied watermark is behind | `FreshImpliesCaughtUp` |
+| `AntflyIndexLifecycle` | crash recovery trusts a stale durable "fresh" snapshot and serves queries | `NoFreshServeBehind` |
 | `AntflyQueryCompleteness` | metadata routes queries to a child before the child has a complete serving view | `RouteRequiresChildServing` |
 | `AntflyQueryCompleteness` | child publishes serving without the moved doc | `NoMissingDocs` |
 | `AntflyQueryCompleteness` | parent and child both serve the moved range to one query | `NoDuplicateDocs` |
