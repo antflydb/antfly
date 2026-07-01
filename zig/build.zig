@@ -3562,7 +3562,9 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
+            "api http server forwards public metadata mutations to metadata leader",
             "api http server does not reforward already-forwarded metadata mutations",
+            "api http server keeps public data routes local when metadata forwarder is configured",
             "api http server dispatches HA admin and internal executors",
             "api http server protects HA admin routes while exempting HA internal routes",
             "api http server forbids non-admin secret access when auth is enabled",

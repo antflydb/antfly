@@ -2399,6 +2399,9 @@ pub const ApiHttpServer = struct {
 
     fn dispatchExtensionRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts) !?http_common.HttpResponse {
         if (!isExtensionPath(uri_parts.path)) return null;
+        if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
+            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
+        }
 
         if (req.method != .GET) {
             if (req.method == .POST) {
@@ -3855,6 +3858,9 @@ pub const ApiHttpServer = struct {
     }
 
     fn dispatchPublicTableRoutes(self: *ApiHttpServer, req: http_common.HttpRequest, uri_parts: UriParts, authenticated_identity: ?AuthenticatedIdentity) !?http_common.HttpResponse {
+        if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
+            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
+        }
         if (req.method == .GET and std.mem.eql(u8, uri_parts.path, routes.Routes.backups)) {
             const params = parseListBackupsParams(uri_parts.query) catch return try textResponse(self.alloc, 400, "missing location");
             return try self.handlePublicClusterBackupList(params.location);
@@ -3910,12 +3916,10 @@ pub const ApiHttpServer = struct {
             }
         }
         if (req.method == .POST and std.mem.eql(u8, uri_parts.path, routes.Routes.backup)) {
-            if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
             return try self.handlePublicClusterBackup(req.body);
         }
         if (req.method == .POST) {
             if (std.mem.eql(u8, uri_parts.path, routes.Routes.restore)) {
-                if (try self.forwardMetadataMutationToLeader(req)) |resp| return resp;
                 return try self.handlePublicClusterRestore(req.body);
             }
         }
@@ -5463,6 +5467,34 @@ pub const ApiHttpServer = struct {
         if (req.metadata_leader_forwarded) return null;
         const forwarder = self.cfg.metadata_mutation_forwarder orelse return null;
         return try forwarder.forward(self.alloc, req);
+    }
+
+    fn publicTableRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
+        return switch (method) {
+            .POST => std.mem.eql(u8, path, routes.Routes.backup) or
+                std.mem.eql(u8, path, routes.Routes.restore) or
+                routes.Routes.matchTableRestore(path) != null or
+                routes.Routes.matchTableIndex(path) != null or
+                routes.Routes.matchTablePath(path) != null,
+            .PUT => routes.Routes.matchTableSchema(path) != null or
+                routes.Routes.matchTableArtifactEnrichment(path) != null,
+            .DELETE => routes.Routes.matchTablePath(path) != null or
+                routes.Routes.matchTableIndex(path) != null or
+                routes.Routes.matchTableArtifactEnrichment(path) != null,
+            .GET => false,
+        };
+    }
+
+    fn publicExtensionRouteMutatesMetadata(method: http_common.Method, path: []const u8) bool {
+        return switch (method) {
+            .POST => routes.Routes.matchInstalledExtension(path) != null or
+                routes.Routes.matchInstalledExtensionUpdate(path) != null or
+                routes.Routes.matchInstalledExtensionDrop(path) != null or
+                routes.Routes.matchInstalledExtensionEnable(path) != null or
+                routes.Routes.matchInstalledExtensionDisable(path) != null,
+            .PUT => routes.Routes.matchInstalledExtensionConfig(path) != null,
+            .GET, .DELETE => false,
+        };
     }
 
     fn tryAdoptSession(self: *ApiHttpServer, txn_id: db_mod.types.TxnId) !bool {
@@ -20776,7 +20808,7 @@ test "api http server lists cluster backups through public route" {
     try std.testing.expect(parsed.value.backups[0].timestamp.len > 0);
 }
 
-test "api http server forwards cluster backup mutations to metadata leader" {
+test "api http server forwards public metadata mutations to metadata leader" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
         fn iface(self: *@This()) StatusSource {
@@ -20830,19 +20862,45 @@ test "api http server forwards cluster backup mutations to metadata leader" {
         .metadata_mutation_forwarder = forwarder.iface(),
     }, source.iface(), null, null);
 
-    var resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/backup",
-        .content_type = "application/json",
-        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}",
-    });
-    defer resp.deinit(alloc);
+    const Case = struct {
+        method: http_common.Method,
+        uri: []const u8,
+        body: []const u8 = "{}",
+    };
+    const cases = [_]Case{
+        .{ .method = .POST, .uri = "/backup", .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}" },
+        .{ .method = .POST, .uri = "/restore" },
+        .{ .method = .POST, .uri = "/tables/docs" },
+        .{ .method = .POST, .uri = "/tables/docs/restore" },
+        .{ .method = .POST, .uri = "/tables/docs/indexes/body" },
+        .{ .method = .PUT, .uri = "/tables/docs/schema" },
+        .{ .method = .PUT, .uri = "/tables/docs/artifacts/chunks/enrichment" },
+        .{ .method = .DELETE, .uri = "/tables/docs/artifacts/chunks/enrichment" },
+        .{ .method = .DELETE, .uri = "/tables/docs/indexes/body" },
+        .{ .method = .DELETE, .uri = "/tables/docs" },
+        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf" },
+        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/update" },
+        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/drop" },
+        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/enable" },
+        .{ .method = .POST, .uri = "/extensions/v1/installed/memoryaf/disable" },
+        .{ .method = .PUT, .uri = "/extensions/v1/installed/memoryaf/config" },
+    };
 
-    try std.testing.expectEqual(@as(usize, 1), forwarder.calls);
-    try std.testing.expectEqual(@as(u16, 202), resp.status);
-    try std.testing.expectEqualStrings("forwarded", resp.body);
-    try std.testing.expectEqualStrings("/backup", forwarder.uri);
-    try std.testing.expectEqualStrings("{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}", forwarder.body);
+    for (cases, 1..) |case, expected_calls| {
+        var resp = try server.handle(.{
+            .method = case.method,
+            .uri = case.uri,
+            .content_type = "application/json",
+            .body = case.body,
+        });
+        defer resp.deinit(alloc);
+
+        try std.testing.expectEqual(@as(usize, expected_calls), forwarder.calls);
+        try std.testing.expectEqual(@as(u16, 202), resp.status);
+        try std.testing.expectEqualStrings("forwarded", resp.body);
+        try std.testing.expectEqualStrings(case.uri, forwarder.uri);
+        try std.testing.expectEqualStrings(case.body, forwarder.body);
+    }
 }
 
 test "api http server does not reforward already-forwarded metadata mutations" {
@@ -20896,6 +20954,75 @@ test "api http server does not reforward already-forwarded metadata mutations" {
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), forwarder.calls);
+}
+
+test "api http server keeps public data routes local when metadata forwarder is configured" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const CaptureForwarder = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) RequestForwarder {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .forward = forward },
+            };
+        }
+
+        fn forward(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 500,
+                .content_type = try allocator.dupe(u8, "text/plain"),
+                .body = try allocator.dupe(u8, "unexpected forward"),
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var forwarder = CaptureForwarder{};
+    var server = ApiHttpServer.init(alloc, .{
+        .metadata_mutation_forwarder = forwarder.iface(),
+    }, source.iface(), null, null);
+
+    const Case = struct {
+        method: http_common.Method,
+        uri: []const u8,
+        body: []const u8 = "{}",
+    };
+    const cases = [_]Case{
+        .{ .method = .POST, .uri = "/tables/docs/query" },
+        .{ .method = .POST, .uri = "/tables/docs/batch" },
+        .{ .method = .POST, .uri = "/tables/docs/merge" },
+        .{ .method = .POST, .uri = "/tables/docs/lookup" },
+        .{ .method = .POST, .uri = "/tables/docs/backup" },
+        .{ .method = .POST, .uri = "/tables/docs/artifacts/chunks/reprocess" },
+        .{ .method = .POST, .uri = "/tables/docs/artifacts/chunks/reprocess-jobs" },
+        .{ .method = .GET, .uri = "/extensions/v1/installed/memoryaf" },
+    };
+
+    for (cases) |case| {
+        var resp = try server.handle(.{
+            .method = case.method,
+            .uri = case.uri,
+            .content_type = "application/json",
+            .body = case.body,
+        });
+        defer resp.deinit(alloc);
+        try std.testing.expectEqual(@as(usize, 0), forwarder.calls);
+    }
 }
 
 test "api http server backs up and restores a table through public routes" {
