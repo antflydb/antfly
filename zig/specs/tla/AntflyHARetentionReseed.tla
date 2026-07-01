@@ -28,6 +28,11 @@
   by AntflyHAReplication), retained bytes/age policy dimensions (only the
   lag dimension is modeled), WAL segment layout, and the operator
   reconciliation cadence. Two replication slots plus one backup slot.
+
+  Make targets: tla-check-ha-retention-reseed (positive);
+  tla-check-ha-retention-negative-{truncate-unmarked,
+  backup-ignores-lost-wal}. Correspondence: hand-modeled from the cited
+  anchors.
 *)
 
 EXTENDS Naturals, TLC

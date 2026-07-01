@@ -29,6 +29,10 @@
   status reporting lag, store health/no_space exclusion reasons, and the
   metadata raft transport are abstracted. One node, two stores, two hosted
   groups.
+
+  Make targets: tla-check-node-drain-lifecycle (positive);
+  tla-check-node-drain-negative-{finalize-active, registration-clears-drain,
+  safe-ignores-debt}. Correspondence: hand-modeled from the cited anchors.
 *)
 
 EXTENDS Naturals, TLC

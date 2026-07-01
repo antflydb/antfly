@@ -16,6 +16,28 @@ steps.
 known weak spots that should block any claim of repository-wide modeling
 maturity.
 
+`make tla-audit` runs the static hygiene audit: orphan negative configs,
+leftover `_TTrace_` artifacts, `Buggy*` constants without an enabling
+expected-failure config (hard failures), and Safety-conjunction-pinned
+negative configs (reported migration debt). Run it before any handoff.
+
+## Model Header Template
+
+Every new `.tla` model must start with a comment block containing:
+
+1. **Code anchors** — the implementation files/lines the model corresponds to.
+2. **What the model proves** — the safety/liveness contracts, in one or two
+   sentences each.
+3. **Deliberate omissions** — what is abstracted away and why that is safe.
+4. **State bounds** — the constants that bound the state space.
+5. **Make targets** — the positive target and each expected-failure target.
+6. **Correspondence tier** — test-backed, trace-backed, or hand-modeled
+   (see the quality tiers in `MODEL_COVERAGE.md`).
+
+Negative configs must pin the specific semantic invariant the mutant
+violates; if multiple invariants are intentionally coupled, say so in the
+config header comment.
+
 ## Specs
 
 ### Transaction Protocol
@@ -110,7 +132,7 @@ These specs are intentionally separate bounded models. They cover implementation
 - `AntflyNodeDrainLifecycle.tla` -- Node drain/scale-down lifecycle: drain/store-flag raft-transaction consistency, finalize preconditions, safe_to_terminate debt gate, registration-preserves-drain, and drain-eventually-safe liveness.
 - `AntflyTableLifecycle.tla` -- Table create/drop lifecycle: in-memory desired vs raft-committed topology, per-command applies, crash rebuilding desired from committed, planner scope, and convergence liveness.
 - `AntflyHARetentionReseed.tla` -- WAL retention floor vs per-slot reseed marking vs truncation, plus backup slots as retention pins with fail-closed backup end; no-permanent-unmarked-lag liveness.
-- `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness.
+- `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness. Sketch-tier authority guardrail; intentionally collapses raft leadership and runtime detail.
 - `AntflyIndexLifecycle.tla` -- Index lifecycle (stale->building->fresh) with non-atomic durable status snapshots, shadow-swap completeness, watermark-validating crash recovery, and build-converges liveness.
 - `AntflyQueryCompletenessBadRouteBeforeChildReady.cfg` -- Expected-failure route-before-child-ready mutant used by `make tla-check-negative`.
 - `AntflyQueryCompletenessBadDoubleServe.cfg` -- Expected-failure parent/child double-serve mutant used by `make tla-check-negative`.

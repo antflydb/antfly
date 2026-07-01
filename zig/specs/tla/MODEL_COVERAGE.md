@@ -102,6 +102,63 @@ the model legitimately allows a stall (unavailable hint lane, lease churn,
 stale rejoin assessment); see the module comments. Stall-injecting liveness
 mutants are future work.
 
+## Model Quality Tiers
+
+Not every model carries the same evidentiary weight. Tiers:
+
+- **Mature** — positive check, per-invariant pinned mutants, and a concrete
+  code/test or trace anchor demonstrating correspondence.
+- **Useful** — positive check and pinned mutants, but correspondence is
+  hand-modeled from code reading (anchors cited, not executed against).
+- **Sketch** — deliberately small guardrail or contract-only model; state
+  space is tiny and implementation detail is intentionally collapsed.
+- **Routed** — intentionally NOT TLA+; work item lives elsewhere.
+
+| Tier | Models |
+|---|---|
+| Mature | `AntflyBatcherCoalescing` (red->green correspondence test), `AntflyDerivedReplay` (executed co-write tests), `AntflyEnrichmentLease`, `AntflyLmdbCommit`, `AntflyLsmWalCompaction`, `AntflyTransaction`, `AntflyTransactionSession` (+trace fixtures), `AntflyShardSplit`, `AntflySnapshotTransfer`, `AntflyDocumentIdentity`, `AntflyDocumentIdentityRangeRepair` (+trace fixtures), `AntflyHASyncWait`, `AntflyHATimelineSwitch`, `AntflyHAStandbyApply`, `AntflyHARejoin`, `AntflyHAReplication`, `AntflySplitRefinementBridge` (+trace fixtures), `AntflyLitePublication`, `AntflyOpenApiCodegen`, `AntflyMlGraphPasses`, `AntflyMlGraphDagPasses`, `AntflyMlCompilerPublication`, `AntflyManagedHostLifecycle` |
+| Useful | `AntflyHAFailoverSafety`, `AntflyHAPartitionFence`, `AntflyHAGateTransitions`, `AntflyHAGates`, `AntflyCdcCutover` (anchor correction pending), `AntflyQueryCompleteness`, `AntflyShardSplitSeq`, `AntflySnapshotContent`, `AntflyLsmReserveCleanup`, `AntflyDbSplitVisibility`, `AntflyLsmLifecycle`, `AntflyNodeDrainLifecycle`, `AntflyTableLifecycle`, `AntflyHARetentionReseed`, `AntflyIndexLifecycle` |
+| Sketch | `AntflyPromotionOwnerHandoff` — a focused authority/ownership guardrail (detach-before-transfer-before-attach), NOT deep implementation correspondence: its state space is tiny and it intentionally collapses raft leadership, group identity, and runtime hook detail into range ownership + an attachment bit. |
+| Routed | Distributed join leases (sim harness), owner-job gate composition (Zig race tests), merge rollback (no abort path exists) — see `TLA_CRITIQUE_REPAIR.md` for the concrete work items. |
+
+Negative-config pinning status (checked by `make tla-audit`): critic-response,
+new-coverage, and the six migrated priority groups (HA sync-wait /
+timeline-switch / standby-apply / rejoin, document identity range repair,
+managed host lifecycle, ML graph/DAG/compiler publication) pin named semantic
+invariants; 25 older configs (DbSplitVisibility, DocumentIdentity, HAGates,
+LitePublication, LmdbCommit, LsmWalCompaction, LsmLifecycle, OpenApiCodegen,
+SplitRefinementBridge) still include the broad `Safety` conjunction and are
+tracked migration debt. Do NOT describe the suite as fully pinned until
+`make tla-audit` reports zero Safety-pinned configs.
+
+Bounds backlog: a few of the newest models hardcode their bounds inside the
+spec (`AntflyBatcherCoalescing` 2 ops, `AntflyShardSplitSeq` 2 writes/no
+deletes, `AntflyHARetentionReseed` MaxLsn 3, `AntflyIndexLifecycle` MaxSeq 2).
+Lifting these to config constants with heavy-tier variants (3 ops / 3 writes
+plus a delete / MaxLsn 4 / MaxSeq 3) is cheap belt-and-suspenders with low
+expected yield (protocol bugs overwhelmingly manifest at small scopes, and
+the heavy tier already pushes the riskiest models to tens of millions of
+states). Not worth blocking on; pure state machines (gate transitions,
+promotion handoff) gain nothing from larger bounds.
+
+## Liveness Mutant Backlog
+
+The temporal properties below are checked but have no stall-injecting mutant
+demonstrating each would fail on a real progress regression. Recorded per
+model: what a regression looks like and the mutant that would expose it.
+
+| Model / property | Stall regression | Exposing mutant (future) |
+|---|---|---|
+| `AntflyHAFailoverSafety` `EventuallyPromoted` | promotion guard tightened so no standby ever qualifies | `BuggyPromotionRequiresBothStandbys`: FenceAndPromote requires the acked set on BOTH standbys |
+| `AntflyHARejoin` `RejoinEventuallyExecutes` | executable rewind never executed (executor gate inverted) | `BuggyExecutorSkipsRewind`: ExecuteRewind guard requires `~CanExecuteRewind` |
+| `AntflyDerivedReplay` `CatchupEventuallyCompletes` | catch-up loop never re-observes an advanced target | `BuggyTargetObservationDisabled`: ObserveReplayTarget disabled after first observation |
+| `AntflyEnrichmentLease` `EnrichmentEventuallyDrains` | retry loop never exits (RetryLater disabled) | `BuggyPermanentRetry`: RetryLater requires FALSE |
+| `AntflyNodeDrainLifecycle` `DrainEventuallyReportsSafe` | status endpoint never recomputes after debt clears | `BuggyStatusComputedOnce`: ComputeStatus disabled after first call |
+| `AntflyTableLifecycle` `TopologyEventuallyConverges` | reconciler never removes undesired intents | `BuggyRemoveIntentDisabled` |
+| `AntflyHARetentionReseed` `NoPermanentUnmarkedLag` | marking loop skips one slot forever | `BuggyMarkSkipsSlot(s)` |
+| `AntflyPromotionOwnerHandoff` `NewSideEventuallyOwns` | attach gate requires an event that never fires | `BuggyAttachRequiresOldCrash` |
+| `AntflyIndexLifecycle` `BuildEventuallyConverges` | build loop wedges below target | `BuggyBuildStopsEarly`: BuildStep requires `applied < target - 1` |
+
 ## Required Negative Validation Backlog
 
 | Model | Negative scenario | Expected failing invariant |

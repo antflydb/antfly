@@ -25,6 +25,11 @@
   policy, multiple simultaneous shadow builds, the exact freshness-source
   taxonomy (live-writer vs background refresh), and query routing between
   index kinds. One index, bounded writes.
+
+  Make targets: tla-check-index-lifecycle (positive);
+  tla-check-index-lifecycle-negative-{swap-incomplete,
+  recover-trusts-status}. Correspondence: hand-modeled from the cited
+  anchors.
 *)
 
 EXTENDS Naturals, TLC

@@ -29,6 +29,11 @@
   Deliberate omissions: table IDs/names (one table), schema payloads,
   replica counts (one intent per range), reconcile leases, group readiness
   reporting, and multi-node placement. Two ranges, bounded operator churn.
+
+  Make targets: tla-check-table-lifecycle (positive);
+  tla-check-table-lifecycle-negative-{range-without-table,
+  intent-undesired-range}. Correspondence: hand-modeled from the cited
+  anchors.
 *)
 
 EXTENDS Naturals, FiniteSets, TLC
