@@ -9181,6 +9181,7 @@ func TestReconcileSwarmStatefulSetMountsSecretStore(t *testing.T) {
 	container := sts.Spec.Template.Spec.Containers[0]
 	g.Expect(container.Args).To(HaveLen(1))
 	g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/secrets/secrets.json'"))
+	g.Expect(container.Args[0]).NotTo(ContainSubstring("/run/antfly/system-secrets/secrets.json"))
 	g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
 		Name:  antflySecretStoreEnvVar,
 		Value: "/run/antfly/secrets/secrets.json",
@@ -9394,6 +9395,44 @@ func TestSecretStoreArgShellQuotesPath(t *testing.T) {
 	g.Expect(arg).NotTo(ContainSubstring(`"/run/antfly/'secrets$(touch /tmp/pwned)"`))
 }
 
+func TestReconcileMetadataSystemSecretStoreCreatesStableForwardingToken(t *testing.T) {
+	g := NewWithT(t)
+
+	s := runtime.NewScheme()
+	g.Expect(antflyv1.AddToScheme(s)).To(Succeed())
+	g.Expect(corev1.AddToScheme(s)).To(Succeed())
+
+	cluster := &antflyv1.AntflyCluster{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "test-split",
+			Namespace: "default",
+		},
+	}
+	client := fake.NewClientBuilder().WithScheme(s).WithObjects(cluster).Build()
+	reconciler := &AntflyClusterReconciler{
+		Client: client,
+		Scheme: s,
+	}
+
+	g.Expect(reconciler.reconcileMetadataSystemSecretStore(context.Background(), cluster)).To(Succeed())
+
+	secret := &corev1.Secret{}
+	key := types.NamespacedName{Name: systemSecretStoreName(cluster), Namespace: cluster.Namespace}
+	g.Expect(client.Get(context.Background(), key, secret)).To(Succeed())
+	g.Expect(secret.Type).To(Equal(corev1.SecretTypeOpaque))
+	g.Expect(secret.Data).To(HaveKey(antflySystemSecretStoreKey))
+	firstToken, ok := metadataForwardingTokenFromSecretStore(secret.Data[antflySystemSecretStoreKey])
+	g.Expect(ok).To(BeTrue())
+	g.Expect(firstToken).NotTo(BeEmpty())
+	g.Expect(secret.OwnerReferences).To(HaveLen(1))
+
+	g.Expect(reconciler.reconcileMetadataSystemSecretStore(context.Background(), cluster)).To(Succeed())
+	g.Expect(client.Get(context.Background(), key, secret)).To(Succeed())
+	secondToken, ok := metadataForwardingTokenFromSecretStore(secret.Data[antflySystemSecretStoreKey])
+	g.Expect(ok).To(BeTrue())
+	g.Expect(secondToken).To(Equal(firstToken))
+}
+
 func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 	g := NewWithT(t)
 
@@ -9451,6 +9490,11 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 		container := sts.Spec.Template.Spec.Containers[0]
 		g.Expect(container.Args).To(HaveLen(1))
 		g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/secrets/secrets.json'"))
+		if component == "metadata" {
+			g.Expect(container.Args[0]).To(ContainSubstring("--secret-store-path '/run/antfly/system-secrets/secrets.json'"))
+		} else {
+			g.Expect(container.Args[0]).NotTo(ContainSubstring("/run/antfly/system-secrets/secrets.json"))
+		}
 		g.Expect(container.Env).To(ContainElement(corev1.EnvVar{
 			Name:  antflySecretStoreEnvVar,
 			Value: "/run/antfly/secrets/secrets.json",
@@ -9472,6 +9516,30 @@ func TestReconcileSplitStatefulSetsMountSecretStore(t *testing.T) {
 				},
 			},
 		}))
+		systemMount := corev1.VolumeMount{
+			Name:      antflySystemSecretStoreVolumeName,
+			MountPath: "/run/antfly/system-secrets",
+			ReadOnly:  true,
+		}
+		systemVolume := corev1.Volume{
+			Name: antflySystemSecretStoreVolumeName,
+			VolumeSource: corev1.VolumeSource{
+				Secret: &corev1.SecretVolumeSource{
+					SecretName: systemSecretStoreName(cluster),
+					Items: []corev1.KeyToPath{{
+						Key:  antflySystemSecretStoreKey,
+						Path: "secrets.json",
+					}},
+				},
+			},
+		}
+		if component == "metadata" {
+			g.Expect(container.VolumeMounts).To(ContainElement(systemMount))
+			g.Expect(sts.Spec.Template.Spec.Volumes).To(ContainElement(systemVolume))
+		} else {
+			g.Expect(container.VolumeMounts).NotTo(ContainElement(systemMount))
+			g.Expect(sts.Spec.Template.Spec.Volumes).NotTo(ContainElement(systemVolume))
+		}
 	}
 }
 
