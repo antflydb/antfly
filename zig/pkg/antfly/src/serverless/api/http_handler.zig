@@ -4218,7 +4218,7 @@ pub const HttpHandler = struct {
         switch (sync_level) {
             .propose, .write => return,
             .full_text => {},
-            .enrichments, .aknn, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
+            .enrichments, .full_index => if (requires_background_materialization and self.runtime_metrics == null) {
                 return error.UnsupportedSyncLevel;
             },
         }
@@ -4291,7 +4291,7 @@ pub const HttpHandler = struct {
             .propose, .write => true,
             .full_text => fullTextSyncSatisfied(status),
             .enrichments => status.enrichment_complete,
-            .aknn, .full_index => status.enrichment_complete,
+            .full_index => fullIndexSyncSatisfied(status),
         };
     }
 
@@ -4309,6 +4309,30 @@ pub const HttpHandler = struct {
             return true;
         }
         return status.artifact_actions.full_text != .rebuild;
+    }
+
+    fn fullIndexSyncSatisfied(status: catalog_types.BuildStatus) bool {
+        if (!status.enrichment_complete) return false;
+        if (!fullTextSyncSatisfied(status)) return false;
+        if (status.artifact_actions.dense_vector == .rebuild) return false;
+        if (status.artifact_actions.sparse_vector == .rebuild) return false;
+        if (status.artifact_actions.graph == .rebuild) return false;
+        if (hasPendingNamedPublication(status.vector_index_actions)) return false;
+        if (hasPendingNamedPublication(status.sparse_index_actions)) return false;
+        if (hasPendingNamedPublication(status.graph_index_actions)) return false;
+        if (status.pending_materialization_families.full_text) return false;
+        if (status.pending_materialization_families.dense_vector) return false;
+        if (status.pending_materialization_families.sparse_vector) return false;
+        if (status.pending_materialization_families.chunk_preview) return false;
+        if (status.pending_materialization_families.chunk_embeddings) return false;
+        return true;
+    }
+
+    fn hasPendingNamedPublication(actions: []const catalog_types.NamedArtifactPublicationAction) bool {
+        for (actions) |entry| {
+            if (entry.action == .rebuild) return true;
+        }
+        return false;
     }
 
     fn executePublicTableQueryRequest(
@@ -8903,6 +8927,141 @@ test "http handler honors public serverless sync levels on table batch writes" {
     defer unsupported.deinit(alloc);
     try std.testing.expectEqual(@as(u16, 400), unsupported.status);
     try std.testing.expect(std.mem.indexOf(u8, unsupported.body, "unsupported sync_level") != null);
+}
+
+test "serverless full_index sync waits for enrichment and index publication" {
+    var status = readyServerlessBuildStatusForSyncTest();
+    try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+
+    status.enrichment_complete = false;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.enrichment_complete = true;
+
+    var full_text_rebuild = [_]catalog_types.FullTextIndexPublicationAction{.{
+        .name = @constCast("full_text_index_v0"),
+        .action = .rebuild,
+    }};
+    status.full_text_index_actions = full_text_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.full_text_index_actions = &.{};
+
+    var vector_rebuild = [_]catalog_types.NamedArtifactPublicationAction{.{
+        .name = @constCast("semantic_idx"),
+        .action = .rebuild,
+    }};
+    status.vector_index_actions = vector_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.vector_index_actions = &.{};
+
+    var sparse_rebuild = [_]catalog_types.NamedArtifactPublicationAction{.{
+        .name = @constCast("sparse_idx"),
+        .action = .rebuild,
+    }};
+    status.sparse_index_actions = sparse_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.sparse_index_actions = &.{};
+
+    var graph_rebuild = [_]catalog_types.NamedArtifactPublicationAction{.{
+        .name = @constCast("graph_idx"),
+        .action = .rebuild,
+    }};
+    status.graph_index_actions = graph_rebuild[0..];
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.graph_index_actions = &.{};
+
+    status.pending_materialization_families.chunk_embeddings = true;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.pending_materialization_families.chunk_embeddings = false;
+
+    status.artifact_actions.dense_vector = .rebuild;
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 10, status));
+    status.artifact_actions.dense_vector = .reuse;
+
+    try std.testing.expect(!HttpHandler.tableSyncLevelSatisfied(.full_index, 11, status));
+    try std.testing.expect(HttpHandler.tableSyncLevelSatisfied(.enrichments, 10, status));
+}
+
+fn readyServerlessBuildStatusForSyncTest() catalog_types.BuildStatus {
+    const ready_actions: catalog_types.ArtifactPublicationActions = .{
+        .document_segment = .reuse,
+        .full_text = .reuse,
+        .dense_vector = .reuse,
+        .sparse_vector = .reuse,
+        .graph = .reuse,
+    };
+    return .{
+        .namespace = @constCast("docs"),
+        .published_search_sources = .{},
+        .materialized_search_sources = .{},
+        .materialized_derived_outputs = .{},
+        .head_version = 1,
+        .published_wal_end_lsn = 10,
+        .latest_wal_lsn = 10,
+        .freshness_lag_records = 0,
+        .pending_records = 0,
+        .next_version = 1,
+        .publish_admitted = true,
+        .max_pending_records = 128,
+        .retained_versions = 1,
+        .retained_artifacts = 1,
+        .compaction_recommended = false,
+        .mutation_tail_resolution = .none,
+        .vector_compaction_driver_index_name = null,
+        .vector_compaction_distance_metric = null,
+        .vector_cluster_count = 0,
+        .vector_target_cluster_count = null,
+        .vector_base_probe_count = 0,
+        .vector_target_base_probe_count = null,
+        .vector_shortlist_multiplier = 0,
+        .vector_target_shortlist_multiplier = null,
+        .vector_cluster_imbalance = 0,
+        .vector_cluster_distance_span_max = 0,
+        .publish_recommended = false,
+        .next_publish_reason = null,
+        .head_document_publish_mode = null,
+        .next_document_publish_mode = null,
+        .document_base_version = 1,
+        .document_lineage_versions = 1,
+        .head_republish_recommended = false,
+        .pending_materialization_rebuild = false,
+        .pending_materialization_families = .{},
+        .head_artifact_actions = ready_actions,
+        .head_full_text_index_actions = &.{},
+        .head_vector_index_actions = &.{},
+        .head_sparse_index_actions = &.{},
+        .head_graph_index_actions = &.{},
+        .head_derived_output_actions = .{},
+        .artifact_actions = ready_actions,
+        .full_text_index_actions = &.{},
+        .vector_index_actions = &.{},
+        .sparse_index_actions = &.{},
+        .graph_index_actions = &.{},
+        .derived_output_actions = .{},
+        .derived_output_resolutions = .{},
+        .enrichment_enabled = false,
+        .lexical_sparse_model_preference = .prefer_model,
+        .lexical_sparse_complete = true,
+        .chunk_preview_enabled = false,
+        .chunk_preview_complete = true,
+        .chunk_embeddings_enabled = false,
+        .chunk_embeddings_model_preference = .prefer_model,
+        .chunk_embeddings_complete = true,
+        .rerank_terms_enabled = false,
+        .rerank_terms_complete = true,
+        .enrichment_failure_policy = .skip_document,
+        .enrichment_active_stage = null,
+        .enrichment_stage_source = null,
+        .enrichment_stage_state = null,
+        .enrichment_in_progress = false,
+        .enrichment_complete = true,
+        .enrichment_head_version = null,
+        .enrichment_doc_offset = 0,
+        .enrichment_total_document_count = 0,
+        .enrichment_pending_document_count = 0,
+        .enrichment_batch_size = 32,
+        .enrichment_publish_min_pending_records = 16,
+        .enrichment_pipeline_version = 1,
+    };
 }
 
 test "http handler serves published graph query endpoints" {

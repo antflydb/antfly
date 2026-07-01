@@ -202,7 +202,10 @@ func TestParseSyncLevel(t *testing.T) {
 		{"Propose", "propose", db.Op_SyncLevelPropose, false},
 		{"Write", "write", db.Op_SyncLevelWrite, false},
 		{"FullText", "full_text", db.Op_SyncLevelFullText, false},
-		{"Aknn", "aknn", db.Op_SyncLevelEmbeddings, false},
+		{"Enrichments", "enrichments", db.Op_SyncLevelEnrichments, false},
+		{"FullIndex", "full_index", db.Op_SyncLevelEmbeddings, false},
+		{"Embeddings", "embeddings", db.Op_SyncLevelEmbeddings, false},
+		{"Aknn", "aknn", db.Op_SyncLevelPropose, true},
 		{"Invalid", "invalid_level", db.Op_SyncLevelPropose, true},
 		{"Unknown", "unknown", db.Op_SyncLevelPropose, true},
 	}

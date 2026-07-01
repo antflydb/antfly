@@ -42,7 +42,6 @@ pub const SyncLevel = enum {
     write,
     full_text,
     enrichments,
-    aknn,
     full_index,
 };
 
@@ -51,7 +50,6 @@ pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
     if (std.mem.eql(u8, text, "write")) return .write;
     if (std.mem.eql(u8, text, "full_text")) return .full_text;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "aknn")) return .full_index;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
 }
@@ -69,14 +67,13 @@ pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
         .write => "write",
         .full_text => "full_text",
         .enrichments => "enrichments",
-        .aknn, .full_index => "full_index",
+        .full_index => "full_index",
     };
 }
 
-test "public sync level text treats aknn as deprecated alias for full_index" {
-    try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("aknn").?);
+test "public sync level text accepts full_index and rejects removed aknn alias" {
+    try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
     try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("full_index").?);
-    try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.aknn));
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
 }
 

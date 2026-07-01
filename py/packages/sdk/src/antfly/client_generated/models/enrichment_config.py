@@ -28,7 +28,7 @@ class EnrichmentConfig:
             chunk_size (int | Unset): Chunk size for chunk enrichments.
             chunk_overlap (int | Unset): Chunk overlap for chunk enrichments.
             chunker_json (str | Unset): Serialized chunker configuration for chunk enrichments.
-            full_text_index (bool | Unset): When true on a chunk enrichment, route generated chunk text into the table's
+            full_text_index (bool | Unset): When true on a chunk or asset enrichment, route generated text into the table's
                 default full-text index. Default: False.
             content_type (str | Unset): Produced asset content type for asset enrichments.
             producer_json (str | Unset): Serialized asset producer configuration.

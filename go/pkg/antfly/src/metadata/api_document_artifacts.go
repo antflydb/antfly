@@ -28,6 +28,10 @@ func (t *TableApi) ReprocessDocumentArtifactRange(w http.ResponseWriter, r *http
 	documentArtifactRouteNotImplemented(w)
 }
 
+func (t *TableApi) ListArtifactEnrichments(w http.ResponseWriter, r *http.Request, tableName string) {
+	documentArtifactRouteNotImplemented(w)
+}
+
 func (t *TableApi) PutArtifactEnrichment(w http.ResponseWriter, r *http.Request, tableName string, artifactName string) {
 	documentArtifactRouteNotImplemented(w)
 }

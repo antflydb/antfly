@@ -2972,12 +2972,11 @@ export interface components {
          *     - "write": Wait for Pebble KV write
          *     - "full_text": Wait for full-text index WAL write
          *     - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-         *     - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "aknn" | "full_index";
+        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -6424,7 +6423,7 @@ export interface components {
             /** @description Serialized chunker configuration for chunk enrichments. */
             chunker_json?: string;
             /**
-             * @description When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
+             * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
              * @default false
              */
             full_text_index?: boolean;

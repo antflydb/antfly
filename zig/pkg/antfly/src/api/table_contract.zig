@@ -223,7 +223,7 @@ pub fn parseArtifactEnrichmentRequest(alloc: std.mem.Allocator, artifact_name: [
         if (value != .bool) return error.InvalidArtifactEnrichmentRequest;
         if (value.bool) {
             const kind = root.get("kind") orelse return error.InvalidArtifactEnrichmentRequest;
-            if (kind != .string or !std.mem.eql(u8, kind.string, "chunk")) return error.InvalidArtifactEnrichmentRequest;
+            if (kind != .string or (!std.mem.eql(u8, kind.string, "chunk") and !std.mem.eql(u8, kind.string, "asset"))) return error.InvalidArtifactEnrichmentRequest;
         }
     }
 
@@ -682,14 +682,15 @@ test "table contract normalizes public artifact enrichment request" {
             "{\"name\":\"other\",\"kind\":\"chunk\",\"field\":\"text\",\"chunk_size\":512}",
         ),
     );
-    try std.testing.expectError(
-        error.InvalidArtifactEnrichmentRequest,
-        parseArtifactEnrichmentRequest(
-            std.testing.allocator,
-            "document_units_v1",
-            "{\"kind\":\"asset\",\"field\":\"url\",\"full_text_index\":true}",
-        ),
+    const asset_config_json = try parseArtifactEnrichmentRequest(
+        std.testing.allocator,
+        "document_units_v1",
+        "{\"kind\":\"asset\",\"field\":\"url\",\"full_text_index\":true}",
     );
+    defer std.testing.allocator.free(asset_config_json);
+    try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"name\":\"document_units_v1\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"kind\":\"asset\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, asset_config_json, "\"full_text_index\":true") != null);
 }
 
 test "table contract rejects reserved full text index names on create table" {

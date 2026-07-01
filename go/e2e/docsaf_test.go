@@ -278,7 +278,7 @@ func indexAntflyDocsWithHierarchy(t *testing.T, ctx context.Context, client *ant
 			Records:      batchRecords,
 			LastMergedId: cursor,
 			DryRun:       false,
-			SyncLevel:    antfly.SyncLevelAknn,
+			SyncLevel:    antfly.SyncLevelFullIndex,
 		})
 		require.NoError(t, err, "Failed to perform linear merge for batch %d", batchNum+1)
 
@@ -415,12 +415,12 @@ func indexAntflyDocs(t *testing.T, ctx context.Context, client *antfly.AntflyCli
 			batchNum+1, totalBatches, start+1, end,
 			batchIDs[0], batchIDs[len(batchIDs)-1])
 
-		// Execute LinearMerge with aknn sync level
+		// Execute LinearMerge with full_index sync level
 		result, err := client.LinearMerge(ctx, tableName, antfly.LinearMergeRequest{
 			Records:      batchRecords,
 			LastMergedId: cursor,
 			DryRun:       false,
-			SyncLevel:    antfly.SyncLevelAknn, // Wait for vector index writes
+			SyncLevel:    antfly.SyncLevelFullIndex, // Wait for vector index writes
 		})
 		require.NoError(t, err, "Failed to perform linear merge for batch %d", batchNum+1)
 

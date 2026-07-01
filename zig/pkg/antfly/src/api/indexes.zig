@@ -289,7 +289,7 @@ pub fn validateArtifactEnrichmentConfigs(configs: []const db_mod.types.Enrichmen
             if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
             if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
         }
-        if (cfg.full_text_index and cfg.kind != .chunk) return error.InvalidEnrichmentConfig;
+        if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .asset, cfg.source_artifact_name) == null) {

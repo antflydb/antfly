@@ -7720,7 +7720,6 @@ components:
         - write
         - full_text
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: >
@@ -7734,10 +7733,7 @@ components:
 
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
 
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async
-        on timeout, slowest, most durable)
-
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig:
       type: object
       required:
@@ -12803,8 +12799,8 @@ components:
           x-go-type-skip-optional-pointer: true
           type: boolean
           default: false
-          description: When true on a chunk enrichment, route generated chunk text into the table's default
-            full-text index.
+          description: When true on a chunk or asset enrichment, route generated text into the table's
+            default full-text index.
         content_type:
           x-go-type-skip-optional-pointer: true
           type: string

@@ -1654,6 +1654,12 @@ fn processAsset(
     const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
     defer runtime.alloc.free(key);
 
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
+    defer {
+        for (text_indexes) |name| runtime.alloc.free(name);
+        runtime.alloc.free(text_indexes);
+    }
+
     const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
@@ -1663,6 +1669,7 @@ fn processAsset(
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
+        try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         return;
     };
@@ -1676,6 +1683,7 @@ fn processAsset(
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
+        try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         return;
     }
@@ -1693,11 +1701,13 @@ fn processAsset(
 
     if (producer_cfg.type == .copy) {
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
+            try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             return;
         }
         try storePutWithRetry(runtime, key, source_text);
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
         recordArtifactBytes(runtime, .asset, source_text.len);
         return;
@@ -1714,6 +1724,7 @@ fn processAsset(
         };
         if (existing) |value| {
             defer runtime.alloc.free(value);
+            try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
             return;
         }
@@ -1735,6 +1746,7 @@ fn processAsset(
     };
     try storePutBatch(runtime, &writes, &.{});
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+    try appendInlineFullTextDocumentToWindow(runtime, window, key, produced, text_indexes);
     try materializeGraphAssetForRuntime(runtime, request, produced, raw, window);
     recordArtifactBytes(runtime, .asset, produced.len);
 }
@@ -2003,7 +2015,7 @@ fn processDocumentExtractionAsset(
     const in_progress_writes = [_]KVPair{.{ .key = in_progress_key, .value = in_progress_manifest }};
     try storePutBatchWithRetry(runtime, in_progress_writes[0..], &.{});
 
-    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, false);
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
     defer {
         for (text_indexes) |name| runtime.alloc.free(name);
         runtime.alloc.free(text_indexes);
@@ -4042,6 +4054,58 @@ fn appendOwnedDocumentsToWindow(
     try window.documents.appendSlice(runtime.alloc, docs.*);
     runtime.alloc.free(docs.*);
     docs.* = &.{};
+}
+
+fn appendInlineFullTextDocumentToWindow(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    value: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    errdefer {
+        for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+        runtime.alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try runtime.alloc.dupe(u8, index_name),
+        };
+    }
+    try window.documents.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, key),
+        .action = .upsert,
+        .cleaned_value = try runtime.alloc.dupe(u8, value),
+        .targets = targets,
+    });
+}
+
+fn appendFullTextDeleteDocumentToWindow(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    errdefer {
+        for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+        runtime.alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try runtime.alloc.dupe(u8, index_name),
+        };
+    }
+    try window.documents.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, key),
+        .action = .delete,
+        .targets = targets,
+    });
 }
 
 fn appendOwnedDenseEmbeddingsToWindow(
