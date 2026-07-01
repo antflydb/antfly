@@ -91,7 +91,10 @@ EXTENDS Naturals, FiniteSets, TLC
 CONSTANTS
     Nodes,          \* Set of node identifiers, e.g. {n1, n2, n3}
     MaxRetries,     \* Maximum retries before giving up (e.g. 10)
-    MaxSnapshots    \* Maximum number of snapshots created (bounds state space)
+    MaxSnapshots,   \* Maximum number of snapshots created (bounds state space)
+    BuggyTransferDoneWithoutPut
+                    \* BOOLEAN: expected-failure mutant that marks a transfer
+                    \* done without first storing the archive locally
 
 ASSUME Cardinality(Nodes) >= 2
 ASSUME MaxRetries \in Nat \ {0}
@@ -265,6 +268,18 @@ TransferSucceeds(n) ==
     /\ needsSnap' = needsSnap \ {n}
     /\ UNCHANGED <<leader, snapCounter, persistedSnap, targetSnap, retryCount, nodeUp>>
 
+BuggyTransferSucceedsWithoutPut(n) ==
+    /\ BuggyTransferDoneWithoutPut
+    /\ transferState[n] = "fetching"
+    /\ nodeUp[n]
+    /\ targetSnap[n] > 0
+    /\ targetSnap[n] \notin snapStore[n]
+    /\ AnyPeerHasSnap(n, targetSnap[n])
+    /\ transferState' = [transferState EXCEPT ![n] = "done"]
+    /\ needsSnap' = needsSnap \ {n}
+    /\ UNCHANGED <<leader, snapCounter, persistedSnap, targetSnap, snapStore,
+                   retryCount, nodeUp>>
+
 (*
   Action 5: TransferRetry
   All peers fail with transient errors (not all 404). Increment retry count.
@@ -378,6 +393,7 @@ Next ==
         \/ CreateSnapshot(n)
         \/ RaftSendsSnapshot(n)
         \/ TransferSucceeds(n)
+        \/ BuggyTransferSucceedsWithoutPut(n)
         \/ TransferRetry(n)
         \/ TransferPermanentFailure(n)
         \/ TransferExhaustedRetries(n)

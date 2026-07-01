@@ -25,6 +25,11 @@ detect_java() {
         echo "${JAVA_HOME}/bin/java"
         return
     fi
+    local local_tools_java="${TLA_TOOLS_DIR}/jdk/bin/java"
+    if [ -x "${local_tools_java}" ]; then
+        echo "${local_tools_java}"
+        return
+    fi
     # macOS TLA+ Toolbox bundled JRE
     local toolbox_java="/Applications/TLA+ Toolbox.app/Contents/Eclipse/plugins/org.lamport.openjdk.macosx.x86_64_14.0.1.7/Contents/Home/bin/java"
     if [ -x "${toolbox_java}" ]; then

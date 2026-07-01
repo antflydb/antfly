@@ -38331,6 +38331,41 @@ test "db split full keeps subsequent left-side source writes searchable" {
     try std.testing.expectEqual(@as(u32, 0), summary.dest_doc_count);
 }
 
+test "db split full preserves latest same-key right-side source write" {
+    const alloc = std.testing.allocator;
+
+    var source_path_buf: [256]u8 = undefined;
+    var dest_path_buf: [256]u8 = undefined;
+    const source_path = tempPath(&source_path_buf);
+    const dest_path = tempPath(&dest_path_buf);
+    defer cleanupTempDir(source_path);
+    defer cleanupTempDir(dest_path);
+
+    var runtime = try DbSplitSimRuntime.init(alloc, source_path, dest_path);
+    defer runtime.deinit();
+
+    try runtime.source_db.?.batch(.{
+        .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"beta\"}" }},
+        .sync_level = .full_text,
+    });
+    try runtime.source_db.?.batch(.{
+        .writes = &.{.{ .key = "doc:z", .value = "{\"title\":\"gamma\"}" }},
+        .sync_level = .full_text,
+    });
+    try runtime.splitFull();
+    try runtime.source_db.?.runUntilIdle();
+    try runtime.dest_db.?.runUntilIdle();
+
+    const child_raw = (try runtime.dest_db.?.get(alloc, "doc:z")).?;
+    defer alloc.free(child_raw);
+    try std.testing.expect(std.mem.indexOf(u8, child_raw, "\"gamma\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, child_raw, "\"beta\"") == null);
+
+    const summary = try runtime.summary(alloc);
+    try std.testing.expectEqual(@as(u32, 0), summary.dest_beta_hits);
+    try std.testing.expectEqual(@as(u32, 1), summary.dest_gamma_hits);
+}
+
 test "db split replay fixtures stay green" {
     try runDbSplitReplayFixtures(std.testing.allocator);
 }

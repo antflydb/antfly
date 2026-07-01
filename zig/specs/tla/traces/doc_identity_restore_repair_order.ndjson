@@ -1,0 +1,4 @@
+{"tag":"doc-identity-range-repair-trace","event":{"name":"RecoverIncompleteImport","init":{"restoreSourceNamespace":1,"restoreTargetNamespace":1},"after":{"restoreSourceNamespace":1,"restoreTargetNamespace":1,"strictRestoreAccepted":false,"importRecovered":true,"runtimeRepairNeeded":true,"runtimeRepairComplete":false,"restoreIntentCleared":false}}}
+{"tag":"doc-identity-range-repair-trace","event":{"name":"ClearRestoreIntent","after":{"importRecovered":true,"runtimeRepairNeeded":true,"runtimeRepairComplete":false,"restoreIntentCleared":false}}}
+{"tag":"doc-identity-range-repair-trace","event":{"name":"RunRuntimeRepair","after":{"importRecovered":true,"runtimeRepairNeeded":true,"runtimeRepairComplete":true,"restoreIntentCleared":false}}}
+{"tag":"doc-identity-range-repair-trace","event":{"name":"ClearRestoreIntent","after":{"importRecovered":true,"runtimeRepairNeeded":true,"runtimeRepairComplete":true,"restoreIntentCleared":true}}}

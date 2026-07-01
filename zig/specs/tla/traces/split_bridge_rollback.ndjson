@@ -1,0 +1,4 @@
+{"tag":"split-bridge-trace","event":{"name":"BeginSplit","after":{"phase":"splitting","routeRightOwner":"parent"}}}
+{"tag":"split-bridge-trace","event":{"name":"ParentRightWrite","after":{"dbDeltaSeq":1}}}
+{"tag":"split-bridge-trace","event":{"name":"ReplayDelta","after":{"dbReplaySeq":1}}}
+{"tag":"split-bridge-trace","event":{"name":"Rollback","after":{"phase":"rolledBack","shardFenceSet":false,"shardFenceSeq":0,"shardCutoverReady":false,"dbChildServing":false,"parentAcceptsRight":true,"childAcceptsRight":false,"routeRightOwner":"parent"}}}
