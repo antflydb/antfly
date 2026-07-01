@@ -3564,6 +3564,8 @@ pub fn build(b: *std.Build) void {
             "api http server requires auth on public routes when enabled",
             "api http server forwards public metadata mutations to metadata leader",
             "api http server does not reforward already-forwarded metadata mutations",
+            "api http server returns retryable not leader for local public metadata mutation",
+            "api http server returns retryable not leader when metadata forwarder has no target",
             "api http server keeps public data routes local when metadata forwarder is configured",
             "api http server dispatches HA admin and internal executors",
             "api http server protects HA admin routes while exempting HA internal routes",

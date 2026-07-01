@@ -2048,7 +2048,16 @@ pub const ApiHttpServer = struct {
         if (try self.dispatchArdRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchExtensionAgentRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         if (try self.dispatchProtocolRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
-        if (try self.dispatchExtensionRoutes(req, uri_parts)) |resp| return resp;
+        const extension_resp = self.dispatchExtensionRoutes(req, uri_parts) catch |err| switch (err) {
+            error.NotLeader => {
+                if (publicExtensionRouteMutatesMetadata(req.method, uri_parts.path)) {
+                    return try metadataNotLeaderResponse(self.alloc);
+                }
+                return err;
+            },
+            else => return err,
+        };
+        if (extension_resp) |resp| return resp;
         if (try self.dispatchUserRoutes(req, uri_parts, authenticated_identity)) |resp| return resp;
         try self.runSessionMaintenanceOnce();
         if (try self.dispatchSecretRoutes(req, uri_parts)) |resp| return resp;
@@ -2056,6 +2065,12 @@ pub const ApiHttpServer = struct {
         if (try http_internal_routes.handle(self.internalRoutesContext(uri_parts), req)) |resp| return resp;
         const public_table_resp = self.dispatchPublicTableRoutes(req, uri_parts, authenticated_identity) catch |err| switch (err) {
             error.InvalidPathParameter => return try textResponse(self.alloc, 400, "invalid path parameter"),
+            error.NotLeader => {
+                if (publicTableRouteMutatesMetadata(req.method, uri_parts.path)) {
+                    return try metadataNotLeaderResponse(self.alloc);
+                }
+                return err;
+            },
             else => return err,
         };
         if (public_table_resp) |resp| return resp;
@@ -4010,6 +4025,7 @@ pub const ApiHttpServer = struct {
                 while (true) {
                     self.source.createTable(self.alloc, table_name, create_req) catch |err| switch (err) {
                         error.UnsupportedOperation => return try textResponse(self.alloc, 405, "method not allowed"),
+                        error.NotLeader => return err,
                         error.UnexpectedHttpStatus => {
                             if (platform_time.monotonicNs() -| metadata_create_start_ns >= metadata_create_timeout_ns) {
                                 std.log.err("public create table metadata create failed table={s} err={}", .{ table_name, err });
@@ -4064,6 +4080,7 @@ pub const ApiHttpServer = struct {
                                 };
                                 break :lifecycle true;
                             },
+                            error.NotLeader => return err,
                             else => {
                                 std.log.err("public create table metadata lifecycle failed table={s} err={}", .{ table_name, err });
                                 return err;
@@ -9696,6 +9713,44 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
         .status = status,
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn metadataNotLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, 2);
+    var initialized_headers: usize = 0;
+    errdefer {
+        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+        alloc.free(headers);
+    }
+
+    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
+    errdefer if (retry_after_name) |value| alloc.free(value);
+    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
+    errdefer if (retry_after_value) |value| alloc.free(value);
+    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
+    retry_after_name = null;
+    retry_after_value = null;
+    initialized_headers += 1;
+
+    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+    errdefer if (not_leader_name) |value| alloc.free(value);
+    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+    errdefer if (not_leader_value) |value| alloc.free(value);
+    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
+    not_leader_name = null;
+    not_leader_value = null;
+    initialized_headers += 1;
+
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    errdefer alloc.free(body);
+    return .{
+        .status = 503,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
     };
 }
 
@@ -20954,6 +21009,137 @@ test "api http server does not reforward already-forwarded metadata mutations" {
     defer resp.deinit(alloc);
 
     try std.testing.expectEqual(@as(usize, 0), forwarder.calls);
+}
+
+fn expectPublicMetadataNotLeaderResponse(resp: http_common.HttpResponse) !void {
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("text/plain", resp.content_type.?);
+    try std.testing.expectEqualStrings("metadata leader unavailable", resp.body);
+
+    var retry_after = false;
+    var metadata_not_leader = false;
+    for (resp.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "Retry-After")) {
+            try std.testing.expectEqualStrings("1", header.value);
+            retry_after = true;
+        }
+        if (std.ascii.eqlIgnoreCase(header.name, http_common.metadata_not_leader_header)) {
+            try std.testing.expectEqualStrings(http_common.metadata_not_leader_value, header.value);
+            metadata_not_leader = true;
+        }
+    }
+    try std.testing.expect(retry_after);
+    try std.testing.expect(metadata_not_leader);
+}
+
+test "api http server returns retryable not leader for local public metadata mutation" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.create_calls += 1;
+            return error.NotLeader;
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
+    defer alloc.free(create_body);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = create_body,
+    });
+    defer resp.deinit(alloc);
+
+    try expectPublicMetadataNotLeaderResponse(resp);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
+}
+
+test "api http server returns retryable not leader when metadata forwarder has no target" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        create_calls: usize = 0,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .create_table = createTable,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn createTable(ptr: *anyopaque, _: std.mem.Allocator, table_name: []const u8, _: tables_api.CreateTableRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            self.create_calls += 1;
+            return error.NotLeader;
+        }
+    };
+    const NullForwarder = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) RequestForwarder {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .forward = forward },
+            };
+        }
+
+        fn forward(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(.POST, req.method);
+            try std.testing.expectEqualStrings("/tables/docs", req.uri);
+            self.calls += 1;
+            return null;
+        }
+    };
+
+    var source = FakeSource{};
+    var forwarder = NullForwarder{};
+    var server = ApiHttpServer.init(alloc, .{
+        .metadata_mutation_forwarder = forwarder.iface(),
+    }, source.iface(), null, null);
+    const create_body = try test_contract_helpers.encodeCreateTableRequest(alloc, "docs table");
+    defer alloc.free(create_body);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/docs",
+        .content_type = "application/json",
+        .body = create_body,
+    });
+    defer resp.deinit(alloc);
+
+    try expectPublicMetadataNotLeaderResponse(resp);
+    try std.testing.expectEqual(@as(usize, 1), forwarder.calls);
+    try std.testing.expectEqual(@as(usize, 1), source.create_calls);
 }
 
 test "api http server keeps public data routes local when metadata forwarder is configured" {
