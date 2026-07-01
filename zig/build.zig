@@ -2697,6 +2697,18 @@ pub fn build(b: *std.Build) void {
     const lib_common_config_test_step = b.step("lib-common-config-test", "Run common/config tests");
     lib_common_config_test_step.dependOn(&run_lib_common_config_tests.step);
 
+    const lib_common_secrets_tests = b.addTest(.{
+        .root_module = lib_test_mod,
+        .filters = &.{"file secret store"},
+        .test_runner = .{
+            .path = b.path("pkg/antfly/src/test_runner.zig"),
+            .mode = .simple,
+        },
+    });
+    const run_lib_common_secrets_tests = b.addRunArtifact(lib_common_secrets_tests);
+    const lib_common_secrets_test_step = b.step("lib-common-secrets-test", "Run common/secret store tests");
+    lib_common_secrets_test_step.dependOn(&run_lib_common_secrets_tests.step);
+
     const lib_casbin_tests = b.addTest(.{
         .root_module = casbin_mod,
     });
@@ -4355,6 +4367,7 @@ pub fn build(b: *std.Build) void {
     unit_test_step.dependOn(&run_lib_reranking_runtime_tests.step);
     unit_test_step.dependOn(&run_lib_common_tests.step);
     unit_test_step.dependOn(&run_lib_common_config_tests.step);
+    unit_test_step.dependOn(&run_lib_common_secrets_tests.step);
     unit_test_step.dependOn(&run_lib_casbin_tests.step);
     unit_test_step.dependOn(&run_lib_usermgr_tests.step);
     unit_test_step.dependOn(&run_embedded_tests.step);
