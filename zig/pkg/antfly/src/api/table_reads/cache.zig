@@ -41,6 +41,7 @@ pub const ProvisionedTableReadCache = struct {
     resource_manager: ?*resource_manager_mod.ResourceManager = null,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     hit_count: std.atomic.Value(u64) = .init(0),
@@ -183,6 +184,7 @@ pub const ProvisionedTableReadCache = struct {
                 self.resource_manager,
                 self.backend_runtime,
                 self.antfly_provider,
+                self.inference_api_url,
                 self.secret_store,
                 self.remote_content,
                 identity_namespace,
@@ -547,6 +549,7 @@ pub fn openProvisionedQueryDbForTableWithRuntime(
         null,
         null,
         null,
+        null,
         try loadTableIdentityNamespaceForGroup(alloc, catalog, table_name, group_id),
     );
 }
@@ -562,6 +565,7 @@ pub fn openProvisionedQueryDbForTableWithCache(
     resource_manager: ?*resource_manager_mod.ResourceManager,
     backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     antfly_provider: ?managed_embedder.AntflyProvider,
+    inference_api_url: ?[]const u8,
     secret_store: ?*common_secrets.FileStore,
     remote_content: ?*const scraping.RemoteContentConfig,
     identity_namespace: ?db_mod.DocIdentityNamespace,
@@ -621,19 +625,20 @@ pub fn openProvisionedQueryDbForTableWithCache(
             raw_indexes_json: []const u8,
             runtime: ?*db_mod.background_runtime.BackendRuntime,
             local_provider: ?managed_embedder.AntflyProvider,
+            local_inference_api_url: ?[]const u8,
             store: ?*common_secrets.FileStore,
             remote: ?*const scraping.RemoteContentConfig,
         ) !EnrichmentSet {
             _ = runtime;
             return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
+                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url }),
+                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = local_inference_api_url }),
                 .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
             };
         }
     }.run;
 
-    var enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+    var enrichments = try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, inference_api_url, secret_store, remote_content);
     errdefer enrichments.deinit(alloc);
 
     var db = if (enrichments.enabled()) blk: {

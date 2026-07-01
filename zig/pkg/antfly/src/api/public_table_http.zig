@@ -119,6 +119,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         InvalidIndexRequest,
         ProbeUnavailable,
+        ModelNotFound,
         InternalFailure,
     };
 
@@ -757,6 +758,7 @@ pub fn handleTableCreateIndex(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported index configuration") },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index validation probe unavailable") },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };

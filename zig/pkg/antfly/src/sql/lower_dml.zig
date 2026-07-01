@@ -20,12 +20,12 @@ const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
-const expr_build = @import("expr_build.zig");
-const expr_equal = @import("expr_equal.zig");
-const expr_operator = @import("expr_operator.zig");
-const expr_predicate = @import("expr_predicate.zig");
-const expr_token = @import("expr_token.zig");
-const expr_type = @import("expr_type.zig");
+const expr_build = @import("expr/build.zig");
+const expr_equal = @import("expr/equal.zig");
+const expr_operator = @import("expr/operator.zig");
+const expr_predicate = @import("expr/predicate.zig");
+const expr_token = @import("expr/token.zig");
+const expr_type = @import("expr/type.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -3278,7 +3278,7 @@ pub fn writeUniqueExpressionIdentityJson(
     expression: runtime_schema.UniqueExpression,
 ) !void {
     try writer.writeAll("{\"op\":");
-    try writer.print("{f}", .{std.json.fmt(lower_expr.uniqueExpressionOpToken(expression.op), .{})});
+    try writer.print("{f}", .{std.json.fmt(expr_type.uniqueExpressionOpToken(expression.op), .{})});
     switch (expression.op) {
         .lower, .upper, .md5 => try writer.print(",\"field\":{f}", .{std.json.fmt(expression.field, .{})}),
         .expression => {
@@ -8984,7 +8984,7 @@ pub fn insertSourceUniquePredicatesFromConstraintAlloc(
         out[initialized] = .{
             .name = "",
             .field = try alloc.dupe(u8, predicate.field),
-            .op = lower_expr.uniquePredicateAsRelationalCheckOp(predicate.op),
+            .op = expr_type.uniquePredicateAsRelationalCheckOp(predicate.op),
             .value_json = if (predicate.value_json) |value| try alloc.dupe(u8, value) else null,
             .validation_state = .enforced,
         };
@@ -9246,7 +9246,7 @@ pub fn parseJoinedMutationWhereAlloc(
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try lower_expr.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-            try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, false, realtime_ns);
+            try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
         }
@@ -9257,7 +9257,7 @@ pub fn parseJoinedMutationWhereAlloc(
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
                 const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
                 try lower_expr.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-                try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, true, realtime_ns);
+                try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                 continue;
             }
@@ -9753,11 +9753,11 @@ fn validateGeneratedConflictTargetUniqueExpressionIdentity(
     const inner_tokens = generated_inner.tokens orelse return error.UnsupportedSqlShape;
     if (inner_tokens.start < item.start or inner_tokens.end > item.end or inner_tokens.start >= inner_tokens.end) return error.UnsupportedSqlShape;
 
-    if (lower_expr.isCaseFoldExpressionOp(expression.op)) {
+    if (expr_type.isCaseFoldExpressionOp(expression.op)) {
         if (generated_inner.kind != .function_call) return error.UnsupportedSqlShape;
         const function_name = generated_inner.function_name_tokens orelse return error.UnsupportedSqlShape;
         if (function_name.start >= function_name.end or function_name.end > tokens.len) return error.UnsupportedSqlShape;
-        if (!std.ascii.eqlIgnoreCase(tokens[function_name.start].text, lower_expr.uniqueExpressionOpToken(expression.op))) return error.UnsupportedSqlShape;
+        if (!std.ascii.eqlIgnoreCase(tokens[function_name.start].text, expr_type.uniqueExpressionOpToken(expression.op))) return error.UnsupportedSqlShape;
         if (generated_inner.argument_items.count != 1 or generated_inner.argument_items.expressions.len != 1) return error.UnsupportedSqlShape;
         const argument = &generated_inner.argument_items.expressions[0];
         if (argument.kind != .token_range) return error.UnsupportedSqlShape;

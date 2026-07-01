@@ -4641,12 +4641,15 @@ test "db graph metric runtime background open-configured pagerank worker pool su
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
             saw_worker_pool_role = true;
             if (tick.worker_steps > 0) {
-                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
-                    .open_mode = .writer_no_replay,
-                    .ttl_cleanup = .{ .enabled = false },
-                    .graph_metric_maintenance = .{
+                const duplicate_resources = worker_pool.core.asyncResources();
+                var duplicate_runtime = try GraphMetricRuntime.init(
+                    alloc,
+                    duplicate_resources.store,
+                    duplicate_resources.index_manager,
+                    duplicate_resources.apply_mutex,
+                    worker_pool.backend_runtime,
+                    .{
                         .enabled = true,
-                        .start_background_loop = false,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-pagerank-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -4658,16 +4661,16 @@ test "db graph metric runtime background open-configured pagerank worker pool su
                             .max_pages_per_round = 2,
                         },
                     },
-                });
-                defer duplicate_worker_pool.close();
+                );
+                defer duplicate_runtime.deinit();
 
-                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                const duplicate_tick = try duplicate_runtime.runOnceDetailed();
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                const duplicate_stats = duplicate_runtime.stats();
                 try std.testing.expect(duplicate_stats.enabled);
-                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expectEqual(Role.worker_pool, duplicate_stats.role);
                 try std.testing.expect(duplicate_stats.lease_owned);
                 try std.testing.expect(!duplicate_stats.has_lease);
                 try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
@@ -4862,12 +4865,15 @@ test "db graph metric runtime background open-configured eigenvector worker pool
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
             saw_worker_pool_role = true;
             if (tick.worker_steps > 0) {
-                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
-                    .open_mode = .writer_no_replay,
-                    .ttl_cleanup = .{ .enabled = false },
-                    .graph_metric_maintenance = .{
+                const duplicate_resources = worker_pool.core.asyncResources();
+                var duplicate_runtime = try GraphMetricRuntime.init(
+                    alloc,
+                    duplicate_resources.store,
+                    duplicate_resources.index_manager,
+                    duplicate_resources.apply_mutex,
+                    worker_pool.backend_runtime,
+                    .{
                         .enabled = true,
-                        .start_background_loop = false,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-eigenvector-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -4879,16 +4885,16 @@ test "db graph metric runtime background open-configured eigenvector worker pool
                             .max_pages_per_round = 2,
                         },
                     },
-                });
-                defer duplicate_worker_pool.close();
+                );
+                defer duplicate_runtime.deinit();
 
-                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                const duplicate_tick = try duplicate_runtime.runOnceDetailed();
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                const duplicate_stats = duplicate_runtime.stats();
                 try std.testing.expect(duplicate_stats.enabled);
-                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expectEqual(Role.worker_pool, duplicate_stats.role);
                 try std.testing.expect(duplicate_stats.lease_owned);
                 try std.testing.expect(!duplicate_stats.has_lease);
                 try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
@@ -5080,12 +5086,15 @@ test "db graph metric runtime background open-configured hits worker pool surviv
             try std.testing.expectEqual(@as(u64, 0), stats.total_coordinator_steps);
             saw_worker_pool_role = true;
             if (tick.worker_steps > 0) {
-                var duplicate_worker_pool = try DB.open(alloc, std.mem.span(path), .{
-                    .open_mode = .writer_no_replay,
-                    .ttl_cleanup = .{ .enabled = false },
-                    .graph_metric_maintenance = .{
+                const duplicate_resources = worker_pool.core.asyncResources();
+                var duplicate_runtime = try GraphMetricRuntime.init(
+                    alloc,
+                    duplicate_resources.store,
+                    duplicate_resources.index_manager,
+                    duplicate_resources.apply_mutex,
+                    worker_pool.backend_runtime,
+                    .{
                         .enabled = true,
-                        .start_background_loop = false,
                         .role = .worker_pool,
                         .runtime_id = "runtime-reopened-hits-pool-worker-owner-duplicate",
                         .lease_owned = true,
@@ -5097,16 +5106,16 @@ test "db graph metric runtime background open-configured hits worker pool surviv
                             .max_pages_per_round = 2,
                         },
                     },
-                });
-                defer duplicate_worker_pool.close();
+                );
+                defer duplicate_runtime.deinit();
 
-                const duplicate_tick = try duplicate_worker_pool.graph_metric_runtime.?.runOnceDetailed();
+                const duplicate_tick = try duplicate_runtime.runOnceDetailed();
                 try std.testing.expect(!duplicate_tick.durableProgressed());
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.worker_steps);
                 try std.testing.expectEqual(@as(usize, 0), duplicate_tick.pages_completed);
-                const duplicate_stats = duplicate_worker_pool.graphMetricRuntimeStats();
+                const duplicate_stats = duplicate_runtime.stats();
                 try std.testing.expect(duplicate_stats.enabled);
-                try std.testing.expectEqual(types.GraphMetricRuntimeRole.worker_pool, duplicate_stats.role.?);
+                try std.testing.expectEqual(Role.worker_pool, duplicate_stats.role);
                 try std.testing.expect(duplicate_stats.lease_owned);
                 try std.testing.expect(!duplicate_stats.has_lease);
                 try std.testing.expectEqual(stats.worker_id_hash, duplicate_stats.worker_id_hash);
@@ -5721,19 +5730,13 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         try std.testing.expectEqual(Role.coordinator, publish_stats.role);
 
         {
-            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
-                .start_index_workers = false,
-                .ttl_cleanup = .{ .enabled = false },
-            });
-            defer live_duplicate_coordinator.close();
-
-            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            const duplicate_resources = coordinator.core.asyncResources();
             var duplicate_runtime = try GraphMetricRuntime.init(
                 alloc,
                 duplicate_resources.store,
                 duplicate_resources.index_manager,
                 duplicate_resources.apply_mutex,
-                live_duplicate_coordinator.backend_runtime,
+                coordinator.backend_runtime,
                 .{
                     .enabled = true,
                     .role = .coordinator,
@@ -6074,19 +6077,13 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         try std.testing.expectEqual(Role.coordinator, publish_stats.role);
 
         {
-            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
-                .start_index_workers = false,
-                .ttl_cleanup = .{ .enabled = false },
-            });
-            defer live_duplicate_coordinator.close();
-
-            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            const duplicate_resources = coordinator.core.asyncResources();
             var duplicate_runtime = try GraphMetricRuntime.init(
                 alloc,
                 duplicate_resources.store,
                 duplicate_resources.index_manager,
                 duplicate_resources.apply_mutex,
-                live_duplicate_coordinator.backend_runtime,
+                coordinator.backend_runtime,
                 .{
                     .enabled = true,
                     .role = .coordinator,
@@ -6426,19 +6423,13 @@ test "db graph metric runtime background reopened coordinators do not duplicate 
         try std.testing.expectEqual(Role.coordinator, publish_stats.role);
 
         {
-            var live_duplicate_coordinator = try DB.open(alloc, std.mem.span(path), .{
-                .start_index_workers = false,
-                .ttl_cleanup = .{ .enabled = false },
-            });
-            defer live_duplicate_coordinator.close();
-
-            const duplicate_resources = live_duplicate_coordinator.core.asyncResources();
+            const duplicate_resources = coordinator.core.asyncResources();
             var duplicate_runtime = try GraphMetricRuntime.init(
                 alloc,
                 duplicate_resources.store,
                 duplicate_resources.index_manager,
                 duplicate_resources.apply_mutex,
-                live_duplicate_coordinator.backend_runtime,
+                coordinator.backend_runtime,
                 .{
                     .enabled = true,
                     .role = .coordinator,

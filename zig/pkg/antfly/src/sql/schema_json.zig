@@ -17,9 +17,8 @@ const std = @import("std");
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
-const expr_type = @import("expr_type.zig");
+const expr_type = @import("expr/type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
-const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 
@@ -307,7 +306,7 @@ pub fn schemaJsonExpressionAlloc(
 pub fn schemaJsonUniquePredicateAlloc(alloc: std.mem.Allocator, predicate: runtime_schema.UniquePredicate) !std.json.Value {
     var object = std.json.ObjectMap.empty;
     try putJsonString(alloc, &object, "field", predicate.field);
-    try putJsonString(alloc, &object, "op", lower_expr.uniquePredicateOpToken(predicate.op));
+    try putJsonString(alloc, &object, "op", expr_type.uniquePredicateOpToken(predicate.op));
     if (predicate.value_json) |value_json| {
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, value_json, .{});
         defer parsed.deinit();

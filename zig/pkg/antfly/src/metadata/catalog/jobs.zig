@@ -19,7 +19,7 @@ const table_catalog = @import("source.zig");
 const metadata_api = @import("snapshot.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const runtime_schema_mod = @import("../../storage/schema.zig");
-const expr_type = @import("../../sql/expr_type.zig");
+const expr_type = @import("../../sql/expr/type.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const table_ddl = @import("table_ddl.zig");
 

@@ -18,11 +18,10 @@ const ast = @import("ast.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
-const expr_type = @import("expr_type.zig");
+const expr_type = @import("expr/type.zig");
 const generated_parser = @import("generated_parser.zig");
-const expr_token = @import("expr_token.zig");
+const expr_token = @import("expr/token.zig");
 const lexer = @import("lexer.zig");
-const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const token_mod = @import("token.zig");
@@ -7008,7 +7007,7 @@ pub fn uniquePredicateWhereJsonAlloc(
         if (i != 0) try writer.writeByte(',');
         try writer.print("{{\"field\":{f},\"op\":{f}", .{
             std.json.fmt(predicate.field, .{}),
-            std.json.fmt(lower_expr.uniquePredicateOpToken(predicate.op), .{}),
+            std.json.fmt(expr_type.uniquePredicateOpToken(predicate.op), .{}),
         });
         if (predicate.value_json) |value_json| {
             try writer.writeAll(",\"value\":");

@@ -2558,18 +2558,8 @@ exec /antfly swarm --id %d --config /config/config.json \
 								swarmHAArgs(cluster.Spec.HighAvailability),
 							),
 						},
-						Resources: r.buildResourceRequirements(swarm.Resources),
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromInt(int(swarm.Health.Port)),
-								},
-							},
-							InitialDelaySeconds: 30,
-							PeriodSeconds:       10,
-							FailureThreshold:    30,
-						},
+						Resources:    r.buildResourceRequirements(swarm.Resources),
+						StartupProbe: buildHTTPStartupProbe(swarm.Health.Port, swarm.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -2784,18 +2774,8 @@ exec /antfly metadata --id $ID --config /config/config.json \
 								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
-						Resources: r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromInt(int(cluster.Spec.MetadataNodes.Health.Port)),
-								},
-							},
-							InitialDelaySeconds: 30,
-							PeriodSeconds:       10,
-							FailureThreshold:    30,
-						},
+						Resources:    r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
+						StartupProbe: buildHTTPStartupProbe(cluster.Spec.MetadataNodes.Health.Port, cluster.Spec.MetadataNodes.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -3006,18 +2986,8 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
-						Resources: r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromInt(int(cluster.Spec.DataNodes.Health.Port)),
-								},
-							},
-							InitialDelaySeconds: 30,
-							PeriodSeconds:       10,
-							FailureThreshold:    30,
-						},
+						Resources:    r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),
+						StartupProbe: buildHTTPStartupProbe(cluster.Spec.DataNodes.Health.Port, cluster.Spec.DataNodes.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -3102,6 +3072,35 @@ func (r *AntflyClusterReconciler) buildResourceRequirements(resourceSpec antflyv
 	}
 
 	return requirements
+}
+
+func buildHTTPStartupProbe(port int32, cfg *antflyv1.ProbeConfig) *corev1.Probe {
+	failureThreshold := int32(30)
+	periodSeconds := int32(10)
+	timeoutSeconds := int32(1)
+	if cfg != nil {
+		if cfg.FailureThreshold != nil {
+			failureThreshold = *cfg.FailureThreshold
+		}
+		if cfg.PeriodSeconds != nil {
+			periodSeconds = *cfg.PeriodSeconds
+		}
+		if cfg.TimeoutSeconds != nil {
+			timeoutSeconds = *cfg.TimeoutSeconds
+		}
+	}
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.FromInt(int(port)),
+			},
+		},
+		InitialDelaySeconds: 30,
+		PeriodSeconds:       periodSeconds,
+		TimeoutSeconds:      timeoutSeconds,
+		FailureThreshold:    failureThreshold,
+	}
 }
 
 func chooseSwarmStorageSize(cluster *antflyv1.AntflyCluster) string {

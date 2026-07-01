@@ -18,16 +18,16 @@ const ast = @import("ast.zig");
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
-const expr_build = @import("expr_build.zig");
-const expr_disjoint = @import("expr_disjoint.zig");
-const expr_equal = @import("expr_equal.zig");
-const expr_generated = @import("expr_generated.zig");
-const expr_limits = @import("expr_limits.zig");
-const expr_operator = @import("expr_operator.zig");
-const expr_parse = @import("expr_parse.zig");
-const expr_predicate = @import("expr_predicate.zig");
-const expr_type = @import("expr_type.zig");
-const expr_token = @import("expr_token.zig");
+const expr_build = @import("expr/build.zig");
+const expr_disjoint = @import("expr/disjoint.zig");
+const expr_equal = @import("expr/equal.zig");
+const expr_generated = @import("expr/generated.zig");
+const expr_limits = @import("expr/limits.zig");
+const expr_operator = @import("expr/operator.zig");
+const expr_parse = @import("expr/parse.zig");
+const expr_predicate = @import("expr/predicate.zig");
+const expr_type = @import("expr/type.zig");
+const expr_token = @import("expr/token.zig");
 const grammar = @import("grammar.zig");
 const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
@@ -7292,9 +7292,9 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
         try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
         const condition = if (generated_quantifier_token_index != null)
-            try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
+            try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
-            try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
+            try expr_predicate.parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
         try appendExpressionConditionGroup(alloc, alternatives, condition);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
@@ -7308,9 +7308,9 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             const condition = if (generated_quantifier_token_index != null)
-                try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
+                try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
-                try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
+                try expr_predicate.parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
             try appendExpressionConditionGroup(alloc, alternatives, condition);
             freeExpression(alloc, lhs);
             lhs_transferred = true;
@@ -7585,9 +7585,9 @@ pub fn parseExpressionWhereConditionsAlloc(
         const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
         try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
         const condition = if (generated_quantifier_token_index != null)
-            try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
+            try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
-            try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
+            try expr_predicate.parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
         var condition_transferred = false;
         errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
         try expression_predicates.append(alloc, condition);
@@ -7613,9 +7613,9 @@ pub fn parseExpressionWhereConditionsAlloc(
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             const condition = if (generated_quantifier_token_index != null)
-                try parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
+                try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
-                try parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
+                try expr_predicate.parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
             var condition_transferred = false;
             errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
             try expression_predicates.append(alloc, condition);
@@ -12278,110 +12278,6 @@ pub fn parseArrayLengthExpressionProjectionAlloc(
     return expr_build.buildExpressionProjection(output, expression);
 }
 
-pub fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
-    return switch (op) {
-        .lower, .upper, .md5 => true,
-        .expression => false,
-    };
-}
-
-pub fn relationalGeneratedOpForUniqueExpressionOp(op: runtime_schema.UniqueExpressionOp) runtime_schema.RelationalGeneratedOp {
-    return switch (op) {
-        .lower => .lower,
-        .upper => .upper,
-        .md5 => .md5,
-        .expression => unreachable,
-    };
-}
-
-pub fn uniqueExpressionOpToken(op: runtime_schema.UniqueExpressionOp) []const u8 {
-    return switch (op) {
-        .lower => "lower",
-        .upper => "upper",
-        .md5 => "md5",
-        .expression => "expression",
-    };
-}
-
-pub fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
-    return switch (op) {
-        .is_null => "is_null",
-        .is_not_null => "is_not_null",
-        .eq => "eq",
-        .ne => "ne",
-    };
-}
-
-pub fn uniquePredicateAsRelationalCheckOp(op: runtime_schema.UniquePredicateOp) runtime_schema.RelationalCheckOp {
-    return switch (op) {
-        .is_null => .is_null,
-        .is_not_null => .is_not_null,
-        .eq => .eq,
-        .ne => .ne,
-    };
-}
-
-pub fn relationalCheckOpFromUniquePredicateToken(token: []const u8) ?runtime_schema.RelationalCheckOp {
-    if (std.mem.eql(u8, token, "is_null")) return .is_null;
-    if (std.mem.eql(u8, token, "is_not_null")) return .is_not_null;
-    if (std.mem.eql(u8, token, "eq")) return .eq;
-    if (std.mem.eql(u8, token, "ne")) return .ne;
-    return null;
-}
-
-pub fn jsonPathSegmentsToDottedPathAlloc(alloc: std.mem.Allocator, segments: []const []const u8) ![]const u8 {
-    if (segments.len == 0) return error.UnsupportedSqlShape;
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    for (segments, 0..) |segment, i| {
-        if (segment.len == 0 or std.mem.indexOfScalar(u8, segment, '.') != null) return error.UnsupportedSqlShape;
-        if (i != 0) try out.append(alloc, '.');
-        try out.appendSlice(alloc, segment);
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
-pub fn parsePostgresJsonPathTextAlloc(alloc: std.mem.Allocator, path: []const u8) ![]const []const u8 {
-    if (path.len < 3 or path[0] != '{' or path[path.len - 1] != '}') return error.UnsupportedSqlShape;
-    const inner = path[1 .. path.len - 1];
-    var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (out.items) |segment| alloc.free(segment);
-        out.deinit(alloc);
-    }
-    var parts = std.mem.splitScalar(u8, inner, ',');
-    while (parts.next()) |part| {
-        if (part.len == 0 or std.mem.indexOfScalar(u8, part, '.') != null) return error.UnsupportedSqlShape;
-        const segment = try alloc.dupe(u8, part);
-        var segment_transferred = false;
-        errdefer if (!segment_transferred) alloc.free(segment);
-        try out.append(alloc, segment);
-        segment_transferred = true;
-    }
-    if (out.items.len == 0) return error.UnsupportedSqlShape;
-    return try out.toOwnedSlice(alloc);
-}
-
-pub fn parsePostgresJsonPathJsonArrayAlloc(alloc: std.mem.Allocator, path_json: []const u8) ![]const []const u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, path_json, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value != .array or parsed.value.array.items.len == 0) return error.UnsupportedSqlShape;
-    var out = std.ArrayListUnmanaged([]const u8).empty;
-    errdefer {
-        for (out.items) |segment| alloc.free(segment);
-        out.deinit(alloc);
-    }
-    for (parsed.value.array.items) |item| {
-        if (item != .string or item.string.len == 0 or std.mem.indexOfScalar(u8, item.string, '.') != null) return error.UnsupportedSqlShape;
-        const segment = try alloc.dupe(u8, item.string);
-        var segment_transferred = false;
-        errdefer if (!segment_transferred) alloc.free(segment);
-        try out.append(alloc, segment);
-        segment_transferred = true;
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
 pub fn generatedUnaryTextColumnForField(
     schema: runtime_schema.TableSchema,
     op: runtime_schema.RelationalGeneratedOp,
@@ -12864,35 +12760,6 @@ pub fn sqlJsonNumberAsF64(value: std.json.Value) ?f64 {
     };
 }
 
-pub fn normalizeSqlLikePatternEscapeAlloc(alloc: std.mem.Allocator, pattern: []const u8, escape: []const u8) ![]const u8 {
-    if (escape.len != 1) return error.UnsupportedSqlShape;
-    const escape_char = escape[0];
-    if (escape_char == '\\') return try alloc.dupe(u8, pattern);
-
-    var out = std.ArrayListUnmanaged(u8).empty;
-    errdefer out.deinit(alloc);
-    var index: usize = 0;
-    while (index < pattern.len) {
-        const byte = pattern[index];
-        if (byte == escape_char) {
-            if (index + 1 >= pattern.len) return error.UnsupportedSqlShape;
-            try out.append(alloc, '\\');
-            try out.append(alloc, pattern[index + 1]);
-            index += 2;
-            continue;
-        }
-        if (byte == '\\') {
-            try out.append(alloc, '\\');
-            try out.append(alloc, '\\');
-            index += 1;
-            continue;
-        }
-        try out.append(alloc, byte);
-        index += 1;
-    }
-    return try out.toOwnedSlice(alloc);
-}
-
 pub fn sqlLikePrefixLiteralAlloc(alloc: std.mem.Allocator, pattern: []const u8) !?[]const u8 {
     var out = std.ArrayListUnmanaged(u8).empty;
     errdefer out.deinit(alloc);
@@ -12921,13 +12788,6 @@ pub fn sqlLikePrefixLiteralAlloc(alloc: std.mem.Allocator, pattern: []const u8) 
     }
     out.deinit(alloc);
     return null;
-}
-
-pub fn jsonStringLiteralValueAlloc(alloc: std.mem.Allocator, value_json: []const u8) ![]const u8 {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value != .string) return error.UnsupportedSqlShape;
-    return try alloc.dupe(u8, parsed.value.string);
 }
 
 pub fn validateAggregateGroupBy(
@@ -17993,28 +17853,6 @@ fn selectorJsonNumber(value: std.json.Value) ?f64 {
     };
 }
 
-pub fn uniqueConstraintReferencesAny(
-    constraint: runtime_schema.UniqueConstraint,
-    fields: []const []const u8,
-) bool {
-    if (stringSlicesIntersect(constraint.columns, fields)) return true;
-    for (constraint.expressions) |expression| {
-        switch (expression.op) {
-            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
-            .expression => if (expression.expression) |row_expression| {
-                if (expr_type.expressionReferencesAny(row_expression, fields)) return true;
-            },
-        }
-    }
-    for (constraint.where) |predicate| {
-        if (stringSlicesContains(fields, predicate.field)) return true;
-    }
-    for (constraint.where_expressions) |condition| {
-        if (expr_type.expressionConditionReferencesAny(condition, fields)) return true;
-    }
-    return false;
-}
-
 pub fn windowOutputFieldIsUnique(
     fields: []const []const u8,
     windows: []const db_mod.types.RelationalRowsWindowSpec,
@@ -18228,7 +18066,7 @@ fn relationalChecksFromUniqueWhereJsonAlloc(
         const field_value = item.object.get("field") orelse return error.UnsupportedSqlShape;
         const op_value = item.object.get("op") orelse return error.UnsupportedSqlShape;
         if (field_value != .string or op_value != .string) return error.UnsupportedSqlShape;
-        const op = relationalCheckOpFromUniquePredicateToken(op_value.string) orelse return error.UnsupportedSqlShape;
+        const op = expr_type.relationalCheckOpFromUniquePredicateToken(op_value.string) orelse return error.UnsupportedSqlShape;
         const field = try alloc.dupe(u8, field_value.string);
         var field_transferred = false;
         errdefer if (!field_transferred) alloc.free(field);
@@ -18259,7 +18097,7 @@ fn validateUniqueWhereJsonMatches(alloc: std.mem.Allocator, where_json: []const 
         const field_value = item.object.get("field") orelse return error.UnsupportedSqlShape;
         const op_value = item.object.get("op") orelse return error.UnsupportedSqlShape;
         if (field_value != .string or !std.mem.eql(u8, field_value.string, predicate.field)) return error.UnsupportedSqlShape;
-        if (op_value != .string or !std.mem.eql(u8, op_value.string, uniquePredicateOpToken(predicate.op))) return error.UnsupportedSqlShape;
+        if (op_value != .string or !std.mem.eql(u8, op_value.string, expr_type.uniquePredicateOpToken(predicate.op))) return error.UnsupportedSqlShape;
         const supplied_value = item.object.get("value");
         if (predicate.value_json) |expected_json| {
             const supplied = supplied_value orelse return error.UnsupportedSqlShape;
@@ -23367,27 +23205,6 @@ pub fn peekAggregateHavingExpression(tokens: []const Token, pos: usize) bool {
         parser.peekKeyword(tokens, pos, "least");
 }
 
-pub fn parseExpressionLikeConditionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    params: []const value_mod.SqlValue,
-    type_context: expr_type.RowExpressionTypeContext,
-    expression: db_mod.types.RelationalRowsExpression,
-    case_insensitive: bool,
-    negated: bool,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const raw_pattern = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, params);
-    defer alloc.free(raw_pattern);
-    const normalized_pattern = if (parser.matchKeyword(tokens, pos, "escape")) blk: {
-        const escape = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, params);
-        defer alloc.free(escape);
-        break :blk try normalizeSqlLikePatternEscapeAlloc(alloc, raw_pattern, escape);
-    } else try alloc.dupe(u8, raw_pattern);
-    defer alloc.free(normalized_pattern);
-    return try expr_predicate.expressionLikeConditionAlloc(alloc, type_context, expression, normalized_pattern, case_insensitive, negated);
-}
-
 pub fn parseExpressionRegexpMatchConditionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -23401,24 +23218,6 @@ pub fn parseExpressionRegexpMatchConditionAlloc(
     const pattern_expression = try parseExpressionWhereConditionRowExpressionAlloc(alloc, tokens, pos, type_context, options);
     defer freeExpression(alloc, pattern_expression);
     return try expr_predicate.expressionRegexpMatchConditionAlloc(alloc, type_context, expression, pattern_expression, case_insensitive, negated);
-}
-
-pub fn parseExpressionLikeSetConditionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    params: []const value_mod.SqlValue,
-    type_context: expr_type.RowExpressionTypeContext,
-    expression: db_mod.types.RelationalRowsExpression,
-    case_insensitive: bool,
-    negated: bool,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const quantifier = expr_token.matchAnySomeOrAllKeyword(tokens, pos) orelse return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .lparen);
-    const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
-    defer alloc.free(values_json);
-    try parser.expectToken(tokens, pos, .rparen);
-    return try expr_predicate.expressionLikeSetConditionAlloc(alloc, type_context, expression, values_json, case_insensitive, negated, quantifier);
 }
 
 pub fn validateGeneratedQuantifiedPredicateIdentity(
@@ -24173,7 +23972,7 @@ pub fn parseWhereAtomAlloc(
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
         const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
         try validateGeneratedPatternPredicateIdentity(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-        try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, negated, realtime_ns);
+        try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, negated, realtime_ns);
         return;
     }
     if (parser.matchKeyword(tokens, pos, "between")) {
@@ -24209,7 +24008,7 @@ pub fn parseWhereAtomAlloc(
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try validateGeneratedPatternPredicateIdentity(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-            try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, true, realtime_ns);
+            try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, true, realtime_ns);
             return;
         }
         try parser.expectKeyword(tokens, pos, "in");
@@ -24453,7 +24252,7 @@ pub fn parseJoinWhereAlloc(
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-            try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, false, realtime_ns);
+            try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -24464,7 +24263,7 @@ pub fn parseJoinWhereAlloc(
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
                 const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
                 try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-                try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, true, realtime_ns);
+                try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
             }
@@ -25029,7 +24828,7 @@ pub fn parseLateralWhereAlloc(
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-            try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, false, realtime_ns);
+            try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
@@ -25041,7 +24840,7 @@ pub fn parseLateralWhereAlloc(
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
                 const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
                 try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
-                try parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, true, realtime_ns);
+                try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
             }
@@ -25205,31 +25004,6 @@ pub fn parseLateralWhereAlloc(
         }
         if (!parser.matchKeyword(tokens, pos, "and")) break;
     }
-}
-
-pub fn parseAndAppendTextPatternPredicateAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    params: []const value_mod.SqlValue,
-    text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
-    field: []const u8,
-    column: runtime_schema.RelationalColumn,
-    case_insensitive: bool,
-    negated: bool,
-    realtime_ns: u64,
-) !void {
-    const pattern_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
-    defer alloc.free(pattern_json);
-    const parsed_pattern = try jsonStringLiteralValueAlloc(alloc, pattern_json);
-    defer alloc.free(parsed_pattern);
-    const pattern = if (parser.matchKeyword(tokens, pos, "escape")) blk: {
-        const escape = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, params);
-        defer alloc.free(escape);
-        break :blk try normalizeSqlLikePatternEscapeAlloc(alloc, parsed_pattern, escape);
-    } else try alloc.dupe(u8, parsed_pattern);
-    defer alloc.free(pattern);
-    try expr_predicate.appendTextPatternPredicateAlloc(alloc, text_patterns, field, column, pattern, case_insensitive, negated);
 }
 
 pub fn joinedMutationExpressionSideAt(
@@ -39446,14 +39220,6 @@ test "sql adapter lower expr lowers temporal range predicates and bound projecti
 test "sql adapter lower expr assembles boolean predicate groups" {
     const alloc = std.testing.allocator;
 
-    const normalized_like = try normalizeSqlLikePatternEscapeAlloc(alloc, "a#_%", "#");
-    defer alloc.free(normalized_like);
-    try std.testing.expectEqualStrings("a\\_%", normalized_like);
-    const escaped_backslash_like = try normalizeSqlLikePatternEscapeAlloc(alloc, "a\\_%", "\\");
-    defer alloc.free(escaped_backslash_like);
-    try std.testing.expectEqualStrings("a\\_%", escaped_backslash_like);
-    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlLikePatternEscapeAlloc(alloc, "dangling#", "#"));
-
     const like_prefix = try sqlLikePrefixLiteralAlloc(alloc, "abc%");
     defer if (like_prefix) |owned| alloc.free(owned);
     try std.testing.expect(like_prefix != null);
@@ -39465,11 +39231,6 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     const wildcard_like_prefix = try sqlLikePrefixLiteralAlloc(alloc, "a_c%");
     defer if (wildcard_like_prefix) |owned| alloc.free(owned);
     try std.testing.expect(wildcard_like_prefix == null);
-
-    const json_string = try jsonStringLiteralValueAlloc(alloc, "\"hello\"");
-    defer alloc.free(json_string);
-    try std.testing.expectEqualStrings("hello", json_string);
-    try std.testing.expectError(error.UnsupportedSqlShape, jsonStringLiteralValueAlloc(alloc, "123"));
 
     var expression_conditions = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpressionCondition).empty;
     defer {
@@ -39814,14 +39575,6 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqual(@as(usize, 0), groups[1].conditions.len);
 }
 
-test "sql adapter lower expr names every row expression kind" {
-    inline for (std.meta.fields(runtime_schema.RelationalRowsExpressionKind)) |field| {
-        const kind: runtime_schema.RelationalRowsExpressionKind = @field(runtime_schema.RelationalRowsExpressionKind, field.name);
-        try std.testing.expect(expr_type.rowExpressionOpName(kind).len > 0);
-        try std.testing.expect(expr_type.rowExpressionDefaultOutputName(kind).len > 0);
-    }
-}
-
 test "sql adapter lower expr validates distinct on order expressions" {
     const lower_status: runtime_schema.RelationalRowsExpression = .{
         .kind = .lower,
@@ -39992,6 +39745,7 @@ test "sql adapter lower expr validates aggregate helpers" {
         .name = "statuses",
         .op = .array_agg,
         .field = "status",
+        .filter_json_contains = &json_filters,
     }};
     const duplicate_aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{.{
         .name = "status",
@@ -40304,42 +40058,7 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expect(!joinProjectionOutputIsUnique(&duplicate_join_projections, "id"));
 }
 
-test "sql adapter lower expr detects catalog expression references" {
-    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
-    const tenant_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "tenant_id" };
-    const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"active\"" };
-    const condition: runtime_schema.RelationalRowsExpressionCondition = .{
-        .lhs = status_field,
-        .op = .eq,
-        .rhs = &.{literal},
-    };
-    const generated_column: runtime_schema.RelationalColumn = .{
-        .name = "tenant_status",
-        .path = "tenant_status",
-        .field_type = .keyword,
-        .generated = .{ .op = .concat_ws, .fields = &.{ "tenant_id", "status" }, .separator = ":" },
-    };
-    const expression_generated: runtime_schema.RelationalColumn = .{
-        .name = "status_lower",
-        .path = "status_lower",
-        .field_type = .keyword,
-        .generated = .{ .op = .expression, .expression = .{ .kind = .lower, .operands = &.{status_field} } },
-    };
-    const unique_constraint: runtime_schema.UniqueConstraint = .{
-        .name = "tenant_status_key",
-        .columns = &.{"tenant_id"},
-        .expressions = &.{.{ .op = .expression, .expression = .{ .kind = .concat, .operands = &.{ tenant_field, status_field } } }},
-        .where_expressions = &.{condition},
-    };
-
-    try std.testing.expect(expr_type.generatedColumnReferencesAny(generated_column, &.{"tenant_id"}));
-    try std.testing.expect(expr_type.generatedColumnReferencesAny(expression_generated, &.{"status"}));
-    try std.testing.expect(expr_type.expressionConditionReferencesAny(condition, &.{"status"}));
-    try std.testing.expect(expr_type.expressionConditionReferencesField(condition, "status"));
-    try std.testing.expect(!expr_type.expressionConditionReferencesField(condition, "tenant_id"));
-    try std.testing.expect(uniqueConstraintReferencesAny(unique_constraint, &.{"status"}));
-    try std.testing.expect(!uniqueConstraintReferencesAny(unique_constraint, &.{"missing"}));
-
+test "sql adapter lower expr handles selector expression helpers" {
     const SelectorValue = struct {
         field: []const u8,
         value_json: []const u8,
@@ -40395,26 +40114,12 @@ test "sql adapter lower expr detects catalog expression references" {
     try std.testing.expectEqual(SelectorJsonOrder.lt, selectorCompareJsonScalars(left_number.value, right_number.value) orelse return error.TestUnexpectedResult);
     try std.testing.expect(selectorJsonValuesEqual(left_number.value, left_number.value));
 
-    try std.testing.expect(isCaseFoldExpressionOp(.lower));
-    try std.testing.expect(isCaseFoldExpressionOp(.upper));
-    try std.testing.expect(isCaseFoldExpressionOp(.md5));
-    try std.testing.expect(!isCaseFoldExpressionOp(.expression));
     const md5_hex = try md5HexTextAlloc(std.testing.allocator, "hello");
     defer std.testing.allocator.free(md5_hex);
     try std.testing.expectEqualStrings("5d41402abc4b2a76b9719d911017c592", md5_hex);
     const initcap = try initcapTextAlloc(std.testing.allocator, "hello SQL-world");
     defer std.testing.allocator.free(initcap);
     try std.testing.expectEqualStrings("Hello Sql-World", initcap);
-    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, relationalGeneratedOpForUniqueExpressionOp(.lower));
-    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, relationalGeneratedOpForUniqueExpressionOp(.upper));
-    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, relationalGeneratedOpForUniqueExpressionOp(.md5));
-    try std.testing.expectEqualStrings("expression", uniqueExpressionOpToken(.expression));
-    try std.testing.expectEqualStrings("eq", uniquePredicateOpToken(.eq));
-    try std.testing.expectEqualStrings("is_not_null", uniquePredicateOpToken(.is_not_null));
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, uniquePredicateAsRelationalCheckOp(.ne));
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, uniquePredicateAsRelationalCheckOp(.is_null));
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, relationalCheckOpFromUniquePredicateToken("eq").?);
-    try std.testing.expect(relationalCheckOpFromUniquePredicateToken("missing") == null);
     const arithmetic_tokens = [_]Token{
         .{ .kind = .identifier, .text = "amount" },
         .{ .kind = .plus, .text = "+" },
@@ -44040,167 +43745,4 @@ test "sql adapter lower expr lowers row_number window query plans" {
     defer duplicate_window_label_order_by_ordinal.deinit(alloc);
     try std.testing.expectEqualStrings("id_2", duplicate_window_label_order_by_ordinal.plan.window.windows[0].output);
     try std.testing.expectEqualStrings("id_2", duplicate_window_label_order_by_ordinal.plan.window.order_by[0].field);
-}
-
-test "sql adapter lower expr detects deterministic row expressions" {
-    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
-    const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"open\"" };
-    const source_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status", .field_source = .source };
-    const now_expression: runtime_schema.RelationalRowsExpression = .{ .kind = .now };
-    const condition: runtime_schema.RelationalRowsExpressionCondition = .{
-        .lhs = status_field,
-        .op = .eq,
-        .rhs = &.{literal},
-    };
-    const nondeterministic_condition: runtime_schema.RelationalRowsExpressionCondition = .{
-        .lhs = status_field,
-        .op = .eq,
-        .rhs = &.{now_expression},
-    };
-
-    try std.testing.expect(expr_type.rowExpressionDeterministic(status_field));
-    try std.testing.expect(!expr_type.rowExpressionDeterministic(source_field));
-    try std.testing.expect(!expr_type.rowExpressionDeterministic(now_expression));
-    try std.testing.expect(expr_type.rowExpressionConditionDeterministic(condition));
-    try std.testing.expect(!expr_type.rowExpressionConditionDeterministic(nondeterministic_condition));
-}
-
-test "sql adapter lower expr validates catalog check expression types" {
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "status", .path = "status", .field_type = .keyword },
-        .{ .name = "amount", .path = "amount", .field_type = .numeric },
-        .{ .name = "metadata", .path = "metadata", .field_type = .json },
-    };
-    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
-    const amount_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "amount" };
-    const metadata_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "metadata" };
-    const numeric_literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "10" };
-    const now_expression: runtime_schema.RelationalRowsExpression = .{ .kind = .now };
-    const lower_status: runtime_schema.RelationalRowsExpression = .{
-        .kind = .lower,
-        .operands = &.{status_field},
-    };
-    const valid_condition: runtime_schema.RelationalRowsExpressionCondition = .{
-        .lhs = amount_field,
-        .op = .gt,
-        .rhs = &.{numeric_literal},
-    };
-    const incomparable_condition: runtime_schema.RelationalRowsExpressionCondition = .{
-        .lhs = status_field,
-        .op = .eq,
-        .rhs = &.{metadata_field},
-    };
-    const nondeterministic_condition: runtime_schema.RelationalRowsExpressionCondition = .{
-        .lhs = amount_field,
-        .op = .eq,
-        .rhs = &.{now_expression},
-    };
-
-    try expr_type.validateCheckExpressionForColumns(&columns, lower_status);
-    try expr_type.validateCheckExpressionConditionForColumns(&columns, valid_condition);
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateCheckExpressionConditionForColumns(&columns, incomparable_condition));
-    try expr_type.validateGeneratedColumnExpressionForColumns(&columns, "status_lower", lower_status);
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateGeneratedColumnExpressionForColumns(&columns, "status", status_field));
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateUniquePredicateExpressionsForColumns(&columns, &.{nondeterministic_condition}));
-
-    try std.testing.expect(expr_type.sqlExpressionTypeIsTextLike(.keyword));
-    try std.testing.expect(!expr_type.sqlExpressionTypeIsTextLike(.json));
-    try std.testing.expect(expr_type.sqlExpressionTypesComparable(.keyword, .text));
-    try std.testing.expect(expr_type.sqlExpressionTypesComparable(.datetime, .numeric));
-    try std.testing.expect(!expr_type.sqlExpressionTypesComparable(.json, .text));
-    try std.testing.expect(expr_type.sqlExpressionTypeIsOrderable(.boolean));
-    try std.testing.expect(!expr_type.sqlExpressionTypeIsOrderable(.json));
-    try std.testing.expect(expr_type.sqlAggregateMinMaxTypeAllowed(.datetime));
-    try std.testing.expect(!expr_type.sqlAggregateMinMaxTypeAllowed(.boolean));
-    try std.testing.expect(expr_type.sqlAggregateModeTypeAllowed(.boolean));
-    try std.testing.expect(expr_type.sqlExpressionTypeIsOrderKey(.json));
-    try std.testing.expect(expr_type.sqlExpressionResultTypesCompatible(.keyword, .text));
-}
-
-test "sql adapter lower expr validates DDL expression catalog constraints" {
-    const columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "status", .path = "status", .field_type = .keyword },
-        .{ .name = "amount", .path = "amount", .field_type = .numeric },
-        .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
-        .{ .name = "updated_at", .path = "updated_at", .field_type = .datetime },
-        .{ .name = "metadata", .path = "metadata", .field_type = .json },
-    };
-    const pk_columns = [_]runtime_schema.RelationalColumn{
-        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
-        .{ .name = "status", .path = "status", .field_type = .keyword },
-    };
-    const periods = [_]runtime_schema.RelationalPeriod{.{ .name = "valid_at", .start_column = "created_at", .end_column = "updated_at" }};
-    const lower_status: runtime_schema.RelationalRowsExpression = .{
-        .kind = .lower,
-        .operands = &.{.{ .kind = .field, .field = "status" }},
-    };
-
-    try expr_type.validateRelationalColumnCatalog(&columns);
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateRelationalColumnCatalog(&.{.{
-        .name = "amount",
-        .path = "amount",
-        .field_type = .numeric,
-        .collation = "C",
-    }}));
-    try expr_type.validatePrimaryKeyColumns(&pk_columns, .{ .columns = &.{"id"}, .include_columns = &.{"status"} });
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validatePrimaryKeyColumns(&columns, .{ .columns = &.{"status"} }));
-
-    try expr_type.validateCheckForColumns(&columns, .{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" });
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateCheckForColumns(&columns, .{ .name = "bad_json_order", .field = "metadata", .op = .gt, .value_json = "{}" }));
-    try expr_type.validateRelationalCheckCatalog(&columns, &.{.{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" }});
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateRelationalCheckCatalog(&columns, &.{
-        .{ .name = "dup_check", .field = "amount", .op = .gt, .value_json = "0" },
-        .{ .name = "dup_check", .field = "amount", .op = .lt, .value_json = "10" },
-    }));
-
-    try expr_type.validateGeneratedColumnForColumns(&columns, .{
-        .name = "status_lower",
-        .path = "status_lower",
-        .field_type = .keyword,
-        .generated = .{ .op = .expression, .expression = lower_status },
-    });
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateGeneratedColumnForColumns(&columns, .{
-        .name = "status",
-        .path = "status",
-        .field_type = .keyword,
-        .generated = .{ .op = .lower, .field = "status" },
-    }));
-
-    try expr_type.validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"amount"});
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"status"}));
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"metadata"}));
-
-    try expr_type.validateUniquePredicatesForColumns(&columns, &.{.{ .field = "status", .op = .eq, .value_json = "\"open\"" }});
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateUniquePredicatesForColumns(&columns, &.{.{ .field = "metadata", .op = .is_not_null }}));
-
-    try expr_type.validateUniqueConstraintForColumns(&columns, &periods, .{
-        .name = "status_key",
-        .columns = &.{"status"},
-        .expressions = &.{.{ .op = .expression, .expression = lower_status }},
-        .include_columns = &.{"amount"},
-        .without_overlaps_period = "valid_at",
-    });
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateUniqueConstraintForColumns(&columns, &periods, .{
-        .name = "metadata_key",
-        .columns = &.{"metadata"},
-    }));
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateUniqueConstraintForColumns(&columns, &periods, .{
-        .name = "empty_key",
-    }));
-    try expr_type.validateUniqueConstraintCatalog(&columns, &periods, &.{.{ .name = "status_key", .columns = &.{"status"} }});
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateUniqueConstraintCatalog(&columns, &periods, &.{
-        .{ .name = "dup_key", .columns = &.{"status"} },
-        .{ .name = "dup_key", .columns = &.{"amount"} },
-    }));
-
-    try expr_type.validateForeignKeyCatalog(&columns, &periods, &.{.{
-        .name = "status_parent_fkey",
-        .parent_table = "parent_statuses",
-        .child_columns = &.{"status"},
-        .parent_columns = &.{"status"},
-    }});
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateForeignKeyCatalog(&columns, &periods, &.{
-        .{ .name = "dup_fkey", .parent_table = "parent_statuses", .child_columns = &.{"status"}, .parent_columns = &.{"status"} },
-        .{ .name = "dup_fkey", .parent_table = "parent_statuses", .child_columns = &.{"amount"}, .parent_columns = &.{"amount"} },
-    }));
 }

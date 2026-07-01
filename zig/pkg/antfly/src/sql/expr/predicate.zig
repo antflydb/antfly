@@ -14,20 +14,58 @@
 
 const std = @import("std");
 
-const ast = @import("ast.zig");
-const db_mod = @import("../storage/db/mod.zig");
-const expr_limits = @import("expr_limits.zig");
-const expr_type = @import("expr_type.zig");
-const plan_mod = @import("plan.zig");
-const runtime_schema = @import("../storage/schema.zig");
-const token_mod = @import("token.zig");
-const value_mod = @import("value.zig");
+const ast = @import("../ast.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const expr_limits = @import("limits.zig");
+const expr_token = @import("token.zig");
+const expr_type = @import("type.zig");
+const parser = @import("../parser.zig");
+const plan_mod = @import("../plan.zig");
+const runtime_schema = @import("../../storage/schema.zig");
+const token_mod = @import("../token.zig");
+const value_mod = @import("../value.zig");
 
 const Token = token_mod.Token;
 const cloneExpressionAlloc = plan_mod.cloneExpressionAlloc;
 const freeExpression = plan_mod.freeExpression;
 const freeExpressionCondition = plan_mod.freeExpressionCondition;
 const max_scalar_or_expanded_branches = expr_limits.max_scalar_or_expanded_branches;
+
+pub fn normalizeSqlLikePatternEscapeAlloc(alloc: std.mem.Allocator, pattern: []const u8, escape: []const u8) ![]const u8 {
+    if (escape.len != 1) return error.UnsupportedSqlShape;
+    const escape_char = escape[0];
+    if (escape_char == '\\') return try alloc.dupe(u8, pattern);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var index: usize = 0;
+    while (index < pattern.len) {
+        const byte = pattern[index];
+        if (byte == escape_char) {
+            if (index + 1 >= pattern.len) return error.UnsupportedSqlShape;
+            try out.append(alloc, '\\');
+            try out.append(alloc, pattern[index + 1]);
+            index += 2;
+            continue;
+        }
+        if (byte == '\\') {
+            try out.append(alloc, '\\');
+            try out.append(alloc, '\\');
+            index += 1;
+            continue;
+        }
+        try out.append(alloc, byte);
+        index += 1;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+pub fn jsonStringLiteralValueAlloc(alloc: std.mem.Allocator, value_json: []const u8) ![]const u8 {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
+    defer parsed.deinit();
+    if (parsed.value != .string) return error.UnsupportedSqlShape;
+    return try alloc.dupe(u8, parsed.value.string);
+}
 
 pub fn appendExpressionValuesJsonConjunction(
     alloc: std.mem.Allocator,
@@ -265,6 +303,27 @@ pub fn expressionLikeConditionAlloc(
     };
 }
 
+pub fn parseExpressionLikeConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    type_context: expr_type.RowExpressionTypeContext,
+    expression: db_mod.types.RelationalRowsExpression,
+    case_insensitive: bool,
+    negated: bool,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const raw_pattern = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+    defer alloc.free(raw_pattern);
+    const normalized_pattern = if (parser.matchKeyword(tokens, pos, "escape")) blk: {
+        const escape = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+        defer alloc.free(escape);
+        break :blk try normalizeSqlLikePatternEscapeAlloc(alloc, raw_pattern, escape);
+    } else try alloc.dupe(u8, raw_pattern);
+    defer alloc.free(normalized_pattern);
+    return try expressionLikeConditionAlloc(alloc, type_context, expression, normalized_pattern, case_insensitive, negated);
+}
+
 pub fn expressionRegexpMatchConditionAlloc(
     alloc: std.mem.Allocator,
     type_context: expr_type.RowExpressionTypeContext,
@@ -418,6 +477,24 @@ pub fn expressionLikeSetConditionAlloc(
     };
 }
 
+pub fn parseExpressionLikeSetConditionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    type_context: expr_type.RowExpressionTypeContext,
+    expression: db_mod.types.RelationalRowsExpression,
+    case_insensitive: bool,
+    negated: bool,
+) !db_mod.types.RelationalRowsExpressionCondition {
+    const quantifier = expr_token.matchAnySomeOrAllKeyword(tokens, pos) orelse return error.UnsupportedSqlShape;
+    try parser.expectToken(tokens, pos, .lparen);
+    const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
+    defer alloc.free(values_json);
+    try parser.expectToken(tokens, pos, .rparen);
+    return try expressionLikeSetConditionAlloc(alloc, type_context, expression, values_json, case_insensitive, negated, quantifier);
+}
+
 pub fn appendExpressionInPredicateGroupsAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -458,6 +535,31 @@ pub fn appendTextPatternPredicateAlloc(
     pattern_transferred = true;
 }
 
+pub fn parseAndAppendTextPatternPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    text_patterns: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate),
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+    case_insensitive: bool,
+    negated: bool,
+    realtime_ns: u64,
+) !void {
+    const pattern_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
+    defer alloc.free(pattern_json);
+    const parsed_pattern = try jsonStringLiteralValueAlloc(alloc, pattern_json);
+    defer alloc.free(parsed_pattern);
+    const pattern = if (parser.matchKeyword(tokens, pos, "escape")) blk: {
+        const escape = try value_mod.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+        defer alloc.free(escape);
+        break :blk try normalizeSqlLikePatternEscapeAlloc(alloc, parsed_pattern, escape);
+    } else try alloc.dupe(u8, parsed_pattern);
+    defer alloc.free(pattern);
+    try appendTextPatternPredicateAlloc(alloc, text_patterns, field, column, pattern, case_insensitive, negated);
+}
+
 fn testTypeContext(alloc: std.mem.Allocator) expr_type.RowExpressionTypeContext {
     const columns = struct {
         const values = [_]runtime_schema.RelationalColumn{
@@ -491,6 +593,24 @@ test "sql expr_predicate builds like predicate expressions" {
     try std.testing.expectEqual(@as(usize, 2), like_any_condition.lhs.operands.len);
     try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.ilike, like_any_condition.lhs.operands[0].kind);
     try std.testing.expectEqualStrings("true", like_any_condition.rhs[0].value_json);
+}
+
+test "sql expr_predicate normalizes pattern escapes and json strings" {
+    const alloc = std.testing.allocator;
+
+    const normalized_like = try normalizeSqlLikePatternEscapeAlloc(alloc, "a#_%", "#");
+    defer alloc.free(normalized_like);
+    try std.testing.expectEqualStrings("a\\_%", normalized_like);
+
+    const escaped_backslash_like = try normalizeSqlLikePatternEscapeAlloc(alloc, "a\\_%", "\\");
+    defer alloc.free(escaped_backslash_like);
+    try std.testing.expectEqualStrings("a\\_%", escaped_backslash_like);
+    try std.testing.expectError(error.UnsupportedSqlShape, normalizeSqlLikePatternEscapeAlloc(alloc, "dangling#", "#"));
+
+    const json_string = try jsonStringLiteralValueAlloc(alloc, "\"hello\"");
+    defer alloc.free(json_string);
+    try std.testing.expectEqualStrings("hello", json_string);
+    try std.testing.expectError(error.UnsupportedSqlShape, jsonStringLiteralValueAlloc(alloc, "123"));
 }
 
 test "sql expr_predicate appends scalar and text predicates" {

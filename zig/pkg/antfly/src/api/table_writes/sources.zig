@@ -438,6 +438,7 @@ pub const ProvisionedTableWriteSource = struct {
     raft_batcher: ?RaftBatcher = null,
     group_visible_root_generation: ?table_read_core.GroupVisibleRootGenerationSource = null,
     antfly_provider: ?managed_embedder.AntflyProvider = null,
+    inference_api_url: ?[]const u8 = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
     resolution_candidate_source: ?db_mod.CandidateSource = null,
@@ -477,6 +478,16 @@ pub const ProvisionedTableWriteSource = struct {
         self.antfly_provider = provider;
         if (self.write_cache) |cache| cache.antfly_provider = provider;
         if (self.startup_write_cache) |cache| cache.antfly_provider = provider;
+        return self;
+    }
+
+    pub fn withInferenceAPIURL(
+        self: *ProvisionedTableWriteSource,
+        inference_api_url: ?[]const u8,
+    ) *ProvisionedTableWriteSource {
+        self.inference_api_url = inference_api_url;
+        if (self.write_cache) |cache| cache.inference_api_url = inference_api_url;
+        if (self.startup_write_cache) |cache| cache.inference_api_url = inference_api_url;
         return self;
     }
 
@@ -1097,6 +1108,7 @@ pub const ProvisionedTableWriteSource = struct {
         _ = alloc;
         if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
+        cache.inference_api_url = self.inference_api_url;
         cache.remote_content = self.remote_content;
         self.syncRuntimeHooksToCache(cache);
         const identity_namespace = if (preloaded_metadata) |metadata|
@@ -1198,6 +1210,7 @@ pub const ProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .inference_api_url = self.inference_api_url,
                     .ha_write_gate = self.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,
@@ -1548,6 +1561,7 @@ pub const ProvisionedTableWriteSource = struct {
 
         if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
+        cache.inference_api_url = self.inference_api_url;
         cache.secret_store = self.secret_store;
         cache.remote_content = self.remote_content;
 
@@ -1587,7 +1601,7 @@ pub const ProvisionedTableWriteSource = struct {
                 try cache.replaceTableMetadataLocked(table.name, table.indexes_json, table.schema_json);
                 continue;
             }
-            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
                 table.indexes_json,
@@ -1601,6 +1615,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.secret_store,
                 self.remote_content,
                 identity_namespace,
+                .{ .inference_api_url = self.inference_api_url },
             );
             defer if (opened) |*db| db.close();
             summary.dbs_opened += 1;
@@ -1878,6 +1893,7 @@ pub const ProvisionedTableWriteSource = struct {
                     identity_namespace,
                     .{
                         .drain_resolver_backfill = false,
+                        .inference_api_url = self.inference_api_url,
                         .ha_write_gate = self.ha_write_gate,
                         .ha_async_effect_mirror = effective_ha_mirror,
                         .ha_async_batch_mirror = effective_ha_mirror,
@@ -2978,7 +2994,7 @@ pub const ProvisionedTableWriteSource = struct {
         indexes_json: []const u8,
     ) !db_mod.DB {
         const identity_namespace = try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id);
-        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+        var db = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
             alloc,
             path,
             indexes_json,
@@ -2992,6 +3008,7 @@ pub const ProvisionedTableWriteSource = struct {
             self.secret_store,
             self.remote_content,
             identity_namespace,
+            .{ .inference_api_url = self.inference_api_url },
         );
         errdefer db.close();
         try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, &db);
@@ -3372,10 +3389,11 @@ pub const ProvisionedTableWriteSource = struct {
             if (self.write_cache) |cache| {
                 if (cache.backend_runtime == null) cache.backend_runtime = self.backend_runtime;
                 cache.antfly_provider = self.antfly_provider;
+                cache.inference_api_url = self.inference_api_url;
                 cache.secret_store = self.secret_store;
                 cache.remote_content = self.remote_content;
             }
-            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+            var opened: ?db_mod.DB = try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                 alloc,
                 path,
                 indexes_json,
@@ -3389,6 +3407,7 @@ pub const ProvisionedTableWriteSource = struct {
                 self.secret_store,
                 self.remote_content,
                 identity_namespace,
+                .{ .inference_api_url = self.inference_api_url },
             );
             defer if (opened) |*db| db.close();
             try applyLocalTableSchemaJson(alloc, &opened.?, schema_json);
@@ -6864,7 +6883,7 @@ pub const ProvisionedTableWriteSource = struct {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
                     path,
                     value,
@@ -6878,6 +6897,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.secret_store,
                     self.remote_content,
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                    .{ .inference_api_url = self.inference_api_url },
                 )
             else
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
@@ -6929,7 +6949,7 @@ pub const ProvisionedTableWriteSource = struct {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
                     path,
                     value,
@@ -6943,6 +6963,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.secret_store,
                     self.remote_content,
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                    .{ .inference_api_url = self.inference_api_url },
                 )
             else
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
@@ -6994,7 +7015,7 @@ pub const ProvisionedTableWriteSource = struct {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
                     path,
                     value,
@@ -7008,6 +7029,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.secret_store,
                     self.remote_content,
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                    .{ .inference_api_url = self.inference_api_url },
                 )
             else
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
@@ -7058,7 +7080,7 @@ pub const ProvisionedTableWriteSource = struct {
             const indexes_json = try loadTableIndexesJson(alloc, self.catalog, table_name);
             defer if (indexes_json) |value| alloc.free(value);
             var db = if (indexes_json) |value|
-                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentity(
+                try openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdentityWithOptions(
                     alloc,
                     path,
                     value,
@@ -7072,6 +7094,7 @@ pub const ProvisionedTableWriteSource = struct {
                     self.secret_store,
                     self.remote_content,
                     try loadTableIdentityNamespaceForGroup(alloc, self.catalog, table_name, group_id),
+                    .{ .inference_api_url = self.inference_api_url },
                 )
             else
                 try openManagedDbForTableGroupWithRuntimeAndHAWriteGate(alloc, path, self.catalog, table_name, group_id, self.backend_runtime, self.ha_write_gate, self.ha_async_mirror);
@@ -7269,6 +7292,7 @@ pub const HostedProvisionedTableWriteSource = struct {
                 identity_namespace,
                 .{
                     .drain_resolver_backfill = false,
+                    .inference_api_url = cache.write_cache.inference_api_url,
                     .ha_write_gate = cache.write_cache.ha_write_gate,
                     .ha_async_effect_mirror = effective_ha_mirror,
                     .ha_async_batch_mirror = effective_ha_mirror,

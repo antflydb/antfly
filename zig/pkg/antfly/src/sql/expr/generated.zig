@@ -12,8 +12,8 @@
 // Elastic License 2.0 for the specific language governing permissions and
 // limitations.
 
-const generated_parser = @import("generated_parser.zig");
-const token_mod = @import("token.zig");
+const generated_parser = @import("../generated_parser.zig");
+const token_mod = @import("../token.zig");
 
 const TokenKind = token_mod.TokenKind;
 

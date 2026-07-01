@@ -14,9 +14,9 @@
 
 const std = @import("std");
 
-const expr_token = @import("expr_token.zig");
-const token_mod = @import("token.zig");
-const value_mod = @import("value.zig");
+const expr_token = @import("token.zig");
+const token_mod = @import("../token.zig");
+const value_mod = @import("../value.zig");
 
 const Token = token_mod.Token;
 

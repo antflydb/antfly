@@ -14,8 +14,8 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
-const runtime_schema = @import("../storage/schema.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 
 fn optionalStringEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
     if (lhs == null or rhs == null) return lhs == null and rhs == null;

@@ -14,8 +14,9 @@
 
 const std = @import("std");
 
-const expr_operator = @import("expr_operator.zig");
-const expr_token = @import("expr_token.zig");
+const expr_json_path = @import("expr/json_path.zig");
+const expr_operator = @import("expr/operator.zig");
+const expr_token = @import("expr/token.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../platform/time.zig");
@@ -596,7 +597,7 @@ pub fn parseJsonExtractOperatorPathOwnedAlloc(
         for (segments) |segment| alloc.free(segment);
         alloc.free(segments);
     }
-    return try lower_expr.jsonPathSegmentsToDottedPathAlloc(alloc, segments);
+    return try expr_json_path.segmentsToDottedPathAlloc(alloc, segments);
 }
 
 pub fn parseJsonExtractPathSegmentsAlloc(
@@ -637,13 +638,13 @@ pub fn parsePostgresJsonPathAlloc(
 ) ![]const []const u8 {
     const cursor = parser.Cursor.init(tokens, pos);
     if (cursor.matchToken(.string)) |token| {
-        return try lower_expr.parsePostgresJsonPathTextAlloc(alloc, token.text);
+        return try expr_json_path.parsePostgresTextAlloc(alloc, token.text);
     }
     if (cursor.matchToken(.placeholder)) |token| {
         const value = try boundSqlValue(token, params);
         return switch (value) {
-            .string => |path| try lower_expr.parsePostgresJsonPathTextAlloc(alloc, path),
-            .json => |path_json| try lower_expr.parsePostgresJsonPathJsonArrayAlloc(alloc, path_json),
+            .string => |path| try expr_json_path.parsePostgresTextAlloc(alloc, path),
+            .json => |path_json| try expr_json_path.parsePostgresJsonArrayAlloc(alloc, path_json),
             else => error.UnsupportedSqlShape,
         };
     }

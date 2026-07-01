@@ -185,6 +185,7 @@ pub const Options = struct {
     backend: backend_types.OpenOptions = .{},
     flush_threshold: usize = 8,
     flush_threshold_bytes: u64 = 0,
+    recovery_replay_flush_threshold: usize = 64 * 1024,
     bulk_ingest_flush_threshold_multiplier: usize = 8,
     bulk_ingest_flush_threshold_bytes_multiplier: usize = 8,
     compact_threshold_runs: usize = 4,
@@ -533,6 +534,8 @@ pub const Backend = struct {
         wal_replay_recovery_flushes: u64 = 0,
         wal_replay_recovery_entry_bytes: u64 = 0,
         wal_replay_recovery_window_peak_bytes: u64 = 0,
+        wal_replay_recovery_records_applied: u64 = 0,
+        wal_replay_recovery_entries_applied: u64 = 0,
         wal_resets: u64 = 0,
         wal_reset_ns: u64 = 0,
         immutable_rotations: u64 = 0,
@@ -3007,6 +3010,14 @@ pub const Backend = struct {
                 },
             );
         };
+        if (!self.options.backend.read_only and
+            recovery_session.flushes > 0 and
+            (self.mutable.entries.items.len > 0 or self.activeImmutableMemtableCount() > 0))
+        {
+            try self.flushMutable();
+            recovery_session.flushes += 1;
+            recovery_session.active_window_bytes = 0;
+        }
         self.recovery_replaying_wal = false;
         if (!self.options.backend.read_only and self.write_stats.manifest_writes != before_manifest_writes) {
             try self.maybeCheckpointWalAfterManifestPublish();
@@ -3031,6 +3042,8 @@ pub const Backend = struct {
             self.write_stats.wal_replay_recovery_window_peak_bytes,
             recovery_session.peak_window_bytes,
         );
+        self.write_stats.wal_replay_recovery_records_applied += recovery_session.records_applied;
+        self.write_stats.wal_replay_recovery_entries_applied += recovery_session.entries_applied;
     }
 
     const RecoveryReplaySession = struct {
@@ -3039,21 +3052,25 @@ pub const Backend = struct {
         peak_window_bytes: u64 = 0,
         total_entry_bytes: u64 = 0,
         flushes: u64 = 0,
+        records_applied: u64 = 0,
+        entries_applied: u64 = 0,
 
         fn noteEntry(self: *@This(), segment: u64, entry_bytes: u64) !void {
             if (segment != 0) self.backend.noteMutableWalSegment(segment);
             self.active_window_bytes +|= entry_bytes;
             self.total_entry_bytes +|= entry_bytes;
             self.peak_window_bytes = @max(self.peak_window_bytes, self.active_window_bytes);
-            if (!self.backend.shouldFlushMutable()) return;
+            self.entries_applied += 1;
+            if (!self.backend.shouldFlushMutableDuringRecoveryReplay()) return;
             try self.backend.flushMutable();
             self.flushes += 1;
             self.active_window_bytes = 0;
         }
 
-        fn noteRecord(self: *@This(), segment: u64) !void {
+        fn noteRecord(self: *@This(), segment: u64, _: u64) !void {
             if (segment != 0) self.backend.noteMutableWalSegment(segment);
-            if (!self.backend.shouldFlushMutable()) return;
+            self.records_applied += 1;
+            if (!self.backend.shouldFlushMutableDuringRecoveryReplay()) return;
             try self.backend.flushMutable();
             self.flushes += 1;
             self.active_window_bytes = 0;
@@ -3074,9 +3091,9 @@ pub const Backend = struct {
         try session.noteEntry(segment, entry_bytes);
     }
 
-    fn replayWalAppliedRecordHook(ctx: *anyopaque, segment: u64, _: u64) anyerror!void {
+    fn replayWalAppliedRecordHook(ctx: *anyopaque, segment: u64, applied: u64) anyerror!void {
         const session: *RecoveryReplaySession = @ptrCast(@alignCast(ctx));
-        try session.noteRecord(segment);
+        try session.noteRecord(segment, applied);
     }
 
     fn replayWalEntryAllocatorHook(ctx: *anyopaque, default_allocator: Allocator) anyerror!Allocator {
@@ -3870,6 +3887,17 @@ pub const Backend = struct {
         const byte_threshold = self.effectiveFlushThresholdBytes();
         if (byte_threshold > 0) return estimateStateBytes(&self.mutable) >= byte_threshold;
         return self.mutable.entries.items.len >= self.effectiveFlushThreshold();
+    }
+
+    fn shouldFlushMutableDuringRecoveryReplay(self: *const Backend) bool {
+        if (self.mutable.entries.items.len == 0) return false;
+        const byte_threshold = self.effectiveFlushThresholdBytes();
+        if (byte_threshold > 0) return estimateStateBytes(&self.mutable) >= byte_threshold;
+        const recovery_threshold = @max(
+            self.effectiveFlushThreshold(),
+            self.options.recovery_replay_flush_threshold,
+        );
+        return self.mutable.entries.items.len >= recovery_threshold;
     }
 
     fn shouldFlushMutableForWalPressureLocked(self: *Backend) !bool {
@@ -13240,6 +13268,7 @@ test "lsm backend recovery replay flushes incrementally and retires covered wal 
     {
         var reopened = try Backend.open(std.testing.allocator, root_dir, .{
             .flush_threshold = 2,
+            .recovery_replay_flush_threshold = 2,
             .storage = memory_storage.storage(),
             .resource_manager = &manager,
         });
@@ -13376,6 +13405,92 @@ test "lsm backend recovery replay byte threshold flushes within a large wal reco
     try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:a"));
     try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:b"));
     try std.testing.expectEqualStrings(large_value, try txn.get(.{ .name = "docs" }, "doc:c"));
+}
+
+test "lsm backend recovery batches large tombstone wal record and checkpoints replay" {
+    const alloc = std.testing.allocator;
+    var memory_storage = storage_io.MemoryStorage.init(alloc);
+    defer memory_storage.deinit();
+
+    const root_dir = "/memory/recovery-replay-large-tombstone-record";
+    try memory_storage.storage().createDirPath(root_dir);
+
+    var seed: State = .{};
+    defer seed.deinit(alloc);
+    var i: u64 = 1;
+    while (i <= 4096) : (i += 1) {
+        var key_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key_buf, i, .big);
+        try seed.upsert(alloc, .{}, &key_buf, "present", false);
+    }
+    _ = try wal_mod.appendStateWithOptions(
+        memory_storage.storage(),
+        alloc,
+        root_dir,
+        &seed,
+        false,
+        .{ .segment_bytes = 256 * 1024 },
+    );
+
+    {
+        var seeded = try Backend.open(alloc, root_dir, .{
+            .flush_threshold = 64,
+            .storage = memory_storage.storage(),
+        });
+        defer seeded.close();
+    }
+
+    var deletes: State = .{};
+    defer deletes.deinit(alloc);
+    i = 1;
+    while (i <= 4096) : (i += 1) {
+        var key_buf: [8]u8 = undefined;
+        std.mem.writeInt(u64, &key_buf, i, .big);
+        try deletes.upsert(alloc, .{}, &key_buf, "", true);
+    }
+    _ = try wal_mod.appendStateWithOptions(
+        memory_storage.storage(),
+        alloc,
+        root_dir,
+        &deletes,
+        false,
+        .{ .segment_bytes = 256 * 1024 },
+    );
+
+    {
+        var reopened = try Backend.open(alloc, root_dir, .{
+            .flush_threshold = 64,
+            .recovery_replay_flush_threshold = 1024,
+            .storage = memory_storage.storage(),
+        });
+        defer reopened.close();
+
+        const stats = reopened.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 1), stats.wal_replay_records);
+        try std.testing.expectEqual(@as(u64, 4096), stats.wal_replay_entries);
+        try std.testing.expectEqual(@as(u64, 4096), stats.wal_replay_recovery_entries_applied);
+        try std.testing.expect(stats.wal_replay_recovery_flushes <= 5);
+        try std.testing.expect(stats.wal_replay_recovery_flushes > 0);
+
+        i = 1;
+        while (i <= 4096) : (i += 1) {
+            var key_buf: [8]u8 = undefined;
+            std.mem.writeInt(u64, &key_buf, i, .big);
+            try std.testing.expectError(error.NotFound, reopened.getMergedWithMutable(&reopened.mutable, .{}, &key_buf));
+        }
+    }
+
+    {
+        var reopened = try Backend.open(alloc, root_dir, .{
+            .flush_threshold = 64,
+            .storage = memory_storage.storage(),
+        });
+        defer reopened.close();
+
+        const stats = reopened.snapshotWriteStats();
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_replay_records);
+        try std.testing.expectEqual(@as(u64, 0), stats.wal_replay_bytes);
+    }
 }
 
 test "lsm backend reloads persisted manifest and run files over host storage" {

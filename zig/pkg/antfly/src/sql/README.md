@@ -97,50 +97,49 @@ That shared ownership does not mean every query lowerer belongs in the
 expression module. Expression helpers should be reusable leaves. Statement
 modules should own statement structure.
 
-## `lower_expr.zig` Extraction Plan
+## Expression Package
 
-`lower_expr.zig` is intentionally treated as a transitional facade. It
-centralizes important semantics, but it also contains query-level lowering and a
-very large public surface. Split it incrementally; do not attempt a single large
-rewrite.
+Expression behavior lives under `sql/expr/`. Lowerers import the leaf module
+they need directly, while `sql/expr/mod.zig` exists as the package namespace for
+public consumers that want the whole expression subsystem. Do not re-export
+these helpers through `lower_expr.zig` or old `expr_*` aliases in `mod.zig`.
 
-Start with flat files in `sql/` rather than a nested `sql/expr/` package. Zig
-files are already modules, and flat files keep imports explicit while the
-dependency graph is being untangled. Introduce a subdirectory only after the
-internal layering is stable and there are enough files to justify an umbrella
-namespace.
+Current expression modules:
 
-Current expression leaf modules:
-
-- `expr_token.zig`: expression keyword, function-name, operator, start-token,
+- `expr/token.zig`: expression keyword, function-name, operator, start-token,
   and tail-boundary classification.
-- `expr_operator.zig`: operator matching, comparison parsing, JSON extraction
+- `expr/operator.zig`: operator matching, comparison parsing, JSON extraction
   operator recognition, cast-type parsing, and `IS`/null-test tails.
-- `expr_build.zig`: construction helpers for `RelationalRowsExpression`,
+- `expr/build.zig`: construction helpers for `RelationalRowsExpression`,
   expression projections, datetime/interval row expressions, function
   expressions, and JSON extraction expressions.
-- `expr_type.zig`: expression serialization/fingerprints, expression names,
+- `expr/type.zig` (`expr.typing` from `expr/mod.zig`): expression serialization/fingerprints, expression names,
   determinism, dependency walking, type compatibility, row-expression type
   context, aggregate input validation, and expression-driven catalog
   validators.
-- `expr_limits.zig`: shared expression expansion limits.
+- `expr/limits.zig`: shared expression expansion limits.
+- `expr/generated.zig`: generated-parser payload and identity validation for
+  row expressions, projections, predicates, order keys, windows, and read
+  clauses.
+- `expr/parse.zig`: row-expression operand-start classification and focused
+  row-expression parse helpers.
+- `expr/predicate.zig`: expression predicate builders and value-list expansion.
+- `expr/disjoint.zig`: simple predicate and expression-condition disjointness.
+- `expr/equal.zig`: row-expression, projection, aggregate-spec, and
+  unique-expression equality.
 - `row_claim.zig`: row-claim clause conversion, generated metadata validation,
-  names, and fingerprint labels.
+  names, and fingerprint labels. This remains outside `expr/` because it owns a
+  statement/runtime claim surface, not a general expression helper.
 
 Remaining extraction targets:
 
-- `expr_generated.zig`: generated-parser payload and identity validation for
-  row expressions, projections, predicates, order keys, windows, and read
-  clauses.
-- `expr_parse.zig`: row-expression parsing and lowering into
-  `RelationalRowsExpression`.
-- `predicate_lower.zig`: scalar/access/expression predicate lowering, predicate
-  branch expansion, and WHERE atom parsing.
-- `expr_equal.zig`: row-expression, projection, aggregate-spec, and
-  unique-expression equality.
-- `select_lower.zig` or expanded `lower_select.zig`: SELECT, aggregate, window,
-  join, lateral, CTE, and set-operation lowering currently living in
-  `lower_expr.zig`.
+- Move remaining row-expression parsing bodies from `lower_expr.zig` into
+  `expr/parse.zig` when their dependencies can stay expression-local.
+- Move scalar/access predicate lowering and WHERE atom parsing into either
+  `expr/predicate.zig` or a focused statement lowerer when catalog ownership is
+  clearer.
+- Continue shrinking `lower_expr.zig` around SELECT, aggregate, window, join,
+  lateral, CTE, and set-operation lowering.
 
 During extraction:
 
@@ -189,7 +188,7 @@ handwritten parsing and generated metadata disagree. After validation, the
 owned output should still be Antfly-native typed plans and expression structs.
 
 Generated metadata validation belongs in narrow modules such as
-`expr_generated.zig` or statement-specific generated validators, not scattered
+`expr/generated.zig` or statement-specific generated validators, not scattered
 through unrelated lowerers.
 
 ## Tests

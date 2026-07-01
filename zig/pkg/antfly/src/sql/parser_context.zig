@@ -15,7 +15,7 @@
 const std = @import("std");
 
 const ddl_plan = @import("ddl_plan.zig");
-const expr_type = @import("expr_type.zig");
+const expr_type = @import("expr/type.zig");
 const generated_parser = @import("generated_parser.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");

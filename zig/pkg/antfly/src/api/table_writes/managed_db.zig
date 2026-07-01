@@ -50,6 +50,7 @@ pub const ManagedDbOpenMode = enum {
 
 pub const ManagedDbOpenOptions = struct {
     drain_resolver_backfill: bool = true,
+    inference_api_url: ?[]const u8 = null,
     ha_write_gate: ?db_mod.HAWriteGate = null,
     ha_async_effect_mirror: ?db_mod.HAAsyncEffectMirror = null,
     ha_async_batch_mirror: ?db_mod.HAAsyncBatchMirror = null,
@@ -1247,6 +1248,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
             raw_indexes_json: []const u8,
             runtime: ?*db_mod.background_runtime.BackendRuntime,
             local_provider: ?managed_embedder.AntflyProvider,
+            inference_api_url: ?[]const u8,
             store: ?*common_secrets.FileStore,
             remote: ?*const scraping.RemoteContentConfig,
         ) !EnrichmentSet {
@@ -1262,8 +1264,8 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
                 allocator.destroy(owned);
             };
             return .{
-                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
-                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote }),
+                .dense = try managed_embedder.ManagedEmbedder.createDenseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
+                .sparse = try managed_embedder.ManagedEmbedder.createSparseEmbedderWithOptions(allocator, raw_indexes_json, .{ .antfly_provider = local_provider, .secret_store = store, .remote_content = remote, .inference_api_url = inference_api_url }),
                 .asset_runtime = asset_runtime,
                 .generated = try indexesJsonHasGeneratedEnrichment(allocator, raw_indexes_json),
             };
@@ -1273,7 +1275,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
     var enrichments = if (mode == .startup_catch_up)
         EnrichmentSet{}
     else
-        try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+        try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
     errdefer enrichments.deinit(alloc);
 
     const openDb = struct {
@@ -1520,7 +1522,7 @@ pub fn openManagedDbWithIndexesJsonAndCacheModeWithRuntimeAndLocalAntflyAndIdent
         enrichments = if (mode == .startup_catch_up)
             EnrichmentSet{}
         else
-            try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, secret_store, remote_content);
+            try createEnrichments(alloc, indexes_json, backend_runtime, antfly_provider, options.inference_api_url, secret_store, remote_content);
         db = blk: {
             const enrichment_cfg = if (enrichments.enabled()) enrichments.config() else null;
             const opened = try openDb(alloc, path, enrichment_cfg, lsm_cache, hbc_cache, lsm_root_generation, resource_manager, mode, backend_runtime, secret_store, remote_content, identity_namespace, options);

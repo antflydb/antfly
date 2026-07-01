@@ -14,12 +14,12 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
-const expr_limits = @import("expr_limits.zig");
-const plan_mod = @import("plan.zig");
-const platform_time = @import("../platform/time.zig");
-const token_mod = @import("token.zig");
-const value_mod = @import("value.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const expr_limits = @import("limits.zig");
+const plan_mod = @import("../plan.zig");
+const platform_time = @import("../../platform/time.zig");
+const token_mod = @import("../token.zig");
+const value_mod = @import("../value.zig");
 
 const Token = token_mod.Token;
 const freeExpression = plan_mod.freeExpression;

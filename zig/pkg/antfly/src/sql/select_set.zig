@@ -16,10 +16,10 @@ const std = @import("std");
 
 const ast = @import("ast.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const expr_disjoint = @import("expr_disjoint.zig");
-const expr_equal = @import("expr_equal.zig");
-const expr_limits = @import("expr_limits.zig");
-const expr_type = @import("expr_type.zig");
+const expr_disjoint = @import("expr/disjoint.zig");
+const expr_equal = @import("expr/equal.zig");
+const expr_limits = @import("expr/limits.zig");
+const expr_type = @import("expr/type.zig");
 const plan_mod = @import("plan.zig");
 const relational_rows_executor = @import("../storage/db/relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");

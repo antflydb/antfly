@@ -13,7 +13,7 @@
 // limitations.
 
 const std = @import("std");
-const expr_type = @import("../sql/expr_type.zig");
+const expr_type = @import("../sql/expr/type.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const catalog_resources = @import("catalog_resources.zig");

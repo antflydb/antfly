@@ -14,13 +14,13 @@
 
 const std = @import("std");
 
-const binder = @import("binder.zig");
-const db_mod = @import("../storage/db/mod.zig");
-const ddl_plan = @import("ddl_plan.zig");
-const expr_equal = @import("expr_equal.zig");
-const runtime_schema = @import("../storage/schema.zig");
-const strings = @import("strings.zig");
-const value_mod = @import("value.zig");
+const binder = @import("../binder.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const ddl_plan = @import("../ddl_plan.zig");
+const expr_equal = @import("equal.zig");
+const runtime_schema = @import("../../storage/schema.zig");
+const strings = @import("../strings.zig");
+const value_mod = @import("../value.zig");
 
 const stringSlicesContains = strings.stringSlicesContains;
 const stringSlicesIntersect = strings.stringSlicesIntersect;
@@ -1901,6 +1901,79 @@ pub fn generatedColumnReferencesAny(column: runtime_schema.RelationalColumn, fie
     return stringSlicesIntersect(generated.fields, fields);
 }
 
+pub fn uniqueConstraintReferencesAny(
+    constraint: runtime_schema.UniqueConstraint,
+    fields: []const []const u8,
+) bool {
+    if (stringSlicesIntersect(constraint.columns, fields)) return true;
+    for (constraint.expressions) |expression| {
+        switch (expression.op) {
+            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
+            .expression => if (expression.expression) |row_expression| {
+                if (expressionReferencesAny(row_expression, fields)) return true;
+            },
+        }
+    }
+    for (constraint.where) |predicate| {
+        if (stringSlicesContains(fields, predicate.field)) return true;
+    }
+    for (constraint.where_expressions) |condition| {
+        if (expressionConditionReferencesAny(condition, fields)) return true;
+    }
+    return false;
+}
+
+pub fn isCaseFoldExpressionOp(op: runtime_schema.UniqueExpressionOp) bool {
+    return switch (op) {
+        .lower, .upper, .md5 => true,
+        .expression => false,
+    };
+}
+
+pub fn relationalGeneratedOpForUniqueExpressionOp(op: runtime_schema.UniqueExpressionOp) runtime_schema.RelationalGeneratedOp {
+    return switch (op) {
+        .lower => .lower,
+        .upper => .upper,
+        .md5 => .md5,
+        .expression => unreachable,
+    };
+}
+
+pub fn uniqueExpressionOpToken(op: runtime_schema.UniqueExpressionOp) []const u8 {
+    return switch (op) {
+        .lower => "lower",
+        .upper => "upper",
+        .md5 => "md5",
+        .expression => "expression",
+    };
+}
+
+pub fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
+    return switch (op) {
+        .is_null => "is_null",
+        .is_not_null => "is_not_null",
+        .eq => "eq",
+        .ne => "ne",
+    };
+}
+
+pub fn uniquePredicateAsRelationalCheckOp(op: runtime_schema.UniquePredicateOp) runtime_schema.RelationalCheckOp {
+    return switch (op) {
+        .is_null => .is_null,
+        .is_not_null => .is_not_null,
+        .eq => .eq,
+        .ne => .ne,
+    };
+}
+
+pub fn relationalCheckOpFromUniquePredicateToken(token: []const u8) ?runtime_schema.RelationalCheckOp {
+    if (std.mem.eql(u8, token, "is_null")) return .is_null;
+    if (std.mem.eql(u8, token, "is_not_null")) return .is_not_null;
+    if (std.mem.eql(u8, token, "eq")) return .eq;
+    if (std.mem.eql(u8, token, "ne")) return .ne;
+    return null;
+}
+
 pub fn expressionReferencesAny(expression: runtime_schema.RelationalRowsExpression, fields: []const []const u8) bool {
     if (expression.kind == .field and stringSlicesContains(fields, expression.field)) return true;
     for (expression.operands) |operand| {
@@ -1964,5 +2037,230 @@ test "sql expr_type validates unique expression lists" {
     try std.testing.expectError(error.UnsupportedSqlShape, validateSqlUniqueExpressionListUnique(&.{
         .{ .op = .expression, .expression = lower_status },
         .{ .op = .expression, .expression = lower_status },
+    }));
+}
+
+test "sql expr_type names every row expression kind" {
+    inline for (std.meta.fields(runtime_schema.RelationalRowsExpressionKind)) |field| {
+        const kind: runtime_schema.RelationalRowsExpressionKind = @field(runtime_schema.RelationalRowsExpressionKind, field.name);
+        try std.testing.expect(rowExpressionOpName(kind).len > 0);
+        try std.testing.expect(rowExpressionDefaultOutputName(kind).len > 0);
+    }
+}
+
+test "sql expr_type detects deterministic row expressions" {
+    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
+    const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"open\"" };
+    const source_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status", .field_source = .source };
+    const now_expression: runtime_schema.RelationalRowsExpression = .{ .kind = .now };
+    const condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{literal},
+    };
+    const nondeterministic_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{now_expression},
+    };
+
+    try std.testing.expect(rowExpressionDeterministic(status_field));
+    try std.testing.expect(!rowExpressionDeterministic(source_field));
+    try std.testing.expect(!rowExpressionDeterministic(now_expression));
+    try std.testing.expect(rowExpressionConditionDeterministic(condition));
+    try std.testing.expect(!rowExpressionConditionDeterministic(nondeterministic_condition));
+}
+
+test "sql expr_type detects catalog expression references" {
+    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
+    const tenant_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "tenant_id" };
+    const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"active\"" };
+    const condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{literal},
+    };
+    const generated_column: runtime_schema.RelationalColumn = .{
+        .name = "tenant_status",
+        .path = "tenant_status",
+        .field_type = .keyword,
+        .generated = .{ .op = .concat_ws, .fields = &.{ "tenant_id", "status" }, .separator = ":" },
+    };
+    const expression_generated: runtime_schema.RelationalColumn = .{
+        .name = "status_lower",
+        .path = "status_lower",
+        .field_type = .keyword,
+        .generated = .{ .op = .expression, .expression = .{ .kind = .lower, .operands = &.{status_field} } },
+    };
+    const unique_constraint: runtime_schema.UniqueConstraint = .{
+        .name = "tenant_status_key",
+        .columns = &.{"tenant_id"},
+        .expressions = &.{.{ .op = .expression, .expression = .{ .kind = .concat, .operands = &.{ tenant_field, status_field } } }},
+        .where_expressions = &.{condition},
+    };
+
+    try std.testing.expect(generatedColumnReferencesAny(generated_column, &.{"tenant_id"}));
+    try std.testing.expect(generatedColumnReferencesAny(expression_generated, &.{"status"}));
+    try std.testing.expect(expressionConditionReferencesAny(condition, &.{"status"}));
+    try std.testing.expect(expressionConditionReferencesField(condition, "status"));
+    try std.testing.expect(!expressionConditionReferencesField(condition, "tenant_id"));
+    try std.testing.expect(uniqueConstraintReferencesAny(unique_constraint, &.{"status"}));
+    try std.testing.expect(!uniqueConstraintReferencesAny(unique_constraint, &.{"missing"}));
+}
+
+test "sql expr_type maps unique expression and predicate operators" {
+    try std.testing.expect(isCaseFoldExpressionOp(.lower));
+    try std.testing.expect(isCaseFoldExpressionOp(.upper));
+    try std.testing.expect(isCaseFoldExpressionOp(.md5));
+    try std.testing.expect(!isCaseFoldExpressionOp(.expression));
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.lower, relationalGeneratedOpForUniqueExpressionOp(.lower));
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.upper, relationalGeneratedOpForUniqueExpressionOp(.upper));
+    try std.testing.expectEqual(runtime_schema.RelationalGeneratedOp.md5, relationalGeneratedOpForUniqueExpressionOp(.md5));
+    try std.testing.expectEqualStrings("expression", uniqueExpressionOpToken(.expression));
+    try std.testing.expectEqualStrings("eq", uniquePredicateOpToken(.eq));
+    try std.testing.expectEqualStrings("is_not_null", uniquePredicateOpToken(.is_not_null));
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, uniquePredicateAsRelationalCheckOp(.ne));
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, uniquePredicateAsRelationalCheckOp(.is_null));
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.eq, relationalCheckOpFromUniquePredicateToken("eq").?);
+    try std.testing.expect(relationalCheckOpFromUniquePredicateToken("missing") == null);
+}
+
+test "sql expr_type validates catalog check expression types" {
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "metadata", .path = "metadata", .field_type = .json },
+    };
+    const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
+    const amount_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "amount" };
+    const metadata_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "metadata" };
+    const numeric_literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "10" };
+    const now_expression: runtime_schema.RelationalRowsExpression = .{ .kind = .now };
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{status_field},
+    };
+    const valid_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = amount_field,
+        .op = .gt,
+        .rhs = &.{numeric_literal},
+    };
+    const incomparable_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = status_field,
+        .op = .eq,
+        .rhs = &.{metadata_field},
+    };
+    const nondeterministic_condition: runtime_schema.RelationalRowsExpressionCondition = .{
+        .lhs = amount_field,
+        .op = .eq,
+        .rhs = &.{now_expression},
+    };
+
+    try validateCheckExpressionForColumns(&columns, lower_status);
+    try validateCheckExpressionConditionForColumns(&columns, valid_condition);
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCheckExpressionConditionForColumns(&columns, incomparable_condition));
+    try validateGeneratedColumnExpressionForColumns(&columns, "status_lower", lower_status);
+    try std.testing.expectError(error.InvalidSqlCatalog, validateGeneratedColumnExpressionForColumns(&columns, "status", status_field));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniquePredicateExpressionsForColumns(&columns, &.{nondeterministic_condition}));
+
+    try std.testing.expect(sqlExpressionTypeIsTextLike(.keyword));
+    try std.testing.expect(!sqlExpressionTypeIsTextLike(.json));
+    try std.testing.expect(sqlExpressionTypesComparable(.keyword, .text));
+    try std.testing.expect(sqlExpressionTypesComparable(.datetime, .numeric));
+    try std.testing.expect(!sqlExpressionTypesComparable(.json, .text));
+    try std.testing.expect(sqlExpressionTypeIsOrderable(.boolean));
+    try std.testing.expect(!sqlExpressionTypeIsOrderable(.json));
+    try std.testing.expect(sqlAggregateMinMaxTypeAllowed(.datetime));
+    try std.testing.expect(!sqlAggregateMinMaxTypeAllowed(.boolean));
+    try std.testing.expect(sqlAggregateModeTypeAllowed(.boolean));
+    try std.testing.expect(sqlExpressionTypeIsOrderKey(.json));
+    try std.testing.expect(sqlExpressionResultTypesCompatible(.keyword, .text));
+}
+
+test "sql expr_type validates DDL expression catalog constraints" {
+    const columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+        .{ .name = "amount", .path = "amount", .field_type = .numeric },
+        .{ .name = "created_at", .path = "created_at", .field_type = .datetime },
+        .{ .name = "updated_at", .path = "updated_at", .field_type = .datetime },
+        .{ .name = "metadata", .path = "metadata", .field_type = .json },
+    };
+    const pk_columns = [_]runtime_schema.RelationalColumn{
+        .{ .name = "id", .path = "id", .field_type = .keyword, .nullable = false },
+        .{ .name = "status", .path = "status", .field_type = .keyword },
+    };
+    const periods = [_]runtime_schema.RelationalPeriod{.{ .name = "valid_at", .start_column = "created_at", .end_column = "updated_at" }};
+    const lower_status: runtime_schema.RelationalRowsExpression = .{
+        .kind = .lower,
+        .operands = &.{.{ .kind = .field, .field = "status" }},
+    };
+
+    try validateRelationalColumnCatalog(&columns);
+    try std.testing.expectError(error.InvalidSqlCatalog, validateRelationalColumnCatalog(&.{.{
+        .name = "amount",
+        .path = "amount",
+        .field_type = .numeric,
+        .collation = "C",
+    }}));
+    try validatePrimaryKeyColumns(&pk_columns, .{ .columns = &.{"id"}, .include_columns = &.{"status"} });
+    try std.testing.expectError(error.InvalidSqlCatalog, validatePrimaryKeyColumns(&columns, .{ .columns = &.{"status"} }));
+
+    try validateCheckForColumns(&columns, .{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCheckForColumns(&columns, .{ .name = "bad_json_order", .field = "metadata", .op = .gt, .value_json = "{}" }));
+    try validateRelationalCheckCatalog(&columns, &.{.{ .name = "amount_positive", .field = "amount", .op = .gt, .value_json = "0" }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateRelationalCheckCatalog(&columns, &.{
+        .{ .name = "dup_check", .field = "amount", .op = .gt, .value_json = "0" },
+        .{ .name = "dup_check", .field = "amount", .op = .lt, .value_json = "10" },
+    }));
+
+    try validateGeneratedColumnForColumns(&columns, .{
+        .name = "status_lower",
+        .path = "status_lower",
+        .field_type = .keyword,
+        .generated = .{ .op = .expression, .expression = lower_status },
+    });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateGeneratedColumnForColumns(&columns, .{
+        .name = "status",
+        .path = "status",
+        .field_type = .keyword,
+        .generated = .{ .op = .lower, .field = "status" },
+    }));
+
+    try validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"amount"});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"status"}));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateCreateIndexIncludeColumns(&columns, &.{"status"}, &.{"metadata"}));
+
+    try validateUniquePredicatesForColumns(&columns, &.{.{ .field = "status", .op = .eq, .value_json = "\"open\"" }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniquePredicatesForColumns(&columns, &.{.{ .field = "metadata", .op = .is_not_null }}));
+
+    try validateUniqueConstraintForColumns(&columns, &periods, .{
+        .name = "status_key",
+        .columns = &.{"status"},
+        .expressions = &.{.{ .op = .expression, .expression = lower_status }},
+        .include_columns = &.{"amount"},
+        .without_overlaps_period = "valid_at",
+    });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintForColumns(&columns, &periods, .{
+        .name = "metadata_key",
+        .columns = &.{"metadata"},
+    }));
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintForColumns(&columns, &periods, .{
+        .name = "empty_key",
+    }));
+    try validateUniqueConstraintCatalog(&columns, &periods, &.{.{ .name = "status_key", .columns = &.{"status"} }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateUniqueConstraintCatalog(&columns, &periods, &.{
+        .{ .name = "dup_key", .columns = &.{"status"} },
+        .{ .name = "dup_key", .columns = &.{"amount"} },
+    }));
+
+    try validateForeignKeyCatalog(&columns, &periods, &.{.{
+        .name = "status_parent_fkey",
+        .parent_table = "parent_statuses",
+        .child_columns = &.{"status"},
+        .parent_columns = &.{"status"},
+    }});
+    try std.testing.expectError(error.InvalidSqlCatalog, validateForeignKeyCatalog(&columns, &periods, &.{
+        .{ .name = "dup_fkey", .parent_table = "parent_statuses", .child_columns = &.{"status"}, .parent_columns = &.{"status"} },
+        .{ .name = "dup_fkey", .parent_table = "parent_statuses", .child_columns = &.{"amount"}, .parent_columns = &.{"amount"} },
     }));
 }

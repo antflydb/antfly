@@ -17,9 +17,9 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
-const expr_type = @import("expr_type.zig");
-const expr_operator = @import("expr_operator.zig");
-const expr_token = @import("expr_token.zig");
+const expr_type = @import("expr/type.zig");
+const expr_operator = @import("expr/operator.zig");
+const expr_token = @import("expr/token.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -22656,7 +22656,7 @@ pub fn dropRelationalColumnAlloc(
         changed = false;
         for (schema.relational_columns) |column| {
             if (stringSlicesContains(dropped.items, column.name)) continue;
-            if (generatedColumnReferencesAny(column, dropped.items)) {
+            if (expr_type.generatedColumnReferencesAny(column, dropped.items)) {
                 try appendUniqueBorrowedString(alloc, &dropped, column.name);
                 changed = true;
             }
@@ -22964,7 +22964,7 @@ fn hashPlanU64(hasher: *std.hash.Wyhash, value: u64) void {
 fn schemaHasDropDependencies(schema: runtime_schema.TableSchema, dropped: []const []const u8) bool {
     if (dropped.len > 1) return true;
     for (schema.unique_constraints) |constraint| {
-        if (uniqueConstraintReferencesAny(constraint, dropped)) return true;
+        if (expr_type.uniqueConstraintReferencesAny(constraint, dropped)) return true;
     }
     for (schema.foreign_keys) |foreign_key| {
         if (stringSlicesIntersect(foreign_key.child_columns, dropped)) return true;
@@ -23005,12 +23005,12 @@ fn dropDependentUniqueConstraintsAlloc(
 ) !void {
     var kept: usize = 0;
     for (schema.unique_constraints) |constraint| {
-        if (!uniqueConstraintReferencesAny(constraint, dropped)) kept += 1;
+        if (!expr_type.uniqueConstraintReferencesAny(constraint, dropped)) kept += 1;
     }
     const out: []runtime_schema.UniqueConstraint = if (kept > 0) try alloc.alloc(runtime_schema.UniqueConstraint, kept) else &.{};
     var out_i: usize = 0;
     for (schema.unique_constraints) |constraint| {
-        if (uniqueConstraintReferencesAny(constraint, dropped)) {
+        if (expr_type.uniqueConstraintReferencesAny(constraint, dropped)) {
             freeDdlUniqueConstraint(alloc, constraint);
         } else {
             out[out_i] = constraint;
@@ -23212,62 +23212,6 @@ fn appendUniqueBorrowedString(
 ) !void {
     if (stringSlicesContains(values.items, value)) return;
     try values.append(alloc, value);
-}
-
-fn generatedColumnReferencesAny(column: runtime_schema.RelationalColumn, fields: []const []const u8) bool {
-    const generated = column.generated orelse return false;
-    if (generated.field) |field| {
-        if (stringSlicesContains(fields, field)) return true;
-    }
-    if (generated.expression) |expression| {
-        if (expressionReferencesAny(expression, fields)) return true;
-    }
-    return stringSlicesIntersect(generated.fields, fields);
-}
-
-fn uniqueConstraintReferencesAny(
-    constraint: runtime_schema.UniqueConstraint,
-    fields: []const []const u8,
-) bool {
-    if (stringSlicesIntersect(constraint.columns, fields)) return true;
-    for (constraint.expressions) |expression| {
-        switch (expression.op) {
-            .lower, .upper, .md5 => if (stringSlicesContains(fields, expression.field)) return true,
-            .expression => if (expression.expression) |row_expression| {
-                if (expressionReferencesAny(row_expression, fields)) return true;
-            },
-        }
-    }
-    for (constraint.where) |predicate| {
-        if (stringSlicesContains(fields, predicate.field)) return true;
-    }
-    for (constraint.where_expressions) |condition| {
-        if (expressionConditionReferencesAny(condition, fields)) return true;
-    }
-    return false;
-}
-
-fn expressionReferencesAny(expression: runtime_schema.RelationalRowsExpression, fields: []const []const u8) bool {
-    if (expression.kind == .field and stringSlicesContains(fields, expression.field)) return true;
-    for (expression.operands) |operand| {
-        if (expressionReferencesAny(operand, fields)) return true;
-    }
-    for (expression.case_branches) |branch| {
-        if (expressionConditionReferencesAny(branch.when, fields)) return true;
-        if (expressionReferencesAny(branch.then, fields)) return true;
-    }
-    for (expression.case_else) |case_else| {
-        if (expressionReferencesAny(case_else, fields)) return true;
-    }
-    return false;
-}
-
-fn expressionConditionReferencesAny(condition: runtime_schema.RelationalRowsExpressionCondition, fields: []const []const u8) bool {
-    if (expressionReferencesAny(condition.lhs, fields)) return true;
-    for (condition.rhs) |rhs| {
-        if (expressionReferencesAny(rhs, fields)) return true;
-    }
-    return false;
 }
 
 fn stringSlicesContains(values: []const []const u8, value: []const u8) bool {

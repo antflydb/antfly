@@ -1153,7 +1153,7 @@ pub fn build(b: *std.Build) void {
     httpx_json_test_mod.addImport("antfly-json", json_mod);
 
     const api_json_helpers_test_mod = b.createModule(.{
-        .root_source_file = b.path("pkg/antfly/src/api/json_helpers.zig"),
+        .root_source_file = b.path("pkg/antfly/src/api_json_helpers_test_root.zig"),
         .target = target,
         .optimize = optimize,
     });

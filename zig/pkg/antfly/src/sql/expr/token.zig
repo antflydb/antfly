@@ -14,10 +14,10 @@
 
 const std = @import("std");
 
-const ast = @import("ast.zig");
-const db_mod = @import("../storage/db/mod.zig");
-const parser = @import("parser.zig");
-const token_mod = @import("token.zig");
+const ast = @import("../ast.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const parser = @import("../parser.zig");
+const token_mod = @import("../token.zig");
 
 pub const Token = token_mod.Token;
 pub const TokenKeyword = token_mod.TokenKeyword;

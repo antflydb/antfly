@@ -14,9 +14,9 @@
 
 const std = @import("std");
 
-const db_mod = @import("../storage/db/mod.zig");
-const expr_equal = @import("expr_equal.zig");
-const runtime_schema = @import("../storage/schema.zig");
+const db_mod = @import("../../storage/db/mod.zig");
+const expr_equal = @import("equal.zig");
+const runtime_schema = @import("../../storage/schema.zig");
 
 pub fn relationalChecksProvablyDisjoint(
     lhs: runtime_schema.RelationalCheck,

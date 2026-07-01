@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
+const expr_type = @import("expr/type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const algebraic_segment = @import("../serverless/algebraic_segment/mod.zig");
 const lake_rows = @import("../serverless/query/lake_rows.zig");
@@ -18475,7 +18476,7 @@ fn validateUniquePredicateAtomJsonMatches(
     const field_value = value.object.get("field") orelse return error.InvalidRowsRequest;
     const op_value = value.object.get("op") orelse return error.InvalidRowsRequest;
     if (field_value != .string or !std.mem.eql(u8, field_value.string, predicate.field)) return error.InvalidRowsRequest;
-    if (op_value != .string or !std.mem.eql(u8, op_value.string, uniquePredicateOpToken(predicate.op))) return error.InvalidRowsRequest;
+    if (op_value != .string or !std.mem.eql(u8, op_value.string, expr_type.uniquePredicateOpToken(predicate.op))) return error.InvalidRowsRequest;
 
     const supplied_value = value.object.get("value");
     if (predicate.value_json) |expected_json| {
@@ -18486,15 +18487,6 @@ fn validateUniquePredicateAtomJsonMatches(
     } else if (supplied_value != null) {
         return error.InvalidRowsRequest;
     }
-}
-
-fn uniquePredicateOpToken(op: runtime_schema.UniquePredicateOp) []const u8 {
-    return switch (op) {
-        .is_null => "is_null",
-        .is_not_null => "is_not_null",
-        .eq => "eq",
-        .ne => "ne",
-    };
 }
 
 pub fn physicalPrimaryKeyFromWhereAlloc(

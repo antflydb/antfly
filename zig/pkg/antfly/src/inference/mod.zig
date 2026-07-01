@@ -72,6 +72,10 @@ test "managed embedder dimension probe validation modes" {
     try managed_embedder.testDimensionProbeValidationModes();
 }
 
+test "managed embedder configured inference api url precedence" {
+    try managed_embedder.testConfiguredInferenceAPIURLPrecedence();
+}
+
 test "managed embedder artifact backed embedding translation" {
     try managed_embedder.testArtifactBackedEmbeddingTranslation();
 }

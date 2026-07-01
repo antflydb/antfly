@@ -15740,6 +15740,13 @@ fn runGraphDegreePublicWorkerThread(ctx: *GraphDegreePublicWorkerThreadCtx) void
     };
     defer graph.close();
 
+    runGraphDegreePublicWorkerStepForTest(&graph, ctx) catch |err| {
+        ctx.err = err;
+        return;
+    };
+}
+
+fn runGraphDegreePublicWorkerStepForTest(graph: *GraphIndex, ctx: *GraphDegreePublicWorkerThreadCtx) !void {
     const step = graph.runGraphMetricPlannedWorkerPageStepForMetric("degree", ctx.worker_id) catch |err| {
         ctx.err = err;
         return;
@@ -15860,16 +15867,10 @@ fn runGraphMetricPublicWorkerThread(ctx: *GraphMetricPublicWorkerThreadCtx) void
         };
         defer graph.close();
 
-        const step = graph.runGraphMetricPlannedWorkerPageStepForMetric(ctx.metric_name, ctx.worker_id) catch |err| {
+        runGraphMetricPublicWorkerStepForTest(&graph, ctx) catch |err| {
             ctx.err = err;
             return;
         };
-        ctx.phase = step.phase;
-        ctx.page_id = step.page_id;
-        ctx.claimed_page = step.claimed_page;
-        ctx.completed_page = step.completed_page;
-        ctx.advanced_phase = step.advanced_phase;
-        ctx.published = step.published;
     } else {
         const metrics = [_]GraphMetricConfig{.{
             .name = ctx.metric_name,
@@ -15884,16 +15885,68 @@ fn runGraphMetricPublicWorkerThread(ctx: *GraphMetricPublicWorkerThreadCtx) void
         };
         defer graph.close();
 
-        const step = graph.runGraphMetricPlannedWorkerPageStepForMetric(ctx.metric_name, ctx.worker_id) catch |err| {
+        runGraphMetricPublicWorkerStepForTest(&graph, ctx) catch |err| {
             ctx.err = err;
             return;
         };
-        ctx.phase = step.phase;
-        ctx.page_id = step.page_id;
-        ctx.claimed_page = step.claimed_page;
-        ctx.completed_page = step.completed_page;
-        ctx.advanced_phase = step.advanced_phase;
-        ctx.published = step.published;
+    }
+}
+
+fn runGraphMetricPublicWorkerStepForTest(graph: *GraphIndex, ctx: *GraphMetricPublicWorkerThreadCtx) !void {
+    const step = try graph.runGraphMetricPlannedWorkerPageStepForMetric(ctx.metric_name, ctx.worker_id);
+    ctx.phase = step.phase;
+    ctx.page_id = step.page_id;
+    ctx.claimed_page = step.claimed_page;
+    ctx.completed_page = step.completed_page;
+    ctx.advanced_phase = step.advanced_phase;
+    ctx.published = step.published;
+}
+
+fn runGraphMetricPublicWorkerPairForTest(
+    alloc: Allocator,
+    store_path: [*:0]const u8,
+    rev_path: [*:0]const u8,
+    worker_ctx_a: *GraphMetricPublicWorkerThreadCtx,
+    worker_ctx_b: *GraphMetricPublicWorkerThreadCtx,
+) !void {
+    var store = try docstore.DocStore.open(alloc, store_path, .{});
+    defer store.close();
+
+    if (worker_ctx_a.kind == .hits_authority or worker_ctx_a.kind == .hits_hub) {
+        const pair_name = if (worker_ctx_a.kind == .hits_authority) "hits_hub" else "hits_authority";
+        const pair_kind: GraphMetricKind = if (worker_ctx_a.kind == .hits_authority) .hits_hub else .hits_authority;
+        const metrics = [_]GraphMetricConfig{
+            .{
+                .name = worker_ctx_a.metric_name,
+                .kind = worker_ctx_a.kind,
+                .refresh = .manual,
+                .max_iterations = 1,
+                .tolerance = 0.000001,
+            },
+            .{
+                .name = pair_name,
+                .kind = pair_kind,
+                .refresh = .manual,
+                .max_iterations = 1,
+                .tolerance = 0.000001,
+            },
+        };
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        defer graph.close();
+        try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_a);
+        try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_b);
+    } else {
+        const metrics = [_]GraphMetricConfig{.{
+            .name = worker_ctx_a.metric_name,
+            .kind = worker_ctx_a.kind,
+            .refresh = .manual,
+            .max_iterations = 1,
+            .tolerance = 0.000001,
+        }};
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        defer graph.close();
+        try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_a);
+        try runGraphMetricPublicWorkerStepForTest(&graph, worker_ctx_b);
     }
 }
 
@@ -15935,10 +15988,7 @@ fn expectGraphMetricConcurrentPublicPhase(
         defer alloc.free(worker_b);
         var worker_ctx_a = GraphMetricPublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .metric_name = metric_name, .kind = kind, .worker_id = worker_a };
         var worker_ctx_b = GraphMetricPublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .metric_name = metric_name, .kind = kind, .worker_id = worker_b };
-        var thread_a = try std.Thread.spawn(.{}, runGraphMetricPublicWorkerThread, .{&worker_ctx_a});
-        var thread_b = try std.Thread.spawn(.{}, runGraphMetricPublicWorkerThread, .{&worker_ctx_b});
-        thread_a.join();
-        thread_b.join();
+        try runGraphMetricPublicWorkerPairForTest(alloc, store_path, rev_path, &worker_ctx_a, &worker_ctx_b);
         try recordGraphMetricPublicWorkerThreadResult(&pages, &page_count, worker_ctx_a, expected_phase);
         try recordGraphMetricPublicWorkerThreadResult(&pages, &page_count, worker_ctx_b, expected_phase);
     }
@@ -15963,7 +16013,9 @@ test "graph degree planned public workers claim phase pages from concurrent hand
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -15990,27 +16042,33 @@ test "graph degree planned public workers claim phase pages from concurrent hand
 
     var scan_pages: [8]u64 = undefined;
     var scan_page_count: usize = 0;
-    for (0..8) |round| {
-        if (scan_page_count >= 2) break;
-        const worker_a = try std.fmt.allocPrint(alloc, "worker-scan-a-{d}", .{round});
-        defer alloc.free(worker_a);
-        const worker_b = try std.fmt.allocPrint(alloc, "worker-scan-b-{d}", .{round});
-        defer alloc.free(worker_b);
-        var scan_a = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_a };
-        var scan_b = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_b };
-        var scan_thread_a = try std.Thread.spawn(.{}, runGraphDegreePublicWorkerThread, .{&scan_a});
-        var scan_thread_b = try std.Thread.spawn(.{}, runGraphDegreePublicWorkerThread, .{&scan_b});
-        scan_thread_a.join();
-        scan_thread_b.join();
-        try recordGraphDegreePublicWorkerThreadResult(&scan_pages, &scan_page_count, scan_a, .scan_edges_and_out_degree);
-        try recordGraphDegreePublicWorkerThreadResult(&scan_pages, &scan_page_count, scan_b, .scan_edges_and_out_degree);
+    {
+        var store = try docstore.DocStore.open(alloc, store_path, .{});
+        defer store.close();
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        defer graph.close();
+        for (0..8) |round| {
+            if (scan_page_count >= 2) break;
+            const worker_a = try std.fmt.allocPrint(alloc, "worker-scan-a-{d}", .{round});
+            defer alloc.free(worker_a);
+            const worker_b = try std.fmt.allocPrint(alloc, "worker-scan-b-{d}", .{round});
+            defer alloc.free(worker_b);
+            var scan_a = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_a };
+            var scan_b = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_b };
+            try runGraphDegreePublicWorkerStepForTest(&graph, &scan_a);
+            try runGraphDegreePublicWorkerStepForTest(&graph, &scan_b);
+            try recordGraphDegreePublicWorkerThreadResult(&scan_pages, &scan_page_count, scan_a, .scan_edges_and_out_degree);
+            try recordGraphDegreePublicWorkerThreadResult(&scan_pages, &scan_page_count, scan_b, .scan_edges_and_out_degree);
+        }
     }
     try std.testing.expectEqual(@as(usize, 2), scan_page_count);
 
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
         const scan_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("degree");
         try std.testing.expectEqual(GraphIndex.GraphMetricBuildPhase.scan_edges_and_out_degree, scan_ready.phase);
@@ -16019,27 +16077,33 @@ test "graph degree planned public workers claim phase pages from concurrent hand
 
     var reduce_pages: [8]u64 = undefined;
     var reduce_page_count: usize = 0;
-    for (0..8) |round| {
-        if (reduce_page_count >= 2) break;
-        const worker_a = try std.fmt.allocPrint(alloc, "worker-reduce-a-{d}", .{round});
-        defer alloc.free(worker_a);
-        const worker_b = try std.fmt.allocPrint(alloc, "worker-reduce-b-{d}", .{round});
-        defer alloc.free(worker_b);
-        var reduce_a = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_a };
-        var reduce_b = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_b };
-        var reduce_thread_a = try std.Thread.spawn(.{}, runGraphDegreePublicWorkerThread, .{&reduce_a});
-        var reduce_thread_b = try std.Thread.spawn(.{}, runGraphDegreePublicWorkerThread, .{&reduce_b});
-        reduce_thread_a.join();
-        reduce_thread_b.join();
-        try recordGraphDegreePublicWorkerThreadResult(&reduce_pages, &reduce_page_count, reduce_a, .reduce_ranks);
-        try recordGraphDegreePublicWorkerThreadResult(&reduce_pages, &reduce_page_count, reduce_b, .reduce_ranks);
+    {
+        var store = try docstore.DocStore.open(alloc, store_path, .{});
+        defer store.close();
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        defer graph.close();
+        for (0..8) |round| {
+            if (reduce_page_count >= 2) break;
+            const worker_a = try std.fmt.allocPrint(alloc, "worker-reduce-a-{d}", .{round});
+            defer alloc.free(worker_a);
+            const worker_b = try std.fmt.allocPrint(alloc, "worker-reduce-b-{d}", .{round});
+            defer alloc.free(worker_b);
+            var reduce_a = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_a };
+            var reduce_b = GraphDegreePublicWorkerThreadCtx{ .store_path = store_path, .rev_path = rev_path, .worker_id = worker_b };
+            try runGraphDegreePublicWorkerStepForTest(&graph, &reduce_a);
+            try runGraphDegreePublicWorkerStepForTest(&graph, &reduce_b);
+            try recordGraphDegreePublicWorkerThreadResult(&reduce_pages, &reduce_page_count, reduce_a, .reduce_ranks);
+            try recordGraphDegreePublicWorkerThreadResult(&reduce_pages, &reduce_page_count, reduce_b, .reduce_ranks);
+        }
     }
     try std.testing.expectEqual(@as(usize, 2), reduce_page_count);
 
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         const reduce_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("degree");
@@ -16094,7 +16158,9 @@ test "graph degree planned status reports concurrent worker page leases from reo
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -16146,7 +16212,9 @@ test "graph degree planned status reports concurrent worker page leases from reo
 
     var store = try docstore.DocStore.open(alloc, store_path, .{});
     defer store.close();
-    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+    var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+        .metric_configs = &metrics,
+    });
     defer graph.close();
 
     var status = try graph.graphMetricStatus("degree");
@@ -16208,7 +16276,9 @@ test "graph pagerank planned public workers claim partitioned phases from concur
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -16254,7 +16324,9 @@ test "graph pagerank planned public workers claim partitioned phases from concur
         try expectGraphMetricConcurrentPublicPhase(alloc, store_path, rev_path, "pagerank", .pagerank, phase, 2);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
         const phase_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("pagerank");
         try std.testing.expectEqual(phase, phase_ready.phase);
@@ -16264,7 +16336,9 @@ test "graph pagerank planned public workers claim partitioned phases from concur
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         const worker_publish = try graph.runGraphMetricPlannedWorkerPageStepForMetric("pagerank", "worker-publish");
@@ -16761,7 +16835,9 @@ test "graph eigenvector planned public workers claim partitioned phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -16807,7 +16883,9 @@ test "graph eigenvector planned public workers claim partitioned phases from con
         try expectGraphMetricConcurrentPublicPhase(alloc, store_path, rev_path, "eigenvector", .eigenvector, phase, 2);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
         const phase_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("eigenvector");
         try std.testing.expectEqual(phase, phase_ready.phase);
@@ -16817,7 +16895,9 @@ test "graph eigenvector planned public workers claim partitioned phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         const worker_publish = try graph.runGraphMetricPlannedWorkerPageStepForMetric("eigenvector", "worker-publish");
@@ -16899,7 +16979,9 @@ test "graph hits planned public workers claim partitioned paired phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         for (0..graph_metric_build_target_scan_page_units + 1) |i| {
@@ -16948,7 +17030,9 @@ test "graph hits planned public workers claim partitioned paired phases from con
         try expectGraphMetricConcurrentPublicPhase(alloc, store_path, rev_path, "hits_authority", .hits_authority, phase, 2);
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
         const phase_ready = try graph.runGraphMetricPlannedCoordinatorStepForMetric("hits_authority");
         try std.testing.expectEqual(phase, phase_ready.phase);
@@ -16958,7 +17042,9 @@ test "graph hits planned public workers claim partitioned paired phases from con
     {
         var store = try docstore.DocStore.open(alloc, store_path, .{});
         defer store.close();
-        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{ .metric_configs = &metrics });
+        var graph = try GraphIndex.open(alloc, &store, rev_path, "links", .{
+            .metric_configs = &metrics,
+        });
         defer graph.close();
 
         const worker_publish = try graph.runGraphMetricPlannedWorkerPageStepForMetric("hits_authority", "worker-publish");

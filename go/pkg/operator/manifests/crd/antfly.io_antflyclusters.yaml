@@ -581,6 +581,21 @@ spec:
                     required:
                     - limits
                     type: object
+                  startupProbe:
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      timeoutSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
                   suspend:
                     type: boolean
                   tolerations:
@@ -3228,6 +3243,21 @@ spec:
                     required:
                     - limits
                     type: object
+                  startupProbe:
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      timeoutSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                    type: object
                   tolerations:
                     items:
                       properties:
@@ -3939,6 +3969,21 @@ spec:
                         type: string
                     required:
                     - limits
+                    type: object
+                  startupProbe:
+                    properties:
+                      failureThreshold:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      periodSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
+                      timeoutSeconds:
+                        format: int32
+                        minimum: 1
+                        type: integer
                     type: object
                   storeAPI:
                     properties:
