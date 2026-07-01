@@ -2746,9 +2746,9 @@ fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
     retry_after_value = null;
     initialized_headers += 1;
 
-    var not_leader_name: ?[]u8 = try alloc.dupe(u8, "X-Antfly-Metadata-Not-Leader");
+    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
     errdefer if (not_leader_name) |value| alloc.free(value);
-    var not_leader_value: ?[]u8 = try alloc.dupe(u8, "true");
+    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
     errdefer if (not_leader_value) |value| alloc.free(value);
     headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
     not_leader_name = null;
@@ -2828,8 +2828,8 @@ test "metadata http server forwards sourced mutations through raft leader forwar
     var source = FakeSource{};
     var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
     const spoofed_headers = [_]http_common.RequestHeader{.{
-        .name = "X-Antfly-Metadata-Leader-Forwarded",
-        .value = "1",
+        .name = http_common.metadata_leader_forwarded_header,
+        .value = http_common.metadata_leader_forwarded_value,
     }};
     var resp = try server.handle(.{
         .method = .POST,

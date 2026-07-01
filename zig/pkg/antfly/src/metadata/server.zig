@@ -182,11 +182,13 @@ pub const MetadataServer = struct {
             };
             owned_admin_mux = mux;
 
+            var admin_listener_cfg = listener_cfg;
+            admin_listener_cfg.trust_internal_request_metadata_headers = true;
             const listener = try alloc.create(raft_transport.StdHttpListener);
             listener.* = if (svc.apiIoImpl()) |io_impl|
-                raft_transport.StdHttpListener.initShared(alloc, listener_cfg, mux.executor(), io_impl)
+                raft_transport.StdHttpListener.initShared(alloc, admin_listener_cfg, mux.executor(), io_impl)
             else
-                raft_transport.StdHttpListener.init(alloc, listener_cfg, mux.executor());
+                raft_transport.StdHttpListener.init(alloc, admin_listener_cfg, mux.executor());
             owned_admin_listener = listener;
         }
 

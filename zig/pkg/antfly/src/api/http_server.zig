@@ -5460,7 +5460,7 @@ pub const ApiHttpServer = struct {
     }
 
     fn forwardMetadataMutationToLeader(self: *ApiHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        if (req.source_node_id != null) return null;
+        if (req.metadata_leader_forwarded) return null;
         const forwarder = self.cfg.metadata_mutation_forwarder orelse return null;
         return try forwarder.forward(self.alloc, req);
     }
@@ -20843,6 +20843,59 @@ test "api http server forwards cluster backup mutations to metadata leader" {
     try std.testing.expectEqualStrings("forwarded", resp.body);
     try std.testing.expectEqualStrings("/backup", forwarder.uri);
     try std.testing.expectEqualStrings("{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}", forwarder.body);
+}
+
+test "api http server does not reforward already-forwarded metadata mutations" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+    };
+    const CaptureForwarder = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) RequestForwarder {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .forward = forward },
+            };
+        }
+
+        fn forward(ptr: *anyopaque, allocator: std.mem.Allocator, _: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return .{
+                .status = 500,
+                .content_type = try allocator.dupe(u8, "text/plain"),
+                .body = try allocator.dupe(u8, "unexpected reforward"),
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var forwarder = CaptureForwarder{};
+    var server = ApiHttpServer.init(alloc, .{
+        .metadata_mutation_forwarder = forwarder.iface(),
+    }, source.iface(), null, null);
+
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/backup",
+        .content_type = "application/json",
+        .body = "{\"backup_id\":\"snap1\",\"location\":\"file:///tmp/backups\"}",
+        .metadata_leader_forwarded = true,
+    });
+    defer resp.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 0), forwarder.calls);
 }
 
 test "api http server backs up and restores a table through public routes" {

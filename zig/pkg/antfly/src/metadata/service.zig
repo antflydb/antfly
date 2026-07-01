@@ -2612,6 +2612,7 @@ pub const MetadataHttpService = struct {
         var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
         errdefer out.deinit(alloc);
         for (headers) |header| {
+            if (http_common.isInternalRequestMetadataHeader(header.name)) continue;
             if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
             if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
             if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
