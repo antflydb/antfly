@@ -1399,7 +1399,8 @@ fn resolveMetadataForwardingToken(
             return try canonicalizeMetadataRuntimeValue(alloc, try alloc.dupe(u8, value));
         }
     }
-    return try resolveMetadataRuntimeSecretValue(alloc, secret_store, metadata_forwarding_token_key);
+    const value = try resolveMetadataRuntimeSecretValue(alloc, secret_store, metadata_forwarding_token_key);
+    return if (value) |owned| try canonicalizeMetadataRuntimeValue(alloc, owned) else null;
 }
 
 fn resolveTrustedPrincipalSecret(
@@ -1423,7 +1424,9 @@ fn resolveMetadataRuntimeSecretValue(
 ) !?[]u8 {
     if (secret_store) |store| {
         if (try store.getOwned(alloc, key)) |value| {
-            return try canonicalizeMetadataRuntimeValue(alloc, value);
+            if (std.mem.trim(u8, value, " \t\r\n").len > 0) return value;
+            alloc.free(value);
+            return null;
         }
         return null;
     }
@@ -1433,7 +1436,9 @@ fn resolveMetadataRuntimeSecretValue(
     const env_var_z = try alloc.dupeZ(u8, env_var);
     defer alloc.free(env_var_z);
     if (platform.env.getenvSlice(env_var_z)) |value| {
-        return try canonicalizeMetadataRuntimeValue(alloc, try alloc.dupe(u8, value));
+        const raw = try alloc.dupe(u8, value);
+        if (std.mem.trim(u8, raw, " \t\r\n").len > 0) return raw;
+        alloc.free(raw);
     }
     return null;
 }
@@ -1512,6 +1517,31 @@ test "metadata runtime resolves metadata forwarding token from secret store trim
     const token = try resolveMetadataForwardingToken(alloc, null, &secret_store);
     defer alloc.free(token.?);
     try std.testing.expectEqualStrings("stored-forwarding-token", token.?);
+}
+
+test "metadata runtime preserves trusted principal auth material bytes" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const store_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-trusted-principal-secrets.json", .{tmp.sub_path});
+    defer alloc.free(store_path);
+
+    var secret_store = try antfly.common.secrets.FileStore.init(alloc, store_path);
+    defer secret_store.deinit();
+
+    var stored_secret = try secret_store.put(alloc, trusted_principal_secret_key, " shared-secret \n");
+    defer stored_secret.deinit(alloc);
+    var stored_issuer = try secret_store.put(alloc, trusted_principal_issuer_key, "\ttrusted-upstream ");
+    defer stored_issuer.deinit(alloc);
+
+    const secret = try resolveTrustedPrincipalSecret(alloc, &secret_store);
+    defer if (secret) |value| alloc.free(value);
+    const issuer = try resolveTrustedPrincipalIssuer(alloc, &secret_store);
+    defer if (issuer) |value| alloc.free(value);
+
+    try std.testing.expectEqualStrings(" shared-secret \n", secret.?);
+    try std.testing.expectEqualStrings("\ttrusted-upstream ", issuer.?);
 }
 
 fn expectMetricPresent(output: []const u8, name: []const u8) !void {
