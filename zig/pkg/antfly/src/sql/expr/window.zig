@@ -19,8 +19,13 @@ const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("../ddl_plan.zig");
 const expr_projection = @import("projection.zig");
 const expr_type = @import("type.zig");
+const parser = @import("../parser.zig");
 const plan_mod = @import("../plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
+const token_mod = @import("../token.zig");
+const value_mod = @import("../value.zig");
+
+pub const Token = token_mod.Token;
 
 pub fn functionRequiresOrder(function: db_mod.types.RelationalRowsWindowFunction) bool {
     return switch (function) {
@@ -79,6 +84,83 @@ pub fn functionSupportsFilter(function: db_mod.types.RelationalRowsWindowFunctio
         .count, .sum, .avg, .min, .max, .bool_or, .bool_and => true,
         else => false,
     };
+}
+
+pub fn parseFunction(
+    tokens: []const Token,
+    pos: *usize,
+) !db_mod.types.RelationalRowsWindowFunction {
+    if (parser.matchKeyword(tokens, pos, "row_number")) return .row_number;
+    if (parser.matchKeyword(tokens, pos, "rank")) return .rank;
+    if (parser.matchKeyword(tokens, pos, "dense_rank")) return .dense_rank;
+    if (parser.matchKeyword(tokens, pos, "percent_rank")) return .percent_rank;
+    if (parser.matchKeyword(tokens, pos, "cume_dist")) return .cume_dist;
+    if (parser.matchKeyword(tokens, pos, "ntile")) return .ntile;
+    if (parser.matchKeyword(tokens, pos, "lag")) return .lag;
+    if (parser.matchKeyword(tokens, pos, "lead")) return .lead;
+    if (parser.matchKeyword(tokens, pos, "first_value")) return .first_value;
+    if (parser.matchKeyword(tokens, pos, "last_value")) return .last_value;
+    if (parser.matchKeyword(tokens, pos, "nth_value")) return .nth_value;
+    if (parser.matchKeyword(tokens, pos, "count")) return .count;
+    if (parser.matchKeyword(tokens, pos, "sum")) return .sum;
+    if (parser.matchKeyword(tokens, pos, "avg")) return .avg;
+    if (parser.matchKeyword(tokens, pos, "min")) return .min;
+    if (parser.matchKeyword(tokens, pos, "max")) return .max;
+    if (parser.matchKeyword(tokens, pos, "bool_or")) return .bool_or;
+    if (parser.matchKeyword(tokens, pos, "bool_and")) return .bool_and;
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseOptionalFrame(
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+) !?db_mod.types.RelationalRowsWindowFrame {
+    const unit: db_mod.types.RelationalRowsWindowFrameUnit = if (parser.matchKeyword(tokens, pos, "rows"))
+        .rows
+    else if (parser.matchKeyword(tokens, pos, "range"))
+        .range
+    else
+        return null;
+    const start, const end = if (parser.matchKeyword(tokens, pos, "between")) blk: {
+        const parsed_start = try parseFrameBound(tokens, pos, params);
+        try parser.expectKeyword(tokens, pos, "and");
+        const parsed_end = try parseFrameBound(tokens, pos, params);
+        break :blk .{ parsed_start, parsed_end };
+    } else blk: {
+        const parsed_start = try parseFrameBound(tokens, pos, params);
+        break :blk .{ parsed_start, plan_mod.ParsedWindowFrameBound{ .bound = .current_row } };
+    };
+    const frame = db_mod.types.RelationalRowsWindowFrame{
+        .unit = unit,
+        .start = start.bound,
+        .start_offset = start.offset,
+        .end = end.bound,
+        .end_offset = end.offset,
+    };
+    try validateFrame(frame);
+    return frame;
+}
+
+pub fn parseFrameBound(
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+) !plan_mod.ParsedWindowFrameBound {
+    if (parser.matchKeyword(tokens, pos, "unbounded")) {
+        if (parser.matchKeyword(tokens, pos, "preceding")) return .{ .bound = .unbounded_preceding };
+        if (parser.matchKeyword(tokens, pos, "following")) return .{ .bound = .unbounded_following };
+        return error.UnsupportedSqlShape;
+    }
+    if (parser.matchKeyword(tokens, pos, "current")) {
+        try parser.expectKeyword(tokens, pos, "row");
+        return .{ .bound = .current_row };
+    }
+    const offset = try value_mod.parseSqlU32Value(tokens, pos, params);
+    if (offset == 0) return error.UnsupportedSqlShape;
+    if (parser.matchKeyword(tokens, pos, "preceding")) return .{ .bound = .offset_preceding, .offset = offset };
+    if (parser.matchKeyword(tokens, pos, "following")) return .{ .bound = .offset_following, .offset = offset };
+    return error.UnsupportedSqlShape;
 }
 
 pub fn outputFieldIsUnique(

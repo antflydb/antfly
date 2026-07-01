@@ -798,18 +798,15 @@ fn isGeneratedUnsupportedHead(tokens: []const Token, raw_statement: RawSqlStatem
         tokenMatchesKeyword(first, .call) or
         tokenMatchesKeyword(first, .checkpoint) or
         tokenMatchesKeyword(first, .cluster) or
-        tokenMatchesKeyword(first, .comment) or
         tokenMatchesKeyword(first, .copy) or
         tokenMatchesText(first, "do") or
         tokenMatchesKeyword(first, .explain) or
-        tokenMatchesKeyword(first, .grant) or
         tokenMatchesKeyword(first, .listen) or
         tokenMatchesText(first, "load") or
         tokenMatchesText(first, "lock") or
         tokenMatchesKeyword(first, .match) or
         tokenMatchesKeyword(first, .notify) or
         tokenMatchesKeyword(first, .reindex) or
-        tokenMatchesKeyword(first, .revoke) or
         tokenMatchesKeyword(first, .security) or
         tokenMatchesKeyword(first, .unlisten) or
         tokenMatchesKeyword(first, .vacuum))
@@ -2190,6 +2187,10 @@ fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDd
         .create_graph_index,
         .create_graph_metric,
         => true,
+        .comment => ddl_ast.comment_target_tokens != null and (ddl_ast.comment_value_tokens != null or (ddl_ast.comment_value_is_null orelse false)),
+        .grant,
+        .revoke,
+        => ddl_ast.privilege_items.items.len > 0 and ddl_ast.privilege_principal_tokens != null,
     };
 }
 

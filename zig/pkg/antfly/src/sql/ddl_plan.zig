@@ -4181,7 +4181,10 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_subscription,
         .drop_subscription,
         => try logicalReplicationCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
-        .comment => try commentMetadataPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
+        .comment => try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .comment_metadata }),
+        .grant,
+        .revoke,
+        => try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .authorization_catalog }),
         .create_policy,
         .alter_policy,
         .drop_policy,
@@ -4321,8 +4324,12 @@ pub fn logicalDdlPlanFromGeneratedAstAlloc(
             break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .logical_replication });
         },
         .comment => blk: {
-            try validateGeneratedCommentDdlAst(tokens, ast);
             break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .comment_metadata });
+        },
+        .grant,
+        .revoke,
+        => blk: {
+            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .authorization_catalog });
         },
         .create_policy,
         .alter_policy,
@@ -4535,6 +4542,8 @@ fn generatedDdlUsesRuntimeBoundary(tokens: []const grammar.Token, ast: generated
         .alter_policy,
         .drop_policy,
         .comment,
+        .grant,
+        .revoke,
         .drop_index,
         .drop_schema,
         .drop_database,
@@ -6624,6 +6633,133 @@ fn generatedCommentTargetMatchesPlan(
         .index => plan_target == .index,
         .constraint => plan_target == .constraint,
     };
+}
+
+fn privilegeChangePlanFromGeneratedDdlAstAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    options: DdlPlanParserOptions,
+) !LegacyDdlParserPlan {
+    try validateGeneratedPrivilegeChangeDdlAst(tokens, ast);
+    var pos: usize = 0;
+    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
+    errdefer plan.deinit(alloc);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
+    switch (plan) {
+        .authorization_catalog => |authorization| switch (ast.kind) {
+            .grant => switch (authorization) {
+                .grant_privilege => |grant| try validateGeneratedPrivilegeChangePlan(alloc, tokens, ast, grant),
+                else => return error.UnsupportedSqlShape,
+            },
+            .revoke => switch (authorization) {
+                .revoke_privilege => |revoke| try validateGeneratedPrivilegeChangePlan(alloc, tokens, ast, revoke),
+                else => return error.UnsupportedSqlShape,
+            },
+            else => return error.UnsupportedSqlShape,
+        },
+        else => return error.UnsupportedSqlShape,
+    }
+    return plan;
+}
+
+fn validateGeneratedPrivilegeChangeDdlAst(tokens: []const grammar.Token, ast: generated_parser.GeneratedSqlDdlAst) !void {
+    const end = generatedStatementEnd(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
+    if (end < 6) return error.UnsupportedSqlShape;
+    switch (ast.kind) {
+        .grant => if (!tokens[0].matchesKeyword("grant")) return error.UnsupportedSqlShape,
+        .revoke => if (!tokens[0].matchesKeyword("revoke")) return error.UnsupportedSqlShape,
+        else => return error.UnsupportedSqlShape,
+    }
+    const privilege_range_end = generatedPrivilegeOnIndex(tokens, end) orelse return error.UnsupportedSqlShape;
+    try validateGeneratedPlainListCount(tokens, .{ .start = 1, .end = privilege_range_end }, &ast.privilege_items, ast.privilege_items.count);
+    if (ast.privilege_items.count == 0) return error.UnsupportedSqlShape;
+
+    const grantee_keyword = if (ast.kind == .grant) "to" else "from";
+    const principal_keyword_index = generatedPrivilegePrincipalKeywordIndex(tokens, privilege_range_end + 1, end, grantee_keyword) orelse return error.UnsupportedSqlShape;
+    const principal = ast.privilege_principal_tokens orelse return error.UnsupportedSqlShape;
+    if (principal.start != principal_keyword_index + 1 or principal.end != principal.start + 1 or principal.end != end) return error.UnsupportedSqlShape;
+
+    const object_kind = ast.privilege_object_kind_tokens orelse return error.UnsupportedSqlShape;
+    const object_name = ast.privilege_object_name_tokens orelse return error.UnsupportedSqlShape;
+    if (ast.privilege_all_tables_in_schema) {
+        if (object_kind.start != privilege_range_end + 1 or object_kind.end != privilege_range_end + 5) return error.UnsupportedSqlShape;
+        if (!tokens[object_kind.start].matchesKeyword("all") or
+            !tokens[object_kind.start + 1].matchesKeyword("tables") or
+            !tokens[object_kind.start + 2].matchesKeyword("in") or
+            !tokens[object_kind.start + 3].matchesKeyword("schema"))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        if (object_name.start != object_kind.end or object_name.end != object_name.start + 1 or object_name.end != principal_keyword_index) return error.UnsupportedSqlShape;
+    } else {
+        if (object_kind.start != privilege_range_end + 1 or object_kind.end != object_kind.start + 1) return error.UnsupportedSqlShape;
+        if (object_name.start != object_kind.end or object_name.end != object_name.start + 1 or object_name.end != principal_keyword_index) return error.UnsupportedSqlShape;
+    }
+}
+
+fn validateGeneratedPrivilegeChangePlan(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    ast: generated_parser.GeneratedSqlDdlAst,
+    plan: PrivilegeChangePlan,
+) !void {
+    if (ast.privilege_items.count != plan.privileges.len) return error.UnsupportedSqlShape;
+    for (ast.privilege_items.items, plan.privileges) |item, expected_privilege| {
+        try validateGeneratedPrivilegeItemMatches(tokens, item, expected_privilege);
+    }
+
+    if (ast.privilege_all_tables_in_schema) {
+        if (!std.ascii.eqlIgnoreCase(plan.object_kind, "ALL_TABLES_IN_SCHEMA")) return error.UnsupportedSqlShape;
+    } else {
+        const object_kind = try generatedIdentifierAlloc(alloc, tokens, ast.privilege_object_kind_tokens orelse return error.UnsupportedSqlShape);
+        defer alloc.free(@constCast(object_kind));
+        if (!std.ascii.eqlIgnoreCase(object_kind, plan.object_kind)) return error.UnsupportedSqlShape;
+    }
+
+    const object_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, ast.privilege_object_name_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(@constCast(object_name));
+    if (!std.ascii.eqlIgnoreCase(object_name, plan.object_name)) return error.UnsupportedSqlShape;
+
+    const principal_name = try generatedIdentifierAlloc(alloc, tokens, ast.privilege_principal_tokens orelse return error.UnsupportedSqlShape);
+    defer alloc.free(@constCast(principal_name));
+    if (!std.ascii.eqlIgnoreCase(principal_name, plan.principal_name)) return error.UnsupportedSqlShape;
+}
+
+fn validateGeneratedPrivilegeItemMatches(
+    tokens: []const grammar.Token,
+    item: generated_parser.GeneratedSqlTokenRange,
+    expected_privilege: []const u8,
+) !void {
+    if (item.start >= item.end or item.end > tokens.len) return error.UnsupportedSqlShape;
+    if (std.ascii.eqlIgnoreCase(expected_privilege, "ALL")) {
+        if (item.end == item.start + 1 and tokens[item.start].matchesKeyword("all")) return;
+        if (item.end == item.start + 2 and tokens[item.start].matchesKeyword("all") and tokens[item.start + 1].matchesKeyword("privileges")) return;
+        return error.UnsupportedSqlShape;
+    }
+    if (item.end != item.start + 1 or tokens[item.start].kind != .identifier) return error.UnsupportedSqlShape;
+    if (!std.ascii.eqlIgnoreCase(tokens[item.start].text, expected_privilege)) return error.UnsupportedSqlShape;
+}
+
+fn generatedPrivilegeOnIndex(tokens: []const grammar.Token, end: usize) ?usize {
+    var index: usize = 1;
+    while (index < end) : (index += 1) {
+        if (tokens[index].matchesKeyword("on")) return index;
+    }
+    return null;
+}
+
+fn generatedPrivilegePrincipalKeywordIndex(
+    tokens: []const grammar.Token,
+    start: usize,
+    end: usize,
+    keyword: []const u8,
+) ?usize {
+    var index = start;
+    while (index < end) : (index += 1) {
+        if (tokens[index].matchesKeyword(keyword)) return index;
+    }
+    return null;
 }
 
 fn logicalReplicationCatalogPlanFromGeneratedDdlAstAlloc(
@@ -8968,6 +9104,8 @@ fn validateGeneratedDdlAstSpans(
         => .drop,
         .refresh_materialized_view => .refresh,
         .comment => .comment,
+        .grant => .grant,
+        .revoke => .revoke,
     };
     if (!tokens[0].matchesKeywordTag(expected)) return error.UnsupportedSqlShape;
 }
@@ -13978,7 +14116,7 @@ pub fn parseCreateTableDefinitionAlloc(
         }
     }
     try cursor.expectToken(.rparen);
-    const tail = try parseOptionalCreateTableTailAlloc(alloc, tokens, pos);
+    var tail = try parseOptionalCreateTableTailAlloc(alloc, tokens, pos);
     errdefer tail.deinit(alloc);
 
     const owned_columns = try columns.toOwnedSlice(alloc);
@@ -14045,7 +14183,7 @@ fn parseOptionalCreateTableTailAlloc(
         if (!cursor.matchKeyword("versioning")) return error.UnsupportedSqlShape;
         return .{ .system_versioned = true };
     }
-    if (!cursor.matchToken(.lparen)) return error.UnsupportedSqlShape;
+    if (cursor.matchToken(.lparen) == null) return error.UnsupportedSqlShape;
 
     var storage_mode: runtime_schema.StorageMode = .relational;
     var explicit_storage_mode = false;
@@ -16072,6 +16210,45 @@ test "sql adapter ddl plan lowers create table ddl into typed schema plan" {
     try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(
         alloc,
         "CREATE TABLE duplicate_fk (id text PRIMARY KEY, tenant_id text, FOREIGN KEY (tenant_id, tenant_id) REFERENCES tenants (id, id));",
+    ));
+}
+
+test "sql adapter ddl plan lowers canonical document table ddl into typed schema plan" {
+    const alloc = std.testing.allocator;
+    var lowered = try legacyDdlParserPlanForTestAlloc(alloc,
+        \\CREATE TABLE docs ()
+        \\WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc')
+        \\DOCUMENT SCHEMA doc AS JSON '{"type":"object","properties":{"title":{"type":"text"}}}';
+    );
+    defer lowered.deinit(alloc);
+
+    switch (lowered) {
+        .create_table => |plan| {
+            try std.testing.expectEqualStrings("docs", plan.table_name);
+            try std.testing.expectEqual(runtime_schema.StorageMode.document, plan.storage_mode);
+            try std.testing.expectEqualStrings("doc", plan.default_type.?);
+            try std.testing.expectEqual(@as(usize, 0), plan.columns.len);
+            try std.testing.expectEqual(@as(usize, 1), plan.document_schemas.len);
+            try std.testing.expectEqualStrings("doc", plan.document_schemas[0].name);
+
+            const schema_json = try documentSchemaJsonFromCreateTablePlanAlloc(alloc, plan);
+            defer alloc.free(schema_json);
+            try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"storage_mode\":\"document\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, schema_json, "\"document_schemas\":{\"doc\":{\"schema\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, schema_json, "CREATE TABLE") == null);
+
+            const applied = try runtimeSchemaFromCreateTablePlanAlloc(alloc, plan);
+            defer runtime_schema.freeSchema(alloc, applied);
+            try std.testing.expectEqual(runtime_schema.StorageMode.document, applied.storage_mode);
+            try std.testing.expectEqualStrings("doc", applied.default_type);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanForTestAlloc(alloc,
+        \\CREATE TABLE docs ()
+        \\WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice')
+        \\DOCUMENT SCHEMA doc AS JSON '{"type":"object"}';
     ));
 }
 
@@ -23880,6 +24057,251 @@ test "sql adapter generated row policy DDL AST lowers to catalog plans" {
     try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &stale_alter_policy_roles));
 }
 
+test "sql adapter generated comment DDL AST lowers to catalog plans" {
+    const alloc = std.testing.allocator;
+
+    var table_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON TABLE usage_records IS 'usage';",
+    );
+    defer table_sql.deinit(alloc);
+    var table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &table_sql);
+    defer table_plan.deinit(alloc);
+    switch (table_plan) {
+        .comment_metadata => |comment| {
+            try std.testing.expectEqual(CommentMetadataTarget.table, comment.target);
+            try std.testing.expectEqualStrings("usage_records", comment.object_name);
+            try std.testing.expectEqualStrings("\"usage\"", comment.comment_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var column_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON COLUMN usage_records.status IS NULL;",
+    );
+    defer column_sql.deinit(alloc);
+    var column_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &column_sql);
+    defer column_plan.deinit(alloc);
+    switch (column_plan) {
+        .comment_metadata => |comment| {
+            try std.testing.expectEqual(CommentMetadataTarget.column, comment.target);
+            try std.testing.expectEqualStrings("usage_records.status", comment.object_name);
+            try std.testing.expect(comment.comment_json == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var constraint_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';",
+    );
+    defer constraint_sql.deinit(alloc);
+    var constraint_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &constraint_sql);
+    defer constraint_plan.deinit(alloc);
+    switch (constraint_plan) {
+        .comment_metadata => |comment| {
+            try std.testing.expectEqual(CommentMetadataTarget.constraint, comment.target);
+            try std.testing.expectEqualStrings("usage_records_status_check", comment.object_name);
+            try std.testing.expectEqualStrings("usage_records", comment.parent_table_name.?);
+            try std.testing.expectEqualStrings("\"valid status\"", comment.comment_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var stale_comment_target = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON TABLE usage_records IS 'usage';",
+    );
+    defer stale_comment_target.deinit(alloc);
+    if (stale_comment_target.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.comment_target = .index,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &stale_comment_target));
+
+    var missing_comment_value = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON TABLE usage_records IS 'usage';",
+    );
+    defer missing_comment_value.deinit(alloc);
+    if (missing_comment_value.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.comment_value_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &missing_comment_value));
+
+    var missing_constraint_parent = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';",
+    );
+    defer missing_constraint_parent.deinit(alloc);
+    if (missing_constraint_parent.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.comment_parent_table_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &missing_constraint_parent));
+
+    var missing_logical_value = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "COMMENT ON TABLE usage_records IS 'usage';",
+    );
+    defer missing_logical_value.deinit(alloc);
+    if (missing_logical_value.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    ddl.comment_value_is_null = null;
+                    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanFromGeneratedAstAlloc(alloc, missing_logical_value.items(), ddl.*, .{}));
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+}
+
+test "sql adapter generated privilege DDL AST lowers to authorization plans" {
+    const alloc = std.testing.allocator;
+
+    var grant_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;",
+    );
+    defer grant_sql.deinit(alloc);
+    var grant_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &grant_sql);
+    defer grant_plan.deinit(alloc);
+    switch (grant_plan) {
+        .authorization_catalog => |authorization| switch (authorization) {
+            .grant_privilege => |grant| {
+                try std.testing.expectEqual(@as(usize, 2), grant.privileges.len);
+                try std.testing.expectEqualStrings("SELECT", grant.privileges[0]);
+                try std.testing.expectEqualStrings("INSERT", grant.privileges[1]);
+                try std.testing.expectEqualStrings("TABLE", grant.object_kind);
+                try std.testing.expectEqualStrings("usage_records", grant.object_name);
+                try std.testing.expectEqualStrings("app_writer", grant.principal_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var grant_all_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_writer;",
+    );
+    defer grant_all_sql.deinit(alloc);
+    var grant_all_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &grant_all_sql);
+    defer grant_all_plan.deinit(alloc);
+    switch (grant_all_plan) {
+        .authorization_catalog => |authorization| switch (authorization) {
+            .grant_privilege => |grant| {
+                try std.testing.expectEqual(@as(usize, 1), grant.privileges.len);
+                try std.testing.expectEqualStrings("ALL", grant.privileges[0]);
+                try std.testing.expectEqualStrings("ALL_TABLES_IN_SCHEMA", grant.object_kind);
+                try std.testing.expectEqualStrings("public", grant.object_name);
+                try std.testing.expectEqualStrings("app_writer", grant.principal_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var revoke_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REVOKE INSERT ON TABLE usage_records FROM app_writer;",
+    );
+    defer revoke_sql.deinit(alloc);
+    var revoke_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &revoke_sql);
+    defer revoke_plan.deinit(alloc);
+    switch (revoke_plan) {
+        .authorization_catalog => |authorization| switch (authorization) {
+            .revoke_privilege => |revoke| {
+                try std.testing.expectEqual(@as(usize, 1), revoke.privileges.len);
+                try std.testing.expectEqualStrings("INSERT", revoke.privileges[0]);
+                try std.testing.expectEqualStrings("TABLE", revoke.object_kind);
+                try std.testing.expectEqualStrings("usage_records", revoke.object_name);
+                try std.testing.expectEqualStrings("app_writer", revoke.principal_name);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var corrupt_privilege = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;",
+    );
+    defer corrupt_privilege.deinit(alloc);
+    if (corrupt_privilege.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.privilege_items.items[0].start += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &corrupt_privilege));
+
+    var missing_principal = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT ON TABLE usage_records TO app_writer;",
+    );
+    defer missing_principal.deinit(alloc);
+    if (missing_principal.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.privilege_principal_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &missing_principal));
+
+    var stale_all_tables = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "GRANT SELECT ON TABLE usage_records TO app_writer;",
+    );
+    defer stale_all_tables.deinit(alloc);
+    if (stale_all_tables.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.privilege_all_tables_in_schema = true,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &stale_all_tables));
+
+    var missing_logical_principal = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "REVOKE INSERT ON TABLE usage_records FROM app_writer;",
+    );
+    defer missing_logical_principal.deinit(alloc);
+    if (missing_logical_principal.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    ddl.privilege_principal_tokens = null;
+                    try std.testing.expectError(error.UnsupportedSqlShape, logicalDdlPlanFromGeneratedAstAlloc(alloc, missing_logical_principal.items(), ddl.*, .{}));
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+}
+
 test "sql adapter generated utility unsupported AST lowers to typed catalog plans" {
     const alloc = std.testing.allocator;
 
@@ -23889,9 +24311,6 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
         trigger_replace_existing: bool = false,
     }{
         .{ .sql = "CALL rotate_usage();", .kind = .call },
-        .{ .sql = "COMMENT ON TABLE usage_records IS 'usage';", .kind = .comment },
-        .{ .sql = "GRANT SELECT ON TABLE usage_records TO app_reader;", .kind = .grant },
-        .{ .sql = "REVOKE SELECT ON TABLE usage_records FROM app_reader;", .kind = .revoke },
         .{ .sql = "LOCK TABLE usage_records IN SHARE MODE;", .kind = .lock },
         .{ .sql = "CREATE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');", .kind = .create_trigger },
         .{ .sql = "CREATE OR REPLACE TRIGGER update_timestamp BEFORE UPDATE ON usage_records EXECUTE FUNCTION touch_updated_at('updated_at_ns');", .kind = .create_trigger, .trigger_replace_existing = true },
@@ -23970,7 +24389,7 @@ test "sql adapter generated utility unsupported AST lowers to typed catalog plan
 
     var malformed_subject = try tokenized.ParsedSql.initAlloc(
         alloc,
-        "GRANT SELECT ON TABLE usage_records TO app_reader;",
+        "GRANT app_reader TO app_writer;",
     );
     defer malformed_subject.deinit(alloc);
     if (malformed_subject.generated_statement) |*generated_statement| {

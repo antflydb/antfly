@@ -36,7 +36,7 @@ diagnostics, and verification evidence are all in place.
 
 - [ ] Rich DDL metadata and semantic coverage
   - [ ] Add native generated AST fields for `GRANT`/`REVOKE`: privilege lists, grant targets, grantees, grant options, revoke grant-option mode, and cascade/restrict behavior.
-  - [ ] Add native generated AST fields for `COMMENT ON`: object class, object name/signature, comment value, and null-comment clearing.
+  - [ ] Extend generated `COMMENT ON` beyond the current table/column/index/constraint metadata: routine signatures, type/domain/extension/schema/database objects, security labels, and unsupported-object diagnostics with exact subject spans.
   - [ ] Extend routine metadata beyond signature/language/return type: body/`AS` clauses, volatility, security, strictness, cost/rows, support, transform, parallel, leakproof, and `SET` options.
   - [ ] Extend row-policy metadata beyond table and role targets: `FOR` command, `USING` predicate, and `WITH CHECK` predicate retained expression ranges/payloads.
   - [ ] Extend publication/subscription metadata beyond current table/publication/enabled fields: publication publish/options, table filters/column lists, subscription options, refresh/copy/slot state, and owner/connection mutations.

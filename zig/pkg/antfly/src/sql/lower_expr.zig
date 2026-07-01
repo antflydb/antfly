@@ -11914,83 +11914,6 @@ pub fn parseSelectOutputOrderByAlloc(
     }
 }
 
-pub fn parseWindowFunction(
-    tokens: []const Token,
-    pos: *usize,
-) !db_mod.types.RelationalRowsWindowFunction {
-    if (parser.matchKeyword(tokens, pos, "row_number")) return .row_number;
-    if (parser.matchKeyword(tokens, pos, "rank")) return .rank;
-    if (parser.matchKeyword(tokens, pos, "dense_rank")) return .dense_rank;
-    if (parser.matchKeyword(tokens, pos, "percent_rank")) return .percent_rank;
-    if (parser.matchKeyword(tokens, pos, "cume_dist")) return .cume_dist;
-    if (parser.matchKeyword(tokens, pos, "ntile")) return .ntile;
-    if (parser.matchKeyword(tokens, pos, "lag")) return .lag;
-    if (parser.matchKeyword(tokens, pos, "lead")) return .lead;
-    if (parser.matchKeyword(tokens, pos, "first_value")) return .first_value;
-    if (parser.matchKeyword(tokens, pos, "last_value")) return .last_value;
-    if (parser.matchKeyword(tokens, pos, "nth_value")) return .nth_value;
-    if (parser.matchKeyword(tokens, pos, "count")) return .count;
-    if (parser.matchKeyword(tokens, pos, "sum")) return .sum;
-    if (parser.matchKeyword(tokens, pos, "avg")) return .avg;
-    if (parser.matchKeyword(tokens, pos, "min")) return .min;
-    if (parser.matchKeyword(tokens, pos, "max")) return .max;
-    if (parser.matchKeyword(tokens, pos, "bool_or")) return .bool_or;
-    if (parser.matchKeyword(tokens, pos, "bool_and")) return .bool_and;
-    return error.UnsupportedSqlShape;
-}
-
-pub fn parseOptionalWindowFrame(
-    tokens: []const Token,
-    pos: *usize,
-    params: []const value_mod.SqlValue,
-) !?db_mod.types.RelationalRowsWindowFrame {
-    const unit: db_mod.types.RelationalRowsWindowFrameUnit = if (parser.matchKeyword(tokens, pos, "rows"))
-        .rows
-    else if (parser.matchKeyword(tokens, pos, "range"))
-        .range
-    else
-        return null;
-    const start, const end = if (parser.matchKeyword(tokens, pos, "between")) blk: {
-        const parsed_start = try parseWindowFrameBound(tokens, pos, params);
-        try parser.expectKeyword(tokens, pos, "and");
-        const parsed_end = try parseWindowFrameBound(tokens, pos, params);
-        break :blk .{ parsed_start, parsed_end };
-    } else blk: {
-        const parsed_start = try parseWindowFrameBound(tokens, pos, params);
-        break :blk .{ parsed_start, plan_mod.ParsedWindowFrameBound{ .bound = .current_row } };
-    };
-    const frame = db_mod.types.RelationalRowsWindowFrame{
-        .unit = unit,
-        .start = start.bound,
-        .start_offset = start.offset,
-        .end = end.bound,
-        .end_offset = end.offset,
-    };
-    try expr_window.validateFrame(frame);
-    return frame;
-}
-
-pub fn parseWindowFrameBound(
-    tokens: []const Token,
-    pos: *usize,
-    params: []const value_mod.SqlValue,
-) !plan_mod.ParsedWindowFrameBound {
-    if (parser.matchKeyword(tokens, pos, "unbounded")) {
-        if (parser.matchKeyword(tokens, pos, "preceding")) return .{ .bound = .unbounded_preceding };
-        if (parser.matchKeyword(tokens, pos, "following")) return .{ .bound = .unbounded_following };
-        return error.UnsupportedSqlShape;
-    }
-    if (parser.matchKeyword(tokens, pos, "current")) {
-        try parser.expectKeyword(tokens, pos, "row");
-        return .{ .bound = .current_row };
-    }
-    const offset = try value_mod.parseSqlU32Value(tokens, pos, params);
-    if (offset == 0) return error.UnsupportedSqlShape;
-    if (parser.matchKeyword(tokens, pos, "preceding")) return .{ .bound = .offset_preceding, .offset = offset };
-    if (parser.matchKeyword(tokens, pos, "following")) return .{ .bound = .offset_following, .offset = offset };
-    return error.UnsupportedSqlShape;
-}
-
 fn generatedWindowDefinitionPartitionTokens(options: WindowDefinitionParserOptions) ?generated_parser.GeneratedSqlTokenRange {
     if (options.generated_window_ast) |window| return window.partition_tokens;
     if (options.generated_over_expression_ast) |expression| return expression.over_partition_tokens;
@@ -12254,7 +12177,7 @@ pub fn parseWindowDefinitionAlloc(
     }
 
     const frame_start = pos.*;
-    const frame = try parseOptionalWindowFrame(tokens, pos, params);
+    const frame = try expr_window.parseOptionalFrame(tokens, pos, params);
     if (options.generated_window_ast != null or options.generated_over_expression_ast != null) {
         if (frame != null) {
             const range = generatedWindowDefinitionFrameTokens(options) orelse return error.UnsupportedSqlShape;
@@ -12512,7 +12435,7 @@ pub fn parseWindowSpecAlloc(
         if (expression_tokens.start != function_start) return error.UnsupportedSqlShape;
         break :blk function;
     } else null;
-    const parsed_function = try parseWindowFunction(tokens, pos);
+    const parsed_function = try expr_window.parseFunction(tokens, pos);
     const function = if (generated_function) |function| blk: {
         if (function != parsed_function) return error.UnsupportedSqlShape;
         break :blk function;
