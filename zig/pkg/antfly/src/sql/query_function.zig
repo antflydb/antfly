@@ -459,6 +459,20 @@ pub const LoweredAntflyQueryFunctionRead = struct {
     }
 };
 
+pub const LoweredAntflyQueryFunctionExpressionBody = struct {
+    function: AntflyQueryFunction,
+    table_name: []const u8,
+    body_json: []const u8,
+    primary_text_index_name: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        alloc.free(@constCast(self.body_json));
+        if (self.primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
+        self.* = undefined;
+    }
+};
+
 pub fn lowerAntflyQueryFunctionReadParsedSqlAlloc(
     alloc: std.mem.Allocator,
     semantic_resolver: ?query_contract.SemanticResolver,
@@ -695,17 +709,59 @@ pub fn lowerAntflyQueryFunctionExpressionParsedSqlAlloc(
     semantic_resolver: ?query_contract.SemanticResolver,
     parsed_sql: *const tokenized.ParsedSql,
 ) !query_contract.OwnedQueryRequest {
+    var lowered = try lowerAntflyQueryFunctionExpressionBodyTokensAlloc(alloc, semantic_resolver, parsed_sql.items());
+    defer lowered.deinit(alloc);
+    var request = try query_contract.parseQueryRequest(alloc, semantic_resolver, lowered.table_name, lowered.body_json);
+    errdefer request.deinit(alloc);
+    if (lowered.primary_text_index_name) |index_name| {
+        if (request.req.primary_text_index_name != null) return error.UnsupportedSqlShape;
+        request.req.primary_text_index_name = try alloc.dupe(u8, index_name);
+    }
+    return request;
+}
+
+pub fn lowerAntflyQueryFunctionExpressionBodyTokensAlloc(
+    alloc: std.mem.Allocator,
+    semantic_resolver: ?query_contract.SemanticResolver,
+    tokens: []const Token,
+) !LoweredAntflyQueryFunctionExpressionBody {
+    var lowered = try lowerAntflyQueryFunctionExpressionRawBodyTokensAlloc(alloc, tokens);
+    errdefer lowered.deinit(alloc);
+    var validated = try query_contract.parseQueryRequest(alloc, semantic_resolver, lowered.table_name, lowered.body_json);
+    validated.deinit(alloc);
+    return lowered;
+}
+
+pub fn lowerAntflyQueryFunctionExpressionRawBodyTokensAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+) !LoweredAntflyQueryFunctionExpressionBody {
     var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
     defer {
         deinitAntflyQueryFunctionArgs(alloc, args.items);
         args.deinit(alloc);
     }
     var pos: usize = 0;
-    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, parsed_sql.items(), &pos, &args);
-    _ = matchSqlToken(parsed_sql.items(), &pos, .semicolon);
-    if (pos != parsed_sql.items().len) return error.UnsupportedSqlShape;
+    const function = try parseAntflyQueryFunctionExpressionAlloc(alloc, tokens, &pos, &args);
+    _ = matchSqlToken(tokens, &pos, .semicolon);
+    if (pos != tokens.len) return error.UnsupportedSqlShape;
 
-    return try lowerParsedAntflyQueryFunctionAlloc(alloc, semantic_resolver, function, args.items);
+    const table_name = antflyQueryFunctionStringArg(args.items, "table_name") orelse
+        antflyQueryFunctionStringArg(args.items, "table") orelse return error.UnsupportedSqlShape;
+    const owned_table_name = try alloc.dupe(u8, table_name);
+    errdefer alloc.free(owned_table_name);
+
+    const body_json = try buildAntflyQueryFunctionBodyAlloc(alloc, function, args.items);
+    errdefer alloc.free(body_json);
+    const primary_text_index_name = try antflyQueryFunctionPrimaryTextIndexAlloc(alloc, function, args.items);
+    errdefer if (primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
+
+    return .{
+        .function = function,
+        .table_name = owned_table_name,
+        .body_json = body_json,
+        .primary_text_index_name = primary_text_index_name,
+    };
 }
 
 pub fn lowerAntflyGraphTableFunctionTokensAlloc(
@@ -887,15 +943,39 @@ fn lowerParsedAntflyQueryFunctionAlloc(
 ) !query_contract.OwnedQueryRequest {
     const table_name = antflyQueryFunctionStringArg(args, "table_name") orelse
         antflyQueryFunctionStringArg(args, "table") orelse return error.UnsupportedSqlShape;
-    const structured_primary_text_index_name = if (function == .hybrid_search)
-        try hybridSourcesPrimaryTextIndexAlloc(alloc, args)
-    else
-        null;
-    defer if (structured_primary_text_index_name) |index_name| alloc.free(index_name);
-    const primary_text_index_name = antflyQueryFunctionStringArg(args, "full_text_index") orelse
-        antflyQueryFunctionStringArg(args, "text_index") orelse
-        if (function == .full_text_search) antflyQueryFunctionStringArg(args, "index") else structured_primary_text_index_name;
+    const primary_text_index_name = try antflyQueryFunctionPrimaryTextIndexAlloc(alloc, function, args);
+    defer if (primary_text_index_name) |index_name| alloc.free(@constCast(index_name));
 
+    const body = try buildAntflyQueryFunctionBodyAlloc(alloc, function, args);
+    defer alloc.free(body);
+    var lowered = try query_contract.parseQueryRequest(alloc, semantic_resolver, table_name, body);
+    errdefer lowered.deinit(alloc);
+    if (primary_text_index_name) |index_name| {
+        if (lowered.req.primary_text_index_name != null) return error.UnsupportedSqlShape;
+        lowered.req.primary_text_index_name = try alloc.dupe(u8, index_name);
+    }
+    return lowered;
+}
+
+fn antflyQueryFunctionPrimaryTextIndexAlloc(
+    alloc: std.mem.Allocator,
+    function: AntflyQueryFunction,
+    args: []const SqlQueryFunctionArg,
+) !?[]const u8 {
+    if (antflyQueryFunctionStringArg(args, "full_text_index")) |index_name| return try alloc.dupe(u8, index_name);
+    if (antflyQueryFunctionStringArg(args, "text_index")) |index_name| return try alloc.dupe(u8, index_name);
+    if (function == .full_text_search) {
+        if (antflyQueryFunctionStringArg(args, "index")) |index_name| return try alloc.dupe(u8, index_name);
+    }
+    if (function == .hybrid_search) return try hybridSourcesPrimaryTextIndexAlloc(alloc, args);
+    return null;
+}
+
+fn buildAntflyQueryFunctionBodyAlloc(
+    alloc: std.mem.Allocator,
+    function: AntflyQueryFunction,
+    args: []const SqlQueryFunctionArg,
+) ![]u8 {
     var body = std.ArrayListUnmanaged(u8).empty;
     defer body.deinit(alloc);
     try body.append(alloc, '{');
@@ -912,14 +992,7 @@ fn lowerParsedAntflyQueryFunctionAlloc(
     }
     try appendCommonAntflyQueryFunctionOptions(alloc, &body, &first, args);
     try body.append(alloc, '}');
-
-    var lowered = try query_contract.parseQueryRequest(alloc, semantic_resolver, table_name, body.items);
-    errdefer lowered.deinit(alloc);
-    if (primary_text_index_name) |index_name| {
-        if (lowered.req.primary_text_index_name != null) return error.UnsupportedSqlShape;
-        lowered.req.primary_text_index_name = try alloc.dupe(u8, index_name);
-    }
-    return lowered;
+    return try body.toOwnedSlice(alloc);
 }
 
 fn appendAntflySqlJsonString(
@@ -2435,6 +2508,22 @@ test "sql adapter query function read keeps projected columns for derived search
     try std.testing.expectEqualStrings("docs_body_semantic", semantic.request.req.dense_queries[0].index_name);
     try std.testing.expectEqual(@as(u32, 7), semantic.request.req.dense_queries[0].query.k);
 
+    var vector_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, _score FROM antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[1.0,0.0,0.5]', limit => 3);",
+    );
+    defer vector_sql.deinit(alloc);
+    var vector = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &vector_sql);
+    defer vector.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", vector.table_name);
+    try std.testing.expectEqual(@as(usize, 2), vector.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", vector.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", vector.projection_columns[1]);
+    try std.testing.expectEqual(@as(u32, 3), vector.request.req.limit);
+    try std.testing.expectEqual(@as(usize, 1), vector.request.req.dense_queries.len);
+    try std.testing.expectEqualStrings("docs_embedding_hnsw", vector.request.req.dense_queries[0].index_name);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.5), vector.request.req.dense_queries[0].query.vector[2], 0.0001);
+
     var hybrid_sql = try tokenized.ParsedSql.initAlloc(alloc,
         \\SELECT _id, _score FROM antfly.hybrid_search(table_name => 'docs', query => 'hybrid refund', fusion => 'rrf', window_size => 25, sources => ARRAY[antfly.source('docs_body_fts', field => 'body', weight => 0.25), antfly.source('docs_body_semantic', weight => 0.6), antfly.source('docs_edge_graph', metric => 'pagerank', weight => 0.15, base_weight => 0.5, missing_score => 0.1, freshness => 'fresh')], limit => 9);
     );
@@ -2452,6 +2541,22 @@ test "sql adapter query function read keeps projected columns for derived search
     try std.testing.expect(hybrid.request.req.graph_metric_rerank != null);
     try std.testing.expect(hybrid.request.req.merge_config != null);
 
+    var graph_traverse_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, _score FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', max_depth => 2, max_results => 11);",
+    );
+    defer graph_traverse_sql.deinit(alloc);
+    var graph_traverse = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &graph_traverse_sql);
+    defer graph_traverse.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", graph_traverse.table_name);
+    try std.testing.expectEqual(@as(usize, 2), graph_traverse.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", graph_traverse.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", graph_traverse.projection_columns[1]);
+    try std.testing.expectEqual(@as(usize, 1), graph_traverse.request.req.graph_queries.len);
+    try std.testing.expectEqualStrings("citation_walk", graph_traverse.request.req.graph_queries[0].name);
+    try std.testing.expectEqual(@as(@TypeOf(graph_traverse.request.req.graph_queries[0].query.query_type), .traverse), graph_traverse.request.req.graph_queries[0].query.query_type);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_traverse.request.req.graph_queries[0].query.index_name);
+
     var graph_metric_sql = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT _id, _score FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh', limit => 2);",
@@ -2467,6 +2572,24 @@ test "sql adapter query function read keeps projected columns for derived search
     try std.testing.expectEqual(@as(usize, 1), graph_metric.request.req.graph_metric_queries.len);
     try std.testing.expectEqualStrings("docs_edge_graph", graph_metric.request.req.graph_metric_queries[0].query.index_name);
     try std.testing.expectEqualStrings("pagerank", graph_metric.request.req.graph_metric_queries[0].query.metric_name);
+
+    var graph_metric_rerank_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, _score FROM antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25, limit => 4);",
+    );
+    defer graph_metric_rerank_sql.deinit(alloc);
+    var graph_metric_rerank = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &graph_metric_rerank_sql);
+    defer graph_metric_rerank.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", graph_metric_rerank.table_name);
+    try std.testing.expectEqual(@as(usize, 2), graph_metric_rerank.projection_columns.len);
+    try std.testing.expectEqualStrings("_id", graph_metric_rerank.projection_columns[0]);
+    try std.testing.expectEqualStrings("_score", graph_metric_rerank.projection_columns[1]);
+    try std.testing.expectEqual(@as(u32, 4), graph_metric_rerank.request.req.limit);
+    try std.testing.expectEqualStrings("docs_body_fts", graph_metric_rerank.request.req.primary_text_index_name.?);
+    try std.testing.expect(graph_metric_rerank.request.req.full_text != null);
+    try std.testing.expect(graph_metric_rerank.request.req.graph_metric_rerank != null);
+    try std.testing.expectEqualStrings("docs_edge_graph", graph_metric_rerank.request.req.graph_metric_rerank.?.index_name);
+    try std.testing.expectEqualStrings("pagerank", graph_metric_rerank.request.req.graph_metric_rerank.?.metric_name);
 }
 
 fn expectMergeWeight(weights: []const @import("../search/fusion.zig").NamedWeight, name: []const u8, expected: f64) !void {

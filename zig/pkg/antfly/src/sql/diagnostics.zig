@@ -37,6 +37,17 @@ pub const SqlDiagnosticPhase = enum {
 
 pub const SqlDiagnosticCode = enum {
     current_transaction_aborted,
+    document_sql_array_requires_unnest,
+    document_sql_bounded_scan_byte_cap_exceeded,
+    document_sql_bounded_scan_incomplete_topk,
+    document_sql_bounded_scan_missing_exact_producer,
+    document_sql_bounded_scan_policy_required,
+    document_sql_bounded_scan_row_cap_exceeded,
+    document_sql_bounded_scan_unbounded_source,
+    document_sql_bounded_scan_unsupported_residual,
+    document_sql_requires_bounded_scan,
+    document_sql_unnest_requires_array,
+    document_sql_unnest_unsupported,
     document_sql_write_unsupported,
     document_sql_view_mapping_unsupported,
     invalid_role_setting,
@@ -113,6 +124,17 @@ pub fn diagnosticCodeToken(code: SqlDiagnosticCode) []const u8 {
 pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
     return switch (code) {
         .current_transaction_aborted => "current transaction is aborted",
+        .document_sql_array_requires_unnest => "document SQL array predicates require explicit UNNEST",
+        .document_sql_bounded_scan_byte_cap_exceeded => "document SQL bounded scan byte cap exceeded",
+        .document_sql_bounded_scan_incomplete_topk => "document SQL bounded scan cannot prove ordered top-k completeness",
+        .document_sql_bounded_scan_missing_exact_producer => "document SQL requires an exact native producer or bounded scan",
+        .document_sql_bounded_scan_policy_required => "document SQL requires an explicit bounded scan policy",
+        .document_sql_bounded_scan_row_cap_exceeded => "document SQL bounded scan row cap exceeded",
+        .document_sql_bounded_scan_unbounded_source => "document SQL scan source is unbounded",
+        .document_sql_bounded_scan_unsupported_residual => "document SQL bounded scan residual predicate is unsupported",
+        .document_sql_requires_bounded_scan => "document SQL requires an explicit bounded scan policy",
+        .document_sql_unnest_requires_array => "document SQL UNNEST requires an array field",
+        .document_sql_unnest_unsupported => "document SQL UNNEST shape is unsupported",
         .document_sql_write_unsupported => "document_sql_write_unsupported",
         .document_sql_view_mapping_unsupported => "document_sql_view_mapping_unsupported",
         .invalid_role_setting => "invalid sql setting",
@@ -139,6 +161,19 @@ pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
 
 pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
     return switch (code) {
+        .document_sql_array_requires_unnest,
+        .document_sql_unnest_requires_array,
+        .document_sql_unnest_unsupported,
+        => "document SQL array expansion execution",
+        .document_sql_bounded_scan_byte_cap_exceeded,
+        .document_sql_bounded_scan_incomplete_topk,
+        .document_sql_bounded_scan_missing_exact_producer,
+        .document_sql_bounded_scan_policy_required,
+        .document_sql_bounded_scan_row_cap_exceeded,
+        .document_sql_bounded_scan_unbounded_source,
+        .document_sql_bounded_scan_unsupported_residual,
+        .document_sql_requires_bounded_scan,
+        => "document SQL bounded-scan execution proof",
         .document_sql_write_unsupported => "document SQL write execution",
         .document_sql_view_mapping_unsupported => "document-to-SQL view mapping execution",
         .unsupported_sql_statement => "typed Antfly logical plan for this SQL shape",
@@ -148,6 +183,17 @@ pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
 
 pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagnosticEnvelope {
     const code: SqlDiagnosticCode = switch (err) {
+        error.DocumentSqlArrayRequiresUnnest => .document_sql_array_requires_unnest,
+        error.DocumentSqlBoundedScanByteCapExceeded => .document_sql_bounded_scan_byte_cap_exceeded,
+        error.DocumentSqlBoundedScanIncompleteTopK => .document_sql_bounded_scan_incomplete_topk,
+        error.DocumentSqlBoundedScanMissingExactProducer => .document_sql_bounded_scan_missing_exact_producer,
+        error.DocumentSqlBoundedScanPolicyRequired => .document_sql_bounded_scan_policy_required,
+        error.DocumentSqlBoundedScanRowCapExceeded => .document_sql_bounded_scan_row_cap_exceeded,
+        error.DocumentSqlBoundedScanUnboundedSource => .document_sql_bounded_scan_unbounded_source,
+        error.DocumentSqlBoundedScanUnsupportedResidual => .document_sql_bounded_scan_unsupported_residual,
+        error.DocumentSqlRequiresBoundedScan => .document_sql_requires_bounded_scan,
+        error.DocumentSqlUnnestRequiresArray => .document_sql_unnest_requires_array,
+        error.DocumentSqlUnnestUnsupported => .document_sql_unnest_unsupported,
         error.DocumentSqlWriteUnsupported => .document_sql_write_unsupported,
         error.DocumentSqlViewMappingUnsupported => .document_sql_view_mapping_unsupported,
         error.InvalidRoleSetting => .invalid_role_setting,
@@ -176,7 +222,21 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         => .unsupported_sql_statement,
         else => return null,
     };
-    return SqlDiagnosticEnvelope.init(phase, code);
+    const diagnostic = SqlDiagnosticEnvelope.init(phase, code);
+    return switch (code) {
+        .document_sql_array_requires_unnest => diagnostic.withHint("Use explicit UNNEST for array fields before applying scalar predicates."),
+        .document_sql_bounded_scan_byte_cap_exceeded => diagnostic.withHint("Increase the document SQL bounded-scan byte cap or use an indexed/native producer."),
+        .document_sql_bounded_scan_incomplete_topk => diagnostic.withHint("Add an explicit LIMIT with a bounded candidate policy, or use an exact order-preserving native producer."),
+        .document_sql_bounded_scan_missing_exact_producer => diagnostic.withHint("Add a matching native index/materialization or provide a bounded scan policy with exact residual execution."),
+        .document_sql_bounded_scan_policy_required => diagnostic.withHint("Provide a bounded scan policy with non-zero row and byte caps."),
+        .document_sql_bounded_scan_row_cap_exceeded => diagnostic.withHint("Increase the document SQL bounded-scan row cap or use an indexed/native producer."),
+        .document_sql_bounded_scan_unbounded_source => diagnostic.withHint("Add an explicit LIMIT or provide a bounded scan policy."),
+        .document_sql_bounded_scan_unsupported_residual => diagnostic.withHint("Rewrite the predicate to a supported exact residual shape or add a native indexed producer."),
+        .document_sql_requires_bounded_scan => diagnostic.withHint("Provide an explicit document SQL bounded-scan policy or add an exact indexed/native producer."),
+        .document_sql_unnest_requires_array => diagnostic.withHint("Use UNNEST only on fields declared with array type metadata."),
+        .document_sql_unnest_unsupported => diagnostic.withHint("Use a single top-level UNNEST over one array field with a bounded document producer."),
+        else => diagnostic,
+    };
 }
 
 pub const SqlAdapterClassificationReason = enum {
@@ -189,6 +249,7 @@ pub const SqlAdapterClassificationReason = enum {
     duplicate_update_target,
     enforced_unique_conflict_target,
     extension,
+    insert_overriding_value_plan,
     invalid_expression_conflict_target,
     invalid_named_conflict_target,
     multi_output_subquery_delete_selector,
@@ -207,6 +268,13 @@ pub const SqlAdapterClassificationReason = enum {
     set_operation_source_schema,
     set_operation_plan,
     system_time_temporal_table,
+    table_access_method_plan,
+    table_cluster_plan,
+    table_owner_plan,
+    table_persistence_plan,
+    table_storage_parameters_plan,
+    table_tablespace_plan,
+    table_trigger_state_plan,
     temporal_fk_action,
     transaction_control,
 };
@@ -248,6 +316,7 @@ pub const NativeRequirementCategory = enum {
     bulk_io_route,
     catalog_lifecycle,
     conflict_target_validation,
+    identity_override_execution,
     output_shape_validation,
     prepared_transaction_recovery,
     role_setting_model,
@@ -279,6 +348,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .invalid_expression_conflict_target,
         .invalid_named_conflict_target,
         => .{ .category = .conflict_target_validation },
+        .insert_overriding_value_plan => .{ .category = .identity_override_execution },
         .aggregate_duplicate_output_name,
         .duplicate_output_name,
         .multi_output_subquery_delete_selector,
@@ -288,6 +358,13 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .extension,
         .schema_namespace,
         .set_operation_source_schema,
+        .table_access_method_plan,
+        .table_cluster_plan,
+        .table_owner_plan,
+        .table_persistence_plan,
+        .table_storage_parameters_plan,
+        .table_tablespace_plan,
+        .table_trigger_state_plan,
         => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .multi_table_generation_barrier => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .prepared_transaction_plan => .{ .category = .prepared_transaction_recovery, .coordinator_recovery = true },
@@ -392,4 +469,72 @@ test "sql diagnostics expose stable phase code and native model fields" {
     try std.testing.expectEqual(SqlDiagnosticPhase.execute, readonly.phase);
     try std.testing.expectEqual(SqlDiagnosticCode.read_only_transaction, readonly.code);
     try std.testing.expect(readonly.missing_native_model == null);
+
+    const array_requires_unnest = knownErrorDiagnostic(.bind, error.DocumentSqlArrayRequiresUnnest) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticPhase.bind, array_requires_unnest.phase);
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_array_requires_unnest, array_requires_unnest.code);
+    try std.testing.expectEqualStrings("document_sql_array_requires_unnest", diagnosticCodeToken(array_requires_unnest.code));
+    try std.testing.expectEqualStrings("document SQL array predicates require explicit UNNEST", array_requires_unnest.message);
+    try std.testing.expectEqualStrings("document SQL array expansion execution", array_requires_unnest.missing_native_model.?);
+    try std.testing.expectEqualStrings("Use explicit UNNEST for array fields before applying scalar predicates.", array_requires_unnest.hint.?);
+
+    const unsupported_unnest = knownErrorDiagnostic(.bind, error.DocumentSqlUnnestUnsupported) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticPhase.bind, unsupported_unnest.phase);
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_unnest_unsupported, unsupported_unnest.code);
+    try std.testing.expectEqualStrings("document_sql_unnest_unsupported", diagnosticCodeToken(unsupported_unnest.code));
+    try std.testing.expectEqualStrings("document SQL UNNEST shape is unsupported", unsupported_unnest.message);
+    try std.testing.expectEqualStrings("document SQL array expansion execution", unsupported_unnest.missing_native_model.?);
+    try std.testing.expectEqualStrings("Use a single top-level UNNEST over one array field with a bounded document producer.", unsupported_unnest.hint.?);
+
+    const unnest_requires_array = knownErrorDiagnostic(.bind, error.DocumentSqlUnnestRequiresArray) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticPhase.bind, unnest_requires_array.phase);
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_unnest_requires_array, unnest_requires_array.code);
+    try std.testing.expectEqualStrings("document_sql_unnest_requires_array", diagnosticCodeToken(unnest_requires_array.code));
+    try std.testing.expectEqualStrings("document SQL UNNEST requires an array field", unnest_requires_array.message);
+    try std.testing.expectEqualStrings("document SQL array expansion execution", unnest_requires_array.missing_native_model.?);
+    try std.testing.expectEqualStrings("Use UNNEST only on fields declared with array type metadata.", unnest_requires_array.hint.?);
+
+    const requires_bounded = knownErrorDiagnostic(.plan, error.DocumentSqlRequiresBoundedScan) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticPhase.plan, requires_bounded.phase);
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_requires_bounded_scan, requires_bounded.code);
+    try std.testing.expectEqualStrings("document_sql_requires_bounded_scan", diagnosticCodeToken(requires_bounded.code));
+    try std.testing.expectEqualStrings("document SQL requires an explicit bounded scan policy", requires_bounded.message);
+    try std.testing.expectEqualStrings("document SQL bounded-scan execution proof", requires_bounded.missing_native_model.?);
+    try std.testing.expectEqualStrings("Provide an explicit document SQL bounded-scan policy or add an exact indexed/native producer.", requires_bounded.hint.?);
+
+    const policy_required = knownErrorDiagnostic(.plan, error.DocumentSqlBoundedScanPolicyRequired) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_policy_required, policy_required.code);
+    try std.testing.expectEqualStrings("document_sql_bounded_scan_policy_required", diagnosticCodeToken(policy_required.code));
+    try std.testing.expectEqualStrings("document SQL requires an explicit bounded scan policy", policy_required.message);
+    try std.testing.expectEqualStrings("Provide a bounded scan policy with non-zero row and byte caps.", policy_required.hint.?);
+
+    const unbounded_source = knownErrorDiagnostic(.plan, error.DocumentSqlBoundedScanUnboundedSource) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_unbounded_source, unbounded_source.code);
+    try std.testing.expectEqualStrings("document SQL scan source is unbounded", unbounded_source.message);
+    try std.testing.expectEqualStrings("Add an explicit LIMIT or provide a bounded scan policy.", unbounded_source.hint.?);
+
+    const unsupported_residual = knownErrorDiagnostic(.plan, error.DocumentSqlBoundedScanUnsupportedResidual) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_unsupported_residual, unsupported_residual.code);
+    try std.testing.expectEqualStrings("document SQL bounded scan residual predicate is unsupported", unsupported_residual.message);
+    try std.testing.expectEqualStrings("Rewrite the predicate to a supported exact residual shape or add a native indexed producer.", unsupported_residual.hint.?);
+
+    const incomplete_topk = knownErrorDiagnostic(.plan, error.DocumentSqlBoundedScanIncompleteTopK) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_incomplete_topk, incomplete_topk.code);
+    try std.testing.expectEqualStrings("document SQL bounded scan cannot prove ordered top-k completeness", incomplete_topk.message);
+    try std.testing.expectEqualStrings("Add an explicit LIMIT with a bounded candidate policy, or use an exact order-preserving native producer.", incomplete_topk.hint.?);
+
+    const missing_exact = knownErrorDiagnostic(.plan, error.DocumentSqlBoundedScanMissingExactProducer) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_missing_exact_producer, missing_exact.code);
+    try std.testing.expectEqualStrings("document SQL requires an exact native producer or bounded scan", missing_exact.message);
+    try std.testing.expectEqualStrings("Add a matching native index/materialization or provide a bounded scan policy with exact residual execution.", missing_exact.hint.?);
+
+    const row_cap = knownErrorDiagnostic(.execute, error.DocumentSqlBoundedScanRowCapExceeded) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_row_cap_exceeded, row_cap.code);
+    try std.testing.expectEqualStrings("document SQL bounded scan row cap exceeded", row_cap.message);
+    try std.testing.expectEqualStrings("Increase the document SQL bounded-scan row cap or use an indexed/native producer.", row_cap.hint.?);
+
+    const byte_cap = knownErrorDiagnostic(.execute, error.DocumentSqlBoundedScanByteCapExceeded) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_byte_cap_exceeded, byte_cap.code);
+    try std.testing.expectEqualStrings("document SQL bounded scan byte cap exceeded", byte_cap.message);
+    try std.testing.expectEqualStrings("Increase the document SQL bounded-scan byte cap or use an indexed/native producer.", byte_cap.hint.?);
 }

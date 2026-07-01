@@ -725,9 +725,12 @@ pub const TxnManager = struct {
             // Check if same key
             if (!std.mem.eql(u8, entry_user_key, user_key)) continue;
 
-            // Check if the other txn is still pending
+            // Pending and committed unresolved intents both reserve the key.
+            // Committed orphaned intents are crash-recovery debt; allowing a
+            // later writer through before recovery can lose the committed
+            // value that has not been externalized yet.
             const status = self.getTransactionStatus(entry_txn_id.*) catch continue;
-            if (status == .pending) return true;
+            if (status == .pending or status == .committed) return true;
         }
 
         return false;

@@ -3948,7 +3948,7 @@ pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
     {
         return error.UnsupportedRowsQuery;
     }
-    try preflightRoutedRowsJoinStrategy(plan.join);
+    try preflightRoutedRowsJoinStrategy(plan);
 
     const empty_rows: []const []const u8 = &.{};
     var cte_rows_storage: ?RoutedRows = null;
@@ -3979,10 +3979,39 @@ pub fn rowsJoinPlanFromRoutedScansWithSchemasAlloc(
     return try relational_rows_api.executeRowsJoinPlanOnJsonRowsWithSchemasAlloc(alloc, cte_base_schema, left_schema, right_schema, local_plan, cte_rows, left_rows.rows, right_rows.rows);
 }
 
-fn preflightRoutedRowsJoinStrategy(join: db_mod.types.RelationalRowsJoinRequest) !void {
+fn preflightRoutedRowsJoinStrategy(plan: db_mod.types.RelationalRowsJoinPlan) !void {
+    const join = plan.join;
+    if (join.strategy == .merge and (plan.left_ranges.len != 0 or plan.right_ranges.len != 0)) {
+        return error.UnsupportedRowsQuery;
+    }
+    if (join.strategy == .merge and (routedRowsJoinInputHasFilterOrPagination(join.left) or routedRowsJoinInputHasFilterOrPagination(join.right))) {
+        return error.UnsupportedRowsQuery;
+    }
     if (join.strategy == .merge and !db_mod.types.relationalRowsJoinInputsSortedOnJoinKeys(join)) {
         return error.UnsupportedRowsQuery;
     }
+}
+
+fn routedRowsJoinInputHasFilterOrPagination(req: db_mod.types.RelationalRowsQueryRequest) bool {
+    return req.predicates.len != 0 or
+        req.array_any.len != 0 or
+        req.array_contains.len != 0 or
+        req.array_eq.len != 0 or
+        req.in_predicates.len != 0 or
+        req.json_contains.len != 0 or
+        req.json_path_eq.len != 0 or
+        req.json_path_exists.len != 0 or
+        req.text_patterns.len != 0 or
+        req.or_predicates.len != 0 or
+        req.not_predicates.len != 0 or
+        req.access_or_predicates.len != 0 or
+        req.access_not_predicates.len != 0 or
+        req.expression_predicates.len != 0 or
+        req.expression_or_predicates.len != 0 or
+        req.expression_not_predicates.len != 0 or
+        req.expression_array_contains.len != 0 or
+        req.limit != null or
+        req.offset != 0;
 }
 
 pub fn rowsLateralPlanFromRoutedScansWithSchemasAlloc(
@@ -4221,7 +4250,7 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     };
 
     const FakeRoutedSource = struct {
-        const LookupMode = enum { stable, changed, first_range_changed, version_changed, missing_version, zero_scan_version };
+        const LookupMode = enum { stable, missing, changed, first_range_changed, version_changed, missing_version, zero_scan_version };
 
         scan_calls: usize = 0,
         lookup_calls: usize = 0,
@@ -4253,6 +4282,7 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
         ) !?LookupResponse {
             const self: *@This() = @ptrCast(@alignCast(ptr));
             self.lookup_calls += 1;
+            if (self.lookup_mode == .missing and std.mem.eql(u8, table_name, "orders") and std.mem.eql(u8, key, "z")) return null;
             const json = if (std.mem.eql(u8, table_name, "orders"))
                 if (std.mem.eql(u8, key, "a"))
                     if (self.lookup_mode == .first_range_changed)
@@ -4696,6 +4726,48 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqual(@as(usize, 1), first_range_changed_fake.scan_calls);
     try std.testing.expectEqual(@as(usize, 1), first_range_changed_fake.lookup_calls);
 
+    var missing_fake = FakeRoutedSource{ .lookup_mode = .missing };
+    var missing_source = missing_fake.source();
+    try std.testing.expectError(error.TopologyChanged, missing_source.rowsQueryPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .ranges = ranges[0..],
+        .query = .{
+            .source_cte = "open_rows",
+            .select = &.{ "id", "amount" },
+            .order_by = &.{.{ .field = "amount", .direction = .desc }},
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), missing_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), missing_fake.lookup_calls);
+
+    var missing_join_fake = FakeRoutedSource{ .lookup_mode = .missing };
+    var missing_join_source = missing_join_fake.source();
+    try std.testing.expectError(error.TopologyChanged, missing_join_source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), missing_join_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), missing_join_fake.lookup_calls);
+
+    var missing_lateral_fake = FakeRoutedSource{ .lookup_mode = .missing };
+    var missing_lateral_source = missing_lateral_fake.source();
+    try std.testing.expectError(error.TopologyChanged, missing_lateral_source.rowsLateralPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .lateral = .{
+            .left = .{ .source_cte = "open_rows" },
+            .right = .{ .order_by = &.{.{ .field = "amount", .direction = .desc }}, .limit = 1 },
+            .correlations = lateral_correlations[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 1), missing_lateral_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), missing_lateral_fake.lookup_calls);
+
     var changed_fake = FakeRoutedSource{ .lookup_mode = .changed };
     var changed_source = changed_fake.source();
     try std.testing.expectError(error.TopologyChanged, changed_source.rowsAggregatePlan(alloc, "orders", schema, .{
@@ -4868,6 +4940,54 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqual(db_mod.types.RelationalRowsJoinStrategy.merge, merge_join_result.strategy_selection.?.selected);
     try std.testing.expectEqual(@as(u32, 4), merge_join_result.total_rows);
     try std.testing.expectEqualStrings("{\"left_id\":\"a\",\"right_id\":\"a\"}", merge_join_result.rows[0]);
+
+    const scans_before_ranged_merge = fake.scan_calls;
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .left_ranges = ranges[0..],
+        .right_ranges = ranges[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .right = .{ .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .on = join_on[0..],
+            .strategy = .merge,
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(scans_before_ranged_merge, fake.scan_calls);
+
+    const scans_before_filtered_merge = fake.scan_calls;
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{
+                .source_cte = "open_rows",
+                .predicates = cte_predicates[0..],
+                .order_by = &.{.{ .field = "status", .direction = .asc }},
+            },
+            .right = .{ .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .on = join_on[0..],
+            .strategy = .merge,
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(scans_before_filtered_merge, fake.scan_calls);
+
+    const scans_before_paged_merge = fake.scan_calls;
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{ .source_cte = "open_rows", .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .right = .{
+                .order_by = &.{.{ .field = "status", .direction = .asc }},
+                .limit = 1,
+            },
+            .on = join_on[0..],
+            .strategy = .merge,
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(scans_before_paged_merge, fake.scan_calls);
 
     var join_result = (try source.rowsJoinPlan(alloc, "orders", schema, .{
         .ctes = ctes[0..],

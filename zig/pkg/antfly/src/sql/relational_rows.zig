@@ -25290,6 +25290,11 @@ test "relational rows join contract accepts typed equality join plans" {
     try std.testing.expectEqualStrings("z", direct_range_request.left.doc_key_range.?.end);
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinRequest(
         std.testing.allocator,
+        "{\"left\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:join\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"right\":{},\"on\":[{\"left_field\":\"customer_id\",\"right_field\":\"id\"}]}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsJoinRequest(
+        std.testing.allocator,
         "{\"left\":{},\"right\":{},\"on\":[{\"left\":\"customer_id\",\"right\":\"id\"}]}",
         schema,
     ));
@@ -25481,6 +25486,11 @@ test "relational rows cte plan contract accepts ordered typed subplans" {
     try std.testing.expect(ranged_aggregate.source.doc_key_range != null);
     try std.testing.expectEqualStrings("row:a", ranged_aggregate.source.doc_key_range.?.start);
     try std.testing.expectEqualStrings("row:z", ranged_aggregate.source.doc_key_range.?.end);
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregateRequest(
+        std.testing.allocator,
+        "{\"source\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:aggregate\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"group_by\":[\"tenant\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}]}",
+        schema,
+    ));
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsAggregatePlanRequest(
         std.testing.allocator,
@@ -25506,6 +25516,11 @@ test "relational rows cte plan contract accepts ordered typed subplans" {
     try std.testing.expect(ranged_window.source.doc_key_range != null);
     try std.testing.expectEqualStrings("row:a", ranged_window.source.doc_key_range.?.start);
     try std.testing.expectEqualStrings("row:z", ranged_window.source.doc_key_range.?.end);
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsWindowRequest(
+        std.testing.allocator,
+        "{\"source\":{\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:window\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}},\"windows\":[{\"as\":\"row_num\",\"function\":\"row_number\",\"partition_by\":[\"tenant\"],\"order_by\":[{\"field\":\"created_at\"}]}],\"select\":[\"tenant\",\"id\"]}",
+        schema,
+    ));
 
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsWindowPlanRequest(
         std.testing.allocator,
@@ -28565,6 +28580,11 @@ test "relational rows api query contract parses typed row claim request" {
     try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
         std.testing.allocator,
         "{\"row_claim\":{\"lease_ms\":0,\"owner_id\":\"session:bad\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
+        schema,
+    ));
+    try std.testing.expectError(error.InvalidRowsRequest, parseRowsQueryRequest(
+        std.testing.allocator,
+        "{\"source_cte\":\"materialized_ready\",\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:cte\",\"transaction_id\":\"00112233445566778899aabbccddeeff\"}}",
         schema,
     ));
 

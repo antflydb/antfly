@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const platform_time = @import("antfly_platform").time;
 const catalog_resources = @import("../catalog_resources.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const metadata_api = @import("../../metadata/api.zig");
@@ -518,6 +519,7 @@ const LocalRelationalMutationWriteSource = struct {
             .ptr = self,
             .vtable = &.{
                 .batch = batch,
+                .mutate_rows_from_source = mutateRowsFromSource,
                 .mutate_rows_joined_from_source_rows = mutateRowsJoinedFromSourceRows,
                 .merge_rows_from_source_rows = mergeRowsFromSourceRows,
             },
@@ -531,6 +533,18 @@ const LocalRelationalMutationWriteSource = struct {
         _: db_mod.types.BatchRequest,
     ) !?void {
         return error.UnsupportedOperation;
+    }
+
+    fn mutateRowsFromSource(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+        schema: storage_schema.TableSchema,
+        req: db_mod.types.RelationalRowsMutationSourceRequest,
+    ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        if (!std.mem.eql(u8, table_name, self.table_name)) return null;
+        return try self.db.mutateRelationalRowsFromSource(alloc, schema, req);
     }
 
     fn mutateRowsJoinedFromSourceRows(
@@ -634,6 +648,136 @@ test "mutation source autocommit rejects non-exclusive claims before opening tra
         .source_assignments = source_assignments[0..],
     }, source_rows[0..]));
     try std.testing.expectError(error.TxnNotFound, db.getTransactionStatus(joined_txn_id));
+}
+
+test "local mutation source staged claims recover after reopen before commit" {
+    const alloc = std.testing.allocator;
+    const path = "/tmp/antfly-api-local-mutation-source-reopen-staged-claim";
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try parseTestRuntimeSchema(alloc, schema_json);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const stale_txn = blk: {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        try db.setSchema(schema);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\"}" }},
+            .timestamp_ns = 1_000,
+        });
+
+        const txn_id = try db.beginTransaction(2_000);
+        var write_source = LocalRelationalMutationWriteSource{ .table_name = "usage_records", .db = &db };
+        const predicates = [_]storage_schema.RelationalCheck{.{
+            .name = "",
+            .field = "status",
+            .op = .eq,
+            .value_json = "\"ready\"",
+        }};
+        const operations = [_]db_mod.types.TransformOp{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"claimed\"",
+        }};
+        const returning = [_][]const u8{ "id", "status" };
+        var staged = (try write_source.source().mutateRowsFromSource(alloc, "usage_records", schema, .{
+            .kind = .update,
+            .source = .{
+                .predicates = predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:stale-api",
+                    .lease_ms = 1,
+                    .txn_id = txn_id,
+                },
+            },
+            .operations = operations[0..],
+            .returning = returning[0..],
+        })) orelse return error.TestUnexpectedResult;
+        defer staged.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u32, 1), staged.matched);
+        try std.testing.expectEqual(@as(u32, 1), staged.staged);
+        try std.testing.expectEqual(@as(usize, 1), staged.returning_rows.len);
+        try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", staged.returning_rows[0]);
+        break :blk txn_id;
+    };
+
+    platform_time.sleepNs(10 * std.time.ns_per_ms);
+
+    {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        try db.setSchema(schema);
+
+        try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try db.getTransactionStatus(stale_txn));
+        var visible_before = (try db.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+        defer visible_before.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, visible_before.json, "\"status\":\"ready\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, visible_before.json, "\"status\":\"claimed\"") == null);
+
+        const next_txn = try db.beginTransaction(3_000);
+        var write_source = LocalRelationalMutationWriteSource{ .table_name = "usage_records", .db = &db };
+        const predicates = [_]storage_schema.RelationalCheck{.{
+            .name = "",
+            .field = "status",
+            .op = .eq,
+            .value_json = "\"ready\"",
+        }};
+        const operations = [_]db_mod.types.TransformOp{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"done\"",
+        }};
+        const returning = [_][]const u8{ "id", "status" };
+        var staged = (try write_source.source().mutateRowsFromSource(alloc, "usage_records", schema, .{
+            .kind = .update,
+            .source = .{
+                .predicates = predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:next-api",
+                    .txn_id = next_txn,
+                },
+            },
+            .operations = operations[0..],
+            .returning = returning[0..],
+        })) orelse return error.TestUnexpectedResult;
+        defer staged.deinit(alloc);
+
+        try std.testing.expectEqual(@as(u32, 1), staged.matched);
+        try std.testing.expectEqual(@as(u32, 1), staged.staged);
+        try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"done\"}", staged.returning_rows[0]);
+        try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try db.getTransactionStatus(stale_txn));
+        try std.testing.expectError(error.DecisionConflict, db.writeTransaction(stale_txn, .{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"stale\"}" }},
+        }));
+
+        try std.testing.expectError(error.IntentConflict, db.batch(.{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"blocked\"}" }},
+            .timestamp_ns = 3_001,
+        }));
+
+        try db.commitTransaction(next_txn, 3_010);
+    }
+
+    var final_db = try db_mod.DB.open(alloc, path, .{});
+    defer final_db.close();
+    try final_db.setSchema(schema);
+
+    var final_row = (try final_db.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+    defer final_row.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"claimed\"") == null);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"stale\"") == null);
 }
 
 test "bound table write source stages joined mutation from materialized source rows" {

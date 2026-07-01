@@ -17,6 +17,7 @@ const std = @import("std");
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_type = @import("expr_type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -278,7 +279,7 @@ pub fn schemaJsonExpressionConditionsAlloc(
     try writer.writeByte('[');
     for (conditions, 0..) |condition, i| {
         if (i != 0) try writer.writeByte(',');
-        try lower_expr.writeRowExpressionConditionJson(writer, condition);
+        try expr_type.writeRowExpressionConditionJson(writer, condition);
     }
     try writer.writeByte(']');
     const json = try out.toOwnedSlice();
@@ -295,7 +296,7 @@ pub fn schemaJsonExpressionAlloc(
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
-    try lower_expr.writeRowExpressionJson(writer, expression);
+    try expr_type.writeRowExpressionJson(writer, expression);
     const json = try out.toOwnedSlice();
     defer alloc.free(json);
     var parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
@@ -354,7 +355,7 @@ pub fn schemaJsonRelationalCheckAlloc(alloc: std.mem.Allocator, check: runtime_s
     if (check.expression) |expression| {
         var expression_json_writer: std.Io.Writer.Allocating = .init(alloc);
         defer expression_json_writer.deinit();
-        try lower_expr.writeRowExpressionConditionJson(&expression_json_writer.writer, expression);
+        try expr_type.writeRowExpressionConditionJson(&expression_json_writer.writer, expression);
         const expression_json = try expression_json_writer.toOwnedSlice();
         defer alloc.free(expression_json);
         var parsed = try std.json.parseFromSlice(std.json.Value, alloc, expression_json, .{});

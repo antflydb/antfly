@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const ddl_plan = @import("ddl_plan.zig");
+const expr_type = @import("expr_type.zig");
 const generated_parser = @import("generated_parser.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -61,10 +62,12 @@ pub const ParserState = struct {
     generated_conflict_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_insert_column_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_conflict_target_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_conflict_target_kind: ?generated_parser.GeneratedSqlConflictTargetKind = null,
     generated_conflict_target_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_conflict_target_where_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_conflict_target_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     generated_conflict_action_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_conflict_action_kind: ?generated_parser.GeneratedSqlConflictActionKind = null,
     generated_conflict_action_where_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_conflict_action_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
@@ -280,6 +283,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .generated_conflict_assignment_items = ptr.generated_assignment_items,
                 .generated_conflict_assignments_tokens = ptr.generated_conflict_assignments_tokens,
                 .generated_conflict_action_tokens = ptr.generated_conflict_action_tokens,
+                .generated_conflict_action_kind = ptr.generated_conflict_action_kind,
                 .generated_insert_column_items = ptr.generated_insert_column_items,
                 .conflict_condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
                 .conflict_dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
@@ -288,8 +292,8 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn rowExpressionTypeContext(ptr: *ParserType) lower_expr.RowExpressionTypeContext {
-            return lower_expr.rowExpressionTypeContext(
+        pub fn rowExpressionTypeContext(ptr: *ParserType) expr_type.RowExpressionTypeContext {
+            return expr_type.rowExpressionTypeContext(
                 ptr.alloc,
                 ptr.schema,
                 ptr.joined_source_schema,
@@ -511,7 +515,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return .{
                 .params = ptr.params,
                 .function_bindings = ptr.function_bindings,
-                .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
+                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .context_hooks = Accessors.selectParserContextHooks(ptr),
                 .select_item_options = Accessors.selectItemParserOptions(ptr),
                 .generated_returning_items = ptr.generated_returning_items,
@@ -522,7 +526,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return .{
                 .params = ptr.params,
                 .function_bindings = ptr.function_bindings,
-                .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
+                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .select_context_hooks = Accessors.selectParserContextHooks(ptr),
                 .joined_context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
                 .select_item_options = Accessors.selectItemParserOptions(ptr),
@@ -545,7 +549,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn orderExpressionParserOptions(ptr: *ParserType) lower_expr.OrderExpressionParserOptions {
             return .{
-                .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
+                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
                 .variadic_hooks = Accessors.variadicRowExpressionParserHooks(ptr),
@@ -677,7 +681,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .params = ptr.params,
                 .available_ctes = ptr.available_ctes,
                 .function_bindings = ptr.function_bindings,
-                .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
+                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .allow_select_set_boundary = ptr.allow_select_set_boundary,
                 .allow_select_set_result_tail_boundary = ptr.allow_select_set_result_tail_boundary,
                 .generated_read_ast = ptr.generated_read_ast,
@@ -719,7 +723,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .params = ptr.params,
                 .available_ctes = ptr.available_ctes,
                 .function_bindings = ptr.function_bindings,
-                .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
+                .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .generated_read_ast = ptr.generated_read_ast,
                 .context_hooks = Accessors.selectParserContextHooks(ptr),
                 .aggregate_spec_options = Accessors.aggregateSpecParserOptions(ptr),
@@ -789,6 +793,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
                 .case_expression_hooks = Accessors.caseExpressionParserHooks(ptr),
                 .generated_target_tokens = ptr.generated_conflict_target_tokens,
+                .generated_target_kind = ptr.generated_conflict_target_kind,
                 .generated_target_items = ptr.generated_conflict_target_items,
                 .generated_where_tokens = ptr.generated_conflict_target_where_tokens,
                 .generated_where_expression = ptr.generated_conflict_target_where_expression,
@@ -880,7 +885,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                     .field_expression_qualifiers = ptr.field_expression_qualifiers,
                     .returning_expression_qualifiers = ptr.returning_expression_qualifiers,
                     .defer_row_expression_field_validation = ptr.defer_row_expression_field_validation,
-                    .field_source = lower_expr.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
+                    .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 },
             };
         }
@@ -1066,6 +1071,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .generated_conflict_assignment_items = ptr.generated_assignment_items,
                 .generated_conflict_assignments_tokens = ptr.generated_conflict_assignments_tokens,
                 .generated_conflict_action_tokens = ptr.generated_conflict_action_tokens,
+                .generated_conflict_action_kind = ptr.generated_conflict_action_kind,
                 .condition_options = Accessors.conflictAssignmentExpressionParserOptions(ptr),
                 .dispatch_options = Accessors.conflictExpressionDispatchOptions(ptr),
                 .returning_hooks = Accessors.returningProjectionParserOptions(ptr),
@@ -1297,7 +1303,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .params = sub.params,
                 .available_ctes = sub.available_ctes,
                 .function_bindings = sub.function_bindings,
-                .field_source = lower_expr.rowExpressionFieldSourceOrDefault(sub.row_expression_field_source_override),
+                .field_source = expr_type.rowExpressionFieldSourceOrDefault(sub.row_expression_field_source_override),
                 .left_alias = left_alias,
                 .context_hooks = Accessors.joinParserContextHooks(&sub),
                 .select_item_options = Accessors.selectItemParserOptions(&sub),
@@ -1317,7 +1323,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 self.params,
                 self.joined_source_schema,
                 self.function_bindings,
-                lower_expr.rowExpressionFieldSourceOrDefault(self.row_expression_field_source_override),
+                expr_type.rowExpressionFieldSourceOrDefault(self.row_expression_field_source_override),
                 Accessors.selectParserContextHooks(self),
                 Accessors.joinedExpressionParserContextHooks(self),
                 Accessors.rowExpressionOperandParserOptions(self),
@@ -1755,7 +1761,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             self.defer_row_expression_field_validation = context.defer_row_expression_field_validation;
         }
 
-        pub fn selectParserRowExpressionTypeContextHook(ptr: *anyopaque) lower_expr.RowExpressionTypeContext {
+        pub fn selectParserRowExpressionTypeContextHook(ptr: *anyopaque) expr_type.RowExpressionTypeContext {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             return Accessors.rowExpressionTypeContext(self);
         }

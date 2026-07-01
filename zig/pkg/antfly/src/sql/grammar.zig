@@ -18,7 +18,9 @@ const ast = @import("ast.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_type = @import("expr_type.zig");
 const generated_parser = @import("generated_parser.zig");
+const expr_token = @import("expr_token.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
@@ -4497,7 +4499,7 @@ pub fn peekDdlIndexElementExpression(
     const token = tokens[scan];
     if (token.matchesKeywordTag(.lower) or
         token.matchesKeywordTag(.upper) or
-        lower_expr.sqlTokenIsMd5Function(token))
+        expr_token.sqlTokenIsMd5Function(token))
     {
         return true;
     }
@@ -4533,7 +4535,7 @@ pub fn parseDdlUniqueExpressionAlloc(
     else if (cursor.matchKeyword("upper"))
         .upper
     else blk: {
-        if (cursor.matchIdentifierTokenIf(lower_expr.sqlTokenIsMd5Function) == null) break :blk null;
+        if (cursor.matchIdentifierTokenIf(expr_token.sqlTokenIsMd5Function) == null) break :blk null;
         break :blk .md5;
     };
     if (op) |simple_op| {
@@ -4569,13 +4571,13 @@ pub fn parseDdlGeneratedExpressionAlloc(
 ) !runtime_schema.RelationalGeneratedValue {
     const cursor = parser.Cursor.init(tokens, pos);
     const start = cursor.checkpoint();
-    if (cursor.peekKeywordTag(.lower) or cursor.peekKeywordTag(.upper) or cursor.peekFunctionCallTokenIf(lower_expr.sqlTokenIsMd5Function)) {
+    if (cursor.peekKeywordTag(.lower) or cursor.peekKeywordTag(.upper) or cursor.peekFunctionCallTokenIf(expr_token.sqlTokenIsMd5Function)) {
         const op: runtime_schema.RelationalGeneratedOp = if (cursor.matchKeywordTag(.lower))
             .lower
         else if (cursor.matchKeywordTag(.upper))
             .upper
         else blk: {
-            if (cursor.matchIdentifierTokenIf(lower_expr.sqlTokenIsMd5Function) == null) return error.UnsupportedSqlShape;
+            if (cursor.matchIdentifierTokenIf(expr_token.sqlTokenIsMd5Function) == null) return error.UnsupportedSqlShape;
             break :blk .md5;
         };
         try cursor.expectToken(.lparen);
@@ -4731,7 +4733,7 @@ fn parseDdlGeneratedPrimaryExpressionAlloc(
         return try ddlGeneratedValueExpressionWithOwnedJsonAlloc(alloc, value_json);
     }
     if (cursor.peekFunctionCallTag(.cast)) return try parseDdlGeneratedCastExpressionAlloc(alloc, cursor);
-    if (cursor.peekFunctionCallIf(sqlKeywordIsJsonExtractPathFunction)) return try parseDdlGeneratedJsonExtractPathExpressionAlloc(alloc, cursor);
+    if (cursor.peekFunctionCallIf(expr_token.sqlKeywordIsJsonExtractPathFunction)) return try parseDdlGeneratedJsonExtractPathExpressionAlloc(alloc, cursor);
     if (cursor.peekKind(.identifier) and cursor.pos.* + 1 < cursor.tokens.len and cursor.tokens[cursor.pos.* + 1].kind == .lparen) {
         return try parseDdlGeneratedFunctionExpressionAlloc(alloc, cursor);
     }
@@ -6742,7 +6744,7 @@ pub fn peekUpdateJoinedMutationSourceAlias(tokens: []const Token, pos: usize) ?[
                 if (j < tokens.len and tokens[j].matchesKeywordTag(.as)) {
                     j += 1;
                 }
-                if (j < tokens.len and tokens[j].kind == .identifier and !lower_expr.sqlJoinedSourceAliasTerminatorToken(tokens[j])) {
+                if (j < tokens.len and tokens[j].kind == .identifier and !expr_token.sqlJoinedSourceAliasTerminatorToken(tokens[j])) {
                     return tokens[j].text;
                 }
                 return table_name;
@@ -7055,7 +7057,7 @@ pub fn parseDdlUniquePredicateWhereJsonAlloc(
         predicate_transferred = true;
         if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
-    try lower_expr.validateUniquePredicatesForColumns(columns, predicates.items);
+    try expr_type.validateUniquePredicatesForColumns(columns, predicates.items);
     return try uniquePredicateWhereJsonAlloc(alloc, predicates.items);
 }
 
@@ -7969,51 +7971,6 @@ fn adapterNoopSetSessionSettingValueAllowed(setting: []const u8, value: []const 
     }
     return false;
 }
-
-pub const sqlKeywordIsAnyOrSome = lower_expr.sqlKeywordIsAnyOrSome;
-pub const sqlKeywordStartsScalarPredicate = lower_expr.sqlKeywordStartsScalarPredicate;
-pub const sqlJoinedSourceAliasTerminator = lower_expr.sqlJoinedSourceAliasTerminator;
-pub const sqlAssignmentTailKeyword = lower_expr.sqlAssignmentTailKeyword;
-pub const sqlKeywordIsLengthFunction = lower_expr.sqlKeywordIsLengthFunction;
-pub const sqlKeywordIsOctetLengthFunction = lower_expr.sqlKeywordIsOctetLengthFunction;
-pub const sqlKeywordIsBitLengthFunction = lower_expr.sqlKeywordIsBitLengthFunction;
-pub const sqlKeywordIsJsonArrayLengthFunction = lower_expr.sqlKeywordIsJsonArrayLengthFunction;
-pub const sqlKeywordIsCardinalityFunction = lower_expr.sqlKeywordIsCardinalityFunction;
-pub const sqlKeywordIsArrayLengthFunction = lower_expr.sqlKeywordIsArrayLengthFunction;
-pub const sqlKeywordIsArrayPositionFunction = lower_expr.sqlKeywordIsArrayPositionFunction;
-pub const sqlKeywordIsArrayToStringFunction = lower_expr.sqlKeywordIsArrayToStringFunction;
-pub const arrayLengthDefaultOutput = lower_expr.arrayLengthDefaultOutput;
-pub const sqlKeywordIsJsonTypeofFunction = lower_expr.sqlKeywordIsJsonTypeofFunction;
-pub const sqlKeywordIsJsonExtractPathFunction = lower_expr.sqlKeywordIsJsonExtractPathFunction;
-pub const sqlKeywordIsJsonBuildObjectFunction = lower_expr.sqlKeywordIsJsonBuildObjectFunction;
-pub const sqlJsonExtractPathFunctionAsText = lower_expr.sqlJsonExtractPathFunctionAsText;
-pub const sqlKeywordIsAsciiFunction = lower_expr.sqlKeywordIsAsciiFunction;
-pub const sqlKeywordIsChrFunction = lower_expr.sqlKeywordIsChrFunction;
-pub const sqlKeywordIsSubstringFunction = lower_expr.sqlKeywordIsSubstringFunction;
-pub const sqlKeywordIsOverlayFunction = lower_expr.sqlKeywordIsOverlayFunction;
-pub const sqlKeywordIsTranslateFunction = lower_expr.sqlKeywordIsTranslateFunction;
-pub const sqlKeywordIsSplitPartFunction = lower_expr.sqlKeywordIsSplitPartFunction;
-pub const sqlKeywordIsStrposFunction = lower_expr.sqlKeywordIsStrposFunction;
-pub const sqlKeywordIsLeftRightFunction = lower_expr.sqlKeywordIsLeftRightFunction;
-pub const sqlKeywordIsPadFunction = lower_expr.sqlKeywordIsPadFunction;
-pub const sqlKeywordIsRepeatFunction = lower_expr.sqlKeywordIsRepeatFunction;
-pub const sqlKeywordIsReverseFunction = lower_expr.sqlKeywordIsReverseFunction;
-pub const sqlKeywordIsInitcapFunction = lower_expr.sqlKeywordIsInitcapFunction;
-pub const sqlKeywordIsMd5Function = lower_expr.sqlKeywordIsMd5Function;
-pub const sqlKeywordIsStartsWithFunction = lower_expr.sqlKeywordIsStartsWithFunction;
-pub const sqlKeywordIsEndsWithFunction = lower_expr.sqlKeywordIsEndsWithFunction;
-pub const sqlKeywordIsDateTruncFunction = lower_expr.sqlKeywordIsDateTruncFunction;
-pub const sqlKeywordIsDateBinFunction = lower_expr.sqlKeywordIsDateBinFunction;
-pub const sqlKeywordIsDatePartFunction = lower_expr.sqlKeywordIsDatePartFunction;
-pub const sqlKeywordIsTrimVariantFunction = lower_expr.sqlKeywordIsTrimVariantFunction;
-pub const sqlKeywordIsUuidV4Function = lower_expr.sqlKeywordIsUuidV4Function;
-pub const sqlKeywordIsRegexpMatchFunction = lower_expr.sqlKeywordIsRegexpMatchFunction;
-pub const sqlKeywordIsRegexpCountFunction = lower_expr.sqlKeywordIsRegexpCountFunction;
-pub const sqlKeywordIsRegexpSubstrFunction = lower_expr.sqlKeywordIsRegexpSubstrFunction;
-pub const sqlKeywordIsRegexpInstrFunction = lower_expr.sqlKeywordIsRegexpInstrFunction;
-pub const rowExpressionBoundaryKeyword = lower_expr.rowExpressionBoundaryKeyword;
-pub const sqlWhereTailClauseKeyword = lower_expr.sqlWhereTailClauseKeyword;
-pub const sqlWindowTailClauseKeyword = lower_expr.sqlWindowTailClauseKeyword;
 
 test "sql adapter grammar parses row security catalog tails" {
     const alloc = std.testing.allocator;

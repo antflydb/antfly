@@ -51,6 +51,12 @@
       ]
     },
     {
+      "reason": "insert_overriding_value_plan",
+      "coverage": [
+        "unsupported_insert_overriding_value"
+      ]
+    },
+    {
       "reason": "invalid_expression_conflict_target",
       "coverage": [
         "invalid_expression_conflict_target"
@@ -169,6 +175,51 @@
       "coverage": [
         "ddl_system_versioned_table",
         "schema_system_versioned_table"
+      ]
+    },
+    {
+      "reason": "table_access_method_plan",
+      "coverage": [
+        "unsupported_ddl_table_access_method"
+      ]
+    },
+    {
+      "reason": "table_cluster_plan",
+      "coverage": [
+        "unsupported_ddl_table_cluster_on",
+        "unsupported_ddl_table_cluster_without"
+      ]
+    },
+    {
+      "reason": "table_owner_plan",
+      "coverage": [
+        "unsupported_ddl_table_owner"
+      ]
+    },
+    {
+      "reason": "table_persistence_plan",
+      "coverage": [
+        "unsupported_ddl_table_persistence"
+      ]
+    },
+    {
+      "reason": "table_storage_parameters_plan",
+      "coverage": [
+        "unsupported_ddl_table_storage_parameters",
+        "unsupported_ddl_table_storage_parameters_reset"
+      ]
+    },
+    {
+      "reason": "table_tablespace_plan",
+      "coverage": [
+        "unsupported_ddl_table_tablespace"
+      ]
+    },
+    {
+      "reason": "table_trigger_state_plan",
+      "coverage": [
+        "unsupported_ddl_table_trigger_disable",
+        "unsupported_ddl_table_trigger_enable"
       ]
     },
     {

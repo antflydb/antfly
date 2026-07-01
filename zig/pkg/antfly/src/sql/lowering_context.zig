@@ -246,15 +246,43 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             context.schema,
             context.params,
         ) },
-        .set_operation => .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
-            context.alloc,
-            parsed_sql,
-            context.schema,
-            context.source_schema,
-            context.params,
-            context.function_bindings,
-        ) },
+        .set_operation => blk: {
+            if (generatedSetOperationAllowsQueryFallback(read_ast)) {
+                const lowered_query: ?plan.LoweredQueryPlan = context.callbacks.lower_query_plan(
+                    context.alloc,
+                    parsed_sql,
+                    context.schema,
+                    context.params,
+                    context.function_bindings,
+                ) catch |err| switch (err) {
+                    error.UnsupportedSqlShape => null,
+                    else => return err,
+                };
+                if (lowered_query) |lowered| {
+                    break :blk .{ .query = lowered };
+                }
+            }
+            break :blk .{ .set_operation = try context.callbacks.lower_set_operation_optional_source_schema(
+                context.alloc,
+                parsed_sql,
+                context.schema,
+                context.source_schema,
+                context.params,
+                context.function_bindings,
+            ) };
+        },
         .cte => try lowerGeneratedCteReadPlanAlloc(context, parsed_sql, read_kind),
+    };
+}
+
+fn generatedSetOperationAllowsQueryFallback(read_ast: *const generated_parser.GeneratedSqlReadAst) bool {
+    const has_result_tail = read_ast.order_tokens != null or
+        read_ast.limit_tokens != null or
+        read_ast.offset_tokens != null or
+        read_ast.fetch_tokens != null;
+    return switch (read_ast.set_operation.kind orelse return false) {
+        .@"union" => true,
+        .intersect, .except => !has_result_tail,
     };
 }
 
@@ -4467,7 +4495,8 @@ fn validateGeneratedSetOperationAstRanges(
 
     const right_query = set_operation.right_query_tokens orelse return error.UnsupportedSqlShape;
     const right_select = set_operation.right_select_tokens orelse return error.UnsupportedSqlShape;
-    if (right_query.start < operator.end or right_query.end != containing.end) return error.UnsupportedSqlShape;
+    if (right_query.start < operator.end or right_query.end > containing.end) return error.UnsupportedSqlShape;
+    if (right_query.end < containing.end and !generatedReadNextIsSetOperationKeyword(tokens, right_query.end)) return error.UnsupportedSqlShape;
     if (set_operation.all_tokens) |all_tokens| {
         if (right_query.start != all_tokens.end) return error.UnsupportedSqlShape;
     } else if (right_query.start != operator.end) {
@@ -4529,6 +4558,13 @@ fn validateGeneratedSetOperationAstRanges(
     } else if (generatedExpressionAstHasMetadata(set_operation.right_where_expression)) {
         return error.UnsupportedSqlShape;
     }
+}
+
+fn generatedReadNextIsSetOperationKeyword(tokens: []const tokenized.Token, pos: usize) bool {
+    if (pos >= tokens.len) return false;
+    return tokens[pos].matchesKeywordTag(.@"union") or
+        tokens[pos].matchesKeywordTag(.intersect) or
+        tokens[pos].matchesKeywordTag(.except);
 }
 
 fn validateGeneratedSetOperationMetadata(

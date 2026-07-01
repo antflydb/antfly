@@ -4803,7 +4803,8 @@ fn generatedReadSetOperationPayloadIsValid(
     }
 
     const right_query = set_operation.right_query_tokens orelse return false;
-    if (!std.meta.eql(right_query, generated_parser.GeneratedSqlTokenRange{ .start = right_start, .end = range.end })) return false;
+    if (right_query.start != right_start or right_query.end > range.end or right_query.start >= right_query.end) return false;
+    if (right_query.end < range.end and !generatedReadNextIsSetOperationKeyword(tokens, end, right_query.end)) return false;
     if (!generatedReadNestedRangeIsValid(tokens, end, range, right_query)) return false;
 
     const right_select = set_operation.right_select_tokens orelse return false;
@@ -4850,6 +4851,13 @@ fn generatedReadSetOperationPayloadIsValid(
         set_operation.right_where_tokens,
     )) return false;
     return true;
+}
+
+fn generatedReadNextIsSetOperationKeyword(tokens: []const Token, end: usize, pos: usize) bool {
+    if (pos >= end) return false;
+    return tokens[pos].matchesKeywordTag(.@"union") or
+        tokens[pos].matchesKeywordTag(.intersect) or
+        tokens[pos].matchesKeywordTag(.except);
 }
 
 fn generatedReadSetOperationRightQueryCursorIsValid(
@@ -6166,6 +6174,13 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_server,
         .alter_system,
         .alter_statistics,
+        .alter_table_access_method,
+        .alter_table_cluster,
+        .alter_table_owner,
+        .alter_table_persistence,
+        .alter_table_storage_parameters,
+        .alter_table_tablespace,
+        .alter_table_trigger_state,
         .alter_text_search_configuration,
         .alter_text_search_dictionary,
         .alter_text_search_parser,
@@ -7511,6 +7526,31 @@ test "sql adapter parsed sql owns typed statement variants" {
             .sql = "ALTER STATISTICS usage_stats SET STATISTICS 100",
             .kind = .alter_statistics,
             .reason = .alter_statistics_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records CLUSTER ON usage_status_idx",
+            .kind = .alter_table_cluster,
+            .reason = .alter_table_cluster_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records OWNER TO app_role",
+            .kind = .alter_table_owner,
+            .reason = .alter_table_owner_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records SET WITHOUT CLUSTER",
+            .kind = .alter_table_cluster,
+            .reason = .alter_table_cluster_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records ENABLE TRIGGER usage_audit",
+            .kind = .alter_table_trigger_state,
+            .reason = .alter_table_trigger_state_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records DISABLE TRIGGER usage_audit",
+            .kind = .alter_table_trigger_state,
+            .reason = .alter_table_trigger_state_not_planned_by_generated_parser,
         },
         .{
             .sql = "ALTER TEXT SEARCH CONFIGURATION usage_search RENAME TO usage_search_v2",

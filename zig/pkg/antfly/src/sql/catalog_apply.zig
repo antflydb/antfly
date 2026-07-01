@@ -18,6 +18,7 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_type = @import("expr_type.zig");
 const lower_expr = @import("lower_expr.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -1656,11 +1657,11 @@ fn applyCreateIndexPlanAlloc(
             .array => if (plan.opclass == .jsonb_path_ops) return error.InvalidSqlCatalog,
             else => return error.InvalidSqlCatalog,
         }
-        try lower_expr.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
+        try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
     }
 
     if (plan.unique) {
-        try lower_expr.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
+        try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
         const constraint: runtime_schema.UniqueConstraint = .{
             .name = plan.index_name,
             .columns = plan.columns,
@@ -1673,7 +1674,7 @@ fn applyCreateIndexPlanAlloc(
             .where_expressions = plan.where_expressions,
             .validation_state = .unvalidated,
         };
-        try lower_expr.validateUniqueConstraintForColumns(schema.relational_columns, schema.periods, constraint);
+        try expr_type.validateUniqueConstraintForColumns(schema.relational_columns, schema.periods, constraint);
         try ddl_plan.appendUniqueConstraintAlloc(alloc, &schema, constraint);
         return schema;
     }
@@ -1682,7 +1683,7 @@ fn applyCreateIndexPlanAlloc(
     if (plan.generated_expression) |generated_expression| {
         if (plan.columns.len != 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
         if (binder.relationalColumnIndex(schema.relational_columns, plan.index_name) != null) return error.InvalidSqlCatalog;
-        try lower_expr.validateCreateIndexIncludeColumns(schema.relational_columns, &.{}, plan.include_columns);
+        try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, &.{}, plan.include_columns);
         const column: runtime_schema.RelationalColumn = .{
             .name = plan.index_name,
             .path = plan.index_name,
@@ -1697,17 +1698,17 @@ fn applyCreateIndexPlanAlloc(
             .index_where = plan.where,
             .index_where_expressions = plan.where_expressions,
         };
-        try lower_expr.validateGeneratedColumnForColumns(schema.relational_columns, column);
-        try lower_expr.validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
-        try lower_expr.validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
+        try expr_type.validateGeneratedColumnForColumns(schema.relational_columns, column);
+        try expr_type.validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
+        try expr_type.validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
         try ddl_plan.appendRelationalColumnAlloc(alloc, &schema, column);
         return schema;
     }
 
     if (plan.columns.len == 0 or plan.expressions.len != 0) return error.UnsupportedSqlShape;
-    try lower_expr.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
-    try lower_expr.validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
-    try lower_expr.validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
+    try expr_type.validateCreateIndexIncludeColumns(schema.relational_columns, plan.columns, plan.include_columns);
+    try expr_type.validateUniquePredicatesForColumns(schema.relational_columns, plan.where);
+    try expr_type.validateUniquePredicateExpressionsForColumns(schema.relational_columns, plan.where_expressions);
     try ddl_plan.markColumnsIndexedAlloc(alloc, &schema, plan.index_name, plan.columns, plan.include_columns, plan.index_keys, plan.where, plan.where_expressions, index_generation);
     return schema;
 }
@@ -1775,7 +1776,7 @@ fn applyAlterTablePlanAlloc(
             .alter_column_nullability => |alter_column_nullability| try ddl_plan.alterRelationalColumnNullability(&schema, alter_column_nullability),
             .alter_column_type => |alter_column_type| try schema_mutation.alterRelationalColumnTypeAlloc(alloc, &schema, alter_column_type),
             .add_unique_constraint => |constraint| {
-                try lower_expr.validateUniqueConstraintForColumns(schema.relational_columns, schema.periods, constraint);
+                try expr_type.validateUniqueConstraintForColumns(schema.relational_columns, schema.periods, constraint);
                 try ddl_plan.appendUniqueConstraintAlloc(alloc, &schema, constraint);
             },
             .add_foreign_key => |foreign_key| {
@@ -1784,7 +1785,7 @@ fn applyAlterTablePlanAlloc(
                 try ddl_plan.appendForeignKeyAlloc(alloc, &schema, foreign_key);
             },
             .add_check => |check| {
-                try lower_expr.validateCheckForColumns(schema.relational_columns, check);
+                try expr_type.validateCheckForColumns(schema.relational_columns, check);
                 try ddl_plan.appendRelationalCheckAlloc(alloc, &schema, check);
             },
             .validate_constraint => |constraint_name| try ddl_plan.validateConstraintByName(&schema, plan.table_name, constraint_name),
@@ -1836,11 +1837,11 @@ fn addRelationalColumnOperationAlloc(
         if (operation.if_not_exists) return;
         return error.InvalidSqlCatalog;
     }
-    try lower_expr.validateGeneratedColumnForColumns(schema.relational_columns, operation.column);
-    try lower_expr.validateUniquePredicatesForColumns(schema.relational_columns, operation.column.index_where);
+    try expr_type.validateGeneratedColumnForColumns(schema.relational_columns, operation.column);
+    try expr_type.validateUniquePredicatesForColumns(schema.relational_columns, operation.column.index_where);
     try ddl_plan.appendRelationalColumnAlloc(alloc, schema, operation.column);
     for (operation.unique_constraints) |constraint| {
-        try lower_expr.validateUniqueConstraintForColumns(schema.relational_columns, schema.periods, constraint);
+        try expr_type.validateUniqueConstraintForColumns(schema.relational_columns, schema.periods, constraint);
         try ddl_plan.appendUniqueConstraintAlloc(alloc, schema, constraint);
     }
     for (operation.foreign_keys) |foreign_key| {
@@ -1849,7 +1850,7 @@ fn addRelationalColumnOperationAlloc(
         try ddl_plan.appendForeignKeyAlloc(alloc, schema, foreign_key);
     }
     for (operation.checks) |check| {
-        try lower_expr.validateCheckForColumns(schema.relational_columns, check);
+        try expr_type.validateCheckForColumns(schema.relational_columns, check);
         try ddl_plan.appendRelationalCheckAlloc(alloc, schema, check);
     }
 }
@@ -1881,7 +1882,7 @@ fn addRelationalPrimaryKeyAlloc(
     primary_key: runtime_schema.PrimaryKey,
 ) !void {
     if (schema.primary_key != null) return error.InvalidSqlCatalog;
-    try lower_expr.validatePrimaryKeyColumns(schema.relational_columns, primary_key);
+    try expr_type.validatePrimaryKeyColumns(schema.relational_columns, primary_key);
     try binder.validatePrimaryKeyTemporalCatalog(schema.periods, primary_key);
     schema.primary_key = try ddl_plan.cloneDdlPrimaryKey(alloc, primary_key);
 }

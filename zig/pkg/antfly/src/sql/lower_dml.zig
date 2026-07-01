@@ -20,6 +20,12 @@ const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_build = @import("expr_build.zig");
+const expr_equal = @import("expr_equal.zig");
+const expr_operator = @import("expr_operator.zig");
+const expr_predicate = @import("expr_predicate.zig");
+const expr_token = @import("expr_token.zig");
+const expr_type = @import("expr_type.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -29,6 +35,7 @@ const plan_mod = @import("plan.zig");
 const query_function = @import("query_function.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
+const row_claim_mod = @import("row_claim.zig");
 const strings = @import("strings.zig");
 const test_support = @import("test_support.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
@@ -52,6 +59,7 @@ pub const InsertSourceParserHooks = struct {
     generated_conflict_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_conflict_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_conflict_action_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_conflict_action_kind: ?generated_parser.GeneratedSqlConflictActionKind = null,
     generated_insert_column_items: ?*const generated_parser.GeneratedSqlListAst = null,
     conflict_condition_options: ConflictAssignmentExpressionParserOptions,
     conflict_dispatch_options: ConflictExpressionDispatchOptions,
@@ -128,10 +136,11 @@ pub const MergeMutationBodyOptions = struct {
 };
 
 pub const ConflictTargetParserOptions = struct {
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool = false,
     case_expression_hooks: lower_expr.CaseExpressionParserHooks,
     generated_target_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_target_kind: ?generated_parser.GeneratedSqlConflictTargetKind = null,
     generated_target_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_where_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
@@ -147,7 +156,7 @@ pub const ConflictIncrementParserOptions = struct {
 };
 
 pub const ConflictUpdateAssignmentExpressionParserOptions = struct {
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     assignment_options: ConflictAssignmentExpressionParserOptions,
 };
 
@@ -156,7 +165,7 @@ pub const JsonSetSqlValueParserOptions = struct {
     schema: runtime_schema.TableSchema,
     conflict_existing_qualifiers: []const []const u8,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     row_expression_hooks: lower_expr.RowExpressionParserHooks,
     arithmetic_hooks: lower_expr.ArithmeticExpressionParserHooks,
@@ -198,7 +207,7 @@ pub const ConflictClauseParserContextHooks = struct {
     ptr: *anyopaque,
     get_context: *const fn (*anyopaque) ConflictClauseParserContext,
     set_context: *const fn (*anyopaque, ConflictClauseParserContext) void,
-    row_expression_type_context: *const fn (*anyopaque) lower_expr.RowExpressionTypeContext,
+    row_expression_type_context: *const fn (*anyopaque) expr_type.RowExpressionTypeContext,
 };
 
 pub const ConflictClauseParserOptions = struct {
@@ -216,6 +225,7 @@ pub const ConflictClauseParserOptions = struct {
     generated_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_action_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_action_kind: ?generated_parser.GeneratedSqlConflictActionKind = null,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
 };
@@ -224,7 +234,7 @@ pub const ConflictAssignmentExpressionParserOptions = struct {
     params: []const sql_value.SqlValue,
     schema: runtime_schema.TableSchema,
     conflict_existing_qualifiers: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     dispatch_options: ConflictExpressionDispatchOptions,
     generated_action_where_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
@@ -302,66 +312,66 @@ pub const ConflictExpressionOperandStart = enum {
 };
 
 pub fn conflictExpressionStartAt(tokens: []const Token, pos: usize) ?ConflictExpressionStart {
-    if (lower_expr.peekCastExpressionSyntax(tokens, pos)) return .cast;
-    if (lower_expr.peekCaseExpressionSyntax(tokens, pos)) return .case;
-    if (lower_expr.peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
-    if (lower_expr.peekReplaceFunctionCall(tokens, pos)) return .replace;
-    if (lower_expr.peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpMatchFunction)) return .regexp_match;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpSubstrFunction)) return .regexp_substr;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpCountFunction)) return .regexp_count;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpInstrFunction)) return .regexp_instr;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsTranslateFunction)) return .translate;
-    if (lower_expr.peekConcatFunctionCall(tokens, pos)) return .concat;
-    if (lower_expr.peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
-    if (lower_expr.peekNullifFunctionCall(tokens, pos)) return .nullif;
-    if (lower_expr.peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsAsciiFunction)) return .ascii;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsChrFunction)) return .chr;
-    if (lower_expr.peekSubstringFunctionKeyword(tokens, pos)) return .substring;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsOverlayFunction)) return .overlay;
-    if (lower_expr.peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
-    if (lower_expr.peekStrposFunctionKeyword(tokens, pos) or lower_expr.peekPositionFunctionSyntax(tokens, pos)) return .strpos;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsLeftRightFunction)) return .left_right;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsPadFunction)) return .pad;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRepeatFunction)) return .repeat;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsReverseFunction)) return .reverse;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsMd5Function)) return .md5;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsStartsWithFunction)) return .starts_with;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsEndsWithFunction)) return .ends_with;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateTruncFunction)) return .date_trunc;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateBinFunction)) return .date_bin;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDatePartFunction)) return .date_part;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .floor)) return .floor;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .ceil)) return .ceil;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .sqrt)) return .sqrt;
-    if (lower_expr.peekFixedUnaryFunctionCall(tokens, pos, .sign)) return .sign;
-    if (lower_expr.peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
-    if (lower_expr.peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
-    if (lower_expr.peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction)) return .json_extract_path;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonBuildObjectFunction)) return .json_build_object;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonTypeofFunction)) return .json_typeof;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonArrayLengthFunction)) return .json_array_length;
-    if (lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayLengthFunction)) return .array_length;
-    if (lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayPositionFunction)) return .array_position;
-    if (lower_expr.peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
-    if (lower_expr.peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
-    if (lower_expr.peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsUuidV4Function)) return .uuid_v4;
-    if (lower_expr.peekSqlNowExpressionSyntax(tokens, pos)) return .now;
-    if (lower_expr.peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
+    if (expr_token.peekCastExpressionSyntax(tokens, pos)) return .cast;
+    if (expr_token.peekCaseExpressionSyntax(tokens, pos)) return .case;
+    if (expr_token.peekCaseFoldFunctionCall(tokens, pos)) return .case_fold;
+    if (expr_token.peekReplaceFunctionCall(tokens, pos)) return .replace;
+    if (expr_token.peekRegexpReplaceFunctionCall(tokens, pos)) return .regexp_replace;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpMatchFunction)) return .regexp_match;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpSubstrFunction)) return .regexp_substr;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpCountFunction)) return .regexp_count;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpInstrFunction)) return .regexp_instr;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsTranslateFunction)) return .translate;
+    if (expr_token.peekConcatFunctionCall(tokens, pos)) return .concat;
+    if (expr_token.peekCoalesceFunctionCall(tokens, pos)) return .coalesce;
+    if (expr_token.peekNullifFunctionCall(tokens, pos)) return .nullif;
+    if (expr_token.peekTextLengthFunctionKeyword(tokens, pos)) return .text_length;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsAsciiFunction)) return .ascii;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsChrFunction)) return .chr;
+    if (expr_token.peekSubstringFunctionKeyword(tokens, pos)) return .substring;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsOverlayFunction)) return .overlay;
+    if (expr_token.peekSplitPartFunctionKeyword(tokens, pos)) return .split_part;
+    if (expr_token.peekStrposFunctionKeyword(tokens, pos) or expr_token.peekPositionFunctionSyntax(tokens, pos)) return .strpos;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsLeftRightFunction)) return .left_right;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsPadFunction)) return .pad;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction)) return .repeat;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsReverseFunction)) return .reverse;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) return .md5;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction)) return .starts_with;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction)) return .ends_with;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction)) return .date_trunc;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateBinFunction)) return .date_bin;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDatePartFunction)) return .date_part;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .abs)) return .abs;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .round)) return .round;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .trunc)) return .trunc;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .floor)) return .floor;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .ceil)) return .ceil;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .sqrt)) return .sqrt;
+    if (expr_token.peekFixedUnaryFunctionCall(tokens, pos, .sign)) return .sign;
+    if (expr_token.peekFixedBinaryFunctionCall(tokens, pos, .mod)) return .mod;
+    if (expr_token.peekFixedBinaryFunctionCall(tokens, pos, .power)) return .power;
+    if (expr_token.peekGreatestLeastFunctionCall(tokens, pos)) return .greatest_least;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonExtractPathFunction)) return .json_extract_path;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonBuildObjectFunction)) return .json_build_object;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonTypeofFunction)) return .json_typeof;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonArrayLengthFunction)) return .json_array_length;
+    if (expr_token.functionCallStartsAtTokenIf(tokens, pos, expr_token.sqlTokenIsArrayLengthFunction)) return .array_length;
+    if (expr_token.functionCallStartsAtTokenIf(tokens, pos, expr_token.sqlTokenIsArrayPositionFunction)) return .array_position;
+    if (expr_token.peekArrayElementTransformFunctionCall(tokens, pos)) return .array_element_transform;
+    if (expr_token.peekArrayToStringFunctionCall(tokens, pos)) return .array_to_string;
+    if (expr_token.peekStringToArrayFunctionCall(tokens, pos)) return .string_to_array;
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsUuidV4Function)) return .uuid_v4;
+    if (expr_token.peekSqlNowExpressionSyntax(tokens, pos)) return .now;
+    if (expr_token.peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
     if (lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
-    if (lower_expr.peekSqlIntervalExpressionSyntax(tokens, pos)) return .interval;
+    if (expr_token.peekSqlIntervalExpressionSyntax(tokens, pos)) return .interval;
     return null;
 }
 
 pub fn conflictExpressionOperandStartAt(tokens: []const Token, pos: usize) ConflictExpressionOperandStart {
-    if (lower_expr.peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
-    if (lower_expr.peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
+    if (expr_token.peekUnaryNegativeExpressionSyntax(tokens, pos)) return .unary_negative;
+    if (expr_token.peekParenthesizedExpressionSyntax(tokens, pos)) return .parenthesized;
     if (conflictExpressionStartAt(tokens, pos) != null) return .expression;
     if (parser.peekKind(tokens, pos, .identifier) and
         !parser.peekKeywordTag(tokens, pos, .null) and
@@ -413,7 +423,7 @@ pub const JoinedMutationAssignmentValueParserOptions = struct {
 
 pub const JoinedMutationAssignmentExpressionParserOptions = struct {
     pending_joined_source_alias: ?[]const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
     boolean_expression_options: lower_expr.JoinedBooleanRowExpressionParserOptions,
 };
@@ -635,7 +645,7 @@ pub const MergeAssignmentParserOptions = struct {
 
 pub const MergeAssignmentExpressionParserOptions = struct {
     default_context: relational_rows.DefaultValueContext = .{},
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
 };
 
@@ -666,13 +676,14 @@ pub const InsertParserOptions = struct {
     schema: runtime_schema.TableSchema,
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
     default_context: relational_rows.DefaultValueContext = .{},
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool = false,
     target_options: ConflictTargetParserOptions,
     assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
     generated_conflict_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_conflict_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_conflict_action_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    generated_conflict_action_kind: ?generated_parser.GeneratedSqlConflictActionKind = null,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
     returning_hooks: lower_expr.ReturningProjectionParserOptions,
@@ -903,7 +914,7 @@ pub fn parseInsertSourceWithCtesAlloc(
 
     const effective_source_schema = relational_rows.rowsPlannedQuerySourceSchema(base_source_schema, planned_ctes, source.query) orelse return error.UnsupportedSqlShape;
 
-    const type_context: lower_expr.RowExpressionTypeContext = .{
+    const type_context: expr_type.RowExpressionTypeContext = .{
         .alloc = alloc,
         .schema = hooks.schema,
         .joined_source_schema = effective_source_schema,
@@ -935,6 +946,7 @@ pub fn parseInsertSourceWithCtesAlloc(
             .generated_assignment_items = hooks.generated_conflict_assignment_items,
             .generated_assignments_tokens = hooks.generated_conflict_assignments_tokens,
             .generated_action_tokens = hooks.generated_conflict_action_tokens,
+            .generated_action_kind = hooks.generated_conflict_action_kind,
             .condition_options = hooks.conflict_condition_options,
             .dispatch_options = hooks.conflict_dispatch_options,
         });
@@ -1460,6 +1472,8 @@ fn generatedDmlOptionalExpressionSurfaceEqual(
         a.inner_expression_kind != b.inner_expression_kind or
         a.subquery_read_kind != b.subquery_read_kind or
         a.subquery_where_expression_kind != b.subquery_where_expression_kind or
+        a.aggregate_function_kind != b.aggregate_function_kind or
+        a.window_function_kind != b.window_function_kind or
         a.filter_expression_kind != b.filter_expression_kind or
         a.over_frame_start_expression_kind != b.over_frame_start_expression_kind or
         a.over_frame_end_expression_kind != b.over_frame_end_expression_kind or
@@ -1868,6 +1882,8 @@ fn generatedDmlReadCteSurfaceEqual(
         generatedDmlOptionalTokenRangeEqual(a.body_fetch_count_tokens, b.body_fetch_count_tokens) and
         generatedDmlOptionalExpressionSurfaceEqual(a.body_fetch_count_expression, b.body_fetch_count_expression) and
         generatedDmlOptionalTokenRangeEqual(a.body_row_lock_tokens, b.body_row_lock_tokens) and
+        a.body_row_lock_mode == b.body_row_lock_mode and
+        a.body_row_lock_wait_policy == b.body_row_lock_wait_policy and
         generatedDmlOptionalTokenRangeEqual(a.body_set_operation_tokens, b.body_set_operation_tokens) and
         generatedDmlSetOperationSurfaceEqual(a.body_set_operation, b.body_set_operation) and
         generatedDmlListSurfaceEqual(a.body_projection_items, b.body_projection_items) and
@@ -1948,6 +1964,8 @@ fn generatedDmlReadAstSurfaceEqual(
         !generatedDmlOptionalTokenRangeEqual(a.fetch_tokens, b.fetch_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.fetch_count_tokens, b.fetch_count_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.row_lock_tokens, b.row_lock_tokens) or
+        a.row_lock_mode != b.row_lock_mode or
+        a.row_lock_wait_policy != b.row_lock_wait_policy or
         !generatedDmlOptionalTokenRangeEqual(a.set_operation_tokens, b.set_operation_tokens))
     {
         return false;
@@ -2010,9 +2028,13 @@ fn generatedDmlAstSurfaceEqual(
         !generatedDmlOptionalTokenRangeEqual(a.mutation_fetch_tokens, b.mutation_fetch_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.mutation_fetch_count_tokens, b.mutation_fetch_count_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.mutation_row_lock_tokens, b.mutation_row_lock_tokens) or
+        a.mutation_row_lock_mode != b.mutation_row_lock_mode or
+        a.mutation_row_lock_wait_policy != b.mutation_row_lock_wait_policy or
         !generatedDmlOptionalTokenRangeEqual(a.conflict_tokens, b.conflict_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.conflict_target_tokens, b.conflict_target_tokens) or
+        a.conflict_target_kind != b.conflict_target_kind or
         !generatedDmlOptionalTokenRangeEqual(a.conflict_action_tokens, b.conflict_action_tokens) or
+        a.conflict_action_kind != b.conflict_action_kind or
         !generatedDmlOptionalTokenRangeEqual(a.conflict_assignments_tokens, b.conflict_assignments_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.conflict_target_where_tokens, b.conflict_target_where_tokens) or
         !generatedDmlOptionalTokenRangeEqual(a.conflict_action_where_tokens, b.conflict_action_where_tokens) or
@@ -2750,7 +2772,7 @@ pub const ArrayTransformValue = struct {
 };
 
 pub fn validateInsertSourceAssignmentExpressionType(
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     target_column: runtime_schema.RelationalColumn,
     expression: db_mod.types.RelationalRowsExpression,
 ) !void {
@@ -2758,7 +2780,7 @@ pub fn validateInsertSourceAssignmentExpressionType(
     const compatible = if (target_column.field_type == .json or target_column.field_type == .array)
         expression_type == target_column.field_type
     else
-        lower_expr.sqlExpressionTypesComparable(target_column.field_type, expression_type);
+        expr_type.sqlExpressionTypesComparable(target_column.field_type, expression_type);
     if (!compatible) return error.UnsupportedSqlShape;
 }
 
@@ -2767,12 +2789,12 @@ pub const AssignmentExpressionValidationOptions = struct {
 };
 
 pub fn validateMutationAssignmentExpressionType(
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     target_column: runtime_schema.RelationalColumn,
     expression: db_mod.types.RelationalRowsExpression,
     options: AssignmentExpressionValidationOptions,
 ) !void {
-    if (lower_expr.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
+    if (expr_type.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
     try validateInsertSourceAssignmentExpressionType(type_context, target_column, expression);
     if (target_column.field_type == .numeric) {
         try type_context.validateNumericRowExpression(expression);
@@ -2805,7 +2827,7 @@ pub fn insertSourceAssignmentsFromSelectAlloc(
     alloc: std.mem.Allocator,
     target_schema: runtime_schema.TableSchema,
     source_schema: runtime_schema.TableSchema,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     target_columns: []const []const u8,
     source_query: db_mod.types.RelationalRowsQueryRequest,
     source_outputs: []const SelectOutputRef,
@@ -2998,7 +3020,7 @@ pub fn insertSourceConflictTargetFromClauseAlloc(
         .unique => |unique| blk: {
             const constraint = binder.findUniqueConstraintByName(schema, unique.name) orelse return error.InvalidSqlCatalog;
             if (unique.where_json.len > 0 and constraint.where.len == 0) return error.UnsupportedSqlShape;
-            if (unique.where_expressions.len > 0 and !lower_expr.relationalRowsExpressionConditionsEqual(constraint.where_expressions, unique.where_expressions)) return error.UnsupportedSqlShape;
+            if (unique.where_expressions.len > 0 and !expr_equal.relationalRowsExpressionConditionsEqual(constraint.where_expressions, unique.where_expressions)) return error.UnsupportedSqlShape;
 
             const name = try alloc.dupe(u8, unique.name);
             var name_transferred = false;
@@ -3261,7 +3283,7 @@ pub fn writeUniqueExpressionIdentityJson(
         .lower, .upper, .md5 => try writer.print(",\"field\":{f}", .{std.json.fmt(expression.field, .{})}),
         .expression => {
             try writer.writeAll(",\"expression\":");
-            try lower_expr.writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
+            try expr_type.writeRowExpressionJson(writer, expression.expression orelse return error.UnsupportedSqlShape);
         },
     }
     try writer.writeByte('}');
@@ -3338,7 +3360,7 @@ fn parseConflictCoalesceValueJsonAlloc(
     insert_values: []const []const u8,
     realtime_ns: u64,
 ) ![]const u8 {
-    try lower_expr.parseCoalesceFunctionCallStart(tokens, pos);
+    try expr_token.parseCoalesceFunctionCallStart(tokens, pos);
 
     var selected: ?[]const u8 = null;
     errdefer if (selected) |value| alloc.free(value);
@@ -3465,7 +3487,7 @@ pub fn parseConflictValueJsonAlloc(
         if (column.field_type != .json) return error.InvalidSqlCatalog;
         return try parseConflictJsonbBuildObjectAlloc(alloc, tokens, pos, schema, params, insert_columns, insert_values, realtime_ns);
     }
-    if (lower_expr.peekCoalesceFunctionCall(tokens, pos.*)) {
+    if (expr_token.peekCoalesceFunctionCall(tokens, pos.*)) {
         return try parseConflictCoalesceValueJsonAlloc(alloc, tokens, pos, schema, params, column, insert_columns, insert_values, realtime_ns);
     }
     if (pos.* < tokens.len and tokens[pos.*].kind == .identifier) {
@@ -3495,7 +3517,7 @@ pub fn parseConflictArrayElementValueJsonAlloc(
         .path = column.path,
         .field_type = item_type,
     };
-    if (lower_expr.peekCoalesceFunctionCall(tokens, pos.*)) {
+    if (expr_token.peekCoalesceFunctionCall(tokens, pos.*)) {
         const value_json = try parseConflictCoalesceValueJsonAlloc(alloc, tokens, pos, schema, params, element_column, insert_columns, insert_values, realtime_ns);
         errdefer alloc.free(value_json);
         try sql_value.validateSqlArrayElementValueJson(alloc, column, value_json);
@@ -3632,14 +3654,14 @@ pub fn parseConflictIncrementAssignmentAlloc(
         true
     else
         return error.UnsupportedSqlShape;
-    if (lower_expr.peekCoalesceFunctionCall(tokens, pos.*)) {
+    if (expr_token.peekCoalesceFunctionCall(tokens, pos.*)) {
         const expression = try parseConflictCoalesceExpressionAlloc(alloc, tokens, pos, column, options.insert_columns, column.field_type, options.assignment_options);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
         const owned_field = try alloc.dupe(u8, field);
         var field_transferred = false;
         errdefer if (!field_transferred) alloc.free(owned_field);
-        const final_expression = if (negated) try lower_expr.buildUnaryNegativeExpressionAlloc(alloc, expression) else expression;
+        const final_expression = if (negated) try expr_build.buildUnaryNegativeExpressionAlloc(alloc, expression) else expression;
         var final_expression_transferred = !negated;
         errdefer if (!final_expression_transferred) freeExpression(alloc, final_expression);
         if (negated) expression_transferred = true;
@@ -3739,7 +3761,7 @@ pub fn parsePointWhereJsonAlloc(
         errdefer if (!field_transferred) alloc.free(field);
         const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
         const op_token_index = pos.*;
-        const value_json = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{ .allow_distinct = false })) |is_tail| blk: {
+        const value_json = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{ .allow_distinct = false })) |is_tail| blk: {
             if (is_tail.op != .is_null) return error.UnsupportedSqlShape;
             try lower_expr.validateGeneratedIsTailPredicateIdentity(generated_expression_ast, tokens, op_token_index, is_tail);
             break :blk try alloc.dupe(u8, "null");
@@ -4342,17 +4364,20 @@ pub fn parseConflictClauseAlloc(
     conflict_existing_qualifiers: []const []const u8,
     insert_columns: []const []const u8,
     insert_values: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     target_options: ConflictTargetParserOptions,
     assignment_hooks: ConflictUpdateSetAssignmentParserOptions,
     generated_assignment_items: ?*const generated_parser.GeneratedSqlListAst,
     generated_assignments_tokens: ?generated_parser.GeneratedSqlTokenRange,
     generated_action_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    generated_action_kind: ?generated_parser.GeneratedSqlConflictActionKind,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
 ) !ConflictClause {
     try parser.expectKeywordTag(tokens, pos, .conflict);
+    if (generated_action_tokens != null and generated_action_kind == null) return error.UnsupportedSqlShape;
+    if (generated_action_tokens == null and generated_action_kind != null) return error.UnsupportedSqlShape;
     if ((condition_options.generated_action_where_tokens != null or condition_options.generated_expression_ast != null) and
         generated_action_tokens == null)
     {
@@ -4368,6 +4393,8 @@ pub fn parseConflictClauseAlloc(
     }
     const target: ConflictTarget = blk: {
         if (generated_action_tokens != null and target_options.generated_target_tokens == null and parser.peekKeywordTag(tokens, pos.*, .do)) {
+            const target_kind = target_options.generated_target_kind orelse return error.UnsupportedSqlShape;
+            if (target_kind != .targetless) return error.UnsupportedSqlShape;
             const items = target_options.generated_target_items orelse return error.UnsupportedSqlShape;
             try validateGeneratedDmlEmptyList(items);
             if (target_options.generated_where_tokens != null or target_options.generated_where_expression != null) return error.UnsupportedSqlShape;
@@ -4380,6 +4407,9 @@ pub fn parseConflictClauseAlloc(
 
     const action_start = pos.*;
     if (parser.matchKeywordTag(tokens, pos, .nothing)) {
+        if (generated_action_kind) |kind| {
+            if (kind != .nothing) return error.UnsupportedSqlShape;
+        }
         if (generated_action_tokens) |action| {
             if (action.start != action_start or action.end != pos.*) return error.UnsupportedSqlShape;
         }
@@ -4399,6 +4429,9 @@ pub fn parseConflictClauseAlloc(
         else => {},
     }
     try parser.expectKeywordTag(tokens, pos, .update);
+    if (generated_action_kind) |kind| {
+        if (kind != .update) return error.UnsupportedSqlShape;
+    }
     try parser.expectKeywordTag(tokens, pos, .set);
     if ((generated_assignment_items == null) != (generated_assignments_tokens == null)) return error.UnsupportedSqlShape;
     if (generated_action_tokens) |action| {
@@ -4585,6 +4618,7 @@ pub fn parseConflictClauseWithContextAlloc(
         options.generated_assignment_items,
         options.generated_assignments_tokens,
         options.generated_action_tokens,
+        options.generated_action_kind,
         condition_options,
         dispatch_options,
     );
@@ -5610,7 +5644,7 @@ pub fn parseMergeArmPredicateAlloc(
     };
 
     const op_token_index = pos.*;
-    const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+    const op: runtime_schema.RelationalCheckOp = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{
         .allow_distinct = false,
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
@@ -5642,7 +5676,7 @@ pub fn parseMergeArmPredicateAlloc(
             },
         }
         break :blk is_tail.op;
-    } else try lower_expr.parseComparisonOp(tokens, pos);
+    } else try expr_operator.parseComparisonOp(tokens, pos);
     try lower_expr.validateGeneratedRelationalPredicateIdentity(generated_expression_ast, tokens, op_token_index, op);
     const value_json = if (op == .is_null or op == .is_not_null)
         null
@@ -5707,7 +5741,7 @@ pub fn parseJoinedMutationAssignmentExpressionAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     target_alias: []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: JoinedMutationAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     const target_qualifiers = [_][]const u8{target_alias};
@@ -5732,7 +5766,7 @@ pub fn parseJoinedMutationBooleanAssignmentExpressionAlloc(
     tokens: []const Token,
     pos: *usize,
     target_alias: []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: JoinedMutationAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     const target_qualifiers = [_][]const u8{target_alias};
@@ -5778,7 +5812,7 @@ pub fn parseConflictAssignmentExpressionAlloc(
     );
     var expression_owned = true;
     errdefer if (expression_owned) freeExpression(alloc, expression);
-    if (lower_expr.peekArithmeticOperator(tokens, pos.*)) |_| {
+    if (expr_operator.peekArithmeticOperator(tokens, pos.*)) |_| {
         try options.type_context.validateNumericOrDatetimeRowExpression(expression);
         expression_owned = false;
         expression = try parseConflictArithmeticExpressionRestAlloc(alloc, tokens, pos, expression, column, insert_columns, 0, options);
@@ -5792,7 +5826,7 @@ pub fn parseConflictAssignmentExpressionAlloc(
         expression_owned = true;
         try options.type_context.validateTextRowExpression(expression);
     }
-    if (lower_expr.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
+    if (expr_type.sqlExpressionIsInterval(expression)) return error.UnsupportedSqlShape;
     if (column.field_type == .datetime) {
         try options.type_context.validateNumericOrDatetimeRowExpression(expression);
     } else if (column.field_type == .numeric) {
@@ -5829,7 +5863,7 @@ pub fn parseConflictRowExpressionAlloc(
     );
     var expression_owned = true;
     errdefer if (expression_owned) freeExpression(alloc, expression);
-    if (lower_expr.peekArithmeticOperator(tokens, pos.*)) |_| {
+    if (expr_operator.peekArithmeticOperator(tokens, pos.*)) |_| {
         try options.type_context.validateNumericOrDatetimeRowExpression(expression);
         expression_owned = false;
         expression = try parseConflictArithmeticExpressionRestAlloc(alloc, tokens, pos, expression, column, insert_columns, 0, options);
@@ -5856,7 +5890,7 @@ pub fn parseConflictExpressionWithExpectedAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     hooks: ConflictExpressionDispatchOptions,
 ) anyerror!db_mod.types.RelationalRowsExpression {
@@ -5887,7 +5921,7 @@ pub fn parseConflictExpressionWithExpectedAndGeneratedAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     hooks: ConflictExpressionDispatchOptions,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
@@ -5956,31 +5990,31 @@ pub fn parseConflictExpressionWithExpectedAndGeneratedAlloc(
                 if (expected_type) |field_type| {
                     if (field_type != .keyword and field_type != .text and field_type != .link) return error.UnsupportedSqlShape;
                 }
-                return try lower_expr.parseSqlUuidV4RowExpression(tokens, pos);
+                return try expr_build.parseSqlUuidV4RowExpression(tokens, pos);
             },
             .now => {
                 if (expected_type) |field_type| {
                     if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
                 }
-                return try lower_expr.parseSqlNowRowExpressionAlloc(alloc, tokens, pos);
+                return try expr_build.parseSqlNowRowExpressionAlloc(alloc, tokens, pos);
             },
             .current_date => {
                 if (expected_type) |field_type| {
                     if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
                 }
-                return try lower_expr.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos);
+                return try expr_build.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos);
             },
             .typed_datetime_literal => {
                 if (expected_type) |field_type| {
                     if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
                 }
-                return try lower_expr.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos);
+                return try expr_build.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos);
             },
             .interval => {
                 if (expected_type) |field_type| {
                     if (field_type != .numeric and field_type != .datetime) return error.UnsupportedSqlShape;
                 }
-                return try lower_expr.parseSqlIntervalRowExpressionAlloc(alloc, tokens, pos);
+                return try expr_build.parseSqlIntervalRowExpressionAlloc(alloc, tokens, pos);
             },
         }
     }
@@ -6029,7 +6063,7 @@ pub fn parseConflictExpressionOperandAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     hooks: ConflictExpressionDispatchOptions,
 ) anyerror!db_mod.types.RelationalRowsExpression {
@@ -6060,7 +6094,7 @@ pub fn parseConflictExpressionOperandWithGeneratedAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     hooks: ConflictExpressionDispatchOptions,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
@@ -6119,7 +6153,7 @@ pub fn parseConflictUnaryNegativeExpressionAlloc(
     );
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    const expression = try lower_expr.buildUnaryNegativeExpressionAlloc(alloc, operand);
+    const expression = try expr_build.buildUnaryNegativeExpressionAlloc(alloc, operand);
     operand_transferred = true;
     return expression;
 }
@@ -6162,7 +6196,7 @@ pub fn parseConflictPipeConcatExpressionRestAlloc(
         rhs_transferred = true;
     }
     if (operands.items.len < 2) return error.UnsupportedSqlShape;
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .concat, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .concat, &operands);
 }
 
 pub fn parseConflictArithmeticExpressionRestAlloc(
@@ -6179,13 +6213,13 @@ pub fn parseConflictArithmeticExpressionRestAlloc(
     var current_owned = true;
     errdefer if (current_owned) freeExpression(alloc, current);
 
-    while (lower_expr.peekArithmeticOperator(tokens, pos.*)) |op| {
+    while (expr_operator.peekArithmeticOperator(tokens, pos.*)) |op| {
         if (op.precedence < min_precedence) break;
         _ = parser.matchToken(tokens, pos, op.token) orelse unreachable;
-        if (lower_expr.peekSqlIntervalExpressionSyntax(tokens, pos.*)) {
+        if (expr_token.peekSqlIntervalExpressionSyntax(tokens, pos.*)) {
             try options.type_context.validateNumericOrDatetimeRowExpression(current);
             const interval = try sql_value.parseSqlIntervalLiteral(tokens, pos);
-            const next = try lower_expr.buildIntervalLiteralArithmeticAlloc(alloc, current, op.kind, interval);
+            const next = try expr_build.buildIntervalLiteralArithmeticAlloc(alloc, current, op.kind, interval);
             current_owned = false;
             current = next;
             current_owned = true;
@@ -6210,14 +6244,14 @@ pub fn parseConflictArithmeticExpressionRestAlloc(
         var rhs_owned = true;
         errdefer if (rhs_owned) freeExpression(alloc, rhs);
 
-        while (lower_expr.peekArithmeticOperator(tokens, pos.*)) |next_op| {
+        while (expr_operator.peekArithmeticOperator(tokens, pos.*)) |next_op| {
             if (next_op.precedence <= op.precedence) break;
             rhs_owned = false;
             rhs = try parseConflictArithmeticExpressionRestAlloc(alloc, tokens, pos, rhs, column, insert_columns, next_op.precedence, options);
             rhs_owned = true;
         }
 
-        const expression = try lower_expr.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
+        const expression = try expr_build.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
         current_owned = false;
         rhs_owned = false;
         current = expression;
@@ -6276,7 +6310,7 @@ pub fn parseConflictCoalesceExpressionAlloc(
     expected_type: ?runtime_schema.AntflyType,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseCoalesceFunctionCallStart(tokens, pos);
+    try expr_token.parseCoalesceFunctionCallStart(tokens, pos);
 
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
     errdefer {
@@ -6294,7 +6328,7 @@ pub fn parseConflictCoalesceExpressionAlloc(
     if (operands.items.len == 0) return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .rparen);
 
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .coalesce, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .coalesce, &operands);
 }
 
 pub fn parseConflictNullifExpressionAlloc(
@@ -6305,7 +6339,7 @@ pub fn parseConflictNullifExpressionAlloc(
     insert_columns: []const []const u8,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseNullifFunctionCallStart(tokens, pos);
+    try expr_token.parseNullifFunctionCallStart(tokens, pos);
     const lhs = try parseConflictExpressionWithExpectedAlloc(
         alloc,
         tokens,
@@ -6341,7 +6375,7 @@ pub fn parseConflictNullifExpressionAlloc(
     errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .nullif, lhs, rhs);
+    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .nullif, lhs, rhs);
     lhs_transferred = true;
     rhs_transferred = true;
     return expression;
@@ -6354,18 +6388,18 @@ pub fn parseConflictLengthExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
-    const kind = try lower_expr.parseTextLengthFunctionCallStart(tokens, pos);
+    const kind = try expr_token.parseTextLengthFunctionCallStart(tokens, pos);
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     try type_context.validateTextRowExpression(operand);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
     operand_transferred = true;
     return expression;
 }
@@ -6377,18 +6411,18 @@ pub fn parseConflictAsciiExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
-    try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, .ascii);
+    try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, .ascii);
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     try type_context.validateTextRowExpression(operand);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, .ascii, operand);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, .ascii, operand);
     operand_transferred = true;
     return expression;
 }
@@ -6400,18 +6434,18 @@ pub fn parseConflictChrExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-    try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, .chr);
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, .chr);
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     try type_context.validateNumericRowExpression(operand);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, .chr, operand);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, .chr, operand);
     operand_transferred = true;
     return expression;
 }
@@ -6424,14 +6458,14 @@ pub fn parseConflictCastExpressionAlloc(
     insert_columns: []const []const u8,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseCastExpressionCallStart(tokens, pos);
+    try expr_token.parseCastExpressionCallStart(tokens, pos);
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    try lower_expr.parseCastExpressionAs(tokens, pos);
-    const cast_type = try lower_expr.parseExpressionCastType(tokens, pos);
+    try expr_token.parseCastExpressionAs(tokens, pos);
+    const cast_type = try expr_operator.parseExpressionCastType(tokens, pos);
     try parser.expectToken(tokens, pos, .rparen);
-    const expression = try lower_expr.buildCastExpressionAlloc(alloc, operand, cast_type);
+    const expression = try expr_build.buildCastExpressionAlloc(alloc, operand, cast_type);
     operand_transferred = true;
     return expression;
 }
@@ -6445,11 +6479,11 @@ pub fn parseConflictCaseExpressionAlloc(
     conflict_existing_qualifiers: []const []const u8,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseCaseExpressionStart(tokens, pos);
+    try expr_token.parseCaseExpressionStart(tokens, pos);
 
     var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
     errdefer {
@@ -6457,11 +6491,11 @@ pub fn parseConflictCaseExpressionAlloc(
         branches.deinit(alloc);
     }
 
-    while (lower_expr.matchCaseExpressionWhen(tokens, pos)) {
+    while (expr_token.matchCaseExpressionWhen(tokens, pos)) {
         const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, options);
         var condition_transferred = false;
         errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-        try lower_expr.parseCaseExpressionThen(tokens, pos);
+        try expr_token.parseCaseExpressionThen(tokens, pos);
         const then_expression = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, column.field_type, options);
         var then_transferred = false;
         errdefer if (!then_transferred) freeExpression(alloc, then_expression);
@@ -6471,11 +6505,11 @@ pub fn parseConflictCaseExpressionAlloc(
     }
     if (branches.items.len == 0) return error.UnsupportedSqlShape;
 
-    try lower_expr.parseCaseExpressionElse(tokens, pos);
+    try expr_token.parseCaseExpressionElse(tokens, pos);
     const else_expression = try parseConflictAssignmentExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, column.field_type, options);
     var else_transferred = false;
     errdefer if (!else_transferred) freeExpression(alloc, else_expression);
-    try lower_expr.parseCaseExpressionEnd(tokens, pos);
+    try expr_token.parseCaseExpressionEnd(tokens, pos);
 
     const owned_branches = try branches.toOwnedSlice(alloc);
     var branches_transferred = false;
@@ -6507,7 +6541,7 @@ pub fn parseConflictExpressionConditionAlloc(
     conflict_existing_qualifiers: []const []const u8,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
@@ -6526,7 +6560,7 @@ pub fn parseConflictExpressionConditionAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     const op_token_index = pos.*;
-    const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+    const op: runtime_schema.RelationalCheckOp = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
     })) |is_tail| blk: {
@@ -6546,12 +6580,12 @@ pub fn parseConflictExpressionConditionAlloc(
             },
         }
         break :blk is_tail.op;
-    } else if (lower_expr.matchPostfixNullTest(tokens, pos)) |postfix_null_test|
+    } else if (expr_operator.matchPostfixNullTest(tokens, pos)) |postfix_null_test|
         postfix_null_test
     else
-        try lower_expr.parseComparisonOp(tokens, pos);
+        try expr_operator.parseComparisonOp(tokens, pos);
 
-    if (op == .eq and lower_expr.matchAnyOrSomeKeyword(tokens, pos)) {
+    if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try sql_value.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -6575,7 +6609,7 @@ pub fn parseConflictExpressionConditionAlloc(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
-    try lower_expr.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
+    try expr_type.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     lhs_transferred = true;
     rhs_transferred = true;
@@ -6597,7 +6631,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
     conflict_existing_qualifiers: []const []const u8,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     alternatives: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     condition_options: ConflictAssignmentExpressionParserOptions,
@@ -6629,7 +6663,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
-    const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+    const op: runtime_schema.RelationalCheckOp = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
         .allow_boolean_literal_negation = true,
@@ -6666,12 +6700,12 @@ pub fn parseConflictActionWhereConditionAlternatives(
             },
         }
         break :blk is_tail.op;
-    } else if (lower_expr.matchPostfixNullTest(tokens, pos)) |postfix_null_test|
+    } else if (expr_operator.matchPostfixNullTest(tokens, pos)) |postfix_null_test|
         postfix_null_test
     else
-        try lower_expr.parseComparisonOp(tokens, pos);
+        try expr_operator.parseComparisonOp(tokens, pos);
 
-    if (op == .eq and lower_expr.matchAnyOrSomeKeyword(tokens, pos)) {
+    if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try sql_value.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -6708,7 +6742,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
-    try lower_expr.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
+    try expr_type.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     const condition: db_mod.types.RelationalRowsExpressionCondition = .{
         .lhs = lhs,
@@ -6730,7 +6764,7 @@ pub fn parseConflictActionWhereClause(
     schema: runtime_schema.TableSchema,
     conflict_existing_qualifiers: []const []const u8,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     where_expression: *?db_mod.types.RelationalRowsExpressionCondition,
     where_expressions: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
@@ -6807,7 +6841,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
     conflict_existing_qualifiers: []const []const u8,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
@@ -6857,7 +6891,7 @@ fn parseBareBooleanConflictExpressionConditionAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
     const expression = try parseConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, options);
@@ -6916,7 +6950,7 @@ pub fn parseConflictBooleanExpressionAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     var operand_parser = ConflictAssignmentBooleanOperandParser{
@@ -6940,13 +6974,13 @@ fn parseConflictBooleanExpressionWithHooksAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     hooks: ConflictBooleanExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
     var expression = try parseConflictBooleanOperandAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
     var expression_owned = true;
     errdefer if (expression_owned) freeExpression(alloc, expression);
-    if (lower_expr.peekBooleanOperator(tokens, pos.*)) |_| {
+    if (expr_operator.peekBooleanOperator(tokens, pos.*)) |_| {
         try type_context.validateBooleanRowExpression(expression);
         expression_owned = false;
         expression = try parseConflictBooleanExpressionRestAlloc(alloc, tokens, pos, expression, column, insert_columns, type_context, hooks, 0);
@@ -6964,7 +6998,7 @@ fn parseConflictBooleanExpressionRestAlloc(
     lhs: db_mod.types.RelationalRowsExpression,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     hooks: ConflictBooleanExpressionParserHooks,
     min_precedence: u8,
 ) !db_mod.types.RelationalRowsExpression {
@@ -6973,7 +7007,7 @@ fn parseConflictBooleanExpressionRestAlloc(
     var current_owned = true;
     errdefer if (current_owned) freeExpression(alloc, current);
 
-    while (lower_expr.peekBooleanOperator(tokens, pos.*)) |op| {
+    while (expr_operator.peekBooleanOperator(tokens, pos.*)) |op| {
         if (op.precedence < min_precedence) break;
         if (!parser.matchKeyword(tokens, pos, op.keyword)) unreachable;
         var rhs = try parseConflictBooleanOperandAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
@@ -6981,14 +7015,14 @@ fn parseConflictBooleanExpressionRestAlloc(
         errdefer if (rhs_owned) freeExpression(alloc, rhs);
         try type_context.validateBooleanRowExpression(rhs);
 
-        while (lower_expr.peekBooleanOperator(tokens, pos.*)) |next_op| {
+        while (expr_operator.peekBooleanOperator(tokens, pos.*)) |next_op| {
             if (next_op.precedence <= op.precedence) break;
             rhs_owned = false;
             rhs = try parseConflictBooleanExpressionRestAlloc(alloc, tokens, pos, rhs, column, insert_columns, type_context, hooks, next_op.precedence);
             rhs_owned = true;
         }
 
-        const expression = try lower_expr.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
+        const expression = try expr_build.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
         current_owned = false;
         rhs_owned = false;
         current = expression;
@@ -7005,11 +7039,11 @@ fn parseConflictBooleanOperandAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     hooks: ConflictBooleanExpressionParserHooks,
 ) anyerror!db_mod.types.RelationalRowsExpression {
-    if (lower_expr.peekBooleanNotExpressionSyntax(tokens, pos.*)) return try parseConflictBooleanNotExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
-    if (lower_expr.peekParenthesizedExpressionSyntax(tokens, pos.*)) return try parseParenthesizedConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    if (expr_token.peekBooleanNotExpressionSyntax(tokens, pos.*)) return try parseConflictBooleanNotExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
+    if (expr_token.peekParenthesizedExpressionSyntax(tokens, pos.*)) return try parseParenthesizedConflictBooleanExpressionAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
     return try hooks.parse_operand(hooks.ptr, column, insert_columns, .boolean);
 }
 
@@ -7019,15 +7053,15 @@ fn parseConflictBooleanNotExpressionAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     hooks: ConflictBooleanExpressionParserHooks,
 ) anyerror!db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseBooleanNotExpressionStart(tokens, pos);
+    try expr_token.parseBooleanNotExpressionStart(tokens, pos);
     const operand = try parseConflictBooleanOperandAlloc(alloc, tokens, pos, column, insert_columns, type_context, hooks);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     try type_context.validateBooleanRowExpression(operand);
-    const expression = try lower_expr.wrapBooleanNotExpressionAlloc(alloc, operand);
+    const expression = try expr_predicate.wrapBooleanNotExpressionAlloc(alloc, operand);
     operand_transferred = true;
     return expression;
 }
@@ -7038,7 +7072,7 @@ fn parseParenthesizedConflictBooleanExpressionAlloc(
     pos: *usize,
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     hooks: ConflictBooleanExpressionParserHooks,
 ) anyerror!db_mod.types.RelationalRowsExpression {
     try parser.expectToken(tokens, pos, .lparen);
@@ -7057,12 +7091,12 @@ pub fn parseConflictCaseFoldExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     assignment_options: ConflictAssignmentExpressionParserOptions,
     options: ConflictCaseFoldExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-    const kind = try lower_expr.parseCaseFoldFunctionCallStart(tokens, pos);
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    const kind = try expr_token.parseCaseFoldFunctionCallStart(tokens, pos);
     if (try lower_expr.parsePeriodBoundRowExpressionAlloc(
         alloc,
         tokens,
@@ -7100,7 +7134,7 @@ pub fn parseConflictCaseFoldExpressionAlloc(
     }
     try parser.expectToken(tokens, pos, .rparen);
 
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
 }
 
 pub fn parseConflictConcatExpressionAlloc(
@@ -7110,11 +7144,11 @@ pub fn parseConflictConcatExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
-    const kind = try lower_expr.parseConcatFunctionCallStart(tokens, pos);
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    const kind = try expr_token.parseConcatFunctionCallStart(tokens, pos);
 
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
     errdefer {
@@ -7135,7 +7169,7 @@ pub fn parseConflictConcatExpressionAlloc(
     }
     try parser.expectToken(tokens, pos, .rparen);
 
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
 }
 
 pub fn parseConflictTextUnaryExpressionAlloc(
@@ -7146,12 +7180,12 @@ pub fn parseConflictTextUnaryExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     switch (kind) {
-        .reverse, .md5 => try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, kind),
+        .reverse, .md5 => try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, kind),
         else => return error.UnsupportedSqlShape,
     }
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
@@ -7160,7 +7194,7 @@ pub fn parseConflictTextUnaryExpressionAlloc(
     try type_context.validateTextRowExpression(operand);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
     operand_transferred = true;
     return expression;
 }
@@ -7174,19 +7208,19 @@ pub fn parseConflictNumericUnaryExpressionAlloc(
     kind: db_mod.types.RelationalRowsExpressionKind,
     options: ConflictAssignmentExpressionParserOptions,
 ) anyerror!db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, kind);
+    try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, kind);
     var operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
     var operand_transferred = false;
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     try options.type_context.validateNumericRowExpression(operand);
-    if (lower_expr.peekArithmeticOperator(tokens, pos.*)) |_| {
+    if (expr_operator.peekArithmeticOperator(tokens, pos.*)) |_| {
         operand_transferred = true;
         operand = try parseConflictArithmeticExpressionRestAlloc(alloc, tokens, pos, operand, column, insert_columns, 0, options);
         operand_transferred = false;
     }
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
     operand_transferred = true;
     return expression;
 }
@@ -7198,10 +7232,10 @@ pub fn parseConflictNumericBinaryExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    try lower_expr.parseFixedBinaryFunctionCallStart(tokens, pos, kind);
+    try expr_token.parseFixedBinaryFunctionCallStart(tokens, pos, kind);
     const lhs = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .numeric, options);
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
@@ -7213,7 +7247,7 @@ pub fn parseConflictNumericBinaryExpressionAlloc(
     try type_context.validateNumericRowExpression(rhs);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
+    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
     lhs_transferred = true;
     rhs_transferred = true;
     return expression;
@@ -7227,13 +7261,13 @@ pub fn parseConflictTextTernaryExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     switch (kind) {
-        .replace => try lower_expr.parseReplaceFunctionCallStart(tokens, pos),
-        .translate => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsTranslateFunction),
+        .replace => try expr_token.parseReplaceFunctionCallStart(tokens, pos),
+        .translate => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsTranslateFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -7255,7 +7289,7 @@ pub fn parseConflictTextTernaryExpressionAlloc(
     try type_context.validateTextRowExpression(third);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildTernaryFunctionExpressionAlloc(alloc, kind, first, second, third);
+    const expression = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, kind, first, second, third);
     first_transferred = true;
     second_transferred = true;
     third_transferred = true;
@@ -7270,24 +7304,24 @@ pub fn parseConflictTextBinaryExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| {
         const compatible = switch (kind) {
             .regexp_count, .regexp_instr => field_type == .numeric,
-            .regexp_substr => lower_expr.sqlExpressionTypeIsTextLike(field_type),
+            .regexp_substr => expr_type.sqlExpressionTypeIsTextLike(field_type),
             .starts_with, .ends_with => field_type == .boolean,
             else => false,
         };
         if (!compatible) return error.UnsupportedSqlShape;
     }
     switch (kind) {
-        .regexp_count => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpCountFunction),
-        .regexp_instr => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpInstrFunction),
-        .regexp_substr => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpSubstrFunction),
-        .starts_with => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsStartsWithFunction),
-        .ends_with => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsEndsWithFunction),
+        .regexp_count => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpCountFunction),
+        .regexp_instr => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpInstrFunction),
+        .regexp_substr => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpSubstrFunction),
+        .starts_with => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction),
+        .ends_with => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction),
         else => return error.UnsupportedSqlShape,
     }
     const lhs = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
@@ -7301,7 +7335,7 @@ pub fn parseConflictTextBinaryExpressionAlloc(
     try type_context.validateTextRowExpression(rhs);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
+    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
     lhs_transferred = true;
     rhs_transferred = true;
     return expression;
@@ -7315,12 +7349,12 @@ pub fn parseConflictRegexpListExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| {
         const compatible = switch (kind) {
-            .regexp_replace => lower_expr.sqlExpressionTypeIsTextLike(field_type),
+            .regexp_replace => expr_type.sqlExpressionTypeIsTextLike(field_type),
             .regexp_match => field_type == .boolean,
             else => false,
         };
@@ -7328,8 +7362,8 @@ pub fn parseConflictRegexpListExpressionAlloc(
     }
 
     switch (kind) {
-        .regexp_replace => try lower_expr.parseRegexpReplaceFunctionCallStart(tokens, pos),
-        .regexp_match => try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpMatchFunction),
+        .regexp_replace => try expr_token.parseRegexpReplaceFunctionCallStart(tokens, pos),
+        .regexp_match => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpMatchFunction),
         else => return error.UnsupportedSqlShape,
     }
 
@@ -7381,7 +7415,7 @@ pub fn parseConflictRegexpListExpressionAlloc(
     }
 
     try parser.expectToken(tokens, pos, .rparen);
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
 }
 
 pub fn parseConflictTextNumericBinaryExpressionAlloc(
@@ -7392,18 +7426,18 @@ pub fn parseConflictTextNumericBinaryExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     const expression_kind: db_mod.types.RelationalRowsExpressionKind = switch (kind) {
         .left, .right => blk: {
-            const matched_kind = lower_expr.matchLeftRightFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
+            const matched_kind = expr_token.matchLeftRightFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
             try parser.expectToken(tokens, pos, .lparen);
             break :blk matched_kind;
         },
         .repeat => blk: {
-            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsRepeatFunction);
+            try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction);
             break :blk .repeat;
         },
         else => return error.UnsupportedSqlShape,
@@ -7421,7 +7455,7 @@ pub fn parseConflictTextNumericBinaryExpressionAlloc(
     try type_context.validateNumericRowExpression(count);
 
     try parser.expectToken(tokens, pos, .rparen);
-    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, expression_kind, source, count);
+    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, expression_kind, source, count);
     source_transferred = true;
     count_transferred = true;
     return expression;
@@ -7435,26 +7469,26 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    if (expected_type) |field_type| if (!lower_expr.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
+    if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
 
     const expression_kind: db_mod.types.RelationalRowsExpressionKind = switch (kind) {
         .substring => blk: {
-            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsSubstringFunction);
+            try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsSubstringFunction);
             break :blk .substring;
         },
         .overlay => blk: {
-            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsOverlayFunction);
+            try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsOverlayFunction);
             break :blk .overlay;
         },
         .split_part => blk: {
-            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsSplitPartFunction);
+            try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsSplitPartFunction);
             break :blk .split_part;
         },
         .lpad, .rpad => blk: {
-            const matched_kind = lower_expr.matchPadFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
+            const matched_kind = expr_token.matchPadFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
             try parser.expectToken(tokens, pos, .lparen);
             break :blk matched_kind;
         },
@@ -7596,7 +7630,7 @@ pub fn parseConflictMixedTextFunctionExpressionAlloc(
     }
 
     try parser.expectToken(tokens, pos, .rparen);
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, expression_kind, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, expression_kind, &operands);
 }
 
 pub fn parseConflictStrposExpressionAlloc(
@@ -7606,12 +7640,12 @@ pub fn parseConflictStrposExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (field_type != .numeric) return error.UnsupportedSqlShape;
 
-    if (lower_expr.matchFunctionKeywordToken(tokens, pos, lower_expr.sqlTokenIsStrposFunction) != null) {
+    if (expr_token.matchFunctionKeywordToken(tokens, pos, expr_token.sqlTokenIsStrposFunction) != null) {
         try parser.expectToken(tokens, pos, .lparen);
         const source = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
         var source_transferred = false;
@@ -7625,7 +7659,7 @@ pub fn parseConflictStrposExpressionAlloc(
         try type_context.validateTextRowExpression(needle);
 
         try parser.expectToken(tokens, pos, .rparen);
-        const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
+        const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
         source_transferred = true;
         needle_transferred = true;
         return expression;
@@ -7643,7 +7677,7 @@ pub fn parseConflictStrposExpressionAlloc(
         try type_context.validateTextRowExpression(source);
 
         try parser.expectToken(tokens, pos, .rparen);
-        const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
+        const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
         source_transferred = true;
         needle_transferred = true;
         return expression;
@@ -7676,7 +7710,7 @@ pub fn parseConflictDateExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     switch (kind) {
@@ -7691,7 +7725,7 @@ pub fn parseConflictDateExpressionAlloc(
 
     switch (kind) {
         .date_trunc => {
-            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsDateTruncFunction);
+            try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction);
             const unit = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             var unit_transferred = false;
             errdefer if (!unit_transferred) freeExpression(alloc, unit);
@@ -7704,13 +7738,13 @@ pub fn parseConflictDateExpressionAlloc(
             try type_context.validateNumericOrDatetimeRowExpression(value);
 
             try parser.expectToken(tokens, pos, .rparen);
-            const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .date_trunc, unit, value);
+            const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .date_trunc, unit, value);
             unit_transferred = true;
             value_transferred = true;
             return expression;
         },
         .date_part => {
-            const extract_syntax = try lower_expr.parseDatePartFunctionCallStart(tokens, pos);
+            const extract_syntax = try expr_token.parseDatePartFunctionCallStart(tokens, pos);
             var unit: db_mod.types.RelationalRowsExpression = undefined;
             var unit_initialized = false;
             var unit_transferred = false;
@@ -7723,7 +7757,7 @@ pub fn parseConflictDateExpressionAlloc(
             if (extract_syntax) {
                 unit = try parseDatePartUnitLiteralExpressionAlloc(alloc, tokens, pos);
                 unit_initialized = true;
-                try lower_expr.parseDatePartExtractSeparator(tokens, pos);
+                try expr_token.parseDatePartExtractSeparator(tokens, pos);
                 value = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
                 value_initialized = true;
                 try type_context.validateNumericOrDatetimeRowExpression(value);
@@ -7738,13 +7772,13 @@ pub fn parseConflictDateExpressionAlloc(
             }
 
             try parser.expectToken(tokens, pos, .rparen);
-            const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .date_part, unit, value);
+            const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .date_part, unit, value);
             unit_transferred = true;
             value_transferred = true;
             return expression;
         },
         .date_bin => {
-            try lower_expr.parseFunctionCallStartTokenIf(tokens, pos, lower_expr.sqlTokenIsDateBinFunction);
+            try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsDateBinFunction);
             const stride = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             var stride_transferred = false;
             errdefer if (!stride_transferred) freeExpression(alloc, stride);
@@ -7763,7 +7797,7 @@ pub fn parseConflictDateExpressionAlloc(
             try type_context.validateNumericOrDatetimeRowExpression(origin);
 
             try parser.expectToken(tokens, pos, .rparen);
-            const expression = try lower_expr.buildTernaryFunctionExpressionAlloc(alloc, .date_bin, stride, source, origin);
+            const expression = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, .date_bin, stride, source, origin);
             stride_transferred = true;
             source_transferred = true;
             origin_transferred = true;
@@ -7782,7 +7816,7 @@ pub fn parseConflictGreatestLeastExpressionAlloc(
     expected_type: ?runtime_schema.AntflyType,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    const kind = try lower_expr.parseGreatestLeastFunctionCallStart(tokens, pos);
+    const kind = try expr_token.parseGreatestLeastFunctionCallStart(tokens, pos);
 
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
     errdefer {
@@ -7800,7 +7834,7 @@ pub fn parseConflictGreatestLeastExpressionAlloc(
     if (operands.items.len == 0) return error.UnsupportedSqlShape;
     try parser.expectToken(tokens, pos, .rparen);
 
-    return try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
 }
 
 pub fn parseConflictJsonUnaryExpressionAlloc(
@@ -7810,12 +7844,12 @@ pub fn parseConflictJsonUnaryExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     switch (kind) {
-        .json_array_length => try lower_expr.parseJsonArrayLengthFunctionCallStart(tokens, pos),
-        .json_typeof => try lower_expr.parseJsonTypeofFunctionCallStart(tokens, pos),
+        .json_array_length => try expr_token.parseJsonArrayLengthFunctionCallStart(tokens, pos),
+        .json_typeof => try expr_token.parseJsonTypeofFunctionCallStart(tokens, pos),
         else => return error.UnsupportedSqlShape,
     }
     const operand = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, .json, options);
@@ -7824,7 +7858,7 @@ pub fn parseConflictJsonUnaryExpressionAlloc(
     try type_context.validateJsonRowExpression(operand);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
     operand_transferred = true;
     return expression;
 }
@@ -7837,14 +7871,14 @@ pub fn parseConflictJsonExtractPathExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    const function_token = lower_expr.matchFunctionKeywordToken(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
-    const as_text = lower_expr.sqlJsonExtractPathTokenAsText(function_token);
+    const function_token = expr_token.matchFunctionKeywordToken(tokens, pos, expr_token.sqlTokenIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    const as_text = expr_token.sqlJsonExtractPathTokenAsText(function_token);
     const output_type: runtime_schema.AntflyType = if (as_text) .keyword else .json;
     if (expected_type) |field_type| {
-        if (!lower_expr.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
+        if (!expr_type.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
     }
 
     try parser.expectToken(tokens, pos, .lparen);
@@ -7857,7 +7891,7 @@ pub fn parseConflictJsonExtractPathExpressionAlloc(
     errdefer if (!path_transferred) alloc.free(path);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildJsonExtractExpressionAlloc(alloc, operand, path, as_text);
+    const expression = try expr_build.buildJsonExtractExpressionAlloc(alloc, operand, path, as_text);
     operand_transferred = true;
     path_transferred = true;
     return expression;
@@ -7873,7 +7907,7 @@ fn parseConflictJsonBuildObjectOperandExpressionAlloc(
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (sql_value.peekToJsonbFunctionCall(tokens, pos.*)) {
-        try lower_expr.parseFixedUnaryFunctionCallStart(tokens, pos, .to_jsonb);
+        try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, .to_jsonb);
         const expression = try parseConflictJsonBuildObjectOperandExpressionAlloc(alloc, tokens, pos, params, column, insert_columns, options);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
@@ -7902,7 +7936,7 @@ pub fn parseConflictJsonBuildObjectExpressionAlloc(
     if (expected_type) |field_type| {
         if (field_type != .json) return error.UnsupportedSqlShape;
     }
-    try lower_expr.parseJsonBuildObjectFunctionCallStart(tokens, pos);
+    try expr_token.parseJsonBuildObjectFunctionCallStart(tokens, pos);
     var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
     errdefer {
         for (operands.items) |operand| freeExpression(alloc, operand);
@@ -7929,7 +7963,7 @@ pub fn parseConflictJsonBuildObjectExpressionAlloc(
         }
         try parser.expectToken(tokens, pos, .rparen);
     }
-    const expression = try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .json_build_object, &operands);
+    const expression = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .json_build_object, &operands);
     var expression_transferred = false;
     errdefer if (!expression_transferred) freeExpression(alloc, expression);
     try options.type_context.validateJsonBuildObjectExpression(expression);
@@ -7945,13 +7979,13 @@ pub fn parseConflictTextArrayExpressionAlloc(
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
     kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| {
         const compatible = switch (kind) {
             .string_to_array => field_type == .array,
-            .array_to_string => lower_expr.sqlExpressionTypeIsTextLike(field_type),
+            .array_to_string => expr_type.sqlExpressionTypeIsTextLike(field_type),
             else => false,
         };
         if (!compatible) return error.UnsupportedSqlShape;
@@ -7959,7 +7993,7 @@ pub fn parseConflictTextArrayExpressionAlloc(
 
     switch (kind) {
         .string_to_array => {
-            try lower_expr.parseStringToArrayFunctionCallStart(tokens, pos);
+            try expr_token.parseStringToArrayFunctionCallStart(tokens, pos);
             const text_expression = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, null, options);
             var text_transferred = false;
             errdefer if (!text_transferred) freeExpression(alloc, text_expression);
@@ -7973,13 +8007,13 @@ pub fn parseConflictTextArrayExpressionAlloc(
             try type_context.validateStringToArrayDelimiterLiteral(delimiter_expression);
 
             try parser.expectToken(tokens, pos, .rparen);
-            const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, .string_to_array, text_expression, delimiter_expression);
+            const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .string_to_array, text_expression, delimiter_expression);
             text_transferred = true;
             delimiter_transferred = true;
             return expression;
         },
         .array_to_string => {
-            try lower_expr.parseArrayToStringFunctionCallStart(tokens, pos);
+            try expr_token.parseArrayToStringFunctionCallStart(tokens, pos);
             var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
             errdefer {
                 for (operands.items) |operand| freeExpression(alloc, operand);
@@ -8010,7 +8044,7 @@ pub fn parseConflictTextArrayExpressionAlloc(
             }
             try parser.expectToken(tokens, pos, .rparen);
 
-            const expression = try lower_expr.buildFunctionExpressionFromOperandListAlloc(alloc, .array_to_string, &operands);
+            const expression = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .array_to_string, &operands);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
             try type_context.validateArrayToStringExpression(expression);
@@ -8029,13 +8063,13 @@ pub fn parseConflictArrayLengthExpressionAlloc(
     insert_columns: []const []const u8,
     options: ConflictArrayLengthExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    const keyword = try lower_expr.parseArrayLengthFunctionCallStart(tokens, pos);
+    const keyword = try expr_token.parseArrayLengthFunctionCallStart(tokens, pos);
     const field = try parseConflictFieldExpressionAlloc(alloc, tokens, pos, options.schema, options.conflict_existing_qualifiers, insert_columns, .array);
     var field_transferred = false;
     errdefer if (!field_transferred) freeExpression(alloc, field);
     try sql_value.parseArrayLengthFunctionTail(tokens, pos, params, keyword);
 
-    const expression = try lower_expr.buildUnaryFunctionExpressionAlloc(alloc, .array_length, field);
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, .array_length, field);
     field_transferred = true;
     return expression;
 }
@@ -8085,24 +8119,24 @@ pub fn parseConflictFieldOrJsonExtractExpressionAlloc(
     conflict_existing_qualifiers: []const []const u8,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
 ) !db_mod.types.RelationalRowsExpression {
     const field_expression = try parseConflictFieldExpressionAlloc(alloc, tokens, pos, schema, conflict_existing_qualifiers, insert_columns, null);
     var field_transferred = false;
     errdefer if (!field_transferred) freeExpression(alloc, field_expression);
 
-    if (lower_expr.matchJsonExtractOperator(tokens, pos)) |operator| {
-        const as_text = lower_expr.tokenKindIsJsonExtractTextOperator(operator);
+    if (expr_operator.matchJsonExtractOperator(tokens, pos)) |operator| {
+        const as_text = expr_operator.tokenKindIsJsonExtractTextOperator(operator);
         _ = binder.relationalColumnForField(type_context.schemaForRowExpressionField(field_expression), field_expression.field, .json) orelse return error.InvalidSqlCatalog;
         const output_type: runtime_schema.AntflyType = if (as_text) .keyword else .json;
         if (expected_type) |field_type| {
-            if (!lower_expr.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
+            if (!expr_type.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
         }
 
         const path = try sql_value.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
         var path_transferred = false;
         errdefer if (!path_transferred) alloc.free(path);
-        const expression = try lower_expr.buildJsonExtractExpressionAlloc(alloc, field_expression, path, as_text);
+        const expression = try expr_build.buildJsonExtractExpressionAlloc(alloc, field_expression, path, as_text);
         field_transferred = true;
         path_transferred = true;
         return expression;
@@ -8117,7 +8151,7 @@ pub fn parseConflictFieldOrJsonExtractExpressionAlloc(
         const path = try sql_value.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
         var path_transferred = false;
         errdefer if (!path_transferred) alloc.free(path);
-        const expression = try lower_expr.buildJsonPathExistsExpressionAlloc(alloc, field_expression, path);
+        const expression = try expr_build.buildJsonPathExistsExpressionAlloc(alloc, field_expression, path);
         field_transferred = true;
         path_transferred = true;
         return expression;
@@ -8125,7 +8159,7 @@ pub fn parseConflictFieldOrJsonExtractExpressionAlloc(
 
     if (expected_type) |field_type| {
         const output_type = try type_context.rowExpressionOutputType(field_expression);
-        if (!lower_expr.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
+        if (!expr_type.sqlExpressionTypesComparable(field_type, output_type)) return error.UnsupportedSqlShape;
     }
     field_transferred = true;
     return field_expression;
@@ -8138,10 +8172,10 @@ pub fn parseConflictArrayPositionExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
-    const kind = try lower_expr.parseArrayPositionFunctionCallStart(tokens, pos);
+    const kind = try expr_token.parseArrayPositionFunctionCallStart(tokens, pos);
     if (expected_type) |field_type| {
         const expected_result_type: runtime_schema.AntflyType = if (kind == .array_positions) .array else .numeric;
         if (field_type != expected_result_type) return error.UnsupportedSqlShape;
@@ -8160,7 +8194,7 @@ pub fn parseConflictArrayPositionExpressionAlloc(
     errdefer if (!needle_transferred) freeExpression(alloc, needle_expression);
     try parser.expectToken(tokens, pos, .rparen);
 
-    const expression = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, array_expression, needle_expression);
+    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, array_expression, needle_expression);
     var expression_transferred = false;
     errdefer if (!expression_transferred) freeExpression(alloc, expression);
     array_transferred = true;
@@ -8178,11 +8212,11 @@ pub fn parseConflictArrayElementTransformExpressionAlloc(
     column: runtime_schema.RelationalColumn,
     insert_columns: []const []const u8,
     expected_type: ?runtime_schema.AntflyType,
-    type_context: lower_expr.RowExpressionTypeContext,
+    type_context: expr_type.RowExpressionTypeContext,
     options: ConflictAssignmentExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (field_type != .array) return error.UnsupportedSqlShape;
-    const kind = try lower_expr.parseArrayElementTransformFunctionCallStart(tokens, pos);
+    const kind = try expr_token.parseArrayElementTransformFunctionCallStart(tokens, pos);
 
     const first_expected: ?runtime_schema.AntflyType = if (kind == .array_prepend) null else .array;
     const first_expression = try parseConflictRowExpressionOperandWithExpectedAlloc(alloc, tokens, pos, column, insert_columns, first_expected, options);
@@ -8206,18 +8240,18 @@ pub fn parseConflictArrayElementTransformExpressionAlloc(
     try parser.expectToken(tokens, pos, .rparen);
 
     const expression = if (kind == .array_prepend) blk: {
-        const out = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, second_expression, first_expression);
+        const out = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, second_expression, first_expression);
         second_transferred = true;
         first_transferred = true;
         break :blk out;
     } else if (kind == .array_replace) blk: {
-        const out = try lower_expr.buildTernaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression, third_expression);
+        const out = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression, third_expression);
         first_transferred = true;
         second_transferred = true;
         third_transferred = true;
         break :blk out;
     } else blk: {
-        const out = try lower_expr.buildBinaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression);
+        const out = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression);
         first_transferred = true;
         second_transferred = true;
         break :blk out;
@@ -8697,7 +8731,7 @@ pub fn parseMergeArmExpressionPredicatesAlloc(
     if (mergeCanParseExpressionNotWhere(tokens, pos.*)) {
         not_where_options.generated_expression_ast = try lower_expr.generatedPredicateExpressionAtStart(tokens, pos.*, options.generated_expression_ast);
         try lower_expr.parseExpressionNotWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &not_groups, not_where_options);
-    } else if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, lower_expr.sqlWhereTailClauseKeywordToken) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos.*)) {
+    } else if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, expr_token.sqlWhereTailClauseKeywordToken) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos.*)) {
         try lower_expr.parseExpressionOrWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &or_groups, or_where_options);
     } else {
         try lower_expr.parseExpressionWhereConditionsWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &conditions, &or_groups, &not_groups, where_condition_options);
@@ -9210,7 +9244,7 @@ pub fn parseJoinedMutationWhereAlloc(
         if (parser.matchKeywordTag(tokens, pos, .like) or parser.matchKeywordTag(tokens, pos, .ilike)) {
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
-            const generated_quantifier_token_index: ?usize = if (lower_expr.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+            const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
             try lower_expr.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
@@ -9221,7 +9255,7 @@ pub fn parseJoinedMutationWhereAlloc(
             if (parser.matchKeywordTag(tokens, pos, .like) or parser.matchKeywordTag(tokens, pos, .ilike)) {
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
-                const generated_quantifier_token_index: ?usize = if (lower_expr.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
+                const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
                 try lower_expr.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
                 try lower_expr.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
@@ -9249,7 +9283,7 @@ pub fn parseJoinedMutationWhereAlloc(
         }
 
         const op_token_index = pos.*;
-        const op: runtime_schema.RelationalCheckOp = if (try lower_expr.parseExpressionIsTailIf(tokens, pos, .{
+        const op: runtime_schema.RelationalCheckOp = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{
             .allow_distinct = false,
             .allow_boolean_unknown = true,
             .allow_boolean_literal = true,
@@ -9289,8 +9323,8 @@ pub fn parseJoinedMutationWhereAlloc(
                 },
             }
             break :blk is_tail.op;
-        } else try lower_expr.parseComparisonOp(tokens, pos);
-        if (op == .eq and lower_expr.matchAnyOrSomeKeyword(tokens, pos)) {
+        } else try expr_operator.parseComparisonOp(tokens, pos);
+        if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
             try lower_expr.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try sql_value.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -9428,12 +9462,19 @@ pub fn parseConflictTargetAlloc(
     const target_start = pos.*;
     if (options.generated_target_items != null and options.generated_target_tokens == null) return error.UnsupportedSqlShape;
     if (options.generated_target_tokens != null and options.generated_target_items == null) return error.UnsupportedSqlShape;
+    if ((options.generated_target_tokens != null or options.generated_target_items != null) and options.generated_target_kind == null) return error.UnsupportedSqlShape;
+    if (options.generated_target_kind) |kind| {
+        if (kind == .targetless) return error.UnsupportedSqlShape;
+    }
     if ((options.generated_where_tokens != null or options.generated_where_expression != null) and
         options.generated_target_tokens == null)
     {
         return error.UnsupportedSqlShape;
     }
     if (cursor.matchKeywordTag(.on)) {
+        if (options.generated_target_kind) |kind| {
+            if (kind != .constraint) return error.UnsupportedSqlShape;
+        }
         if (options.generated_target_items) |items| {
             try validateGeneratedDmlEmptyList(items);
         }
@@ -9448,6 +9489,9 @@ pub fn parseConflictTargetAlloc(
     }
 
     try cursor.expectToken(.lparen);
+    if (options.generated_target_kind) |kind| {
+        if (kind != .inference) return error.UnsupportedSqlShape;
+    }
     var columns = std.ArrayListUnmanaged([]const u8).empty;
     defer {
         for (columns.items) |column| alloc.free(column);
@@ -9488,7 +9532,7 @@ pub fn parseConflictTargetAlloc(
     }
     if (columns.items.len == 0 and expressions.items.len == 0) return error.UnsupportedSqlShape;
     try validateSqlInsertColumnsUnique(schema, columns.items);
-    try lower_expr.validateSqlUniqueExpressionListUnique(expressions.items);
+    try expr_type.validateSqlUniqueExpressionListUnique(expressions.items);
 
     var where_json: []const u8 = "";
     defer if (where_json.len > 0) alloc.free(where_json);
@@ -9781,9 +9825,9 @@ fn validateConflictTargetUniqueExpression(
 ) !void {
     if (expression.op == .expression) {
         const row_expression = expression.expression orelse return error.InvalidSqlCatalog;
-        try lower_expr.validateCheckExpressionForColumns(schema.relational_columns, row_expression);
-        if (!lower_expr.rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
-        if (!lower_expr.checkExpressionTypeOrderable(try lower_expr.checkExpressionTypeForColumns(schema.relational_columns, row_expression))) return error.InvalidSqlCatalog;
+        try expr_type.validateCheckExpressionForColumns(schema.relational_columns, row_expression);
+        if (!expr_type.rowExpressionDeterministic(row_expression)) return error.InvalidSqlCatalog;
+        if (!expr_type.checkExpressionTypeOrderable(try expr_type.checkExpressionTypeForColumns(schema.relational_columns, row_expression))) return error.InvalidSqlCatalog;
     } else if (binder.relationalColumnForField(schema, expression.field, null) == null) {
         return error.InvalidSqlCatalog;
     }
@@ -10024,7 +10068,7 @@ pub fn parseExistsSemiJoinMutationTailAlloc(
                 target_query.row_claim.?.wait_policy = generated_claim.wait_policy;
                 target_query.row_claim.?.skip_locked = generated_claim.skip_locked;
             } else {
-                lower_expr.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
+                row_claim_mod.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -10164,7 +10208,7 @@ pub fn parseSemiJoinMutationSourceAlloc(
                 target_query.row_claim.?.wait_policy = generated_claim.wait_policy;
                 target_query.row_claim.?.skip_locked = generated_claim.skip_locked;
             } else {
-                lower_expr.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
+                row_claim_mod.setSqlRowClaimClause(&target_query.row_claim.?, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, &target_qualifiers));
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -11533,7 +11577,7 @@ pub fn parseJoinedMutationTailAlloc(
                 row_claim.wait_policy = generated_claim.wait_policy;
                 row_claim.skip_locked = generated_claim.skip_locked;
             } else {
-                lower_expr.setSqlRowClaimClause(&row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, options.returning_qualifiers));
+                row_claim_mod.setSqlRowClaimClause(&row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, options.returning_qualifiers));
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -11800,13 +11844,19 @@ fn parseGeneratedDmlRowClaimForClauseAlloc(
     if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.@"for")) return null;
     const range = ast.mutation_row_lock_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != keyword_index or range.start + 1 != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
-    try validateGeneratedDmlMutationRowLockClauseLayout(tokens, range);
+    try validateGeneratedDmlMutationRowLockClauseLayout(tokens, range, ast.mutation_row_lock_mode, ast.mutation_row_lock_wait_policy);
     const scoped_tokens = tokens[0..range.end];
     var generated_pos = pos.*;
     const clause = try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, scoped_tokens, &generated_pos, allowed_targets);
     if (generated_pos != range.end) return error.UnsupportedSqlShape;
     pos.* = range.end;
-    return lower_expr.sqlRowClaimForClause(clause);
+    const claim = row_claim_mod.sqlRowClaimForClause(clause);
+    if (row_claim_mod.rowClaimModeForGeneratedMode(ast.mutation_row_lock_mode orelse return error.UnsupportedSqlShape) != claim.mode or
+        row_claim_mod.rowClaimWaitPolicyForGeneratedPolicy(ast.mutation_row_lock_wait_policy orelse return error.UnsupportedSqlShape) != claim.wait_policy)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    return claim;
 }
 
 pub fn parseMutationSourceQueryTailAlloc(
@@ -12035,7 +12085,7 @@ pub fn parseMutationSourceQueryTailAlloc(
                 owned_row_claim.wait_policy = generated_claim.wait_policy;
                 owned_row_claim.skip_locked = generated_claim.skip_locked;
             } else {
-                lower_expr.setSqlRowClaimClause(&owned_row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, returning_qualifiers));
+                row_claim_mod.setSqlRowClaimClause(&owned_row_claim, try grammar.parseExclusiveForRowClaimClauseAlloc(alloc, tokens, pos, returning_qualifiers));
             }
         } else if (parser.matchKeywordTag(tokens, pos, .returning)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12498,6 +12548,7 @@ fn parseInsertConflictClauseAlloc(
         options.generated_conflict_assignment_items,
         options.generated_conflict_assignments_tokens,
         options.generated_conflict_action_tokens,
+        options.generated_conflict_action_kind,
         conflictAssignmentExpressionOptionsWithExistingQualifiers(options.condition_options, existing_qualifiers),
         conflictDispatchOptionsWithExistingQualifiers(options.dispatch_options, existing_qualifiers),
     );
@@ -13243,23 +13294,23 @@ pub fn insertBodyJsonAlloc(
             try writeMutationAssignmentsJson(writer, clause.patch, clause.patch_expr, clause.increment, clause.increment_expr, clause.json_set, clause.array_update);
             if (clause.where_expression) |condition| {
                 try writer.writeAll(",\"where_expression\":");
-                try lower_expr.writeRowExpressionConditionJson(writer, condition);
+                try expr_type.writeRowExpressionConditionJson(writer, condition);
             }
             if (clause.where_expressions.len > 0) {
                 try writer.writeAll(",\"where_expressions\":[");
                 for (clause.where_expressions, 0..) |condition, i| {
                     if (i != 0) try writer.writeByte(',');
-                    try lower_expr.writeRowExpressionConditionJson(writer, condition);
+                    try expr_type.writeRowExpressionConditionJson(writer, condition);
                 }
                 try writer.writeByte(']');
             }
             if (clause.where_any.len > 0) {
                 try writer.writeByte(',');
-                try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "where_any", clause.where_any);
+                try expr_type.writeRowExpressionPredicateGroupsJson(writer, "where_any", clause.where_any);
             }
             if (clause.where_not.len > 0) {
                 try writer.writeByte(',');
-                try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "where_not", clause.where_not);
+                try expr_type.writeRowExpressionPredicateGroupsJson(writer, "where_not", clause.where_not);
             }
             try writer.writeByte('}');
         }
@@ -13284,7 +13335,7 @@ pub fn writeConflictTargetJson(writer: *std.Io.Writer, target: ConflictTarget) !
                 try writer.writeAll(",\"where_expressions\":[");
                 for (unique.where_expressions, 0..) |condition, i| {
                     if (i != 0) try writer.writeByte(',');
-                    try lower_expr.writeRowExpressionConditionJson(writer, condition);
+                    try expr_type.writeRowExpressionConditionJson(writer, condition);
                 }
                 try writer.writeByte(']');
             }
@@ -13390,24 +13441,24 @@ pub fn joinedMutationSourceBodyJsonAlloc(
         try writer.writeAll(",\"match_expression_where\":[");
         for (tail.match_expression_predicates, 0..) |condition, i| {
             if (i != 0) try writer.writeByte(',');
-            try lower_expr.writeRowExpressionConditionJson(writer, condition);
+            try expr_type.writeRowExpressionConditionJson(writer, condition);
         }
         try writer.writeByte(']');
     }
     if (tail.match_expression_or_predicates.len > 0) {
         try writer.writeByte(',');
-        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "match_expression_any", tail.match_expression_or_predicates);
+        try expr_type.writeRowExpressionPredicateGroupsJson(writer, "match_expression_any", tail.match_expression_or_predicates);
     }
     if (tail.match_expression_not_predicates.len > 0) {
         try writer.writeByte(',');
-        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "match_expression_not", tail.match_expression_not_predicates);
+        try expr_type.writeRowExpressionPredicateGroupsJson(writer, "match_expression_not", tail.match_expression_not_predicates);
     }
     if (tail.match_expression_array_contains.len > 0) {
         try writer.writeAll(",\"match_expression_array_contains\":[");
         for (tail.match_expression_array_contains, 0..) |predicate, i| {
             if (i != 0) try writer.writeByte(',');
             try writer.writeAll("{\"expr\":");
-            try lower_expr.writeRowExpressionJson(writer, predicate.expression);
+            try expr_type.writeRowExpressionJson(writer, predicate.expression);
             try writer.writeAll(",\"value\":");
             try writer.writeAll(predicate.value_json);
             try writer.writeByte('}');
@@ -13464,7 +13515,7 @@ fn writeMutationAssignmentsJson(
         for (patch_expr, 0..) |item, i| {
             if (i != 0) try writer.writeByte(',');
             try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
-            try lower_expr.writeRowExpressionJson(writer, item.expression);
+            try expr_type.writeRowExpressionJson(writer, item.expression);
         }
         try writer.writeByte('}');
     }
@@ -13482,7 +13533,7 @@ fn writeMutationAssignmentsJson(
         for (increment_expr, 0..) |item, i| {
             if (i != 0) try writer.writeByte(',');
             try writer.print("{f}:", .{std.json.fmt(item.field, .{})});
-            try lower_expr.writeRowExpressionJson(writer, item.expression);
+            try expr_type.writeRowExpressionJson(writer, item.expression);
         }
         try writer.writeByte('}');
     }
@@ -13516,7 +13567,7 @@ pub fn writeJsonSetValuesJson(writer: *std.Io.Writer, json_set: []const JsonSetV
         try writer.writeByte(']');
         if (item.expression) |expression| {
             try writer.writeAll(",\"expr\":");
-            try lower_expr.writeRowExpressionJson(writer, expression);
+            try expr_type.writeRowExpressionJson(writer, expression);
         } else if (item.value_json) |value_json| {
             try writer.writeAll(",\"value\":");
             try writer.writeAll(value_json);
@@ -13567,15 +13618,15 @@ pub fn writeMutationSourceQueryJson(
         if (source.predicates.len > 0 or source.array_contains.len > 0 or source.array_eq.len > 0 or source.array_any.len > 0 or source.in_predicates.len > 0 or source.json_contains.len > 0 or source.json_path_eq.len > 0 or source.json_path_exists.len > 0 or source.text_patterns.len > 0) {
             try writer.writeAll("\"all\":[");
             var wrote_atom = false;
-            try lower_expr.writeRelationalCheckAtomsJson(writer, &wrote_atom, source.predicates);
-            try lower_expr.writeInPredicateAtomsJson(writer, &wrote_atom, source.in_predicates);
-            try lower_expr.writeTextPatternPredicateAtomsJson(writer, &wrote_atom, source.text_patterns);
-            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_any", source.array_any);
-            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_contains", source.array_contains);
-            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_eq", source.array_eq);
-            try lower_expr.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "json_contains", source.json_contains);
-            try lower_expr.writeJsonPathEqPredicateAtomsJson(writer, &wrote_atom, source.json_path_eq);
-            try lower_expr.writeJsonPathExistsPredicateAtomsJson(writer, &wrote_atom, source.json_path_exists);
+            try expr_type.writeRelationalCheckAtomsJson(writer, &wrote_atom, source.predicates);
+            try expr_type.writeInPredicateAtomsJson(writer, &wrote_atom, source.in_predicates);
+            try expr_type.writeTextPatternPredicateAtomsJson(writer, &wrote_atom, source.text_patterns);
+            try expr_type.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_any", source.array_any);
+            try expr_type.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_contains", source.array_contains);
+            try expr_type.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "array_eq", source.array_eq);
+            try expr_type.writeStructuredValuePredicateAtomsJson(writer, &wrote_atom, "json_contains", source.json_contains);
+            try expr_type.writeJsonPathEqPredicateAtomsJson(writer, &wrote_atom, source.json_path_eq);
+            try expr_type.writeJsonPathExistsPredicateAtomsJson(writer, &wrote_atom, source.json_path_exists);
             try writer.writeByte(']');
             wrote_where = true;
         }
@@ -13585,11 +13636,11 @@ pub fn writeMutationSourceQueryJson(
             for (source.or_predicates, 0..) |group, group_i| {
                 if (group_i != 0) try writer.writeByte(',');
                 if (group.predicates.len == 1) {
-                    try lower_expr.writeRelationalCheckAtomJson(writer, group.predicates[0]);
+                    try expr_type.writeRelationalCheckAtomJson(writer, group.predicates[0]);
                 } else {
                     try writer.writeAll("{\"all\":[");
                     var wrote_atom = false;
-                    try lower_expr.writeRelationalCheckAtomsJson(writer, &wrote_atom, group.predicates);
+                    try expr_type.writeRelationalCheckAtomsJson(writer, &wrote_atom, group.predicates);
                     try writer.writeAll("]}");
                 }
             }
@@ -13602,11 +13653,11 @@ pub fn writeMutationSourceQueryJson(
             for (source.not_predicates, 0..) |group, group_i| {
                 if (group_i != 0) try writer.writeByte(',');
                 if (group.predicates.len == 1) {
-                    try lower_expr.writeRelationalCheckAtomJson(writer, group.predicates[0]);
+                    try expr_type.writeRelationalCheckAtomJson(writer, group.predicates[0]);
                 } else {
                     try writer.writeAll("{\"all\":[");
                     var wrote_atom = false;
-                    try lower_expr.writeRelationalCheckAtomsJson(writer, &wrote_atom, group.predicates);
+                    try expr_type.writeRelationalCheckAtomsJson(writer, &wrote_atom, group.predicates);
                     try writer.writeAll("]}");
                 }
             }
@@ -13620,19 +13671,19 @@ pub fn writeMutationSourceQueryJson(
         try writer.writeAll("\"expression_where\":[");
         for (source.expression_predicates, 0..) |condition, i| {
             if (i != 0) try writer.writeByte(',');
-            try lower_expr.writeRowExpressionConditionJson(writer, condition);
+            try expr_type.writeRowExpressionConditionJson(writer, condition);
         }
         try writer.writeByte(']');
         wrote = true;
     }
     if (source.expression_or_predicates.len > 0) {
         if (wrote) try writer.writeByte(',');
-        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "expression_any", source.expression_or_predicates);
+        try expr_type.writeRowExpressionPredicateGroupsJson(writer, "expression_any", source.expression_or_predicates);
         wrote = true;
     }
     if (source.expression_not_predicates.len > 0) {
         if (wrote) try writer.writeByte(',');
-        try lower_expr.writeRowExpressionPredicateGroupsJson(writer, "expression_not", source.expression_not_predicates);
+        try expr_type.writeRowExpressionPredicateGroupsJson(writer, "expression_not", source.expression_not_predicates);
         wrote = true;
     }
     if (source.expression_array_contains.len > 0) {
@@ -13641,7 +13692,7 @@ pub fn writeMutationSourceQueryJson(
         for (source.expression_array_contains, 0..) |predicate, i| {
             if (i != 0) try writer.writeByte(',');
             try writer.writeAll("{\"expr\":");
-            try lower_expr.writeRowExpressionJson(writer, predicate.expression);
+            try expr_type.writeRowExpressionJson(writer, predicate.expression);
             try writer.writeAll(",\"value\":");
             try writer.writeAll(predicate.value_json);
             try writer.writeByte('}');
@@ -13656,7 +13707,7 @@ pub fn writeMutationSourceQueryJson(
             if (i != 0) try writer.writeByte(',');
             if (order.expression) |expression| {
                 try writer.writeAll("{\"expr\":");
-                try lower_expr.writeRowExpressionJson(writer, expression);
+                try expr_type.writeRowExpressionJson(writer, expression);
             } else {
                 try writer.print("{{\"field\":{f}", .{std.json.fmt(order.field, .{})});
             }
@@ -13681,8 +13732,8 @@ pub fn writeMutationSourceQueryJson(
         const txn_id = claim.txn_id orelse return error.UnsupportedRowsQuery;
         const txn_hex = sql_value.encodeSqlTxnIdHex(txn_id);
         try writer.print("\"row_claim\":{{\"mode\":\"{s}\",\"wait_policy\":\"{s}\",\"lease_ms\":{d},\"owner_id\":{f},\"transaction_id\":\"{s}\"}}", .{
-            lower_expr.sqlRowClaimModeName(claim.mode),
-            lower_expr.sqlRowClaimWaitPolicyName(claim.effectiveWaitPolicy()),
+            row_claim_mod.sqlRowClaimModeName(claim.mode),
+            row_claim_mod.sqlRowClaimWaitPolicyName(claim.effectiveWaitPolicy()),
             claim.lease_ms,
             std.json.fmt(claim.owner_id, .{}),
             txn_hex,
@@ -13698,7 +13749,7 @@ pub fn writeReturningProjectionJson(writer: *std.Io.Writer, returning: Returning
     for (returning.expressions, 0..) |projection, i| {
         if (i != 0) try writer.writeByte(',');
         try writer.print("{{\"as\":{f},\"expr\":", .{std.json.fmt(projection.output, .{})});
-        try lower_expr.writeRowExpressionJson(writer, projection.expression);
+        try expr_type.writeRowExpressionJson(writer, projection.expression);
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -13972,54 +14023,54 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
         keywordTagAt(tokens, pos, .coalesce) or
         keywordTagAt(tokens, pos, .lower) or
         keywordTagAt(tokens, pos, .upper) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsInitcapFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsInitcapFunction) or
         keywordTagAt(tokens, pos, .trim) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsTrimVariantFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsTrimVariantFunction) or
         keywordTagAt(tokens, pos, .replace) or
         keywordTagAt(tokens, pos, .regexp_replace) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpSubstrFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpMatchFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpCountFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRegexpInstrFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsTranslateFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpSubstrFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpMatchFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpCountFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpInstrFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsTranslateFunction) or
         keywordTagAt(tokens, pos, .concat) or
         keywordTagAt(tokens, pos, .concat_ws) or
         keywordTagAt(tokens, pos, .nullif) or
-        lower_expr.peekTextLengthFunctionKeyword(tokens, pos) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsAsciiFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsChrFunction) or
-        lower_expr.peekSubstringFunctionKeyword(tokens, pos) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsOverlayFunction) or
-        lower_expr.peekSplitPartFunctionKeyword(tokens, pos) or
-        lower_expr.peekStrposFunctionKeyword(tokens, pos) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsLeftRightFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsPadFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsRepeatFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsReverseFunction) or
-        (include_md5 and lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsMd5Function)) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsStartsWithFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsEndsWithFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateTruncFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDateBinFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsDatePartFunction) or
+        expr_token.peekTextLengthFunctionKeyword(tokens, pos) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsAsciiFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsChrFunction) or
+        expr_token.peekSubstringFunctionKeyword(tokens, pos) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsOverlayFunction) or
+        expr_token.peekSplitPartFunctionKeyword(tokens, pos) or
+        expr_token.peekStrposFunctionKeyword(tokens, pos) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsLeftRightFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsPadFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsReverseFunction) or
+        (include_md5 and expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDateBinFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsDatePartFunction) or
         keywordAt(tokens, pos, "position") or
         keywordTagAt(tokens, pos, .abs) or
         keywordTagAt(tokens, pos, .round) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .trunc) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .floor) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .ceil) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .sqrt) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .sign) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .mod) or
-        lower_expr.peekFunctionCallTag(tokens, pos, .power) or
+        expr_token.peekFunctionCallTag(tokens, pos, .trunc) or
+        expr_token.peekFunctionCallTag(tokens, pos, .floor) or
+        expr_token.peekFunctionCallTag(tokens, pos, .ceil) or
+        expr_token.peekFunctionCallTag(tokens, pos, .sqrt) or
+        expr_token.peekFunctionCallTag(tokens, pos, .sign) or
+        expr_token.peekFunctionCallTag(tokens, pos, .mod) or
+        expr_token.peekFunctionCallTag(tokens, pos, .power) or
         keywordTagAt(tokens, pos, .greatest) or
         keywordTagAt(tokens, pos, .least) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonExtractPathFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonTypeofFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonArrayLengthFunction) or
-        lower_expr.peekFunctionCallTokenIf(tokens, pos, lower_expr.sqlTokenIsJsonBuildObjectFunction) or
-        lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayLengthFunction) or
-        lower_expr.functionCallStartsAtTokenIf(tokens, pos, lower_expr.sqlTokenIsArrayPositionFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonExtractPathFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonTypeofFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonArrayLengthFunction) or
+        expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsJsonBuildObjectFunction) or
+        expr_token.functionCallStartsAtTokenIf(tokens, pos, expr_token.sqlTokenIsArrayLengthFunction) or
+        expr_token.functionCallStartsAtTokenIf(tokens, pos, expr_token.sqlTokenIsArrayPositionFunction) or
         keywordTagAt(tokens, pos, .array_append) or
         keywordTagAt(tokens, pos, .array_prepend) or
         keywordTagAt(tokens, pos, .array_cat) or
@@ -14049,8 +14100,8 @@ fn scanBooleanAssignmentTail(tokens: []const Token, pos: usize, assignment_tail:
             .lparen => depth += 1,
             .eq, .neq, .gt, .gte, .lt, .lte, .arrow_text, .arrow_json, .path_arrow_text, .path_arrow_json, .at_contains, .range_overlap, .question, .regex_match, .regex_imatch, .regex_not_match, .regex_not_imatch => return false,
             .identifier => {
-                if (depth == 0 and assignment_tail and lower_expr.sqlAssignmentTailKeywordToken(token)) break;
-                if (lower_expr.sqlKeywordStartsScalarPredicate(token.text)) return false;
+                if (depth == 0 and assignment_tail and expr_token.sqlAssignmentTailKeywordToken(token)) break;
+                if (expr_token.sqlKeywordStartsScalarPredicate(token.text)) return false;
                 if (token.matchesKeywordTag(.@"and") or
                     token.matchesKeywordTag(.@"or") or
                     token.matchesKeywordTag(.not))
@@ -14091,8 +14142,8 @@ fn scanBareBooleanExpressionTail(tokens: []const Token, pos: usize) BareBooleanS
                 .saw_token = false,
             },
             .identifier => {
-                if (depth == 0 and lower_expr.sqlWhereTailClauseKeywordToken(token)) break;
-                if (lower_expr.sqlKeywordStartsScalarPredicate(token.text)) return .{
+                if (depth == 0 and expr_token.sqlWhereTailClauseKeywordToken(token)) break;
+                if (expr_token.sqlKeywordStartsScalarPredicate(token.text)) return .{
                     .saw_boolean_syntax = false,
                     .saw_token = false,
                 };
@@ -14118,7 +14169,7 @@ fn booleanKeywordCanStart(token: Token) bool {
         token.matchesKeywordTag(.cast) or
         token.matchesKeywordTag(.coalesce) or
         token.matchesKeywordTag(.nullif) or
-        lower_expr.sqlTokenIsStartsWithFunction(token);
+        expr_token.sqlTokenIsStartsWithFunction(token);
 }
 
 fn keywordTagAt(tokens: []const Token, pos: usize, keyword: parser.TokenKeyword) bool {
@@ -14941,7 +14992,7 @@ fn writeMergeReturningProjectionJson(writer: *std.Io.Writer, returning: Returnin
     for (returning.expressions, 0..) |projection, i| {
         if (i != 0) try writer.writeByte(',');
         try writer.print("{{\"as\":{f},\"expr\":", .{std.json.fmt(projection.output, .{})});
-        try lower_expr.writeRowExpressionJson(writer, projection.expression);
+        try expr_type.writeRowExpressionJson(writer, projection.expression);
         try writer.writeByte('}');
     }
     try writer.writeByte(']');
@@ -16753,10 +16804,12 @@ fn recursiveInsertSourceFromGeneratedDmlAstAlloc(
         .generated_conflict_assignments_tokens = ast.conflict_assignments_tokens,
         .generated_insert_column_items = &ast.insert_column_items,
         .generated_conflict_target_tokens = ast.conflict_target_tokens,
+        .generated_conflict_target_kind = ast.conflict_target_kind,
         .generated_conflict_target_items = &ast.conflict_target_items,
         .generated_conflict_target_where_tokens = ast.conflict_target_where_tokens,
         .generated_conflict_target_where_expression = if (ast.conflict_target_where_tokens != null) &ast.conflict_target_where_expression else null,
         .generated_conflict_action_tokens = ast.conflict_action_tokens,
+        .generated_conflict_action_kind = ast.conflict_action_kind,
         .generated_conflict_action_where_tokens = ast.conflict_action_where_tokens,
         .generated_conflict_action_where_expression = if (ast.conflict_action_where_tokens != null) &ast.conflict_action_where_expression else null,
     };
@@ -17157,7 +17210,9 @@ fn validateGeneratedDmlReturningHookRange(
 fn validateGeneratedDmlNoConflictMetadata(ast: generated_parser.GeneratedSqlDmlAst) !void {
     if (ast.conflict_tokens != null or
         ast.conflict_target_tokens != null or
+        ast.conflict_target_kind != null or
         ast.conflict_action_tokens != null or
+        ast.conflict_action_kind != null or
         ast.conflict_assignments_tokens != null or
         ast.conflict_target_where_tokens != null or
         ast.conflict_action_where_tokens != null)
@@ -17229,13 +17284,23 @@ fn validateGeneratedInsertConflictMetadata(
     if (!tokens[conflict_range.start - 1].matchesKeywordTag(.on) or !tokens[conflict_range.start].matchesKeywordTag(.conflict)) return error.UnsupportedSqlShape;
 
     var cursor = conflict_range.start + 1;
-    if (ast.conflict_target_tokens) |target| {
-        if (target.start != cursor or target.end > conflict_range.end) return error.UnsupportedSqlShape;
-        if (tokens[target.start].kind == .lparen) {
+    const target_kind = ast.conflict_target_kind orelse return error.UnsupportedSqlShape;
+    switch (target_kind) {
+        .targetless => {
+            if (ast.conflict_target_tokens != null or ast.conflict_target_where_tokens != null) return error.UnsupportedSqlShape;
+            try validateGeneratedDmlEmptyList(&ast.conflict_target_items);
+        },
+        .inference => {
+            const target = ast.conflict_target_tokens orelse return error.UnsupportedSqlShape;
+            if (target.start != cursor or target.end > conflict_range.end or tokens[target.start].kind != .lparen) return error.UnsupportedSqlShape;
             const close = parser.findMatchingRParenIndex(tokens, target.start) orelse return error.UnsupportedSqlShape;
             if (close >= conflict_range.end or target.end != close + 1) return error.UnsupportedSqlShape;
             try validateGeneratedDmlListItemsRange(tokens, .{ .start = target.start + 1, .end = target.end - 1 }, &ast.conflict_target_items);
-        } else {
+            cursor = target.end;
+        },
+        .constraint => {
+            const target = ast.conflict_target_tokens orelse return error.UnsupportedSqlShape;
+            if (target.start != cursor or target.end > conflict_range.end) return error.UnsupportedSqlShape;
             if (target.end != target.start + 3 or
                 !tokens[target.start].matchesKeywordTag(.on) or
                 !tokens[target.start + 1].matchesKeywordTag(.constraint) or
@@ -17244,13 +17309,12 @@ fn validateGeneratedInsertConflictMetadata(
                 return error.UnsupportedSqlShape;
             }
             try validateGeneratedDmlEmptyList(&ast.conflict_target_items);
-        }
-        cursor = target.end;
-    } else {
-        try validateGeneratedDmlEmptyList(&ast.conflict_target_items);
+            cursor = target.end;
+        },
     }
 
     if (ast.conflict_target_where_tokens) |where| {
+        if (target_kind != .inference) return error.UnsupportedSqlShape;
         if (where.start != cursor + 1 or where.start >= where.end or where.end > conflict_range.end) return error.UnsupportedSqlShape;
         if (!tokens[cursor].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
         if (!generatedDmlTokenRangeEql(ast.conflict_target_where_expression.tokens orelse return error.UnsupportedSqlShape, where)) return error.UnsupportedSqlShape;
@@ -17265,11 +17329,19 @@ fn validateGeneratedInsertConflictMetadata(
     if (cursor >= conflict_range.end or !tokens[cursor].matchesKeywordTag(.do)) return error.UnsupportedSqlShape;
     const action = ast.conflict_action_tokens orelse return error.UnsupportedSqlShape;
     if (action.start != cursor + 1 or action.start >= action.end or action.end != conflict_range.end) return error.UnsupportedSqlShape;
-    if (tokens[action.start].matchesKeywordTag(.nothing)) {
-        if (action.end != action.start + 1 or ast.conflict_assignments_tokens != null or ast.conflict_action_where_tokens != null) return error.UnsupportedSqlShape;
-        try validateGeneratedDmlEmptyList(&ast.conflict_assignment_items);
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.conflict_action_where_expression);
-        return;
+    const action_kind = ast.conflict_action_kind orelse return error.UnsupportedSqlShape;
+    switch (action_kind) {
+        .nothing => {
+            if (!tokens[action.start].matchesKeywordTag(.nothing)) return error.UnsupportedSqlShape;
+            if (action.end != action.start + 1 or ast.conflict_assignments_tokens != null or ast.conflict_action_where_tokens != null) return error.UnsupportedSqlShape;
+            try validateGeneratedDmlEmptyList(&ast.conflict_assignment_items);
+            try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.conflict_action_where_expression);
+            return;
+        },
+        .update => {
+            if (target_kind == .targetless) return error.UnsupportedSqlShape;
+            if (!tokens[action.start].matchesKeywordTag(.update) or action.start + 1 >= action.end or !tokens[action.start + 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
+        },
     }
     if (!tokens[action.start].matchesKeywordTag(.update) or action.start + 1 >= action.end or !tokens[action.start + 1].matchesKeywordTag(.set)) return error.UnsupportedSqlShape;
     const assignments = ast.conflict_assignments_tokens orelse return error.UnsupportedSqlShape;
@@ -17402,10 +17474,12 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
             .generated_assignment_items = &ast.conflict_assignment_items,
             .generated_conflict_assignments_tokens = ast.conflict_assignments_tokens,
             .generated_conflict_target_tokens = ast.conflict_target_tokens,
+            .generated_conflict_target_kind = ast.conflict_target_kind,
             .generated_conflict_target_items = &ast.conflict_target_items,
             .generated_conflict_target_where_tokens = ast.conflict_target_where_tokens,
             .generated_conflict_target_where_expression = if (ast.conflict_target_where_tokens != null) &ast.conflict_target_where_expression else null,
             .generated_conflict_action_tokens = ast.conflict_action_tokens,
+            .generated_conflict_action_kind = ast.conflict_action_kind,
             .generated_conflict_action_where_tokens = ast.conflict_action_where_tokens,
             .generated_conflict_action_where_expression = if (ast.conflict_action_where_tokens != null) &ast.conflict_action_where_expression else null,
         };
@@ -17547,10 +17621,12 @@ fn insertSourceFromGeneratedDmlAstAlloc(
         .generated_conflict_assignments_tokens = ast.conflict_assignments_tokens,
         .generated_insert_column_items = &ast.insert_column_items,
         .generated_conflict_target_tokens = ast.conflict_target_tokens,
+        .generated_conflict_target_kind = ast.conflict_target_kind,
         .generated_conflict_target_items = &ast.conflict_target_items,
         .generated_conflict_target_where_tokens = ast.conflict_target_where_tokens,
         .generated_conflict_target_where_expression = if (ast.conflict_target_where_tokens != null) &ast.conflict_target_where_expression else null,
         .generated_conflict_action_tokens = ast.conflict_action_tokens,
+        .generated_conflict_action_kind = ast.conflict_action_kind,
         .generated_conflict_action_where_tokens = ast.conflict_action_where_tokens,
         .generated_conflict_action_where_expression = if (ast.conflict_action_where_tokens != null) &ast.conflict_action_where_expression else null,
     };
@@ -18062,28 +18138,37 @@ fn firstOptionalIndex(indexes: []const ?usize) ?usize {
 fn validateGeneratedDmlMutationRowLockClauseLayout(
     tokens: []const Token,
     lock_tokens: generated_parser.GeneratedSqlTokenRange,
+    mode: ?generated_parser.GeneratedSqlRowLockMode,
+    wait_policy: ?generated_parser.GeneratedSqlRowLockWaitPolicy,
 ) !void {
+    const generated_mode = mode orelse return error.UnsupportedSqlShape;
+    const generated_wait_policy = wait_policy orelse return error.UnsupportedSqlShape;
     if (lock_tokens.start >= lock_tokens.end or lock_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     if (!tokens[lock_tokens.start].matchesKeywordTag(.@"for")) return error.UnsupportedSqlShape;
 
     var cursor = lock_tokens.start + 1;
     if (cursor >= lock_tokens.end) return error.UnsupportedSqlShape;
-    if (tokens[cursor].matchesKeywordTag(.update) or tokens[cursor].matchesKeywordTag(.share)) {
+    const parsed_mode: generated_parser.GeneratedSqlRowLockMode = if (tokens[cursor].matchesKeywordTag(.update)) blk: {
         cursor += 1;
+        break :blk .update;
+    } else if (tokens[cursor].matchesKeywordTag(.share)) blk: {
+        cursor += 1;
+        break :blk .share;
     } else if (cursor + 2 < lock_tokens.end and
         tokens[cursor].matchesKeywordTag(.no) and
         tokens[cursor + 1].matchesKeywordTag(.key) and
         tokens[cursor + 2].matchesKeywordTag(.update))
-    {
+    blk: {
         cursor += 3;
+        break :blk .no_key_update;
     } else if (cursor + 1 < lock_tokens.end and
         tokens[cursor].matchesKeywordTag(.key) and
         tokens[cursor + 1].matchesKeywordTag(.share))
-    {
+    blk: {
         cursor += 2;
-    } else {
-        return error.UnsupportedSqlShape;
-    }
+        break :blk .key_share;
+    } else return error.UnsupportedSqlShape;
+    if (parsed_mode != generated_mode) return error.UnsupportedSqlShape;
 
     if (cursor < lock_tokens.end and tokens[cursor].matchesKeywordTag(.of)) {
         cursor += 1;
@@ -18106,13 +18191,16 @@ fn validateGeneratedDmlMutationRowLockClauseLayout(
         if (!saw_target or previous_was_comma) return error.UnsupportedSqlShape;
     }
 
+    var parsed_wait_policy = generated_parser.GeneratedSqlRowLockWaitPolicy.wait;
     if (cursor < lock_tokens.end) {
         if (tokens[cursor].matchesKeywordTag(.nowait)) {
+            parsed_wait_policy = .nowait;
             cursor += 1;
         } else if (cursor + 1 < lock_tokens.end and
             tokens[cursor].matchesKeywordTag(.skip) and
             tokens[cursor + 1].matchesKeywordTag(.locked))
         {
+            parsed_wait_policy = .skip_locked;
             cursor += 2;
         } else {
             return error.UnsupportedSqlShape;
@@ -18120,6 +18208,7 @@ fn validateGeneratedDmlMutationRowLockClauseLayout(
     }
 
     if (cursor != lock_tokens.end) return error.UnsupportedSqlShape;
+    if (parsed_wait_policy != generated_wait_policy) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedDmlEmptyOrderMetadata(list: generated_parser.GeneratedSqlListAst) !void {
@@ -18218,8 +18307,8 @@ fn validateGeneratedDmlMutationTailMetadata(
     if (row_lock_index) |idx| {
         const range = ast.mutation_row_lock_tokens orelse return error.UnsupportedSqlShape;
         if (range.start != idx or range.end != tail_end) return error.UnsupportedSqlShape;
-        try validateGeneratedDmlMutationRowLockClauseLayout(tokens, range);
-    } else if (ast.mutation_row_lock_tokens != null) {
+        try validateGeneratedDmlMutationRowLockClauseLayout(tokens, range, ast.mutation_row_lock_mode, ast.mutation_row_lock_wait_policy);
+    } else if (ast.mutation_row_lock_tokens != null or ast.mutation_row_lock_mode != null or ast.mutation_row_lock_wait_policy != null) {
         return error.UnsupportedSqlShape;
     }
 }
@@ -20236,6 +20325,28 @@ test "sql adapter lower dml validates generated mutation tail metadata" {
         else => return error.TestUnexpectedResult,
     }
 
+    var update_stale_fetch_count_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id LIMIT +5 OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer update_stale_fetch_count_expression.deinit(alloc);
+    const update_stale_fetch_count_expression_end = switch (update_stale_fetch_count_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(update_stale_fetch_count_expression.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (update_stale_fetch_count_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.mutation_fetch_count_expression.kind = .function_call,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (update_stale_fetch_count_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedUpdateSourceRanges(update_stale_fetch_count_expression.items(), dml, update_stale_fetch_count_expression_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
     var update_stale_fetch_layout = try tokenized.ParsedSql.initAlloc(
         alloc,
         "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id FETCH NEXT +3 ROWS ONLY RETURNING id",
@@ -20280,6 +20391,106 @@ test "sql adapter lower dml validates generated mutation tail metadata" {
         else => return error.TestUnexpectedResult,
     }
 
+    var delete_stale_order = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer delete_stale_order.deinit(alloc);
+    const delete_stale_order_end = switch (delete_stale_order.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(delete_stale_order.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (delete_stale_order.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_order_tokens == null or dml.mutation_order_items.count == 0) return error.TestUnexpectedResult;
+                    dml.mutation_order_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (delete_stale_order.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_order.items(), dml, delete_stale_order_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_stale_limit_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id LIMIT +5 OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer delete_stale_limit_expression.deinit(alloc);
+    const delete_stale_limit_expression_end = switch (delete_stale_limit_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(delete_stale_limit_expression.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (delete_stale_limit_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_limit_tokens == null or dml.mutation_limit_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_limit_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (delete_stale_limit_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_limit_expression.items(), dml, delete_stale_limit_expression_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_stale_offset_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer delete_stale_offset_expression.deinit(alloc);
+    const delete_stale_offset_expression_end = switch (delete_stale_offset_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(delete_stale_offset_expression.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (delete_stale_offset_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_offset_tokens == null or dml.mutation_offset_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_offset_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (delete_stale_offset_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_offset_expression.items(), dml, delete_stale_offset_expression_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_stale_fetch_count_expression = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer delete_stale_fetch_count_expression.deinit(alloc);
+    const delete_stale_fetch_count_expression_end = switch (delete_stale_fetch_count_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(delete_stale_fetch_count_expression.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (delete_stale_fetch_count_expression.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_fetch_count_tokens == null or dml.mutation_fetch_count_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_fetch_count_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (delete_stale_fetch_count_expression.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_fetch_count_expression.items(), dml, delete_stale_fetch_count_expression_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
     var delete_stale_lock = try tokenized.ParsedSql.initAlloc(
         alloc,
         "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
@@ -20299,6 +20510,50 @@ test "sql adapter lower dml validates generated mutation tail metadata" {
     } else return error.TestUnexpectedResult;
     switch (delete_stale_lock.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
         .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_lock.items(), dml, delete_stale_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_stale_lock_mode = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer delete_stale_lock_mode.deinit(alloc);
+    const delete_stale_mode_end = switch (delete_stale_lock_mode.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(delete_stale_lock_mode.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (delete_stale_lock_mode.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.mutation_row_lock_mode = .share,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (delete_stale_lock_mode.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_lock_mode.items(), dml, delete_stale_mode_end)),
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_stale_lock_wait = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer delete_stale_lock_wait.deinit(alloc);
+    const delete_stale_wait_end = switch (delete_stale_lock_wait.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| generatedDmlStatementEnd(delete_stale_lock_wait.items(), dml.statement_span) orelse return error.TestUnexpectedResult,
+        else => return error.TestUnexpectedResult,
+    };
+    if (delete_stale_lock_wait.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| dml.mutation_row_lock_wait_policy = .nowait,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    switch (delete_stale_lock_wait.generated_statement.?.ast orelse return error.TestUnexpectedResult) {
+        .dml => |dml| try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedDeleteSourceRanges(delete_stale_lock_wait.items(), dml, delete_stale_wait_end)),
         else => return error.TestUnexpectedResult,
     }
 }
@@ -21008,6 +21263,279 @@ test "sql adapter lower dml rejects stale generated DML typed write-plan metadat
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_cte_command_span_dml, schema, &.{}, options),
+    );
+
+    var malformed_update_tail_offset_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer malformed_update_tail_offset_dml.deinit(alloc);
+    if (malformed_update_tail_offset_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_offset_tokens == null or dml.mutation_offset_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_offset_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_update_tail_offset_dml, schema, &.{}, options),
+    );
+
+    var malformed_update_tail_fetch_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer malformed_update_tail_fetch_dml.deinit(alloc);
+    if (malformed_update_tail_fetch_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_fetch_count_tokens == null or dml.mutation_fetch_count_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_fetch_count_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_update_tail_fetch_dml, schema, &.{}, options),
+    );
+
+    var malformed_delete_tail_offset_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id ASC OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer malformed_delete_tail_offset_dml.deinit(alloc);
+    if (malformed_delete_tail_offset_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_offset_tokens == null or dml.mutation_offset_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_offset_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_delete_tail_offset_dml, schema, &.{}, options),
+    );
+
+    var malformed_delete_tail_fetch_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id ASC OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+    );
+    defer malformed_delete_tail_fetch_dml.deinit(alloc);
+    if (malformed_delete_tail_fetch_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.mutation_fetch_count_tokens == null or dml.mutation_fetch_count_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.mutation_fetch_count_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_delete_tail_fetch_dml, schema, &.{}, options),
+    );
+
+    var malformed_conflict_action_kind_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u2', 'ready', 7) ON CONFLICT (id) DO NOTHING RETURNING id",
+    );
+    defer malformed_conflict_action_kind_dml.deinit(alloc);
+    if (malformed_conflict_action_kind_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.conflict_action_kind != .nothing or dml.conflict_action_tokens == null) return error.TestUnexpectedResult;
+                    dml.conflict_action_kind = .update;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_conflict_action_kind_dml, schema, &.{}, options),
+    );
+
+    var malformed_conflict_target_kind_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u2', 'ready', 7) ON CONFLICT (id) DO NOTHING RETURNING id",
+    );
+    defer malformed_conflict_target_kind_dml.deinit(alloc);
+    if (malformed_conflict_target_kind_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.conflict_target_kind != .inference or dml.conflict_target_tokens == null) return error.TestUnexpectedResult;
+                    dml.conflict_target_kind = .constraint;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_conflict_target_kind_dml, schema, &.{}, options),
+    );
+
+    var malformed_conflict_assignment_rhs_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u2', 'ready', 7) ON CONFLICT (id) DO UPDATE SET status = excluded.status, quantity = excluded.quantity RETURNING id",
+    );
+    defer malformed_conflict_assignment_rhs_dml.deinit(alloc);
+    if (malformed_conflict_assignment_rhs_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.conflict_assignment_items.count != 2 or dml.conflict_assignment_items.expressions.len != 2) return error.TestUnexpectedResult;
+                    dml.conflict_assignment_items.expressions[1].right_tokens = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_conflict_assignment_rhs_dml, schema, &.{}, options),
+    );
+
+    var malformed_conflict_target_where_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u2', 'ready', 7) ON CONFLICT (id) WHERE status = 'ready' DO NOTHING RETURNING id",
+    );
+    defer malformed_conflict_target_where_dml.deinit(alloc);
+    if (malformed_conflict_target_where_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.conflict_target_where_tokens == null or dml.conflict_target_where_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.conflict_target_where_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_conflict_target_where_dml, schema, &.{}, options),
+    );
+
+    var malformed_conflict_action_where_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u2', 'ready', 7) ON CONFLICT (id) DO UPDATE SET status = excluded.status WHERE status != excluded.status RETURNING id",
+    );
+    defer malformed_conflict_action_where_dml.deinit(alloc);
+    if (malformed_conflict_action_where_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.conflict_action_where_tokens == null or dml.conflict_action_where_expression.tokens == null) return error.TestUnexpectedResult;
+                    dml.conflict_action_where_expression.kind = .function_call;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_conflict_action_where_dml, schema, &.{}, options),
+    );
+
+    var malformed_insert_returning_alias_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status, quantity) VALUES ('u2', 'ready', 7) RETURNING lower(status) AS status_key",
+    );
+    defer malformed_insert_returning_alias_dml.deinit(alloc);
+    if (malformed_insert_returning_alias_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.returning_items.alias_items.len == 0 or dml.returning_items.alias_items[0] == null) return error.TestUnexpectedResult;
+                    dml.returning_items.alias_items[0] = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_insert_returning_alias_dml, schema, &.{}, options),
+    );
+
+    var malformed_update_returning_function_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "UPDATE usage_records SET status = 'ready' WHERE id = 'u1' RETURNING lower(status) AS status_key",
+    );
+    defer malformed_update_returning_function_dml.deinit(alloc);
+    if (malformed_update_returning_function_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.returning_items.expressions.len == 0 or dml.returning_items.expressions[0].argument_items.expressions.len != 1) return error.TestUnexpectedResult;
+                    dml.returning_items.expressions[0].argument_items.expressions[0].kind = .current_date;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_update_returning_function_dml, schema, &.{}, options),
+    );
+
+    var malformed_delete_returning_function_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "DELETE FROM usage_records WHERE id = 'u1' RETURNING lower(status) AS deleted_status_key",
+    );
+    defer malformed_delete_returning_function_dml.deinit(alloc);
+    if (malformed_delete_returning_function_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.returning_items.expressions.len == 0 or dml.returning_items.expressions[0].argument_items.expressions.len != 1) return error.TestUnexpectedResult;
+                    dml.returning_items.expressions[0].argument_items.expressions[0].kind = .current_date;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_delete_returning_function_dml, schema, &.{}, options),
+    );
+
+    var malformed_merge_returning_expression_dml = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status RETURNING id, lower(status) AS status_key",
+    );
+    defer malformed_merge_returning_expression_dml.deinit(alloc);
+    if (malformed_merge_returning_expression_dml.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .dml => |*dml| {
+                    if (dml.returning_items.expressions.len < 2) return error.TestUnexpectedResult;
+                    dml.returning_items.expressions[1].kind = .current_date;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerWritePlanParsedSqlForDmlTestAlloc(alloc, &malformed_merge_returning_expression_dml, schema, &.{}, options),
     );
 
     var nonrecursive_with_recursive_ast = try tokenized.ParsedSql.initAlloc(
@@ -23874,7 +24402,7 @@ test "sql adapter lower dml rejects stale generated conflict assignment ranges" 
 test "sql adapter lower dml rejects stale generated conflict target helper payload metadata" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_status_key","columns":["status"]}]}
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -23905,6 +24433,7 @@ test "sql adapter lower dml rejects stale generated conflict target helper paylo
             .parse_operand = Hooks.failExpression,
         },
         .generated_target_tokens = target,
+        .generated_target_kind = ast.conflict_target_kind,
         .generated_target_items = &ast.conflict_target_items,
     });
     defer freeConflictTarget(alloc, parsed_target);
@@ -23918,6 +24447,31 @@ test "sql adapter lower dml rejects stale generated conflict target helper paylo
             .parse_expression = Hooks.failExpression,
             .parse_operand = Hooks.failExpression,
         },
+        .generated_target_tokens = target,
+        .generated_target_items = &ast.conflict_target_items,
+    }));
+
+    pos = target.start;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseConflictTargetAlloc(alloc, parsed.items(), &pos, schema, "usage_records", .{
+        .type_context = .{ .alloc = alloc, .schema = schema },
+        .case_expression_hooks = .{
+            .ptr = &hooks_context,
+            .parse_expression = Hooks.failExpression,
+            .parse_operand = Hooks.failExpression,
+        },
+        .generated_target_items = &ast.conflict_target_items,
+    }));
+
+    pos = target.start;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseConflictTargetAlloc(alloc, parsed.items(), &pos, schema, "usage_records", .{
+        .type_context = .{ .alloc = alloc, .schema = schema },
+        .case_expression_hooks = .{
+            .ptr = &hooks_context,
+            .parse_expression = Hooks.failExpression,
+            .parse_operand = Hooks.failExpression,
+        },
+        .generated_target_tokens = target,
+        .generated_target_kind = .constraint,
         .generated_target_items = &ast.conflict_target_items,
     }));
 
@@ -23932,6 +24486,7 @@ test "sql adapter lower dml rejects stale generated conflict target helper paylo
             .parse_operand = Hooks.failExpression,
         },
         .generated_target_tokens = target,
+        .generated_target_kind = stale_ast.conflict_target_kind,
         .generated_target_items = &stale_ast.conflict_target_items,
     }));
 
@@ -23955,6 +24510,7 @@ test "sql adapter lower dml rejects stale generated conflict target helper paylo
             .parse_operand = Hooks.failExpression,
         },
         .generated_target_tokens = named_target,
+        .generated_target_kind = named_ast.conflict_target_kind,
         .generated_target_items = &named_ast.conflict_target_items,
     });
     defer freeConflictTarget(alloc, parsed_named_target);
@@ -23971,6 +24527,7 @@ test "sql adapter lower dml rejects stale generated conflict target helper paylo
             .parse_operand = Hooks.failExpression,
         },
         .generated_target_tokens = named_target,
+        .generated_target_kind = stale_named_ast.conflict_target_kind,
         .generated_target_items = &stale_named_ast.conflict_target_items,
     }));
 
@@ -23983,6 +24540,7 @@ test "sql adapter lower dml rejects stale generated conflict target helper paylo
             .parse_operand = Hooks.failExpression,
         },
         .generated_target_tokens = named_target,
+        .generated_target_kind = named_ast.conflict_target_kind,
         .generated_target_items = &named_ast.conflict_target_items,
         .generated_where_tokens = named_target,
     }));
@@ -24121,8 +24679,10 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         .alloc = alloc,
         .tokens = parsed.items(),
         .schema = schema,
+        .generated_conflict_target_kind = ast.conflict_target_kind,
         .generated_conflict_target_items = &ast.conflict_target_items,
         .generated_conflict_action_tokens = ast.conflict_action_tokens,
+        .generated_conflict_action_kind = ast.conflict_action_kind,
     };
     var pos = conflict.start;
     const lowered = try parseConflictClauseAlloc(
@@ -24142,11 +24702,35 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         &ast.conflict_assignment_items,
         ast.conflict_assignments_tokens,
         ast.conflict_action_tokens,
+        ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     );
     defer freeConflictClause(alloc, lowered);
     try std.testing.expectEqual(conflict.end, pos);
+
+    pos = conflict.start;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseConflictClauseAlloc(
+        alloc,
+        parsed.items(),
+        &pos,
+        &.{},
+        schema,
+        "usage_records",
+        &.{"usage_records"},
+        insert_columns[0..],
+        &.{},
+        .{ .alloc = alloc, .schema = schema },
+        false,
+        parser_context.ParserState.ContextAccessors.conflictTargetParserOptions(&parser_state),
+        parser_context.ParserState.ContextAccessors.conflictUpdateSetAssignmentParserOptions(&parser_state, insert_columns[0..], &.{}),
+        &ast.conflict_assignment_items,
+        ast.conflict_assignments_tokens,
+        ast.conflict_action_tokens,
+        .update,
+        parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
+        parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
+    ));
 
     var stale_target_ast = ast;
     stale_target_ast.conflict_target_items.first_tokens = action;
@@ -24154,8 +24738,10 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         .alloc = alloc,
         .tokens = parsed.items(),
         .schema = schema,
+        .generated_conflict_target_kind = stale_target_ast.conflict_target_kind,
         .generated_conflict_target_items = &stale_target_ast.conflict_target_items,
         .generated_conflict_action_tokens = stale_target_ast.conflict_action_tokens,
+        .generated_conflict_action_kind = stale_target_ast.conflict_action_kind,
     };
     pos = conflict.start;
     try std.testing.expectError(error.UnsupportedSqlShape, parseConflictClauseAlloc(
@@ -24175,6 +24761,7 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         &stale_target_ast.conflict_assignment_items,
         stale_target_ast.conflict_assignments_tokens,
         stale_target_ast.conflict_action_tokens,
+        stale_target_ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_target_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_target_state),
     ));
@@ -24185,8 +24772,10 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         .alloc = alloc,
         .tokens = parsed.items(),
         .schema = schema,
+        .generated_conflict_target_kind = stale_assignment_ast.conflict_target_kind,
         .generated_conflict_target_items = &stale_assignment_ast.conflict_target_items,
         .generated_conflict_action_tokens = stale_assignment_ast.conflict_action_tokens,
+        .generated_conflict_action_kind = stale_assignment_ast.conflict_action_kind,
     };
     pos = conflict.start;
     try std.testing.expectError(error.UnsupportedSqlShape, parseConflictClauseAlloc(
@@ -24206,6 +24795,7 @@ test "sql adapter lower dml rejects stale generated targetless conflict do nothi
         &stale_assignment_ast.conflict_assignment_items,
         stale_assignment_ast.conflict_assignments_tokens,
         stale_assignment_ast.conflict_action_tokens,
+        stale_assignment_ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_assignment_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_assignment_state),
     ));
@@ -24242,8 +24832,10 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         .schema = schema,
         .conflict_existing_qualifiers = &.{"usage_records"},
         .generated_conflict_target_tokens = ast.conflict_target_tokens,
+        .generated_conflict_target_kind = ast.conflict_target_kind,
         .generated_conflict_target_items = &ast.conflict_target_items,
         .generated_conflict_action_tokens = ast.conflict_action_tokens,
+        .generated_conflict_action_kind = ast.conflict_action_kind,
     };
     var pos = conflict.start;
     const lowered = try parseConflictClauseAlloc(
@@ -24263,6 +24855,7 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         &ast.conflict_assignment_items,
         ast.conflict_assignments_tokens,
         ast.conflict_action_tokens,
+        ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     );
@@ -24285,8 +24878,32 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         parser_context.ParserState.ContextAccessors.conflictTargetParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictUpdateSetAssignmentParserOptions(&parser_state, insert_columns[0..], &.{}),
         &ast.conflict_assignment_items,
+        ast.conflict_assignments_tokens,
+        ast.conflict_action_tokens,
+        .nothing,
+        parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
+        parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
+    ));
+
+    pos = conflict.start;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseConflictClauseAlloc(
+        alloc,
+        parsed.items(),
+        &pos,
+        &.{},
+        schema,
+        "usage_records",
+        &.{"usage_records"},
+        insert_columns[0..],
+        &.{},
+        .{ .alloc = alloc, .schema = schema },
+        false,
+        parser_context.ParserState.ContextAccessors.conflictTargetParserOptions(&parser_state),
+        parser_context.ParserState.ContextAccessors.conflictUpdateSetAssignmentParserOptions(&parser_state, insert_columns[0..], &.{}),
+        &ast.conflict_assignment_items,
         null,
         ast.conflict_action_tokens,
+        ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
     ));
@@ -24308,6 +24925,7 @@ test "sql adapter lower dml rejects stale generated conflict update assignment h
         parser_context.ParserState.ContextAccessors.conflictUpdateSetAssignmentParserOptions(&parser_state, insert_columns[0..], &.{}),
         &ast.conflict_assignment_items,
         ast.conflict_assignments_tokens,
+        null,
         null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&parser_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&parser_state),
@@ -24340,6 +24958,7 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         .tokens = parsed_target.items(),
         .schema = schema,
         .generated_conflict_target_tokens = target_ast.conflict_target_tokens,
+        .generated_conflict_target_kind = target_ast.conflict_target_kind,
         .generated_conflict_target_items = &target_ast.conflict_target_items,
         .generated_conflict_target_where_tokens = target_ast.conflict_target_where_tokens,
         .generated_conflict_target_where_expression = &target_ast.conflict_target_where_expression,
@@ -24354,13 +24973,14 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         parser_context.ParserState.ContextAccessors.conflictTargetParserOptions(&target_state),
     );
     defer freeConflictTarget(alloc, parsed_conflict_target);
-    try std.testing.expectEqual(target.end, pos);
+    try std.testing.expectEqual((target_ast.conflict_target_where_tokens orelse return error.TestUnexpectedResult).end, pos);
 
     var missing_items_state = parser_context.ParserState{
         .alloc = alloc,
         .tokens = parsed_target.items(),
         .schema = schema,
         .generated_conflict_target_tokens = target_ast.conflict_target_tokens,
+        .generated_conflict_target_kind = target_ast.conflict_target_kind,
         .generated_conflict_target_where_tokens = target_ast.conflict_target_where_tokens,
         .generated_conflict_target_where_expression = &target_ast.conflict_target_where_expression,
     };
@@ -24378,6 +24998,7 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         .alloc = alloc,
         .tokens = parsed_target.items(),
         .schema = schema,
+        .generated_conflict_target_kind = target_ast.conflict_target_kind,
         .generated_conflict_target_items = &target_ast.conflict_target_items,
         .generated_conflict_target_where_tokens = target_ast.conflict_target_where_tokens,
         .generated_conflict_target_where_expression = &target_ast.conflict_target_where_expression,
@@ -24412,10 +25033,12 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         .schema = schema,
         .conflict_existing_qualifiers = &.{"usage_records"},
         .generated_conflict_target_tokens = action_ast.conflict_target_tokens,
+        .generated_conflict_target_kind = action_ast.conflict_target_kind,
         .generated_conflict_target_items = &action_ast.conflict_target_items,
         .generated_conflict_target_where_tokens = action_ast.conflict_target_where_tokens,
         .generated_conflict_target_where_expression = &action_ast.conflict_target_where_expression,
         .generated_conflict_action_tokens = action_ast.conflict_action_tokens,
+        .generated_conflict_action_kind = action_ast.conflict_action_kind,
         .generated_conflict_action_where_tokens = action_ast.conflict_action_where_tokens,
         .generated_conflict_action_where_expression = &action_ast.conflict_action_where_expression,
     };
@@ -24437,6 +25060,7 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         &action_ast.conflict_assignment_items,
         action_ast.conflict_assignments_tokens,
         action_ast.conflict_action_tokens,
+        action_ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&action_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&action_state),
     );
@@ -24462,6 +25086,7 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         &action_ast.conflict_assignment_items,
         action_ast.conflict_assignments_tokens,
         null,
+        null,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_action_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_action_state),
     ));
@@ -24486,6 +25111,7 @@ test "sql adapter lower dml rejects stale generated conflict predicate parent ho
         &action_ast.conflict_assignment_items,
         action_ast.conflict_assignments_tokens,
         action_ast.conflict_action_tokens,
+        action_ast.conflict_action_kind,
         parser_context.ParserState.ContextAccessors.conflictAssignmentExpressionParserOptions(&stale_action_where_state),
         parser_context.ParserState.ContextAccessors.conflictExpressionDispatchOptions(&stale_action_where_state),
     ));
@@ -25359,6 +25985,211 @@ test "sql adapter lower dml rejects stale generated conflict update assignment r
     );
 }
 
+test "sql adapter lower dml rejects stale generated conflict do nothing action kind metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\"}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT (id) DO NOTHING RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed.items(), ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlConflictActionKind.nothing, ast.conflict_action_kind.?);
+
+    var stale_ast = ast;
+    stale_ast.conflict_action_kind = .update;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+}
+
+test "sql adapter lower dml rejects stale generated conflict do update action kind metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\"}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed.items(), ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlConflictActionKind.update, ast.conflict_action_kind.?);
+
+    var stale_ast = ast;
+    stale_ast.conflict_action_kind = .nothing;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+}
+
+test "sql adapter lower dml rejects stale generated conflict inference target kind metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\"}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT (id) DO UPDATE SET status = excluded.status RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed.items(), ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlConflictTargetKind.inference, ast.conflict_target_kind.?);
+
+    var stale_ast = ast;
+    stale_ast.conflict_target_kind = .constraint;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+}
+
+test "sql adapter lower dml rejects stale generated conflict targetless kind metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\"}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, status) VALUES ('u1', 'ready') ON CONFLICT DO NOTHING RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed.items(), ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlConflictTargetKind.targetless, ast.conflict_target_kind.?);
+
+    var stale_ast = ast;
+    stale_ast.conflict_target_kind = .inference;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+}
+
+test "sql adapter lower dml rejects stale generated conflict named constraint target kind metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"email":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id","email"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"unique_constraints":[{"name":"usage_records_email_key","columns":["email"]}]}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\"}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'ready') ON CONFLICT ON CONSTRAINT usage_records_email_key DO UPDATE SET status = excluded.status RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try insertValuesFromGeneratedDmlAstAlloc(alloc, parsed.items(), ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlConflictTargetKind.constraint, ast.conflict_target_kind.?);
+
+    var stale_ast = ast;
+    stale_ast.conflict_target_kind = .inference;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        insertValuesFromGeneratedDmlAstAlloc(
+            alloc,
+            parsed.items(),
+            stale_ast,
+            schema,
+            &.{},
+            options,
+        ),
+    );
+}
+
 test "sql adapter lower dml rejects stale generated conflict literal assignment rhs expression kind metadata" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -26019,6 +26850,71 @@ test "sql adapter lower dml rejects stale generated merge arm list boundary meta
     );
 }
 
+test "sql adapter lower dml rejects stale generated merge arm matched metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var resolver_ctx = TestPrimaryResolver{ .row_json = "{\"id\":\"u1\",\"status\":\"active\",\"quantity\":1}", .version = 9 };
+    const options = plan_mod.LowerWritePlanOptions{
+        .unique_resolver = resolver_ctx.resolver(),
+        .sync_level = .full_text,
+    };
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN NOT MATCHED THEN INSERT (id, status, quantity) VALUES (source.id, source.status, source.quantity) RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, ast, schema, &.{}, options);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 2), ast.merge_arms.count);
+    try std.testing.expectEqual(@as(usize, 1), ast.merge_arms.matched_count);
+    try std.testing.expectEqual(@as(usize, 1), ast.merge_arms.not_matched_count);
+    try std.testing.expect(ast.merge_arms.items[0].matched);
+    try std.testing.expect(!ast.merge_arms.items[1].matched);
+
+    var stale_matched_arm_ast = ast;
+    const stale_matched_arm_items = try alloc.dupe(generated_parser.GeneratedSqlMergeArmAst, stale_matched_arm_ast.merge_arms.items);
+    defer alloc.free(stale_matched_arm_items);
+    stale_matched_arm_ast.merge_arms.items = stale_matched_arm_items;
+    stale_matched_arm_ast.merge_arms.items[0].matched = false;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_matched_arm_ast, schema, &.{}, options),
+    );
+
+    var stale_not_matched_arm_ast = ast;
+    const stale_not_matched_arm_items = try alloc.dupe(generated_parser.GeneratedSqlMergeArmAst, stale_not_matched_arm_ast.merge_arms.items);
+    defer alloc.free(stale_not_matched_arm_items);
+    stale_not_matched_arm_ast.merge_arms.items = stale_not_matched_arm_items;
+    stale_not_matched_arm_ast.merge_arms.items[1].matched = true;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_not_matched_arm_ast, schema, &.{}, options),
+    );
+
+    var stale_matched_count_ast = ast;
+    stale_matched_count_ast.merge_arms.matched_count = 2;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_matched_count_ast, schema, &.{}, options),
+    );
+
+    var stale_not_matched_count_ast = ast;
+    stale_not_matched_count_ast.merge_arms.not_matched_count = 2;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_not_matched_count_ast, schema, &.{}, options),
+    );
+}
+
 test "sql adapter lower dml rejects stale generated merge arm hook metadata" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -26167,6 +27063,61 @@ test "sql adapter lower dml rejects stale generated merge arm hook metadata" {
         parser_context.ParserState.ContextAccessors.mergeMutationParserOptions(&stale_action_payload_parser_state),
         .{ .ctes = &.{}, .base_table_name = null },
     ));
+}
+
+test "sql adapter lower dml rejects stale generated merge arm action kind metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MERGE INTO usage_records USING usage_records AS source ON usage_records.id = source.id WHEN MATCHED THEN UPDATE SET status = source.status WHEN MATCHED THEN DELETE WHEN NOT MATCHED THEN INSERT (id, status, quantity) VALUES (source.id, source.status, source.quantity) RETURNING id",
+    );
+    defer parsed.deinit(alloc);
+    const ast = switch ((parsed.generated_statement orelse return error.TestUnexpectedResult).ast orelse return error.TestUnexpectedResult) {
+        .dml => |generated_ast| generated_ast,
+        else => return error.TestUnexpectedResult,
+    };
+    var lowered = try mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, ast, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 3), ast.merge_arms.count);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlMergeActionKind.update, ast.merge_arms.items[0].action_kind);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlMergeActionKind.delete, ast.merge_arms.items[1].action_kind);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlMergeActionKind.insert, ast.merge_arms.items[2].action_kind);
+
+    var stale_update_ast = ast;
+    const stale_update_items = try alloc.dupe(generated_parser.GeneratedSqlMergeArmAst, stale_update_ast.merge_arms.items);
+    defer alloc.free(stale_update_items);
+    stale_update_ast.merge_arms.items = stale_update_items;
+    stale_update_ast.merge_arms.items[0].action_kind = .delete;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_update_ast, schema, &.{}, .{}),
+    );
+
+    var stale_delete_ast = ast;
+    const stale_delete_items = try alloc.dupe(generated_parser.GeneratedSqlMergeArmAst, stale_delete_ast.merge_arms.items);
+    defer alloc.free(stale_delete_items);
+    stale_delete_ast.merge_arms.items = stale_delete_items;
+    stale_delete_ast.merge_arms.items[1].action_kind = .update;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_delete_ast, schema, &.{}, .{}),
+    );
+
+    var stale_insert_ast = ast;
+    const stale_insert_items = try alloc.dupe(generated_parser.GeneratedSqlMergeArmAst, stale_insert_ast.merge_arms.items);
+    defer alloc.free(stale_insert_items);
+    stale_insert_ast.merge_arms.items = stale_insert_items;
+    stale_insert_ast.merge_arms.items[2].action_kind = .do_nothing;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(alloc, &parsed, stale_insert_ast, schema, &.{}, .{}),
+    );
 }
 
 test "sql adapter lower dml rejects stale generated merge bodyless action hook payload metadata" {
@@ -27404,14 +28355,23 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     defer runtime_schema.freeSchema(alloc, schema);
     var catalog = corpus.AppParitySourceSchemaCatalog.init("docs", schema_json);
 
-    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
-        alloc,
+    const cases = [_][]const u8{
         "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')",
-        schema,
-        &.{},
-        .{},
-        catalog.iface(),
-    ));
+        "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'",
+        "DELETE FROM docs WHERE _id = 'doc:a'",
+        "TRUNCATE docs",
+        "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE",
+    };
+    for (cases) |sql| {
+        try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        ));
+    }
 }
 
 test "sql adapter lower dml detects dotted path conflicts" {
@@ -32351,9 +33311,10 @@ test "sql adapter lower dml lowers mutation source pagination fetch forms" {
         .owner_id = "worker-limit-all",
         .txn_id = txn_id,
     };
+    const update_fetch_sql = "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET 1 ROW FETCH FIRST ROW ONLY FOR UPDATE RETURNING id";
     var mutation = try lowerUpdateMutationSourceForTestAlloc(
         alloc,
-        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC OFFSET 1 ROW FETCH FIRST ROW ONLY FOR UPDATE RETURNING id",
+        update_fetch_sql,
         schema,
         &.{},
         claim,
@@ -32362,9 +33323,26 @@ test "sql adapter lower dml lowers mutation source pagination fetch forms" {
     try std.testing.expectEqual(@as(u32, 1), mutation.mutation.req.source.limit.?);
     try std.testing.expectEqual(@as(u32, 1), mutation.mutation.req.source.offset);
 
+    var generated_mutation = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        update_fetch_sql,
+        schema,
+        &.{},
+        .{ .row_claim = claim },
+    );
+    defer generated_mutation.deinit(alloc);
+    switch (generated_mutation) {
+        .update_source => |source| {
+            try std.testing.expectEqual(@as(u32, 1), source.mutation.req.source.limit.?);
+            try std.testing.expectEqual(@as(u32, 1), source.mutation.req.source.offset);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const update_limit_sql = "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC LIMIT +5 OFFSET +2 ROWS FOR UPDATE RETURNING id";
     var plus_limit = try lowerUpdateMutationSourceForTestAlloc(
         alloc,
-        "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' ORDER BY id ASC LIMIT +5 OFFSET +2 ROWS FOR UPDATE RETURNING id",
+        update_limit_sql,
         schema,
         &.{},
         claim,
@@ -32373,9 +33351,26 @@ test "sql adapter lower dml lowers mutation source pagination fetch forms" {
     try std.testing.expectEqual(@as(u32, 5), plus_limit.mutation.req.source.limit.?);
     try std.testing.expectEqual(@as(u32, 2), plus_limit.mutation.req.source.offset);
 
+    var generated_plus_limit = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        update_limit_sql,
+        schema,
+        &.{},
+        .{ .row_claim = claim },
+    );
+    defer generated_plus_limit.deinit(alloc);
+    switch (generated_plus_limit) {
+        .update_source => |source| {
+            try std.testing.expectEqual(@as(u32, 5), source.mutation.req.source.limit.?);
+            try std.testing.expectEqual(@as(u32, 2), source.mutation.req.source.offset);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const delete_fetch_sql = "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id ASC OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id";
     var plus_fetch = try lowerDeleteMutationSourceForTestAlloc(
         alloc,
-        "DELETE FROM usage_records WHERE status = 'queued' ORDER BY id ASC OFFSET +2 ROWS FETCH NEXT +3 ROWS ONLY FOR UPDATE RETURNING id",
+        delete_fetch_sql,
         schema,
         &.{},
         claim,
@@ -32383,6 +33378,22 @@ test "sql adapter lower dml lowers mutation source pagination fetch forms" {
     defer plus_fetch.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 3), plus_fetch.mutation.req.source.limit.?);
     try std.testing.expectEqual(@as(u32, 2), plus_fetch.mutation.req.source.offset);
+
+    var generated_plus_fetch = try lowerGeneratedDmlWritePlanForDmlTestAlloc(
+        alloc,
+        delete_fetch_sql,
+        schema,
+        &.{},
+        .{ .row_claim = claim },
+    );
+    defer generated_plus_fetch.deinit(alloc);
+    switch (generated_plus_fetch) {
+        .delete_source => |source| {
+            try std.testing.expectEqual(@as(u32, 3), source.mutation.req.source.limit.?);
+            try std.testing.expectEqual(@as(u32, 2), source.mutation.req.source.offset);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lower dml lowers temporal portion mutation sources" {

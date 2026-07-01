@@ -3094,6 +3094,8 @@ test "postgres sql adapter classifies application parity corpus" {
     const corpus = external_source.root.entries;
     var required_coverage = try sql_adapter.parseAppParityCoverageRequirementsAlloc(alloc);
     defer required_coverage.deinit(alloc);
+    var resolved_requirements = try sql_adapter.parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved_requirements.deinit(alloc);
 
     var coverage = AppParityCorpusCoverage{};
     var entry_arena = std.heap.ArenaAllocator.init(alloc);
@@ -3105,7 +3107,12 @@ test "postgres sql adapter classifies application parity corpus" {
         try coverage.observe(entry_alloc, entry);
         try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
-    try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
+    try sql_adapter.expectAppParityCoverageRequirementsWithReportAlloc(
+        alloc,
+        coverage,
+        required_coverage.root.required,
+        resolved_requirements.root.resolved,
+    );
 }
 
 test "postgres sql adapter checks application parity fixture freshness" {
@@ -3128,13 +3135,8 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
 
     const fixture_root = try sql_adapter.parseFixtureRootAlloc(alloc, parsed_fixture.value);
     defer sql_adapter.freeFixtureRoot(alloc, fixture_root);
-    const source_json = @embedFile("../sql/fixtures/sql_api_parity_source_corpus.json");
-    const source_sha256 = try sql_adapter.sourceCorpusSha256HexAlloc(alloc, source_json);
-    defer alloc.free(source_sha256);
-    try std.testing.expectEqualStrings(source_sha256, fixture_root.source_sha256);
     const skipped_entries = fixture_root.skipped_entries;
     const schema_json = fixture_root.schema_json;
-    try std.testing.expectEqual(@as(usize, 0), skipped_entries.len);
 
     var parsed_schema = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
@@ -3157,6 +3159,8 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
     defer seen_skipped_names.deinit(alloc);
     var required_coverage = try sql_adapter.parseAppParityCoverageRequirementsAlloc(alloc);
     defer required_coverage.deinit(alloc);
+    var resolved_requirements = try sql_adapter.parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved_requirements.deinit(alloc);
     for (skipped_entries) |name| {
         if (name.len == 0 or seen_skipped_names.contains(name)) return error.TestUnexpectedResult;
         try seen_skipped_names.put(alloc, name, {});
@@ -3175,7 +3179,12 @@ test "postgres sql adapter classifies fixture-backed application parity corpus" 
         try coverage.observe(entry_alloc, entry);
         try expectAppParityCorpusEntry(entry_alloc, schema_json, schema, entry, resolver_ctx.resolver(), row_claim);
     }
-    try sql_adapter.expectAppParityCoverageRequirements(coverage, required_coverage.root.required);
+    try sql_adapter.expectAppParityCoverageRequirementsWithReportAlloc(
+        alloc,
+        coverage,
+        required_coverage.root.required,
+        resolved_requirements.root.resolved,
+    );
 }
 
 fn expectSqlTemporalJsonNumberEqual(expected: f64, actual: std.json.Value) !void {

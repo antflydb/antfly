@@ -1776,6 +1776,59 @@ test "db transactions row claims block transactional and direct mutations until 
     try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
 }
 
+test "db transactions row claims prevent double claim until resolution" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"base\"}" }},
+        .timestamp_ns = 1_000,
+    });
+
+    const first_txn = try db.beginTransaction(2_000);
+    try db.claimRowsForTransaction(first_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:first",
+        .txn_id = first_txn,
+    });
+
+    const second_txn = try db.beginTransaction(2_001);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.claimRowsForTransaction(second_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:second",
+        .txn_id = second_txn,
+    }));
+
+    try db.abortTransaction(first_txn, 2_010);
+    try db.claimRowsForTransaction(second_txn, &.{"doc:claim"}, .{
+        .mode = .for_update,
+        .owner_id = "session:second",
+        .txn_id = second_txn,
+    });
+
+    const blocked_txn = try db.beginTransaction(2_011);
+    try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"blocked\"}" }},
+    }));
+
+    try db.commitTransaction(second_txn, 2_020);
+    try db.writeTransaction(blocked_txn, .{
+        .writes = &.{.{ .key = "doc:claim", .value = "{\"title\":\"updated\"}" }},
+    });
+    try db.commitTransaction(blocked_txn, 2_021);
+
+    const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
+}
+
 test "db transactions row claim lease expiry aborts stale owner and lets next claimer proceed" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -1825,6 +1878,109 @@ test "db transactions row claim lease expiry aborts stale owner and lets next cl
     try db.commitTransaction(blocked_txn, 2_011);
 
     const raw = (try db.get(alloc, "doc:claim")) orelse return error.TestExpectedEqual;
+    defer alloc.free(raw);
+    try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
+}
+
+test "db transactions row claim survives reopen and expires without mixed state" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const live_txn = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        try setup_db.batch(.{
+            .writes = &.{.{ .key = "doc:claim_reopen", .value = "{\"title\":\"base\"}" }},
+            .timestamp_ns = 1_000,
+        });
+
+        const txn_id = try setup_db.beginTransaction(2_000);
+        try setup_db.claimRowsForTransaction(txn_id, &.{"doc:claim_reopen"}, .{
+            .mode = .for_update,
+            .owner_id = "session:reopen-live",
+            .lease_ms = 60_000,
+            .txn_id = txn_id,
+        });
+        break :blk txn_id;
+    };
+
+    {
+        var reopened_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened_db.close();
+
+        try std.testing.expectEqual(transactions_mod.TxnStatus.pending, try reopened_db.getTransactionStatus(live_txn));
+
+        const competing_txn = try reopened_db.beginTransaction(2_001);
+        try std.testing.expectError(transactions_mod.TxnError.IntentConflict, reopened_db.claimRowsForTransaction(competing_txn, &.{"doc:claim_reopen"}, .{
+            .mode = .for_update,
+            .owner_id = "session:competing",
+            .txn_id = competing_txn,
+        }));
+        try std.testing.expectError(transactions_mod.TxnError.IntentConflict, reopened_db.batch(.{
+            .writes = &.{.{ .key = "doc:claim_reopen", .value = "{\"title\":\"direct-blocked\"}" }},
+            .timestamp_ns = 2_002,
+        }));
+
+        const raw = (try reopened_db.get(alloc, "doc:claim_reopen")) orelse return error.TestExpectedEqual;
+        defer alloc.free(raw);
+        try std.testing.expectEqualStrings("{\"title\":\"base\"}", raw);
+
+        try reopened_db.abortTransaction(live_txn, 2_010);
+    }
+
+    const stale_txn = blk: {
+        var setup_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer setup_db.close();
+
+        const txn_id = try setup_db.beginTransaction(2_020);
+        try setup_db.claimRowsForTransaction(txn_id, &.{"doc:claim_reopen"}, .{
+            .mode = .for_update,
+            .owner_id = "session:reopen-stale",
+            .lease_ms = 1,
+            .txn_id = txn_id,
+        });
+        break :blk txn_id;
+    };
+
+    platform.time.sleepMs(10);
+
+    {
+        var reopened_db = try DB.open(alloc, std.mem.span(path), .{});
+        defer reopened_db.close();
+
+        const next_txn = try reopened_db.beginTransaction(3_000);
+        try reopened_db.claimRowsForTransaction(next_txn, &.{"doc:claim_reopen"}, .{
+            .mode = .for_update,
+            .owner_id = "session:reopen-next",
+            .txn_id = next_txn,
+        });
+
+        try std.testing.expectEqual(transactions_mod.TxnStatus.aborted, try reopened_db.getTransactionStatus(stale_txn));
+        try std.testing.expectError(transactions_mod.TxnError.DecisionConflict, reopened_db.writeTransaction(stale_txn, .{
+            .writes = &.{.{ .key = "doc:claim_reopen", .value = "{\"title\":\"stale\"}" }},
+        }));
+
+        const blocked_txn = try reopened_db.beginTransaction(3_001);
+        try std.testing.expectError(transactions_mod.TxnError.IntentConflict, reopened_db.writeTransaction(blocked_txn, .{
+            .writes = &.{.{ .key = "doc:claim_reopen", .value = "{\"title\":\"blocked\"}" }},
+        }));
+
+        try reopened_db.commitTransaction(next_txn, 3_010);
+        try reopened_db.writeTransaction(blocked_txn, .{
+            .writes = &.{.{ .key = "doc:claim_reopen", .value = "{\"title\":\"updated\"}" }},
+        });
+        try reopened_db.commitTransaction(blocked_txn, 3_011);
+    }
+
+    var final_db = try DB.open(alloc, std.mem.span(path), .{});
+    defer final_db.close();
+
+    const raw = (try final_db.get(alloc, "doc:claim_reopen")) orelse return error.TestExpectedEqual;
     defer alloc.free(raw);
     try std.testing.expectEqualStrings("{\"title\":\"updated\"}", raw);
 }
@@ -2051,6 +2207,26 @@ test "db transactions recoverTransactions auto-aborts stale pending intents" {
     try std.testing.expect(raw == null);
 }
 
+const test_txn_records_prefix = "\x00\x00__txn_records__:";
+
+fn committedTxnRecordKey(txn_id: transactions_mod.TxnId) [test_txn_records_prefix.len + 16]u8 {
+    var key: [test_txn_records_prefix.len + 16]u8 = undefined;
+    @memcpy(key[0..test_txn_records_prefix.len], test_txn_records_prefix);
+    @memcpy(key[test_txn_records_prefix.len..], &txn_id);
+    return key;
+}
+
+fn committedTxnRecordValueAlloc(alloc: std.mem.Allocator, begin_timestamp: u64, commit_version: u64) ![]u8 {
+    const txn_record_v1_size = 33;
+    const value = try alloc.alloc(u8, txn_record_v1_size);
+    value[0] = @intFromEnum(transactions_mod.TxnStatus.committed);
+    std.mem.writeInt(u64, value[1..9], begin_timestamp, .little);
+    std.mem.writeInt(u64, value[9..17], commit_version, .little);
+    std.mem.writeInt(u64, value[17..25], begin_timestamp, .little);
+    std.mem.writeInt(u64, value[25..33], commit_version, .little);
+    return value;
+}
+
 test "db transactions participant recovery preserves finalized transaction until all participants resolve" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -2086,6 +2262,114 @@ test "db transactions participant recovery preserves finalized transaction until
     const cleaned = try db.recoverTransactions(3_000, 4_000);
     try std.testing.expectEqual(@as(u64, 1), cleaned.cleaned_records);
     try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
+}
+
+test "db transactions recovery resolves committed mutation source row claims after reopen" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try schema_api_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_api_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+
+    const txn_id: transactions_mod.TxnId = .{ 0xc0, 0xc1, 0xc2, 0xc3, 0xc4, 0xc5, 0xc6, 0xc7, 0xc8, 0xc9, 0xca, 0xcb, 0xcc, 0xcd, 0xce, 0xcf };
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\"}" }},
+            .timestamp_ns = 1_000,
+        });
+
+        _ = try db.beginTransactionWithId(txn_id, 2_000);
+        const predicates = [_]schema_mod.RelationalCheck{.{
+            .name = "",
+            .field = "status",
+            .op = .eq,
+            .value_json = "\"ready\"",
+        }};
+        const operations = [_]types.TransformOp{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"done\"",
+        }};
+        var staged = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+            .kind = .update,
+            .source = .{
+                .predicates = predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:committed-orphan",
+                    .lease_ms = 60_000,
+                    .txn_id = txn_id,
+                },
+            },
+            .operations = operations[0..],
+        });
+        defer staged.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 1), staged.matched);
+        try std.testing.expectEqual(@as(u32, 1), staged.staged);
+
+        const record_key = committedTxnRecordKey(txn_id);
+        const record_value = try committedTxnRecordValueAlloc(alloc, 2_000, 2_100);
+        defer alloc.free(record_value);
+        try db.core.putStoreBatch(&.{.{ .key = &record_key, .value = record_value }}, &.{});
+    }
+
+    {
+        var db = try DB.open(alloc, std.mem.span(path), .{});
+        defer db.close();
+        try db.setSchema(runtime_schema);
+
+        try std.testing.expectEqual(transactions_mod.TxnStatus.committed, try db.getTransactionStatus(txn_id));
+        try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.batch(.{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"lost\"}" }},
+            .timestamp_ns = 2_200,
+        }));
+
+        const contender_txn = try db.beginTransaction(2_300);
+        try std.testing.expectError(transactions_mod.TxnError.IntentConflict, db.claimRowsForTransaction(contender_txn, &.{"row:a"}, .{
+            .mode = .for_update,
+            .owner_id = "session:contender",
+            .lease_ms = 60_000,
+            .txn_id = contender_txn,
+        }));
+        try db.abortTransaction(contender_txn, 3_100);
+
+        const stats = try db.recoverTransactions(3_000, 4_000);
+        try std.testing.expectEqual(@as(u64, 1), stats.resolved_finalized);
+        try std.testing.expectEqual(@as(u64, 1), stats.cleaned_records);
+        try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
+
+        var final_row = (try db.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+        defer final_row.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"done\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"lost\"") == null);
+
+        const post_recovery_txn = try db.beginTransaction(4_100);
+        try db.claimRowsForTransaction(post_recovery_txn, &.{"row:a"}, .{
+            .mode = .for_update,
+            .owner_id = "session:post-recovery",
+            .lease_ms = 60_000,
+            .txn_id = post_recovery_txn,
+        });
+        try db.abortTransaction(post_recovery_txn, 4_101);
+
+        const again = try db.recoverTransactions(3_000, 4_200);
+        try std.testing.expectEqual(@as(u64, 0), again.resolved_finalized);
+        try std.testing.expectEqual(@as(u64, 0), again.cleaned_records);
+    }
 }
 
 test "db transactions recovery runtime resolves participants and unblocks cleanup" {

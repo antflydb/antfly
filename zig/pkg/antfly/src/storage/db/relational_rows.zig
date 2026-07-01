@@ -17114,6 +17114,121 @@ test "relational rows mutation source plans across injected owner ranges" {
     try std.testing.expectError(error.InvalidQueryRequest, db.planRelationalRowsMutationSourceAcrossRangesAlloc(alloc, runtime_schema, embedded_range_req, ranges[0..]));
 }
 
+test "relational rows mutation source skip locked across ranges fills from later candidates" {
+    const alloc = std.testing.allocator;
+    const table_schema_api = @import("../../schema/mod.zig");
+    const DB = @import("mod.zig").DB;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"rank":{"type":"numeric"}},"required":["id","status","rank"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try table_schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try table_schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer schema_mod.freeSchema(alloc, runtime_schema);
+    try db.setSchema(runtime_schema);
+
+    const row_jsons = [_][]const u8{
+        "{\"id\":\"a\",\"status\":\"ready\",\"rank\":1}",
+        "{\"id\":\"b\",\"status\":\"ready\",\"rank\":2}",
+        "{\"id\":\"c\",\"status\":\"ready\",\"rank\":3}",
+    };
+    var row_keys: [row_jsons.len][]u8 = undefined;
+    for (row_jsons, 0..) |row_json, i| {
+        row_keys[i] = try physicalPrimaryKeyFromRowJsonAlloc(alloc, runtime_schema, row_json);
+    }
+    defer {
+        for (row_keys) |key| alloc.free(key);
+    }
+
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = row_keys[0], .value = row_jsons[0] },
+            .{ .key = row_keys[1], .value = row_jsons[1] },
+            .{ .key = row_keys[2], .value = row_jsons[2] },
+        },
+        .timestamp_ns = 1_000,
+    });
+
+    const locker_txn = try db.beginTransaction(2_000);
+    defer db.abortTransaction(locker_txn, 2_001) catch {};
+    try db.claimRowsForTransaction(locker_txn, &.{row_keys[0]}, .{
+        .mode = .for_update,
+        .owner_id = "session:range-locker",
+        .txn_id = locker_txn,
+    });
+
+    const mutation_txn = try db.beginTransaction(2_010);
+    const predicates = [_]schema_mod.RelationalCheck{.{
+        .name = "",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"ready\"",
+    }};
+    const order_by = [_]types.RelationalRowsQueryOrder{.{
+        .field = "rank",
+        .direction = .asc,
+    }};
+    const operations = [_]types.TransformOp{.{
+        .op = .set,
+        .path = "status",
+        .value_json = "\"claimed\"",
+    }};
+    const returning = [_][]const u8{ "id", "status", "rank" };
+    const ranges = [_]types.RelationalRowsDocKeyRange{
+        .{ .start = row_keys[0], .end = row_keys[1] },
+        .{ .start = row_keys[1], .end = "" },
+    };
+    const req: types.RelationalRowsMutationSourceRequest = .{
+        .kind = .update,
+        .source = .{
+            .predicates = predicates[0..],
+            .order_by = order_by[0..],
+            .row_claim = .{
+                .mode = .for_update,
+                .skip_locked = true,
+                .owner_id = "session:ranged-skip-locked",
+                .txn_id = mutation_txn,
+            },
+            .limit = 2,
+        },
+        .operations = operations[0..],
+        .returning = returning[0..],
+    };
+
+    var plan = try db.planRelationalRowsMutationSourceAcrossRangesAlloc(alloc, runtime_schema, req, ranges[0..]);
+    defer plan.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), plan.matched);
+    try std.testing.expectEqual(@as(usize, 3), plan.candidates.len);
+
+    var result = try db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, runtime_schema, req, plan.matched, plan.candidates);
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), result.matched);
+    try std.testing.expectEqual(@as(u32, 2), result.staged);
+    try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"b\",\"status\":\"claimed\",\"rank\":2}", result.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"c\",\"status\":\"claimed\",\"rank\":3}", result.returning_rows[1]);
+
+    try db.commitTransaction(mutation_txn, 2_020);
+
+    var locked = (try db.lookup(alloc, row_keys[0], .{})).?;
+    defer locked.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, locked.json, "\"status\":\"ready\"") != null);
+    var claimed_b = (try db.lookup(alloc, row_keys[1], .{})).?;
+    defer claimed_b.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, claimed_b.json, "\"status\":\"claimed\"") != null);
+    var claimed_c = (try db.lookup(alloc, row_keys[2], .{})).?;
+    defer claimed_c.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, claimed_c.json, "\"status\":\"claimed\"") != null);
+}
+
 test "relational rows mutation source stages primary key identity rewrites" {
     const alloc = std.testing.allocator;
     const table_schema_api = @import("../../schema/mod.zig");

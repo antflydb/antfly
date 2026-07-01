@@ -17,6 +17,9 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
+const expr_type = @import("expr_type.zig");
+const expr_operator = @import("expr_operator.zig");
+const expr_token = @import("expr_token.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
@@ -1306,15 +1309,15 @@ pub fn runtimeSchemaFromCreateTablePlanAlloc(
     alloc: std.mem.Allocator,
     plan: CreateTablePlan,
 ) !runtime_schema.TableSchema {
-    try lower_expr.validateRelationalColumnCatalog(plan.columns);
+    try expr_type.validateRelationalColumnCatalog(plan.columns);
     try binder.validateRelationalPeriodCatalog(plan.columns, plan.periods);
     if (plan.primary_key) |primary_key| {
-        try lower_expr.validatePrimaryKeyColumns(plan.columns, primary_key);
+        try expr_type.validatePrimaryKeyColumns(plan.columns, primary_key);
         try binder.validatePrimaryKeyTemporalCatalog(plan.periods, primary_key);
     }
-    try lower_expr.validateUniqueConstraintCatalog(plan.columns, plan.periods, plan.unique_constraints);
-    try lower_expr.validateForeignKeyCatalog(plan.columns, plan.periods, plan.foreign_keys);
-    try lower_expr.validateRelationalCheckCatalog(plan.columns, plan.checks);
+    try expr_type.validateUniqueConstraintCatalog(plan.columns, plan.periods, plan.unique_constraints);
+    try expr_type.validateForeignKeyCatalog(plan.columns, plan.periods, plan.foreign_keys);
+    try expr_type.validateRelationalCheckCatalog(plan.columns, plan.checks);
     for (plan.columns) |column| {
         if (column.default_value) |default_value| try value_mod.validateDefaultValueForColumnAlloc(alloc, column, default_value);
         if (column.on_update_value) |on_update_value| try value_mod.validateDefaultValueForColumnAlloc(alloc, column, on_update_value);
@@ -5458,26 +5461,45 @@ fn generatedAlterTableUsesRuntimeBoundary(tokens: []const grammar.Token, ast: ge
     const end = generatedStatementEnd(tokens, ast.statement_span) orelse return false;
     const operation_range = ast.alter_table_operation_tokens orelse return false;
     if (!generatedRangeWithinStatement(operation_range, end) or operation_range.start >= operation_range.end) return false;
-    var depth: usize = 0;
-    var segment_start = operation_range.start;
-    var index = operation_range.start;
-    while (index <= operation_range.end) : (index += 1) {
-        if (index == operation_range.end or (depth == 0 and tokens[index].kind == .comma)) {
-            if (segment_start == index) return false;
-            if (!generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens, segment_start, index)) return false;
-            segment_start = index + 1;
-            continue;
-        }
-        switch (tokens[index].kind) {
-            .lparen => depth += 1,
-            .rparen => {
-                if (depth == 0) return false;
-                depth -= 1;
-            },
-            else => {},
+    validateGeneratedAlterTableOperationItems(tokens, operation_range, &ast.alter_table_operation_items) catch return false;
+    return true;
+}
+
+fn validateGeneratedAlterTableOperationItems(
+    tokens: []const grammar.Token,
+    operation_range: generated_parser.GeneratedSqlTokenRange,
+    items: *const generated_parser.GeneratedSqlListAst,
+) !void {
+    if (operation_range.end > tokens.len or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
+    if (items.count == 0 or items.items.len != items.count) return error.UnsupportedSqlShape;
+    if (items.expression_items.len != 0 or
+        items.alias_items.len != 0 or
+        items.alias_name_items.len != 0 or
+        items.direction_items.len != 0 or
+        items.directions.len != 0 or
+        items.order_using_operator_items.len != 0 or
+        items.nulls_order_items.len != 0 or
+        items.nulls_orders.len != 0 or
+        items.expressions.len != 0)
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    if (!std.meta.eql(items.first_tokens orelse return error.UnsupportedSqlShape, items.items[0])) return error.UnsupportedSqlShape;
+    if (!std.meta.eql(items.last_tokens orelse return error.UnsupportedSqlShape, items.items[items.items.len - 1])) return error.UnsupportedSqlShape;
+
+    var expected_start = operation_range.start;
+    for (items.items, 0..) |item, item_index| {
+        if (item.start != expected_start or item.start >= item.end or item.end > operation_range.end) return error.UnsupportedSqlShape;
+        if (!generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens, item.start, item.end)) return error.UnsupportedSqlShape;
+        if (item_index + 1 < items.items.len) {
+            if (item.end >= operation_range.end or tokens[item.end].kind != .comma) return error.UnsupportedSqlShape;
+            expected_start = item.end + 1;
+        } else {
+            expected_start = item.end;
         }
     }
-    return depth == 0 and segment_start == operation_range.end + 1;
+    if (expected_start != operation_range.end) return error.UnsupportedSqlShape;
 }
 
 fn generatedAlterTableOperationSegmentUsesRuntimeBoundary(tokens: []const grammar.Token, start: usize, end: usize) bool {
@@ -5557,7 +5579,10 @@ fn generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens: []const grammar.Tok
     const operation_range = ast.alter_table_operation_tokens orelse return false;
     if (!generatedRangeWithinStatement(operation_range, end) or operation_range.start >= operation_range.end) return false;
     if (generatedRangeHasKind(tokens, operation_range, .comma)) return false;
-    return generatedRangeMatchesKeywords(tokens, operation_range, &.{ "enable", "row", "level", "security" }) or
+    const enabled = ast.alter_table_row_security_enabled orelse return false;
+    return if (enabled)
+        generatedRangeMatchesKeywords(tokens, operation_range, &.{ "enable", "row", "level", "security" })
+    else
         generatedRangeMatchesKeywords(tokens, operation_range, &.{ "disable", "row", "level", "security" });
 }
 
@@ -6747,6 +6772,7 @@ fn alterTablePlanFromGeneratedAstAlloc(
 
     const operation_range = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
     if (operation_range.start != index or operation_range.end != end or operation_range.start >= operation_range.end) return error.UnsupportedSqlShape;
+    try validateGeneratedAlterTableOperationItems(tokens, operation_range, &ast.alter_table_operation_items);
 
     const alter_tokens = tokens[1..end];
     var state = parser_context.ParserState{
@@ -6809,6 +6835,7 @@ fn rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(
     const generated_table_name = try generatedSqlObjectIdentifierAlloc(alloc, tokens, table_range);
     defer alloc.free(@constCast(generated_table_name));
     if (!std.ascii.eqlIgnoreCase(generated_table_name, plan.table_name)) return error.UnsupportedSqlShape;
+    if (ast.alter_table_row_security_enabled != plan.enabled) return error.UnsupportedSqlShape;
     return plan;
 }
 
@@ -8317,7 +8344,7 @@ pub fn parseRowSecurityPolicyExpressionBindingPredicateAlloc(
     const lhs = try parseRowSecurityPolicyRoutineOperandAlloc(alloc, tokens, pos, options);
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
-    const op = try lower_expr.parseComparisonOp(tokens, pos);
+    const op = try expr_operator.parseComparisonOp(tokens, pos);
     const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
     var rhs_transferred = false;
     errdefer {
@@ -9194,7 +9221,7 @@ pub fn parseCreateIndexPlanAlloc(
     if (columns.items.len == 0 and expressions.items.len == 0 and generated_expression == null and
         method != .antfly_algebraic and method != .antfly_graph_metric and method != .antfly_hybrid) return error.UnsupportedSqlShape;
     try grammar.validateSqlIdentifierListUnique(columns.items);
-    try lower_expr.validateSqlUniqueExpressionListUnique(expressions.items);
+    try expr_type.validateSqlUniqueExpressionListUnique(expressions.items);
 
     if (ddlIndexMethodIsDerived(method)) {
         if (unique or expressions.items.len != 0 or generated_expression != null or without_overlaps_period != null) return error.UnsupportedSqlShape;
@@ -9324,7 +9351,7 @@ fn parseDerivedIndexFieldPathAlloc(
 ) ![]const u8 {
     const cursor = parser.Cursor.init(tokens, pos);
     const wrapper_count = grammar.consumeDdlIndexExpressionWrappers(tokens, pos);
-    const field = if (cursor.peekFunctionCallIf(grammar.sqlKeywordIsJsonExtractPathFunction))
+    const field = if (cursor.peekFunctionCallIf(expr_token.sqlKeywordIsJsonExtractPathFunction))
         try parseDerivedIndexJsonExtractPathFunctionAlloc(alloc, tokens, pos)
     else
         try parseDerivedIndexIdentifierOrJsonOperatorPathAlloc(alloc, tokens, pos);
@@ -9383,7 +9410,7 @@ fn parseDerivedIndexJsonExtractPathFunctionAlloc(
     pos: *usize,
 ) ![]const u8 {
     const cursor = parser.Cursor.init(tokens, pos);
-    _ = cursor.matchIdentifierIf(grammar.sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
+    _ = cursor.matchIdentifierIf(expr_token.sqlKeywordIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
     try cursor.expectToken(.lparen);
     const root = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
     defer alloc.free(root);
@@ -11464,7 +11491,7 @@ fn parseDdlCheckExpressionPredicateFactorAlternatives(
         return;
     }
 
-    if (lower_expr.parenthesizedPredicateGroupCanStartAt(tokens, pos.*)) {
+    if (expr_token.parenthesizedPredicateGroupCanStartAt(tokens, pos.*)) {
         try cursor.expectToken(.lparen);
         const groups = try parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, options);
         var groups_transferred = false;
@@ -11494,7 +11521,7 @@ fn parseDdlRoutineExpressionConditionAlternativesAlloc(
     var lhs_transferred = false;
     errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
 
-    const op = try lower_expr.parseComparisonOp(tokens, pos);
+    const op = try expr_operator.parseComparisonOp(tokens, pos);
     const rhs = switch (op) {
         .is_null, .is_not_null => &.{},
         else => blk: {
@@ -11546,7 +11573,7 @@ fn parseDdlCheckNegatedPredicateGroupsAlloc(
     options: DdlExpressionOptions,
 ) anyerror![]db_mod.types.RelationalRowsExpressionPredicateGroup {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (lower_expr.parenthesizedPredicateGroupCanStartAt(tokens, pos.*)) {
+    if (expr_token.parenthesizedPredicateGroupCanStartAt(tokens, pos.*)) {
         try cursor.expectToken(.lparen);
         const groups = try parseDdlCheckExpressionPredicateGroupsAlloc(alloc, tokens, pos, options);
         errdefer {
@@ -11610,7 +11637,7 @@ pub fn parseDomainCheckConstraintAlloc(
     try cursor.expectToken(.lparen);
     const value_token = cursor.matchToken(.identifier) orelse return error.UnsupportedSqlShape;
     if (!std.ascii.eqlIgnoreCase(value_token.text, "value")) return error.UnsupportedSqlShape;
-    const op = try lower_expr.parseComparisonOp(tokens, pos);
+    const op = try expr_operator.parseComparisonOp(tokens, pos);
     const value_json = if (op == .is_null or op == .is_not_null)
         null
     else
@@ -12454,6 +12481,13 @@ fn generatedUnsupportedExpectedReason(kind: generated_parser.GeneratedSqlUnsuppo
         .alter_subscription => .alter_subscription_not_planned_by_generated_parser,
         .alter_system => .alter_system_not_planned_by_generated_parser,
         .alter_statistics => .alter_statistics_not_planned_by_generated_parser,
+        .alter_table_access_method => .alter_table_access_method_not_planned_by_generated_parser,
+        .alter_table_cluster => .alter_table_cluster_not_planned_by_generated_parser,
+        .alter_table_owner => .alter_table_owner_not_planned_by_generated_parser,
+        .alter_table_persistence => .alter_table_persistence_not_planned_by_generated_parser,
+        .alter_table_storage_parameters => .alter_table_storage_parameters_not_planned_by_generated_parser,
+        .alter_table_tablespace => .alter_table_tablespace_not_planned_by_generated_parser,
+        .alter_table_trigger_state => .alter_table_trigger_state_not_planned_by_generated_parser,
         .alter_text_search_configuration => .alter_text_search_configuration_not_planned_by_generated_parser,
         .alter_text_search_dictionary => .alter_text_search_dictionary_not_planned_by_generated_parser,
         .alter_text_search_parser => .alter_text_search_parser_not_planned_by_generated_parser,
@@ -18773,6 +18807,18 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
 
     var runtime_multi_alter_table = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
     defer runtime_multi_alter_table.deinit(alloc);
+    if (runtime_multi_alter_table.generated_statement) |generated_statement| {
+        if (generated_statement.ast) |generated_ast| {
+            switch (generated_ast) {
+                .ddl => |ddl| {
+                    try std.testing.expectEqual(@as(usize, 2), ddl.alter_table_operation_items.count);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 7 }, ddl.alter_table_operation_items.items[0]);
+                    try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 8, .end = 14 }, ddl.alter_table_operation_items.items[1]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
     var runtime_multi_alter_table_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_multi_alter_table);
     defer runtime_multi_alter_table_plan.deinit(alloc);
     switch (runtime_multi_alter_table_plan) {
@@ -18808,6 +18854,19 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
     try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_alter_table_entry));
     try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_alter_table_entry, .{}));
 
+    var malformed_generated_alter_table_item = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ADD COLUMN notes text, DROP COLUMN IF EXISTS old_status RESTRICT;");
+    defer malformed_generated_alter_table_item.deinit(alloc);
+    if (malformed_generated_alter_table_item.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_operation_items.items[1].start += 1,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_generated_alter_table_item));
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &malformed_generated_alter_table_item, .{}));
+
     var runtime_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
     defer runtime_row_security.deinit(alloc);
     var runtime_row_security_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &runtime_row_security);
@@ -18822,6 +18881,18 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    var mismatched_generated_row_security = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE generated_usage_records ENABLE ROW LEVEL SECURITY;");
+    defer mismatched_generated_row_security.deinit(alloc);
+    if (mismatched_generated_row_security.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.alter_table_row_security_enabled = false,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &mismatched_generated_row_security));
 
     var malformed_generated_ddl = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DATABASE tenant_ops;");
     defer malformed_generated_ddl.deinit(alloc);

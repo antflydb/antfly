@@ -13,6 +13,7 @@
 // limitations.
 
 const std = @import("std");
+const expr_type = @import("../sql/expr_type.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const catalog_resources = @import("catalog_resources.zig");
@@ -643,7 +644,7 @@ fn validateRowSecurityPredicateForSchema(
             try validateRowSecurityLiteralForColumn(alloc, column, literal.value_json);
         },
         .expression => |expression| {
-            try sql_adapter.validateCheckExpressionConditionForColumns(schema.relational_columns, expression);
+            try expr_type.validateCheckExpressionConditionForColumns(schema.relational_columns, expression);
         },
         .conjunction => |conjunction| {
             for (conjunction.predicates) |term| try validateRowSecurityPredicateForSchema(alloc, schema, term);
@@ -864,7 +865,7 @@ fn expressionRowFilterJsonAlloc(
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.writeAll("{\"expression_where\":[");
-    try sql_adapter.writeRowExpressionConditionJson(writer, predicate);
+    try expr_type.writeRowExpressionConditionJson(writer, predicate);
     try writer.writeAll("]}");
     return try out.toOwnedSlice();
 }

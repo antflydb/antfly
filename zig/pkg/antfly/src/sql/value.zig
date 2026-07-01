@@ -14,6 +14,8 @@
 
 const std = @import("std");
 
+const expr_operator = @import("expr_operator.zig");
+const expr_token = @import("expr_token.zig");
 const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../platform/time.zig");
@@ -292,12 +294,12 @@ pub fn parseSqlColumnValueAlloc(
         const default_value = column.default_value orelse return error.UnsupportedSqlShape;
         return try relational_rows.relationalDefaultValueJsonAlloc(alloc, default_value);
     }
-    if (lower_expr.peekSqlNowExpressionSyntax(tokens, pos.*)) {
+    if (expr_token.peekSqlNowExpressionSyntax(tokens, pos.*)) {
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         const now_ns = try checkedRealtimeNsU64(realtime_ns);
         return try parseSqlNowValueJsonAlloc(alloc, tokens, pos, now_ns);
     }
-    if (lower_expr.peekSqlCurrentDateExpressionSyntax(tokens, pos.*)) {
+    if (expr_token.peekSqlCurrentDateExpressionSyntax(tokens, pos.*)) {
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         const now_ns = try checkedRealtimeNsU64(realtime_ns);
         return try parseSqlCurrentDateValueJsonAlloc(alloc, tokens, pos, sqlCurrentUtcDateStartNs(now_ns));
@@ -305,7 +307,7 @@ pub fn parseSqlColumnValueAlloc(
     if (column.field_type == .datetime and lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos.*)) {
         return try parseSqlTypedDatetimeLiteralValueJsonAlloc(alloc, tokens, pos);
     }
-    if (lower_expr.peekFunctionCallTokenIf(tokens, pos.*, lower_expr.sqlTokenIsUuidV4Function)) {
+    if (expr_token.peekFunctionCallTokenIf(tokens, pos.*, expr_token.sqlTokenIsUuidV4Function)) {
         if (column.field_type != .keyword and column.field_type != .text and column.field_type != .link) return error.InvalidSqlCatalog;
         return try parseUuidV4ValueJsonAlloc(alloc, tokens, pos);
     }
@@ -585,7 +587,7 @@ pub fn parseJsonExtractOperatorPathOwnedAlloc(
     params: []const SqlValue,
     operator: TokenKind,
 ) ![]const u8 {
-    if (!lower_expr.tokenKindIsJsonExtractPathOperator(operator)) {
+    if (!expr_operator.tokenKindIsJsonExtractPathOperator(operator)) {
         return try parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
     }
 
@@ -662,7 +664,7 @@ pub fn parseSqlU32Value(tokens: []const Token, pos: *usize, params: []const SqlV
 
 pub fn parseArrayLengthFunctionTail(tokens: []const Token, pos: *usize, params: []const SqlValue, keyword: []const u8) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    if (!lower_expr.sqlKeywordIsCardinalityFunction(keyword)) {
+    if (!expr_token.sqlKeywordIsCardinalityFunction(keyword)) {
         try cursor.expectToken(.comma);
         const dimension = try parseSqlU32Value(tokens, pos, params);
         if (dimension != 1) return error.UnsupportedSqlShape;
@@ -703,7 +705,7 @@ pub fn peekStandaloneSqlBooleanLiteral(tokens: []const Token, pos: usize) ?bool 
         .semicolon, .rparen => enabled,
         .identifier => if (next.matchesKeywordTag(.@"and") or
             next.matchesKeywordTag(.@"or") or
-            lower_expr.sqlWhereTailClauseKeywordToken(next))
+            expr_token.sqlWhereTailClauseKeywordToken(next))
             enabled
         else
             null,
@@ -853,7 +855,7 @@ pub fn parseSqlCurrentDateKeyword(tokens: []const Token, pos: *usize) !void {
 
 pub fn parseSqlUuidV4Call(tokens: []const Token, pos: *usize) !void {
     const cursor = parser.Cursor.init(tokens, pos);
-    _ = cursor.matchIdentifierTokenIf(lower_expr.sqlTokenIsUuidV4Function) orelse return error.UnsupportedSqlShape;
+    _ = cursor.matchIdentifierTokenIf(expr_token.sqlTokenIsUuidV4Function) orelse return error.UnsupportedSqlShape;
     try cursor.expectToken(.lparen);
     try cursor.expectToken(.rparen);
 }

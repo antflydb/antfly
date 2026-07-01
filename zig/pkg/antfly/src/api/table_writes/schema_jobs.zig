@@ -758,9 +758,25 @@ pub fn runTableEmptyingJobGroupLocal(
         result.invalidated = true;
         return error.InvalidTableEmptyingJob;
     }
-    var parsed = try schema_mod.parseValidatedTableSchema(alloc, table.schema_json);
+    var parsed = schema_mod.parseValidatedTableSchema(alloc, table.schema_json) catch |err| {
+        catalog.invalidateTableEmptyingJob(.{
+            .job_id = record.job_id,
+            .lease_owner = worker_id,
+            .last_error = @errorName(err),
+        }) catch {};
+        result.invalidated = true;
+        return err;
+    };
     defer parsed.deinit(alloc);
-    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed);
+    const runtime_schema = schema_mod.deriveRuntimeTableSchema(alloc, parsed) catch |err| {
+        catalog.invalidateTableEmptyingJob(.{
+            .job_id = record.job_id,
+            .lease_owner = worker_id,
+            .last_error = @errorName(err),
+        }) catch {};
+        result.invalidated = true;
+        return err;
+    };
     defer storage_schema.freeSchema(alloc, runtime_schema);
     if (runtime_schema.storage_mode != .relational) {
         catalog.invalidateTableEmptyingJob(.{
@@ -789,6 +805,7 @@ pub fn runTableEmptyingJobGroupLocal(
         return err;
     };
     errdefer result.result.deinit(alloc);
+    if (result.result.staged != result.result.matched) return result;
 
     try catalog.finishTableEmptyingJob(.{
         .job_id = record.job_id,
@@ -1212,6 +1229,498 @@ test "table emptying worker helper claims deletes rows and finishes job" {
     try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
     try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, final_jobs[0].state);
     try std.testing.expectEqual(@as(u64, 2), final_jobs[0].completed_row_count);
+}
+
+test "table emptying worker live lease blocks competing worker without deleting rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-worker-busy", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+    } });
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_json,
+    };
+    try manager.upsertTable(table);
+    var job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .start_row_key = "",
+        .end_row_key = null,
+        .affected_table_ids = &.{77},
+    };
+    job.job_id = metadata_table_manager.stableTableEmptyingJobId(job);
+    try manager.upsertTableEmptyingJob(job);
+    try manager.beginTableEmptyingJob(.{
+        .job_id = job.job_id,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 2000,
+    });
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+
+    const records = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_running, records[0].state);
+
+    var catalog = Catalog{ .manager = &manager };
+    var result = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, records[0], "worker-b", 1200, 500);
+    defer result.deinit(alloc);
+    try std.testing.expect(!result.claimed);
+    try std.testing.expect(!result.completed);
+    try std.testing.expect(!result.invalidated);
+    try std.testing.expectEqual(@as(u32, 0), result.result.matched);
+    try std.testing.expectEqual(@as(u32, 0), result.result.staged);
+
+    const row = (try db.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"status\":\"open\"") != null);
+
+    const final_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_running, final_jobs[0].state);
+    try std.testing.expectEqualStrings("worker-a", final_jobs[0].lease_owner);
+    try std.testing.expectEqual(@as(u64, 2000), final_jobs[0].lease_expires_at_ms);
+    try std.testing.expectEqual(@as(u32, 1), final_jobs[0].attempts);
+}
+
+test "table emptying worker stale lease lets next worker delete rows and finish job" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-worker-takeover", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+    } });
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_json,
+    };
+    try manager.upsertTable(table);
+    var job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .start_row_key = "",
+        .end_row_key = null,
+        .affected_table_ids = &.{77},
+    };
+    job.job_id = metadata_table_manager.stableTableEmptyingJobId(job);
+    try manager.upsertTableEmptyingJob(job);
+    try manager.beginTableEmptyingJob(.{
+        .job_id = job.job_id,
+        .lease_owner = "worker-a",
+        .now_ms = 1000,
+        .lease_expires_at_ms = 2000,
+    });
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+
+    const running_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, running_jobs);
+    try std.testing.expectEqual(@as(usize, 1), running_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_running, running_jobs[0].state);
+    try std.testing.expectEqualStrings("worker-a", running_jobs[0].lease_owner);
+    try std.testing.expectEqual(@as(u32, 1), running_jobs[0].attempts);
+
+    var catalog = Catalog{ .manager = &manager };
+    var result = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, running_jobs[0], "worker-b", 2000, 500);
+    defer result.deinit(alloc);
+    try std.testing.expect(result.claimed);
+    try std.testing.expect(result.completed);
+    try std.testing.expect(!result.invalidated);
+    try std.testing.expectEqual(@as(u32, 1), result.result.matched);
+    try std.testing.expectEqual(@as(u32, 1), result.result.staged);
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "row:a"));
+
+    const final_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, final_jobs[0].state);
+    try std.testing.expectEqualStrings("", final_jobs[0].lease_owner);
+    try std.testing.expectEqual(@as(u64, 0), final_jobs[0].lease_expires_at_ms);
+    try std.testing.expectEqual(@as(u32, 2), final_jobs[0].attempts);
+    try std.testing.expectEqual(@as(u64, 1), final_jobs[0].completed_row_count);
+}
+
+test "table emptying worker leaves job running when concurrent row claim skips rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-worker-row-claim", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+        .{ .key = "row:b", .value = "{\"id\":\"b\",\"status\":\"open\"}" },
+    } });
+
+    const locker_txn = try db.beginTransaction(1_000);
+    try db.claimRowsForTransaction(locker_txn, &.{"row:a"}, .{
+        .mode = .for_update,
+        .owner_id = "writer:row-a",
+        .txn_id = locker_txn,
+    });
+    defer db.abortTransaction(locker_txn, 1_500) catch {};
+
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = schema_json,
+    };
+    try manager.upsertTable(table);
+    var job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(schema_json),
+        .start_row_key = "",
+        .end_row_key = null,
+        .affected_table_ids = &.{77},
+    };
+    job.job_id = metadata_table_manager.stableTableEmptyingJobId(job);
+    try manager.upsertTableEmptyingJob(job);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+
+    var catalog = Catalog{ .manager = &manager };
+    {
+        const records = try manager.listTableEmptyingJobs(alloc);
+        defer manager.freeTableEmptyingJobs(alloc, records);
+        try std.testing.expectEqual(@as(usize, 1), records.len);
+
+        var partial = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, records[0], "worker-a", 1_100, 200);
+        defer partial.deinit(alloc);
+        try std.testing.expect(partial.claimed);
+        try std.testing.expect(!partial.completed);
+        try std.testing.expect(!partial.invalidated);
+        try std.testing.expectEqual(@as(u32, 2), partial.result.matched);
+        try std.testing.expectEqual(@as(u32, 1), partial.result.staged);
+    }
+
+    const locked = (try db.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(locked);
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "row:b"));
+    {
+        const running_jobs = try manager.listTableEmptyingJobs(alloc);
+        defer manager.freeTableEmptyingJobs(alloc, running_jobs);
+        try std.testing.expectEqual(@as(usize, 1), running_jobs.len);
+        try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_running, running_jobs[0].state);
+        try std.testing.expectEqualStrings("worker-a", running_jobs[0].lease_owner);
+        try std.testing.expectEqual(@as(u64, 1300), running_jobs[0].lease_expires_at_ms);
+        try std.testing.expectEqual(@as(u32, 1), running_jobs[0].attempts);
+    }
+
+    try db.abortTransaction(locker_txn, 1_500);
+    {
+        const running_jobs = try manager.listTableEmptyingJobs(alloc);
+        defer manager.freeTableEmptyingJobs(alloc, running_jobs);
+        var finished = try runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, running_jobs[0], "worker-b", 1_300, 200);
+        defer finished.deinit(alloc);
+        try std.testing.expect(finished.claimed);
+        try std.testing.expect(finished.completed);
+        try std.testing.expect(!finished.invalidated);
+        try std.testing.expectEqual(@as(u32, 1), finished.result.matched);
+        try std.testing.expectEqual(@as(u32, 1), finished.result.staged);
+    }
+
+    try std.testing.expectError(error.NotFound, db.core.store.get(alloc, "row:a"));
+    const final_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_ready, final_jobs[0].state);
+    try std.testing.expectEqual(@as(u64, 1), final_jobs[0].completed_row_count);
+}
+
+test "table emptying worker invalidates malformed schema after claiming without deleting rows" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/table-emptying-worker-schema-abort", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const storage_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    try db.applyTableSchemaJson(alloc, storage_schema_json, .{});
+    try db.batch(.{ .writes = &.{
+        .{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"open\"}" },
+    } });
+
+    const malformed_schema_json = "{\"version\":1";
+    var manager = metadata_table_manager.TableManager.init(alloc);
+    defer manager.deinit();
+    const table = metadata_table_manager.TableRecord{
+        .table_id = 77,
+        .name = "orders",
+        .schema_json = malformed_schema_json,
+    };
+    try manager.upsertTable(table);
+    var job = metadata_table_manager.TableEmptyingJobRecord{
+        .job_id = 0,
+        .table_id = 77,
+        .group_id = 9001,
+        .schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(malformed_schema_json),
+        .start_row_key = "",
+        .end_row_key = null,
+        .affected_table_ids = &.{77},
+    };
+    job.job_id = metadata_table_manager.stableTableEmptyingJobId(job);
+    try manager.upsertTableEmptyingJob(job);
+
+    const Catalog = struct {
+        manager: *metadata_table_manager.TableManager,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .begin_table_emptying_job = beginTableEmptyingJob,
+                    .finish_table_emptying_job = finishTableEmptyingJob,
+                    .invalidate_table_emptying_job = invalidateTableEmptyingJob,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+
+        fn beginTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobBeginRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.beginTableEmptyingJob(request);
+        }
+
+        fn finishTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobFinishRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.finishTableEmptyingJob(request);
+        }
+
+        fn invalidateTableEmptyingJob(ptr: *anyopaque, request: metadata_table_manager.TableEmptyingJobInvalidateRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return try self.manager.invalidateTableEmptyingJob(request);
+        }
+    };
+
+    const records = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, records);
+    try std.testing.expectEqual(@as(usize, 1), records.len);
+
+    var catalog = Catalog{ .manager = &manager };
+    try std.testing.expectError(
+        error.UnexpectedEndOfInput,
+        runTableEmptyingJobGroupLocal(alloc, &db, catalog.iface(), table, records[0], "worker-a", 1_000, 500),
+    );
+
+    const row = (try db.get(alloc, "row:a")) orelse return error.TestUnexpectedResult;
+    defer alloc.free(row);
+
+    const final_jobs = try manager.listTableEmptyingJobs(alloc);
+    defer manager.freeTableEmptyingJobs(alloc, final_jobs);
+    try std.testing.expectEqual(@as(usize, 1), final_jobs.len);
+    try std.testing.expectEqualStrings(metadata_table_manager.table_emptying_invalid, final_jobs[0].state);
+    try std.testing.expectEqualStrings("", final_jobs[0].lease_owner);
+    try std.testing.expectEqual(@as(u64, 0), final_jobs[0].lease_expires_at_ms);
+    try std.testing.expectEqualStrings(@errorName(error.UnexpectedEndOfInput), final_jobs[0].last_error);
 }
 
 test "table emptying worker invalidates stale range job before deleting rows" {

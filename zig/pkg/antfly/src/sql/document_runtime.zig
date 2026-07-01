@@ -1219,6 +1219,14 @@ fn documentSqlIndexQueryRequestAlloc(
     include_documents: bool,
     count_only: bool,
 ) !OwnedQueryRequest {
+    if (query.native_query_json) |body| {
+        const owned_body = try documentSqlNativeIndexQueryRequestBodyAlloc(alloc, body, limit, include_documents, count_only);
+        errdefer alloc.free(owned_body);
+        return .{
+            .body_json = owned_body,
+            .index_name = query.index_name,
+        };
+    }
     var out: std.ArrayListUnmanaged(u8) = .empty;
     defer out.deinit(alloc);
     try out.append(alloc, '{');
@@ -1253,6 +1261,37 @@ fn documentSqlIndexQueryRequestAlloc(
         .body_json = body,
         .index_name = query.index_name,
     };
+}
+
+fn documentSqlNativeIndexQueryRequestBodyAlloc(
+    alloc: std.mem.Allocator,
+    body: []const u8,
+    limit: ?u32,
+    include_documents: bool,
+    count_only: bool,
+) ![]u8 {
+    if (limit == null and !include_documents and !count_only) return try alloc.dupe(u8, body);
+
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, body, .{ .allocate = .alloc_always });
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    if (limit) |value| try putJsonObjectField(alloc, &parsed.value.object, "limit", .{ .integer = @intCast(value) });
+    if (include_documents) try putJsonObjectField(alloc, &parsed.value.object, "include_documents", .{ .bool = true });
+    if (count_only) try putJsonObjectField(alloc, &parsed.value.object, "count_only", .{ .bool = true });
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
+}
+
+fn putJsonObjectField(
+    alloc: std.mem.Allocator,
+    object: *std.json.ObjectMap,
+    name: []const u8,
+    value: std.json.Value,
+) !void {
+    if (object.getPtr(name)) |slot| {
+        slot.* = value;
+        return;
+    }
+    try object.put(alloc, try alloc.dupe(u8, name), value);
 }
 
 fn documentSqlNativeFilterQueryJsonAlloc(
@@ -3010,6 +3049,32 @@ test "document sql filter-only index query requests include match_all base query
     try std.testing.expect(std.mem.indexOf(u8, req.body_json, "\"limit\":10") != null);
 }
 
+test "document sql native index query requests forward raw body" {
+    const alloc = std.testing.allocator;
+    var req = try documentSqlIndexQueryRequestAlloc(
+        alloc,
+        .{ .native_query_json = "{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}" },
+        null,
+        false,
+        false,
+    );
+    defer req.deinit(alloc);
+
+    try std.testing.expectEqualStrings("{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}", req.body_json);
+    try std.testing.expect(std.mem.indexOf(u8, req.body_json, "\"full_text_search\"") == null);
+
+    var capped_req = try documentSqlIndexQueryRequestAlloc(
+        alloc,
+        .{ .native_query_json = "{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}" },
+        25,
+        false,
+        false,
+    );
+    defer capped_req.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, capped_req.body_json, "\"limit\":25") != null);
+    try std.testing.expect(std.mem.indexOf(u8, capped_req.body_json, "\"limit\":5") == null);
+}
+
 test "document sql native filter rewrite only maps field identifiers" {
     const alloc = std.testing.allocator;
     const native_filter = try documentSqlNativeFilterQueryJsonAlloc(
@@ -3172,6 +3237,259 @@ test "document SQL bounded residual scan fails closed only when the scan cap is 
     defer partial.deinit(alloc);
     try std.testing.expectEqual(@as(u32, 0), partial.total);
     try std.testing.expectEqual(@as(usize, 0), partial.rows.len);
+}
+
+test "document SQL ordered bounded residual scan fails closed only when top-k completeness is unknown" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        scanned_rows: u32,
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            if (!std.mem.eql(u8, key, "doc:a")) return null;
+            return .{ .json = try lookup_alloc.dupe(u8, "{\"status\":\"active\",\"rank\":2}"), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            const ndjson = if (self.scanned_rows == 0)
+                ""
+            else
+                "{\"key\":\"doc:a\"}\n";
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .id, .output = "_id" },
+        .{
+            .kind = .field,
+            .field = "/rank",
+            .output = "rank",
+        },
+    };
+    const residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}";
+    const order_by = sql_adapter.DocumentOrderBy{
+        .field = "/rank",
+        .field_type = .numeric,
+        .direction = .asc,
+    };
+
+    const capped_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 1,
+            .residual_filter_json = residual_filter_json,
+        } },
+        .order_by = order_by,
+        .limit = 1,
+    };
+    var capped_source = MockSource{ .scanned_rows = 1 };
+    try std.testing.expectError(
+        error.DocumentSqlBoundedScanRowCapExceeded,
+        executeReadPlanAlloc(alloc, capped_source.source(), capped_plan, .stale),
+    );
+
+    const partial_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 2,
+            .residual_filter_json = residual_filter_json,
+        } },
+        .order_by = order_by,
+        .limit = 1,
+    };
+    var partial_source = MockSource{ .scanned_rows = 1 };
+    var partial = (try executeReadPlanAlloc(alloc, partial_source.source(), partial_plan, .stale)).?;
+    defer partial.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), partial.total);
+    try std.testing.expectEqual(@as(usize, 1), partial.rows.len);
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"rank\":2}", partial.rows[0]);
+}
+
+test "document SQL bounded unnest scan fails closed when expansion cannot prove completeness" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        scanned_rows: u32,
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            if (!std.mem.eql(u8, key, "doc:a")) return null;
+            return .{ .json = try lookup_alloc.dupe(u8, "{\"tags\":[\"urgent\",\"vip\"]}"), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            const ndjson = if (self.scanned_rows == 0)
+                ""
+            else
+                "{\"key\":\"doc:a\"}\n";
+            return .{ .ndjson = try scan_alloc.dupe(u8, ndjson) };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    var projection = [_]sql_adapter.DocumentProjection{
+        .{ .kind = .id, .output = "_id" },
+        .{ .kind = .unnest_value, .output = "tag" },
+    };
+    const missing_tag_unnest = sql_adapter.DocumentUnnest{
+        .field = "/tags",
+        .alias = "tag",
+        .item_type = .keyword,
+        .filter_value_json = "\"missing\"",
+    };
+    const urgent_tag_unnest = sql_adapter.DocumentUnnest{
+        .field = "/tags",
+        .alias = "tag",
+        .item_type = .keyword,
+        .filter_value_json = "\"urgent\"",
+    };
+
+    const capped_no_match_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{ .max_rows = 1 } },
+        .unnest = missing_tag_unnest,
+        .limit = 1,
+    };
+    var capped_source = MockSource{ .scanned_rows = 1 };
+    try std.testing.expectError(
+        error.DocumentSqlBoundedScanRowCapExceeded,
+        executeReadPlanAlloc(alloc, capped_source.source(), capped_no_match_plan, .stale),
+    );
+
+    const partial_no_match_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{ .max_rows = 2 } },
+        .unnest = missing_tag_unnest,
+        .limit = 1,
+    };
+    var partial_source = MockSource{ .scanned_rows = 1 };
+    var partial = (try executeReadPlanAlloc(alloc, partial_source.source(), partial_no_match_plan, .stale)).?;
+    defer partial.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), partial.total);
+    try std.testing.expectEqual(@as(usize, 0), partial.rows.len);
+
+    const match_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{ .max_rows = 1 } },
+        .unnest = urgent_tag_unnest,
+        .limit = 1,
+    };
+    var match_source = MockSource{ .scanned_rows = 1 };
+    var matched = (try executeReadPlanAlloc(alloc, match_source.source(), match_plan, .stale)).?;
+    defer matched.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), matched.total);
+    try std.testing.expectEqual(@as(usize, 1), matched.rows.len);
+    try std.testing.expectEqualStrings("{\"_id\":\"doc:a\",\"tag\":\"urgent\"}", matched.rows[0]);
 }
 
 test "document SQL bounded aggregate scan admits only lookup-backed document keys" {

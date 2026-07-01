@@ -563,6 +563,90 @@ frontend over native document storage, not a second storage format and not an
 unstructured write path. See MongoDB's SQL Interface overview:
 https://www.mongodb.com/docs/sql-interface/.
 
+### Document Table DDL
+
+Document table creation should stay on ordinary `CREATE TABLE` with an explicit
+Antfly storage profile rather than adding a separate canonical
+`CREATE DOCUMENT TABLE` statement. The parser may accept
+`CREATE DOCUMENT TABLE` later as compatibility sugar if it helps the product
+surface, but the durable plan should be the same catalog schema mutation as:
+
+```sql
+CREATE TABLE docs
+WITH (
+  antfly.storage_mode = 'document',
+  antfly.default_type = 'doc'
+)
+DOCUMENT SCHEMA doc AS JSON '{
+  "type": "object",
+  "properties": {
+    "title": {"type": "text"},
+    "body": {"type": "text"},
+    "status": {"type": "keyword"},
+    "amount": {"type": "numeric"},
+    "metadata": {"type": "json"}
+  },
+  "required": ["title"],
+  "additionalProperties": true
+}';
+```
+
+That lowers directly to the native table schema shape:
+
+```json
+{
+  "storage_mode": "document",
+  "default_type": "doc",
+  "document_schemas": {
+    "doc": {
+      "schema": {
+        "type": "object",
+        "properties": {
+          "title": {"type": "text"},
+          "body": {"type": "text"},
+          "status": {"type": "keyword"},
+          "amount": {"type": "numeric"},
+          "metadata": {"type": "json"}
+        },
+        "required": ["title"],
+        "additionalProperties": true
+      }
+    }
+  }
+}
+```
+
+Multiple document types use repeated `DOCUMENT SCHEMA` clauses and must set a
+`default_type` that names one of them:
+
+```sql
+CREATE TABLE events
+WITH (
+  antfly.storage_mode = 'document',
+  antfly.default_type = 'page_view'
+)
+DOCUMENT SCHEMA page_view AS JSON '{...}'
+DOCUMENT SCHEMA purchase AS JSON '{...}';
+```
+
+The document-schema clause is native JSON Schema plus Antfly extensions, not a
+relational column list. The SQL column-list form remains reserved for
+relational tables because it carries PostgreSQL column semantics: required
+storage columns, defaults, generated columns, constraints, physical row
+identity, and write behavior. Reusing `CREATE TABLE docs (title text, ...)`
+for document mappings would make those semantics ambiguous. A future compact
+schema shorthand can be added only as syntax sugar that lowers to the JSON
+Schema-backed `DOCUMENT SCHEMA` plan and still creates a document-mode table.
+
+Document DDL participates in the same DDL lifecycle rules as relational table
+DDL: it emits a typed catalog schema mutation plan, records no raw SQL text in
+durable metadata, validates document schema and dynamic-template shape through
+the shared schema validators, and schedules any derived-index rebuild or
+runtime-schema promotion work through the catalog-owned lifecycle path.
+Creating or altering document schemas through SQL does not admit document SQL
+writes; writes remain unsupported until they lower through the native document
+write path described below.
+
 ### Source Binding
 
 The planner uses an explicit source-binding layer after parse and before
@@ -739,21 +823,6 @@ nullable unless a durable schema constraint proves otherwise.
 
 ### Supported Query Shape
 
-The current document SQL milestone is read-only. SQL writes over schemaless
-documents raise durable semantics questions that should not be answered by the
-SQL adapter alone: missing fields, partial update behavior, JSON merge
-semantics, array mutation, generated fields, constraint interaction, trigger
-ordering, row-filter checks, and audit records. A later write surface can be
-added only through explicit document semantics such as `INSERT INTO docs (_id,
-_doc) VALUES (...)` or typed JSON patch operations lowered into the same native
-document write path as REST/SDK callers.
-
-Current catalog-backed write lowering enforces this milestone with
-`DocumentSqlWriteUnsupported` for document-storage targets, and the public SQL
-endpoint maps that to `document_sql_write_unsupported`. That keeps document SQL
-read-only until writes are explicitly lowered through native document write
-semantics rather than relational row batches.
-
 The current read-only milestone supports:
 
 - single-table `SELECT` over one document table;
@@ -785,6 +854,95 @@ pagination tails beyond the initial `LIMIT` shape, locking tails such as
 families, aggregate expressions, multi-key grouping, aggregate `FILTER`
 clauses, and broader `HAVING` expressions can be added only when they lower to
 a typed aggregate or materialized-sidecar plan with an explicit cost model.
+
+### Document Write Shape
+
+The current executable document SQL milestone is read-only. Catalog-backed write
+lowering enforces this with `DocumentSqlWriteUnsupported` for document-storage
+targets, and the public SQL endpoint maps that to
+`document_sql_write_unsupported`. That guard should remain until document SQL
+writes lower through the same native document write semantics as REST, SDK, MCP,
+A2A, CLI, and internal callers rather than through relational row batches.
+
+Document SQL writes are a valid future surface, but they must be admitted in a
+constrained order. SQL writes over schemaless or schema-ish documents raise
+durable semantics questions that cannot be answered by the SQL adapter alone:
+missing fields, partial update behavior, JSON merge semantics, array mutation,
+generated fields, schema validation, constraint interaction, trigger ordering,
+row-filter checks, audit records, and write conflict behavior. The design
+requirement is that every admitted write form lowers to a typed native document
+insert, upsert, patch, or delete request before it can reach storage.
+
+The first admitted write form should be full-document insert/upsert through
+`_id` and `_doc`:
+
+```sql
+INSERT INTO docs (_id, _doc)
+VALUES ('doc-1', '{"title":"Hello","status":"draft"}'::jsonb);
+
+INSERT INTO docs (_doc)
+VALUES ('{"title":"Hello","status":"draft"}'::jsonb);
+```
+
+The first form supplies the document key explicitly. The second form asks the
+native document write path to generate the key if the table policy supports
+generated document ids. Both forms validate `_doc` through the document table's
+schema, row filters, authorization, audit policy, and native insert/upsert
+conflict behavior. SQL must not decompose `_doc` into relational cells.
+
+Projection-column inserts are an ergonomic later layer, not the base contract:
+
+```sql
+INSERT INTO docs (_id, title, status)
+VALUES ('doc-1', 'Hello', 'draft');
+```
+
+They are admissible only after the virtual schema is durable enough to prove
+field paths, nullability, type validation, defaults, generated-field rejection,
+and `additionalProperties` behavior. The lowered plan still constructs a JSON
+document and calls the native document insert/upsert path; it never becomes a
+relational row insert.
+
+Deletes should be admitted before broad updates because the first useful shape
+has exact document identity semantics:
+
+```sql
+DELETE FROM docs WHERE _id = 'doc-1';
+```
+
+Additional delete predicates may be admitted only when they lower to exact
+native document query/delete semantics with the same row-filter, authorization,
+audit, boundedness, and no-match behavior as native callers. View-target writes
+remain rejected until view write semantics are deliberately designed.
+
+Updates should start with explicit `_doc` JSON patch/update expressions rather
+than pretending document tables support arbitrary relational assignment:
+
+```sql
+UPDATE docs
+SET _doc = jsonb_set(_doc, '{status}', '"published"'::jsonb)
+WHERE _id = 'doc-1';
+```
+
+Equivalent Antfly-owned helpers such as `antfly.json_patch(_doc, patch)` can be
+added when they lower to a typed native document patch request. Broad
+`UPDATE docs SET status = 'published' ...` projection-field updates are a later
+surface because they require stable JSON path assignment, missing-path behavior,
+array semantics, generated-field rejection, type validation, stale-filter
+behavior, conflict handling, and audit ordering. If admitted, they must lower to
+native document patch/update requests, not relational mutation-source plans.
+
+The admission order is therefore:
+
+1. `INSERT (_id, _doc)` and `INSERT (_doc)`;
+2. `DELETE WHERE _id = ...`;
+3. explicit `_doc` JSON patch/update expressions;
+4. projection-column inserts and updates after virtual-schema write semantics
+   are fully pinned.
+
+All other document-table `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, `MERGE`, and
+data-modifying CTE shapes remain fail-closed until they have a typed native
+document write plan, stable diagnostics, and SQL/native parity fixtures.
 
 Document SQL lowering should push down only behavior that Antfly can execute
 natively:

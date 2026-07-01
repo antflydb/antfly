@@ -1146,12 +1146,29 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
     catalog: table_catalog.CatalogSource,
     table_name: []const u8,
     session: catalog_resources.SqlCatalogSession,
+    allow_document_view: bool,
 ) !source_binding.SqlSourceBinding {
-    const target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
-    errdefer deinitCatalogTableRef(alloc, target);
+    const requested_target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
+    errdefer deinitCatalogTableRef(alloc, requested_target);
     var snapshot = try catalog.adminSnapshot();
     defer catalog.freeAdminSnapshot(&snapshot);
-    const table = qualifiedTableRecord(&snapshot, target.database_name, target.namespace_name, target.table_name) orelse return error.InvalidSqlCatalog;
+    if (qualifiedTableRecord(&snapshot, requested_target.database_name, requested_target.namespace_name, requested_target.table_name)) |table| {
+        return try sourceBindingForCatalogTableRecordAlloc(alloc, requested_target, table);
+    }
+    if (!allow_document_view) return error.InvalidSqlCatalog;
+    const source_table = try documentSqlViewSourceTableRecordAlloc(alloc, &snapshot, requested_target) orelse return error.InvalidSqlCatalog;
+    const source_target = try catalogTableRefForTableRecordAlloc(alloc, source_table);
+    errdefer deinitCatalogTableRef(alloc, source_target);
+    const binding = try sourceBindingForCatalogTableRecordAlloc(alloc, source_target, source_table);
+    deinitCatalogTableRef(alloc, requested_target);
+    return binding;
+}
+
+fn sourceBindingForCatalogTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    target: source_binding.CatalogTableRef,
+    table: metadata_table_manager.TableRecord,
+) !source_binding.SqlSourceBinding {
     if (table.schema_json.len == 0) return error.InvalidSqlCatalog;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
     defer parsed.deinit(alloc);
@@ -1165,12 +1182,15 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
         },
         .document => |*document| {
             document.table_id = table.table_id;
-            document.schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+            const schema_generation = metadata_table_manager.schemaRewriteGenerationForSchemaJson(table.schema_json);
+            document.schema_generation = schema_generation;
             document.indexes_json = try alloc.dupe(u8, table.indexes_json);
             errdefer if (document.indexes_json) |indexes_json| alloc.free(@constCast(indexes_json));
-            document.capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, table.indexes_json);
+            const source_schema_fingerprint = try source_binding.documentSqlSourceSchemaFingerprintAlloc(alloc, table.schema_json);
+            defer alloc.free(source_schema_fingerprint);
+            document.capabilities = try source_binding.documentCapabilitiesForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, table.indexes_json, schema_generation, source_schema_fingerprint);
             errdefer source_binding.deinitDocumentSqlCapabilities(alloc, &document.capabilities);
-            document.virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, table.indexes_json);
+            document.virtual_schema = try source_binding.documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(alloc, schema, table.indexes_json, target.table_name, schema_generation, source_schema_fingerprint);
         },
         .lake => |*lake| {
             lake.table_id = table.table_id;
@@ -1178,6 +1198,49 @@ fn sourceBindingForCatalogTableWithSessionAlloc(
         },
     }
     return binding;
+}
+
+fn documentSqlViewSourceTableRecordAlloc(
+    alloc: std.mem.Allocator,
+    snapshot: *const metadata_api.AdminSnapshot,
+    requested_target: source_binding.CatalogTableRef,
+) !?metadata_table_manager.TableRecord {
+    for (snapshot.tables) |table| {
+        if (!std.mem.eql(u8, table.database_name, requested_target.database_name)) continue;
+        if (!std.mem.eql(u8, table.namespace_name, requested_target.namespace_name)) continue;
+        if (table.schema_json.len == 0) continue;
+        if (!try source_binding.documentSqlIndexesJsonHasViewMappingForSourceTableAlloc(alloc, table.indexes_json, requested_target.table_name, table.name)) continue;
+        return table;
+    }
+    return null;
+}
+
+fn rejectDocumentSqlViewWriteTargetAlloc(
+    alloc: std.mem.Allocator,
+    catalog: table_catalog.CatalogSource,
+    table_name: []const u8,
+    session: catalog_resources.SqlCatalogSession,
+) !void {
+    const requested_target = try ownedCatalogTableRefForObjectNameAlloc(alloc, table_name, session);
+    defer deinitCatalogTableRef(alloc, requested_target);
+    var snapshot = try catalog.adminSnapshot();
+    defer catalog.freeAdminSnapshot(&snapshot);
+    if (qualifiedTableRecord(&snapshot, requested_target.database_name, requested_target.namespace_name, requested_target.table_name) != null) return;
+    if (try documentSqlViewSourceTableRecordAlloc(alloc, &snapshot, requested_target) != null) return error.DocumentSqlWriteUnsupported;
+}
+
+fn catalogTableRefForTableRecordAlloc(alloc: std.mem.Allocator, table: metadata_table_manager.TableRecord) !source_binding.CatalogTableRef {
+    const database_name = try alloc.dupe(u8, table.database_name);
+    errdefer alloc.free(database_name);
+    const namespace_name = try alloc.dupe(u8, table.namespace_name);
+    errdefer alloc.free(namespace_name);
+    const table_name = try alloc.dupe(u8, table.name);
+    errdefer alloc.free(table_name);
+    return .{
+        .database_name = database_name,
+        .namespace_name = namespace_name,
+        .table_name = table_name,
+    };
 }
 
 fn deinitSqlSourceBinding(alloc: std.mem.Allocator, binding: *source_binding.SqlSourceBinding) void {
@@ -2512,7 +2575,8 @@ fn resolveWritePlanCatalogOptionsFromParsedSqlWithSessionAndAuthorizationAlloc(
 
     const target_table_name = try writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql);
     defer alloc.free(target_table_name);
-    out.target_binding = sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, target_table_name, session) catch |err| switch (err) {
+    try rejectDocumentSqlViewWriteTargetAlloc(alloc, catalog, target_table_name, session);
+    out.target_binding = sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, target_table_name, session, false) catch |err| switch (err) {
         error.InvalidSqlCatalog, error.TableNotFound => null,
         else => return err,
     };
@@ -2611,10 +2675,10 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAll
     if (try readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved_tables| {
         var tables = resolved_tables;
         defer tables.deinit(alloc);
-        out.target_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.left, session);
+        out.target_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.left, session, true);
         try appendBoundCatalogObjectForBindingAlloc(alloc, &bound_objects, .target, out.target_binding.?);
         if (!std.mem.eql(u8, tables.left, tables.source)) {
-            out.source_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session);
+            out.source_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, tables.source, session, true);
             try appendBoundCatalogObjectForBindingAlloc(alloc, &bound_objects, .source, out.source_binding.?);
             out.source_schema = switch (out.source_binding.?) {
                 .relational => |binding| binding.schema,
@@ -4594,6 +4658,37 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
     }
     try std.testing.expect(document_read.source_schema == null);
 
+    document_catalog.tables[0].indexes_json =
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}";
+    var parsed_document_view_read = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
+    );
+    defer parsed_document_view_read.deinit(alloc);
+    var bound_document_view_read = try bindReadPlanCatalogStatementAlloc(alloc, &parsed_document_view_read, document_catalog.iface());
+    defer bound_document_view_read.deinit(alloc);
+    const document_view_read = try bound_document_view_read.readCatalog();
+    try std.testing.expect(document_view_read.target_binding != null);
+    try std.testing.expectEqual(@as(usize, 1), document_view_read.bound_objects.len);
+    switch (document_view_read.target_binding.?) {
+        .document => |binding| {
+            try std.testing.expectEqualStrings("docs", binding.target.table_name);
+            try std.testing.expectEqual(@as(u64, 1), binding.table_id);
+            var saw_plan_view_field = false;
+            for (binding.virtual_schema.fields) |field| {
+                if (std.mem.eql(u8, field.name, "plan")) {
+                    saw_plan_view_field = true;
+                    try std.testing.expectEqualStrings("/metadata/plan", field.path);
+                    try std.testing.expectEqual(source_binding.DocumentSqlVirtualFieldSource.view_mapping, field.source);
+                }
+            }
+            try std.testing.expect(saw_plan_view_field);
+            try std.testing.expectEqual(source_binding.SqlSourceFamily.document, document_view_read.bound_objects[0].family);
+            try std.testing.expectEqualStrings("docs", document_view_read.bound_objects[0].target.table_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     var parsed_document_unnest_read = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;",
@@ -4612,6 +4707,16 @@ test "sql adapter binder produces bound sql statements for catalog read and writ
         else => return error.TestUnexpectedResult,
     }
     try std.testing.expect(document_unnest_read.source_schema == null);
+
+    var parsed_document_view_write = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "INSERT INTO support_view (_id, plan) VALUES ('doc:a', 'pro')",
+    );
+    defer parsed_document_view_write.deinit(alloc);
+    try std.testing.expectError(
+        error.DocumentSqlWriteUnsupported,
+        bindWritePlanCatalogStatementAlloc(alloc, &parsed_document_view_write, .{}, document_catalog.iface()),
+    );
 
     var parsed_write = try tokenized.ParsedSql.initAlloc(
         alloc,

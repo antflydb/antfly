@@ -590,13 +590,26 @@ metadata before either lowerer computes body boundaries. Generated
 `ON CONFLICT ON CONSTRAINT ...` target lowering also requires the retained
 target-item list to be fully empty, not just zero-count, so stale list boundary
 metadata or target-`WHERE` payloads cannot survive the named-constraint helper
-path. Generated `ON CONFLICT DO UPDATE SET` hook lowering now also requires
-the retained assignment item list and assignment range to be supplied together,
+path. Generated conflict targets now retain whether the clause is targetless,
+index-inference, or named-constraint based, and generated DML validation
+requires that target kind to agree with the retained target tokens before
+target predicates or actions can lower. Parser-context conflict target hooks
+now require the same retained target kind whenever generated target
+tokens/items are supplied, so reusable target helpers cannot infer targetless,
+index-inference, or named-constraint layout from tokens alone. Generated
+`ON CONFLICT DO UPDATE SET` hook lowering now also requires the retained
+assignment item list and assignment range to be supplied together,
 so the update-action parser cannot consume generated item boundaries without
 the generated `SET` body range that anchors them to the conflict action; those
 assignment payloads now also require the owning generated conflict action
-range before the typed conflict action parser can consume them. Point
-and joined generated `UPDATE ... SET` hook lowering now similarly revalidates
+range before the typed conflict action parser can consume them.
+Generated conflict actions now also retain a semantic action kind for
+`DO NOTHING` versus `DO UPDATE`, and generated DML validation requires that
+kind to agree with the action tokens before conflict assignment or predicate
+lowering can run. Parser-context conflict clause hooks now require that action
+kind whenever generated action tokens are supplied, so reusable conflict clause
+helpers cannot infer `DO NOTHING` or `DO UPDATE` from tokens alone. Point and
+joined generated `UPDATE ... SET` hook lowering now similarly revalidates
 retained assignment item lists against the generated DML `assignments_tokens`
 range before typed assignment parsing consumes those items, including
 data-modifying CTE update bodies that are parsed from retained body-local DML
@@ -627,12 +640,13 @@ joined lowerers can reparse either relation through legacy table-alias
 parsing. Generated DML target and relation-source helpers also fail closed when
 their retained command/source cursor position drifts, rather than returning a
 probe miss that lets the typed DML lowerer re-enter legacy alias parsing.
-Deeper DML cutover still requires
-complete generated AST-driven semantic lowering inside assignment expressions,
-predicates, returning lists, conflict clauses, and merge action bodies,
-broader unsupported-shape diagnostics, and a later full statement-head
-promotion once generated coverage matches the currently supported typed DML
-surface.
+Generated DML semantic lowering now carries retained expression/list payloads
+through top-level update assignments, mutation predicates, returning lists,
+conflict targets/actions, and merge action bodies, and generated-covered
+statement heads are promoted only after matching the supported typed DML
+surface. Generated unsupported DML diagnostics now preserve valid
+PostgreSQL DML shapes that Antfly does not execute, including identity
+override inserts, as stable unsupported write requirements.
 Representative
 read queries now have generated-parser corpus coverage, retained generated raw
 and AST nodes for covered read statements, top-level generated AST ranges for
@@ -1130,11 +1144,26 @@ create-index metadata covers basic
 PostgreSQL-style unique, covering, partial, method, element-list, and option
 clauses with parsed-statement clause-layout validation and generated-first
 AST-to-plan parity validation. Generated
-`ALTER TABLE` ASTs now retain target-table and operation-tail ranges and
-generated-first ALTER TABLE planning validates those ranges before lowering
-through the typed DDL planner for covered add/drop/rename/validate operations
-and generated-owned add-primary-key, add-unique, add-foreign-key, add-check,
-and add-period constraint families.
+`ALTER TABLE` ASTs now retain target-table, operation-tail, and top-level
+operation-item ranges, and generated-first ALTER TABLE planning validates
+those ranges before lowering through the typed DDL planner for covered
+add/drop/rename/validate operations and generated-owned add-primary-key,
+add-unique, add-foreign-key, add-check, and add-period constraint families.
+Generated row-security table alterations additionally retain explicit
+enable/disable metadata, and the row-security DDL lowerer requires that
+metadata to match the retained operation tail before producing a typed catalog
+plan.
+Valid but unplanned `ALTER TABLE ... SET ACCESS METHOD ...`,
+`ALTER TABLE ... CLUSTER ON ...`/`SET WITHOUT CLUSTER`,
+`ALTER TABLE ... OWNER TO ...`,
+`ALTER TABLE ... SET LOGGED/UNLOGGED`, and
+`ALTER TABLE ... SET/RESET (...)`/`SET TABLESPACE ...` storage changes, plus
+`ALTER TABLE ... ENABLE/DISABLE TRIGGER ...` trigger-state changes, now classify
+as explicit generated unsupported diagnostics with stable
+`table_access_method_plan`, `table_cluster_plan`, `table_owner_plan`,
+`table_persistence_plan`, `table_storage_parameters_plan`,
+`table_tablespace_plan`, and `table_trigger_state_plan` native
+requirements instead of falling through the generic ALTER TABLE lowerer.
 Generated `CREATE TABLE` and `ALTER TABLE` lowerer failures now propagate from
 the parsed DDL entrypoints instead of retrying the legacy DDL token planner;
 corrupted retained generated metadata for those table DDL forms therefore
@@ -1281,7 +1310,11 @@ Unsupported DDL remains on the existing parser until
    target, target predicate, action, update-assignment, and action-predicate
    ranges, and fail closed when any retained conflict metadata is missing,
    stale, or inconsistent with the actual conflict clause before typed
-   conflict-action semantics can run. Explicit-column
+   conflict-action semantics can run. Retained conflict target and action
+   kinds must also match the target/action tokens, including through
+   parser-context conflict target and clause hooks, so stale targetless,
+   index-inference, named-constraint, `DO NOTHING`, or `DO UPDATE` metadata
+   fails before typed conflict parsing. Explicit-column
    `INSERT ... VALUES` direct lowering also requires the retained values body
    to start immediately after the retained column list and `VALUES` keyword, so
    stale generated metadata cannot silently publish only a suffix of a multi-row
@@ -1698,13 +1731,21 @@ contract until storage and API row plans grow those outer-join semantics.
    named-window reference or inline definition, partition list, order list,
    frame expression spans, and typed window-function argument arity/ranges
    before the typed window-spec lowerer accepts the consumed projection
-   expression.
+   expression. Window select-list lowering now classifies generated-backed
+   projections from retained generated function-call/`OVER` payloads before
+   entering typed window lowering, and inline or named generated frame clauses
+   carry retained generated frame unit/bound metadata that must match the
+   lowered typed frame before acceptance.
    Generated aggregate projection functions now validate retained function
    name, argument, `DISTINCT`, ordered-argument, `WITHIN GROUP`, and `FILTER`
    predicate spans before the typed aggregate lowerer accepts supported
-   aggregate specs, and aggregate/window `FILTER (WHERE ...)` lowering now
-   threads retained generated filter predicate metadata into typed scalar,
-   expression, boolean-group, and containment filter branches.
+   aggregate specs. Aggregate select-list lowering now classifies
+   generated-backed projections from retained generated function-call payloads
+   before entering typed aggregate lowering, so stale generated aggregate
+   function/list metadata cannot be bypassed by token peeking; aggregate/window
+   `FILTER (WHERE ...)` lowering now threads retained generated filter
+   predicate metadata into typed scalar, expression, boolean-group, and
+   containment filter branches.
    Generated `WHERE` and aggregate `HAVING` predicates now recursively validate
    retained quantified-comparison, `EXISTS`, grouped, subquery, set-operation
    subquery, array-constructor, and boolean condition-chain boundary payloads
@@ -1729,10 +1770,10 @@ contract until storage and API row plans grow those outer-join semantics.
    closed before fallback projection parsing can accept it; fixed select-list
    function branches now also validate the retained function-name token against
    the typed branch, including accepted aliases such as `jsonb_typeof`;
-   aggregate specs now validate the retained function-name token against the
-   typed aggregate op before accepting aggregate argument/filter metadata, and
-   typed window specs validate the retained function-name token before
-   accepting generated `OVER` metadata;
+   aggregate specs now validate retained generated aggregate function-kind
+   metadata against the typed aggregate op before accepting argument/filter
+   metadata, and typed window specs validate retained generated window
+   function-kind metadata before accepting generated `OVER` metadata;
    scalar expression predicate lowering now validates exact-range generated
    function-call metadata against the typed row-expression function kind, and
    exact-range generated JSON key/extract and string-concat operator metadata
@@ -1784,14 +1825,16 @@ contract until storage and API row plans grow those outer-join semantics.
    kind or child-expression payloads that lack a matching token range before
    lowering.
    Complete generated row-locking reads now retain generated `row_lock_tokens`
-   for all PostgreSQL row-lock strengths, target lists, and wait policies, and
-   lower through typed relational row-claim planning for supported relational
-   reads; document SQL returns the explicit
+   plus row-lock mode and wait-policy metadata for all PostgreSQL row-lock
+   strengths, target lists, and wait policies, and lower through typed
+   relational row-claim planning only when the retained generated semantics
+   match the typed claim; document SQL returns the explicit
    `DocumentSqlLockingUnsupported` diagnostic. CTE read bodies now retain
-   `body_row_lock_tokens`, validate the `FOR` row-lock boundary, and clone that
-   metadata into direct generated read ASTs; CTE body row-lock lowering now
-   fails closed when retained generated body row-lock metadata is stale instead
-   of accepting the typed body text alone. CTE read bodies also retain,
+   `body_row_lock_tokens` plus mode/wait-policy metadata, validate the `FOR`
+   row-lock boundary, and clone that metadata into direct generated read ASTs;
+   CTE body row-lock lowering now fails closed when retained generated body
+   row-lock metadata is stale instead of accepting the typed body text alone.
+   CTE read bodies also retain,
    validate, and clone body-level Antfly and graph table-function metadata so
    generated child-read planning sees the same table-function source semantics
    as direct top-level reads. Parsed-statement classification now also
@@ -1935,13 +1978,15 @@ now also validates join operator token sequences against generated join kind
 metadata and rejects conditionless join metadata unless the generated join kind
 is actually conditionless. Generated row-lock clauses now validate the complete
 `FOR` strength, optional `OF` target list, and `NOWAIT`/`SKIP LOCKED` wait
-policy layout instead of only checking the leading `FOR` token. Generated
-semijoin mutation tails now consume retained `mutation_row_lock_tokens` for
-`IN` and `EXISTS` joined writes, so missing or stale row-lock metadata fails
-closed instead of falling back to the legacy row-lock parser; normal
-`UPDATE ... FROM` and `DELETE ... USING` joined mutation tails now enforce the
-same retained row-lock span before typed joined-tail parsing can consume
-`FOR ...` clauses. Read
+policy layout instead of only checking the leading `FOR` token. Generated DML
+mutation tails now retain `mutation_row_lock_tokens` plus row-lock mode and
+wait-policy metadata, validate those retained semantics against the typed
+row-claim parser result, and consume that metadata for `IN`/`EXISTS` semijoin
+joined writes; missing or stale row-lock metadata fails closed instead of
+falling back to the legacy row-lock parser. Normal `UPDATE ... FROM` and
+`DELETE ... USING` joined mutation tails now enforce the same retained row-lock
+span and semantics before typed joined-tail parsing can consume `FOR ...`
+clauses. Read
 classification also verifies that top-level and CTE-body clause body ranges are
 preceded by the expected clause keywords, including `FROM`, `WHERE`, `GROUP BY`,
 `HAVING`, `WINDOW`, `ORDER BY`, `LIMIT`, `OFFSET`, and `FETCH`, before a
@@ -2469,6 +2514,12 @@ Generated grammar work needs evidence at multiple levels:
   assignment tails, rejects stale retained insert target-column payloads before
   insert lowerers can rescan parenthesized column lists, rejects stale retained
   returning-list payloads before returning lowerers can rescan projection tails,
+  rejects stale retained conflict target-kind payloads before conflict target
+  lowerers can infer targetless, index-inference, or named-constraint layout
+  from tokens, including direct parser-context conflict target hooks,
+  rejects stale retained conflict action-kind payloads before conflict action
+  lowerers can infer `DO NOTHING` or `DO UPDATE` from tokens, including direct
+  parser-context conflict clause hooks,
   rejects stale retained DML CTE column-list and materialization payloads before
   CTE layout parsing can skip over them, and generated-family validation over
   other representative write plans. Read plans have initial

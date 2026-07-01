@@ -1,0 +1,28 @@
+{
+  "reason_format": 1,
+  "required": [
+    "bulk_io_plan",
+    "duplicate_conflict_update_target",
+    "duplicate_row_batch_target",
+    "duplicate_update_target",
+    "enforced_unique_conflict_target",
+    "extension",
+    "insert_overriding_value_plan",
+    "invalid_expression_conflict_target",
+    "invalid_named_conflict_target",
+    "multi_output_subquery_delete_selector",
+    "multi_output_subquery_update_selector",
+    "row_lock_mode_plan",
+    "schema_namespace",
+    "session_setting",
+    "set_operation_output_shape",
+    "table_access_method_plan",
+    "table_cluster_plan",
+    "table_owner_plan",
+    "table_persistence_plan",
+    "table_storage_parameters_plan",
+    "table_tablespace_plan",
+    "table_trigger_state_plan",
+    "transaction_control"
+  ]
+}

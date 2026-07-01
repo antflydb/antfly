@@ -204,9 +204,9 @@ pub fn expectAppParityReadSummary(summary: corpus.AppParityPlanSummary, lowered:
         .recursive_cte => |recursive_cte| {
             try expectOptionalTableName(summary.table_name, recursive_cte.anchor.table_name);
             try expectOptionalUsize(summary.ctes, 1);
-            try expectOptionalUsize(summary.select, recursive_cte.anchor.plan.query.select.len);
-            try expectOptionalUsize(summary.order_by, recursive_cte.anchor.plan.query.order_by.len);
-            try expectOptionalU32(summary.limit, recursive_cte.anchor.plan.query.limit);
+            try expectOptionalUsize(summary.select, recursive_cte.final_query.select.len);
+            try expectOptionalUsize(summary.order_by, recursive_cte.final_query.order_by.len);
+            try expectOptionalU32(summary.limit, recursive_cte.final_query.limit);
         },
         .aggregate => |aggregate| {
             try expectOptionalTableName(summary.table_name, aggregate.table_name);

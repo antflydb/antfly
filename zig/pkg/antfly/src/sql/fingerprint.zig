@@ -18,6 +18,7 @@ const binder = @import("binder.zig");
 const corpus = @import("corpus.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const diagnostics = @import("diagnostics.zig");
+const expr_type = @import("expr_type.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
@@ -883,7 +884,7 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                 .{ if (alter.enabled) "enable" else "disable", alter.table_name },
             ),
             .create_policy => |create| blk: {
-                const predicate_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
+                const predicate_suffix = try expr_type.rowSecurityPredicateFingerprintSuffixAlloc(alloc, create.predicate);
                 defer alloc.free(predicate_suffix);
                 var base = try std.fmt.allocPrint(
                     alloc,
@@ -891,7 +892,7 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                     .{ create.policy_name, create.table_name, predicate_suffix },
                 );
                 if (create.check_predicate) |check_predicate| {
-                    const check_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    const check_suffix = try expr_type.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
                     defer alloc.free(check_suffix);
                     const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
                     alloc.free(base);
@@ -906,14 +907,14 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                     .{ alter.policy_name, alter.table_name },
                 );
                 if (alter.predicate) |predicate| {
-                    const predicate_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, predicate);
+                    const predicate_suffix = try expr_type.rowSecurityPredicateFingerprintSuffixAlloc(alloc, predicate);
                     defer alloc.free(predicate_suffix);
                     const with_predicate = try std.fmt.allocPrint(alloc, "{s}:{s}", .{ base, predicate_suffix });
                     alloc.free(base);
                     base = with_predicate;
                 }
                 if (alter.check_predicate) |check_predicate| {
-                    const check_suffix = try lower_expr.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
+                    const check_suffix = try expr_type.rowSecurityPredicateFingerprintSuffixAlloc(alloc, check_predicate);
                     defer alloc.free(check_suffix);
                     const with_check = try std.fmt.allocPrint(alloc, "{s}:check={s}", .{ base, check_suffix });
                     alloc.free(base);
@@ -1426,7 +1427,7 @@ fn appliedDdlWorkItemFingerprintAlloc(alloc: std.mem.Allocator, item: AppliedDdl
         },
     );
     if (item.rewrite_expression) |rewrite| {
-        const expression = try lower_expr.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
+        const expression = try expr_type.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
         defer alloc.free(expression);
         const with_expression = try std.fmt.allocPrint(
             alloc,
@@ -1763,7 +1764,7 @@ fn createRoutineFingerprintAlloc(alloc: std.mem.Allocator, create: CreateRoutine
         alloc.free(base);
         if (body.expression) |body_expression| {
             errdefer alloc.free(next);
-            const expression = try lower_expr.rowRewriteExpressionFingerprintAlloc(alloc, body_expression);
+            const expression = try expr_type.rowRewriteExpressionFingerprintAlloc(alloc, body_expression);
             defer alloc.free(expression);
             const with_expression = try std.fmt.allocPrint(
                 alloc,

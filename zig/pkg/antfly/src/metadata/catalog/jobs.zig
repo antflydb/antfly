@@ -19,6 +19,7 @@ const table_catalog = @import("source.zig");
 const metadata_api = @import("snapshot.zig");
 const metadata_table_manager = @import("../table_manager.zig");
 const runtime_schema_mod = @import("../../storage/schema.zig");
+const expr_type = @import("../../sql/expr_type.zig");
 const sql_adapter = @import("../../sql/mod.zig");
 const table_ddl = @import("table_ddl.zig");
 
@@ -121,7 +122,7 @@ pub fn schemaRewriteJobForAppliedDdlWorkItem(
     if (item.rewrite_expression) |rewrite| {
         hasher.update(rewrite.target_column);
         hasher.update(&[_]u8{0});
-        const expression = try sql_adapter.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
+        const expression = try expr_type.rowRewriteExpressionFingerprintAlloc(alloc, rewrite.expression);
         defer alloc.free(expression);
         hasher.update(expression);
     }

@@ -83,6 +83,17 @@ const WriteCoalesceQueue = table_write_bulk_ingest.WriteCoalesceQueue;
 const max_cached_write_tables = 64;
 const hosted_mutation_source_topology_attempts = 2;
 const post_stage_topology_changed_error = error.TopologyChangedAfterMutationSourceStage;
+
+fn findRangeRecordPtr(
+    ranges: []const *const metadata_table_manager.RangeRecord,
+    group_id: u64,
+) ?*const metadata_table_manager.RangeRecord {
+    for (ranges) |range| {
+        if (range.group_id == group_id) return range;
+    }
+    return null;
+}
+
 const freeBackupShards = table_write_backup_restore.freeBackupShards;
 const ProvisionedTableWriteCache = table_write_cache.ProvisionedTableWriteCache;
 const HostedManagedDbCache = table_write_cache.HostedManagedDbCache;
@@ -133,7 +144,6 @@ const isTransientReplayVisibilityError = table_write_managed_db.isTransientRepla
 const loadTableIndexesJson = table_write_managed_db.loadTableIndexesJson;
 const loadTableIdentityNamespaceForGroup = table_write_managed_db.loadTableIdentityNamespaceForGroup;
 const findTableRecord = table_write_managed_db.findTableRecord;
-const findRangeRecord = table_write_managed_db.findRangeRecord;
 const loadTableSchemaJson = table_write_managed_db.loadTableSchemaJson;
 const loadTableManagedMetadata = table_write_managed_db.loadTableManagedMetadata;
 const validateProvisionedDbIdentityNamespaceExpected = table_write_managed_db.validateProvisionedDbIdentityNamespaceExpected;
@@ -1521,15 +1531,20 @@ pub const ProvisionedTableWriteSource = struct {
         ranges: []const *const metadata_table_manager.RangeRecord,
         backend_runtime: ?*db_mod.background_runtime.BackendRuntime,
     ) !metadata_table_provisioner.ProvisionSummary {
-        const cache = self.write_cache orelse return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
-            alloc,
-            self.replica_root_dir,
-            metadata_group_id,
-            hosted_group_ids,
-            tables,
-            ranges,
-            .{ .backend_runtime = backend_runtime },
-        );
+        const cache = self.write_cache orelse {
+            const range_values = try alloc.alloc(metadata_table_manager.RangeRecord, ranges.len);
+            defer alloc.free(range_values);
+            for (ranges, 0..) |range, i| range_values[i] = range.*;
+            return try metadata_table_provisioner.reconcileReplicaRootWithOptions(
+                alloc,
+                self.replica_root_dir,
+                metadata_group_id,
+                hosted_group_ids,
+                tables,
+                range_values,
+                .{ .backend_runtime = backend_runtime },
+            );
+        };
 
         if (cache.backend_runtime == null) cache.backend_runtime = backend_runtime orelse self.backend_runtime;
         cache.antfly_provider = self.antfly_provider;
@@ -1539,7 +1554,7 @@ pub const ProvisionedTableWriteSource = struct {
         var summary: metadata_table_provisioner.ProvisionSummary = .{};
         for (hosted_group_ids) |group_id| {
             if (group_id == metadata_group_id) continue;
-            const range = findRangeRecord(ranges, group_id) orelse continue;
+            const range = findRangeRecordPtr(ranges, group_id) orelse continue;
             const table = findTableRecord(tables, range.table_id) orelse continue;
             summary.groups_considered += 1;
 
@@ -1549,13 +1564,13 @@ pub const ProvisionedTableWriteSource = struct {
             var io_impl = std.Io.Threaded.init(alloc, .{});
             defer io_impl.deinit();
             try fs_paths.createDirPathPortable(io_impl.io(), path);
-            try metadata_table_provisioner.applyRestoreIntentIfNeeded(alloc, path, group_id, table, range);
+            try metadata_table_provisioner.applyRestoreIntentIfNeeded(alloc, path, group_id, table, range.*);
 
             const lsm_root_generation = self.visibleRootGeneration(group_id);
             const identity_namespace = doc_identity.Namespace{
                 .table_id = table.table_id,
-                .shard_id = metadata_table_manager.rangeDocIdentityShardId(range),
-                .range_id = metadata_table_manager.rangeDocIdentityRangeId(range),
+                .shard_id = metadata_table_manager.rangeDocIdentityShardId(range.*),
+                .range_id = metadata_table_manager.rangeDocIdentityRangeId(range.*),
             };
             if (cache.getLocked(group_id, lsm_root_generation, table.name)) |db| {
                 try validateProvisionedDbIdentityNamespaceExpected(identity_namespace, db);
@@ -7881,6 +7896,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         schema: storage_schema.TableSchema,
         req: db_mod.types.RelationalRowsMutationSourceRequest,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateMutationSourceLockableRuntime(req);
         var attempt: usize = 0;
         while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
             return mutateRowsFromSourceOnce(ptr, alloc, table_name, schema, req) catch |err| switch (err) {
@@ -7954,6 +7970,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         schema: storage_schema.TableSchema,
         req: db_mod.types.RelationalRowsMutationSourceRequest,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateMutationSourceLockableRuntime(req);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -7978,6 +7995,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsMutationSourceRequest,
         sync_level: db_mod.types.SyncLevel,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateMutationSourceLockableRuntime(req);
         var attempt: usize = 0;
         while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
             return mutateRowsFromSourceAutocommitOnce(ptr, alloc, table_name, schema, req, sync_level) catch |err| switch (err) {
@@ -8074,6 +8092,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         schema: storage_schema.TableSchema,
         req: db_mod.types.RelationalRowsMutationSourceRequest,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateMutationSourceLockableRuntime(req);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -8093,6 +8112,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         schema: storage_schema.TableSchema,
         req: db_mod.types.RelationalRowsMutationSourceRequest,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateMutationSourceLockableRuntime(req);
         const claim = req.source.row_claim orelse return error.InvalidQueryRequest;
         const request_body = try relational_rows_api.encodeRowsMutationSourceRequestAlloc(alloc, req);
         defer alloc.free(request_body);
@@ -8178,6 +8198,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
         source_rows: []const []const u8,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateJoinedMutationSourceLockableRuntime(req);
         var attempt: usize = 0;
         while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
             return mutateRowsJoinedFromSourceRowsOnce(ptr, alloc, table_name, target_schema, source_schema, req, source_rows) catch |err| switch (err) {
@@ -8264,6 +8285,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
         source_rows: []const []const u8,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateJoinedMutationSourceLockableRuntime(req);
         const claim = switch (req.target_side) {
             .left => req.join.left.row_claim,
             .right => req.join.right.row_claim,
@@ -8820,6 +8842,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
         source_rows: []const []const u8,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateJoinedMutationSourceLockableRuntime(req);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -8849,6 +8872,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         source_rows: []const []const u8,
         sync_level: db_mod.types.SyncLevel,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateJoinedMutationSourceLockableRuntime(req);
         var attempt: usize = 0;
         while (attempt < hosted_mutation_source_topology_attempts) : (attempt += 1) {
             return mutateRowsJoinedFromSourceRowsAutocommitOnce(ptr, alloc, table_name, target_schema, source_schema, req, source_rows, sync_level) catch |err| switch (err) {
@@ -8958,6 +8982,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
         source_rows: []const []const u8,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
+        try validateJoinedMutationSourceLockableRuntime(req);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
         const hosted_cache = try hostedManagedDbCacheForRoot(self.replica_root_dir);
@@ -8977,6 +9002,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsMutationSourceRequest,
     ) !?[]u8 {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateMutationSourceLockableRuntime(req);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -9005,6 +9031,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         candidates: []const db_mod.DB.RelationalRowsMutationSourceCandidate,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateMutationSourceLockableRuntime(req);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         try validateMutationSourceCandidatesForGroup(group_id, candidates);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -9033,6 +9060,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
     ) !?[]u8 {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateJoinedMutationSourceLockableRuntime(req);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -9059,6 +9087,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         req: db_mod.types.RelationalRowsJoinedMutationSourceRequest,
     ) !?[]u8 {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateJoinedMutationSourceLockableRuntime(req);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
         defer alloc.free(path);
@@ -9084,6 +9113,7 @@ pub const HostedProvisionedTableWriteSource = struct {
         candidates: []const db_mod.DB.RelationalRowsJoinedMutationSourceCandidate,
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *HostedProvisionedTableWriteSource = @ptrCast(@alignCast(ptr));
+        try validateJoinedMutationSourceLockableRuntime(req);
         try table_catalog.validateGroupTopologyEpoch(alloc, self.catalog, table_name, group_id, topology_epoch);
         try validateJoinedMutationSourceCandidatesForGroup(group_id, candidates);
         const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, self.replica_root_dir, group_id);
@@ -11770,6 +11800,32 @@ fn validateJoinedMutationSourceCandidatesForGroup(
     }
 }
 
+fn validateMutationSourceLockableRuntime(req: db_mod.types.RelationalRowsMutationSourceRequest) !void {
+    if (req.source.row_claim != null and req.source.source_cte.len != 0) return error.UnsupportedRowsQuery;
+}
+
+fn joinedMutationSourceTargetQuery(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) db_mod.types.RelationalRowsQueryRequest {
+    return switch (req.target_side) {
+        .left => req.join.left,
+        .right => req.join.right,
+    };
+}
+
+fn joinedMutationSourceSourceQuery(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) db_mod.types.RelationalRowsQueryRequest {
+    return switch (req.target_side) {
+        .left => req.join.right,
+        .right => req.join.left,
+    };
+}
+
+fn validateJoinedMutationSourceLockableRuntime(req: db_mod.types.RelationalRowsJoinedMutationSourceRequest) !void {
+    const target_query = joinedMutationSourceTargetQuery(req);
+    const source_query = joinedMutationSourceSourceQuery(req);
+    if (target_query.row_claim == null) return error.InvalidQueryRequest;
+    if (target_query.source_cte.len != 0) return error.UnsupportedRowsQuery;
+    if (source_query.row_claim != null) return error.UnsupportedRowsQuery;
+}
+
 pub const BoundTableWriteSource = struct {
     table_name: []const u8,
     db: *db_mod.DB,
@@ -12611,6 +12667,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateMutationSourceLockableRuntime(req);
         return try self.db.mutateRelationalRowsFromSource(alloc, schema, req);
     }
 
@@ -12624,6 +12681,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateMutationSourceLockableRuntime(req);
         return try mutateRowsFromSourceAutocommitOnDb(alloc, self.db, schema, req);
     }
 
@@ -12647,6 +12705,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateJoinedMutationSourceLockableRuntime(req);
 
         return try mutateRowsJoinedFromSourceRowsOnDb(alloc, self.db, target_schema, source_schema, req, source_rows);
     }
@@ -12663,6 +12722,7 @@ pub const BoundTableWriteSource = struct {
     ) !?db_mod.types.RelationalRowsMutationSourceResult {
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateJoinedMutationSourceLockableRuntime(req);
         return try mutateRowsJoinedFromSourceRowsAutocommitOnDb(alloc, self.db, target_schema, source_schema, req, source_rows);
     }
 
@@ -12678,6 +12738,7 @@ pub const BoundTableWriteSource = struct {
         _ = topology_epoch;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateMutationSourceLockableRuntime(req);
         const candidates = try self.db.collectRelationalRowsMutationSourceCandidatesAlloc(alloc, schema, req, null);
         defer {
             for (candidates) |*candidate| candidate.deinit(alloc);
@@ -12701,6 +12762,7 @@ pub const BoundTableWriteSource = struct {
         _ = topology_epoch;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateMutationSourceLockableRuntime(req);
         try validateMutationSourceCandidatesForGroup(group_id, candidates);
         return try self.db.stagePlannedRelationalRowsMutationSourceAlloc(alloc, schema, req, matched, candidates);
     }
@@ -12717,6 +12779,7 @@ pub const BoundTableWriteSource = struct {
         _ = topology_epoch;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateJoinedMutationSourceLockableRuntime(req);
         const candidates = try self.db.collectRelationalRowsJoinedMutationTargetCandidatesForTargetRangeAlloc(alloc, target_schema, req, null);
         defer {
             for (candidates) |*candidate| candidate.deinit(alloc);
@@ -12739,6 +12802,7 @@ pub const BoundTableWriteSource = struct {
         _ = topology_epoch;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateJoinedMutationSourceLockableRuntime(req);
         var rows = try self.db.queryRelationalRowsJoinedMutationSourceSideForRangeAlloc(alloc, source_schema, req, null);
         defer rows.deinit(alloc);
         return try relational_rows_api.encodeRowsQueryResponseAlloc(alloc, rows);
@@ -12759,6 +12823,7 @@ pub const BoundTableWriteSource = struct {
         _ = topology_epoch;
         const self: *BoundTableWriteSource = @ptrCast(@alignCast(ptr));
         if (!std.mem.eql(u8, self.table_name, table_name)) return null;
+        try validateJoinedMutationSourceLockableRuntime(req);
         try validateJoinedMutationSourceCandidatesForGroup(group_id, candidates);
         return try self.db.stagePlannedRelationalRowsJoinedMutationSourceWithSourceSchemaAlloc(alloc, target_schema, source_schema, req, matched, candidates);
     }
@@ -23415,6 +23480,7 @@ test "replica root reconcile seeds write cache across generation bump" {
         .start_key = "",
         .end_key = null,
     }};
+    const range_ptrs = [_]*const metadata_table_manager.RangeRecord{&ranges[0]};
     const hosted_groups = [_]u64{7001};
 
     var generation: u64 = 1;
@@ -23429,7 +23495,7 @@ test "replica root reconcile seeds write cache across generation bump" {
         1,
         &hosted_groups,
         &tables,
-        &ranges,
+        &range_ptrs,
         null,
     );
     try std.testing.expectEqual(@as(usize, 1), summary.groups_considered);
@@ -23885,6 +23951,15 @@ test "hosted mutation-source remote autocommit dispatches supported stage reques
     try std.testing.expectError(error.UnsupportedOperation, source.source().mutateRowsFromSourceAutocommit(alloc, "docs", runtime_schema, expression_request.req, .write));
     try std.testing.expectEqual(@as(usize, 2), executor.calls);
 
+    var claimed_cte_request = req;
+    claimed_cte_request.source.source_cte = "materialized_ready";
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, claimed_cte_request));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsFromSourceAutocommit(alloc, "docs", runtime_schema, claimed_cte_request, .write));
+    try std.testing.expectEqual(@as(usize, 2), executor.calls);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsMutationSourceCollectGroupLocal(alloc, 7001, "docs", 0, runtime_schema, claimed_cte_request));
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", 0, runtime_schema, claimed_cte_request, 0, &.{}));
+
     var joined_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
         alloc,
         "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:remote-fail-closed\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}],\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"patch\":{\"status\":\"joined\"},\"returning\":[\"id\",\"quantity\"]}",
@@ -23962,6 +24037,35 @@ test "hosted mutation-source remote autocommit dispatches supported stage reques
     );
     defer joined_expression_request.deinit(alloc);
     try std.testing.expectError(error.UnsupportedOperation, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, joined_expression_request.req, source_rows[0..], .write));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+
+    var source_claim_joined_request = joined_request.req;
+    source_claim_joined_request.join.right.row_claim = .{
+        .mode = .for_update,
+        .owner_id = "session:remote-source-claim",
+        .txn_id = txn_id,
+        .lease_ms = 60_000,
+    };
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, source_claim_joined_request, source_rows[0..]));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, source_claim_joined_request, source_rows[0..], .write));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceCollectGroupLocal(alloc, 7001, "docs", 0, runtime_schema, source_claim_joined_request));
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceInputsGroupLocal(alloc, 7001, "docs", 0, runtime_schema, source_claim_joined_request));
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", 0, runtime_schema, runtime_schema, source_claim_joined_request, 0, &.{}));
+
+    var target_cte_joined_request = joined_request.req;
+    target_cte_joined_request.join.left.source_cte = "materialized_targets";
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, target_cte_joined_request, source_rows[0..]));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, target_cte_joined_request, source_rows[0..], .write));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+
+    var missing_target_claim_request = joined_request.req;
+    missing_target_claim_request.join.left.row_claim = null;
+    try std.testing.expectError(error.InvalidQueryRequest, source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, missing_target_claim_request, source_rows[0..]));
+    try std.testing.expectEqual(@as(usize, 4), executor.calls);
+    try std.testing.expectError(error.InvalidQueryRequest, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, missing_target_claim_request, source_rows[0..], .write));
     try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
@@ -25471,7 +25575,10 @@ test "hosted mutation source stages global planned candidates across remote owne
                 };
                 try std.testing.expectEqualStrings("skip_locked", wait_policy);
                 if (group_id == 7001) {
-                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
+                    if (self.stage_calls == 1) {
+                        return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
+                    }
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"a\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:a\",\"expected_version\":9}]}") };
                 }
                 return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
             }
@@ -25500,6 +25607,17 @@ test "hosted mutation source stages global planned candidates across remote owne
     try std.testing.expectEqualStrings("row:z", result.participant_predicates[0].key);
     try std.testing.expectEqual(@as(usize, 2), executor.collect_calls);
     try std.testing.expectEqual(@as(usize, 2), executor.stage_calls);
+
+    var retry_result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, request.req)).?;
+    defer retry_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), retry_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), retry_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), retry_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", retry_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), retry_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", retry_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 4), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.stage_calls);
 }
 
 test "provisioned table read source survives many external write-sync batches before first profiled dense query" {

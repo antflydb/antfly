@@ -246,27 +246,798 @@
     {
       "name": "arbitrary string length helper",
       "sql": "SELECT _id FROM docs WHERE length(status) = 6 LIMIT 10",
-      "expected_error": "UnsupportedSqlShape"
+      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
     },
     {
       "name": "case-fold helper with LIKE",
       "sql": "SELECT _id FROM docs WHERE lower(status) LIKE 'act%' LIMIT 10",
-      "expected_error": "UnsupportedSqlShape"
+      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
     },
     {
       "name": "numeric arithmetic expression",
       "sql": "SELECT _id FROM docs WHERE amount + 1 > 10 LIMIT 10",
-      "expected_error": "UnsupportedSqlShape"
+      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
     },
     {
       "name": "case-insensitive pattern predicate",
       "sql": "SELECT _id FROM docs WHERE status ILIKE 'act%' LIMIT 10",
-      "expected_error": "UnsupportedSqlShape"
+      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
     },
     {
       "name": "regex predicate",
       "sql": "SELECT _id FROM docs WHERE status ~ 'act.*' LIMIT 10",
-      "expected_error": "UnsupportedSqlShape"
+      "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
+    }
+  ],
+  "document_read_plan_cases": [
+    {
+      "name": "explicit unnest equality over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest equality over unindexed array uses catalog array element producer",
+      "schema": "array_unindexed",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/tags\"",
+          "\"urgent\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest IN over indexed array lowers to indexed array element producer",
+      "schema": "array_ready",
+      "indexes_json": "{\"tags_array_element\":{\"type\":\"array_element\",\"path\":\"tags\"}}",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"terms\"",
+          "\"/tags\"",
+          "\"urgent\"",
+          "\"vip\""
+        ]
+      }
+    },
+    {
+      "name": "explicit unnest equality over unindexed array requires bounded scan policy",
+      "schema": "array_unindexed",
+      "sql": "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "view-mapped scalar predicate without indexed path lowers to bounded residual scan",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "bounded_scan",
+        "residual_filter_contains": [
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ]
+      }
+    },
+    {
+      "name": "view-mapped scalar predicate with indexed path lowers to indexed filter",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v1\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "producer": "indexed_filter",
+        "filter_query_contains": [
+          "\"term\"",
+          "\"/metadata/plan\"",
+          "\"pro\""
+        ]
+      }
+    },
+    {
+      "name": "view mapping with stale source table rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"other_docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with missing required index rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"missing_fts\"],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with stale required index generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"generation\":5}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"generation\":4}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with stale source generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_generation\":8,\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with stale source schema fingerprint rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"fixture-schema-v2\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with invalid nullable metadata rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":\"sometimes\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with duplicate aliases rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"PLAN\",\"path\":\"metadata.alt_plan\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with invalid document path rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata..plan\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, plan FROM docs WHERE plan = 'pro' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping with source schema type contradiction rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"title_as_number\",\"path\":\"title\",\"type\":\"numeric\"}]}}}",
+      "sql": "SELECT _id, title_as_number FROM docs WHERE title_as_number = 7 LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "view mapping to source default column rejects during binding",
+      "schema": "default_generated",
+      "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"status\",\"path\":\"status\",\"type\":\"keyword\"}]}}}",
+      "sql": "SELECT _id, status FROM docs WHERE status = 'new' LIMIT 10",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "vector search predicate with vector capability lowers to native query producer",
+      "schema": "vector_ready",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"embeddings\"",
+          "\"docs_embedding_hnsw\"",
+          "\"indexes\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "vector search predicate without vector capability rejects as index unavailable",
+      "schema": "text_only",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "vector search predicate with catalog vector capability validates requested index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_embedding_hnsw\":{\"type\":\"aknn\",\"index_generation\":11,\"expected_index_generation\":11}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"embeddings\"",
+          "\"docs_embedding_hnsw\"",
+          "\"indexes\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "vector search predicate with catalog vector capability rejects unknown index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_embedding_hnsw\":{\"type\":\"aknn\",\"index_generation\":11,\"expected_index_generation\":11}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'missing_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "vector search predicate with stale index generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_embedding_hnsw\":{\"type\":\"aknn\",\"index_generation\":11,\"expected_index_generation\":12}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "vector search with scalar residual requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) AND status = 'active'",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "vector search with scalar residual lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) AND status = 'active'",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"embeddings\":{\"docs_embedding_hnsw\":[0.1,0.2,0.3]},\"indexes\":[\"docs_embedding_hnsw\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"embeddings\"",
+          "\"docs_embedding_hnsw\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "semantic search predicate with semantic capability lowers to native query producer",
+      "schema": "semantic_ready",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"docs_body_semantic\"",
+          "\"indexes\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "semantic search predicate without semantic capability rejects as index unavailable",
+      "schema": "text_only",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "semantic search predicate with catalog semantic capability validates requested index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"docs_body_semantic\"",
+          "\"indexes\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "semantic search predicate with catalog semantic capability rejects unknown index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'missing_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "semantic search predicate with stale index generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":13}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "semantic search predicate with stale catalog semantic capability rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"lifecycle\":\"building\"}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "semantic search predicate with stale source generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"source_generation\":8}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "semantic search predicate with stale source schema fingerprint rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_semantic\":{\"type\":\"semantic\",\"source_schema_fingerprint\":\"fixture-schema-v2\"}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "semantic search with scalar residual requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5) AND status = 'active'",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "semantic search with scalar residual lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'alpha', limit => 5) AND status = 'active'",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"docs_body_semantic\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "hybrid search predicate with hybrid capability lowers to native query producer",
+      "schema": "semantic_ready",
+      "indexes_json": "{\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"docs_body_semantic\"",
+          "\"full_text_search\"",
+          "\"match\":\"alpha\"",
+          "\"merge_config\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "hybrid search predicate without hybrid capability rejects as index unavailable",
+      "schema": "semantic_ready",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "hybrid search predicate with component capabilities validates requested index names",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12},\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"docs_body_semantic\"",
+          "\"full_text_search\"",
+          "\"merge_config\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "hybrid search predicate with component capabilities rejects unknown semantic index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12},\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'missing_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "hybrid search predicate with component capabilities rejects unknown full text index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_body_fts\":{\"type\":\"full_text\"},\"docs_body_semantic\":{\"type\":\"semantic\",\"generation\":12,\"required_index_generation\":12},\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'missing_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "hybrid search predicate with stale hybrid index generation rejects during binding",
+      "schema": "semantic_ready",
+      "indexes_json": "{\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":14}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "hybrid search with scalar residual requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5) AND status = 'active'",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "hybrid search with scalar residual lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_hybrid\":{\"type\":\"hybrid\",\"index_generation\":13,\"expected_index_generation\":13}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', field => 'body', query => 'alpha', fusion => 'rrf', limit => 5) AND status = 'active'",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"semantic_search\":\"alpha\",\"indexes\":[\"docs_body_semantic\"],\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"merge_config\":{\"strategy\":\"rrf\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"semantic_search\":\"alpha\"",
+          "\"full_text_search\"",
+          "\"merge_config\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "graph traversal predicate with graph capability lowers to native query producer",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', max_depth => 2, limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_searches\":{\"traverse\":{\"type\":\"traverse\",\"index_name\":\"docs_edge_graph\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"params\":{\"max_depth\":2}}},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_searches\"",
+          "\"type\":\"traverse\"",
+          "\"index_name\":\"docs_edge_graph\"",
+          "\"keys\":[\"doc:a\"]",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph shortest path predicate with graph capability lowers to native query producer",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', max_depth => 4, limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_searches\":{\"shortest_path\":{\"type\":\"shortest_path\",\"index_name\":\"docs_edge_graph\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"target_nodes\":{\"keys\":[\"doc:z\"]},\"params\":{\"max_depth\":4}}},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_searches\"",
+          "\"type\":\"shortest_path\"",
+          "\"index_name\":\"docs_edge_graph\"",
+          "\"target_nodes\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph pattern predicate with graph capability lowers to native query producer",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', pattern => '(a)-[:cites]->(b)', return => 'b', max_results => 5, limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_searches\":{\"graph_match\":{\"type\":\"pattern\",\"index_name\":\"docs_edge_graph\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"pattern\":[{\"alias\":\"a\"},{\"alias\":\"b\",\"edge\":{\"direction\":\"out\",\"types\":[\"cites\"]}}],\"return_aliases\":[\"b\"],\"params\":{\"max_results\":5}}},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_searches\"",
+          "\"type\":\"pattern\"",
+          "\"pattern\"",
+          "\"return_aliases\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph traversal predicate without graph capability rejects as index unavailable",
+      "schema": "text_only",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', max_depth => 2, limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "graph traversal predicate with graph capability rejects unknown graph index name",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'missing_edge_graph', start => 'doc:a', max_depth => 2, limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "graph traversal predicate with stale graph index generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":15}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', max_depth => 2, limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "graph traversal with scalar residual requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', max_depth => 2, limit => 5) AND status = 'active'",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "graph traversal with scalar residual lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_edge_graph\":{\"type\":\"graph\",\"index_generation\":14,\"expected_index_generation\":14}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', max_depth => 2, limit => 5) AND status = 'active'",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_searches\":{\"traverse\":{\"type\":\"traverse\",\"index_name\":\"docs_edge_graph\",\"start_nodes\":{\"keys\":[\"doc:a\"]},\"params\":{\"max_depth\":2}}},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_searches\"",
+          "\"type\":\"traverse\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "graph metric predicate with graph metric capability lowers to native query producer",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":15,\"expected_index_generation\":15}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_metric\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\",\"top_k\":10},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_metric\"",
+          "\"index\":\"docs_edge_graph\"",
+          "\"metric\":\"pagerank\"",
+          "\"top_k\":10",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph metric predicate without graph metric capability rejects as index unavailable",
+      "schema": "text_only",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "graph metric predicate with constrained graph metric capability validates requested graph index",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":15,\"expected_index_generation\":15}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_metric\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\",\"top_k\":10},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_metric\"",
+          "\"index\":\"docs_edge_graph\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph metric predicate with constrained graph metric capability rejects unknown graph index",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":15,\"expected_index_generation\":15}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'missing_edge_graph', metric => 'pagerank', top_k => 10, limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "graph metric predicate with stale graph metric index generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":15,\"expected_index_generation\":16}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "graph metric predicate with stale catalog graph metric capability rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"capability_lifecycle_status\":\"stale\"}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "graph metric with scalar residual requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":15,\"expected_index_generation\":15}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5) AND status = 'active'",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "graph metric with scalar residual lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":15,\"expected_index_generation\":15}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 10, limit => 5) AND status = 'active'",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"graph_metric\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\",\"top_k\":10},\"limit\":5}",
+        "native_query_contains": [
+          "\"graph_metric\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
+    },
+    {
+      "name": "graph metric rerank predicate with graph metric capability lowers to native query producer",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":16,\"expected_index_generation\":16}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"graph_metric_rerank\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"full_text_search\"",
+          "\"match\":\"alpha\"",
+          "\"graph_metric_rerank\"",
+          "\"index\":\"docs_edge_graph\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph metric rerank predicate without graph metric capability rejects as index unavailable",
+      "schema": "text_only",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "graph metric rerank predicate with constrained graph metric capability validates requested graph index",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":16,\"expected_index_generation\":16}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5)",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"graph_metric_rerank\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"full_text_search\"",
+          "\"graph_metric_rerank\"",
+          "\"index\":\"docs_edge_graph\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ]
+      }
+    },
+    {
+      "name": "graph metric rerank predicate with constrained graph metric capability rejects unknown graph index",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":16,\"expected_index_generation\":16}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'missing_edge_graph', graph_metric => 'pagerank', limit => 5)",
+      "expected": {
+        "expected_error": "DocumentSqlIndexUnavailable"
+      }
+    },
+    {
+      "name": "graph metric rerank predicate with stale graph metric index generation rejects during binding",
+      "schema": "text_only",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"graph_index\":\"docs_edge_graph\",\"index_generation\":16,\"expected_index_generation\":17}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5)",
+      "expected": {
+        "expected_error": "InvalidSqlCatalog"
+      }
+    },
+    {
+      "name": "graph metric rerank with scalar residual requires bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":16,\"expected_index_generation\":16}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5) AND status = 'active'",
+      "expected": {
+        "expected_error": "DocumentSqlBoundedScanPolicyRequired"
+      }
+    },
+    {
+      "name": "graph metric rerank with scalar residual lowers under bounded candidate policy",
+      "schema": "vector_with_status",
+      "indexes_json": "{\"docs_pagerank\":{\"type\":\"graph_metric\",\"index_generation\":16,\"expected_index_generation\":16}}",
+      "bounded_scan_rows": 25,
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'alpha', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', limit => 5) AND status = 'active'",
+      "expected": {
+        "producer": "native_query",
+        "native_query_json": "{\"full_text_search\":{\"match\":\"alpha\",\"field\":\"body\"},\"graph_metric_rerank\":{\"index\":\"docs_edge_graph\",\"metric\":\"pagerank\"},\"limit\":5}",
+        "native_query_contains": [
+          "\"full_text_search\"",
+          "\"graph_metric_rerank\"",
+          "\"metric\":\"pagerank\"",
+          "\"limit\":5"
+        ],
+        "residual_filter_contains": [
+          "\"/status\"",
+          "\"active\""
+        ],
+        "residual_filter_json": "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        "max_candidate_rows": 25
+      }
     }
   ]
 }

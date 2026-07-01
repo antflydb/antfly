@@ -35,10 +35,31 @@ pub const DocumentSqlUnsupportedExpressionCaseJson = struct {
     expected_error: []const u8,
 };
 
+pub const DocumentSqlReadPlanExpectationJson = struct {
+    producer: ?[]const u8 = null,
+    native_query_json: ?[]const u8 = null,
+    residual_filter_json: ?[]const u8 = null,
+    filter_query_contains: []const []const u8 = &.{},
+    native_query_contains: []const []const u8 = &.{},
+    residual_filter_contains: []const []const u8 = &.{},
+    max_candidate_rows: ?u32 = null,
+    expected_error: ?[]const u8 = null,
+};
+
+pub const DocumentSqlReadPlanCaseJson = struct {
+    name: []const u8,
+    schema: []const u8,
+    indexes_json: ?[]const u8 = null,
+    bounded_scan_rows: ?u32 = null,
+    sql: []const u8,
+    expected: DocumentSqlReadPlanExpectationJson,
+};
+
 pub const DocumentSqlCorpusRootJson = struct {
     fixture_format: u32,
     residual_filter_cases: []const DocumentSqlResidualCaseJson = &.{},
     unsupported_residual_expression_cases: []const DocumentSqlUnsupportedExpressionCaseJson = &.{},
+    document_read_plan_cases: []const DocumentSqlReadPlanCaseJson = &.{},
 };
 
 pub fn parseDocumentSqlCorpusAlloc(alloc: std.mem.Allocator) !std.json.Parsed(DocumentSqlCorpusRootJson) {
@@ -49,8 +70,14 @@ pub fn parseDocumentSqlCorpusAlloc(alloc: std.mem.Allocator) !std.json.Parsed(Do
 }
 
 pub fn errorFromName(name: []const u8) !anyerror {
+    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanUnsupportedResidual")) return error.DocumentSqlBoundedScanUnsupportedResidual;
+    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanPolicyRequired")) return error.DocumentSqlBoundedScanPolicyRequired;
+    if (std.mem.eql(u8, name, "DocumentSqlIndexUnavailable")) return error.DocumentSqlIndexUnavailable;
+    if (std.mem.eql(u8, name, "DocumentSqlNativeSearchRequiresTableFunction")) return error.DocumentSqlNativeSearchRequiresTableFunction;
+    if (std.mem.eql(u8, name, "DocumentSqlUnnestRequiresArray")) return error.DocumentSqlUnnestRequiresArray;
     if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return error.UnsupportedSqlShape;
     if (std.mem.eql(u8, name, "InvalidRowsRequest")) return error.InvalidRowsRequest;
+    if (std.mem.eql(u8, name, "InvalidSqlCatalog")) return error.InvalidSqlCatalog;
     return error.InvalidSqlCorpusFixture;
 }
 
@@ -59,4 +86,5 @@ test "document SQL corpus fixture parses" {
     defer parsed.deinit();
     try std.testing.expect(parsed.value.residual_filter_cases.len > 0);
     try std.testing.expect(parsed.value.unsupported_residual_expression_cases.len > 0);
+    try std.testing.expect(parsed.value.document_read_plan_cases.len > 0);
 }

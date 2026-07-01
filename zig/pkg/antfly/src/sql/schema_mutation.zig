@@ -16,6 +16,7 @@ const std = @import("std");
 
 const binder = @import("binder.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_type = @import("expr_type.zig");
 const lower_expr = @import("lower_expr.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_mod = @import("../schema/mod.zig");
@@ -42,10 +43,10 @@ pub fn alterRelationalColumnTypeAlloc(
     }
     if (columns[index].default_value) |default_value| try value_mod.validateDefaultValueForColumnAlloc(alloc, columns[index], default_value);
     if (columns[index].on_update_value) |on_update_value| try value_mod.validateDefaultValueForColumnAlloc(alloc, columns[index], on_update_value);
-    try lower_expr.validateRelationalColumnCatalog(schema.relational_columns);
+    try expr_type.validateRelationalColumnCatalog(schema.relational_columns);
     try binder.validateRelationalPeriodCatalog(schema.relational_columns, schema.periods);
     if (schema.primary_key) |primary_key| {
-        try lower_expr.validatePrimaryKeyColumns(schema.relational_columns, primary_key);
+        try expr_type.validatePrimaryKeyColumns(schema.relational_columns, primary_key);
         try binder.validatePrimaryKeyTemporalCatalog(schema.periods, primary_key);
         if (primary_key.name) |name| {
             if (binder.uniqueConstraintNameExists(schema.unique_constraints, name) or
@@ -56,9 +57,9 @@ pub fn alterRelationalColumnTypeAlloc(
             }
         }
     }
-    try lower_expr.validateUniqueConstraintCatalog(schema.relational_columns, schema.periods, schema.unique_constraints);
-    try lower_expr.validateForeignKeyCatalog(schema.relational_columns, schema.periods, schema.foreign_keys);
-    try lower_expr.validateRelationalCheckCatalog(schema.relational_columns, schema.checks);
+    try expr_type.validateUniqueConstraintCatalog(schema.relational_columns, schema.periods, schema.unique_constraints);
+    try expr_type.validateForeignKeyCatalog(schema.relational_columns, schema.periods, schema.foreign_keys);
+    try expr_type.validateRelationalCheckCatalog(schema.relational_columns, schema.checks);
 }
 
 fn foreignKeyValidationStateString(state: runtime_schema.ForeignKeyValidationState) ![]const u8 {

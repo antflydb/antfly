@@ -1,0 +1,126 @@
+// Copyright 2026 Antfly, Inc.
+//
+// Licensed under the Elastic License 2.0 (ELv2); you may not use this file
+// except in compliance with the Elastic License 2.0. You may obtain a copy of
+// the Elastic License 2.0 at
+//
+//     https://www.antfly.io/licensing/ELv2-license
+//
+// Unless required by applicable law or agreed to in writing, software distributed
+// under the Elastic License 2.0 is distributed on an "AS IS" BASIS, WITHOUT
+// WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied. See the
+// Elastic License 2.0 for the specific language governing permissions and
+// limitations.
+
+const ast = @import("ast.zig");
+const db_mod = @import("../storage/db/mod.zig");
+const generated_parser = @import("generated_parser.zig");
+const grammar = @import("grammar.zig");
+const token_mod = @import("token.zig");
+
+const Token = token_mod.Token;
+
+pub fn sqlRowClaimForClause(clause: ast.SqlRowClaimClause) db_mod.types.RowClaimRequest {
+    return .{
+        .mode = clause.mode,
+        .wait_policy = clause.wait_policy,
+        .skip_locked = clause.wait_policy == .skip_locked,
+    };
+}
+
+pub fn rowClaimModeForGeneratedMode(
+    mode: generated_parser.GeneratedSqlRowLockMode,
+) db_mod.types.RowClaimMode {
+    return switch (mode) {
+        .update => .for_update,
+        .no_key_update => .for_no_key_update,
+        .share => .for_share,
+        .key_share => .for_key_share,
+    };
+}
+
+pub fn rowClaimWaitPolicyForGeneratedPolicy(
+    wait_policy: generated_parser.GeneratedSqlRowLockWaitPolicy,
+) db_mod.types.RowClaimWaitPolicy {
+    return switch (wait_policy) {
+        .wait => .wait,
+        .nowait => .nowait,
+        .skip_locked => .skip_locked,
+    };
+}
+
+pub fn setSqlRowClaimClause(claim: *db_mod.types.RowClaimRequest, clause: ast.SqlRowClaimClause) void {
+    claim.mode = clause.mode;
+    claim.wait_policy = clause.wait_policy;
+    claim.skip_locked = clause.wait_policy == .skip_locked;
+}
+
+pub fn parseGeneratedReadRowClaimForClauseAlloc(
+    alloc: @import("std").mem.Allocator,
+    tokens: []const Token,
+    keyword_index: usize,
+    pos: *usize,
+    allowed_targets: []const []const u8,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?db_mod.types.RowClaimRequest {
+    const read_ast = generated_read_ast orelse return null;
+    if (keyword_index >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.@"for")) return null;
+    const range = read_ast.row_lock_tokens orelse return error.UnsupportedSqlShape;
+    if (range.start != keyword_index or range.start + 1 != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
+
+    const scoped_tokens = tokens[0..range.end];
+    var generated_pos = pos.*;
+    const clause = try grammar.parseCheckedForRowClaimClauseAlloc(alloc, scoped_tokens, &generated_pos, allowed_targets);
+    if (generated_pos != range.end) return error.UnsupportedSqlShape;
+    pos.* = range.end;
+
+    const claim = sqlRowClaimForClause(clause);
+    if (rowClaimModeForGeneratedMode(read_ast.row_lock_mode orelse return error.UnsupportedSqlShape) != claim.mode or
+        rowClaimWaitPolicyForGeneratedPolicy(read_ast.row_lock_wait_policy orelse return error.UnsupportedSqlShape) != claim.wait_policy)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    return claim;
+}
+
+pub fn sqlRowClaimModeName(mode: db_mod.types.RowClaimMode) []const u8 {
+    return switch (mode) {
+        .for_update => "for_update",
+        .for_no_key_update => "for_no_key_update",
+        .for_share => "for_share",
+        .for_key_share => "for_key_share",
+    };
+}
+
+pub fn sqlRowClaimWaitPolicyName(wait_policy: db_mod.types.RowClaimWaitPolicy) []const u8 {
+    return switch (wait_policy) {
+        .wait => "wait",
+        .nowait => "nowait",
+        .skip_locked => "skip_locked",
+    };
+}
+
+pub fn sqlRowClaimFingerprintName(claim: db_mod.types.RowClaimRequest) []const u8 {
+    return switch (claim.mode) {
+        .for_update => switch (claim.effectiveWaitPolicy()) {
+            .wait => "locked",
+            .nowait => "nowait",
+            .skip_locked => "skip_locked",
+        },
+        .for_no_key_update => switch (claim.effectiveWaitPolicy()) {
+            .wait => "no_key_update",
+            .nowait => "no_key_update_nowait",
+            .skip_locked => "no_key_update_skip_locked",
+        },
+        .for_share => switch (claim.effectiveWaitPolicy()) {
+            .wait => "share",
+            .nowait => "share_nowait",
+            .skip_locked => "share_skip_locked",
+        },
+        .for_key_share => switch (claim.effectiveWaitPolicy()) {
+            .wait => "key_share",
+            .nowait => "key_share_nowait",
+            .skip_locked => "key_share_skip_locked",
+        },
+    };
+}

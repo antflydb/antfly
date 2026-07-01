@@ -13,6 +13,7 @@
 // limitations.
 
 const http_server = @import("api/http_server.zig");
+const api_distributed_txn = @import("api/distributed_txn.zig");
 const pgwire = @import("pgwire/mod.zig");
 const sql_adapter_integration = @import("api/sql_adapter_integration.zig");
 const relational_rows = @import("sql/relational_rows.zig");
@@ -29,10 +30,13 @@ const metadata_reconciler = @import("metadata/reconciler.zig");
 const metadata_placement_planner = @import("metadata/placement_planner.zig");
 const metadata_table_manager = @import("metadata/table_manager.zig");
 const metadata_catalog_jobs = @import("metadata/catalog/jobs.zig");
+const metadata_catalog_routing = @import("metadata/catalog/routing.zig");
+const table_writes_integrity = @import("api/table_writes/integrity.zig");
 const table_writes_schema_jobs = @import("api/table_writes/schema_jobs.zig");
 
 test {
     _ = http_server;
+    _ = api_distributed_txn;
     _ = pgwire;
     _ = sql_adapter_integration;
     _ = relational_rows;
@@ -49,5 +53,7 @@ test {
     _ = metadata_placement_planner;
     _ = metadata_table_manager;
     _ = metadata_catalog_jobs;
+    _ = metadata_catalog_routing;
+    _ = table_writes_integrity;
     _ = table_writes_schema_jobs;
 }

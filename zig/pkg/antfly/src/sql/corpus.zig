@@ -30,6 +30,8 @@ const plan_mod = @import("plan.zig");
 const query_contract = @import("../query/contract.zig");
 const raft_reconciler = @import("../raft/reconciler.zig");
 const runtime_schema = @import("../storage/schema.zig");
+const row_claim = @import("row_claim.zig");
+const select_set = @import("select_set.zig");
 const schema_api = @import("../schema/mod.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
 const token_mod = @import("token.zig");
@@ -59,8 +61,8 @@ const aggregateInputExpressionCount = lower_expr.aggregateInputExpressionCount;
 const aggregateModeCount = lower_expr.aggregateModeCount;
 const aggregatePercentileArrayCount = lower_expr.aggregatePercentileArrayCount;
 const expressionOrderCount = lower_expr.expressionOrderCount;
-const sqlRowClaimFingerprintName = lower_expr.sqlRowClaimFingerprintName;
-const sourceQueryUsesExtendedPredicates = lower_expr.sourceQueryUsesExtendedPredicates;
+const sqlRowClaimFingerprintName = row_claim.sqlRowClaimFingerprintName;
+const sourceQueryUsesExtendedPredicates = select_set.sourceQueryUsesExtendedPredicates;
 const windowDefaultCount = lower_expr.windowDefaultCount;
 const windowFilterAccessCount = lower_expr.windowFilterAccessCount;
 const windowFilterExpressionCount = lower_expr.windowFilterExpressionCount;
@@ -720,6 +722,7 @@ pub const app_parity_coverage_fixture_format: u64 = 1;
 pub const app_parity_coverage_regression_requirement_fixture_format: u64 = 1;
 pub const app_parity_native_requirement_fixture_format: u64 = 1;
 pub const app_parity_resolved_requirement_fixture_format: u64 = 1;
+pub const app_parity_unsupported_reason_fixture_format: u64 = 1;
 pub const app_parity_summary_assertion_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
@@ -756,6 +759,11 @@ pub const AppParityNativeRequirementRoot = struct {
     required: []const []const u8,
 };
 
+pub const AppParityUnsupportedReasonRoot = struct {
+    reason_format: u64,
+    required: []const []const u8,
+};
+
 pub const AppParityResolvedRequirement = struct {
     reason: []const u8,
     coverage: []const []const u8,
@@ -772,6 +780,16 @@ pub const AppParityNativeRequirements = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeNativeRequirementRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const AppParityUnsupportedReasons = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: AppParityUnsupportedReasonRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeUnsupportedReasonRoot(alloc, self.root);
         self.parsed.deinit();
     }
 };
@@ -906,6 +924,55 @@ pub fn parseAppParityNativeRequirementsAlloc(alloc: std.mem.Allocator) !AppParit
 
     const root = try parseNativeRequirementRootAlloc(alloc, parsed.value);
     errdefer freeNativeRequirementRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+pub fn parseUnsupportedReasonRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !AppParityUnsupportedReasonRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "reason_format", "required" });
+    const reason_format = try fixtureJsonOptionalU64(root, "reason_format", 0);
+    if (reason_format != app_parity_unsupported_reason_fixture_format) return error.TestUnexpectedResult;
+    const required = try parseFixtureStringListAlloc(alloc, root, "required");
+    errdefer if (required.len > 0) alloc.free(required);
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+    for (required, 0..) |name, i| {
+        if (name.len == 0 or seen.contains(name) or !diagnostics.classificationReasonTokenIsKnown(name)) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, required[i - 1], name)) return error.TestUnexpectedResult;
+        try seen.put(alloc, name, {});
+    }
+
+    return .{
+        .reason_format = reason_format,
+        .required = required,
+    };
+}
+
+pub fn freeUnsupportedReasonRoot(
+    alloc: std.mem.Allocator,
+    root: AppParityUnsupportedReasonRoot,
+) void {
+    if (root.required.len > 0) alloc.free(root.required);
+}
+
+pub fn parseAppParityUnsupportedReasonsAlloc(alloc: std.mem.Allocator) !AppParityUnsupportedReasons {
+    const reason_json = @embedFile("fixtures/sql_api_required_unsupported_reasons.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, reason_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseUnsupportedReasonRootAlloc(alloc, parsed.value);
+    errdefer freeUnsupportedReasonRoot(alloc, root);
 
     return .{
         .parsed = parsed,
@@ -2061,6 +2128,238 @@ fn freeSqlAdapterEdgeCase(
 ) void {
     if (edge_case.coverage.len > 0) alloc.free(edge_case.coverage);
     if (edge_case.params.len > 0) alloc.free(edge_case.params);
+}
+
+pub const AppParityCoverageReport = struct {
+    missing: []const []const u8 = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.missing.len > 0) alloc.free(self.missing);
+        self.* = .{};
+    }
+};
+
+pub fn appParityCoverageReportAlloc(
+    alloc: std.mem.Allocator,
+    coverage: AppParityCorpusCoverage,
+    required: []const []const u8,
+) !AppParityCoverageReport {
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var missing = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer missing.deinit(alloc);
+    for (required) |name| {
+        if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
+            try missing.append(alloc, name);
+        }
+    }
+
+    return .{ .missing = try missing.toOwnedSlice(alloc) };
+}
+
+pub const AppParityCoverageArtifactKind = enum {
+    parser,
+    binder,
+    lowering,
+    runtime,
+    native_parity,
+};
+
+pub const AppParityCoverageArtifactGap = struct {
+    bucket: []const u8,
+    artifact: AppParityCoverageArtifactKind,
+};
+
+pub const AppParityCoverageArtifactReport = struct {
+    missing: []const AppParityCoverageArtifactGap = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.missing.len > 0) alloc.free(self.missing);
+        self.* = .{};
+    }
+};
+
+pub const AppParityCoverageNextAction = struct {
+    bucket: []const u8,
+    artifact: AppParityCoverageArtifactKind,
+    feature: []const u8,
+    file_path: []const u8,
+    fixture_path: []const u8,
+    test_target: []const u8,
+};
+
+pub const AppParityCoverageNextActionReport = struct {
+    missing: []const AppParityCoverageNextAction = &.{},
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.missing.len > 0) alloc.free(self.missing);
+        self.* = .{};
+    }
+};
+
+fn appParityResolvedRequirementsContainCoverage(
+    resolved: []const AppParityResolvedRequirement,
+    bucket: []const u8,
+) bool {
+    for (resolved) |item| {
+        if (stringListContains(item.coverage, bucket)) return true;
+    }
+    return false;
+}
+
+pub fn appParityCoverageArtifactForBucket(
+    bucket: []const u8,
+    resolved: []const AppParityResolvedRequirement,
+) !AppParityCoverageArtifactKind {
+    if (!appParityCoverageRequirementKnown(bucket)) return error.TestUnexpectedResult;
+    if (appParityResolvedRequirementsContainCoverage(resolved, bucket)) return .native_parity;
+    if (std.mem.startsWith(u8, bucket, "bound_")) return .binder;
+    if (std.mem.startsWith(u8, bucket, "applied_") or
+        std.mem.endsWith(u8, bucket, "_execution_contract") or
+        std.mem.eql(u8, bucket, "deterministic_returning_rows") or
+        std.mem.eql(u8, bucket, "session_set_runtime_setting"))
+    {
+        return .runtime;
+    }
+    if (std.mem.startsWith(u8, bucket, "invalid_") or
+        std.mem.startsWith(u8, bucket, "unsupported_") or
+        std.mem.startsWith(u8, bucket, "write_plan_") or
+        std.mem.endsWith(u8, bucket, "_plan"))
+    {
+        return .lowering;
+    }
+    return .parser;
+}
+
+pub fn appParityCoverageArtifactReportAlloc(
+    alloc: std.mem.Allocator,
+    coverage: AppParityCorpusCoverage,
+    required: []const []const u8,
+    resolved: []const AppParityResolvedRequirement,
+) !AppParityCoverageArtifactReport {
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var missing = std.ArrayListUnmanaged(AppParityCoverageArtifactGap).empty;
+    errdefer missing.deinit(alloc);
+    for (required) |name| {
+        if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
+            try missing.append(alloc, .{
+                .bucket = name,
+                .artifact = try appParityCoverageArtifactForBucket(name, resolved),
+            });
+        }
+    }
+
+    return .{ .missing = try missing.toOwnedSlice(alloc) };
+}
+
+fn appParityCoverageFeatureForBucket(bucket: []const u8) []const u8 {
+    if (std.mem.startsWith(u8, bucket, "bound_catalog_")) return "catalog_binding";
+    if (std.mem.startsWith(u8, bucket, "write_plan_insert_")) return "write_plan_insert";
+    if (std.mem.startsWith(u8, bucket, "write_plan_update_")) return "write_plan_update";
+    if (std.mem.startsWith(u8, bucket, "read_recursive_cte_")) return "read_recursive_cte";
+    if (std.mem.startsWith(u8, bucket, "ddl_cast_")) return "ddl_cast";
+    if (std.mem.startsWith(u8, bucket, "ddl_copy_")) return "ddl_copy";
+    if (std.mem.eql(u8, bucket, "deterministic_returning_rows")) return "returning_rows";
+
+    var underscores: usize = 0;
+    for (bucket, 0..) |ch, i| {
+        if (ch == '_') {
+            underscores += 1;
+            if (underscores == 2) return bucket[0..i];
+        }
+    }
+    return bucket;
+}
+
+fn appParityCoverageActionFilePath(
+    bucket: []const u8,
+    artifact: AppParityCoverageArtifactKind,
+) []const u8 {
+    return switch (artifact) {
+        .parser => "zig/pkg/antfly/src/sql/grammar/antfly_sql.y",
+        .binder => "zig/pkg/antfly/src/sql/binder.zig",
+        .lowering => if (std.mem.startsWith(u8, bucket, "write_plan_"))
+            "zig/pkg/antfly/src/sql/lower_dml.zig"
+        else if (std.mem.startsWith(u8, bucket, "ddl_"))
+            "zig/pkg/antfly/src/sql/ddl_plan.zig"
+        else
+            "zig/pkg/antfly/src/sql/plan.zig",
+        .runtime => if (std.mem.startsWith(u8, bucket, "applied_"))
+            "zig/pkg/antfly/src/sql/catalog_apply.zig"
+        else
+            "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        .native_parity => "zig/pkg/antfly/src/sql/fixtures/sql_api_resolved_native_requirements.json",
+    };
+}
+
+fn appParityCoverageActionFixturePath(artifact: AppParityCoverageArtifactKind) []const u8 {
+    return switch (artifact) {
+        .binder => "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+        .native_parity => "zig/pkg/antfly/src/sql/fixtures/sql_api_resolved_native_requirements.json",
+        else => "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_corpus.json",
+    };
+}
+
+fn appParityCoverageActionTestTarget(artifact: AppParityCoverageArtifactKind) []const u8 {
+    return switch (artifact) {
+        .native_parity => "zig build api-table-reads-test -- --test-filter \"sql adapter source corpus covers resolved native requirements with positive typed plans\"",
+        else => "zig build api-table-reads-test -- --test-filter \"sql adapter corpus parses data-driven coverage requirements\"",
+    };
+}
+
+pub fn appParityCoverageNextActionReportAlloc(
+    alloc: std.mem.Allocator,
+    coverage: AppParityCorpusCoverage,
+    required: []const []const u8,
+    resolved: []const AppParityResolvedRequirement,
+) !AppParityCoverageNextActionReport {
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var missing = std.ArrayListUnmanaged(AppParityCoverageNextAction).empty;
+    errdefer missing.deinit(alloc);
+    for (required) |name| {
+        if (!try appParityCoverageRequirementSatisfied(coverage, name)) {
+            const artifact = try appParityCoverageArtifactForBucket(name, resolved);
+            try missing.append(alloc, .{
+                .bucket = name,
+                .artifact = artifact,
+                .feature = appParityCoverageFeatureForBucket(name),
+                .file_path = appParityCoverageActionFilePath(name, artifact),
+                .fixture_path = appParityCoverageActionFixturePath(artifact),
+                .test_target = appParityCoverageActionTestTarget(artifact),
+            });
+        }
+    }
+
+    return .{ .missing = try missing.toOwnedSlice(alloc) };
+}
+
+fn printAppParityCoverageNextAction(action: AppParityCoverageNextAction) void {
+    std.debug.print(
+        "missing app parity coverage: bucket={s} artifact={s} feature={s} file={s} fixture={s} test={s}\n",
+        .{
+            action.bucket,
+            @tagName(action.artifact),
+            action.feature,
+            action.file_path,
+            action.fixture_path,
+            action.test_target,
+        },
+    );
+}
+
+pub fn expectAppParityCoverageRequirementsWithReportAlloc(
+    alloc: std.mem.Allocator,
+    coverage: AppParityCorpusCoverage,
+    required: []const []const u8,
+    resolved: []const AppParityResolvedRequirement,
+) !void {
+    var report = try appParityCoverageNextActionReportAlloc(alloc, coverage, required, resolved);
+    defer report.deinit(alloc);
+    if (report.missing.len == 0) return;
+    for (report.missing) |action| printAppParityCoverageNextAction(action);
+    return error.TestUnexpectedResult;
 }
 
 pub fn expectAppParityCoverageRequirements(
@@ -3704,7 +4003,8 @@ pub fn corpusFixtureAllowsPredicateSummary(entry: AppParityCorpusEntry) bool {
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
             corpusReadPlanHasPrefix(entry, "read:window:") or
-            corpusReadPlanHasPrefix(entry, "read:set_operation:"),
+            corpusReadPlanHasPrefix(entry, "read:set_operation:") or
+            corpusReadPlanHasPrefix(entry, "read:recursive_cte:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
@@ -3778,7 +4078,8 @@ pub fn corpusFixtureAllowsAccessSummary(entry: AppParityCorpusEntry) bool {
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
             corpusReadPlanHasPrefix(entry, "read:window:") or
-            corpusReadPlanHasPrefix(entry, "read:set_operation:"),
+            corpusReadPlanHasPrefix(entry, "read:set_operation:") or
+            corpusReadPlanHasPrefix(entry, "read:recursive_cte:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
@@ -4040,7 +4341,8 @@ pub fn corpusFixtureAllowsPaginationSummary(entry: AppParityCorpusEntry) bool {
             corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusReadPlanHasPrefix(entry, "read:lateral:") or
             corpusReadPlanHasPrefix(entry, "read:window:") or
-            corpusReadPlanHasPrefix(entry, "read:set_operation:"),
+            corpusReadPlanHasPrefix(entry, "read:set_operation:") or
+            corpusReadPlanHasPrefix(entry, "read:recursive_cte:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
             corpusReadPlanHasPrefix(entry, "read:join:") or
@@ -4074,12 +4376,13 @@ fn corpusFixtureUsesSourcePagination(entry: AppParityCorpusEntry) bool {
 pub fn corpusFixturePaginationSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
     const source_pagination = corpusFixtureUsesSourcePagination(entry);
     const result_pagination = corpusFixtureUsesSetOperationResultPagination(entry);
+    const final_query_pagination = corpusFixtureUsesRecursiveCteFinalPagination(entry);
     if (entry.summary.order_by) |order_by| {
-        const token_text = if (source_pagination) ":source_order=" else if (result_pagination) ":result_order=" else ":order=";
+        const token_text = if (source_pagination) ":source_order=" else if (result_pagination) ":result_order=" else if (final_query_pagination) ":final_order=" else ":order=";
         if (!planHasExactUsizeToken(entry.plan, token_text, order_by)) return false;
     }
     if (entry.summary.limit) |limit| {
-        const token_text = if (source_pagination) ":source_limit=" else if (result_pagination) ":result_limit=" else ":limit=";
+        const token_text = if (source_pagination) ":source_limit=" else if (result_pagination) ":result_limit=" else if (final_query_pagination) ":final_limit=" else ":limit=";
         if (!planHasExactUsizeToken(entry.plan, token_text, limit)) return false;
     }
     if (entry.summary.offset) |offset| {
@@ -4091,6 +4394,10 @@ pub fn corpusFixturePaginationSummaryMatchesPlan(entry: AppParityCorpusEntry) bo
 
 fn corpusFixtureUsesSetOperationResultPagination(entry: AppParityCorpusEntry) bool {
     return corpusReadPlanHasPrefix(entry, "read:set_operation:");
+}
+
+fn corpusFixtureUsesRecursiveCteFinalPagination(entry: AppParityCorpusEntry) bool {
+    return corpusReadPlanHasPrefix(entry, "read:recursive_cte:");
 }
 
 pub fn corpusFixtureAllowsRowClaimSummary(entry: AppParityCorpusEntry) bool {
@@ -5122,12 +5429,16 @@ pub fn recursiveCteFingerprintAlloc(alloc: std.mem.Allocator, recursive_cte: Low
     defer alloc.free(member);
     return try std.fmt.allocPrint(
         alloc,
-        "recursive_cte:name={s}:op={s}:anchor={s}:member={s}:outputs={d}:self_ref={}:max_rows={d}:max_bytes={d}:spill_after={d}",
+        "recursive_cte:name={s}:op={s}:anchor={s}:member={s}:final_pred={d}:final_select={d}:final_order={d}:final_limit={d}:outputs={d}:self_ref={}:max_rows={d}:max_bytes={d}:spill_after={d}",
         .{
             recursive_cte.cte_name,
             @tagName(recursive_cte.operation),
             anchor,
             member,
+            recursive_cte.final_query.predicates.len,
+            recursive_cte.final_query.select.len,
+            recursive_cte.final_query.order_by.len,
+            appParityLimitValue(recursive_cte.final_query.limit),
             recursive_cte.output_columns.len,
             recursive_cte.recursive_member_references_cte,
             recursive_cte.max_rows orelse 0,
@@ -5885,6 +6196,44 @@ test "sql adapter source corpus covers required native requirement classificatio
     try expectSourceCorpusNativeRequirements(alloc, source.root.entries, requirements.root.required, resolved.root.resolved);
 }
 
+fn expectSourceCorpusUnsupportedReasons(
+    alloc: std.mem.Allocator,
+    entries: []const AppParityCorpusEntry,
+    required: []const []const u8,
+) !void {
+    if (required.len == 0) return error.TestUnexpectedResult;
+
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entries) |entry| {
+        if (entry.classification_reason.len == 0) continue;
+        if (!diagnostics.classificationReasonTokenIsKnown(entry.classification_reason)) return error.TestUnexpectedResult;
+        if (!stringListContains(required, entry.classification_reason)) {
+            std.debug.print("unlisted source corpus unsupported reason: {s}\n", .{entry.classification_reason});
+            return error.TestUnexpectedResult;
+        }
+        try seen.put(alloc, entry.classification_reason, {});
+    }
+
+    for (required) |name| {
+        if (!seen.contains(name)) {
+            std.debug.print("missing source corpus unsupported reason: {s}\n", .{name});
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "sql adapter source corpus covers required unsupported classification reasons" {
+    const alloc = std.testing.allocator;
+    var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer source.deinit(alloc);
+    var reasons = try parseAppParityUnsupportedReasonsAlloc(alloc);
+    defer reasons.deinit(alloc);
+
+    try expectSourceCorpusUnsupportedReasons(alloc, source.root.entries, reasons.root.required);
+}
+
 test "sql adapter corpus validates native requirement manifest" {
     const alloc = std.testing.allocator;
     var requirements = try parseAppParityNativeRequirementsAlloc(alloc);
@@ -5955,6 +6304,58 @@ test "sql adapter corpus validates native requirement manifest" {
             &.{"aggregate_duplicate_output_name"},
             &.{.{ .reason = "bulk_io_plan", .coverage = &.{"ddl_copy_from_execution_contract"} }},
         ),
+    );
+}
+
+test "sql adapter corpus validates unsupported reason manifest" {
+    const alloc = std.testing.allocator;
+    var reasons = try parseAppParityUnsupportedReasonsAlloc(alloc);
+    defer reasons.deinit(alloc);
+    try std.testing.expectEqual(app_parity_unsupported_reason_fixture_format, reasons.root.reason_format);
+    try std.testing.expect(reasons.root.required.len > 0);
+
+    const unknown_json =
+        \\{
+        \\  "reason_format": 1,
+        \\  "required": [
+        \\    "bulk_io_plan",
+        \\    "not_a_reason"
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown = try std.json.parseFromSlice(std.json.Value, alloc, unknown_json, .{});
+    defer parsed_unknown.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseUnsupportedReasonRootAlloc(alloc, parsed_unknown.value));
+
+    const unsorted_json =
+        \\{
+        \\  "reason_format": 1,
+        \\  "required": [
+        \\    "duplicate_row_batch_target",
+        \\    "bulk_io_plan"
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
+    defer parsed_unsorted.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseUnsupportedReasonRootAlloc(alloc, parsed_unsorted.value));
+
+    const entries = [_]AppParityCorpusEntry{
+        .{
+            .name = "unsupported bulk",
+            .family = .unsupported_ddl,
+            .classification_reason = "bulk_io_plan",
+            .plan = "unsupported:ddl:requires=bulk_io_plan",
+            .sql = "COPY usage_records FROM STDIN",
+        },
+    };
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectSourceCorpusUnsupportedReasons(alloc, &entries, &.{ "bulk_io_plan", "duplicate_row_batch_target" }),
+    );
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectSourceCorpusUnsupportedReasons(alloc, &entries, &.{"duplicate_row_batch_target"}),
     );
 }
 
@@ -7017,6 +7418,90 @@ test "sql adapter corpus parses data-driven coverage requirements" {
     try std.testing.expect(try appParityCoverageRequirementSatisfied(coverage, "deterministic_returning_rows"));
     coverage.deterministic_returning_rows = 0;
     try std.testing.expect(!try appParityCoverageRequirementSatisfied(coverage, "deterministic_returning_rows"));
+    var report = try appParityCoverageReportAlloc(alloc, coverage, &.{ "deterministic_returning_rows", "query" });
+    defer report.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), report.missing.len);
+    try std.testing.expectEqualStrings("deterministic_returning_rows", report.missing[0]);
+    try std.testing.expectError(error.TestUnexpectedResult, appParityCoverageReportAlloc(alloc, coverage, &.{}));
+
+    const resolved_native = [_]AppParityResolvedRequirement{.{
+        .reason = "recursive_cte_stream_plan",
+        .coverage = &.{"read_recursive_cte_stream_plan"},
+    }};
+    var artifact_report = try appParityCoverageArtifactReportAlloc(
+        alloc,
+        .{},
+        &.{
+            "ddl_cast_create",
+            "bound_catalog_read_source",
+            "deterministic_returning_rows",
+            "write_plan_insert_op_set",
+            "read_recursive_cte_stream_plan",
+        },
+        &resolved_native,
+    );
+    defer artifact_report.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), artifact_report.missing.len);
+    try std.testing.expectEqualStrings("ddl_cast_create", artifact_report.missing[0].bucket);
+    try std.testing.expectEqual(AppParityCoverageArtifactKind.parser, artifact_report.missing[0].artifact);
+    try std.testing.expectEqualStrings("bound_catalog_read_source", artifact_report.missing[1].bucket);
+    try std.testing.expectEqual(AppParityCoverageArtifactKind.binder, artifact_report.missing[1].artifact);
+    try std.testing.expectEqualStrings("deterministic_returning_rows", artifact_report.missing[2].bucket);
+    try std.testing.expectEqual(AppParityCoverageArtifactKind.runtime, artifact_report.missing[2].artifact);
+    try std.testing.expectEqualStrings("write_plan_insert_op_set", artifact_report.missing[3].bucket);
+    try std.testing.expectEqual(AppParityCoverageArtifactKind.lowering, artifact_report.missing[3].artifact);
+    try std.testing.expectEqualStrings("read_recursive_cte_stream_plan", artifact_report.missing[4].bucket);
+    try std.testing.expectEqual(AppParityCoverageArtifactKind.native_parity, artifact_report.missing[4].artifact);
+    try std.testing.expectError(error.TestUnexpectedResult, appParityCoverageArtifactReportAlloc(alloc, .{}, &.{}, &.{}));
+
+    var next_actions = try appParityCoverageNextActionReportAlloc(
+        alloc,
+        .{},
+        &.{
+            "ddl_cast_create",
+            "bound_catalog_read_source",
+            "deterministic_returning_rows",
+            "write_plan_insert_op_set",
+            "read_recursive_cte_stream_plan",
+        },
+        &resolved_native,
+    );
+    defer next_actions.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 5), next_actions.missing.len);
+    try std.testing.expectEqualStrings("ddl_cast", next_actions.missing[0].feature);
+    try std.testing.expectEqualStrings("zig/pkg/antfly/src/sql/grammar/antfly_sql.y", next_actions.missing[0].file_path);
+    try std.testing.expectEqualStrings("catalog_binding", next_actions.missing[1].feature);
+    try std.testing.expectEqualStrings("zig/pkg/antfly/src/sql/binder.zig", next_actions.missing[1].file_path);
+    try std.testing.expectEqualStrings("zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json", next_actions.missing[1].fixture_path);
+    try std.testing.expectEqualStrings("returning_rows", next_actions.missing[2].feature);
+    try std.testing.expectEqualStrings("zig/pkg/antfly/src/api/sql_adapter_integration.zig", next_actions.missing[2].file_path);
+    try std.testing.expectEqualStrings("write_plan_insert", next_actions.missing[3].feature);
+    try std.testing.expectEqualStrings("zig/pkg/antfly/src/sql/lower_dml.zig", next_actions.missing[3].file_path);
+    try std.testing.expectEqualStrings("read_recursive_cte", next_actions.missing[4].feature);
+    try std.testing.expectEqualStrings("zig/pkg/antfly/src/sql/fixtures/sql_api_resolved_native_requirements.json", next_actions.missing[4].file_path);
+    try std.testing.expectEqualStrings(
+        "zig build api-table-reads-test -- --test-filter \"sql adapter source corpus covers resolved native requirements with positive typed plans\"",
+        next_actions.missing[4].test_target,
+    );
+    try std.testing.expectError(error.TestUnexpectedResult, appParityCoverageNextActionReportAlloc(alloc, .{}, &.{}, &.{}));
+    try std.testing.expectError(
+        error.TestUnexpectedResult,
+        expectAppParityCoverageRequirementsWithReportAlloc(
+            alloc,
+            .{},
+            &.{ "deterministic_returning_rows", "query" },
+            &resolved_native,
+        ),
+    );
+    try expectAppParityCoverageRequirementsWithReportAlloc(
+        alloc,
+        .{
+            .query = true,
+            .deterministic_returning_rows = 1,
+        },
+        &.{ "deterministic_returning_rows", "query" },
+        &resolved_native,
+    );
 
     const invalid_json =
         \\{
@@ -7931,6 +8416,16 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
+    unsupported_ddl_table_access_method: bool = false,
+    unsupported_ddl_table_cluster_on: bool = false,
+    unsupported_ddl_table_cluster_without: bool = false,
+    unsupported_ddl_table_owner: bool = false,
+    unsupported_ddl_table_persistence: bool = false,
+    unsupported_ddl_table_storage_parameters: bool = false,
+    unsupported_ddl_table_storage_parameters_reset: bool = false,
+    unsupported_ddl_table_tablespace: bool = false,
+    unsupported_ddl_table_trigger_disable: bool = false,
+    unsupported_ddl_table_trigger_enable: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     ddl_temporal_fk_update_cascade_action: bool = false,
@@ -7959,6 +8454,7 @@ pub const AppParityCorpusCoverage = struct {
     invalid_delete: bool = false,
     invalid_delete_multi_output_subquery_selector: bool = false,
     unsupported_insert: bool = false,
+    unsupported_insert_overriding_value: bool = false,
     invalid_read_row_lock_target: bool = false,
     invalid_update_source_row_lock_mode: bool = false,
     invalid_update_source_row_lock_target: bool = false,
@@ -9292,7 +9788,11 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
             .unsupported_write => {},
-            .unsupported_insert => self.unsupported_insert = true,
+            .unsupported_insert => {
+                self.unsupported_insert = true;
+                self.unsupported_insert_overriding_value = self.unsupported_insert_overriding_value or
+                    std.mem.eql(u8, entry.classification_reason, "insert_overriding_value_plan");
+            },
             .unsupported_update => {},
             .unsupported_update_source => {},
             .unsupported_delete => {},
@@ -9415,6 +9915,48 @@ pub const AppParityCorpusCoverage = struct {
                 (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
                     appParityTokensStartWithKeyword(sql_tokens, .copy) and
                     appParityTokensHaveKeyword(sql_tokens, .oids));
+            self.unsupported_ddl_table_access_method = self.unsupported_ddl_table_access_method or
+                (std.mem.eql(u8, entry.classification_reason, "table_access_method_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .access, .method }));
+            self.unsupported_ddl_table_cluster_on = self.unsupported_ddl_table_cluster_on or
+                (std.mem.eql(u8, entry.classification_reason, "table_cluster_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .cluster, .on }));
+            self.unsupported_ddl_table_cluster_without = self.unsupported_ddl_table_cluster_without or
+                (std.mem.eql(u8, entry.classification_reason, "table_cluster_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .without, .cluster }));
+            self.unsupported_ddl_table_owner = self.unsupported_ddl_table_owner or
+                (std.mem.eql(u8, entry.classification_reason, "table_owner_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeyword(sql_tokens, .to));
+            self.unsupported_ddl_table_persistence = self.unsupported_ddl_table_persistence or
+                (std.mem.eql(u8, entry.classification_reason, "table_persistence_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .unlogged }));
+            self.unsupported_ddl_table_storage_parameters = self.unsupported_ddl_table_storage_parameters or
+                (std.mem.eql(u8, entry.classification_reason, "table_storage_parameters_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeyword(sql_tokens, .set));
+            self.unsupported_ddl_table_storage_parameters_reset = self.unsupported_ddl_table_storage_parameters_reset or
+                (std.mem.eql(u8, entry.classification_reason, "table_storage_parameters_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeyword(sql_tokens, .reset));
+            self.unsupported_ddl_table_tablespace = self.unsupported_ddl_table_tablespace or
+                (std.mem.eql(u8, entry.classification_reason, "table_tablespace_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .tablespace }));
+            self.unsupported_ddl_table_trigger_disable = self.unsupported_ddl_table_trigger_disable or
+                (std.mem.eql(u8, entry.classification_reason, "table_trigger_state_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveIdentifier(sql_tokens, "disable") and
+                    appParityTokensHaveKeyword(sql_tokens, .trigger));
+            self.unsupported_ddl_table_trigger_enable = self.unsupported_ddl_table_trigger_enable or
+                (std.mem.eql(u8, entry.classification_reason, "table_trigger_state_plan") and
+                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
+                    appParityTokensHaveIdentifier(sql_tokens, "enable") and
+                    appParityTokensHaveKeyword(sql_tokens, .trigger));
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {

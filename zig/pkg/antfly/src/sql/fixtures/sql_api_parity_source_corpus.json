@@ -5619,6 +5619,18 @@
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' ORDER BY id USING < LIMIT 5 OFFSET 2"
     },
     {
+      "name": "query chained union all set operation ordered page",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=3:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE status = 'closed' UNION ALL SELECT id FROM usage_records WHERE status = 'pending' ORDER BY id ASC LIMIT 5"
+    },
+    {
       "name": "query union all set operation fetch tail",
       "family": "read",
       "summary": {
@@ -6456,8 +6468,20 @@
         "table_name": "usage_records",
         "select": 1
       },
-      "plan": "read:recursive_cte:recursive_cte:name=usage_tree:op=union_all:anchor=anchor:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:member=recursive_member_join:type=inner:left=usage_records:right=usage_tree:on=1:projections=1:outputs=1:self_ref=true:max_rows=65536:max_bytes=67108864:spill_after=67108864",
+      "plan": "read:recursive_cte:recursive_cte:name=usage_tree:op=union_all:anchor=anchor:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:member=recursive_member_join:type=inner:left=usage_records:right=usage_tree:on=1:projections=1:final_pred=0:final_select=1:final_order=0:final_limit=-1:outputs=1:self_ref=true:max_rows=65536:max_bytes=67108864:spill_after=67108864",
       "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree"
+    },
+    {
+      "name": "recursive cte read ordered page",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "select": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:recursive_cte:recursive_cte:name=usage_tree:op=union_all:anchor=anchor:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:member=recursive_member_join:type=inner:left=usage_records:right=usage_tree:on=1:projections=1:final_pred=0:final_select=1:final_order=1:final_limit=5:outputs=1:self_ref=true:max_rows=65536:max_bytes=67108864:spill_after=67108864",
+      "sql": "WITH RECURSIVE usage_tree AS (SELECT id FROM usage_records UNION ALL SELECT child.id FROM usage_records AS child JOIN usage_tree AS parent ON child.organization_id = parent.id) SELECT id FROM usage_tree ORDER BY id ASC LIMIT 5"
     },
     {
       "name": "single table json expression order key query",
@@ -6548,6 +6572,19 @@
       },
       "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=0:having=0:order=0:limit=-1:percentile_desc=1",
       "sql": "SELECT customer_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC) AS median_amount FROM usage_records GROUP BY customer_id"
+    },
+    {
+      "name": "ordered-set filtered percentile aggregate ordered page",
+      "family": "aggregate",
+      "summary": {
+        "table_name": "usage_records",
+        "group_by": 1,
+        "aggregations": 1,
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "aggregate:table=usage_records:source_pred=0:source_json_eq=0:group=1:group_expr=0:aggs=1:agg_expr=0:filter_expr=1:having=0:order=1:limit=5:percentile_desc=1",
+      "sql": "SELECT customer_id, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC) FILTER (WHERE lower(status) = 'open') AS open_median FROM usage_records GROUP BY customer_id ORDER BY open_median DESC LIMIT 5"
     },
     {
       "name": "ordered-set percentile discrete aggregate",
@@ -9116,6 +9153,76 @@
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
     {
+      "name": "unsupported alter table access method",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_access_method_plan",
+      "classification_reason": "table_access_method_plan",
+      "sql": "ALTER TABLE usage_records SET ACCESS METHOD heap"
+    },
+    {
+      "name": "unsupported alter table cluster on",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_cluster_plan",
+      "classification_reason": "table_cluster_plan",
+      "sql": "ALTER TABLE usage_records CLUSTER ON usage_status_idx"
+    },
+    {
+      "name": "unsupported alter table owner",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_owner_plan",
+      "classification_reason": "table_owner_plan",
+      "sql": "ALTER TABLE usage_records OWNER TO app_role"
+    },
+    {
+      "name": "unsupported alter table set without cluster",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_cluster_plan",
+      "classification_reason": "table_cluster_plan",
+      "sql": "ALTER TABLE usage_records SET WITHOUT CLUSTER"
+    },
+    {
+      "name": "unsupported alter table persistence",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_persistence_plan",
+      "classification_reason": "table_persistence_plan",
+      "sql": "ALTER TABLE usage_records SET UNLOGGED"
+    },
+    {
+      "name": "unsupported alter table storage parameters",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_storage_parameters_plan",
+      "classification_reason": "table_storage_parameters_plan",
+      "sql": "ALTER TABLE usage_records SET (fillfactor = 70)"
+    },
+    {
+      "name": "unsupported alter table reset storage parameters",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_storage_parameters_plan",
+      "classification_reason": "table_storage_parameters_plan",
+      "sql": "ALTER TABLE usage_records RESET (fillfactor)"
+    },
+    {
+      "name": "unsupported alter table tablespace",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_tablespace_plan",
+      "classification_reason": "table_tablespace_plan",
+      "sql": "ALTER TABLE usage_records SET TABLESPACE fastspace"
+    },
+    {
+      "name": "unsupported alter table enable trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_trigger_state_plan",
+      "classification_reason": "table_trigger_state_plan",
+      "sql": "ALTER TABLE usage_records ENABLE TRIGGER usage_audit"
+    },
+    {
+      "name": "unsupported alter table disable trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_trigger_state_plan",
+      "classification_reason": "table_trigger_state_plan",
+      "sql": "ALTER TABLE usage_records DISABLE TRIGGER usage_audit"
+    },
+    {
       "name": "read classifier equality join",
       "family": "read",
       "plan": "read:join:join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
@@ -10482,6 +10589,21 @@
       "sql": "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS amount_row_num, row_number() OVER (PARTITION BY tenant_id ORDER BY id DESC) AS id_row_num FROM usage_records WHERE status = 'open' ORDER BY amount_row_num ASC, id_row_num ASC LIMIT 5"
     },
     {
+      "name": "named window ordered frame page",
+      "family": "window",
+      "summary": {
+        "table_name": "usage_records",
+        "ctes": 0,
+        "predicates": 1,
+        "select": 2,
+        "order_by": 1,
+        "limit": 5,
+        "windows": 2
+      },
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=0:window_default=0:window_frame_sig=17972907067872603248:select=2:order=1:limit=5",
+      "sql": "SELECT tenant_id, id, row_number() OVER usage_window AS row_num, rank() OVER usage_window AS usage_rank FROM usage_records WHERE status = 'open' WINDOW usage_window AS (PARTITION BY tenant_id ORDER BY amount DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ORDER BY row_num ASC LIMIT 5"
+    },
+    {
       "name": "canonical unnamed window output",
       "family": "window",
       "summary": {
@@ -11104,6 +11226,13 @@
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);"
       ],
       "sql": "INSERT INTO usage_records (id, email, status) VALUES ('u2', 'a@example.test', 'pending') ON CONFLICT (email) DO UPDATE SET status = excluded.status RETURNING id, status"
+    },
+    {
+      "name": "unsupported insert overriding value",
+      "family": "unsupported_insert",
+      "plan": "unsupported:insert:requires=insert_overriding_value_plan",
+      "classification_reason": "insert_overriding_value_plan",
+      "sql": "INSERT INTO usage_records (id, status) OVERRIDING SYSTEM VALUE VALUES ('u1', 'ready') RETURNING id"
     },
     {
       "name": "schema-derived unvalidated check insert",

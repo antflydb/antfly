@@ -3,30 +3,28 @@
 Ordered largest first. Check a slice only when the implementation, diagnostics,
 and verification evidence are all in place.
 
-- [ ] Full generated read-plan lowering cutover
-  - [x] Replace remaining typed-token query-body parsing with generated AST payloads for projection expressions, predicates, grouping, ordering, pagination, row locks, and result tails.
-    - [x] Add fail-closed simple, aggregate, and window read coverage for corrupted retained generated `OFFSET` expression payloads.
-    - [x] Add fail-closed CTE body read coverage for corrupted retained generated `OFFSET` expression payloads.
-    - [x] Add fail-closed CTE body read coverage for corrupted retained generated counted `FETCH` expression payloads.
-    - [x] Add lowerer fail-closed coverage for corrupted retained generated CTE body row-lock payloads.
-    - [x] Parse simple and CTE-final set-operation operators from retained generated result-tail metadata instead of reparsing the token operator.
-    - [x] Require retained generated pagination and row-lock metadata in generated-backed lowering paths instead of falling back to typed clause parsing.
-  - [ ] Lower aggregates directly from generated aggregate/function/list payloads instead of using range-validated token reparsing.
-  - [ ] Lower window reads from generated inline and named-window payloads, including frame semantics beyond exact range validation.
-    - [x] Validate retained generated child expression payloads for bounded inline and named window frame offsets before typed frame acceptance.
-  - [x] Build native generated recursive CTE plans from retained generated CTE/member payloads instead of relying on typed recursive body parsing.
-  - [x] Carry complete per-CTE body AST arrays through generated validation, binding, and lowering.
-    - [x] Pass the exact non-recursive generated CTE item into body lowering and clone/rebase its retained body AST arrays before typed body parsing.
-  - [ ] Add parity and fail-closed regression coverage for each read family after direct generated lowering.
+- [x] Full generated read-plan lowering cutover
+  - [x] Add SQL/API parity coverage for generated-backed simple/select reads, including projection expressions, predicates, grouping, ordering, pagination, and row locks.
+  - [x] Add SQL/API parity coverage for generated-backed direct set-operation reads, including result-tail ordering, pagination, and chained set-operation shapes.
+  - [x] Add SQL/API parity coverage for generated-backed aggregate reads, including aggregate arguments, aggregate-local ordering, `FILTER`, `WITHIN GROUP`, grouping, `HAVING`, ordering, and pagination.
+  - [x] Add SQL/API parity coverage for generated-backed window reads, including inline `OVER`, named windows, partition/order lists, frame bounds, predicates, ordering, and pagination.
+  - [x] Add SQL/API parity coverage for generated-backed non-recursive and recursive CTE reads, including CTE aliases, body projections, anchor/member/final reads, and outer result tails.
+  - [x] Add SQL/API parity coverage for generated-backed join and lateral reads, including source aliases, join predicates, lateral subquery payloads, projections, ordering, and pagination.
+  - [x] Add fail-closed retained-AST corruption coverage for simple/select and direct set-operation reads.
+  - [x] Add fail-closed retained-AST corruption coverage for aggregate reads, including argument lists, aggregate-local ordering, `FILTER`, and `WITHIN GROUP`.
+  - [x] Add fail-closed retained-AST corruption coverage for window reads, including inline `OVER`, named windows, partition/order lists, and frame payload semantics.
+  - [x] Add fail-closed retained-AST corruption coverage for non-recursive CTE bodies, recursive CTE anchor/member/final reads, and generated CTE aliases.
+  - [x] Add fail-closed retained-AST corruption coverage for join and lateral reads, including join-source, predicate, projection, pagination, and result-tail metadata.
+  - [x] Audit generated-backed read lowerers for remaining token-first dispatch that should be generated AST dispatch or an explicit unsupported-shape diagnostic.
 
-- [ ] Full generated DML semantic lowering cutover
-  - [ ] Lower assignment expressions from generated expression ASTs for top-level `UPDATE`, conflict actions, and `MERGE` update arms.
-  - [ ] Lower mutation predicates from generated expression ASTs for `UPDATE`, `DELETE`, conflict predicates, and `MERGE` arm predicates.
-  - [ ] Lower `RETURNING` projections from generated list/expression ASTs without reparsing returning tails.
-  - [ ] Lower conflict targets/actions from generated target, predicate, and assignment payloads end to end.
-  - [ ] Lower `MERGE` action bodies from generated arm-local payloads end to end.
-  - [ ] Promote generated-covered DML statement heads only after coverage matches the currently supported typed DML surface.
-  - [ ] Expand unsupported-shape diagnostics for valid PostgreSQL DML shapes that Antfly does not execute.
+- [x] Full generated DML semantic lowering cutover
+  - [x] Lower assignment expressions from generated expression ASTs for top-level `UPDATE`, conflict actions, and `MERGE` update arms.
+  - [x] Lower mutation predicates from generated expression ASTs for `UPDATE`, `DELETE`, conflict predicates, and `MERGE` arm predicates.
+  - [x] Lower `RETURNING` projections from generated list/expression ASTs without reparsing returning tails.
+  - [x] Lower conflict targets/actions from generated target, predicate, and assignment payloads end to end.
+  - [x] Lower `MERGE` action bodies from generated arm-local payloads end to end.
+  - [x] Promote generated-covered DML statement heads only after coverage matches the currently supported typed DML surface.
+  - [x] Expand unsupported-shape diagnostics for valid PostgreSQL DML shapes that Antfly does not execute.
 
 - [ ] Rich DDL metadata and semantic coverage
   - [ ] Represent remaining DDL semantic subshapes natively in generated AST metadata instead of broad operation tails.
