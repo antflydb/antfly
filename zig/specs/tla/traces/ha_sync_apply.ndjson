@@ -1,0 +1,6 @@
+{"tag":"ha-trace","event":{"name":"PrimaryAppend","timeline":1,"lsn":1}}
+{"tag":"ha-trace","event":{"name":"StandbyReceive","timeline":1,"lsn":1}}
+{"tag":"ha-trace","event":{"name":"StandbyApplyFailure","lsn":1}}
+{"tag":"ha-trace","event":{"name":"StandbyApplySuccess","lsn":1}}
+{"tag":"ha-trace","event":{"name":"FreezeSyncWait","timeline":1,"lsn":1}}
+{"tag":"ha-trace","event":{"name":"StatusAck","timeline":1,"appliedLsn":1}}

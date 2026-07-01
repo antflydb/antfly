@@ -1,0 +1,15 @@
+{"tag":"split-bridge-trace","event":{"name":"BeginSplit","after":{"phase":"splitting","routeRightOwner":"parent"}}}
+{"tag":"split-bridge-trace","event":{"name":"ParentRightWrite","after":{"dbDeltaSeq":1,"shardCutoverReady":false}}}
+{"tag":"split-bridge-trace","event":{"name":"ParentRightWrite","after":{"dbDeltaSeq":2,"shardCutoverReady":false}}}
+{"tag":"split-bridge-trace","event":{"name":"ReplayDelta","after":{"dbReplaySeq":1}}}
+{"tag":"split-bridge-trace","event":{"name":"BuildTextIndex","after":{"dbTextIndexSeq":1}}}
+{"tag":"split-bridge-trace","event":{"name":"BuildSparseIndex","after":{"dbSparseIndexSeq":1}}}
+{"tag":"split-bridge-trace","event":{"name":"BuildGraphIndex","after":{"dbGraphIndexSeq":1}}}
+{"tag":"split-bridge-trace","event":{"name":"ReplayDelta","after":{"dbReplaySeq":2}}}
+{"tag":"split-bridge-trace","event":{"name":"BuildTextIndex","after":{"dbTextIndexSeq":2}}}
+{"tag":"split-bridge-trace","event":{"name":"BuildSparseIndex","after":{"dbSparseIndexSeq":2}}}
+{"tag":"split-bridge-trace","event":{"name":"BuildGraphIndex","after":{"dbGraphIndexSeq":2}}}
+{"tag":"split-bridge-trace","event":{"name":"SetShardFence","after":{"shardFenceSet":true,"shardFenceSeq":2}}}
+{"tag":"split-bridge-trace","event":{"name":"CompleteShardCutover","after":{"phase":"cutover","shardCutoverReady":true}}}
+{"tag":"split-bridge-trace","event":{"name":"PublishDbChildServing","after":{"phase":"children","dbChildServing":true,"parentAcceptsRight":false,"childAcceptsRight":true}}}
+{"tag":"split-bridge-trace","event":{"name":"RouteMetadataToChild","after":{"routeRightOwner":"child"}}}

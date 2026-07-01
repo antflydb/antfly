@@ -1,0 +1,5 @@
+{"tag":"ha-trace","event":{"name":"PrimaryAppend","timeline":1,"lsn":1}}
+{"tag":"ha-trace","event":{"name":"StandbyReceive","timeline":1,"lsn":1}}
+{"tag":"ha-trace","event":{"name":"StandbyApplySuccess","lsn":1}}
+{"tag":"ha-trace","event":{"name":"TimelineSwitch","parentReceivedLsn":1,"parentAppliedLsn":1,"safeReadLsn":1,"previousLsn":1,"switchLsn":2,"newTimeline":2,"newEpoch":2}}
+{"tag":"ha-trace","event":{"name":"RejectOldTimeline","timeline":1}}

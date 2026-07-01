@@ -81,8 +81,10 @@ CONSTANTS
     TxnReadSet,    \* Function: Txns -> SUBSET Keys (OCC read set)
     TxnCoord,      \* Function: Txns -> Shards (coordinator shard per txn)
     MaxTimestamp,   \* Nat: upper bound on clock for state space bounding
-    StalePendingThreshold  \* Nat: minimum clock ticks before a Pending txn is
+    StalePendingThreshold, \* Nat: minimum clock ticks before a Pending txn is
                            \* considered stale and auto-aborted by recovery
+    BuggySkipIntentConflict \* BOOLEAN: expected-failure mutant that checks only
+                            \* committed versions and ignores pending intents
 
 ASSUME \A t \in Txns : TxnCoord[t] \in TxnShards[t]
 ASSUME \A t \in Txns : TxnShards[t] \subseteq Shards
@@ -164,12 +166,15 @@ CommittedVersionPredicatesPass(t, s) ==
 \* Whether there are conflicting pending intents from another transaction.
 \* Maps to: hasConflictingIntentForKey() added in PR #381.
 NoConflictingIntents(t, s) ==
-    ~\E t2 \in Txns :
-        /\ t2 /= t
-        /\ intents[t2, s] = "written"
-        /\ txnRecords[t2] /= "aborted"
-        /\ \E k \in TxnKeys[t, s] \intersect TxnReadSet[t] :
-            k \in TxnKeys[t2, s]
+    IF BuggySkipIntentConflict
+    THEN TRUE
+    ELSE
+        ~\E t2 \in Txns :
+            /\ t2 /= t
+            /\ intents[t2, s] = "written"
+            /\ txnRecords[t2] /= "aborted"
+            /\ \E k \in TxnKeys[t, s] \intersect TxnReadSet[t] :
+                k \in TxnKeys[t2, s]
 
 \* --- Initial state ---
 

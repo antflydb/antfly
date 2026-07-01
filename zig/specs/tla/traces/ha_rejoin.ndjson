@@ -1,0 +1,4 @@
+{"tag":"ha-trace","event":{"name":"AssessRejoin","hasFence":true,"identityMatches":true,"oldPrimaryMatches":true,"timelineState":"parent","formerLastLsn":2,"forkLsn":1,"retainedFromLsn":0,"forced":false,"allowForcedRewind":false,"action":"rewind"}}
+{"tag":"ha-trace","event":{"name":"ExecuteRewind","previousLastLsn":2,"forkLsn":1,"forkRecordPresent":true,"forkRecordMatches":true}}
+{"tag":"ha-trace","event":{"name":"AssessRejoin","hasFence":true,"identityMatches":true,"oldPrimaryMatches":true,"timelineState":"parent","formerLastLsn":3,"forkLsn":1,"retainedFromLsn":2,"forced":false,"allowForcedRewind":false,"action":"reseed"}}
+{"tag":"ha-trace","event":{"name":"ExecuteReseed","forkLsn":1,"reseedRequired":true,"baseBackupRequired":true}}

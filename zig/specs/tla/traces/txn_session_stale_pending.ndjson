@@ -1,0 +1,5 @@
+{"tag":"txn-session-trace","event":{"name":"BeginSession","after":{"status":"open","baseVisible":0,"staged":0,"intentCount":0,"visible":0,"identityRows":0,"prepared":[],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"StageWrite","after":{"status":"open","staged":1,"intentCount":1,"visible":0,"identityRows":0}}}
+{"tag":"txn-session-trace","event":{"name":"MarkStalePending","after":{"status":"open","staged":1,"intentCount":1,"visible":0,"identityRows":0,"stalePending":true}}}
+{"tag":"txn-session-trace","event":{"name":"RecoverStalePending","after":{"status":"aborted","staged":1,"intentCount":0,"visible":0,"identityRows":0,"stalePending":false}}}
+{"tag":"txn-session-trace","event":{"name":"Cleanup","after":{"status":"idle","baseVisible":0,"staged":0,"intentCount":0,"visible":0,"identityRows":0,"prepared":[],"resolved":[]}}}

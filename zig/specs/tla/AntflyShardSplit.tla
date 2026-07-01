@@ -161,7 +161,10 @@ EXTENDS Naturals, FiniteSets, TLC
 CONSTANTS
     Keys,          \* Set of key identifiers, e.g. {k1, k2, k3}
     ParentKeys,    \* SUBSET Keys: keys that stay with parent after split
-    ChildKeys      \* SUBSET Keys: keys that go to the child shard
+    ChildKeys,     \* SUBSET Keys: keys that go to the child shard
+    BuggyChildDefaultOnReplayCaughtUp
+                   \* BOOLEAN: expected-failure mutant for using
+                   \* SplitReplayCaughtUp instead of SplitCutoverReady
 
 ASSUME ParentKeys \subseteq Keys
 ASSUME ChildKeys \subseteq Keys
@@ -499,6 +502,22 @@ TablemgrTransitionsChild ==
                    dataStore, parentDeltaKeys, childReplayedKeys,
                    splitCutoverReady, splitFenceSet>>
 
+BuggyTablemgrTransitionsChildOnReplayCaughtUp ==
+    /\ BuggyChildDefaultOnReplayCaughtUp
+    /\ newShardState \in {"splittingOff", "preSnap"}
+    /\ newShardHasSnapshot
+    /\ ~newShardInitializing
+    /\ newShardHasLeader
+    /\ routingUpdated
+    /\ SplitReplayCaughtUp
+    /\ ~splitCutoverReady
+    /\ newShardState' = "default"
+    /\ UNCHANGED <<splitPhase, parentRange, archiveCreated,
+                   parentHasLeader, newShardHasSnapshot,
+                   newShardInitializing, newShardHasLeader, routingUpdated,
+                   dataStore, parentDeltaKeys, childReplayedKeys,
+                   splitCutoverReady, splitFenceSet>>
+
 (*
   Action 8a: FinalizeSplitSetFence
   Reconciler triggers FinalizeSplit on parent shard when child is caught up
@@ -798,6 +817,7 @@ Next ==
     \/ NewShardReceivesSnapshot
     \/ ChildClearsInitializing
     \/ TablemgrTransitionsChild
+    \/ BuggyTablemgrTransitionsChildOnReplayCaughtUp
     \/ FinalizeSplitSetFence
     \/ FinalizeSplitComplete
     \/ TimeoutRollback

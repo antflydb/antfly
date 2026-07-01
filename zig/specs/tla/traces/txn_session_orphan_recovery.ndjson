@@ -1,0 +1,14 @@
+{"tag":"txn-session-trace","event":{"name":"BeginSession","after":{"status":"open","baseVisible":0,"staged":0,"intentCount":0,"visible":0,"identityRows":0,"prepared":[],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"StageWrite","after":{"status":"open","staged":1,"intentCount":1,"visible":0,"identityRows":0}}}
+{"tag":"txn-session-trace","event":{"name":"PrepareParticipant","participant":"local","after":{"status":"open","staged":1,"intentCount":1,"prepared":["local"],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"PrepareParticipant","participant":"remote","after":{"status":"prepared","staged":1,"intentCount":1,"prepared":["local","remote"],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"CrashFinalizeCommittedOrphan","after":{"status":"committed","baseVisible":0,"staged":1,"intentCount":1,"visible":0,"identityRows":0,"prepared":["local","remote"],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"RecoverFinalizedIntents","after":{"status":"committed","baseVisible":0,"staged":1,"intentCount":0,"visible":1,"identityRows":1,"prepared":["local","remote"],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"ResolveParticipant","participant":"local","after":{"status":"committed","visible":1,"identityRows":1,"prepared":["local","remote"],"resolved":["local"]}}}
+{"tag":"txn-session-trace","event":{"name":"ResolveParticipant","participant":"remote","after":{"status":"committed","visible":1,"identityRows":1,"prepared":["local","remote"],"resolved":["local","remote"]}}}
+{"tag":"txn-session-trace","event":{"name":"Cleanup","after":{"status":"idle","baseVisible":1,"staged":0,"intentCount":0,"visible":1,"identityRows":1,"prepared":[],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"BeginSession","after":{"status":"open","baseVisible":1,"staged":0,"intentCount":0,"visible":1,"identityRows":1,"prepared":[],"resolved":[]}}}
+{"tag":"txn-session-trace","event":{"name":"StageWrite","after":{"status":"open","baseVisible":1,"staged":1,"intentCount":1,"visible":1,"identityRows":1}}}
+{"tag":"txn-session-trace","event":{"name":"CrashFinalizeAbortedOrphan","after":{"status":"aborted","baseVisible":1,"staged":1,"intentCount":1,"visible":1,"identityRows":1}}}
+{"tag":"txn-session-trace","event":{"name":"RecoverFinalizedIntents","after":{"status":"aborted","baseVisible":1,"staged":1,"intentCount":0,"visible":1,"identityRows":1}}}
+{"tag":"txn-session-trace","event":{"name":"Cleanup","after":{"status":"idle","baseVisible":1,"staged":0,"intentCount":0,"visible":1,"identityRows":1,"prepared":[],"resolved":[]}}}

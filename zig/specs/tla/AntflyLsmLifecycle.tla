@@ -41,7 +41,8 @@ EXTENDS Naturals, TLC
 
 CONSTANTS
     ReadCache,
-    WriteCache
+    WriteCache,
+    BuggyIndexFailLeaksTemp
 
 Caches == {ReadCache, WriteCache}
 
@@ -228,6 +229,13 @@ IndexRetiredAllocationFails ==
     /\ indexOpFailed' = TRUE
     /\ UNCHANGED <<cacheLoc, cacheLeases, cacheRetiredCap, snapshotLoc, activeReaders, snapshotRetiredCap>>
 
+IndexRetiredAllocationFailsLeakingTemp ==
+    /\ BuggyIndexFailLeaksTemp
+    /\ indexTemp = "NewOnly"
+    /\ indexTemp' = "Leaked"
+    /\ indexOpFailed' = TRUE
+    /\ UNCHANGED <<cacheLoc, cacheLeases, cacheRetiredCap, snapshotLoc, activeReaders, snapshotRetiredCap>>
+
 IndexRetiredAllocationSucceeds ==
     /\ indexTemp = "NewOnly"
     /\ indexTemp' = "BothAllocated"
@@ -268,6 +276,7 @@ Next ==
     \/ ReleaseReaderDrainsRetiredSnapshot
     \/ IndexAllocateNewSegments
     \/ IndexRetiredAllocationFails
+    \/ IndexRetiredAllocationFailsLeakingTemp
     \/ IndexRetiredAllocationSucceeds
     \/ IndexRebuildFails
     \/ IndexRebuildPublishes

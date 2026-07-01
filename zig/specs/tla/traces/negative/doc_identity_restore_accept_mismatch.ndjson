@@ -1,0 +1,1 @@
+{"tag":"doc-identity-range-repair-trace","event":{"name":"StrictDeferredRestore","init":{"restoreSourceNamespace":1,"restoreTargetNamespace":2},"after":{"restoreSourceNamespace":1,"restoreTargetNamespace":2,"strictRestoreAccepted":true}}}

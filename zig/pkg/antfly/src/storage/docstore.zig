@@ -2741,6 +2741,59 @@ test "docstore indexes replay rows by hint and truncates them" {
     try std.testing.expectEqual(@as(usize, 0), after.len);
 }
 
+test "docstore replay co-writes original hint lanes when record decode fails" {
+    if (!supports_lmdb) return error.UnsupportedPlatform;
+
+    const alloc = std.testing.allocator;
+    var path_buf: [256]u8 = undefined;
+    const path = tmpPath(&path_buf);
+    defer cleanupTmp(path);
+
+    var store = try DocStore.open(alloc, path, .{});
+    defer store.close();
+
+    var payload: [15]u8 = undefined;
+    @memcpy(payload[0..4], "CJ2\x00");
+    std.mem.writeInt(u16, payload[4..6], 1, .little);
+    std.mem.writeInt(u64, payload[6..14], 11, .little);
+    payload[14] = change_journal_mod.singleHintMask(.full_text);
+    try std.testing.expectEqual(payload[14], try change_journal_mod.encodedRecordHintMask(payload[0..]));
+    if (change_journal_mod.decodeRecord(alloc, payload[0..])) |decoded| {
+        var owned = decoded;
+        owned.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    try store.putBatchWithReplay(null, &.{
+        .{ .key = "doc:bad-record", .value = "A" },
+    }, &.{}, .{
+        .sequence = 11,
+        .payload = payload[0..],
+    });
+
+    try std.testing.expectEqual(@as(u64, 11), store.lastReplaySequence(0));
+    try std.testing.expectEqual(@as(u64, 11), try store.latestReplaySequenceForHint(.full_text, 0));
+    try std.testing.expectEqual(@as(u64, 0), try store.latestReplaySequenceForHint(.dense_vector, 0));
+
+    const all_entries = try store.iterateReplayFrom(alloc, 11);
+    defer {
+        for (all_entries) |*entry| entry.deinit(alloc);
+        alloc.free(all_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), all_entries.len);
+    try std.testing.expectEqual(@as(u64, 11), all_entries[0].sequence);
+    try std.testing.expectEqualSlices(u8, payload[0..], all_entries[0].payload);
+
+    const full_text_entries = try store.iterateReplayEntriesFromHint(alloc, 11, .full_text);
+    defer {
+        for (full_text_entries) |*entry| entry.deinit(alloc);
+        alloc.free(full_text_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), full_text_entries.len);
+    try std.testing.expectEqual(@as(u64, 11), full_text_entries[0].sequence);
+    try std.testing.expectEqualSlices(u8, payload[0..], full_text_entries[0].payload);
+}
+
 test "docstore runtime lsm hint replay iteration avoids ordinary read snapshots" {
     const alloc = std.testing.allocator;
     var tmp = std.testing.tmpDir(.{});

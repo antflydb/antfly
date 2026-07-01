@@ -947,6 +947,71 @@ test "lite native docstore persists replay lanes across reopen and truncation" {
     }
 }
 
+test "lite native docstore co-writes original hint lane when record decode fails" {
+    const allocator = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try testPath(allocator, tmp, "native-docstore-replay-decode-failure.aflite");
+    defer allocator.free(path);
+
+    var payload: [15]u8 = undefined;
+    @memcpy(payload[0..4], "CJ2\x00");
+    std.mem.writeInt(u16, payload[4..6], 1, .little);
+    std.mem.writeInt(u64, payload[6..14], 11, .little);
+    payload[14] = change_journal_mod.singleHintMask(.full_text);
+    try std.testing.expectEqual(payload[14], try change_journal_mod.encodedRecordHintMask(payload[0..]));
+    if (change_journal_mod.decodeRecord(allocator, payload[0..])) |decoded| {
+        var owned = decoded;
+        owned.deinit();
+        return error.ExpectedDecodeFailure;
+    } else |_| {}
+
+    var store = try Store.create(allocator, path, true);
+    defer store.close();
+
+    var runtime = try store.runtimeStore(allocator);
+    defer runtime.deinit();
+
+    try runtime.appendReplayOpaque(allocator, 11, payload[0..]);
+    try std.testing.expectEqual(@as(u64, 11), runtime.lastReplaySequence(0));
+    try std.testing.expectEqual(@as(u64, 12), runtime.nextReplaySequence(0));
+
+    const all_entries = try runtime.iterateReplayFrom(allocator, 11);
+    defer {
+        for (all_entries) |*entry| entry.deinit(allocator);
+        allocator.free(all_entries);
+    }
+    try std.testing.expectEqual(@as(usize, 1), all_entries.len);
+    try std.testing.expectEqual(@as(u64, 11), all_entries[0].sequence);
+    try std.testing.expectEqualSlices(u8, payload[0..], all_entries[0].payload);
+
+    const LaneContext = struct {
+        expected_payload: []const u8,
+        count: usize = 0,
+
+        fn handle(ctx: *@This(), sequence: u64, lane_payload: []const u8) !void {
+            try std.testing.expectEqual(@as(u64, 11), sequence);
+            try std.testing.expectEqualSlices(u8, ctx.expected_payload, lane_payload);
+            ctx.count += 1;
+        }
+    };
+    var full_text_ctx = LaneContext{ .expected_payload = payload[0..] };
+    const full_text_stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.full_text), 11, 0, &full_text_ctx, LaneContext.handle);
+    try std.testing.expectEqual(@as(usize, 1), full_text_ctx.count);
+    try std.testing.expectEqual(@as(u64, 11), full_text_stats.last_sequence);
+
+    const EmptyContext = struct {
+        fn handle(_: *@This(), _: u64, _: []const u8) !void {
+            return error.UnexpectedReplayRecord;
+        }
+    };
+    var dense_ctx = EmptyContext{};
+    const dense_stats = try runtime.forEachReplayLaneFrom(replayHintOrdinal(.dense_vector), 11, 0, &dense_ctx, EmptyContext.handle);
+    try std.testing.expectEqual(@as(u64, 0), dense_stats.matched_entries);
+}
+
 test "lite native docstore reserves one writer until abort or commit" {
     const allocator = std.testing.allocator;
 
