@@ -255,11 +255,15 @@ tla-list: ## List available TLA+ verification targets.
 	  '' \
 	  'Housekeeping:' \
 	  '  make tla-tools                    # install/check local TLC tools' \
-	  '  make tla-clean                    # remove TLC runtime artifacts'
+	  '  make tla-clean                    # remove TLC runtime artifacts' \
+	  '  make tla-audit                    # static hygiene audit (orphans, TTrace, unexercised mutants, Safety pins)'
 
 tla-clean: ## Remove TLA+ model checker runtime artifacts.
 	rm -rf specs/tla/states states
 	find specs/tla -maxdepth 1 \( -name '*_TTrace_*.tla' -o -name '*_TTrace_*.bin' \) -delete
+
+tla-audit: ## Static hygiene audit for the TLA+ suite (fails on orphans/TTrace/unexercised mutants; reports Safety-pin migration debt).
+	@bash ../scripts/tla-audit.sh
 
 tla-check: tla-check-txn tla-check-split tla-check-snap tla-check-lsm
 

@@ -7,6 +7,16 @@
 (*
   Entity-promotion single-owner handoff across split/merge.
 
+  MATURITY: Sketch-tier guardrail, NOT deep implementation correspondence.
+  The state space is tiny (14 states) and deliberately collapses raft
+  leadership, group identity, and runtime hook plumbing into range ownership
+  plus an attachment bit. It expresses the detach-before-transfer-before-
+  attach authority ordering and nothing more; treat green runs accordingly.
+
+  Make targets: tla-check-promotion-owner-handoff (positive);
+  tla-check-promotion-handoff-negative-{attach-before-detach,
+  attach-before-transfer, promote-unowned}. Correspondence: hand-modeled.
+
   Exactly one side may run entity promotion for a range at a time: the
   source shard's local raft leader (RESOLUTION.md; promotion ownership is a
   runtime predicate, storage/db/promotion_runtime.zig PromotionOwner /
