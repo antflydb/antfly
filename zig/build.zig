@@ -3821,6 +3821,7 @@ pub fn build(b: *std.Build) void {
             "primary lookup adopts seeded write cache across visible generation bump",
             "provisioned write cache close detaches promotion leadership callback before stats",
             "provisioned table write source coalesces same-group waiters",
+            "provisioned table write source preserves same-key delete then write across coalesced waiters",
             "provisioned table write coalescer isolates failed waiters",
             "provisioned table write source consistent visibility hook does not block on busy apply lock",
             "provisioned table write source consistent visibility refreshes stale dense status",
