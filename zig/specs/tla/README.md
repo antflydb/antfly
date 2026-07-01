@@ -107,6 +107,11 @@ These specs are intentionally separate bounded models. They cover implementation
 - `AntflyLsmReserveCleanupBadPublishWithoutReserve.cfg` -- Expected-failure publish-without-cleanup-reserve mutant used by `make tla-check-negative`.
 - `AntflyLsmReserveCleanupBadFailureLeaksTemp.cfg` -- Expected-failure failure-leaks-temp mutant used by `make tla-check-negative`.
 - `AntflyQueryCompleteness.tla` -- Split query routing completeness model for no missing or duplicate docs during route/serving transitions.
+- `AntflyNodeDrainLifecycle.tla` -- Node drain/scale-down lifecycle: drain/store-flag raft-transaction consistency, finalize preconditions, safe_to_terminate debt gate, registration-preserves-drain, and drain-eventually-safe liveness.
+- `AntflyTableLifecycle.tla` -- Table create/drop lifecycle: in-memory desired vs raft-committed topology, per-command applies, crash rebuilding desired from committed, planner scope, and convergence liveness.
+- `AntflyHARetentionReseed.tla` -- WAL retention floor vs per-slot reseed marking vs truncation, plus backup slots as retention pins with fail-closed backup end; no-permanent-unmarked-lag liveness.
+- `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness.
+- `AntflyIndexLifecycle.tla` -- Index lifecycle (stale->building->fresh) with non-atomic durable status snapshots, shadow-swap completeness, watermark-validating crash recovery, and build-converges liveness.
 - `AntflyQueryCompletenessBadRouteBeforeChildReady.cfg` -- Expected-failure route-before-child-ready mutant used by `make tla-check-negative`.
 - `AntflyQueryCompletenessBadDoubleServe.cfg` -- Expected-failure parent/child double-serve mutant used by `make tla-check-negative`.
 - `AntflyQueryCompletenessBadMissingDoc.cfg` -- Expected-failure child-serving-without-moved-doc mutant used by `make tla-check-negative`.
@@ -320,6 +325,23 @@ make tla-check-query-completeness
 make tla-check-query-completeness-negative-route-before-child-ready
 make tla-check-query-completeness-negative-double-serve
 make tla-check-query-completeness-negative-missing-doc
+make tla-check-node-drain-lifecycle
+make tla-check-node-drain-negative-finalize-active
+make tla-check-node-drain-negative-registration-clears-drain
+make tla-check-node-drain-negative-safe-ignores-debt
+make tla-check-table-lifecycle
+make tla-check-table-lifecycle-negative-range-without-table
+make tla-check-table-lifecycle-negative-intent-undesired-range
+make tla-check-ha-retention-reseed
+make tla-check-ha-retention-negative-truncate-unmarked
+make tla-check-ha-retention-negative-backup-ignores-lost-wal
+make tla-check-promotion-owner-handoff
+make tla-check-promotion-handoff-negative-attach-before-detach
+make tla-check-promotion-handoff-negative-attach-before-transfer
+make tla-check-promotion-handoff-negative-promote-unowned
+make tla-check-index-lifecycle
+make tla-check-index-lifecycle-negative-swap-incomplete
+make tla-check-index-lifecycle-negative-recover-trusts-status
 make tla-check-enrichment-lease-negative-stale-publish
 make tla-check-enrichment-lease-negative-empty-pending
 make tla-check-lsm-wal-compaction-negative-checkpoint

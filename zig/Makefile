@@ -320,13 +320,19 @@ endef
 define tla_check_expected_failure
 	@echo "==> Model checking expected-failure $(1)..."
 	@source ../scripts/tla-tools.sh && \
-	if "$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
+	status=0; \
+	out=$$("$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
 	  -config specs/tla/$(2).cfg specs/tla/$(3).tla \
-	  -workers auto -deadlock; then \
+	  -workers auto -deadlock 2>&1) || status=$$?; \
+	echo "$$out"; \
+	if [ $$status -eq 0 ]; then \
 	  echo "ERROR: expected $(1) to fail, but TLC passed"; \
 	  exit 1; \
-	else \
+	elif echo "$$out" | grep -qE "Invariant .* is violated|Temporal property .* (is |was )?violated"; then \
 	  echo "OK: $(1) failed as expected"; \
+	else \
+	  echo "ERROR: $(1) failed, but not on an invariant/property violation (spec or config error?)"; \
+	  exit 1; \
 	fi
 endef
 
@@ -334,11 +340,11 @@ tla-check-new: tla-check-new-fast tla-check-new-heavy ## Model check all newly-a
 
 tla-check-critical: tla-check-derived-replay tla-check-ha-failover-safety tla-check-ha-partition-fence tla-check-ha-gate-transitions tla-check-batcher-coalescing tla-check-cdc-cutover tla-check-shard-split-seq tla-check-snapshot-content tla-check-lsm-reserve-cleanup tla-check-query-completeness tla-check-split-refinement-bridge ## Run critique-repair critical safety subset.
 
-tla-check-new-fast: tla-check-ha-gates tla-check-ha-sync-wait tla-check-ha-timeline-switch tla-check-ha-standby-apply tla-check-ha-rejoin tla-check-ha-failover-safety tla-check-ha-partition-fence tla-check-ha-gate-transitions tla-check-batcher-coalescing tla-check-cdc-cutover tla-check-shard-split-seq tla-check-snapshot-content tla-check-lsm-reserve-cleanup tla-check-query-completeness tla-check-derived-replay tla-check-enrichment-lease tla-check-lmdb-commit tla-check-lsm-wal-compaction tla-check-db-split-visibility tla-check-split-refinement-bridge tla-check-document-identity tla-check-document-identity-range-repair tla-check-transaction-session tla-check-managed-host-lifecycle tla-check-lite-publication tla-check-ml-graph-passes tla-check-ml-graph-dag-passes tla-check-ml-compiler-publication tla-check-openapi-codegen ## Model check the fast newly-added focused specs.
+tla-check-new-fast: tla-check-ha-gates tla-check-ha-sync-wait tla-check-ha-timeline-switch tla-check-ha-standby-apply tla-check-ha-rejoin tla-check-ha-failover-safety tla-check-ha-partition-fence tla-check-ha-gate-transitions tla-check-batcher-coalescing tla-check-cdc-cutover tla-check-shard-split-seq tla-check-snapshot-content tla-check-lsm-reserve-cleanup tla-check-query-completeness tla-check-node-drain-lifecycle tla-check-table-lifecycle tla-check-ha-retention-reseed tla-check-promotion-owner-handoff tla-check-index-lifecycle tla-check-derived-replay tla-check-enrichment-lease tla-check-lmdb-commit tla-check-lsm-wal-compaction tla-check-db-split-visibility tla-check-split-refinement-bridge tla-check-document-identity tla-check-document-identity-range-repair tla-check-transaction-session tla-check-managed-host-lifecycle tla-check-lite-publication tla-check-ml-graph-passes tla-check-ml-graph-dag-passes tla-check-ml-compiler-publication tla-check-openapi-codegen ## Model check the fast newly-added focused specs.
 
 tla-check-new-heavy: tla-check-ha-replication tla-check-derived-replay-heavy ## Model check heavier newly-added focused specs.
 
-tla-check-negative: tla-check-txn-negative-skip-intent-conflict tla-check-split-negative-premature-child-default tla-check-snap-negative-apply-without-put tla-check-lsm-negative-index-temp-leak tla-check-ha-replication-negative-stale-timeline-ack tla-check-ha-gates-negative-standby-runtime tla-check-ha-sync-wait-negative-move-target tla-check-ha-sync-wait-negative-wrong-timeline-ack tla-check-ha-sync-wait-negative-below-target-ack tla-check-ha-timeline-switch-negative-before-applied tla-check-ha-timeline-switch-negative-non-monotonic tla-check-ha-timeline-switch-negative-old-timeline tla-check-ha-timeline-switch-negative-recovery-previous tla-check-ha-standby-apply-negative-failure-advances tla-check-ha-standby-apply-negative-duplicate-effect tla-check-ha-standby-apply-negative-crash-loses-receive tla-check-ha-standby-apply-negative-client-write tla-check-ha-standby-apply-negative-background-runtime tla-check-ha-rejoin-negative-unfenced-rewind tla-check-ha-rejoin-negative-expired-wal-rewind tla-check-ha-rejoin-negative-forced-rewind tla-check-ha-rejoin-negative-identity-mismatch-rewind tla-check-ha-rejoin-negative-stale-assessment tla-check-ha-rejoin-negative-fork-mismatch tla-check-ha-failover-negative-promote-missing-ack tla-check-ha-failover-negative-old-primary-write tla-check-ha-failover-negative-ack-without-receipt tla-check-ha-partition-fence-negative-promote-before-fence tla-check-ha-partition-fence-negative-old-primary-write-after-promotion tla-check-ha-gate-transitions-negative-stale-allow tla-check-batcher-coalescing-negative-delete-write-inversion tla-check-batcher-coalescing-negative-write-delete-inversion tla-check-batcher-coalescing-negative-partial-visibility tla-check-batcher-coalescing-negative-delete-visible-without-delete tla-check-cdc-cutover-negative-boundary-duplicate tla-check-cdc-cutover-negative-checkpoint-ahead tla-check-cdc-cutover-negative-resume-replay tla-check-cdc-cutover-negative-stream-before-snapshot-complete tla-check-shard-split-seq-negative-keyset-cutover tla-check-shard-split-seq-negative-fenced-write-dropped tla-check-snapshot-content-negative-wrong-content tla-check-snapshot-content-negative-gc-needed-content tla-check-lsm-reserve-cleanup-negative-publish-without-reserve tla-check-lsm-reserve-cleanup-negative-failure-leaks-temp tla-check-query-completeness-negative-route-before-child-ready tla-check-query-completeness-negative-double-serve tla-check-query-completeness-negative-missing-doc tla-check-derived-replay-negative tla-check-enrichment-lease-negative-stale-publish tla-check-enrichment-lease-negative-empty-pending tla-check-lsm-wal-compaction-negative-checkpoint tla-check-lsm-wal-compaction-negative-corrupt-rotate tla-check-lsm-wal-compaction-negative-pinned-retire tla-check-lmdb-commit-negative-meta-before-data tla-check-lmdb-commit-negative-reader-reuse tla-check-transaction-session-negative-rollback tla-check-transaction-session-negative-recovery-decision tla-check-transaction-session-negative-cleanup tla-check-transaction-session-trace-negative-cleanup tla-check-document-identity-negative-reuse-ordinal tla-check-document-identity-negative-stale-filter tla-check-document-identity-negative-namespace-mismatch tla-check-document-identity-range-repair-negative-split-unhealthy tla-check-document-identity-range-repair-negative-split-dest-namespace tla-check-document-identity-range-repair-negative-merge-mismatch tla-check-document-identity-range-repair-negative-merge-active-reassign tla-check-document-identity-range-repair-negative-restore-namespace tla-check-document-identity-range-repair-negative-restore-early-clear tla-check-document-identity-range-repair-trace-negative-restore-mismatch tla-check-document-identity-range-repair-trace-negative-restore-early-clear tla-check-db-split-visibility-negative-parent-write tla-check-db-split-visibility-negative-child-serve tla-check-db-split-visibility-negative-merge-donor tla-check-db-split-visibility-negative-enrichment-owner tla-check-split-refinement-bridge-negative-route-before-db-serving tla-check-split-refinement-bridge-negative-db-serve-before-shard-cutover tla-check-split-refinement-bridge-negative-stale-fence-cutover tla-check-split-refinement-bridge-trace-negative-route-before-db-serving tla-check-managed-host-lifecycle-negative-premature-restore tla-check-managed-host-lifecycle-negative-stale-route tla-check-managed-host-lifecycle-negative-revive-removed tla-check-managed-host-lifecycle-negative-restore-cancel tla-check-lite-publication-negative-manifest-before-artifacts tla-check-lite-publication-negative-failed-head tla-check-lite-publication-negative-pinned-cleanup tla-check-lite-publication-negative-mixed-generation tla-check-ml-graph-passes-negative-dangling-cse tla-check-ml-graph-passes-negative-parameter-dedup tla-check-ml-graph-passes-negative-missing-lower-closure tla-check-ml-graph-passes-negative-fallback-runtime tla-check-ml-graph-passes-negative-partial-publish tla-check-ml-graph-dag-passes-negative-cse-miss-duplicate tla-check-ml-graph-dag-passes-negative-cse-no-consumer-remap tla-check-ml-graph-dag-passes-negative-dce-drop-reachable tla-check-ml-graph-dag-passes-negative-dce-non-topo-map tla-check-ml-compiler-publication-negative-stale-compile tla-check-ml-compiler-publication-negative-missing-input tla-check-ml-compiler-publication-negative-output-selection tla-check-ml-compiler-publication-negative-fallback-publish tla-check-ml-compiler-publication-negative-partial-artifact tla-check-openapi-codegen-negative-stale-package tla-check-openapi-codegen-negative-stale-root tla-check-openapi-codegen-negative-internal-leak tla-check-openapi-codegen-negative-partial-commit ## Run TLA+ expected-failure mutant checks.
+tla-check-negative: tla-check-txn-negative-skip-intent-conflict tla-check-split-negative-premature-child-default tla-check-snap-negative-apply-without-put tla-check-lsm-negative-index-temp-leak tla-check-ha-replication-negative-stale-timeline-ack tla-check-ha-gates-negative-standby-runtime tla-check-ha-sync-wait-negative-move-target tla-check-ha-sync-wait-negative-wrong-timeline-ack tla-check-ha-sync-wait-negative-below-target-ack tla-check-ha-timeline-switch-negative-before-applied tla-check-ha-timeline-switch-negative-non-monotonic tla-check-ha-timeline-switch-negative-old-timeline tla-check-ha-timeline-switch-negative-recovery-previous tla-check-ha-standby-apply-negative-failure-advances tla-check-ha-standby-apply-negative-duplicate-effect tla-check-ha-standby-apply-negative-crash-loses-receive tla-check-ha-standby-apply-negative-client-write tla-check-ha-standby-apply-negative-background-runtime tla-check-ha-rejoin-negative-unfenced-rewind tla-check-ha-rejoin-negative-expired-wal-rewind tla-check-ha-rejoin-negative-forced-rewind tla-check-ha-rejoin-negative-identity-mismatch-rewind tla-check-ha-rejoin-negative-stale-assessment tla-check-ha-rejoin-negative-fork-mismatch tla-check-ha-failover-negative-promote-missing-ack tla-check-ha-failover-negative-old-primary-write tla-check-ha-failover-negative-ack-without-receipt tla-check-ha-partition-fence-negative-promote-before-fence tla-check-ha-partition-fence-negative-old-primary-write-after-promotion tla-check-ha-gate-transitions-negative-stale-allow tla-check-batcher-coalescing-negative-delete-write-inversion tla-check-batcher-coalescing-negative-write-delete-inversion tla-check-batcher-coalescing-negative-partial-visibility tla-check-batcher-coalescing-negative-delete-visible-without-delete tla-check-cdc-cutover-negative-boundary-duplicate tla-check-cdc-cutover-negative-checkpoint-ahead tla-check-cdc-cutover-negative-resume-replay tla-check-cdc-cutover-negative-stream-before-snapshot-complete tla-check-shard-split-seq-negative-keyset-cutover tla-check-shard-split-seq-negative-fenced-write-dropped tla-check-node-drain-negative-finalize-active tla-check-node-drain-negative-registration-clears-drain tla-check-node-drain-negative-safe-ignores-debt tla-check-table-lifecycle-negative-range-without-table tla-check-table-lifecycle-negative-intent-undesired-range tla-check-ha-retention-negative-truncate-unmarked tla-check-ha-retention-negative-backup-ignores-lost-wal tla-check-promotion-handoff-negative-attach-before-detach tla-check-promotion-handoff-negative-attach-before-transfer tla-check-promotion-handoff-negative-promote-unowned tla-check-index-lifecycle-negative-swap-incomplete tla-check-index-lifecycle-negative-recover-trusts-status tla-check-snapshot-content-negative-wrong-content tla-check-snapshot-content-negative-gc-needed-content tla-check-lsm-reserve-cleanup-negative-publish-without-reserve tla-check-lsm-reserve-cleanup-negative-failure-leaks-temp tla-check-query-completeness-negative-route-before-child-ready tla-check-query-completeness-negative-double-serve tla-check-query-completeness-negative-missing-doc tla-check-derived-replay-negative tla-check-enrichment-lease-negative-stale-publish tla-check-enrichment-lease-negative-empty-pending tla-check-lsm-wal-compaction-negative-checkpoint tla-check-lsm-wal-compaction-negative-corrupt-rotate tla-check-lsm-wal-compaction-negative-pinned-retire tla-check-lmdb-commit-negative-meta-before-data tla-check-lmdb-commit-negative-reader-reuse tla-check-transaction-session-negative-rollback tla-check-transaction-session-negative-recovery-decision tla-check-transaction-session-negative-cleanup tla-check-transaction-session-trace-negative-cleanup tla-check-document-identity-negative-reuse-ordinal tla-check-document-identity-negative-stale-filter tla-check-document-identity-negative-namespace-mismatch tla-check-document-identity-range-repair-negative-split-unhealthy tla-check-document-identity-range-repair-negative-split-dest-namespace tla-check-document-identity-range-repair-negative-merge-mismatch tla-check-document-identity-range-repair-negative-merge-active-reassign tla-check-document-identity-range-repair-negative-restore-namespace tla-check-document-identity-range-repair-negative-restore-early-clear tla-check-document-identity-range-repair-trace-negative-restore-mismatch tla-check-document-identity-range-repair-trace-negative-restore-early-clear tla-check-db-split-visibility-negative-parent-write tla-check-db-split-visibility-negative-child-serve tla-check-db-split-visibility-negative-merge-donor tla-check-db-split-visibility-negative-enrichment-owner tla-check-split-refinement-bridge-negative-route-before-db-serving tla-check-split-refinement-bridge-negative-db-serve-before-shard-cutover tla-check-split-refinement-bridge-negative-stale-fence-cutover tla-check-split-refinement-bridge-trace-negative-route-before-db-serving tla-check-managed-host-lifecycle-negative-premature-restore tla-check-managed-host-lifecycle-negative-stale-route tla-check-managed-host-lifecycle-negative-revive-removed tla-check-managed-host-lifecycle-negative-restore-cancel tla-check-lite-publication-negative-manifest-before-artifacts tla-check-lite-publication-negative-failed-head tla-check-lite-publication-negative-pinned-cleanup tla-check-lite-publication-negative-mixed-generation tla-check-ml-graph-passes-negative-dangling-cse tla-check-ml-graph-passes-negative-parameter-dedup tla-check-ml-graph-passes-negative-missing-lower-closure tla-check-ml-graph-passes-negative-fallback-runtime tla-check-ml-graph-passes-negative-partial-publish tla-check-ml-graph-dag-passes-negative-cse-miss-duplicate tla-check-ml-graph-dag-passes-negative-cse-no-consumer-remap tla-check-ml-graph-dag-passes-negative-dce-drop-reachable tla-check-ml-graph-dag-passes-negative-dce-non-topo-map tla-check-ml-compiler-publication-negative-stale-compile tla-check-ml-compiler-publication-negative-missing-input tla-check-ml-compiler-publication-negative-output-selection tla-check-ml-compiler-publication-negative-fallback-publish tla-check-ml-compiler-publication-negative-partial-artifact tla-check-openapi-codegen-negative-stale-package tla-check-openapi-codegen-negative-stale-root tla-check-openapi-codegen-negative-internal-leak tla-check-openapi-codegen-negative-partial-commit ## Run TLA+ expected-failure mutant checks.
 
 tla-check-txn-negative-skip-intent-conflict: tla-tools
 	$(call tla_check_expected_failure,transaction OCC pending-intent conflict mutant,AntflyTransactionBadSkipIntentConflict,MC)
@@ -459,6 +465,42 @@ tla-check-shard-split-seq-negative-keyset-cutover: tla-tools
 
 tla-check-shard-split-seq-negative-fenced-write-dropped: tla-tools
 	$(call tla_check_expected_failure,shard split cutover drops fenced write mutant,AntflyShardSplitSeqBadFencedWriteDropped,AntflyShardSplitSeq)
+
+tla-check-node-drain-negative-finalize-active: tla-tools
+	$(call tla_check_expected_failure,node drain finalize accepted while active mutant,AntflyNodeDrainLifecycleBadFinalizeActive,AntflyNodeDrainLifecycle)
+
+tla-check-node-drain-negative-registration-clears-drain: tla-tools
+	$(call tla_check_expected_failure,node re-registration clears drain intent mutant,AntflyNodeDrainLifecycleBadRegistrationClearsDrain,AntflyNodeDrainLifecycle)
+
+tla-check-node-drain-negative-safe-ignores-debt: tla-tools
+	$(call tla_check_expected_failure,node drain safe report ignores termination debt mutant,AntflyNodeDrainLifecycleBadSafeIgnoresDebt,AntflyNodeDrainLifecycle)
+
+tla-check-table-lifecycle-negative-range-without-table: tla-tools
+	$(call tla_check_expected_failure,desired range without table mutant,AntflyTableLifecycleBadRangeWithoutTable,AntflyTableLifecycle)
+
+tla-check-table-lifecycle-negative-intent-undesired-range: tla-tools
+	$(call tla_check_expected_failure,placement intent planned for undesired range mutant,AntflyTableLifecycleBadIntentUndesiredRange,AntflyTableLifecycle)
+
+tla-check-ha-retention-negative-truncate-unmarked: tla-tools
+	$(call tla_check_expected_failure,WAL truncation ignores unmarked lagging slot mutant,AntflyHARetentionReseedBadTruncateUnmarked,AntflyHARetentionReseed)
+
+tla-check-ha-retention-negative-backup-ignores-lost-wal: tla-tools
+	$(call tla_check_expected_failure,backup end ignores lost slot/truncated WAL mutant,AntflyHARetentionReseedBadBackupIgnoresLostWal,AntflyHARetentionReseed)
+
+tla-check-promotion-handoff-negative-attach-before-detach: tla-tools
+	$(call tla_check_expected_failure,promotion owner attach before detach mutant,AntflyPromotionOwnerHandoffBadAttachBeforeDetach,AntflyPromotionOwnerHandoff)
+
+tla-check-promotion-handoff-negative-attach-before-transfer: tla-tools
+	$(call tla_check_expected_failure,promotion owner attach before range transfer mutant,AntflyPromotionOwnerHandoffBadAttachBeforeTransfer,AntflyPromotionOwnerHandoff)
+
+tla-check-promotion-handoff-negative-promote-unowned: tla-tools
+	$(call tla_check_expected_failure,promotion without ownership predicate mutant,AntflyPromotionOwnerHandoffBadPromoteUnowned,AntflyPromotionOwnerHandoff)
+
+tla-check-index-lifecycle-negative-swap-incomplete: tla-tools
+	$(call tla_check_expected_failure,shadow index swap while behind mutant,AntflyIndexLifecycleBadSwapIncomplete,AntflyIndexLifecycle)
+
+tla-check-index-lifecycle-negative-recover-trusts-status: tla-tools
+	$(call tla_check_expected_failure,index recovery trusts stale fresh status mutant,AntflyIndexLifecycleBadRecoverTrustsStatus,AntflyIndexLifecycle)
 
 tla-check-snapshot-content-negative-wrong-content: tla-tools
 	$(call tla_check_expected_failure,snapshot wrong content for applied index mutant,AntflySnapshotContentBadWrongContent,AntflySnapshotContent)
@@ -732,6 +774,21 @@ tla-check-lsm-reserve-cleanup: tla-tools
 
 tla-check-query-completeness: tla-tools
 	$(call tla_check_module,split query routing completeness safety,AntflyQueryCompleteness)
+
+tla-check-node-drain-lifecycle: tla-tools
+	$(call tla_check_module,node drain/scale-down lifecycle safety,AntflyNodeDrainLifecycle)
+
+tla-check-table-lifecycle: tla-tools
+	$(call tla_check_module,table create/drop desired-vs-committed lifecycle safety,AntflyTableLifecycle)
+
+tla-check-ha-retention-reseed: tla-tools
+	$(call tla_check_module,WAL retention floor/reseed/backup slot safety,AntflyHARetentionReseed)
+
+tla-check-promotion-owner-handoff: tla-tools
+	$(call tla_check_module,entity promotion single-owner handoff safety,AntflyPromotionOwnerHandoff)
+
+tla-check-index-lifecycle: tla-tools
+	$(call tla_check_module,index lifecycle/shadow swap freshness safety,AntflyIndexLifecycle)
 
 tla-check-derived-replay: tla-tools
 	$(call tla_check_module,derived replay hint lanes and watermarks,AntflyDerivedReplay)

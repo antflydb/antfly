@@ -1141,6 +1141,17 @@ follow-up repairs:
 8. Split query-route completeness, including route-ready missing-doc and
    double-serve mutants: `AntflyQueryCompleteness.tla`.
 
+The July 1 final-critique coverage backlog is also closed: node drain
+(`AntflyNodeDrainLifecycle.tla`), table create/drop (`AntflyTableLifecycle.tla`),
+WAL retention/reseed + backup slots (`AntflyHARetentionReseed.tla`), entity
+promotion single-owner handoff (`AntflyPromotionOwnerHandoff.tla`), and index
+lifecycle (`AntflyIndexLifecycle.tla`), each with per-invariant pinned mutants
+and a liveness property. Distributed join leases were routed to the sim
+harness, owner-job gate composition to Zig race tests, and merge rollback is
+not modeled because the implementation has no merge-abort path (rationale in
+`TLA_CRITIQUE_REPAIR.md`). The expected-failure harness now requires a real
+invariant/temporal violation in TLC output rather than any nonzero exit.
+
 Remaining work should be validation depth, not broad speculative modeling:
 
 1. Investigate the provisioned write coalescer delete->write order issue

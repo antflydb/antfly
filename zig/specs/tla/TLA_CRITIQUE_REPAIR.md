@@ -46,22 +46,31 @@ stall; add liveness mutants if a progress regression ever needs pinning.
 Lease-churn re-collection in the enrichment model is a known modeling
 limitation scoped out of the drain property.
 
-## New Coverage Backlog From The Final Critique (July 1)
+## New Coverage Backlog From The Final Critique (July 1) — RESOLVED
 
-Control-plane surfaces with correctness stakes found modeled nowhere and
-absent from every prior backlog. Ordered by stakes:
+Every surface was either modeled or explicitly routed away from TLA+ with a
+recorded rationale. Contract extraction was grounded in a fresh code read
+before each model was written.
 
-| Surface | Anchors | Stakes |
-|---|---|---|
-| Node drain lifecycle (active -> draining -> complete -> removed, crash recovery, idempotent cancel) | `metadata/state.zig`, `metadata/replication_backfill.zig`, `SCALING.md` | premature termination / availability |
-| Table create/drop raft coordination (ID reserve + schema persist + discoverability; drop quiesce; crash orphaning) | `metadata/table_workflow.zig`, `metadata/storage/raft_apply_store.zig` | orphaned/phantom groups, data loss |
-| Entity promotion single-owner across split/merge | `storage/db/promotion_runtime.zig` (`setOwner`), `RESOLUTION.md` | duplicate canonical documents |
-| Merge crash-recovery parity with split (prepare/cutover crash windows, artifact-routing idempotence) | `AntflyDbSplitVisibility.tla` models merge shallower than split | double-serve / lost range |
-| WAL retention expiry -> forced reseed ordering vs slot GC | `storage/ha/slot_store.zig`, `storage/ha/rejoin.zig` | unrecoverable standby window |
-| Index lifecycle (stale -> building -> converged) outside split; shadow swap atomicity | `storage/db/catalog/index_manager.zig` | stale/partial query results |
-| Distributed join lease lifecycle vs ownership changes mid-query | `api/distributed_join.zig` | duplicate/missing join rows |
-| Backup slot vs WAL truncation vs reseed coordination (control-plane slice only) | `storage/ha/primary.zig` backup slots | corrupted in-flight backup |
-| Per-subsystem owner-job gate composition (enrichment/CDC/compaction against gate transitions) | `storage/ha/owner_job_gate.zig` | standby-mutation corruption |
+| Surface | Resolution |
+|---|---|
+| Node drain lifecycle | Modeled: `AntflyNodeDrainLifecycle.tla`. Drain/store-flag raft-transaction consistency, finalize preconditions (`ActiveNodeFinalizeRejected`, raft_apply_store.zig:1626/1648), safe_to_terminate debt gate (http_server.zig:1685-1691), registration-preserves-drain (the SCALING.md historical regression is a mutant), drain-eventually-safe liveness. 3 mutants. |
+| Table create/drop coordination | Modeled: `AntflyTableLifecycle.tla`. In-memory desired vs raft-committed topology, per-command applies, crash rebuilds desired from committed (drop atomicity is deliberately NOT claimed — matches bootstrapDesiredFromCommitted behavior), convergence liveness. 2 mutants (UnknownTable guard, planner scope). |
+| Entity promotion single-owner | Modeled: `AntflyPromotionOwnerHandoff.tla`. Detach-before-transfer-before-attach across split AND merge, runtime (non-durable) attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness. 3 mutants. |
+| Merge crash-recovery parity | Covered by the combination of `AntflyPromotionOwnerHandoff` (the donor->receiver ownership window that AntflyDbSplitVisibility does not represent) and existing merge invariants in `AntflyDbSplitVisibility`. Prepare->cutover ROLLBACK is intentionally not modeled: the implementation has no merge-abort path, and modeling one would verify fiction. Partial per-index catch-up at finalize is covered generically by `AntflyIndexLifecycle` freshness contracts; noted as an accepted abstraction in AntflyDbSplitVisibility. |
+| WAL retention expiry -> reseed vs slot GC | Modeled: `AntflyHARetentionReseed.tla`. Floor over active/unmarked slots (slot_store.zig:295-349), per-slot mark loop (crash-partial marking is the natural interleaving), mark-before-truncate invariant, no-permanent-unmarked-lag liveness. |
+| Backup slot vs truncation vs reseed | Modeled in `AntflyHARetentionReseed.tla`: backup slot as a pinning slot (primary.zig:481-525); a slow backup MAY lose its slot to retention policy (real code gap, modeled as-is) but backup end must then FAIL CLOSED — success-after-truncation is the mutant. |
+| Index lifecycle outside split | Modeled: `AntflyIndexLifecycle.tla`. stale->building->fresh with non-atomic durable status snapshots (db.zig:9611-9796), shadow-swap completeness, crash recovery re-validating a stale "fresh" snapshot against durable watermarks, build-converges liveness (strong fairness: crash loops interrupt enabledness but applied is durable). 2 mutants. |
+| Distributed join lease lifecycle | ROUTED TO SIM HARNESS, not TLA+. The lease is advisory (no hard mutual exclusion to prove), expiry is continuous-time, and correctness rests on import-fallback and row-level dedup — data-shaped. A TLA+ model would either prove an invariant the code deliberately does not guarantee or bury the real question (imported-state completeness). Validate with fault-injection shuffle joins + deterministic result comparison. |
+| Owner-job gate composition | ROUTED TO ZIG TESTS, not TLA+. The risk is a thread-level check-then-execute race within one role; the structural stale-allow class is already modeled in `AntflyHAGateTransitions`. Needed tests: demotion/fence between `haOwnerJobCanRun` (data/runtime.zig caches per job kind) and job execution. |
+
+Harness hardening from this pass: `tla_check_expected_failure` now requires
+an actual "Invariant ... is violated" / temporal-property violation in TLC
+output — a bare nonzero exit (e.g. a spec error) no longer counts as an
+expected failure. This trap was hit in practice while developing these
+models (an underparenthesized ghost-variable assignment produced
+"successor state not completely specified", which the old exit-code-only
+check silently accepted as the mutant failing).
 
 ## Remaining Critique Backlog
 
