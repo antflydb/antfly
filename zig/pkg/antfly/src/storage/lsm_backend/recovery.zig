@@ -209,9 +209,9 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
             backend.finalizeDeferredStorageWork() catch |err| {
                 if (err == error.FileNotFound) {
                     std.log.warn("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
-                    return;
+                } else {
+                    std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
                 }
-                std.log.err("lsm backend close skipped deferred storage finalization root={?s} err={}", .{ backend.root_dir, err });
             };
         } else if (backend.mutable.entries.items.len > 0) {
             compaction_mod.flushMutable(BackendType, backend) catch |err| {

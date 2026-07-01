@@ -1,0 +1,89 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "cte-backed-join-fail-closed",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "cte_backed_join",
+      "visibility_outcome": "changed_version_fail_closed",
+      "evidence_kind": "execution_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+      "coverage_contract": "CTE-backed joins and laterals revalidate scanned owner rows and fail closed on missing owners, changed row bodies, and changed row versions before local join execution.",
+      "missing_or_next_evidence": "Keep extending this row for additional CTE-backed multi-stage join sources before enabling non-materialized routed joins.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "live-write-pagination-gap",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "live_write_pagination",
+      "visibility_outcome": "gap_tracked",
+      "evidence_kind": "gap_inventory",
+      "evidence_file": "zig/RELATIONAL.md",
+      "evidence_symbol": "Add live-write and range-movement pagination tests for routed reads",
+      "coverage_contract": "The matrix keeps live-write and range-movement pagination visible as a separate execution gap instead of treating local pagination fixtures as routed visibility proof.",
+      "missing_or_next_evidence": "Add release-gated routed pagination tests proving stable ordering, no duplicates, no missing rows, and deterministic retry or fail-closed behavior under range movement.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "non-cte-ranged-join-fail-closed",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "non_cte_ranged_join",
+      "visibility_outcome": "stale_owner_fail_closed",
+      "evidence_kind": "execution_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+      "coverage_contract": "Non-CTE ranged routed joins collect both sides through scanned owner rows and fail closed on missing scanned rows, changed row bodies, and changed row versions.",
+      "missing_or_next_evidence": "Add topology retry evidence when ranged joins run against real hosted/provisioned owner movement.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "routed-cte-revalidation",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "routed_cte",
+      "visibility_outcome": "changed_row_fail_closed",
+      "evidence_kind": "execution_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+      "coverage_contract": "Routed CTE reads revalidate scanned owner rows and fail closed on missing rows, changed row bodies, changed versions, missing scan versions, zero scan versions, and oversized bounded materialization.",
+      "missing_or_next_evidence": "Replace bounded CTE materialization with durable spill cursors before marking large recursive CTE streaming complete.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "routed-merge-join-unsupported",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "routed_merge_join",
+      "visibility_outcome": "unsupported_fixture",
+      "evidence_kind": "unsupported_fixture",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+      "coverage_contract": "Routed merge joins reject ranged fanout, filtered inputs, limit pagination, and offset pagination before scanning unless sorted-input proof is local and complete.",
+      "missing_or_next_evidence": "Keep merge joins fail-closed until every non-materialized routed source shape proves global leading ascending join-key order after owner scans, topology retry, filtering, and pagination.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "routed-system-time-as-of",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "system_time_read",
+      "visibility_outcome": "topology_retry_required",
+      "evidence_kind": "execution_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
+      "evidence_symbol": "bound table read source executes SQL system-time as-of by commit sequence",
+      "coverage_contract": "System-time reads execute by commit sequence and timestamp, preserve historical visibility through query, CTE, group-local, and set-operation paths, and fail closed after history pruning or mismatched as-of inputs.",
+      "missing_or_next_evidence": "Add live topology retry evidence for system-time reads against real hosted owner movement.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "system-time-cte-provisioned",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "routed_shape": "system_time_cte",
+      "visibility_outcome": "topology_retry_required",
+      "evidence_kind": "execution_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
+      "evidence_symbol": "provisioned table read source composes local system-time as-of with cte plans",
+      "coverage_contract": "Provisioned system-time reads compose local as-of execution with CTE plans, multi-range scans, and explicit included or excluded doc-key ranges across owner groups.",
+      "missing_or_next_evidence": "Extend this evidence to hosted range movement once routed pagination and live topology retry harnesses land.",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

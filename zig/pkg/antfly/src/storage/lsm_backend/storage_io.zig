@@ -2562,7 +2562,8 @@ test "native copied storage handle fails closed after owner deinit" {
 
     var native = try NativeStorage.init(std.testing.allocator, .threaded);
     const copied = native.storage();
-    const path = "/tmp/antfly-storage-closed-handle-file";
+    var path_buf: [128]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "/tmp/antfly-storage-closed-handle-file-{d}", .{atomic_write_nonce.fetchAdd(1, .monotonic)});
     try native.storage().writeFileAbsolute(path, "hello");
     native.deinit();
 

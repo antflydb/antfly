@@ -18,16 +18,23 @@ const ast = @import("ast.zig");
 const binder = @import("binder.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_aggregate = @import("expr/aggregate.zig");
 const expr_build = @import("expr/build.zig");
+const expr_condition = @import("expr/condition.zig");
 const expr_disjoint = @import("expr/disjoint.zig");
 const expr_equal = @import("expr/equal.zig");
 const expr_generated = @import("expr/generated.zig");
+const expr_generated_validate = @import("expr/generated_validate.zig");
 const expr_limits = @import("expr/limits.zig");
 const expr_operator = @import("expr/operator.zig");
 const expr_parse = @import("expr/parse.zig");
 const expr_predicate = @import("expr/predicate.zig");
+const expr_projection = @import("expr/projection.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
+const expr_text = @import("expr/text.zig");
 const expr_type = @import("expr/type.zig");
 const expr_token = @import("expr/token.zig");
+const expr_window = @import("expr/window.zig");
 const grammar = @import("grammar.zig");
 const generated_parser = @import("generated_parser.zig");
 const lexer = @import("lexer.zig");
@@ -91,17 +98,17 @@ pub const JoinParserContextHooks = struct {
 pub const SelectParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     allow_select_set_boundary: bool = false,
     allow_select_set_result_tail_boundary: bool = false,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: SelectParserContextHooks,
     select_item_options: SelectItemParserOptions,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-    fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
@@ -1187,7 +1194,7 @@ pub fn validateGeneratedOptionalExpressionForExactRange(
     expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
-    const exact_expression = generatedExpressionForExactRange(expression, range) orelse return false;
+    const exact_expression = expr_generated_validate.generatedExpressionForExactRange(expression, range) orelse return false;
     try validateGeneratedOptionalExpression(tokens, range, exact_expression.*);
     return true;
 }
@@ -4537,11 +4544,11 @@ fn generatedLateralSubqueryReadAstForRange(
 pub const WindowParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: SelectParserContextHooks,
     named_window_hooks: NamedWindowSpecsContextHooks,
-    fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
@@ -4590,7 +4597,7 @@ pub const LateralParserOptions = struct {
 pub const LateralSubqueryParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     left_alias: []const u8,
     context_hooks: JoinParserContextHooks,
@@ -4604,19 +4611,19 @@ pub const LateralSubqueryParserOptions = struct {
 pub const AggregateParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
     context_hooks: SelectParserContextHooks,
     aggregate_spec_options: AggregateSpecParserOptions,
     select_item_options: SelectItemParserOptions,
-    fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
     output_field_options: AggregateOutputFieldParserOptions,
     output_field_condition_options: AggregateOutputFieldExpressionConditionParserOptions,
-    case_expression_hooks: CaseExpressionParserHooks,
+    case_expression_hooks: expr_row_parse.CaseExpressionParserHooks,
     output_order_expression_options: OutputOrderExpressionParserOptions,
     realtime_ns: u64,
 };
@@ -4624,7 +4631,7 @@ pub const AggregateParserOptions = struct {
 pub const UniquePredicateWhereExpressionParserOptions = struct {
     type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool = false,
-    case_expression_hooks: CaseExpressionParserHooks,
+    case_expression_hooks: expr_row_parse.CaseExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     require_exact_generated_expression: bool = false,
 };
@@ -4637,7 +4644,7 @@ pub const AggregateOutputFieldExpressionConditionParserOptions = struct {
 
 pub const ReturningProjectionParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     context_hooks: SelectParserContextHooks,
     select_item_options: SelectItemParserOptions,
@@ -4646,7 +4653,7 @@ pub const ReturningProjectionParserOptions = struct {
 
 pub const JoinedMutationReturningProjectionParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
@@ -4656,7 +4663,7 @@ pub const JoinedMutationReturningProjectionParserOptions = struct {
 
 pub const AggregateOutputExpressionConditionParserOptions = struct {
     context_hooks: SelectParserContextHooks,
-    case_expression_hooks: CaseExpressionParserHooks,
+    case_expression_hooks: expr_row_parse.CaseExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
@@ -4667,7 +4674,7 @@ pub const BareBooleanAggregateHavingExpressionParserOptions = struct {
 };
 
 pub const BareBooleanWhereExpressionParserOptions = struct {
-    boolean_hooks: BooleanRowExpressionParserHooks,
+    boolean_hooks: expr_row_parse.BooleanRowExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
@@ -4678,25 +4685,25 @@ pub const AggregateOutputFieldParserOptions = struct {
 };
 
 pub const AggregateSpecParserOptions = struct {
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     order_expression_hooks: OrderExpressionParserOptions,
     aggregate_input: AggregateInputExpressionParserOptions,
     expression_alternatives: ExpressionWhereConditionAlternativesParserOptions,
     expression_conditions: ExpressionWhereConditionsParserOptions,
-    fixed_binary: FixedBinaryRowExpressionParserOptions,
+    fixed_binary: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     realtime_ns: u64,
 };
 
 pub const AggregateInputExpressionParserOptions = struct {
     context_hooks: SelectParserContextHooks,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
 };
 
 pub const OutputOrderExpressionParserOptions = struct {
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     context_hooks: SelectParserContextHooks,
     order_expression_hooks: OrderExpressionParserOptions,
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
@@ -4704,7 +4711,7 @@ pub const OutputOrderExpressionParserOptions = struct {
 
 pub const OrderByParserOptions = struct {
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_expression_qualifiers: []const []const u8 = &.{},
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
@@ -4716,12 +4723,12 @@ pub const OrderByParserOptions = struct {
 
 pub const OrderExpressionParserOptions = struct {
     field_source: db_mod.types.RelationalRowsExpressionFieldSource = .row,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-    parenthesized: ParenthesizedRowExpressionParserOptions,
-    case_fold_hooks: CaseFoldRowExpressionParserOptions,
-    fixed_unary: FixedUnaryRowExpressionParserOptions,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
+    parenthesized: expr_row_parse.ParenthesizedRowExpressionParserOptions,
+    case_fold_hooks: expr_row_parse.CaseFoldRowExpressionParserOptions,
+    fixed_unary: expr_row_parse.FixedUnaryRowExpressionParserOptions,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
@@ -4731,7 +4738,7 @@ pub const WindowDefinitionParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     type_context: expr_type.RowExpressionTypeContext,
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     order_expression_hooks: OrderExpressionParserOptions,
     generated_window_items: []const generated_parser.GeneratedSqlWindowAst = &.{},
     generated_window_ast: ?*const generated_parser.GeneratedSqlWindowAst = null,
@@ -4739,13 +4746,13 @@ pub const WindowDefinitionParserOptions = struct {
 };
 
 pub const WindowSpecParserOptions = struct {
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-    boolean_hooks: BooleanRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
+    boolean_hooks: expr_row_parse.BooleanRowExpressionParserHooks,
     expression_alternatives: ExpressionWhereConditionAlternativesParserOptions,
     expression_conditions: ExpressionWhereConditionsParserOptions,
-    fixed_binary: FixedBinaryRowExpressionParserOptions,
+    fixed_binary: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     realtime_ns: u64,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
@@ -4755,656 +4762,13 @@ pub const ExpressionWhereConditionRowParserOptions = struct {
     joined_context_hooks: ?JoinedExpressionParserContextHooks = null,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     require_exact_generated_expression: bool = false,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
 };
 
 pub const ExpressionWhereConditionsParserOptions = ExpressionWhereConditionRowParserOptions;
 pub const ExpressionWhereConditionAlternativesParserOptions = ExpressionWhereConditionRowParserOptions;
-
-fn generatedExpressionForExactRange(
-    expression: *const generated_parser.GeneratedSqlExpressionAst,
-    range: generated_parser.GeneratedSqlTokenRange,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (expression.tokens) |tokens_range| {
-        if (expr_generated.generatedTokenRangeEqual(tokens_range, range)) return expression;
-    }
-    return generatedChildExpressionForExactRange(expression, range);
-}
-
-fn generatedChildExpressionForExactRange(
-    expression: *const generated_parser.GeneratedSqlExpressionAst,
-    range: generated_parser.GeneratedSqlTokenRange,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (generatedOptionalExpressionForExactRange(expression.inner_expression, expression.inner_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.left_expression, expression.left_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.right_expression, expression.right_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.between_lower_expression, expression.between_lower_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.between_upper_expression, expression.between_upper_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.escape_expression, expression.escape_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.cast_expression, expression.cast_expression_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.case_first_condition, expression.case_first_condition_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.case_first_result, expression.case_first_result_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.case_else_expression, expression.case_else_expression_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.boolean_first_condition, expression.boolean_first_condition_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.boolean_last_condition, expression.boolean_last_condition_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.extract_source_expression, expression.extract_source_tokens, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.argument_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.argument_order_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.within_group_order_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.over_partition_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.over_order_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.array_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.boolean_condition_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.case_condition_items, range)) |found| return found;
-    if (generatedExpressionListForExactRange(expression.case_result_items, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.filter_expression, expression.filter_predicate_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.over_frame_start_expression, expression.over_frame_start_expression_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.over_frame_end_expression, expression.over_frame_end_expression_tokens, range)) |found| return found;
-    if (generatedOptionalExpressionForExactRange(expression.subquery_where_expression, expression.subquery_where_tokens, range)) |found| return found;
-    if (expression.subquery_tail) |tail| {
-        if (tail.limit_expression) |limit_expression| {
-            if (generatedExpressionForExactRange(limit_expression, range)) |found| return found;
-        }
-        if (tail.offset_expression) |offset_expression| {
-            if (generatedExpressionForExactRange(offset_expression, range)) |found| return found;
-        }
-        if (tail.fetch_count_expression) |fetch_expression| {
-            if (generatedExpressionForExactRange(fetch_expression, range)) |found| return found;
-        }
-    }
-    return null;
-}
-
-fn generatedExpressionListHasConsistentExpressions(list: generated_parser.GeneratedSqlListAst) bool {
-    return list.count == list.items.len and list.count == list.expressions.len;
-}
-
-fn generatedExpressionListForExactRange(
-    list: generated_parser.GeneratedSqlListAst,
-    range: generated_parser.GeneratedSqlTokenRange,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (!generatedExpressionListHasConsistentExpressions(list)) return null;
-    for (list.expressions) |*item| {
-        if (generatedExpressionForExactRange(item, range)) |found| return found;
-    }
-    return null;
-}
-
-fn generatedOptionalExpressionForExactRange(
-    expression: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: ?generated_parser.GeneratedSqlTokenRange,
-    range: generated_parser.GeneratedSqlTokenRange,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (tokens == null) return null;
-    const child = expression orelse return null;
-    return generatedExpressionForExactRange(child, range);
-}
-
-fn generatedExpressionListForOperatorStart(
-    list: generated_parser.GeneratedSqlListAst,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    operator_token_index: usize,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (!generatedExpressionListHasConsistentExpressions(list)) return null;
-    for (list.expressions) |*item| {
-        if (generatedExpressionForOperatorStart(item, expected_kind, operator_token_index)) |found| return found;
-    }
-    return null;
-}
-
-fn generatedExpressionForOperatorStart(
-    expression: *const generated_parser.GeneratedSqlExpressionAst,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    operator_token_index: usize,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (expression.kind == expected_kind) {
-        if (expression.operator_tokens) |operator_tokens| {
-            if (operator_tokens.start == operator_token_index) return expression;
-        }
-    }
-    if (generatedOptionalExpressionForOperatorStart(expression.inner_expression, expression.inner_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.left_expression, expression.left_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.right_expression, expression.right_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.between_lower_expression, expression.between_lower_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.between_upper_expression, expression.between_upper_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.escape_expression, expression.escape_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.cast_expression, expression.cast_expression_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.case_first_condition, expression.case_first_condition_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.case_first_result, expression.case_first_result_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.case_else_expression, expression.case_else_expression_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.boolean_first_condition, expression.boolean_first_condition_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.boolean_last_condition, expression.boolean_last_condition_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.extract_source_expression, expression.extract_source_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.filter_expression, expression.filter_predicate_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.over_frame_start_expression, expression.over_frame_start_expression_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.over_frame_end_expression, expression.over_frame_end_expression_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (generatedOptionalExpressionForOperatorStart(expression.subquery_where_expression, expression.subquery_where_tokens, expected_kind, operator_token_index)) |found| return found;
-    if (expression.subquery_tail) |tail| {
-        if (tail.limit_expression) |limit_expression| {
-            if (generatedExpressionForOperatorStart(limit_expression, expected_kind, operator_token_index)) |found| return found;
-        }
-        if (tail.offset_expression) |offset_expression| {
-            if (generatedExpressionForOperatorStart(offset_expression, expected_kind, operator_token_index)) |found| return found;
-        }
-        if (tail.fetch_count_expression) |fetch_expression| {
-            if (generatedExpressionForOperatorStart(fetch_expression, expected_kind, operator_token_index)) |found| return found;
-        }
-    }
-    if (generatedExpressionListForOperatorStart(expression.argument_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.argument_order_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.within_group_order_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.over_partition_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.over_order_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.array_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.case_condition_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.case_result_items, expected_kind, operator_token_index)) |found| return found;
-    if (generatedExpressionListForOperatorStart(expression.boolean_condition_items, expected_kind, operator_token_index)) |found| return found;
-    return null;
-}
-
-fn generatedOptionalExpressionForOperatorStart(
-    expression: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: ?generated_parser.GeneratedSqlTokenRange,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    operator_token_index: usize,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    if (tokens == null) return null;
-    const child = expression orelse return null;
-    return generatedExpressionForOperatorStart(child, expected_kind, operator_token_index);
-}
-
-fn generatedFunctionNameMatchesRowExpressionKind(
-    token: Token,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-) ?bool {
-    return switch (kind) {
-        .uuid_v4 => expr_token.sqlTokenIsUuidV4Function(token),
-        .coalesce => token.matchesKeywordTag(.coalesce),
-        .lower => token.matchesKeywordTag(.lower),
-        .upper => token.matchesKeywordTag(.upper),
-        .initcap => expr_token.sqlTokenIsInitcapFunction(token),
-        .trim => token.matchesKeywordTag(.trim) or token.matchesKeywordTag(.btrim),
-        .ltrim => token.matchesKeywordTag(.ltrim),
-        .rtrim => token.matchesKeywordTag(.rtrim),
-        .replace => token.matchesKeywordTag(.replace),
-        .regexp_replace => token.matchesKeywordTag(.regexp_replace),
-        .regexp_substr => expr_token.sqlTokenIsRegexpSubstrFunction(token),
-        .regexp_count => expr_token.sqlTokenIsRegexpCountFunction(token),
-        .regexp_instr => expr_token.sqlTokenIsRegexpInstrFunction(token),
-        .translate => expr_token.sqlTokenIsTranslateFunction(token),
-        .concat => token.matchesKeywordTag(.concat),
-        .concat_ws => token.matchesKeywordTag(.concat_ws),
-        .nullif => token.matchesKeywordTag(.nullif),
-        .length => expr_token.sqlTokenIsLengthFunction(token),
-        .octet_length => expr_token.sqlTokenIsOctetLengthFunction(token),
-        .bit_length => expr_token.sqlTokenIsBitLengthFunction(token),
-        .ascii => expr_token.sqlTokenIsAsciiFunction(token),
-        .chr => expr_token.sqlTokenIsChrFunction(token),
-        .substring => expr_token.sqlTokenIsSubstringFunction(token),
-        .overlay => expr_token.sqlTokenIsOverlayFunction(token),
-        .split_part => expr_token.sqlTokenIsSplitPartFunction(token),
-        .strpos => expr_token.sqlTokenIsStrposFunction(token) or token.matchesKeywordTag(.position),
-        .left => token.matchesKeywordTag(.left),
-        .right => token.matchesKeywordTag(.right),
-        .lpad => token.matchesKeywordTag(.lpad),
-        .rpad => token.matchesKeywordTag(.rpad),
-        .repeat => expr_token.sqlTokenIsRepeatFunction(token),
-        .reverse => expr_token.sqlTokenIsReverseFunction(token),
-        .md5 => expr_token.sqlTokenIsMd5Function(token),
-        .starts_with => expr_token.sqlTokenIsStartsWithFunction(token),
-        .ends_with => expr_token.sqlTokenIsEndsWithFunction(token),
-        .regexp_match => expr_token.sqlTokenIsRegexpMatchFunction(token),
-        .date_trunc => expr_token.sqlTokenIsDateTruncFunction(token),
-        .date_bin => expr_token.sqlTokenIsDateBinFunction(token),
-        .date_part => expr_token.sqlTokenIsDatePartFunction(token),
-        .abs => token.matchesKeywordTag(.abs),
-        .round => token.matchesKeywordTag(.round),
-        .trunc => token.matchesKeywordTag(.trunc),
-        .floor => token.matchesKeywordTag(.floor),
-        .ceil => token.matchesKeywordTag(.ceil),
-        .sqrt => token.matchesKeywordTag(.sqrt),
-        .sign => token.matchesKeywordTag(.sign),
-        .power => token.matchesKeywordTag(.power),
-        .mod => token.matchesKeywordTag(.mod),
-        .greatest => token.matchesKeywordTag(.greatest),
-        .least => token.matchesKeywordTag(.least),
-        .json_extract => expr_token.sqlTokenIsJsonExtractPathFunction(token),
-        .json_typeof => expr_token.sqlTokenIsJsonTypeofFunction(token),
-        .json_array_length => expr_token.sqlTokenIsJsonArrayLengthFunction(token),
-        .json_build_object => expr_token.sqlTokenIsJsonBuildObjectFunction(token),
-        .to_jsonb => token.matchesKeywordTag(.to_jsonb),
-        .array_length => expr_token.sqlTokenIsArrayLengthFunction(token),
-        .array_position => token.matchesKeywordTag(.array_position),
-        .array_positions => token.matchesKeywordTag(.array_positions),
-        .array_append => token.matchesKeywordTag(.array_append),
-        .array_prepend => token.matchesKeywordTag(.array_prepend),
-        .array_cat => token.matchesKeywordTag(.array_cat),
-        .array_remove => token.matchesKeywordTag(.array_remove),
-        .array_replace => token.matchesKeywordTag(.array_replace),
-        .array_to_string => expr_token.sqlTokenIsArrayToStringFunction(token),
-        .string_to_array => token.matchesKeywordTag(.string_to_array),
-        else => null,
-    };
-}
-
-fn generatedOperatorKindMatchesRowExpressionKind(
-    generated_kind: generated_parser.GeneratedSqlExpressionKind,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-) ?bool {
-    return switch (generated_kind) {
-        .unary_negative => generatedUnaryNegativeMatchesRowExpression(parsed_expression),
-        .additive => parsed_expression.kind == .add,
-        .subtractive => parsed_expression.kind == .sub,
-        .multiplicative => parsed_expression.kind == .mul,
-        .divisive => parsed_expression.kind == .div,
-        .modulo => parsed_expression.kind == .mod,
-        .logical_or => parsed_expression.kind == .bool_or,
-        .logical_and => parsed_expression.kind == .bool_and,
-        .logical_not => parsed_expression.kind == .bool_not,
-        .string_concat => parsed_expression.kind == .concat,
-        .json_access, .json_text_access, .json_path_access, .json_path_text_access => parsed_expression.kind == .json_extract,
-        .json_key_exists => parsed_expression.kind == .json_path_exists,
-        .json_key_any => parsed_expression.kind == .json_path_exists or parsed_expression.kind == .bool_or,
-        .json_key_all => parsed_expression.kind == .json_path_exists or parsed_expression.kind == .bool_and,
-        else => null,
-    };
-}
-
-fn generatedUnaryNegativeMatchesRowExpression(
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-) bool {
-    if (parsed_expression.kind == .value) return std.mem.startsWith(u8, parsed_expression.value_json, "-");
-    return parsed_expression.kind == .mul and
-        parsed_expression.operands.len == 2 and
-        parsed_expression.operands[0].kind == .value and
-        std.mem.eql(u8, parsed_expression.operands[0].value_json, "-1");
-}
-
-fn generatedArithmeticOperatorKindMayRepresentRowExpressionKind(
-    generated_kind: generated_parser.GeneratedSqlExpressionKind,
-    parsed_kind: db_mod.types.RelationalRowsExpressionKind,
-) bool {
-    return switch (generated_kind) {
-        .additive, .subtractive => parsed_kind == .add or parsed_kind == .sub,
-        .multiplicative, .divisive, .modulo => parsed_kind == .mul or parsed_kind == .div or parsed_kind == .mod,
-        else => false,
-    };
-}
-
-fn generatedLeafKindMayRepresentRowExpression(
-    generated_kind: generated_parser.GeneratedSqlExpressionKind,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-) bool {
-    return switch (generated_kind) {
-        .token_range => true,
-        .current_timestamp => parsed_expression.kind == .now,
-        .current_date => parsed_expression.kind == .date_trunc,
-        .timestamp_literal => parsed_expression.kind == .value,
-        .interval_literal => parsed_expression.kind == .interval_ns or parsed_expression.kind == .interval_months,
-        .cast => parsed_expression.kind == .cast,
-        .case_expression => parsed_expression.kind == .case,
-        .extract_expression => parsed_expression.kind == .date_part,
-        .array_constructor => parsed_expression.kind == .value,
-        else => false,
-    };
-}
-
-fn validateGeneratedConcatExpressionOperandStrict(
-    tokens: []const Token,
-    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    parsed_operand_index: *usize,
-) anyerror!void {
-    if (generated_expression.kind == .string_concat) {
-        const left_expression = generated_expression.left_expression orelse return error.UnsupportedSqlShape;
-        try validateGeneratedConcatExpressionOperandStrict(tokens, left_expression, parsed_expression, parsed_operand_index);
-        const right_expression = generated_expression.right_expression orelse return error.UnsupportedSqlShape;
-        try validateGeneratedConcatExpressionOperandStrict(tokens, right_expression, parsed_expression, parsed_operand_index);
-        return;
-    }
-    if (parsed_operand_index.* >= parsed_expression.operands.len) return error.UnsupportedSqlShape;
-    const range = generated_expression.tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedRowExpressionIdentityStrict(
-        tokens,
-        range.start,
-        range.end,
-        parsed_expression.operands[parsed_operand_index.*],
-        generated_expression,
-    );
-    parsed_operand_index.* += 1;
-}
-
-fn validateGeneratedConcatExpressionOperandsStrict(
-    tokens: []const Token,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
-) anyerror!void {
-    var parsed_operand_index: usize = 0;
-    try validateGeneratedConcatExpressionOperandStrict(tokens, generated_expression, parsed_expression, &parsed_operand_index);
-    if (parsed_operand_index != parsed_expression.operands.len) return error.UnsupportedSqlShape;
-}
-
-fn generatedPositionFunctionArgumentSeparator(
-    tokens: []const Token,
-    argument_tokens: generated_parser.GeneratedSqlTokenRange,
-) ?usize {
-    var depth: usize = 0;
-    var i = argument_tokens.start;
-    while (i < argument_tokens.end) : (i += 1) {
-        switch (tokens[i].kind) {
-            .lparen, .lbracket => depth += 1,
-            .rparen, .rbracket => {
-                if (depth == 0) return null;
-                depth -= 1;
-            },
-            .identifier => if (depth == 0 and tokens[i].matchesKeywordTag(.in)) return i,
-            else => {},
-        }
-    }
-    return null;
-}
-
-fn validateGeneratedPositionFunctionOperandsStrict(
-    tokens: []const Token,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
-) anyerror!bool {
-    if (parsed_expression.kind != .strpos or generated_expression.kind != .function_call) return false;
-    const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
-    if (!token.matchesKeywordTag(.position)) return false;
-    if (parsed_expression.operands.len != 2) return error.UnsupportedSqlShape;
-    const argument_tokens = generated_expression.argument_tokens orelse return error.UnsupportedSqlShape;
-    const separator = generatedPositionFunctionArgumentSeparator(tokens, argument_tokens) orelse return error.UnsupportedSqlShape;
-    if (separator == argument_tokens.start or separator + 1 >= argument_tokens.end) return error.UnsupportedSqlShape;
-    try validateGeneratedRowExpressionIdentityStrict(
-        tokens,
-        separator + 1,
-        argument_tokens.end,
-        parsed_expression.operands[0],
-        generated_expression,
-    );
-    try validateGeneratedRowExpressionIdentityStrict(
-        tokens,
-        argument_tokens.start,
-        separator,
-        parsed_expression.operands[1],
-        generated_expression,
-    );
-    return true;
-}
-
-fn jsonPathSegmentCount(path: []const u8) ?usize {
-    if (path.len == 0) return null;
-    var count: usize = 1;
-    var previous_dot = false;
-    for (path) |ch| {
-        if (ch == '.') {
-            if (previous_dot) return null;
-            previous_dot = true;
-            count += 1;
-        } else {
-            previous_dot = false;
-        }
-    }
-    if (previous_dot) return null;
-    return count;
-}
-
-fn validateGeneratedJsonExtractPathFunctionOperandsStrict(
-    tokens: []const Token,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
-) anyerror!bool {
-    if (parsed_expression.kind != .json_extract or generated_expression.kind != .function_call) return false;
-    const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
-    if (!expr_token.sqlTokenIsJsonExtractPathFunction(token)) return false;
-    if (expr_token.sqlJsonExtractPathTokenAsText(token) != parsed_expression.json_as_text) return error.UnsupportedSqlShape;
-    if (parsed_expression.operands.len != 1) return error.UnsupportedSqlShape;
-    const segment_count = jsonPathSegmentCount(parsed_expression.json_path) orelse return error.UnsupportedSqlShape;
-    if (generated_expression.argument_items.count != segment_count + 1 or
-        generated_expression.argument_items.items.len != generated_expression.argument_items.count or
-        generated_expression.argument_items.expressions.len != generated_expression.argument_items.count)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const source_tokens = generated_expression.argument_items.items[0];
-    try validateGeneratedRowExpressionIdentityStrict(
-        tokens,
-        source_tokens.start,
-        source_tokens.end,
-        parsed_expression.operands[0],
-        generated_expression,
-    );
-    for (generated_expression.argument_items.items[1..], 1..) |path_tokens, index| {
-        try validateGeneratedOptionalExpression(tokens, path_tokens, generated_expression.argument_items.expressions[index]);
-    }
-    return true;
-}
-
-fn generatedJsonKeySetArrayExpression(
-    expression: *const generated_parser.GeneratedSqlExpressionAst,
-) ?*const generated_parser.GeneratedSqlExpressionAst {
-    var current = expression;
-    while (true) {
-        switch (current.kind) {
-            .grouped => current = current.inner_expression orelse return null,
-            .cast => current = current.cast_expression orelse return null,
-            .array_constructor => return current,
-            else => return null,
-        }
-    }
-}
-
-fn validateGeneratedJsonKeySetExpressionOperandsStrict(
-    tokens: []const Token,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
-) anyerror!bool {
-    const expected_compound_kind: db_mod.types.RelationalRowsExpressionKind = switch (generated_expression.kind) {
-        .json_key_any => .bool_or,
-        .json_key_all => .bool_and,
-        else => return false,
-    };
-    if (parsed_expression.kind != expected_compound_kind and parsed_expression.kind != .json_path_exists) return false;
-    const left_tokens = generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
-    const right_expression = generated_expression.right_expression orelse return error.UnsupportedSqlShape;
-    const array_expression = generatedJsonKeySetArrayExpression(right_expression) orelse return error.UnsupportedSqlShape;
-    if (array_expression.array_items.count == 0 or
-        array_expression.array_items.items.len != array_expression.array_items.count or
-        array_expression.array_items.expressions.len != array_expression.array_items.count)
-    {
-        return error.UnsupportedSqlShape;
-    }
-
-    const path_exists_operands = if (parsed_expression.kind == .json_path_exists) blk: {
-        if (parsed_expression.operands.len != 1) return error.UnsupportedSqlShape;
-        break :blk parsed_expression.operands[0..1];
-    } else parsed_expression.operands;
-    if (path_exists_operands.len != array_expression.array_items.items.len) return error.UnsupportedSqlShape;
-    for (path_exists_operands, array_expression.array_items.items) |path_exists, item_tokens| {
-        if (path_exists.kind != .json_path_exists or path_exists.operands.len != 1) return error.UnsupportedSqlShape;
-        if (item_tokens.end != item_tokens.start + 1 or tokens[item_tokens.start].kind != .string) return error.UnsupportedSqlShape;
-        if (!std.mem.eql(u8, path_exists.json_path, tokens[item_tokens.start].text)) return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityStrict(
-            tokens,
-            left_tokens.start,
-            left_tokens.end,
-            path_exists.operands[0],
-            generated_expression,
-        );
-    }
-    return true;
-}
-
-fn validateGeneratedRowExpressionOperandsStrict(
-    tokens: []const Token,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
-) anyerror!void {
-    if (parsed_expression.operands.len == 0) return;
-    if (parsed_expression.kind == .concat and generated_expression.kind == .string_concat) {
-        try validateGeneratedConcatExpressionOperandsStrict(tokens, parsed_expression, generated_expression);
-        return;
-    }
-    if (try validateGeneratedPositionFunctionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
-    if (try validateGeneratedJsonExtractPathFunctionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
-    if (try validateGeneratedJsonKeySetExpressionOperandsStrict(tokens, parsed_expression, generated_expression)) return;
-    var expected_operand_count: usize = 0;
-    if (generated_expression.left_tokens) |left_tokens| {
-        if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityStrict(
-            tokens,
-            left_tokens.start,
-            left_tokens.end,
-            parsed_expression.operands[expected_operand_count],
-            generated_expression,
-        );
-        expected_operand_count += 1;
-    }
-    if (generated_expression.right_tokens) |right_tokens| {
-        if (parsed_expression.operands.len <= expected_operand_count) return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityStrict(
-            tokens,
-            right_tokens.start,
-            right_tokens.end,
-            parsed_expression.operands[expected_operand_count],
-            generated_expression,
-        );
-        expected_operand_count += 1;
-    }
-    if (generated_expression.kind == .function_call and generated_expression.argument_items.count != 0) {
-        if (expected_operand_count != 0) return error.UnsupportedSqlShape;
-        if (generated_expression.argument_items.count != parsed_expression.operands.len) return error.UnsupportedSqlShape;
-        for (generated_expression.argument_items.items, 0..) |argument_tokens, index| {
-            try validateGeneratedRowExpressionIdentityStrict(
-                tokens,
-                argument_tokens.start,
-                argument_tokens.end,
-                parsed_expression.operands[index],
-                generated_expression,
-            );
-        }
-        return;
-    }
-}
-
-pub fn validateGeneratedRowExpressionIdentity(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !void {
-    try validateGeneratedRowExpressionIdentityWithMode(tokens, start, end, parsed_expression, generated_expression_ast, false);
-}
-
-pub fn validateGeneratedRowExpressionIdentityStrict(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !void {
-    try validateGeneratedRowExpressionIdentityWithMode(tokens, start, end, parsed_expression, generated_expression_ast, true);
-}
-
-fn validateGeneratedRowExpressionIdentityWithMode(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    parsed_expression: db_mod.types.RelationalRowsExpression,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    comptime require_exact_expression: bool,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const range: generated_parser.GeneratedSqlTokenRange = .{ .start = start, .end = end };
-    const generated_expression = generatedExpressionForExactRange(root, range) orelse {
-        if (require_exact_expression) return error.UnsupportedSqlShape;
-        return;
-    };
-    try validateGeneratedExpressionPayloads(tokens, generated_expression.*);
-    if (generated_expression.kind == .grouped) {
-        const inner_expression = generated_expression.inner_expression orelse return error.UnsupportedSqlShape;
-        const inner_tokens = inner_expression.tokens orelse return error.UnsupportedSqlShape;
-        try validateGeneratedRowExpressionIdentityWithMode(tokens, inner_tokens.start, inner_tokens.end, parsed_expression, inner_expression, require_exact_expression);
-        return;
-    }
-    switch (generated_expression.kind) {
-        .function_call => {
-            const token = try generatedExpressionFunctionNameToken(tokens, generated_expression.*);
-            if (generatedFunctionNameMatchesRowExpressionKind(token, parsed_expression.kind)) |matches| {
-                if (!matches and (require_exact_expression or token.kind != .identifier)) return error.UnsupportedSqlShape;
-            }
-        },
-        else => {
-            if (generatedOperatorKindMatchesRowExpressionKind(generated_expression.kind, parsed_expression)) |matches| {
-                if (!matches and !generatedArithmeticOperatorKindMayRepresentRowExpressionKind(generated_expression.kind, parsed_expression.kind)) return error.UnsupportedSqlShape;
-                const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
-                try validateGeneratedExpressionOperatorTokens(tokens, generated_expression.kind, operator_tokens);
-            } else if (require_exact_expression and !generatedLeafKindMayRepresentRowExpression(generated_expression.kind, parsed_expression)) {
-                return error.UnsupportedSqlShape;
-            }
-        },
-    }
-    if (require_exact_expression) try validateGeneratedRowExpressionOperandsStrict(tokens, parsed_expression, generated_expression);
-}
-
-pub fn validateGeneratedExpressionConditionIdentity(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !void {
-    try validateGeneratedExpressionConditionIdentityWithMode(tokens, start, end, parsed_condition, generated_expression_ast, false);
-}
-
-pub fn validateGeneratedExpressionConditionIdentityStrict(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !void {
-    try validateGeneratedExpressionConditionIdentityWithMode(tokens, start, end, parsed_condition, generated_expression_ast, true);
-}
-
-fn validateGeneratedExpressionConditionIdentityWithMode(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    parsed_condition: db_mod.types.RelationalRowsExpressionCondition,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    comptime require_exact_child_expressions: bool,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const range: generated_parser.GeneratedSqlTokenRange = .{ .start = start, .end = end };
-    const generated_expression = generatedExpressionForExactRange(root, range) orelse return error.UnsupportedSqlShape;
-    const operator_tokens = generated_expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedRelationalPredicateExpression(generated_expression, tokens, operator_tokens.start, parsed_condition.op);
-    const lhs_tokens = generated_expression.left_tokens orelse return error.UnsupportedSqlShape;
-    if (require_exact_child_expressions) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, lhs_tokens.start, lhs_tokens.end, parsed_condition.lhs, generated_expression);
-    } else {
-        try validateGeneratedRowExpressionIdentity(tokens, lhs_tokens.start, lhs_tokens.end, parsed_condition.lhs, generated_expression);
-    }
-    switch (parsed_condition.op) {
-        .is_null, .is_not_null => {
-            if (parsed_condition.rhs.len != 0 or generated_expression.right_tokens != null) return error.UnsupportedSqlShape;
-        },
-        else => {
-            if (parsed_condition.rhs.len != 1) return error.UnsupportedSqlShape;
-            const rhs_tokens = generated_expression.right_tokens orelse return error.UnsupportedSqlShape;
-            if (require_exact_child_expressions) {
-                try validateGeneratedRowExpressionIdentityStrict(tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
-            } else {
-                try validateGeneratedRowExpressionIdentity(tokens, rhs_tokens.start, rhs_tokens.end, parsed_condition.rhs[0], generated_expression);
-            }
-        },
-    }
-}
 
 fn parseExpressionWhereConditionRowExpressionAlloc(
     alloc: std.mem.Allocator,
@@ -5414,7 +4778,7 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
     options: ExpressionWhereConditionRowParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     const start = pos.*;
-    const expression = try parseRowExpressionAlloc(
+    const expression = try expr_row_parse.parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -5425,7 +4789,7 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
     );
     errdefer freeExpression(alloc, expression);
     if (options.require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(
             tokens,
             start,
             pos.*,
@@ -5433,7 +4797,7 @@ fn parseExpressionWhereConditionRowExpressionAlloc(
             options.generated_expression_ast,
         );
     } else {
-        try validateGeneratedRowExpressionIdentity(
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(
             tokens,
             start,
             pos.*,
@@ -5562,7 +4926,7 @@ pub const JoinedMutationExpressionWhereConditionParserOptions = struct {
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
     alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
-    fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
 };
@@ -5721,7 +5085,7 @@ pub fn parseUniquePredicateWhereExpressionConditionsAlloc(
     }
     while (true) {
         const condition_start = pos.*;
-        var condition = try parseCaseExpressionConditionAlloc(
+        var condition = try expr_row_parse.parseCaseExpressionConditionAlloc(
             alloc,
             tokens,
             pos,
@@ -5732,9 +5096,9 @@ pub fn parseUniquePredicateWhereExpressionConditionsAlloc(
         var condition_transferred = false;
         errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
         if (options.require_exact_generated_expression) {
-            try validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
+            try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
         } else {
-            try validateGeneratedExpressionConditionIdentity(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
+            try expr_generated_validate.validateGeneratedExpressionConditionIdentity(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
         }
         try conditions.append(alloc, condition);
         condition = undefined;
@@ -5743,32 +5107,6 @@ pub fn parseUniquePredicateWhereExpressionConditionsAlloc(
     }
     return try conditions.toOwnedSlice(alloc);
 }
-
-pub const ProjectedColumnType = struct {
-    field_type: runtime_schema.AntflyType,
-    array_item_type: ?runtime_schema.AntflyType = null,
-};
-
-pub const AggregateFilter = struct {
-    predicates: []const runtime_schema.RelationalCheck = &.{},
-    array_any: []const db_mod.types.RelationalRowsArrayAnyPredicate = &.{},
-    array_contains: []const db_mod.types.RelationalRowsArrayContainsPredicate = &.{},
-    array_eq: []const db_mod.types.RelationalRowsArrayEqPredicate = &.{},
-    in_predicates: []const db_mod.types.RelationalRowsInPredicate = &.{},
-    json_contains: []const db_mod.types.RelationalRowsJsonContainsPredicate = &.{},
-    json_path_eq: []const db_mod.types.RelationalRowsJsonPathEqPredicate = &.{},
-    json_path_exists: []const db_mod.types.RelationalRowsJsonPathExistsPredicate = &.{},
-    text_patterns: []const db_mod.types.RelationalRowsTextPatternPredicate = &.{},
-    expressions: []const db_mod.types.RelationalRowsExpressionCondition = &.{},
-    expression_array_contains: []const db_mod.types.RelationalRowsExpressionArrayContainsPredicate = &.{},
-    any_groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
-    not_groups: []const db_mod.types.RelationalRowsExpressionPredicateGroup = &.{},
-};
-
-pub const AggregatePercentileArgument = struct {
-    percentile: ?f64 = null,
-    percentiles: []const f64 = &.{},
-};
 
 pub fn parseBulkIoWhereExpressionsAlloc(
     alloc: std.mem.Allocator,
@@ -5817,7 +5155,7 @@ fn parseBulkIoWhereExpressionConditionAlloc(
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
 ) !db_mod.types.RelationalRowsExpressionCondition {
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -5864,338 +5202,9 @@ fn parseBulkIoWhereExpressionConditionAlloc(
     };
 }
 
-pub const ExtensionFunctionBinding = struct {
-    sql_name: []const u8,
-    native_expression_kind: runtime_schema.RelationalRowsExpressionKind,
-    arity: u16,
-};
-
-pub const RoutineExpressionBinding = struct {
-    sql_name: []const u8,
-    arity: u16,
-    expression: runtime_schema.RelationalRowsExpression,
-    null_input: ?ddl_plan.RoutineNullInput = null,
-};
-
-pub const SqlFunctionBindings = struct {
-    extension_functions: []const ExtensionFunctionBinding = &.{},
-    routine_expressions: []const RoutineExpressionBinding = &.{},
-};
-
-pub const RowExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
-pub const ExtensionFunctionRowExpressionParserOptions = struct {
-    type_context: expr_type.RowExpressionTypeContext,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
-pub const RoutineExpressionRowExpressionParserOptions = struct {
-    type_context: expr_type.RowExpressionTypeContext,
-    boolean_hooks: BooleanRowExpressionParserHooks,
-};
-
-pub const ParenthesizedRowExpressionParserOptions = struct {
-    type_context: expr_type.RowExpressionTypeContext,
-    boolean_hooks: BooleanRowExpressionParserHooks,
-};
-
-pub const CastRowExpressionParserOptions = struct {
-    type_context: expr_type.RowExpressionTypeContext,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
-pub const CoalesceRowExpressionParserOptions = struct {
-    type_context: expr_type.RowExpressionTypeContext,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
 pub const CoalesceProjectionParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
 };
-
-pub const ExpressionProjectionParserOptions = struct {
-    type_context: expr_type.RowExpressionTypeContext,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-    boolean_hooks: BooleanRowExpressionParserHooks,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
-    require_exact_generated_expression: bool = false,
-};
-
-pub const JsonValueExpressionProjectionParserOptions = struct {
-    params: []const value_mod.SqlValue = &.{},
-};
-
-pub const RowExpressionInputDomain = enum {
-    text,
-    numeric,
-    json,
-    any,
-};
-
-pub const FixedUnaryRowExpressionParserOptions = struct {
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
-pub const FixedBinaryRowExpressionParserOptions = struct {
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
-pub const VariadicRowExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
-pub const JsonBuildObjectRowExpressionParserOptions = struct {
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
-pub const ArithmeticExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-    parenthesized: ParenthesizedRowExpressionParserOptions,
-};
-
-pub const BooleanExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
-pub const BooleanRowExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
-pub const CaseExpressionParserHooks = struct {
-    ptr: *anyopaque,
-    parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-    parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
-};
-
-pub const CaseFoldRowExpressionParserOptions = struct {
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-};
-
-pub fn booleanExpressionFromPredicateGroupsAlloc(
-    alloc: std.mem.Allocator,
-    groups: []db_mod.types.RelationalRowsExpressionPredicateGroup,
-) !db_mod.types.RelationalRowsExpression {
-    if (groups.len == 0) return error.UnsupportedSqlShape;
-    if (groups.len == 1) return try booleanExpressionFromPredicateGroupAlloc(alloc, &groups[0]);
-
-    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, groups.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
-        alloc.free(operands);
-    }
-    for (groups) |*group| {
-        operands[initialized] = try booleanExpressionFromPredicateGroupAlloc(alloc, group);
-        initialized += 1;
-    }
-    return .{
-        .kind = .bool_or,
-        .operands = operands,
-    };
-}
-
-pub fn booleanExpressionFromPredicateGroupAlloc(
-    alloc: std.mem.Allocator,
-    group: *db_mod.types.RelationalRowsExpressionPredicateGroup,
-) !db_mod.types.RelationalRowsExpression {
-    if (group.conditions.len == 0) return try booleanLiteralExpressionAlloc(alloc, true);
-    if (group.conditions.len == 1) {
-        const conditions = group.conditions;
-        const condition = conditions[0];
-        @constCast(conditions)[0] = emptyExpressionCondition();
-        const expression = try booleanExpressionFromConditionAlloc(alloc, condition);
-        group.conditions = &.{};
-        alloc.free(conditions);
-        return expression;
-    }
-
-    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, group.conditions.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (operands[0..initialized]) |operand| freeExpression(alloc, operand);
-        alloc.free(operands);
-    }
-    const conditions = group.conditions;
-    for (conditions, 0..) |condition, i| {
-        @constCast(conditions)[i] = emptyExpressionCondition();
-        operands[initialized] = try booleanExpressionFromConditionAlloc(alloc, condition);
-        initialized += 1;
-    }
-    group.conditions = &.{};
-    alloc.free(conditions);
-    return .{
-        .kind = .bool_and,
-        .operands = operands,
-    };
-}
-
-fn emptyExpressionCondition() db_mod.types.RelationalRowsExpressionCondition {
-    return .{
-        .lhs = .{ .kind = .value },
-        .op = .eq,
-        .rhs = &.{},
-    };
-}
-
-pub fn booleanNotExpressionAlloc(
-    alloc: std.mem.Allocator,
-    operand: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpression {
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var operands_transferred = false;
-    errdefer if (!operands_transferred) alloc.free(operands);
-    operands[0] = operand;
-    operand_transferred = true;
-    operands_transferred = true;
-    return .{
-        .kind = .bool_not,
-        .operands = operands,
-    };
-}
-
-pub fn booleanExpressionConditionAlloc(
-    alloc: std.mem.Allocator,
-    expression: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred) alloc.free(rhs);
-    rhs[0] = try booleanLiteralExpressionAlloc(alloc, true);
-    var rhs_expression_transferred = false;
-    errdefer if (!rhs_expression_transferred) freeExpression(alloc, rhs[0]);
-    expression_transferred = true;
-    rhs_expression_transferred = true;
-    rhs_transferred = true;
-    return .{
-        .lhs = expression,
-        .op = .eq,
-        .rhs = rhs,
-    };
-}
-
-pub fn booleanExpressionFromConditionAlloc(
-    alloc: std.mem.Allocator,
-    condition: db_mod.types.RelationalRowsExpressionCondition,
-) !db_mod.types.RelationalRowsExpression {
-    var condition_transferred = false;
-    errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-
-    const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, 1);
-    var branches_transferred = false;
-    errdefer if (!branches_transferred) alloc.free(branches);
-    const then_expression = try booleanLiteralExpressionAlloc(alloc, true);
-    var then_transferred = false;
-    errdefer if (!then_transferred) freeExpression(alloc, then_expression);
-
-    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var fallback_transferred = false;
-    errdefer if (!fallback_transferred) alloc.free(fallback);
-    fallback[0] = try booleanLiteralExpressionAlloc(alloc, false);
-    var fallback_expression_transferred = false;
-    errdefer if (!fallback_expression_transferred) freeExpression(alloc, fallback[0]);
-
-    branches[0] = .{
-        .when = condition,
-        .then = then_expression,
-    };
-    condition_transferred = true;
-    then_transferred = true;
-    branches_transferred = true;
-    fallback_expression_transferred = true;
-    fallback_transferred = true;
-    return .{
-        .kind = .case,
-        .case_branches = branches,
-        .case_else = fallback,
-    };
-}
-
-pub fn booleanLiteralExpressionAlloc(
-    alloc: std.mem.Allocator,
-    value: bool,
-) !db_mod.types.RelationalRowsExpression {
-    return .{
-        .kind = .value,
-        .value_json = try alloc.dupe(u8, if (value) "true" else "false"),
-    };
-}
-
-pub fn appendExpressionConditionGroup(
-    alloc: std.mem.Allocator,
-    expression_groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    condition: db_mod.types.RelationalRowsExpressionCondition,
-) !void {
-    var condition_transferred = false;
-    errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-    const conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
-    var conditions_transferred = false;
-    errdefer if (!conditions_transferred) alloc.free(conditions);
-    conditions[0] = condition;
-    condition_transferred = true;
-    try expression_groups.append(alloc, .{ .conditions = conditions });
-    conditions_transferred = true;
-}
-
-pub fn andExpressionPredicateAlternatives(
-    alloc: std.mem.Allocator,
-    groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    alternatives: []const db_mod.types.RelationalRowsExpressionPredicateGroup,
-) !void {
-    if (groups.items.len == 0 or alternatives.len == 0) return error.UnsupportedSqlShape;
-    var combined = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
-    var combined_transferred = false;
-    errdefer {
-        if (!combined_transferred) freeExpressionPredicateGroups(alloc, combined.items);
-        combined.deinit(alloc);
-    }
-
-    for (groups.items) |base| {
-        for (alternatives) |alternative| {
-            const conditions = try cloneExpressionConditionsConcatAlloc(alloc, base.conditions, alternative.conditions);
-            var conditions_transferred = false;
-            errdefer if (!conditions_transferred) {
-                freeExpressionConditions(alloc, conditions);
-                if (conditions.len > 0) alloc.free(conditions);
-            };
-            try combined.append(alloc, .{ .conditions = conditions });
-            conditions_transferred = true;
-        }
-    }
-
-    freeExpressionPredicateGroups(alloc, groups.items);
-    groups.deinit(alloc);
-    groups.* = combined;
-    combined_transferred = true;
-}
 
 pub fn parseWhereAlloc(
     alloc: std.mem.Allocator,
@@ -6225,7 +5234,7 @@ pub fn parseWhereAlloc(
     expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate),
     realtime_ns: u64,
-    fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
@@ -6271,7 +5280,7 @@ pub fn parseWhereAlloc(
         } else if (expr_token.peekStringToArrayFunctionCall(tokens, pos.*)) {
             if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
                 const operator_token_index = stringToArrayContainmentOperatorTokenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape;
-                try validateGeneratedSingleOperatorPredicateIdentity(try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast), .contains, tokens, operator_token_index);
+                try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast), .contains, tokens, operator_token_index);
                 const predicate = try parseExpressionArrayContainsPredicateAlloc(
                     alloc,
                     tokens,
@@ -6615,7 +5624,7 @@ fn arrayOverlapPredicateCanStartAtAlloc(
     pos.* = index;
     defer pos.* = saved_pos;
 
-    const parsed_field = parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -6658,7 +5667,7 @@ pub fn parseArrayOverlapIntoAccessBranchesAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     const saved_pos = pos.*;
-    const parsed_field = parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -6700,7 +5709,7 @@ pub fn parseArrayOverlapIntoAccessBranchesAlloc(
     };
     const operator_token_index = pos.*;
     _ = parser.matchToken(tokens, pos, .range_overlap);
-    try validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .overlaps, tokens, operator_token_index);
+    try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .overlaps, tokens, operator_token_index);
     const values_json = try value_mod.parseArrayPredicateValueAlloc(alloc, tokens, pos, params);
     defer alloc.free(values_json);
     try value_mod.validateSqlArrayValueJson(alloc, column, values_json);
@@ -6714,9 +5723,9 @@ pub fn parseExpressionArrayContainsPredicateAlloc(
     pos: *usize,
     params: []const value_mod.SqlValue,
     type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
+    hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionArrayContainsPredicate {
-    const expression = try parseStringToArrayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks);
+    const expression = try expr_row_parse.parseStringToArrayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks);
     var expression_transferred = false;
     errdefer if (!expression_transferred) freeExpression(alloc, expression);
     try parser.expectToken(tokens, pos, .at_contains);
@@ -6756,9 +5765,9 @@ pub fn parseValueEqualsAnyArrayPredicateAlloc(
     const operator_token_index = pos.*;
     try parser.expectToken(tokens, pos, .eq);
     if (!expr_token.matchAnyOrSomeKeyword(tokens, pos)) return error.UnsupportedSqlShape;
-    try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, operator_token_index, pos.* - 1);
+    try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, operator_token_index, pos.* - 1);
     try parser.expectToken(tokens, pos, .lparen);
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -6947,7 +5956,7 @@ pub fn parseScalarBooleanIsNotIntoOrBranchesAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     const saved_pos = pos.*;
-    const parsed_field = parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -6989,7 +5998,7 @@ pub fn parseScalarBooleanIsNotIntoOrBranchesAlloc(
     const column = binder.relationalColumnForField(schema, field, .boolean) orelse return error.InvalidSqlCatalog;
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
     const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
-    try validateGeneratedBooleanIsPredicateExpression(generated_expression_ast, tokens, operator_token_index, expected_kind);
+    try expr_generated_validate.validateGeneratedBooleanIsPredicateExpression(generated_expression_ast, tokens, operator_token_index, expected_kind);
     try expandBooleanIsNotIntoOrBranches(alloc, branches, field, value);
     return true;
 }
@@ -7008,7 +6017,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
 ) !bool {
     if (!peekSimpleScalarSetPredicate(tokens, pos.*)) return false;
 
-    const field = try parseRowExpressionFieldOwnedAlloc(
+    const field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -7024,14 +6033,14 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
     if (parser.matchKeyword(tokens, pos, "not")) {
         const negation_token_index = pos.* - 1;
         try parser.expectKeyword(tokens, pos, "in");
-        try validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try appendScalarValuesJsonToOrBranches(alloc, branches, field, values_json, .ne, column.collation);
         return true;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
         try expandScalarValuesJsonIntoOrBranches(alloc, branches, field, values_json, .eq, column.collation);
@@ -7041,7 +6050,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
     const op_token_index = pos.*;
     const op = try expr_operator.parseComparisonOp(tokens, pos);
     if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7050,7 +6059,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .ne and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7059,7 +6068,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7068,7 +6077,7 @@ pub fn parseScalarWhereSetIntoOrBranchesAlloc(
         return true;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7145,7 +6154,7 @@ pub fn parseExpressionNotWhereWithGeneratedAlloc(
                 &alternatives,
                 hooks_with_generated,
             );
-            try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+            try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
             freeExpressionPredicateGroups(alloc, alternatives.items);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
         }
@@ -7221,7 +6230,7 @@ pub fn parseExpressionOrWhereWithGeneratedAlloc(
                     &alternatives,
                     hooks_with_generated,
                 );
-                try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+                try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
                 freeExpressionPredicateGroups(alloc, alternatives.items);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
             }
@@ -7248,7 +6257,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     options: ExpressionWhereConditionAlternativesParserOptions,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
-        try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
+        try expr_condition.appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
 
@@ -7263,7 +6272,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     if (expr_operator.matchRegexPredicateOperator(tokens, pos)) |regex_operator| {
-        try validateGeneratedRegexPredicateExpression(
+        try expr_generated_validate.validateGeneratedRegexPredicateExpression(
             options.generated_expression_ast,
             tokens,
             pos.* - 1,
@@ -7280,7 +6289,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
             regex_operator.negated,
             options,
         );
-        try appendExpressionConditionGroup(alloc, alternatives, condition);
+        try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
         return;
@@ -7290,12 +6299,12 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
         const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-        try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+        try expr_generated_validate.validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
         const condition = if (generated_quantifier_token_index != null)
             try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
             try expr_predicate.parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false);
-        try appendExpressionConditionGroup(alloc, alternatives, condition);
+        try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
         return;
@@ -7306,12 +6315,12 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-            try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            try expr_generated_validate.validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             const condition = if (generated_quantifier_token_index != null)
                 try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
                 try expr_predicate.parseExpressionLikeConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true);
-            try appendExpressionConditionGroup(alloc, alternatives, condition);
+            try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
             freeExpression(alloc, lhs);
             lhs_transferred = true;
             return;
@@ -7320,7 +6329,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         try expr_predicate.appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, alternatives, lhs);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
@@ -7329,10 +6338,10 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
 
     if (parser.matchKeyword(tokens, pos, "between")) {
         const operator_token_index = pos.* - 1;
-        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
-        try validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
+        const modifier_token_index = expr_generated_validate.betweenModifierTokenIndex(tokens, pos.*);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
         const symmetric = expr_token.matchBetweenSymmetricMode(tokens, pos);
-        const lower_expression = try parseRowExpressionAlloc(
+        const lower_expression = try expr_row_parse.parseRowExpressionAlloc(
             alloc,
             tokens,
             pos,
@@ -7344,7 +6353,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         var lower_transferred = false;
         errdefer if (!lower_transferred) freeExpression(alloc, lower_expression);
         try parser.expectKeyword(tokens, pos, "and");
-        const upper_expression = try parseRowExpressionAlloc(
+        const upper_expression = try expr_row_parse.parseRowExpressionAlloc(
             alloc,
             tokens,
             pos,
@@ -7357,7 +6366,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         errdefer if (!upper_transferred) freeExpression(alloc, upper_expression);
 
         if (symmetric) {
-            try appendExpressionBetweenSymmetricGroups(alloc, alternatives, lhs, lower_expression, upper_expression, false);
+            try expr_condition.appendExpressionBetweenSymmetricGroups(alloc, alternatives, lhs, lower_expression, upper_expression, false);
             freeExpression(alloc, lhs);
             freeExpression(alloc, lower_expression);
             freeExpression(alloc, upper_expression);
@@ -7415,38 +6424,38 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         .allow_boolean_literal_negation = true,
     })) |is_tail| blk: {
         switch (is_tail.kind) {
-            .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
+            .distinct_comparison, .null_test => try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
             .boolean_unknown => {
-                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
-                const condition = expressionNullTestCondition(lhs, is_tail.op);
+                const condition = expr_condition.expressionNullTestCondition(lhs, is_tail.op);
                 lhs_transferred = true;
-                try appendExpressionConditionGroup(alloc, alternatives, condition);
+                try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
                 return;
             },
             .boolean_literal => {
-                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
                 if (is_tail.boolean_negated) {
-                    try appendExpressionBooleanIsNotGroups(alloc, alternatives, lhs, is_tail.boolean_value);
+                    try expr_condition.appendExpressionBooleanIsNotGroups(alloc, alternatives, lhs, is_tail.boolean_value);
                     freeExpression(alloc, lhs);
                     lhs_transferred = true;
                     return;
                 }
-                const condition = try expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
+                const condition = try expr_condition.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
                 lhs_transferred = true;
-                try appendExpressionConditionGroup(alloc, alternatives, condition);
+                try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
                 return;
             },
         }
         break :blk is_tail.op;
     } else if (expr_operator.matchPostfixNullTest(tokens, pos)) |postfix_null_test| blk: {
-        try validateGeneratedPostfixNullPredicateExpression(options.generated_expression_ast, tokens, op_token_index, postfix_null_test);
+        try expr_generated_validate.validateGeneratedPostfixNullPredicateExpression(options.generated_expression_ast, tokens, op_token_index, postfix_null_test);
         break :blk postfix_null_test;
     } else try expr_operator.parseComparisonOp(tokens, pos);
 
     if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7457,7 +6466,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
     if (op == .ne and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7468,7 +6477,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7479,7 +6488,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7496,7 +6505,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
             const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
             var out_transferred = false;
             errdefer if (!out_transferred) alloc.free(out);
-            out[0] = try parseRowExpressionAlloc(
+            out[0] = try expr_row_parse.parseRowExpressionAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -7514,7 +6523,7 @@ pub fn parseExpressionWhereConditionAlternativesAlloc(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
-    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
     try expr_type.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     const conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
@@ -7544,7 +6553,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     options: ExpressionWhereConditionsParserOptions,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
-        if (!enabled) try appendBooleanConstantExpressionCondition(alloc, expression_predicates, false);
+        if (!enabled) try expr_condition.appendBooleanConstantExpressionCondition(alloc, expression_predicates, false);
         return;
     }
 
@@ -7553,7 +6562,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
 
     if (expr_operator.matchRegexPredicateOperator(tokens, pos)) |regex_operator| {
-        try validateGeneratedRegexPredicateExpression(
+        try expr_generated_validate.validateGeneratedRegexPredicateExpression(
             options.generated_expression_ast,
             tokens,
             pos.* - 1,
@@ -7583,7 +6592,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
         const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-        try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+        try expr_generated_validate.validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
         const condition = if (generated_quantifier_token_index != null)
             try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, false)
         else
@@ -7598,7 +6607,7 @@ pub fn parseExpressionWhereConditionsAlloc(
     }
 
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         try expr_predicate.appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, expression_or_predicates, lhs);
         freeExpression(alloc, lhs);
         lhs_transferred = true;
@@ -7611,7 +6620,7 @@ pub fn parseExpressionWhereConditionsAlloc(
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-            try validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            try expr_generated_validate.validateGeneratedPatternPredicateIdentity(options.generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             const condition = if (generated_quantifier_token_index != null)
                 try expr_predicate.parseExpressionLikeSetConditionAlloc(alloc, tokens, pos, params, type_context, lhs, case_insensitive, true)
             else
@@ -7625,7 +6634,7 @@ pub fn parseExpressionWhereConditionsAlloc(
             return;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
-            try validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
             try expr_predicate.appendExpressionInPredicateGroupsAlloc(alloc, tokens, pos, params, type_context, expression_not_predicates, lhs);
             freeExpression(alloc, lhs);
             lhs_transferred = true;
@@ -7633,8 +6642,8 @@ pub fn parseExpressionWhereConditionsAlloc(
         }
         try parser.expectKeyword(tokens, pos, "between");
         const operator_token_index = pos.* - 1;
-        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
-        try validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .not_between, tokens, operator_token_index, negation_token_index, modifier_token_index);
+        const modifier_token_index = expr_generated_validate.betweenModifierTokenIndex(tokens, pos.*);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .not_between, tokens, operator_token_index, negation_token_index, modifier_token_index);
         const symmetric = expr_token.matchBetweenSymmetricMode(tokens, pos);
         const lower_expression = try parseExpressionWhereConditionRowExpressionAlloc(alloc, tokens, pos, type_context, options);
         var lower_transferred = false;
@@ -7645,7 +6654,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         errdefer if (!upper_transferred) freeExpression(alloc, upper_expression);
 
         if (symmetric) {
-            try appendExpressionBetweenSymmetricGroups(alloc, expression_or_predicates, lhs, lower_expression, upper_expression, true);
+            try expr_condition.appendExpressionBetweenSymmetricGroups(alloc, expression_or_predicates, lhs, lower_expression, upper_expression, true);
             freeExpression(alloc, lhs);
             freeExpression(alloc, lower_expression);
             freeExpression(alloc, upper_expression);
@@ -7707,8 +6716,8 @@ pub fn parseExpressionWhereConditionsAlloc(
 
     if (parser.matchKeyword(tokens, pos, "between")) {
         const operator_token_index = pos.* - 1;
-        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
-        try validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
+        const modifier_token_index = expr_generated_validate.betweenModifierTokenIndex(tokens, pos.*);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(options.generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
         const symmetric = expr_token.matchBetweenSymmetricMode(tokens, pos);
         const upper_lhs = try cloneExpressionAlloc(alloc, lhs);
         var upper_lhs_transferred = false;
@@ -7725,7 +6734,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         if (symmetric) {
             freeExpression(alloc, upper_lhs);
             upper_lhs_transferred = true;
-            try appendExpressionBetweenSymmetricGroups(alloc, expression_or_predicates, lhs, lower_expression, upper_expression, false);
+            try expr_condition.appendExpressionBetweenSymmetricGroups(alloc, expression_or_predicates, lhs, lower_expression, upper_expression, false);
             freeExpression(alloc, lhs);
             freeExpression(alloc, lower_expression);
             freeExpression(alloc, upper_expression);
@@ -7772,24 +6781,24 @@ pub fn parseExpressionWhereConditionsAlloc(
         .allow_boolean_literal_negation = true,
     })) |is_tail| blk: {
         switch (is_tail.kind) {
-            .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
+            .distinct_comparison, .null_test => try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
             .boolean_unknown => {
-                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
-                try expression_predicates.append(alloc, expressionNullTestCondition(lhs, is_tail.op));
+                try expression_predicates.append(alloc, expr_condition.expressionNullTestCondition(lhs, is_tail.op));
                 lhs_transferred = true;
                 return;
             },
             .boolean_literal => {
-                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 try type_context.validateBooleanRowExpression(lhs);
                 if (is_tail.boolean_negated) {
-                    try appendExpressionBooleanIsNotGroups(alloc, expression_or_predicates, lhs, is_tail.boolean_value);
+                    try expr_condition.appendExpressionBooleanIsNotGroups(alloc, expression_or_predicates, lhs, is_tail.boolean_value);
                     freeExpression(alloc, lhs);
                     lhs_transferred = true;
                     return;
                 }
-                const condition = try expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
+                const condition = try expr_condition.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
                 var condition_transferred = false;
                 errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
                 try expression_predicates.append(alloc, condition);
@@ -7800,12 +6809,12 @@ pub fn parseExpressionWhereConditionsAlloc(
         }
         break :blk is_tail.op;
     } else if (expr_operator.matchPostfixNullTest(tokens, pos)) |postfix_null_test| blk: {
-        try validateGeneratedPostfixNullPredicateExpression(options.generated_expression_ast, tokens, op_token_index, postfix_null_test);
+        try expr_generated_validate.validateGeneratedPostfixNullPredicateExpression(options.generated_expression_ast, tokens, op_token_index, postfix_null_test);
         break :blk postfix_null_test;
     } else try expr_operator.parseComparisonOp(tokens, pos);
 
     if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7816,7 +6825,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .ne and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7827,7 +6836,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7838,7 +6847,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, pos.* - 1);
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
         defer alloc.free(values_json);
@@ -7865,7 +6874,7 @@ pub fn parseExpressionWhereConditionsAlloc(
         for (rhs) |expression| freeExpression(alloc, expression);
         alloc.free(rhs);
     };
-    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
     try expr_type.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
 
     try expression_predicates.append(alloc, .{
@@ -7875,264 +6884,6 @@ pub fn parseExpressionWhereConditionsAlloc(
     });
     lhs_transferred = true;
     rhs_transferred = true;
-}
-
-pub fn appendExpressionBetweenSymmetricGroups(
-    alloc: std.mem.Allocator,
-    expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    lhs: db_mod.types.RelationalRowsExpression,
-    lower_expression: db_mod.types.RelationalRowsExpression,
-    upper_expression: db_mod.types.RelationalRowsExpression,
-    negated: bool,
-) !void {
-    if (!negated) {
-        try appendExpressionBetweenGroup(alloc, expression_or_predicates, lhs, .gte, lower_expression, .lte, upper_expression);
-        try appendExpressionBetweenGroup(alloc, expression_or_predicates, lhs, .gte, upper_expression, .lte, lower_expression);
-    } else {
-        try appendExpressionBetweenGroup(alloc, expression_or_predicates, lhs, .lt, lower_expression, .lt, upper_expression);
-        try appendExpressionBetweenGroup(alloc, expression_or_predicates, lhs, .gt, lower_expression, .gt, upper_expression);
-    }
-}
-
-pub fn appendExpressionBetweenGroup(
-    alloc: std.mem.Allocator,
-    expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    lhs: db_mod.types.RelationalRowsExpression,
-    first_op: runtime_schema.RelationalCheckOp,
-    first_rhs: db_mod.types.RelationalRowsExpression,
-    second_op: runtime_schema.RelationalCheckOp,
-    second_rhs: db_mod.types.RelationalRowsExpression,
-) !void {
-    const conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 2);
-    var conditions_transferred = false;
-    var first_initialized = false;
-    var second_initialized = false;
-    errdefer {
-        if (!conditions_transferred) {
-            if (first_initialized) freeExpressionCondition(alloc, conditions[0]);
-            if (second_initialized) freeExpressionCondition(alloc, conditions[1]);
-            alloc.free(conditions);
-        }
-    }
-
-    conditions[0] = try expressionConditionCloneAlloc(alloc, lhs, first_op, first_rhs);
-    first_initialized = true;
-    conditions[1] = try expressionConditionCloneAlloc(alloc, lhs, second_op, second_rhs);
-    second_initialized = true;
-
-    try expression_or_predicates.append(alloc, .{ .conditions = conditions });
-    conditions_transferred = true;
-}
-
-pub fn expressionConditionCloneAlloc(
-    alloc: std.mem.Allocator,
-    lhs: db_mod.types.RelationalRowsExpression,
-    op: runtime_schema.RelationalCheckOp,
-    rhs: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const lhs_clone = try cloneExpressionAlloc(alloc, lhs);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) freeExpression(alloc, lhs_clone);
-
-    const rhs_slice = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var rhs_slice_transferred = false;
-    var rhs_initialized = false;
-    errdefer {
-        if (!rhs_slice_transferred) {
-            if (rhs_initialized) freeExpression(alloc, rhs_slice[0]);
-            alloc.free(rhs_slice);
-        }
-    }
-    rhs_slice[0] = try cloneExpressionAlloc(alloc, rhs);
-    rhs_initialized = true;
-
-    lhs_transferred = true;
-    rhs_slice_transferred = true;
-    return .{
-        .lhs = lhs_clone,
-        .op = op,
-        .rhs = rhs_slice,
-    };
-}
-
-pub fn appendBooleanConstantExpressionCondition(
-    alloc: std.mem.Allocator,
-    expression_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition),
-    enabled: bool,
-) !void {
-    const condition = try booleanConstantExpressionConditionAlloc(alloc, enabled);
-    var condition_transferred = false;
-    errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-    try expression_predicates.append(alloc, condition);
-    condition_transferred = true;
-}
-
-pub fn appendBooleanConstantExpressionGroup(
-    alloc: std.mem.Allocator,
-    expression_groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    enabled: bool,
-) !void {
-    if (enabled) {
-        try expression_groups.append(alloc, .{ .conditions = &.{} });
-        return;
-    }
-    const conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
-    var conditions_transferred = false;
-    errdefer if (!conditions_transferred) alloc.free(conditions);
-    conditions[0] = try booleanConstantExpressionConditionAlloc(alloc, false);
-    var condition_transferred = false;
-    errdefer if (!condition_transferred) freeExpressionCondition(alloc, conditions[0]);
-    try expression_groups.append(alloc, .{ .conditions = conditions });
-    condition_transferred = true;
-    conditions_transferred = true;
-}
-
-pub fn booleanConstantExpressionConditionAlloc(
-    alloc: std.mem.Allocator,
-    enabled: bool,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const lhs_json = try alloc.dupe(u8, "true");
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) alloc.free(lhs_json);
-    const rhs_json = try alloc.dupe(u8, if (enabled) "true" else "false");
-    var rhs_json_transferred = false;
-    errdefer if (!rhs_json_transferred) alloc.free(rhs_json);
-    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred) alloc.free(rhs);
-    rhs[0] = .{
-        .kind = .value,
-        .value_json = rhs_json,
-    };
-    lhs_transferred = true;
-    rhs_json_transferred = true;
-    rhs_transferred = true;
-    return .{
-        .lhs = .{
-            .kind = .value,
-            .value_json = lhs_json,
-        },
-        .op = .eq,
-        .rhs = rhs,
-    };
-}
-
-pub fn expressionBooleanComparisonConditionAlloc(
-    alloc: std.mem.Allocator,
-    lhs: db_mod.types.RelationalRowsExpression,
-    op: runtime_schema.RelationalCheckOp,
-    value: bool,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const rhs_json = try alloc.dupe(u8, if (value) "true" else "false");
-    var rhs_json_transferred = false;
-    errdefer if (!rhs_json_transferred) alloc.free(rhs_json);
-    const rhs = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred) alloc.free(rhs);
-    rhs[0] = .{
-        .kind = .value,
-        .value_json = rhs_json,
-    };
-    rhs_json_transferred = true;
-    rhs_transferred = true;
-    return .{
-        .lhs = lhs,
-        .op = op,
-        .rhs = rhs,
-    };
-}
-
-pub fn expressionNullTestCondition(
-    lhs: db_mod.types.RelationalRowsExpression,
-    op: runtime_schema.RelationalCheckOp,
-) db_mod.types.RelationalRowsExpressionCondition {
-    return .{
-        .lhs = lhs,
-        .op = op,
-        .rhs = &.{},
-    };
-}
-
-pub fn expressionFieldBooleanConditionAlloc(
-    alloc: std.mem.Allocator,
-    field: []const u8,
-    op: runtime_schema.RelationalCheckOp,
-    value: bool,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const lhs_field = try alloc.dupe(u8, field);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) alloc.free(lhs_field);
-    const lhs: db_mod.types.RelationalRowsExpression = .{
-        .kind = .field,
-        .field = lhs_field,
-    };
-    const condition = try expressionBooleanComparisonConditionAlloc(alloc, lhs, op, value);
-    lhs_transferred = true;
-    return condition;
-}
-
-pub fn expressionFieldNullConditionAlloc(
-    alloc: std.mem.Allocator,
-    field: []const u8,
-    op: runtime_schema.RelationalCheckOp,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const lhs_field = try alloc.dupe(u8, field);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) alloc.free(lhs_field);
-    lhs_transferred = true;
-    return expressionNullTestCondition(.{
-        .kind = .field,
-        .field = lhs_field,
-    }, op);
-}
-
-pub fn appendBooleanIsNotExpressionGroups(
-    alloc: std.mem.Allocator,
-    expression_groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    field: []const u8,
-    value: bool,
-) !void {
-    const ne_condition = try expressionFieldBooleanConditionAlloc(alloc, field, .ne, value);
-    try appendExpressionConditionGroup(alloc, expression_groups, ne_condition);
-    const null_condition = try expressionFieldNullConditionAlloc(alloc, field, .is_null);
-    try appendExpressionConditionGroup(alloc, expression_groups, null_condition);
-}
-
-pub fn appendExpressionBooleanIsNotGroups(
-    alloc: std.mem.Allocator,
-    expression_groups: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
-    lhs: db_mod.types.RelationalRowsExpression,
-    value: bool,
-) !void {
-    const ne_lhs = try cloneExpressionAlloc(alloc, lhs);
-    var ne_lhs_transferred = false;
-    errdefer if (!ne_lhs_transferred) freeExpression(alloc, ne_lhs);
-    const null_lhs = try cloneExpressionAlloc(alloc, lhs);
-    var null_lhs_transferred = false;
-    errdefer if (!null_lhs_transferred) freeExpression(alloc, null_lhs);
-
-    const ne_conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
-    var ne_conditions_transferred = false;
-    errdefer if (!ne_conditions_transferred) alloc.free(ne_conditions);
-    ne_conditions[0] = try expressionBooleanComparisonConditionAlloc(alloc, ne_lhs, .ne, value);
-    var ne_condition_transferred = false;
-    errdefer if (!ne_condition_transferred) freeExpressionCondition(alloc, ne_conditions[0]);
-    ne_lhs_transferred = true;
-
-    const null_conditions = try alloc.alloc(db_mod.types.RelationalRowsExpressionCondition, 1);
-    var null_conditions_transferred = false;
-    errdefer if (!null_conditions_transferred) alloc.free(null_conditions);
-    null_conditions[0] = expressionNullTestCondition(null_lhs, .is_null);
-    var null_condition_transferred = false;
-    errdefer if (!null_condition_transferred) freeExpressionCondition(alloc, null_conditions[0]);
-    null_lhs_transferred = true;
-
-    try expression_groups.append(alloc, .{ .conditions = ne_conditions });
-    ne_condition_transferred = true;
-    ne_conditions_transferred = true;
-    try expression_groups.append(alloc, .{ .conditions = null_conditions });
-    null_condition_transferred = true;
-    null_conditions_transferred = true;
 }
 
 pub fn expandScalarValuesJsonIntoOrBranches(
@@ -9288,160 +8039,6 @@ pub fn freeAccessPredicateBranch(alloc: std.mem.Allocator, branch: *AccessPredic
     branch.text_patterns.deinit(alloc);
 }
 
-pub fn peekExtensionFunctionCall(tokens: []const Token, pos: usize, bindings: []const ExtensionFunctionBinding) bool {
-    if (bindings.len == 0) return false;
-    if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
-    for (bindings) |binding| {
-        if (std.ascii.eqlIgnoreCase(binding.sql_name, tokens[pos].text)) return true;
-    }
-    return false;
-}
-
-pub fn extensionFunctionBinding(bindings: []const ExtensionFunctionBinding, name: []const u8) !?ExtensionFunctionBinding {
-    var found: ?ExtensionFunctionBinding = null;
-    for (bindings) |binding| {
-        if (!std.ascii.eqlIgnoreCase(binding.sql_name, name)) continue;
-        if (found != null) return error.UnsupportedSqlShape;
-        found = binding;
-    }
-    return found;
-}
-
-pub fn parseExtensionFunctionRowExpressionOrNullAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    bindings: []const ExtensionFunctionBinding,
-    options: ExtensionFunctionRowExpressionParserOptions,
-) !?db_mod.types.RelationalRowsExpression {
-    if (!peekExtensionFunctionCall(tokens, pos.*, bindings)) return null;
-    const name = tokens[pos.*].text;
-    const binding = try extensionFunctionBinding(bindings, name) orelse return null;
-    const kind = binding.native_expression_kind;
-    _ = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .lparen);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    if (parser.matchToken(tokens, pos, .rparen) == null) {
-        while (true) {
-            const operand = try parseRowExpressionAlloc(
-                alloc,
-                tokens,
-                pos,
-                options.type_context,
-                options.row_expression_hooks,
-                options.arithmetic_hooks,
-                options.variadic_hooks,
-            );
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(alloc, operand);
-            try operands.append(alloc, operand);
-            operand_transferred = true;
-            if (parser.matchToken(tokens, pos, .comma) == null) break;
-        }
-        try parser.expectToken(tokens, pos, .rparen);
-    }
-    try validateExtensionFunctionArity(kind, binding.arity, operands.items.len);
-    if (kind == .uuid_v4) return .{ .kind = .uuid_v4 };
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
-}
-
-pub fn peekRoutineExpressionCall(tokens: []const Token, pos: usize, bindings: []const RoutineExpressionBinding) bool {
-    if (bindings.len == 0) return false;
-    if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier or tokens[pos + 1].kind != .lparen) return false;
-    for (bindings) |binding| {
-        if (std.ascii.eqlIgnoreCase(binding.sql_name, tokens[pos].text)) return true;
-    }
-    return false;
-}
-
-pub fn routineExpressionBinding(
-    bindings: []const RoutineExpressionBinding,
-    name: []const u8,
-    arity: usize,
-) !?RoutineExpressionBinding {
-    var found: ?RoutineExpressionBinding = null;
-    for (bindings) |binding| {
-        if (!std.ascii.eqlIgnoreCase(binding.sql_name, name)) continue;
-        if (@as(usize, binding.arity) != arity) continue;
-        if (found != null) return error.UnsupportedSqlShape;
-        found = binding;
-    }
-    return found;
-}
-
-pub fn parseRoutineExpressionRowExpressionOrNullAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    bindings: []const RoutineExpressionBinding,
-    options: RoutineExpressionRowExpressionParserOptions,
-) !?db_mod.types.RelationalRowsExpression {
-    if (!peekRoutineExpressionCall(tokens, pos.*, bindings)) return null;
-    const name = tokens[pos.*].text;
-    _ = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .lparen);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    defer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    if (parser.matchToken(tokens, pos, .rparen) == null) {
-        while (true) {
-            const operand = try parseBooleanRowExpressionAlloc(
-                alloc,
-                tokens,
-                pos,
-                options.type_context,
-                options.boolean_hooks,
-            );
-            var operand_transferred = false;
-            errdefer if (!operand_transferred) freeExpression(alloc, operand);
-            try operands.append(alloc, operand);
-            operand_transferred = true;
-            if (parser.matchToken(tokens, pos, .comma) != null) continue;
-            break;
-        }
-        try parser.expectToken(tokens, pos, .rparen);
-    }
-    const binding = try routineExpressionBinding(bindings, name, operands.items.len) orelse return error.UnsupportedSqlShape;
-    if (binding.null_input == .returns_null) {
-        for (operands.items) |operand| {
-            if (routineArgumentExpressionIsNullLiteral(operand)) {
-                return .{
-                    .kind = .value,
-                    .value_json = try alloc.dupe(u8, "null"),
-                };
-            }
-        }
-        return error.UnsupportedSqlShape;
-    }
-
-    return try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, binding.expression, operands.items);
-}
-
-pub fn routineArgumentExpressionIsNullLiteral(value: runtime_schema.RelationalRowsExpression) bool {
-    return value.kind == .value and std.mem.eql(u8, value.value_json, "null");
-}
-
-pub fn parseParenthesizedRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: ParenthesizedRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try parser.expectToken(tokens, pos, .lparen);
-    const expression = try parseBooleanRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.boolean_hooks);
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try parser.expectToken(tokens, pos, .rparen);
-    expression_transferred = true;
-    return expression;
-}
-
 pub fn parseBooleanNotRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -9449,7 +8046,7 @@ pub fn parseBooleanNotRowExpressionAlloc(
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     joined_source_expression_qualifiers: []const []const u8,
@@ -9461,7 +8058,7 @@ pub fn parseBooleanNotRowExpressionAlloc(
 ) anyerror!db_mod.types.RelationalRowsExpression {
     try expr_token.parseBooleanNotExpressionStart(tokens, pos);
     const operand = if (expr_token.peekParenthesizedExpressionSyntax(tokens, pos.*))
-        try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, .{
+        try expr_row_parse.parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, .{
             .type_context = type_context,
             .boolean_hooks = operand_options.parenthesized.boolean_hooks,
         })
@@ -9498,7 +8095,7 @@ pub fn parseUnaryNegativeRowExpressionAlloc(
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     joined_source_expression_qualifiers: []const []const u8,
@@ -9537,55 +8134,6 @@ pub fn parseUnaryNegativeRowExpressionAlloc(
     errdefer if (!operand_transferred) freeExpression(alloc, operand);
     const expression = try expr_build.buildUnaryNegativeExpressionAlloc(alloc, operand);
     operand_transferred = true;
-    return expression;
-}
-
-pub fn parseCastRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: CastRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseCastExpressionCallStart(tokens, pos);
-    const operand = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    try expr_token.parseCastExpressionAs(tokens, pos);
-    const cast_type = try expr_operator.parseExpressionCastType(tokens, pos);
-    try parser.expectToken(tokens, pos, .rparen);
-    const expression = try expr_build.buildCastExpressionAlloc(alloc, operand, cast_type);
-    operand_transferred = true;
-    return expression;
-}
-
-pub fn parseCoalesceRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: CoalesceRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseCoalesceFunctionCallStart(tokens, pos);
-
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    while (true) {
-        const operand = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(alloc, operand);
-        try operands.append(alloc, operand);
-        operand_transferred = true;
-        if (parser.matchToken(tokens, pos, .comma) == null) break;
-    }
-    if (operands.items.len == 0) return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .coalesce, &operands);
-    errdefer freeExpression(alloc, expression);
-    try type_context.validateExpressionOperandDomains(expression);
     return expression;
 }
 
@@ -9657,387 +8205,6 @@ pub fn parseCoalesceOperandAlloc(
     return .{ .kind = .value, .value_json = value_json };
 }
 
-pub fn parseParenthesizedNullTestExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    try parser.expectToken(tokens, pos, .lparen);
-    const field = try parseRowExpressionFieldOwnedAlloc(
-        alloc,
-        tokens,
-        pos,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    );
-    var field_transferred = false;
-    errdefer if (!field_transferred) alloc.free(field);
-    if (binder.relationalColumnForField(schema, field, null) == null) return error.InvalidSqlCatalog;
-    const op_token_index = pos.*;
-    try parser.expectKeyword(tokens, pos, "is");
-    const op: runtime_schema.RelationalCheckOp = if (parser.matchKeyword(tokens, pos, "not")) blk: {
-        try parser.expectKeyword(tokens, pos, "null");
-        break :blk .is_not_null;
-    } else blk: {
-        try parser.expectKeyword(tokens, pos, "null");
-        break :blk .is_null;
-    };
-    try validateGeneratedIsTailPredicateIdentity(generated_expression_ast, tokens, op_token_index, .{
-        .kind = .null_test,
-        .op = op,
-    });
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, if (op == .is_not_null) "is_not_null" else "is_null");
-    var output_transferred = false;
-    errdefer if (!output_transferred) alloc.free(output);
-
-    const true_json = try alloc.dupe(u8, "true");
-    var true_transferred = false;
-    errdefer if (!true_transferred) alloc.free(true_json);
-    const false_json = try alloc.dupe(u8, "false");
-    var false_transferred = false;
-    errdefer if (!false_transferred) alloc.free(false_json);
-    const branches = try alloc.alloc(db_mod.types.RelationalRowsExpressionCaseBranch, 1);
-    var branches_transferred = false;
-    errdefer if (!branches_transferred) alloc.free(branches);
-    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var fallback_transferred = false;
-    errdefer if (!fallback_transferred) alloc.free(fallback);
-
-    branches[0] = .{
-        .when = .{
-            .lhs = .{ .kind = .field, .field = field, .field_source = field_source },
-            .op = op,
-        },
-        .then = .{ .kind = .value, .value_json = true_json },
-    };
-    fallback[0] = .{ .kind = .value, .value_json = false_json };
-    field_transferred = true;
-    true_transferred = true;
-    false_transferred = true;
-    branches_transferred = true;
-    fallback_transferred = true;
-
-    const expression: db_mod.types.RelationalRowsExpression = .{
-        .kind = .case,
-        .case_branches = branches,
-        .case_else = fallback,
-    };
-    errdefer freeExpression(alloc, expression);
-    output_transferred = true;
-    return expr_build.buildExpressionProjection(output, expression);
-}
-
-pub fn buildExpressionProjectionFromOwnedExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    expression: db_mod.types.RelationalRowsExpression,
-    default_output: []const u8,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, default_output);
-    var output_transferred = false;
-    errdefer if (!output_transferred) alloc.free(output);
-    const projection = expr_build.buildExpressionProjection(output, expression);
-    expression_transferred = true;
-    output_transferred = true;
-    return projection;
-}
-
-pub fn buildOpExpressionProjectionFromOwnedExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    expression: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, expr_type.rowExpressionOpName(expression.kind));
-}
-
-pub fn buildDefaultExpressionProjectionFromOwnedExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    expression: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, expr_type.rowExpressionDefaultOutputName(expression.kind));
-}
-
-pub fn buildTextExpressionProjectionFromOwnedExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    expression: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try type_context.validateTextRowExpression(expression);
-    const default_output = if (expression.kind == .field and expression.field.len != 0)
-        expression.field
-    else
-        expr_type.rowExpressionOpName(expression.kind);
-    expression_transferred = true;
-    const projection = try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
-    return projection;
-}
-
-pub fn buildNumericExpressionProjectionFromOwnedExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    expression: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try type_context.validateNumericRowExpression(expression);
-    expression_transferred = true;
-    const projection = try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-    return projection;
-}
-
-pub fn buildBooleanExpressionProjectionFromOwnedExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    expression: db_mod.types.RelationalRowsExpression,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try type_context.validateBooleanRowExpression(expression);
-    expression_transferred = true;
-    const projection = try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-    return projection;
-}
-
-fn validateGeneratedExpressionProjectionIdentity(
-    tokens: []const Token,
-    start: usize,
-    end: usize,
-    expression: db_mod.types.RelationalRowsExpression,
-    options: ExpressionProjectionParserOptions,
-) !void {
-    if (options.require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, start, end, expression, options.generated_expression_ast);
-    } else {
-        try validateGeneratedRowExpressionIdentity(tokens, start, end, expression, options.generated_expression_ast);
-    }
-}
-
-pub fn parseTextExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildTextExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
-}
-
-pub fn parseGenericExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildNumericExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
-}
-
-pub fn parseBooleanExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseBooleanRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.boolean_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildBooleanExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, expression);
-}
-
-pub fn parseParenthesizedExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    try parser.expectToken(tokens, pos, .lparen);
-    const expression = try parseBooleanRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.boolean_hooks);
-    errdefer freeExpression(alloc, expression);
-    try parser.expectToken(tokens, pos, .rparen);
-    return try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-}
-
-pub fn parseNowExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const expression = try expr_build.parseSqlNowRowExpressionAlloc(alloc, tokens, pos);
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "now");
-}
-
-pub fn parseCurrentDateExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const expression = try expr_build.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos);
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "current_date");
-}
-
-pub fn parseTypedDatetimeLiteralExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const expression = try expr_build.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos);
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "datetime_literal");
-}
-
-pub fn parseUuidV4ExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const expression = try expr_build.parseSqlUuidV4RowExpression(tokens, pos);
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, "gen_random_uuid");
-}
-
-pub fn parseFixedOutputExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    default_output: []const u8,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
-}
-
-pub fn parseOpOutputExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-}
-
-pub fn parseDefaultOutputExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildDefaultExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-}
-
-pub fn parseRegexpMatchExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const default_output = if (parser.peekKeyword(tokens, pos.*, "regexp_like")) "regexp_like" else "regexp_match";
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
-}
-
-pub fn parseJsonExtractPathExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    options: ExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const start = pos.*;
-    const expression = try parseRowExpressionAlloc(alloc, tokens, pos, options.type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    errdefer freeExpression(alloc, expression);
-    try validateGeneratedExpressionProjectionIdentity(tokens, start, pos.*, expression, options);
-    const default_output = if (expression.json_as_text) "json_extract_path_text" else "json_extract_path";
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(
-        alloc,
-        tokens,
-        pos,
-        expression,
-        default_output,
-    );
-}
-
-pub fn parseExtensionFunctionExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    bindings: []const ExtensionFunctionBinding,
-    options: ExtensionFunctionRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const expression = (try parseExtensionFunctionRowExpressionOrNullAlloc(alloc, tokens, pos, bindings, options)) orelse return error.UnsupportedSqlShape;
-    return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-}
-
-pub fn parseRoutineExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    bindings: []const RoutineExpressionBinding,
-    options: RoutineExpressionRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const expression = (try parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, bindings, options)) orelse return error.UnsupportedSqlShape;
-    return try buildOpExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression);
-}
-
-pub fn parseJsonValueExpressionProjectionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    default_output: []const u8,
-    hooks: JsonValueExpressionProjectionParserOptions,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, hooks.params);
-    const expression: db_mod.types.RelationalRowsExpression = .{
-        .kind = .value,
-        .value_json = value_json,
-    };
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, expression, default_output);
-}
-
 pub fn parseNullifRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -10045,7 +8212,7 @@ pub fn parseNullifRowExpressionAlloc(
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     joined_source_expression_qualifiers: []const []const u8,
@@ -10107,1023 +8274,16 @@ pub fn parseNullifRowExpressionAlloc(
     return expression;
 }
 
-pub fn parseTextLengthRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: FixedUnaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = try expr_token.parseTextLengthFunctionCallStart(tokens, pos);
-    return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, .text, options);
-}
-
-pub fn parseFixedUnaryRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    input_domain: RowExpressionInputDomain,
-    options: FixedUnaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFixedUnaryFunctionCallStart(tokens, pos, kind);
-    return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, input_domain, options);
-}
-
-pub fn parseJsonUnaryRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: FixedUnaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    switch (kind) {
-        .json_array_length => try expr_token.parseJsonArrayLengthFunctionCallStart(tokens, pos),
-        .json_typeof => try expr_token.parseJsonTypeofFunctionCallStart(tokens, pos),
-        else => return error.UnsupportedSqlShape,
-    }
-    return try parseUnaryRowExpressionCallRestAlloc(alloc, tokens, pos, kind, type_context, .json, options);
-}
-
-pub fn parseJsonExtractPathRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    params: []const value_mod.SqlValue,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: FixedUnaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const function_token = expr_token.matchFunctionKeywordToken(tokens, pos, expr_token.sqlTokenIsJsonExtractPathFunction) orelse return error.UnsupportedSqlShape;
-    const as_text = expr_token.sqlJsonExtractPathTokenAsText(function_token);
-    try parser.expectToken(tokens, pos, .lparen);
-    const operand = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    try type_context.validateJsonRowExpression(operand);
-    const path = try value_mod.parseJsonExtractPathSegmentsAlloc(alloc, tokens, pos, params);
-    var path_transferred = false;
-    errdefer if (!path_transferred) alloc.free(path);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildJsonExtractExpressionAlloc(alloc, operand, path, as_text);
-    operand_transferred = true;
-    path_transferred = true;
-    return expression;
-}
-
-fn parseUnaryRowExpressionCallRestAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    input_domain: RowExpressionInputDomain,
-    options: FixedUnaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const operand = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    switch (input_domain) {
-        .text => try type_context.validateTextRowExpression(operand),
-        .numeric => try type_context.validateNumericRowExpression(operand),
-        .json => try type_context.validateJsonRowExpression(operand),
-        .any => _ = try type_context.rowExpressionOutputType(operand),
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, kind, operand);
-    operand_transferred = true;
-    return expression;
-}
-
-pub fn parseJsonBuildObjectRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: JsonBuildObjectRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseJsonBuildObjectFunctionCallStart(tokens, pos);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    if (parser.matchToken(tokens, pos, .rparen) == null) {
-        while (true) {
-            const key = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-            var key_transferred = false;
-            errdefer if (!key_transferred) freeExpression(alloc, key);
-            try type_context.validateTextRowExpression(key);
-            try operands.append(alloc, key);
-            key_transferred = true;
-
-            try parser.expectToken(tokens, pos, .comma);
-            const value = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-            var value_transferred = false;
-            errdefer if (!value_transferred) freeExpression(alloc, value);
-            _ = try type_context.rowExpressionOutputType(value);
-            try operands.append(alloc, value);
-            value_transferred = true;
-
-            if (parser.matchToken(tokens, pos, .comma) == null) break;
-        }
-        try parser.expectToken(tokens, pos, .rparen);
-    }
-    const expression = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .json_build_object, &operands);
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try type_context.validateJsonBuildObjectExpression(expression);
-    expression_transferred = true;
-    return expression;
-}
-
-pub fn parseArrayPositionRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = try expr_token.parseArrayPositionFunctionCallStart(tokens, pos);
-    const array_expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var array_transferred = false;
-    errdefer if (!array_transferred) freeExpression(alloc, array_expression);
-    const array_type = try type_context.rowExpressionOutputType(array_expression);
-    if (array_type != .array) return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .comma);
-    const needle_expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var needle_transferred = false;
-    errdefer if (!needle_transferred) freeExpression(alloc, needle_expression);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, array_expression, needle_expression);
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    array_transferred = true;
-    needle_transferred = true;
-    try type_context.validateArrayPositionExpression(expression);
-
-    expression_transferred = true;
-    return expression;
-}
-
-pub fn parseStringToArrayRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseStringToArrayFunctionCallStart(tokens, pos);
-    const text_expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var text_transferred = false;
-    errdefer if (!text_transferred) freeExpression(alloc, text_expression);
-    try parser.expectToken(tokens, pos, .comma);
-    const delimiter_expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var delimiter_transferred = false;
-    errdefer if (!delimiter_transferred) freeExpression(alloc, delimiter_expression);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .string_to_array, text_expression, delimiter_expression);
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    text_transferred = true;
-    delimiter_transferred = true;
-    try type_context.validateStringToArrayExpression(expression);
-    expression_transferred = true;
-    return expression;
-}
-
-pub fn parseArrayToStringRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseArrayToStringFunctionCallStart(tokens, pos);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-
-    const array_expression = try hooks.parse_expression(hooks.ptr);
-    var array_transferred = false;
-    errdefer if (!array_transferred) freeExpression(alloc, array_expression);
-    try operands.append(alloc, array_expression);
-    array_transferred = true;
-
-    try parser.expectToken(tokens, pos, .comma);
-    const delimiter_expression = try hooks.parse_expression(hooks.ptr);
-    var delimiter_transferred = false;
-    errdefer if (!delimiter_transferred) freeExpression(alloc, delimiter_expression);
-    try operands.append(alloc, delimiter_expression);
-    delimiter_transferred = true;
-
-    if (parser.matchToken(tokens, pos, .comma) != null) {
-        const null_expression = try hooks.parse_expression(hooks.ptr);
-        var null_transferred = false;
-        errdefer if (!null_transferred) freeExpression(alloc, null_expression);
-        try operands.append(alloc, null_expression);
-        null_transferred = true;
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .array_to_string, &operands);
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try type_context.validateArrayToStringExpression(expression);
-    expression_transferred = true;
-    return expression;
-}
-
-pub fn parseArrayElementTransformRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = try expr_token.parseArrayElementTransformFunctionCallStart(tokens, pos);
-    const first_expression = try hooks.parse_expression(hooks.ptr);
-    var first_transferred = false;
-    errdefer if (!first_transferred) freeExpression(alloc, first_expression);
-    try parser.expectToken(tokens, pos, .comma);
-    const second_expression = try hooks.parse_expression(hooks.ptr);
-    var second_transferred = false;
-    errdefer if (!second_transferred) freeExpression(alloc, second_expression);
-    var third_expression: db_mod.types.RelationalRowsExpression = undefined;
-    var third_transferred = true;
-    if (kind == .array_replace) {
-        third_transferred = false;
-        try parser.expectToken(tokens, pos, .comma);
-        third_expression = try hooks.parse_expression(hooks.ptr);
-        errdefer if (!third_transferred) freeExpression(alloc, third_expression);
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = if (kind == .array_prepend) blk: {
-        const out = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, second_expression, first_expression);
-        second_transferred = true;
-        first_transferred = true;
-        break :blk out;
-    } else if (kind == .array_replace) blk: {
-        const out = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression, third_expression);
-        first_transferred = true;
-        second_transferred = true;
-        third_transferred = true;
-        break :blk out;
-    } else blk: {
-        const out = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, first_expression, second_expression);
-        first_transferred = true;
-        second_transferred = true;
-        break :blk out;
-    };
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    if (kind == .array_cat) {
-        try type_context.validateArrayCatExpression(expression);
-    } else if (kind == .array_replace) {
-        try type_context.validateArrayReplaceExpression(expression);
-    } else {
-        try type_context.validateArrayElementTransformExpression(expression);
-    }
-
-    expression_transferred = true;
-    return expression;
-}
-
-pub fn parseFixedNumericBinaryRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFixedBinaryFunctionCallStart(tokens, pos, kind);
-    const lhs = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
-    try type_context.validateNumericRowExpression(lhs);
-    try parser.expectToken(tokens, pos, .comma);
-    const rhs = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
-    try type_context.validateNumericRowExpression(rhs);
-    try parser.expectToken(tokens, pos, .rparen);
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
-    lhs_transferred = true;
-    rhs_transferred = true;
-    return expression;
-}
-
-pub fn parseTextBinaryRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    switch (kind) {
-        .starts_with => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsStartsWithFunction),
-        .ends_with => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsEndsWithFunction),
-        .regexp_substr => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpSubstrFunction),
-        .regexp_count => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpCountFunction),
-        .regexp_instr => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpInstrFunction),
-        else => return error.UnsupportedSqlShape,
-    }
-
-    const lhs = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
-    try type_context.validateTextRowExpression(lhs);
-    try parser.expectToken(tokens, pos, .comma);
-    const rhs = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
-    try type_context.validateTextRowExpression(rhs);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
-    lhs_transferred = true;
-    rhs_transferred = true;
-    return expression;
-}
-
-pub fn parseTextTernaryRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    switch (kind) {
-        .replace => try expr_token.parseReplaceFunctionCallStart(tokens, pos),
-        .translate => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsTranslateFunction),
-        else => return error.UnsupportedSqlShape,
-    }
-
-    const first = try hooks.parse_expression(hooks.ptr);
-    var first_transferred = false;
-    errdefer if (!first_transferred) freeExpression(alloc, first);
-    try type_context.validateTextRowExpression(first);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const second = try hooks.parse_expression(hooks.ptr);
-    var second_transferred = false;
-    errdefer if (!second_transferred) freeExpression(alloc, second);
-    try type_context.validateTextRowExpression(second);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const third = try hooks.parse_expression(hooks.ptr);
-    var third_transferred = false;
-    errdefer if (!third_transferred) freeExpression(alloc, third);
-    try type_context.validateTextRowExpression(third);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, kind, first, second, third);
-    first_transferred = true;
-    second_transferred = true;
-    third_transferred = true;
-    return expression;
-}
-
-pub fn parseRegexpListRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    switch (kind) {
-        .regexp_replace => try expr_token.parseRegexpReplaceFunctionCallStart(tokens, pos),
-        .regexp_match => try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRegexpMatchFunction),
-        else => return error.UnsupportedSqlShape,
-    }
-
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-
-    switch (kind) {
-        .regexp_replace => {
-            while (true) {
-                const operand = try hooks.parse_expression(hooks.ptr);
-                var operand_transferred = false;
-                errdefer if (!operand_transferred) freeExpression(alloc, operand);
-                try type_context.validateTextRowExpression(operand);
-                try operands.append(alloc, operand);
-                operand_transferred = true;
-                if (parser.matchToken(tokens, pos, .comma) == null) break;
-            }
-            if (operands.items.len != 3 and operands.items.len != 4) return error.UnsupportedSqlShape;
-        },
-        .regexp_match => {
-            const source = try hooks.parse_expression(hooks.ptr);
-            var source_transferred = false;
-            errdefer if (!source_transferred) freeExpression(alloc, source);
-            try type_context.validateTextRowExpression(source);
-            try operands.append(alloc, source);
-            source_transferred = true;
-
-            try parser.expectToken(tokens, pos, .comma);
-            const pattern = try hooks.parse_expression(hooks.ptr);
-            var pattern_transferred = false;
-            errdefer if (!pattern_transferred) freeExpression(alloc, pattern);
-            try type_context.validateTextRowExpression(pattern);
-            try operands.append(alloc, pattern);
-            pattern_transferred = true;
-
-            if (parser.matchToken(tokens, pos, .comma) != null) {
-                const case_insensitive = try hooks.parse_expression(hooks.ptr);
-                var case_transferred = false;
-                errdefer if (!case_transferred) freeExpression(alloc, case_insensitive);
-                try type_context.validateBooleanRowExpression(case_insensitive);
-                try operands.append(alloc, case_insensitive);
-                case_transferred = true;
-            }
-        },
-        else => unreachable,
-    }
-
-    try parser.expectToken(tokens, pos, .rparen);
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
-}
-
-pub fn parseSubstringRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsSubstringFunction);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-
-    const text_operand = try hooks.parse_expression(hooks.ptr);
-    var text_transferred = false;
-    errdefer if (!text_transferred) freeExpression(alloc, text_operand);
-    try type_context.validateTextRowExpression(text_operand);
-    try operands.append(alloc, text_operand);
-    text_transferred = true;
-
-    if (parser.matchToken(tokens, pos, .comma) != null) {
-        const start_operand = try hooks.parse_expression(hooks.ptr);
-        var start_transferred = false;
-        errdefer if (!start_transferred) freeExpression(alloc, start_operand);
-        try type_context.validateNumericRowExpression(start_operand);
-        try operands.append(alloc, start_operand);
-        start_transferred = true;
-
-        if (parser.matchToken(tokens, pos, .comma) != null) {
-            const length_operand = try hooks.parse_expression(hooks.ptr);
-            var length_transferred = false;
-            errdefer if (!length_transferred) freeExpression(alloc, length_operand);
-            try type_context.validateNumericRowExpression(length_operand);
-            try operands.append(alloc, length_operand);
-            length_transferred = true;
-        }
-    } else if (parser.matchKeyword(tokens, pos, "from")) {
-        const start_operand = try hooks.parse_expression(hooks.ptr);
-        var start_transferred = false;
-        errdefer if (!start_transferred) freeExpression(alloc, start_operand);
-        try type_context.validateNumericRowExpression(start_operand);
-        try operands.append(alloc, start_operand);
-        start_transferred = true;
-
-        if (parser.matchKeyword(tokens, pos, "for")) {
-            const length_operand = try hooks.parse_expression(hooks.ptr);
-            var length_transferred = false;
-            errdefer if (!length_transferred) freeExpression(alloc, length_operand);
-            try type_context.validateNumericRowExpression(length_operand);
-            try operands.append(alloc, length_operand);
-            length_transferred = true;
-        }
-    } else return error.UnsupportedSqlShape;
-
-    try parser.expectToken(tokens, pos, .rparen);
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .substring, &operands);
-}
-
-pub fn parseOverlayRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsOverlayFunction);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-
-    const source_operand = try hooks.parse_expression(hooks.ptr);
-    var source_transferred = false;
-    errdefer if (!source_transferred) freeExpression(alloc, source_operand);
-    try type_context.validateTextRowExpression(source_operand);
-    try operands.append(alloc, source_operand);
-    source_transferred = true;
-
-    try parser.expectKeyword(tokens, pos, "placing");
-    const replacement_operand = try hooks.parse_expression(hooks.ptr);
-    var replacement_transferred = false;
-    errdefer if (!replacement_transferred) freeExpression(alloc, replacement_operand);
-    try type_context.validateTextRowExpression(replacement_operand);
-    try operands.append(alloc, replacement_operand);
-    replacement_transferred = true;
-
-    try parser.expectKeyword(tokens, pos, "from");
-    const start_operand = try hooks.parse_expression(hooks.ptr);
-    var start_transferred = false;
-    errdefer if (!start_transferred) freeExpression(alloc, start_operand);
-    try type_context.validateNumericRowExpression(start_operand);
-    try operands.append(alloc, start_operand);
-    start_transferred = true;
-
-    if (parser.matchKeyword(tokens, pos, "for")) {
-        const length_operand = try hooks.parse_expression(hooks.ptr);
-        var length_transferred = false;
-        errdefer if (!length_transferred) freeExpression(alloc, length_operand);
-        try type_context.validateNumericRowExpression(length_operand);
-        try operands.append(alloc, length_operand);
-        length_transferred = true;
-    }
-
-    try parser.expectToken(tokens, pos, .rparen);
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .overlay, &operands);
-}
-
-pub fn parseSplitPartRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsSplitPartFunction);
-    const source = try hooks.parse_expression(hooks.ptr);
-    var source_transferred = false;
-    errdefer if (!source_transferred) freeExpression(alloc, source);
-    try type_context.validateTextRowExpression(source);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const delimiter = try hooks.parse_expression(hooks.ptr);
-    var delimiter_transferred = false;
-    errdefer if (!delimiter_transferred) freeExpression(alloc, delimiter);
-    try type_context.validateTextRowExpression(delimiter);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const position = try hooks.parse_expression(hooks.ptr);
-    var position_transferred = false;
-    errdefer if (!position_transferred) freeExpression(alloc, position);
-    try type_context.validateNumericRowExpression(position);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, .split_part, source, delimiter, position);
-    source_transferred = true;
-    delimiter_transferred = true;
-    position_transferred = true;
-    return expression;
-}
-
-pub fn parseStrposRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    if (expr_token.matchFunctionKeywordToken(tokens, pos, expr_token.sqlTokenIsStrposFunction) != null) {
-        try parser.expectToken(tokens, pos, .lparen);
-        const source = try hooks.parse_expression(hooks.ptr);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(alloc, source);
-        try type_context.validateTextRowExpression(source);
-        try parser.expectToken(tokens, pos, .comma);
-
-        const needle = try hooks.parse_expression(hooks.ptr);
-        var needle_transferred = false;
-        errdefer if (!needle_transferred) freeExpression(alloc, needle);
-        try type_context.validateTextRowExpression(needle);
-        try parser.expectToken(tokens, pos, .rparen);
-
-        const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
-        source_transferred = true;
-        needle_transferred = true;
-        return expression;
-    } else if (parser.matchKeyword(tokens, pos, "position")) {
-        try parser.expectToken(tokens, pos, .lparen);
-        const needle = try hooks.parse_operand(hooks.ptr);
-        var needle_transferred = false;
-        errdefer if (!needle_transferred) freeExpression(alloc, needle);
-        try type_context.validateTextRowExpression(needle);
-        try parser.expectKeyword(tokens, pos, "in");
-
-        const source = try hooks.parse_expression(hooks.ptr);
-        var source_transferred = false;
-        errdefer if (!source_transferred) freeExpression(alloc, source);
-        try type_context.validateTextRowExpression(source);
-        try parser.expectToken(tokens, pos, .rparen);
-
-        const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .strpos, source, needle);
-        source_transferred = true;
-        needle_transferred = true;
-        return expression;
-    } else return error.UnsupportedSqlShape;
-}
-
-pub fn parsePadRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = expr_token.matchPadFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .lparen);
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-
-    const source = try hooks.parse_expression(hooks.ptr);
-    var source_transferred = false;
-    errdefer if (!source_transferred) freeExpression(alloc, source);
-    try type_context.validateTextRowExpression(source);
-    try operands.append(alloc, source);
-    source_transferred = true;
-    try parser.expectToken(tokens, pos, .comma);
-
-    const target = try hooks.parse_expression(hooks.ptr);
-    var target_transferred = false;
-    errdefer if (!target_transferred) freeExpression(alloc, target);
-    try type_context.validateNumericRowExpression(target);
-    try operands.append(alloc, target);
-    target_transferred = true;
-
-    if (parser.matchToken(tokens, pos, .comma) != null) {
-        const fill = try hooks.parse_expression(hooks.ptr);
-        var fill_transferred = false;
-        errdefer if (!fill_transferred) freeExpression(alloc, fill);
-        try type_context.validateTextRowExpression(fill);
-        try operands.append(alloc, fill);
-        fill_transferred = true;
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
-}
-
-pub fn parseLeftRightRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = expr_token.matchLeftRightFunctionKind(tokens, pos) orelse return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .lparen);
-    return try parseTextNumericBinaryRowExpressionRestAlloc(alloc, tokens, pos, kind, type_context, hooks);
-}
-
-pub fn parseRepeatRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsRepeatFunction);
-    return try parseTextNumericBinaryRowExpressionRestAlloc(alloc, tokens, pos, .repeat, type_context, hooks);
-}
-
-pub fn parseDateTruncRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsDateTruncFunction);
-    const unit = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var unit_transferred = false;
-    errdefer if (!unit_transferred) freeExpression(alloc, unit);
-    try type_context.validateTextRowExpression(unit);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const value = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var value_transferred = false;
-    errdefer if (!value_transferred) freeExpression(alloc, value);
-    try type_context.validateNumericOrDatetimeRowExpression(value);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .date_trunc, unit, value);
-    unit_transferred = true;
-    value_transferred = true;
-    return expression;
-}
-
-pub fn parseDateBinRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseFunctionCallStartTokenIf(tokens, pos, expr_token.sqlTokenIsDateBinFunction);
-    const stride = try hooks.parse_expression(hooks.ptr);
-    var stride_transferred = false;
-    errdefer if (!stride_transferred) freeExpression(alloc, stride);
-    try type_context.validateDateBinStrideRowExpression(stride);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const source = try hooks.parse_expression(hooks.ptr);
-    var source_transferred = false;
-    errdefer if (!source_transferred) freeExpression(alloc, source);
-    try type_context.validateNumericOrDatetimeRowExpression(source);
-    try parser.expectToken(tokens, pos, .comma);
-
-    const origin = try hooks.parse_expression(hooks.ptr);
-    var origin_transferred = false;
-    errdefer if (!origin_transferred) freeExpression(alloc, origin);
-    try type_context.validateNumericOrDatetimeRowExpression(origin);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildTernaryFunctionExpressionAlloc(alloc, .date_bin, stride, source, origin);
-    stride_transferred = true;
-    source_transferred = true;
-    origin_transferred = true;
-    return expression;
-}
-
-pub fn parseDatePartRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    const extract_syntax = try expr_token.parseDatePartFunctionCallStart(tokens, pos);
-    var unit: db_mod.types.RelationalRowsExpression = undefined;
-    var unit_initialized = false;
-    var unit_transferred = false;
-    errdefer if (unit_initialized and !unit_transferred) freeExpression(alloc, unit);
-    var value: db_mod.types.RelationalRowsExpression = undefined;
-    var value_initialized = false;
-    var value_transferred = false;
-    errdefer if (value_initialized and !value_transferred) freeExpression(alloc, value);
-
-    if (extract_syntax) {
-        unit = try parseDatePartUnitLiteralExpressionAlloc(alloc, tokens, pos);
-        unit_initialized = true;
-        try expr_token.parseDatePartExtractSeparator(tokens, pos);
-        value = try hooks.parse_expression(hooks.ptr);
-        value_initialized = true;
-        try type_context.validateNumericOrDatetimeRowExpression(value);
-    } else {
-        unit = try hooks.parse_expression(hooks.ptr);
-        unit_initialized = true;
-        try type_context.validateTextRowExpression(unit);
-        try parser.expectToken(tokens, pos, .comma);
-        value = try hooks.parse_expression(hooks.ptr);
-        value_initialized = true;
-        try type_context.validateNumericOrDatetimeRowExpression(value);
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .date_part, unit, value);
-    unit_transferred = true;
-    value_transferred = true;
-    return expression;
-}
-
-fn parseDatePartUnitLiteralExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-) !db_mod.types.RelationalRowsExpression {
-    const token = if (parser.matchToken(tokens, pos, .identifier)) |token|
-        token
-    else if (parser.matchToken(tokens, pos, .string)) |token|
-        token
-    else
-        return error.UnsupportedSqlShape;
-    if (std.ascii.eqlIgnoreCase(token.text, "from")) return error.UnsupportedSqlShape;
-    return .{
-        .kind = .value,
-        .value_json = try std.json.Stringify.valueAlloc(alloc, token.text, .{}),
-    };
-}
-
-pub fn parseConcatRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = try expr_token.parseConcatFunctionCallStart(tokens, pos);
-
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    while (true) {
-        const operand = try hooks.parse_operand(hooks.ptr);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(alloc, operand);
-        try operands.append(alloc, operand);
-        operand_transferred = true;
-        if (parser.matchToken(tokens, pos, .comma) == null) break;
-    }
-    if ((kind == .concat and operands.items.len == 0) or (kind == .concat_ws and operands.items.len < 2)) return error.UnsupportedSqlShape;
-    if (kind == .concat_ws) {
-        for (operands.items) |operand| try type_context.validateTextRowExpression(operand);
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
-}
-
-pub fn parsePipeConcatExpressionRestAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    left: db_mod.types.RelationalRowsExpression,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    var left_transferred = false;
-    errdefer if (!left_transferred) freeExpression(alloc, left);
-    try type_context.validateTextRowExpression(left);
-
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    try operands.append(alloc, left);
-    left_transferred = true;
-
-    while (parser.matchToken(tokens, pos, .pipe_concat) != null) {
-        const rhs = try hooks.parse_operand(hooks.ptr);
-        var rhs_transferred = false;
-        errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
-        try type_context.validateTextRowExpression(rhs);
-        try operands.append(alloc, rhs);
-        rhs_transferred = true;
-    }
-    if (operands.items.len < 2) return error.UnsupportedSqlShape;
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, .concat, &operands);
-}
-
-pub fn parseArithmeticExpressionRestAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    lhs: db_mod.types.RelationalRowsExpression,
-    min_precedence: u8,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: ArithmeticExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    var current = lhs;
-    var current_owned = true;
-    errdefer if (current_owned) freeExpression(alloc, current);
-
-    while (expr_operator.peekArithmeticOperator(tokens, pos.*)) |op| {
-        if (op.precedence < min_precedence) break;
-        _ = parser.matchToken(tokens, pos, op.token) orelse unreachable;
-        if (expr_token.peekSqlIntervalExpressionSyntax(tokens, pos.*)) {
-            try type_context.validateNumericOrDatetimeRowExpression(current);
-            const interval = try value_mod.parseSqlIntervalLiteral(tokens, pos);
-            const next = try expr_build.buildIntervalLiteralArithmeticAlloc(alloc, current, op.kind, interval);
-            current_owned = false;
-            current = next;
-            current_owned = true;
-            continue;
-        }
-
-        var rhs = if (expr_token.peekParenthesizedExpressionSyntax(tokens, pos.*))
-            try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, hooks.parenthesized)
-        else
-            try hooks.parse_operand(hooks.ptr);
-        var rhs_owned = true;
-        errdefer if (rhs_owned) freeExpression(alloc, rhs);
-        try type_context.validateNumericRowExpression(rhs);
-
-        while (expr_operator.peekArithmeticOperator(tokens, pos.*)) |next_op| {
-            if (next_op.precedence <= op.precedence) break;
-            rhs_owned = false;
-            rhs = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, rhs, next_op.precedence, type_context, hooks);
-            rhs_owned = true;
-        }
-
-        const expression = try expr_build.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
-        current_owned = false;
-        rhs_owned = false;
-        current = expression;
-        current_owned = true;
-    }
-
-    current_owned = false;
-    return current;
-}
-
-pub fn parseBooleanExpressionRestAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    lhs: db_mod.types.RelationalRowsExpression,
-    min_precedence: u8,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: BooleanExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try type_context.validateBooleanRowExpression(lhs);
-    var current = lhs;
-    var current_owned = true;
-    errdefer if (current_owned) freeExpression(alloc, current);
-
-    while (expr_operator.peekBooleanOperator(tokens, pos.*)) |op| {
-        if (op.precedence < min_precedence) break;
-        if (!parser.matchKeyword(tokens, pos, op.keyword)) unreachable;
-        var rhs = try hooks.parse_operand(hooks.ptr);
-        var rhs_owned = true;
-        errdefer if (rhs_owned) freeExpression(alloc, rhs);
-        try type_context.validateBooleanRowExpression(rhs);
-
-        while (expr_operator.peekBooleanOperator(tokens, pos.*)) |next_op| {
-            if (next_op.precedence <= op.precedence) break;
-            rhs_owned = false;
-            rhs = try parseBooleanExpressionRestAlloc(alloc, tokens, pos, rhs, next_op.precedence, type_context, hooks);
-            rhs_owned = true;
-        }
-
-        const expression = try expr_build.buildBinaryExpressionAlloc(alloc, op.kind, current, rhs);
-        current_owned = false;
-        rhs_owned = false;
-        current = expression;
-        current_owned = true;
-    }
-
-    current_owned = false;
-    return current;
-}
-
-pub fn parseRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    var expression = try hooks.parse_operand(hooks.ptr);
-    var expression_owned = true;
-    errdefer if (expression_owned) freeExpression(alloc, expression);
-    if (expr_operator.peekArithmeticOperator(tokens, pos.*)) |_| {
-        try type_context.validateNumericOrDatetimeRowExpression(expression);
-        expression_owned = false;
-        expression = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, expression, 0, type_context, arithmetic_hooks);
-        expression_owned = true;
-        try type_context.validateNumericRowExpression(expression);
-    }
-    if (parser.peekKind(tokens, pos.*, .pipe_concat)) {
-        expression_owned = false;
-        expression = try parsePipeConcatExpressionRestAlloc(alloc, tokens, pos, expression, type_context, variadic_hooks);
-        expression_owned = true;
-    }
-    expression_owned = false;
-    return expression;
-}
-
 pub fn parseRowExpressionFromContextAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
     context_hooks: SelectParserContextHooks,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpression {
-    return try parseRowExpressionAlloc(
+    return try expr_row_parse.parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11136,9 +8296,9 @@ pub fn parseRowExpressionFromContextAlloc(
 
 pub const RecursiveCteMemberProjectionExpressionParserOptions = struct {
     type_context: expr_type.RowExpressionTypeContext,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
 };
 
 pub fn parseRecursiveCteMemberProjectionExpressionAlloc(
@@ -11147,7 +8307,7 @@ pub fn parseRecursiveCteMemberProjectionExpressionAlloc(
     pos: *usize,
     options: RecursiveCteMemberProjectionExpressionParserOptions,
 ) !plan_mod.RecursiveCteMemberProjectionExpression {
-    const expression = try parseRowExpressionAlloc(
+    const expression = try expr_row_parse.parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11269,9 +8429,9 @@ fn setJoinedExpressionContextForTables(
 
 pub const JoinedRowExpressionParserOptions = struct {
     context_hooks: JoinedExpressionParserContextHooks,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     require_exact_generated_expression: bool = false,
 };
@@ -11290,7 +8450,7 @@ pub fn parseJoinedRowExpressionWithTableQualifiersAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
 
     const start = pos.*;
-    const expression = try parseRowExpressionAlloc(
+    const expression = try expr_row_parse.parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11301,9 +8461,9 @@ pub fn parseJoinedRowExpressionWithTableQualifiersAlloc(
     );
     errdefer freeExpression(alloc, expression);
     if (options.require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
     } else {
-        try validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
     }
     return expression;
 }
@@ -11320,7 +8480,7 @@ pub fn parseJoinedRowExpressionWithQualifiersAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
 
     const start = pos.*;
-    const expression = try parseRowExpressionAlloc(
+    const expression = try expr_row_parse.parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11331,16 +8491,16 @@ pub fn parseJoinedRowExpressionWithQualifiersAlloc(
     );
     errdefer freeExpression(alloc, expression);
     if (options.require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
     } else {
-        try validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
     }
     return expression;
 }
 
 pub const JoinedBooleanRowExpressionParserOptions = struct {
     context_hooks: JoinedExpressionParserContextHooks,
-    boolean_hooks: BooleanRowExpressionParserHooks,
+    boolean_hooks: expr_row_parse.BooleanRowExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     require_exact_generated_expression: bool = false,
 };
@@ -11357,7 +8517,7 @@ pub fn parseJoinedBooleanRowExpressionWithQualifiersAlloc(
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
 
     const start = pos.*;
-    const expression = try parseBooleanRowExpressionAlloc(
+    const expression = try expr_row_parse.parseBooleanRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11366,9 +8526,9 @@ pub fn parseJoinedBooleanRowExpressionWithQualifiersAlloc(
     );
     errdefer freeExpression(alloc, expression);
     if (options.require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
     } else {
-        try validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
     }
     return expression;
 }
@@ -11382,12 +8542,12 @@ fn setDeferredRowExpressionFieldValidation(context_hooks: SelectParserContextHoo
 }
 
 pub const DeferredRowExpressionParserOptions = struct {
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     require_routine_expression_binding: bool = false,
     context_hooks: SelectParserContextHooks,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
 };
 
 pub fn parseRowExpressionWithDeferredFieldValidationAlloc(
@@ -11400,7 +8560,7 @@ pub fn parseRowExpressionWithDeferredFieldValidationAlloc(
     const previous_context = setDeferredRowExpressionFieldValidation(options.context_hooks);
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
 
-    return try parseRowExpressionAlloc(
+    return try expr_row_parse.parseRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11412,10 +8572,10 @@ pub fn parseRowExpressionWithDeferredFieldValidationAlloc(
 }
 
 pub const DeferredBooleanRowExpressionParserOptions = struct {
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     require_routine_expression_binding: bool = false,
     context_hooks: SelectParserContextHooks,
-    boolean_hooks: BooleanRowExpressionParserHooks,
+    boolean_hooks: expr_row_parse.BooleanRowExpressionParserHooks,
 };
 
 pub fn parseBooleanRowExpressionWithDeferredFieldValidationAlloc(
@@ -11428,7 +8588,7 @@ pub fn parseBooleanRowExpressionWithDeferredFieldValidationAlloc(
     const previous_context = setDeferredRowExpressionFieldValidation(options.context_hooks);
     defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
 
-    return try parseBooleanRowExpressionAlloc(
+    return try expr_row_parse.parseBooleanRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -11439,7 +8599,7 @@ pub fn parseBooleanRowExpressionWithDeferredFieldValidationAlloc(
 
 pub const DeferredUniquePredicateWhereExpressionConditionsParserOptions = struct {
     context_hooks: SelectParserContextHooks,
-    case_expression_hooks: CaseExpressionParserHooks,
+    case_expression_hooks: expr_row_parse.CaseExpressionParserHooks,
 };
 
 pub fn parseUniquePredicateWhereExpressionConditionsWithDeferredFieldValidationAlloc(
@@ -11731,7 +8891,7 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
 
     if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
         const operator_token_index = stringToArrayContainmentOperatorTokenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape;
-        try validateGeneratedSingleOperatorPredicateIdentity(options.generated_expression_ast, .contains, tokens, operator_token_index);
+        try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(options.generated_expression_ast, .contains, tokens, operator_token_index);
         const predicate = try parseExpressionArrayContainsPredicateAlloc(alloc, tokens, pos, options.params, expression_type_context, options.fixed_binary_hooks);
         var predicate_transferred = false;
         errdefer if (!predicate_transferred) freeExpressionArrayContainsOne(alloc, predicate);
@@ -11779,414 +8939,6 @@ pub fn parseJoinedMutationExpressionWhereConditionWithContextAlloc(
             break :blk expression_condition_hooks;
         },
     );
-}
-
-pub fn parseArithmeticExpressionProjectionFromFieldAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    expression_start: usize,
-    lhs_field: []const u8,
-    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: ArithmeticExpressionParserHooks,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    require_exact_generated_expression: bool,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    var current: db_mod.types.RelationalRowsExpression = .{
-        .kind = .field,
-        .field = lhs_field,
-        .field_source = field_source,
-    };
-    var current_owned = true;
-    errdefer if (current_owned) freeExpression(alloc, current);
-
-    current_owned = false;
-    current = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, current, 0, type_context, hooks);
-    current_owned = true;
-    if (require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, expression_start, pos.*, current, generated_expression_ast);
-    } else {
-        try validateGeneratedRowExpressionIdentity(tokens, expression_start, pos.*, current, generated_expression_ast);
-    }
-    try type_context.validateNumericRowExpression(current);
-
-    const default_output = switch (current.kind) {
-        .add => "add",
-        .sub => "sub",
-        .mul => "mul",
-        .div => "div",
-        else => "expr",
-    };
-    current_owned = false;
-    return try buildExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, current, default_output);
-}
-
-pub fn parseBooleanExpressionProjectionFromFieldAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    expression_start: usize,
-    lhs_field: []const u8,
-    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: BooleanExpressionParserHooks,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    require_exact_generated_expression: bool,
-) !db_mod.types.RelationalRowsExpressionProjection {
-    var current: db_mod.types.RelationalRowsExpression = .{
-        .kind = .field,
-        .field = lhs_field,
-        .field_source = field_source,
-    };
-    var current_owned = true;
-    errdefer if (current_owned) freeExpression(alloc, current);
-
-    current_owned = false;
-    current = try parseBooleanExpressionRestAlloc(alloc, tokens, pos, current, 0, type_context, hooks);
-    current_owned = true;
-    if (require_exact_generated_expression) {
-        try validateGeneratedRowExpressionIdentityStrict(tokens, expression_start, pos.*, current, generated_expression_ast);
-    } else {
-        try validateGeneratedRowExpressionIdentity(tokens, expression_start, pos.*, current, generated_expression_ast);
-    }
-
-    current_owned = false;
-    return try buildBooleanExpressionProjectionFromOwnedExpressionAlloc(alloc, tokens, pos, type_context, current);
-}
-
-pub fn parseBooleanRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: BooleanRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    var expression = try hooks.parse_expression(hooks.ptr);
-    var expression_owned = true;
-    errdefer if (expression_owned) freeExpression(alloc, expression);
-    if (expr_operator.peekBooleanOperator(tokens, pos.*)) |_| {
-        try type_context.validateBooleanRowExpression(expression);
-        expression_owned = false;
-        expression = try parseBooleanExpressionRestAlloc(alloc, tokens, pos, expression, 0, type_context, .{
-            .ptr = hooks.ptr,
-            .parse_operand = hooks.parse_operand,
-        });
-        expression_owned = true;
-        try type_context.validateBooleanRowExpression(expression);
-    }
-    expression_owned = false;
-    return expression;
-}
-
-pub fn parseCaseRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    defer_row_expression_field_validation: bool,
-    hooks: CaseExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    try expr_token.parseCaseExpressionStart(tokens, pos);
-
-    var branches = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCaseBranch).empty;
-    errdefer {
-        for (branches.items) |branch| plan_mod.freeExpressionCaseBranch(alloc, branch);
-        branches.deinit(alloc);
-    }
-
-    while (expr_token.matchCaseExpressionWhen(tokens, pos)) {
-        const condition = try parseCaseExpressionConditionAlloc(alloc, tokens, pos, type_context, defer_row_expression_field_validation, hooks);
-        var condition_transferred = false;
-        errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-        try expr_token.parseCaseExpressionThen(tokens, pos);
-        const then_expression = try hooks.parse_operand(hooks.ptr);
-        var then_transferred = false;
-        errdefer if (!then_transferred) freeExpression(alloc, then_expression);
-        try branches.append(alloc, .{ .when = condition, .then = then_expression });
-        condition_transferred = true;
-        then_transferred = true;
-    }
-    if (branches.items.len == 0) return error.UnsupportedSqlShape;
-
-    try expr_token.parseCaseExpressionElse(tokens, pos);
-    const else_expression = try hooks.parse_operand(hooks.ptr);
-    var else_transferred = false;
-    errdefer if (!else_transferred) freeExpression(alloc, else_expression);
-    try expr_token.parseCaseExpressionEnd(tokens, pos);
-
-    const owned_branches = try branches.toOwnedSlice(alloc);
-    var branches_transferred = false;
-    errdefer if (!branches_transferred) {
-        for (owned_branches) |branch| plan_mod.freeExpressionCaseBranch(alloc, branch);
-        alloc.free(owned_branches);
-    };
-    const fallback = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var fallback_initialized = false;
-    var fallback_transferred = false;
-    errdefer if (!fallback_transferred) {
-        if (fallback_initialized) freeExpression(alloc, fallback[0]);
-        alloc.free(fallback);
-    };
-    fallback[0] = else_expression;
-    fallback_initialized = true;
-    else_transferred = true;
-
-    _ = try type_context.caseExpressionOutputType(owned_branches, fallback);
-
-    branches_transferred = true;
-    fallback_transferred = true;
-    return .{
-        .kind = .case,
-        .case_branches = owned_branches,
-        .case_else = fallback,
-    };
-}
-
-pub fn parseCaseExpressionConditionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    defer_row_expression_field_validation: bool,
-    hooks: CaseExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    return try parseCaseExpressionConditionWithOperatorAlloc(
-        alloc,
-        tokens,
-        pos,
-        type_context,
-        defer_row_expression_field_validation,
-        hooks,
-        null,
-    );
-}
-
-fn parseCaseExpressionConditionWithOperatorAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    defer_row_expression_field_validation: bool,
-    hooks: CaseExpressionParserHooks,
-    operator_token_index: ?*usize,
-) !db_mod.types.RelationalRowsExpressionCondition {
-    const lhs = try hooks.parse_expression(hooks.ptr);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
-
-    const parsed_operator_token_index = pos.*;
-    const op: runtime_schema.RelationalCheckOp = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{})) |is_tail|
-        is_tail.op
-    else
-        try expr_operator.parseComparisonOp(tokens, pos);
-    if (operator_token_index) |out| out.* = parsed_operator_token_index;
-
-    const rhs = switch (op) {
-        .is_null, .is_not_null => &.{},
-        else => blk: {
-            const out = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-            var out_transferred = false;
-            errdefer if (!out_transferred) alloc.free(out);
-            out[0] = try hooks.parse_expression(hooks.ptr);
-            out_transferred = true;
-            break :blk out;
-        },
-    };
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred and rhs.len > 0) {
-        for (rhs) |expression| freeExpression(alloc, expression);
-        alloc.free(rhs);
-    };
-    try expr_type.validateExpressionConditionTypes(type_context, defer_row_expression_field_validation, lhs, op, rhs);
-
-    lhs_transferred = true;
-    rhs_transferred = true;
-    return .{
-        .lhs = lhs,
-        .op = op,
-        .rhs = rhs,
-    };
-}
-
-pub fn parseCaseFoldRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
-    type_context: expr_type.RowExpressionTypeContext,
-    options: CaseFoldRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = try expr_token.parseCaseFoldFunctionCallStart(tokens, pos);
-    if (try parsePeriodBoundRowExpressionAlloc(
-        alloc,
-        tokens,
-        pos,
-        kind,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-        field_source,
-    )) |expression| return expression;
-
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-
-    var effective_type_context = type_context;
-    effective_type_context.defer_row_expression_field_validation =
-        effective_type_context.defer_row_expression_field_validation or
-        defer_row_expression_field_validation or
-        effective_type_context.joined_source_schema != null;
-
-    const operand = parseRowExpressionAlloc(alloc, tokens, pos, effective_type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks) catch |err| {
-        const token_text = if (pos.* < tokens.len) tokens[pos.*].text else "<eof>";
-        std.log.err("case fold operand parse failed token={s} pos={} err={}", .{ token_text, pos.*, err });
-        return err;
-    };
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operand);
-    effective_type_context.validateTextRowExpression(operand) catch |err| {
-        const field = if (operand.kind == .field) operand.field else "";
-        std.log.err("case fold operand text validation failed kind={} field={s} err={}", .{ operand.kind, field, err });
-        return err;
-    };
-    try operands.append(alloc, operand);
-    operand_transferred = true;
-
-    if (kind == .trim or kind == .ltrim or kind == .rtrim) {
-        if (parser.matchToken(tokens, pos, .comma) != null) {
-            const trim_operand = try parseRowExpressionAlloc(alloc, tokens, pos, effective_type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
-            var trim_transferred = false;
-            errdefer if (!trim_transferred) freeExpression(alloc, trim_operand);
-            try effective_type_context.validateTextRowExpression(trim_operand);
-            try operands.append(alloc, trim_operand);
-            trim_transferred = true;
-        }
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-
-    return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
-}
-
-pub fn parsePeriodBoundRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
-) !?db_mod.types.RelationalRowsExpression {
-    if (kind != .lower and kind != .upper) return null;
-    const start_pos = pos.*;
-    const parsed_field = parseIdentifierOwnedAlloc(alloc, tokens, pos) catch |err| switch (err) {
-        error.UnsupportedSqlShape => return null,
-        else => return err,
-    };
-    defer alloc.free(parsed_field);
-    const field = (try binder.normalizePeriodReferenceAlloc(
-        alloc,
-        schema,
-        parsed_field,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-    )) orelse (binder.normalizeRowExpressionFieldAlloc(
-        alloc,
-        schema,
-        parsed_field,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    ) catch |err| switch (err) {
-        error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
-            pos.* = start_pos;
-            return null;
-        },
-        else => return err,
-    });
-    defer alloc.free(field);
-    const period = binder.relationalPeriodForDdl(schema.periods, field) orelse {
-        pos.* = start_pos;
-        return null;
-    };
-    if (!parser.Cursor.init(tokens, pos).peekKind(.rparen)) return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .rparen);
-    const bound_name = if (kind == .lower) period.start_column else period.end_column;
-    const bound_column = binder.relationalColumnForField(schema, bound_name, null) orelse return error.InvalidSqlCatalog;
-    if (!binder.relationalPeriodColumnType(bound_column.field_type)) return error.InvalidSqlCatalog;
-    return .{
-        .kind = .field,
-        .field = try alloc.dupe(u8, bound_column.name),
-        .field_source = field_source,
-    };
-}
-
-fn parseTextNumericBinaryRowExpressionRestAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    kind: db_mod.types.RelationalRowsExpressionKind,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: FixedBinaryRowExpressionParserOptions,
-) !db_mod.types.RelationalRowsExpression {
-    const lhs = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
-    try type_context.validateTextRowExpression(lhs);
-    try parser.expectToken(tokens, pos, .comma);
-    const rhs = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.row_expression_hooks, hooks.arithmetic_hooks, hooks.variadic_hooks);
-    var rhs_transferred = false;
-    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
-    try type_context.validateNumericRowExpression(rhs);
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, lhs, rhs);
-    lhs_transferred = true;
-    rhs_transferred = true;
-    return expression;
-}
-
-pub fn parseGreatestLeastRowExpressionAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    type_context: expr_type.RowExpressionTypeContext,
-    hooks: VariadicRowExpressionParserHooks,
-) !db_mod.types.RelationalRowsExpression {
-    const kind = try expr_token.parseGreatestLeastFunctionCallStart(tokens, pos);
-
-    var operands = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpression).empty;
-    errdefer {
-        for (operands.items) |operand| freeExpression(alloc, operand);
-        operands.deinit(alloc);
-    }
-    while (true) {
-        const operand = try hooks.parse_expression(hooks.ptr);
-        var operand_transferred = false;
-        errdefer if (!operand_transferred) freeExpression(alloc, operand);
-        try operands.append(alloc, operand);
-        operand_transferred = true;
-        if (parser.matchToken(tokens, pos, .comma) == null) break;
-    }
-    if (operands.items.len == 0) return error.UnsupportedSqlShape;
-    try parser.expectToken(tokens, pos, .rparen);
-
-    const expression = try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
-    var expression_transferred = false;
-    errdefer if (!expression_transferred) freeExpression(alloc, expression);
-    try type_context.validateExpressionOperandDomains(expression);
-    expression_transferred = true;
-    return expression;
 }
 
 pub fn parseArrayLengthRowExpressionAlloc(
@@ -12278,189 +9030,6 @@ pub fn parseArrayLengthExpressionProjectionAlloc(
     return expr_build.buildExpressionProjection(output, expression);
 }
 
-pub fn generatedUnaryTextColumnForField(
-    schema: runtime_schema.TableSchema,
-    op: runtime_schema.RelationalGeneratedOp,
-    field: []const u8,
-) ?runtime_schema.RelationalColumn {
-    switch (op) {
-        .lower, .upper, .md5 => {},
-        .concat, .concat_ws, .expression => return null,
-    }
-    for (schema.relational_columns) |column| {
-        const generated = column.generated orelse continue;
-        if (generated.op != op) continue;
-        const generated_field = generated.field orelse continue;
-        if (std.mem.eql(u8, generated_field, field)) return column;
-    }
-    return null;
-}
-
-pub fn generatedConcatColumnAt(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) !?runtime_schema.RelationalColumn {
-    for (schema.relational_columns) |column| {
-        const generated = column.generated orelse continue;
-        if (generated.op != .concat and generated.op != .concat_ws) continue;
-        if (try concatCallMatchesGeneratedAt(
-            alloc,
-            tokens,
-            pos,
-            schema,
-            generated,
-            field_expression_qualifiers,
-            returning_expression_qualifiers,
-            defer_row_expression_field_validation,
-        )) return column;
-    }
-    return null;
-}
-
-pub fn parseGeneratedFieldExpressionOwnedAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) !?[]const u8 {
-    if (pos.* + 1 >= tokens.len or tokens[pos.*].kind != .identifier or tokens[pos.* + 1].kind != .lparen) return null;
-
-    if (generatedUnaryOpToken(tokens[pos.*])) |op| {
-        pos.* += 2;
-        const parsed_source = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
-        defer alloc.free(parsed_source);
-        const source = try binder.normalizeRowExpressionFieldAlloc(
-            alloc,
-            schema,
-            parsed_source,
-            field_expression_qualifiers,
-            returning_expression_qualifiers,
-            defer_row_expression_field_validation,
-        );
-        defer alloc.free(source);
-        if (binder.relationalColumnForField(schema, source, null) == null) return error.InvalidSqlCatalog;
-        try parser.expectToken(tokens, pos, .rparen);
-        const generated = generatedUnaryTextColumnForField(schema, op, source) orelse return error.UnsupportedSqlShape;
-        return try alloc.dupe(u8, generated.name);
-    }
-
-    const is_concat = tokens[pos.*].matchesKeywordTag(.concat);
-    const is_concat_ws = tokens[pos.*].matchesKeywordTag(.concat_ws);
-    if (!is_concat and !is_concat_ws) return null;
-
-    const generated = (try generatedConcatColumnAt(
-        alloc,
-        tokens,
-        pos.*,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    )) orelse return error.UnsupportedSqlShape;
-    pos.* += 2;
-    const generated_value = generated.generated orelse return error.UnsupportedSqlShape;
-    if (generated_value.op == .concat_ws) {
-        const separator = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
-        if (!std.mem.eql(u8, separator.text, generated_value.separator)) return error.UnsupportedSqlShape;
-        if (parser.matchToken(tokens, pos, .comma) == null) return error.UnsupportedSqlShape;
-    }
-    for (generated_value.fields, 0..) |field, i| {
-        const parsed_source = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
-        defer alloc.free(parsed_source);
-        const source = try binder.normalizeRowExpressionFieldAlloc(
-            alloc,
-            schema,
-            parsed_source,
-            field_expression_qualifiers,
-            returning_expression_qualifiers,
-            defer_row_expression_field_validation,
-        );
-        defer alloc.free(source);
-        if (!std.mem.eql(u8, source, field)) return error.UnsupportedSqlShape;
-        if (i + 1 < generated_value.fields.len) {
-            if (parser.matchToken(tokens, pos, .comma) == null) return error.UnsupportedSqlShape;
-            if (generated_value.op == .concat) {
-                const separator = parser.matchToken(tokens, pos, .string) orelse return error.UnsupportedSqlShape;
-                if (!std.mem.eql(u8, separator.text, generated_value.separator)) return error.UnsupportedSqlShape;
-                if (parser.matchToken(tokens, pos, .comma) == null) return error.UnsupportedSqlShape;
-            }
-        }
-    }
-    try parser.expectToken(tokens, pos, .rparen);
-    return try alloc.dupe(u8, generated.name);
-}
-
-pub fn parseGeneratedFieldExpressionOrNullOwnedAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) !?[]const u8 {
-    const start_pos = pos.*;
-    return parseGeneratedFieldExpressionOwnedAlloc(
-        alloc,
-        tokens,
-        pos,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    ) catch |err| switch (err) {
-        error.InvalidSqlCatalog, error.UnsupportedSqlShape => {
-            pos.* = start_pos;
-            return null;
-        },
-        else => return err,
-    };
-}
-
-pub fn parseRowExpressionFieldOwnedAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) ![]const u8 {
-    if (try generatedExpressionCallHasGeneratedColumn(
-        alloc,
-        tokens,
-        pos.*,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    )) if (try parseGeneratedFieldExpressionOwnedAlloc(
-        alloc,
-        tokens,
-        pos,
-        schema,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    )) |field| return field;
-    return try parseIdentifierOwnedAlloc(alloc, tokens, pos);
-}
-
-fn generatedUnaryOpToken(token: Token) ?runtime_schema.RelationalGeneratedOp {
-    if (token.matchesKeywordTag(.lower)) return .lower;
-    if (token.matchesKeywordTag(.upper)) return .upper;
-    if (token.matchesKeywordTag(.md5)) return .md5;
-    return null;
-}
-
 fn parseIdentifierOwnedAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -12468,230 +9037,6 @@ fn parseIdentifierOwnedAlloc(
 ) ![]const u8 {
     const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, token.text);
-}
-
-fn concatCallMatchesGeneratedAt(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: usize,
-    schema: runtime_schema.TableSchema,
-    generated: runtime_schema.RelationalGeneratedValue,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) !bool {
-    if (generated.fields.len == 0) return false;
-    if (pos + 2 >= tokens.len) return false;
-    if (tokens[pos].kind != .identifier) return false;
-    if (generated.op == .concat and !tokens[pos].matchesKeywordTag(.concat)) return false;
-    if (generated.op == .concat_ws and !tokens[pos].matchesKeywordTag(.concat_ws)) return false;
-    if (tokens[pos + 1].kind != .lparen) return false;
-    var i: usize = pos + 2;
-    if (generated.op == .concat_ws) {
-        if (i >= tokens.len or tokens[i].kind != .string) return false;
-        if (!std.mem.eql(u8, tokens[i].text, generated.separator)) return false;
-        i += 1;
-        if (i >= tokens.len or tokens[i].kind != .comma) return false;
-        i += 1;
-    }
-    for (generated.fields, 0..) |field, field_index| {
-        if (i >= tokens.len or tokens[i].kind != .identifier) return false;
-        const normalized_field = try binder.normalizeRowExpressionFieldAlloc(
-            alloc,
-            schema,
-            tokens[i].text,
-            field_expression_qualifiers,
-            returning_expression_qualifiers,
-            defer_row_expression_field_validation,
-        );
-        defer alloc.free(normalized_field);
-        if (!std.mem.eql(u8, normalized_field, field)) return false;
-        i += 1;
-        if (field_index + 1 < generated.fields.len) {
-            if (i >= tokens.len or tokens[i].kind != .comma) return false;
-            i += 1;
-            if (generated.op == .concat) {
-                if (i >= tokens.len or tokens[i].kind != .string) return false;
-                if (!std.mem.eql(u8, tokens[i].text, generated.separator)) return false;
-                i += 1;
-                if (i >= tokens.len or tokens[i].kind != .comma) return false;
-                i += 1;
-            }
-        }
-    }
-    return i < tokens.len and tokens[i].kind == .rparen;
-}
-
-fn routineArgIndex(field: []const u8) ?usize {
-    if (!std.mem.startsWith(u8, field, "arg") or field.len <= 3) return null;
-    var index: usize = 0;
-    for (field[3..]) |ch| {
-        if (ch < '0' or ch > '9') return null;
-        index = index * 10 + @as(usize, ch - '0');
-    }
-    if (index == 0) return null;
-    return index - 1;
-}
-
-pub fn cloneExpressionSubstitutingRoutineArgsAlloc(
-    alloc: std.mem.Allocator,
-    value: runtime_schema.RelationalRowsExpression,
-    args: []const runtime_schema.RelationalRowsExpression,
-) anyerror!runtime_schema.RelationalRowsExpression {
-    if (value.kind == .field) {
-        if (routineArgIndex(value.field)) |index| {
-            if (index >= args.len) return error.UnsupportedSqlShape;
-            return try runtime_schema.cloneRelationalRowsExpressionAlloc(alloc, args[index]);
-        }
-    }
-
-    var cloned: runtime_schema.RelationalRowsExpression = .{
-        .kind = value.kind,
-        .field_source = value.field_source,
-        .cast_type = value.cast_type,
-        .json_as_text = value.json_as_text,
-    };
-    errdefer runtime_schema.freeRelationalRowsExpression(alloc, cloned);
-
-    if (value.field.len > 0) cloned.field = try alloc.dupe(u8, value.field);
-    if (value.value_json.len > 0) cloned.value_json = try alloc.dupe(u8, value.value_json);
-    if (value.json_path.len > 0) cloned.json_path = try alloc.dupe(u8, value.json_path);
-
-    if (value.operands.len > 0) {
-        const operands = try alloc.alloc(runtime_schema.RelationalRowsExpression, value.operands.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (operands[0..initialized]) |operand| runtime_schema.freeRelationalRowsExpression(alloc, operand);
-            alloc.free(operands);
-        }
-        for (value.operands, 0..) |operand, i| {
-            operands[i] = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, operand, args);
-            initialized += 1;
-        }
-        cloned.operands = operands;
-    }
-
-    if (value.case_branches.len > 0) {
-        const branches = try alloc.alloc(runtime_schema.RelationalRowsExpressionCaseBranch, value.case_branches.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (branches[0..initialized]) |branch| freeRoutineExpressionCaseBranch(alloc, branch);
-            alloc.free(branches);
-        }
-        for (value.case_branches, 0..) |branch, i| {
-            branches[i] = try cloneExpressionCaseBranchSubstitutingRoutineArgsAlloc(alloc, branch, args);
-            initialized += 1;
-        }
-        cloned.case_branches = branches;
-    }
-
-    if (value.case_else.len > 0) {
-        const fallback = try alloc.alloc(runtime_schema.RelationalRowsExpression, value.case_else.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (fallback[0..initialized]) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
-            alloc.free(fallback);
-        }
-        for (value.case_else, 0..) |expression, i| {
-            fallback[i] = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, expression, args);
-            initialized += 1;
-        }
-        cloned.case_else = fallback;
-    }
-
-    return cloned;
-}
-
-fn cloneExpressionCaseBranchSubstitutingRoutineArgsAlloc(
-    alloc: std.mem.Allocator,
-    value: runtime_schema.RelationalRowsExpressionCaseBranch,
-    args: []const runtime_schema.RelationalRowsExpression,
-) anyerror!runtime_schema.RelationalRowsExpressionCaseBranch {
-    const when = try cloneExpressionConditionSubstitutingRoutineArgsAlloc(alloc, value.when, args);
-    var when_transferred = false;
-    errdefer if (!when_transferred) runtime_schema.freeRelationalRowsExpressionCondition(alloc, when);
-    const then_expression = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, value.then, args);
-    when_transferred = true;
-    return .{
-        .when = when,
-        .then = then_expression,
-    };
-}
-
-fn cloneExpressionConditionSubstitutingRoutineArgsAlloc(
-    alloc: std.mem.Allocator,
-    value: runtime_schema.RelationalRowsExpressionCondition,
-    args: []const runtime_schema.RelationalRowsExpression,
-) anyerror!runtime_schema.RelationalRowsExpressionCondition {
-    const lhs = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, value.lhs, args);
-    var lhs_transferred = false;
-    errdefer if (!lhs_transferred) runtime_schema.freeRelationalRowsExpression(alloc, lhs);
-
-    const rhs = if (value.rhs.len > 0) blk: {
-        const out = try alloc.alloc(runtime_schema.RelationalRowsExpression, value.rhs.len);
-        var initialized: usize = 0;
-        errdefer {
-            for (out[0..initialized]) |expression| runtime_schema.freeRelationalRowsExpression(alloc, expression);
-            alloc.free(out);
-        }
-        for (value.rhs, 0..) |expression, i| {
-            out[i] = try cloneExpressionSubstitutingRoutineArgsAlloc(alloc, expression, args);
-            initialized += 1;
-        }
-        break :blk out;
-    } else &.{};
-
-    lhs_transferred = true;
-    return .{
-        .lhs = lhs,
-        .op = value.op,
-        .rhs = rhs,
-    };
-}
-
-fn freeRoutineExpressionCaseBranch(
-    alloc: std.mem.Allocator,
-    value: runtime_schema.RelationalRowsExpressionCaseBranch,
-) void {
-    runtime_schema.freeRelationalRowsExpressionCondition(alloc, value.when);
-    runtime_schema.freeRelationalRowsExpression(alloc, value.then);
-}
-
-pub fn aggregateOpForName(name: []const u8) ?db_mod.types.RelationalRowsAggregateOp {
-    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
-    if (std.ascii.eqlIgnoreCase(name, "sum")) return .sum;
-    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
-    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
-    if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
-    if (std.ascii.eqlIgnoreCase(name, "percentile_cont")) return .percentile_cont;
-    if (std.ascii.eqlIgnoreCase(name, "percentile_disc")) return .percentile_disc;
-    if (std.ascii.eqlIgnoreCase(name, "mode")) return .mode;
-    if (std.ascii.eqlIgnoreCase(name, "array_agg")) return .array_agg;
-    if (std.ascii.eqlIgnoreCase(name, "string_agg")) return .string_agg;
-    if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
-    if (std.ascii.eqlIgnoreCase(name, "bool_and")) return .bool_and;
-    return null;
-}
-
-pub fn aggregateOpName(op: db_mod.types.RelationalRowsAggregateOp) []const u8 {
-    return switch (op) {
-        .count => "count",
-        .sum => "sum",
-        .min => "min",
-        .max => "max",
-        .avg => "avg",
-        .percentile_cont => "percentile_cont",
-        .percentile_disc => "percentile_disc",
-        .mode => "mode",
-        .array_agg => "array_agg",
-        .string_agg => "string_agg",
-        .bool_or => "bool_or",
-        .bool_and => "bool_and",
-    };
-}
-
-pub fn validateSqlAggregatePercentile(percentile: f64) !void {
-    if (!std.math.isFinite(percentile) or percentile < 0 or percentile > 1) return error.UnsupportedSqlShape;
 }
 
 pub fn parseStringAggDelimiterAlloc(
@@ -12712,7 +9057,7 @@ pub fn parseAggregatePercentileArgumentAlloc(
     tokens: []const Token,
     pos: *usize,
     params: []const value_mod.SqlValue,
-) !AggregatePercentileArgument {
+) !expr_aggregate.PercentileArgument {
     const value_json = if (parser.peekKeyword(tokens, pos.*, "array"))
         try value_mod.parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params)
     else
@@ -12725,39 +9070,15 @@ pub fn parseAggregatePercentileArgumentAlloc(
         const percentiles = try alloc.alloc(f64, parsed.value.array.items.len);
         errdefer alloc.free(percentiles);
         for (parsed.value.array.items, 0..) |item, i| {
-            const percentile = sqlJsonNumberAsF64(item) orelse return error.UnsupportedSqlShape;
-            try validateSqlAggregatePercentile(percentile);
+            const percentile = expr_aggregate.sqlJsonNumberAsF64(item) orelse return error.UnsupportedSqlShape;
+            try expr_aggregate.validatePercentile(percentile);
             percentiles[i] = percentile;
         }
         return .{ .percentiles = percentiles };
     }
-    const percentile = sqlJsonNumberAsF64(parsed.value) orelse return error.UnsupportedSqlShape;
-    try validateSqlAggregatePercentile(percentile);
+    const percentile = expr_aggregate.sqlJsonNumberAsF64(parsed.value) orelse return error.UnsupportedSqlShape;
+    try expr_aggregate.validatePercentile(percentile);
     return .{ .percentile = percentile };
-}
-
-pub fn aggregateAliasOrDefaultAlloc(
-    alloc: std.mem.Allocator,
-    explicit_alias: ?[]const u8,
-    op: db_mod.types.RelationalRowsAggregateOp,
-    field: ?[]const u8,
-) ![]const u8 {
-    if (explicit_alias) |alias| return try alloc.dupe(u8, alias);
-    if (field) |field_name| return try std.fmt.allocPrint(alloc, "{s}_{s}", .{ aggregateOpName(op), field_name });
-    return try alloc.dupe(u8, aggregateOpName(op));
-}
-
-pub fn isSqlPercentileAggregateOp(op: db_mod.types.RelationalRowsAggregateOp) bool {
-    return op == .percentile_cont or op == .percentile_disc;
-}
-
-pub fn sqlJsonNumberAsF64(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |number| @floatFromInt(number),
-        .float => |number| number,
-        .number_string => |number| std.fmt.parseFloat(f64, number) catch null,
-        else => null,
-    };
 }
 
 pub fn sqlLikePrefixLiteralAlloc(alloc: std.mem.Allocator, pattern: []const u8) !?[]const u8 {
@@ -12788,38 +9109,6 @@ pub fn sqlLikePrefixLiteralAlloc(alloc: std.mem.Allocator, pattern: []const u8) 
     }
     out.deinit(alloc);
     return null;
-}
-
-pub fn validateAggregateGroupBy(
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    group_by: []const []const u8,
-    parsed_group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-) !void {
-    if (!stringSlicesEqual(group_fields, group_by)) return error.UnsupportedSqlShape;
-    if (group_expressions.len != parsed_group_expressions.len) return error.UnsupportedSqlShape;
-    for (group_expressions, parsed_group_expressions) |selected, parsed| {
-        if (!expr_equal.relationalRowsExpressionEqual(selected.expression, parsed.expression)) return error.UnsupportedSqlShape;
-    }
-}
-
-pub fn aggregateOutputFieldIsUnique(
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field: []const u8,
-) bool {
-    var matches: usize = 0;
-    for (group_fields) |group_field| {
-        if (std.mem.eql(u8, group_field, field)) matches += 1;
-    }
-    for (group_expressions) |projection| {
-        if (std.mem.eql(u8, projection.output, field)) matches += 1;
-    }
-    for (aggregations) |aggregation| {
-        if (std.mem.eql(u8, aggregation.name, field)) matches += 1;
-    }
-    return matches == 1;
 }
 
 pub fn parseAggregateOutputFieldAlloc(
@@ -12855,7 +9144,7 @@ pub fn parseAggregateOutputFieldAlloc(
 
     const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     errdefer alloc.free(field);
-    if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
+    if (!expr_aggregate.outputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
     return field;
 }
 
@@ -12879,7 +9168,7 @@ pub fn parseAggregateSpecAlloc(
         break :blk op;
     } else null;
     const function_name = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
-    const token_op = aggregateOpForName(function_name.text) orelse return error.UnsupportedSqlShape;
+    const token_op = expr_aggregate.opForName(function_name.text) orelse return error.UnsupportedSqlShape;
     const op = if (generated_op) |op| blk: {
         if (op != token_op) return error.UnsupportedSqlShape;
         break :blk op;
@@ -12911,7 +9200,7 @@ pub fn parseAggregateSpecAlloc(
     var within_group_order_start: ?usize = null;
     var within_group_order_end: ?usize = null;
     var within_group_end: ?usize = null;
-    if (isSqlPercentileAggregateOp(op)) {
+    if (expr_aggregate.isPercentileOp(op)) {
         if (distinct) return error.UnsupportedSqlShape;
         const percentile_argument = try parseAggregatePercentileArgumentAlloc(alloc, tokens, pos, params);
         percentile = percentile_argument.percentile;
@@ -13029,7 +9318,7 @@ pub fn parseAggregateSpecAlloc(
             expression = parsed_expression;
             parsed_expression_transferred = true;
         } else {
-            const raw_field = try parseRowExpressionFieldOwnedAlloc(
+            const raw_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -13087,7 +9376,7 @@ pub fn parseAggregateSpecAlloc(
             null,
         );
     }
-    if (!isSqlPercentileAggregateOp(op) and op != .mode) {
+    if (!expr_aggregate.isPercentileOp(op) and op != .mode) {
         argument_end = pos.*;
         try parser.expectToken(tokens, pos, .rparen);
     }
@@ -13114,7 +9403,7 @@ pub fn parseAggregateSpecAlloc(
         generated_filter_expression,
     );
     var filter_transferred = false;
-    errdefer if (!filter_transferred) freeAggregateFilter(alloc, filter);
+    errdefer if (!filter_transferred) expr_aggregate.freeFilter(alloc, filter);
     const filter_end = if (filter_start != null) pos.* else null;
     const filter_predicate_end = if (filter_start != null) pos.* - 1 else null;
     try validateGeneratedAggregateFunctionForSpec(
@@ -13135,7 +9424,7 @@ pub fn parseAggregateSpecAlloc(
     );
     const explicit_alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
     defer if (explicit_alias) |alias| alloc.free(alias);
-    const name = try aggregateAliasOrDefaultAlloc(alloc, explicit_alias, op, field);
+    const name = try expr_aggregate.aliasOrDefaultAlloc(alloc, explicit_alias, op, field);
     var name_transferred = false;
     errdefer if (!name_transferred) alloc.free(name);
     field_transferred = true;
@@ -13153,7 +9442,7 @@ pub fn parseAggregateSpecAlloc(
         .distinct_max_items = if (distinct) db_mod.types.default_relational_rows_aggregate_distinct_max_items else 0,
         .percentile = percentile,
         .percentiles = percentiles,
-        .percentile_max_items = if (isSqlPercentileAggregateOp(op)) db_mod.types.default_relational_rows_percentile_max_items else 0,
+        .percentile_max_items = if (expr_aggregate.isPercentileOp(op)) db_mod.types.default_relational_rows_percentile_max_items else 0,
         .percentile_order = percentile_order,
         .array_max_items = if (op == .array_agg or op == .string_agg) db_mod.types.default_relational_rows_array_agg_max_items else 0,
         .array_order_by = try array_order_by.toOwnedSlice(alloc),
@@ -13185,7 +9474,7 @@ pub fn parseAggregateInputExpressionAlloc(
     options: AggregateInputExpressionParserOptions,
 ) !db_mod.types.RelationalRowsExpression {
     if (peekAggregateExpressionInput(tokens, pos.*)) {
-        return try parseRowExpressionAlloc(
+        return try expr_row_parse.parseRowExpressionAlloc(
             alloc,
             tokens,
             pos,
@@ -13196,7 +9485,7 @@ pub fn parseAggregateInputExpressionAlloc(
         );
     }
 
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -13220,7 +9509,7 @@ pub fn parseAggregateInputExpressionAlloc(
     if (column.field_type != .numeric) return error.InvalidSqlCatalog;
     if (expr_operator.peekArithmeticOperator(tokens, pos.*) == null) return error.UnsupportedSqlShape;
     field_transferred = true;
-    return try parseArithmeticExpressionRestAlloc(
+    return try expr_row_parse.parseArithmeticExpressionRestAlloc(
         alloc,
         tokens,
         pos,
@@ -13229,490 +9518,6 @@ pub fn parseAggregateInputExpressionAlloc(
         options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
         options.arithmetic_hooks,
     );
-}
-
-pub fn aggregateOutputColumnExists(columns: []const runtime_schema.RelationalColumn, name: []const u8) bool {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.name, name)) return true;
-    }
-    return false;
-}
-
-pub fn windowOutputFieldByOrdinalAlloc(
-    alloc: std.mem.Allocator,
-    select: plan_mod.WindowSelectList,
-    ordinal: u32,
-) ![]const u8 {
-    if (ordinal == 0) return error.UnsupportedSqlShape;
-    const index: usize = @intCast(ordinal - 1);
-    if (index >= select.outputs.len) return error.UnsupportedSqlShape;
-    const output = select.outputs[index];
-    return switch (output.kind) {
-        .field => try alloc.dupe(u8, select.fields[output.index]),
-        .window => try alloc.dupe(u8, select.windows[output.index].output),
-    };
-}
-
-pub fn windowOutputColumnsAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    type_context: expr_type.RowExpressionTypeContext,
-    select: plan_mod.WindowSelectList,
-) ![]runtime_schema.RelationalColumn {
-    const total = select.fields.len + select.windows.len;
-    if (total == 0) return &.{};
-    const out = try alloc.alloc(runtime_schema.RelationalColumn, total);
-    var initialized: usize = 0;
-    errdefer {
-        ddl_plan.clearDdlRelationalColumns(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (select.fields) |field| {
-        if (aggregateOutputColumnExists(out[0..initialized], field)) return error.UnsupportedSqlShape;
-        const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
-        out[initialized] = try projectedSourceColumnAlloc(alloc, field, column);
-        initialized += 1;
-    }
-    for (select.windows) |window| {
-        if (aggregateOutputColumnExists(out[0..initialized], window.output)) return error.UnsupportedSqlShape;
-        const value_type = if (window.value_expression) |expression| try type_context.rowExpressionOutputType(expression) else null;
-        out[initialized] = try projectedColumnAlloc(alloc, window.output, try expr_type.windowOutputType(window.function, value_type), null, true);
-        initialized += 1;
-    }
-    return out;
-}
-
-pub fn aggregateOutputColumnForFieldAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    type_context: expr_type.RowExpressionTypeContext,
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    field: []const u8,
-) !runtime_schema.RelationalColumn {
-    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
-    defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
-    for (output_columns) |column| {
-        if (std.mem.eql(u8, column.name, field)) return try projectedSourceColumnAlloc(alloc, column.name, column);
-    }
-    return error.UnsupportedSqlShape;
-}
-
-pub fn aggregateOutputColumnsAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    type_context: expr_type.RowExpressionTypeContext,
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-) ![]runtime_schema.RelationalColumn {
-    const total = group_fields.len + group_expressions.len + aggregations.len;
-    if (total == 0) return &.{};
-    const out = try alloc.alloc(runtime_schema.RelationalColumn, total);
-    var initialized: usize = 0;
-    errdefer {
-        ddl_plan.clearDdlRelationalColumns(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (group_fields) |field| {
-        if (aggregateOutputColumnExists(out[0..initialized], field)) return error.UnsupportedSqlShape;
-        const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
-        out[initialized] = try projectedSourceColumnAlloc(alloc, field, column);
-        initialized += 1;
-    }
-    for (group_expressions) |projection| {
-        if (aggregateOutputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
-        out[initialized] = try projectedColumnAlloc(alloc, projection.output, try type_context.rowExpressionOutputType(projection.expression), null, true);
-        initialized += 1;
-    }
-    for (aggregations) |aggregation| {
-        if (aggregateOutputColumnExists(out[0..initialized], aggregation.name)) return error.UnsupportedSqlShape;
-        const input_type = if (aggregation.field != null or aggregation.expression != null)
-            try aggregateInputType(schema, type_context, aggregation)
-        else
-            null;
-        const projected_type = try aggregateOutputProjectedType(aggregation, input_type);
-        out[initialized] = try projectedColumnAlloc(alloc, aggregation.name, projected_type.field_type, projected_type.array_item_type, false);
-        initialized += 1;
-    }
-    return out;
-}
-
-pub fn aggregateInputType(
-    schema: runtime_schema.TableSchema,
-    type_context: expr_type.RowExpressionTypeContext,
-    aggregation: db_mod.types.RelationalRowsAggregateSpec,
-) !runtime_schema.AntflyType {
-    if (aggregation.field) |field| {
-        const column = binder.relationalColumnForField(schema, field, null) orelse return error.InvalidSqlCatalog;
-        return column.field_type;
-    }
-    if (aggregation.expression) |expression| {
-        return try type_context.rowExpressionOutputType(expression);
-    }
-    return error.UnsupportedSqlShape;
-}
-
-pub fn selectListOutputCount(
-    fields: []const []const u8,
-    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
-    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
-    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
-    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    output: []const u8,
-) usize {
-    var count: usize = 0;
-    for (fields) |field| {
-        if (std.mem.eql(u8, field, output)) count += 1;
-    }
-    for (json_extract) |projection| {
-        if (std.mem.eql(u8, projection.output, output)) count += 1;
-    }
-    for (array_length) |projection| {
-        if (std.mem.eql(u8, projection.output, output)) count += 1;
-    }
-    for (coalesce) |projection| {
-        if (std.mem.eql(u8, projection.output, output)) count += 1;
-    }
-    for (field_aliases) |projection| {
-        if (std.mem.eql(u8, projection.output, output)) count += 1;
-    }
-    for (expressions) |projection| {
-        if (std.mem.eql(u8, projection.output, output)) count += 1;
-    }
-    return count;
-}
-
-fn selectProjectionOutputCollision(
-    schema: runtime_schema.TableSchema,
-    select_all: bool,
-    fields: []const []const u8,
-    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
-    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
-    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
-    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    output: []const u8,
-) bool {
-    if (select_all and binder.relationalColumnForField(schema, output, null) != null) return true;
-    return selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, output) > 0;
-}
-
-fn allocateDisambiguatedSelectProjectionOutputAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    select_all: bool,
-    fields: []const []const u8,
-    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
-    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
-    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
-    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    output: []const u8,
-) !?[]const u8 {
-    if (!select_all) return null;
-    if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, output)) return null;
-
-    var suffix: usize = 2;
-    while (true) : (suffix += 1) {
-        const candidate = try std.fmt.allocPrint(alloc, "{s}_{d}", .{ output, suffix });
-        if (!selectProjectionOutputCollision(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, candidate)) return candidate;
-        alloc.free(candidate);
-    }
-}
-
-fn disambiguateSelectProjectionOutputIfNeededAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    select_all: bool,
-    fields: []const []const u8,
-    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
-    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
-    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
-    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    output: *[]const u8,
-) !void {
-    const disambiguated = try allocateDisambiguatedSelectProjectionOutputAlloc(
-        alloc,
-        schema,
-        select_all,
-        fields,
-        json_extract,
-        array_length,
-        coalesce,
-        field_aliases,
-        expressions,
-        output.*,
-    ) orelse return;
-    alloc.free(output.*);
-    output.* = disambiguated;
-}
-
-pub fn validateSelectListOutputs(
-    schema: runtime_schema.TableSchema,
-    select_all: bool,
-    fields: []const []const u8,
-    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
-    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
-    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
-    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-) !void {
-    if (!select_all) {
-        for (fields) |field| {
-            if (field.len == 0) return error.UnsupportedSqlShape;
-            if (selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, field) > 1) return error.UnsupportedSqlShape;
-        }
-    }
-    for (json_extract) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (array_length) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (coalesce) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (field_aliases) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-    for (expressions) |projection| try validateSelectProjectionOutput(schema, select_all, fields, json_extract, array_length, coalesce, field_aliases, expressions, projection.output);
-}
-
-fn validateSelectProjectionOutput(
-    schema: runtime_schema.TableSchema,
-    select_all: bool,
-    fields: []const []const u8,
-    json_extract: []const db_mod.types.RelationalRowsJsonExtractProjection,
-    array_length: []const db_mod.types.RelationalRowsArrayLengthProjection,
-    coalesce: []const db_mod.types.RelationalRowsCoalesceProjection,
-    field_aliases: []const db_mod.types.RelationalRowsFieldAliasProjection,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    output: []const u8,
-) !void {
-    if (output.len == 0) return error.UnsupportedSqlShape;
-    if (select_all and binder.relationalColumnForField(schema, output, null) != null) return error.UnsupportedSqlShape;
-    if (selectListOutputCount(fields, json_extract, array_length, coalesce, field_aliases, expressions, output) > 1) return error.UnsupportedSqlShape;
-}
-
-pub fn selectOutputColumnsAlloc(
-    alloc: std.mem.Allocator,
-    type_context: expr_type.RowExpressionTypeContext,
-    select: plan_mod.SelectList,
-) ![]runtime_schema.RelationalColumn {
-    if (select.select_all) return error.UnsupportedSqlShape;
-    if (select.outputs.len == 0) return &.{};
-    const out = try alloc.alloc(runtime_schema.RelationalColumn, select.outputs.len);
-    var initialized: usize = 0;
-    errdefer {
-        ddl_plan.clearDdlRelationalColumns(alloc, out[0..initialized]);
-        alloc.free(out);
-    }
-    for (select.outputs) |output| {
-        const column = try selectOutputColumnAlloc(alloc, type_context, select, output);
-        var column_transferred = false;
-        errdefer if (!column_transferred) ddl_plan.freeDdlRelationalColumn(alloc, column);
-        if (aggregateOutputColumnExists(out[0..initialized], column.name)) return error.UnsupportedSqlShape;
-        out[initialized] = column;
-        column_transferred = true;
-        initialized += 1;
-    }
-    return out;
-}
-
-pub fn loweredSelectOutputColumnsAlloc(
-    alloc: std.mem.Allocator,
-    type_context: expr_type.RowExpressionTypeContext,
-    lowered: plan_mod.LoweredSelect,
-) ![]runtime_schema.RelationalColumn {
-    return try selectOutputColumnsAlloc(alloc, type_context, .{
-        .fields = lowered.query.select,
-        .json_extract = lowered.query.json_extract,
-        .array_length = lowered.query.array_length,
-        .coalesce = lowered.query.coalesce,
-        .field_aliases = lowered.query.field_aliases,
-        .expressions = lowered.query.expressions,
-        .outputs = lowered.select_outputs,
-        .select_all = lowered.query.select_all,
-    });
-}
-
-fn selectOutputColumnAlloc(
-    alloc: std.mem.Allocator,
-    type_context: expr_type.RowExpressionTypeContext,
-    select: plan_mod.SelectList,
-    output: ast.SelectOutputRef,
-) !runtime_schema.RelationalColumn {
-    return switch (output.kind) {
-        .field => blk: {
-            if (output.index >= select.fields.len) return error.UnsupportedSqlShape;
-            const field = select.fields[output.index];
-            const source = binder.relationalColumnForField(type_context.schema, field, null) orelse return error.InvalidSqlCatalog;
-            break :blk try projectedSourceColumnAlloc(alloc, field, source);
-        },
-        .json_extract => blk: {
-            if (output.index >= select.json_extract.len) return error.UnsupportedSqlShape;
-            const projection = select.json_extract[output.index];
-            const field_type: runtime_schema.AntflyType = if (projection.as_text) .keyword else .json;
-            break :blk try projectedColumnAlloc(alloc, projection.output, field_type, null, true);
-        },
-        .array_length => blk: {
-            if (output.index >= select.array_length.len) return error.UnsupportedSqlShape;
-            const projection = select.array_length[output.index];
-            break :blk try projectedColumnAlloc(alloc, projection.output, .numeric, null, true);
-        },
-        .coalesce => blk: {
-            if (output.index >= select.coalesce.len) return error.UnsupportedSqlShape;
-            const projection = select.coalesce[output.index];
-            const field_type = try coalesceOutputType(alloc, type_context.schema.relational_columns, projection);
-            break :blk try projectedColumnAlloc(alloc, projection.output, field_type.field_type, field_type.array_item_type, true);
-        },
-        .field_alias => blk: {
-            if (output.index >= select.field_aliases.len) return error.UnsupportedSqlShape;
-            const projection = select.field_aliases[output.index];
-            const source = binder.relationalColumnForField(type_context.schema, projection.field, null) orelse return error.InvalidSqlCatalog;
-            break :blk try projectedSourceColumnAlloc(alloc, projection.output, source);
-        },
-        .expression => blk: {
-            if (output.index >= select.expressions.len) return error.UnsupportedSqlShape;
-            const projection = select.expressions[output.index];
-            break :blk try projectedExpressionColumnAlloc(alloc, type_context, projection.output, projection.expression);
-        },
-    };
-}
-
-pub fn validateWindowSelectListOutputs(
-    fields: []const []const u8,
-    windows: []const db_mod.types.RelationalRowsWindowSpec,
-) !void {
-    for (fields, 0..) |field, i| {
-        for (fields[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, field, other)) return error.UnsupportedSqlShape;
-        }
-        for (windows) |window| {
-            if (std.mem.eql(u8, field, window.output)) return error.UnsupportedSqlShape;
-        }
-    }
-    for (windows, 0..) |window, i| {
-        for (windows[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, window.output, other.output)) return error.UnsupportedSqlShape;
-        }
-    }
-}
-
-pub fn validateAggregateSelectListOutputs(
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-) !void {
-    for (group_fields, 0..) |field, i| {
-        for (group_fields[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, field, other)) return error.UnsupportedSqlShape;
-        }
-        for (group_expressions) |projection| {
-            if (std.mem.eql(u8, field, projection.output)) return error.UnsupportedSqlShape;
-        }
-        for (aggregations) |aggregation| {
-            if (std.mem.eql(u8, field, aggregation.name)) return error.UnsupportedSqlShape;
-        }
-    }
-    for (group_expressions, 0..) |projection, i| {
-        for (group_expressions[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, projection.output, other.output)) return error.UnsupportedSqlShape;
-        }
-        for (aggregations) |aggregation| {
-            if (std.mem.eql(u8, projection.output, aggregation.name)) return error.UnsupportedSqlShape;
-        }
-    }
-    for (aggregations, 0..) |aggregation, i| {
-        for (aggregations[i + 1 ..]) |other| {
-            if (std.mem.eql(u8, aggregation.name, other.name)) return error.UnsupportedSqlShape;
-        }
-    }
-}
-
-pub fn validateReturningProjectionOutputs(
-    schema: runtime_schema.TableSchema,
-    fields: []const []const u8,
-    expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-) !void {
-    const returning_all = fields.len == 1 and std.mem.eql(u8, fields[0], "*");
-    if (returning_all) {
-        for (expressions) |projection| {
-            if (projection.output.len == 0) return error.UnsupportedSqlShape;
-            if (binder.relationalColumnForReturningField(schema, projection.output) != null) return error.UnsupportedSqlShape;
-            if (returningExpressionOutputCount(expressions, projection.output) > 1) return error.UnsupportedSqlShape;
-        }
-        return;
-    }
-    for (fields) |field| {
-        if (field.len == 0 or std.mem.eql(u8, field, "*")) return error.UnsupportedSqlShape;
-        if (returningFieldOutputCount(fields, field) > 1) return error.UnsupportedSqlShape;
-        if (returningExpressionOutputCount(expressions, field) > 0) return error.UnsupportedSqlShape;
-    }
-    for (expressions) |projection| {
-        if (projection.output.len == 0) return error.UnsupportedSqlShape;
-        if (returningExpressionOutputCount(expressions, projection.output) > 1) return error.UnsupportedSqlShape;
-        if (returningFieldOutputCount(fields, projection.output) > 0) return error.UnsupportedSqlShape;
-    }
-}
-
-fn cloneReturningOutputColumnAlloc(
-    alloc: std.mem.Allocator,
-    output_name: []const u8,
-    source: runtime_schema.RelationalColumn,
-) !runtime_schema.RelationalColumn {
-    const name = try alloc.dupe(u8, output_name);
-    errdefer alloc.free(name);
-    const path = try alloc.dupe(u8, output_name);
-    errdefer alloc.free(path);
-    const collation = if (source.collation) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (collation) |value| alloc.free(value);
-    return .{
-        .name = name,
-        .path = path,
-        .field_type = source.field_type,
-        .array_item_type = source.array_item_type,
-        .nullable = source.nullable,
-        .collation = collation,
-    };
-}
-
-pub fn returningOutputColumnsAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    type_context: expr_type.RowExpressionTypeContext,
-    returning: plan_mod.ReturningProjection,
-) ![]const runtime_schema.RelationalColumn {
-    if (!returning.hasProjection()) return &.{};
-    const returning_all = returning.returnsAll();
-    const field_count = if (returning_all) schema.relational_columns.len else returning.fields.len;
-    const columns = try alloc.alloc(runtime_schema.RelationalColumn, field_count + returning.expressions.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (columns[0..initialized]) |column| {
-            alloc.free(column.name);
-            alloc.free(column.path);
-            if (column.collation) |collation| alloc.free(collation);
-        }
-        alloc.free(columns);
-    }
-
-    if (returning_all) {
-        for (schema.relational_columns) |source| {
-            columns[initialized] = try cloneReturningOutputColumnAlloc(alloc, source.name, source);
-            initialized += 1;
-        }
-    } else {
-        for (returning.fields) |field| {
-            const source = binder.relationalColumnForReturningField(schema, field) orelse return error.InvalidSqlCatalog;
-            columns[initialized] = try cloneReturningOutputColumnAlloc(alloc, field, source);
-            initialized += 1;
-        }
-    }
-
-    for (returning.expressions) |projection| {
-        const field_type = try type_context.rowExpressionOutputType(projection.expression);
-        const array_item_type = try type_context.rowExpressionOutputArrayItemType(projection.expression);
-        columns[initialized] = try projectedColumnAlloc(alloc, projection.output, field_type, array_item_type, true);
-        initialized += 1;
-    }
-    return columns;
 }
 
 pub fn parseReturningProjectionAlloc(
@@ -13755,7 +9560,7 @@ pub fn parseReturningProjectionAlloc(
         if (peekSimpleReturningField(tokens, pos.*)) {
             try validateGeneratedSimpleReturningExpression(tokens, if (generated_item) |item| item.expression else null);
             const context = options.context_hooks.get_context(options.context_hooks.ptr);
-            const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+            const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -13877,7 +9682,7 @@ pub fn parseReturningProjectionAlloc(
     errdefer if (fields_owned) strings.freeStringSlice(alloc, owned_fields);
     const owned_expressions = try expressions.toOwnedSlice(alloc);
     errdefer freeExpressionProjections(alloc, owned_expressions);
-    try validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
+    try expr_projection.validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
     fields_owned = false;
     return .{
         .fields = owned_fields,
@@ -13927,7 +9732,7 @@ pub fn parseJoinedMutationReturningProjectionAlloc(
         if (peekSimpleReturningField(tokens, pos.*)) {
             try validateGeneratedSimpleReturningExpression(tokens, if (generated_item) |item| item.expression else null);
             const context = options.select_context_hooks.get_context(options.select_context_hooks.ptr);
-            const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+            const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -14092,144 +9897,12 @@ pub fn parseJoinedMutationReturningProjectionAlloc(
     errdefer if (fields_owned) strings.freeStringSlice(alloc, owned_fields);
     const owned_expressions = try expressions.toOwnedSlice(alloc);
     errdefer freeExpressionProjections(alloc, owned_expressions);
-    try validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
+    try expr_projection.validateReturningProjectionOutputs(schema, owned_fields, owned_expressions);
     fields_owned = false;
     return .{
         .fields = owned_fields,
         .expressions = owned_expressions,
     };
-}
-
-pub fn returningFieldOutputCount(fields: []const []const u8, output: []const u8) usize {
-    var count: usize = 0;
-    for (fields) |field| {
-        if (std.mem.eql(u8, field, output)) count += 1;
-    }
-    return count;
-}
-
-pub fn returningExpressionOutputCount(expressions: []const db_mod.types.RelationalRowsExpressionProjection, output: []const u8) usize {
-    var count: usize = 0;
-    for (expressions) |projection| {
-        if (std.mem.eql(u8, projection.output, output)) count += 1;
-    }
-    return count;
-}
-
-pub fn jsonValueProjectedType(alloc: std.mem.Allocator, value_json: []const u8) !ProjectedColumnType {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    return switch (parsed.value) {
-        .string => .{ .field_type = .keyword },
-        .integer, .float => .{ .field_type = .numeric },
-        .bool => .{ .field_type = .boolean },
-        .array => .{ .field_type = .array, .array_item_type = .keyword },
-        .object => .{ .field_type = .json },
-        .null => error.UnsupportedSqlShape,
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-pub fn coalesceOutputType(
-    alloc: std.mem.Allocator,
-    columns: []const runtime_schema.RelationalColumn,
-    projection: db_mod.types.RelationalRowsCoalesceProjection,
-) !ProjectedColumnType {
-    for (projection.operands) |operand| {
-        switch (operand.kind) {
-            .field => {
-                const source = relationalColumnSliceField(columns, operand.field) orelse return error.InvalidSqlCatalog;
-                return .{ .field_type = source.field_type, .array_item_type = source.array_item_type };
-            },
-            .value => if (operand.value_json.len != 0) return try jsonValueProjectedType(alloc, operand.value_json),
-        }
-    }
-    return error.UnsupportedSqlShape;
-}
-
-fn relationalColumnSliceField(
-    columns: []const runtime_schema.RelationalColumn,
-    field: []const u8,
-) ?runtime_schema.RelationalColumn {
-    for (columns) |column| {
-        if (std.mem.eql(u8, column.name, field) or std.mem.eql(u8, column.path, field)) return column;
-    }
-    return null;
-}
-
-pub fn projectedColumnAlloc(
-    alloc: std.mem.Allocator,
-    name: []const u8,
-    field_type: runtime_schema.AntflyType,
-    array_item_type: ?runtime_schema.AntflyType,
-    nullable: bool,
-) !runtime_schema.RelationalColumn {
-    const owned_name = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_name);
-    const owned_path = try alloc.dupe(u8, name);
-    errdefer alloc.free(owned_path);
-    return .{
-        .name = owned_name,
-        .path = owned_path,
-        .field_type = field_type,
-        .array_item_type = array_item_type,
-        .nullable = nullable,
-    };
-}
-
-fn projectedExpressionColumnAlloc(
-    alloc: std.mem.Allocator,
-    type_context: expr_type.RowExpressionTypeContext,
-    output_name: []const u8,
-    expression: db_mod.types.RelationalRowsExpression,
-) !runtime_schema.RelationalColumn {
-    if (expression.kind == .field) {
-        if (binder.relationalColumnForField(type_context.schemaForRowExpressionField(expression), expression.field, null)) |source| {
-            return try projectedSourceColumnAlloc(alloc, output_name, source);
-        }
-        if (!type_context.defer_row_expression_field_validation) return error.InvalidSqlCatalog;
-    }
-    const field_type = try type_context.rowExpressionOutputType(expression);
-    const array_item_type = try type_context.rowExpressionOutputArrayItemType(expression);
-    return try projectedColumnAlloc(alloc, output_name, field_type, array_item_type, true);
-}
-
-fn projectedSourceColumnAlloc(
-    alloc: std.mem.Allocator,
-    output_name: []const u8,
-    source: runtime_schema.RelationalColumn,
-) !runtime_schema.RelationalColumn {
-    const owned_name = try alloc.dupe(u8, output_name);
-    errdefer alloc.free(owned_name);
-    const owned_path = try alloc.dupe(u8, output_name);
-    errdefer alloc.free(owned_path);
-    const collation = if (source.collation) |value| try alloc.dupe(u8, value) else null;
-    errdefer if (collation) |value| alloc.free(value);
-    return .{
-        .name = owned_name,
-        .path = owned_path,
-        .field_type = source.field_type,
-        .array_item_type = source.array_item_type,
-        .nullable = source.nullable,
-        .collation = collation,
-    };
-}
-
-pub fn aggregateOutputFieldByOrdinalAlloc(
-    alloc: std.mem.Allocator,
-    group_fields: []const []const u8,
-    group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
-    aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
-    ordinal: u32,
-) ![]const u8 {
-    if (ordinal == 0) return error.UnsupportedSqlShape;
-    var index: usize = @intCast(ordinal - 1);
-    if (index < group_fields.len) return try alloc.dupe(u8, group_fields[index]);
-    index -= group_fields.len;
-    if (index < group_expressions.len) return try alloc.dupe(u8, group_expressions[index].output);
-    index -= group_expressions.len;
-    if (index < aggregations.len) return try alloc.dupe(u8, aggregations[index].name);
-    return error.UnsupportedSqlShape;
 }
 
 pub fn aggregateJsonPathEqFilterCanStartAt(tokens: []const Token, pos: usize) bool {
@@ -14266,7 +9939,7 @@ pub fn canParseBareBooleanAggregateHavingExpression(
     group_expressions: []const db_mod.types.RelationalRowsExpressionProjection,
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
 ) !bool {
-    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    const output_columns = try expr_aggregate.outputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
     defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
@@ -14289,8 +9962,8 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
     const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, options.output_field_options);
     var field_transferred = false;
     errdefer if (!field_transferred) alloc.free(field);
-    if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
-    const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+    if (!expr_aggregate.outputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
+    const column = try expr_aggregate.outputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
     defer ddl_plan.freeDdlRelationalColumn(alloc, column);
 
     const op_token_index = pos.*;
@@ -14299,14 +9972,14 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         .allow_boolean_literal = true,
     })) |is_tail| blk: {
         switch (is_tail.kind) {
-            .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
+            .distinct_comparison, .null_test => try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail),
             .boolean_unknown => {
-                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 break :blk is_tail.op;
             },
             .boolean_literal => {
-                try validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(options.generated_expression_ast, tokens, op_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                 errdefer alloc.free(value_json);
@@ -14332,7 +10005,7 @@ pub fn parseAggregateOutputFieldExpressionConditionAlloc(
         }
         break :blk is_tail.op;
     } else try expr_operator.parseComparisonOp(tokens, pos);
-    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, op_token_index, op);
 
     const lhs: db_mod.types.RelationalRowsExpression = .{
         .kind = .field,
@@ -14377,7 +10050,7 @@ pub fn parseAggregateOutputExpressionConditionAlloc(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     options: AggregateOutputExpressionConditionParserOptions,
 ) !db_mod.types.RelationalRowsExpressionCondition {
-    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    const output_columns = try expr_aggregate.outputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
     defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
@@ -14395,7 +10068,7 @@ pub fn parseAggregateOutputExpressionConditionAlloc(
     );
     var condition_transferred = false;
     errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-    try validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, operator_token_index, condition.op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(options.generated_expression_ast, tokens, operator_token_index, condition.op);
     condition_transferred = true;
     return condition;
 }
@@ -14411,7 +10084,7 @@ pub fn parseAggregateOutputOrderExpressionAlloc(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     options: OutputOrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
-    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    const output_columns = try expr_aggregate.outputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
     defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
@@ -14437,7 +10110,7 @@ pub fn parseWindowOutputOrderExpressionAlloc(
     select: plan_mod.WindowSelectList,
     options: OutputOrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
-    const output_columns = try windowOutputColumnsAlloc(alloc, schema, type_context, select);
+    const output_columns = try expr_window.outputColumnsAlloc(alloc, schema, type_context, select);
     defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const window_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
@@ -14491,7 +10164,7 @@ pub fn parseBareBooleanAggregateHavingExpression(
     aggregations: []const db_mod.types.RelationalRowsAggregateSpec,
     options: BareBooleanAggregateHavingExpressionParserOptions,
 ) !void {
-    const output_columns = try aggregateOutputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
+    const output_columns = try expr_aggregate.outputColumnsAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations);
     defer ddl_plan.freeDdlRelationalColumns(alloc, output_columns);
     const aggregate_schema: runtime_schema.TableSchema = .{
         .storage_mode = .relational,
@@ -14543,12 +10216,12 @@ pub fn parseAggregateHavingBooleanIsNotGroups(
         return false;
     }
 
-    const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+    const column = try expr_aggregate.outputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
     defer ddl_plan.freeDdlRelationalColumn(alloc, column);
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
     const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
-    try validateGeneratedBooleanIsPredicateExpression(options.generated_expression_ast, tokens, operator_token_index, expected_kind);
-    try appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
+    try expr_generated_validate.validateGeneratedBooleanIsPredicateExpression(options.generated_expression_ast, tokens, operator_token_index, expected_kind);
+    try expr_condition.appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
     return true;
 }
 
@@ -14564,7 +10237,7 @@ pub fn parseAggregateFilterBooleanIsNotGroupsAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     const saved_pos = pos.*;
-    const parsed_field = parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -14606,8 +10279,8 @@ pub fn parseAggregateFilterBooleanIsNotGroupsAlloc(
     const column = binder.relationalColumnForField(schema, field, .boolean) orelse return error.InvalidSqlCatalog;
     const value = (try value_mod.parseSqlBooleanIsValue(tokens, pos, column)) orelse return error.UnsupportedSqlShape;
     const expected_kind: generated_parser.GeneratedSqlExpressionKind = if (value) .is_not_true else .is_not_false;
-    try validateGeneratedBooleanIsPredicateExpression(generated_expression_ast, tokens, operator_token_index, expected_kind);
-    try appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
+    try expr_generated_validate.validateGeneratedBooleanIsPredicateExpression(generated_expression_ast, tokens, operator_token_index, expected_kind);
+    try expr_condition.appendBooleanIsNotExpressionGroups(alloc, groups, field, value);
     return true;
 }
 
@@ -14627,7 +10300,7 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
-        try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
+        try expr_condition.appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
     const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
@@ -14677,7 +10350,7 @@ pub fn parseAggregateFilterConditionAlternativesAlloc(
     const condition = try select_set.expressionConditionFromOwnedRelationalCheckAlloc(alloc, predicate);
     var condition_transferred = false;
     errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-    try appendExpressionConditionGroup(alloc, alternatives, condition);
+    try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
     condition_transferred = true;
 }
 
@@ -14728,7 +10401,7 @@ pub fn parseAggregateFilterNotGroupAlloc(
             realtime_ns,
             generated_expression_ast,
         );
-        try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+        try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
         if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
@@ -14783,7 +10456,7 @@ pub fn parseAggregateFilterOrGroupsAlloc(
                 realtime_ns,
                 generated_expression_ast,
             );
-            try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+            try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
             freeExpressionPredicateGroups(alloc, alternatives.items);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
         }
@@ -14862,10 +10535,10 @@ pub fn parseAggregateFilterAlloc(
     type_context: expr_type.RowExpressionTypeContext,
     expression_hooks: ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: ExpressionWhereConditionsParserOptions,
-    fixed_binary_hooks: FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     realtime_ns: u64,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !AggregateFilter {
+) !expr_aggregate.Filter {
     if (!parser.matchKeyword(tokens, pos, "filter")) return .{};
     try parser.expectToken(tokens, pos, .lparen);
     try parser.expectKeyword(tokens, pos, "where");
@@ -14974,10 +10647,10 @@ pub fn parseAggregateFilterAlloc(
                 );
             } else if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
                 saw_boolean_constant = true;
-                if (!enabled) try appendBooleanConstantExpressionCondition(alloc, &expressions, false);
+                if (!enabled) try expr_condition.appendBooleanConstantExpressionCondition(alloc, &expressions, false);
             } else if (stringToArrayPredicateIsContainment(tokens, pos.*)) {
                 const operator_token_index = stringToArrayContainmentOperatorTokenIndex(tokens, pos.*) orelse return error.UnsupportedSqlShape;
-                try validateGeneratedSingleOperatorPredicateIdentity(try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast), .contains, tokens, operator_token_index);
+                try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast), .contains, tokens, operator_token_index);
                 const predicate = try parseExpressionArrayContainsPredicateAlloc(
                     alloc,
                     tokens,
@@ -15062,7 +10735,7 @@ pub fn parseAggregateHavingConditionAlternativesAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
-        try appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
+        try expr_condition.appendBooleanConstantExpressionGroup(alloc, alternatives, enabled);
         return;
     }
     const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
@@ -15136,7 +10809,7 @@ pub fn parseAggregateHavingNotGroupAlloc(
             expression_options,
             generated_expression_ast,
         );
-        try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+        try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
         if (!parser.matchKeyword(tokens, pos, "and")) break;
     }
@@ -15189,7 +10862,7 @@ pub fn parseAggregateHavingOrGroupsAlloc(
                 expression_options,
                 generated_expression_ast,
             );
-            try andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+            try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
             freeExpressionPredicateGroups(alloc, alternatives.items);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
         }
@@ -15238,7 +10911,7 @@ pub fn parseAggregateHavingAlloc(
             const generated_condition_expression = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
             try parseAggregateHavingNotGroupAlloc(alloc, tokens, pos, schema, type_context, not_groups, group_fields, group_expressions, aggregations, field_condition_options, expression_condition_options, generated_condition_expression);
         } else if (value_mod.matchStandaloneSqlBooleanLiteral(tokens, pos)) |enabled| {
-            if (!enabled) try appendBooleanConstantExpressionCondition(alloc, expressions, false);
+            if (!enabled) try expr_condition.appendBooleanConstantExpressionCondition(alloc, expressions, false);
         } else if (peekAggregateHavingExpression(tokens, pos.*)) {
             var expression_options_with_generated = expression_condition_options;
             expression_options_with_generated.generated_expression_ast = try generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
@@ -15252,8 +10925,8 @@ pub fn parseAggregateHavingAlloc(
             const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, output_field_options);
             var field_transferred = false;
             errdefer if (!field_transferred) alloc.free(field);
-            if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
-            const column = try aggregateOutputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
+            if (!expr_aggregate.outputFieldIsUnique(group_fields, group_expressions, aggregations, field)) return error.UnsupportedSqlShape;
+            const column = try expr_aggregate.outputColumnForFieldAlloc(alloc, schema, type_context, group_fields, group_expressions, aggregations, field);
             defer ddl_plan.freeDdlRelationalColumn(alloc, column);
             const op_token_index = pos.*;
             const op: runtime_schema.RelationalCheckOp = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{
@@ -15261,14 +10934,14 @@ pub fn parseAggregateHavingAlloc(
                 .allow_boolean_literal = true,
             })) |is_tail| blk: {
                 switch (is_tail.kind) {
-                    .distinct_comparison, .null_test => try validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail),
+                    .distinct_comparison, .null_test => try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail),
                     .boolean_unknown => {
-                        try validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail);
+                        try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail);
                         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                         break :blk is_tail.op;
                     },
                     .boolean_literal => {
-                        try validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail);
+                        try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_condition_expression, tokens, op_token_index, is_tail);
                         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                         const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                         var value_transferred = false;
@@ -15287,7 +10960,7 @@ pub fn parseAggregateHavingAlloc(
                 }
                 break :blk is_tail.op;
             } else try expr_operator.parseComparisonOp(tokens, pos);
-            try validateGeneratedRelationalPredicateExpression(generated_condition_expression, tokens, op_token_index, op);
+            try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_condition_expression, tokens, op_token_index, op);
             const value_json = switch (op) {
                 .is_null, .is_not_null => null,
                 else => try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params),
@@ -15452,7 +11125,7 @@ pub fn parseAggregateGroupByAlloc(
     pos: *usize,
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     type_context: expr_type.RowExpressionTypeContext,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
@@ -15475,7 +11148,7 @@ pub fn parseAggregateGroupByAlloc(
             try appendAggregateGroupByOrdinal(alloc, group_by, group_expressions, select, ordinal);
         } else if (peekStandaloneAggregateGroupIdentifier(tokens, pos.*)) {
             try validateGeneratedSimpleGroupExpression(tokens, generated_expression);
-            const raw_field = try parseRowExpressionFieldOwnedAlloc(
+            const raw_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -15549,13 +11222,13 @@ pub fn parseAggregateOrderByAlloc(
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
-            break :blk db_mod.types.RelationalRowsQueryOrder{ .field = try aggregateOutputFieldByOrdinalAlloc(alloc, group_fields, group_expressions, aggregations, ordinal) };
+            break :blk db_mod.types.RelationalRowsQueryOrder{ .field = try expr_aggregate.outputFieldByOrdinalAlloc(alloc, group_fields, group_expressions, aggregations, ordinal) };
         } else if (peekAggregateOutputOrderExpression(tokens, pos.*)) blk: {
             break :blk try parseAggregateOutputOrderExpressionAlloc(alloc, tokens, pos, schema, type_context, group_fields, group_expressions, aggregations, item_order_expression_options);
         } else blk: {
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
             const field = try parseAggregateOutputFieldAlloc(alloc, tokens, pos, group_fields, group_expressions, aggregations, field_options);
-            if (!aggregateOutputFieldIsUnique(group_fields, group_expressions, aggregations, field)) {
+            if (!expr_aggregate.outputFieldIsUnique(group_fields, group_expressions, aggregations, field)) {
                 alloc.free(field);
                 return error.UnsupportedSqlShape;
             }
@@ -15595,8 +11268,8 @@ pub fn parseWindowOutputOrderByAlloc(
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
-            const field = try windowOutputFieldByOrdinalAlloc(alloc, select, ordinal);
-            if (!windowOutputFieldIsUnique(select.fields, select.windows, field)) {
+            const field = try expr_window.outputFieldByOrdinalAlloc(alloc, select, ordinal);
+            if (!expr_window.outputFieldIsUnique(select.fields, select.windows, field)) {
                 alloc.free(field);
                 return error.UnsupportedSqlShape;
             }
@@ -15606,7 +11279,7 @@ pub fn parseWindowOutputOrderByAlloc(
         } else blk: {
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
             const field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
-            if (!windowOutputFieldIsUnique(select.fields, select.windows, field)) {
+            if (!expr_window.outputFieldIsUnique(select.fields, select.windows, field)) {
                 alloc.free(field);
                 return error.UnsupportedSqlShape;
             }
@@ -15702,14 +11375,6 @@ pub fn parseTargetOrderByAlloc(
     }
 }
 
-pub fn expressionOrderCount(order_by: []const db_mod.types.RelationalRowsQueryOrder) usize {
-    var count: usize = 0;
-    for (order_by) |order| {
-        if (order.expression != null) count += 1;
-    }
-    return count;
-}
-
 pub fn validateDistinctOnOrder(
     distinct_on: []const db_mod.types.RelationalRowsExpression,
     order_by: []const db_mod.types.RelationalRowsQueryOrder,
@@ -15730,9 +11395,9 @@ pub fn parseOptionalDistinctOnAlloc(
     tokens: []const Token,
     pos: *usize,
     type_context: expr_type.RowExpressionTypeContext,
-    row_expression_hooks: RowExpressionParserHooks,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    variadic_hooks: VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
 ) ![]const db_mod.types.RelationalRowsExpression {
     if (!parser.matchKeyword(tokens, pos, "distinct")) return &.{};
     if (!parser.matchKeyword(tokens, pos, "on")) return error.UnsupportedSqlShape;
@@ -15743,7 +11408,7 @@ pub fn parseOptionalDistinctOnAlloc(
         expressions.deinit(alloc);
     }
     while (true) {
-        const expression = try parseRowExpressionAlloc(
+        const expression = try expr_row_parse.parseRowExpressionAlloc(
             alloc,
             tokens,
             pos,
@@ -15874,44 +11539,6 @@ pub fn cloneOrderForNullTestAlloc(
     };
 }
 
-pub fn selectOutputOrderByRefAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    select: plan_mod.SelectList,
-    output: ast.SelectOutputRef,
-) !db_mod.types.RelationalRowsQueryOrder {
-    return switch (output.kind) {
-        .field => try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, select.fields[output.index])),
-        .json_extract => .{ .expression = try expressionFromJsonExtractProjectionAlloc(alloc, select.json_extract[output.index]) },
-        .array_length => .{ .expression = try expressionFromArrayLengthProjectionAlloc(alloc, select.array_length[output.index]) },
-        .coalesce => .{ .expression = try expressionFromCoalesceProjectionAlloc(alloc, select.coalesce[output.index]) },
-        .field_alias => try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, select.field_aliases[output.index].field)),
-        .expression => blk: {
-            const expression = select.expressions[output.index].expression;
-            if (expression.kind == .field) break :blk try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, expression.field));
-            break :blk .{ .expression = try cloneExpressionAlloc(alloc, expression) };
-        },
-    };
-}
-
-pub fn selectOutputOrderByOrdinalAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    select: plan_mod.SelectList,
-    ordinal: u32,
-) !db_mod.types.RelationalRowsQueryOrder {
-    if (ordinal == 0) return error.UnsupportedSqlShape;
-    var index: usize = @intCast(ordinal - 1);
-    if (select.select_all) {
-        if (index < schema.relational_columns.len) {
-            return try orderForOwnedOutputFieldAlloc(alloc, schema, try alloc.dupe(u8, schema.relational_columns[index].name));
-        }
-        index -= schema.relational_columns.len;
-    }
-    if (index >= select.outputs.len) return error.UnsupportedSqlShape;
-    return try selectOutputOrderByRefAlloc(alloc, schema, select, select.outputs[index]);
-}
-
 fn aggregateSpecNameCollision(
     name: []const u8,
     group_fields: []const []const u8,
@@ -16001,7 +11628,7 @@ pub fn parseAggregateSelectListAlloc(
     pos: *usize,
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     type_context: expr_type.RowExpressionTypeContext,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
@@ -16123,7 +11750,7 @@ pub fn parseAggregateSelectListAlloc(
         }
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
-    try validateAggregateSelectListOutputs(group_fields.items, group_expressions.items, aggregations.items);
+    try expr_aggregate.validateSelectListOutputs(group_fields.items, group_expressions.items, aggregations.items);
 
     const owned_group_fields = try group_fields.toOwnedSlice(alloc);
     var group_fields_transferred = false;
@@ -16156,27 +11783,6 @@ pub fn parseAggregateSelectListAlloc(
     };
 }
 
-pub fn parseSelectOutputOrderByNameMaybeAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: *usize,
-    schema: runtime_schema.TableSchema,
-    select: plan_mod.SelectList,
-) !?db_mod.types.RelationalRowsQueryOrder {
-    if (!parser.peekKind(tokens, pos.*, .identifier)) return null;
-    if (pos.* + 1 < tokens.len) {
-        switch (tokens[pos.* + 1].kind) {
-            .lparen, .arrow_json, .arrow_text, .path_arrow_json, .path_arrow_text, .plus, .minus, .star, .slash, .percent, .pipe_concat => return null,
-            else => {},
-        }
-    }
-
-    const name = tokens[pos.*].text;
-    const output = (try plan_mod.selectOutputByName(name, select)) orelse return null;
-    pos.* += 1;
-    return try selectOutputOrderByRefAlloc(alloc, schema, select, output);
-}
-
 pub fn parseOrderByAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -16207,7 +11813,7 @@ pub fn parseOrderByWithExpressionHooksAlloc(
     pos: *usize,
     order_by: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder),
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
@@ -16270,8 +11876,8 @@ pub fn parseSelectOutputOrderByAlloc(
         var order = if (parser.matchToken(tokens, pos, .number)) |token| blk: {
             try validateGeneratedSimpleOrderExpression(tokens, generated_expression);
             const ordinal = std.fmt.parseInt(u32, token.text, 10) catch return error.UnsupportedSqlShape;
-            break :blk try selectOutputOrderByOrdinalAlloc(alloc, options.schema, select, ordinal);
-        } else if (try parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, options.schema, select)) |named_order| blk: {
+            break :blk try expr_projection.selectOutputOrderByOrdinalAlloc(alloc, options.schema, select, ordinal);
+        } else if (try expr_projection.parseSelectOutputOrderByNameMaybeAlloc(alloc, tokens, pos, options.schema, select)) |named_order| blk: {
             const order_candidate = named_order;
             var order_candidate_transferred = false;
             errdefer if (!order_candidate_transferred) {
@@ -16306,195 +11912,6 @@ pub fn parseSelectOutputOrderByAlloc(
         order_transferred = true;
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
-}
-
-pub fn expressionFromJsonExtractProjectionAlloc(
-    alloc: std.mem.Allocator,
-    projection: db_mod.types.RelationalRowsJsonExtractProjection,
-) anyerror!db_mod.types.RelationalRowsExpression {
-    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var operands_transferred = false;
-    errdefer if (!operands_transferred) alloc.free(operands);
-    operands[0] = .{ .kind = .field, .field = try alloc.dupe(u8, projection.field) };
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operands[0]);
-    const path = try alloc.dupe(u8, projection.path);
-    var path_transferred = false;
-    errdefer if (!path_transferred) alloc.free(path);
-    operands_transferred = true;
-    operand_transferred = true;
-    path_transferred = true;
-    return .{
-        .kind = .json_extract,
-        .json_path = path,
-        .json_as_text = projection.as_text,
-        .operands = operands,
-    };
-}
-
-pub fn expressionFromArrayLengthProjectionAlloc(
-    alloc: std.mem.Allocator,
-    projection: db_mod.types.RelationalRowsArrayLengthProjection,
-) !db_mod.types.RelationalRowsExpression {
-    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
-    var operands_transferred = false;
-    errdefer if (!operands_transferred) alloc.free(operands);
-    operands[0] = .{ .kind = .field, .field = try alloc.dupe(u8, projection.field) };
-    var operand_transferred = false;
-    errdefer if (!operand_transferred) freeExpression(alloc, operands[0]);
-    operands_transferred = true;
-    operand_transferred = true;
-    return .{
-        .kind = .array_length,
-        .operands = operands,
-    };
-}
-
-pub fn expressionFromCoalesceProjectionAlloc(
-    alloc: std.mem.Allocator,
-    projection: db_mod.types.RelationalRowsCoalesceProjection,
-) !db_mod.types.RelationalRowsExpression {
-    var expression_projection = try plan_mod.expressionProjectionFromCoalesceAlloc(alloc, projection);
-    alloc.free(expression_projection.output);
-    expression_projection.output = "";
-    return expression_projection.expression;
-}
-
-pub fn aggregateFilterExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_expressions.len;
-    }
-    return count;
-}
-
-pub fn aggregateFilterExpressionArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_expression_array_contains.len;
-    }
-    return count;
-}
-
-pub fn aggregateFilterJsonAccessCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_json_contains.len +
-            aggregation.filter_json_path_eq.len +
-            aggregation.filter_json_path_exists.len;
-    }
-    return count;
-}
-
-pub fn aggregateFilterStructuredAccessCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_array_any.len +
-            aggregation.filter_array_contains.len +
-            aggregation.filter_array_eq.len +
-            aggregation.filter_in_predicates.len +
-            aggregation.filter_text_patterns.len;
-    }
-    return count;
-}
-
-pub fn aggregateFilterGroupCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        count += aggregation.filter_any.len + aggregation.filter_not.len;
-    }
-    return count;
-}
-
-pub fn aggregateInputExpressionCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (aggregation.expression != null) count += 1;
-    }
-    return count;
-}
-
-pub fn aggregateDescendingPercentileCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentile_order == .desc) count += 1;
-    }
-    return count;
-}
-
-pub fn aggregatePercentileArrayCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (isSqlPercentileAggregateOp(aggregation.op) and aggregation.percentiles.len > 0) count += 1;
-    }
-    return count;
-}
-
-pub fn aggregateModeCount(aggregations: []const db_mod.types.RelationalRowsAggregateSpec) usize {
-    var count: usize = 0;
-    for (aggregations) |aggregation| {
-        if (aggregation.op == .mode) count += 1;
-    }
-    return count;
-}
-
-pub fn windowFunctionRequiresOrder(function: db_mod.types.RelationalRowsWindowFunction) bool {
-    return switch (function) {
-        .count, .sum, .avg, .min, .max, .bool_or, .bool_and => false,
-        .row_number, .rank, .dense_rank, .percent_rank, .cume_dist, .ntile, .lag, .lead, .first_value, .last_value, .nth_value => true,
-    };
-}
-
-pub fn windowFunctionName(function: db_mod.types.RelationalRowsWindowFunction) []const u8 {
-    return switch (function) {
-        .row_number => "row_number",
-        .rank => "rank",
-        .dense_rank => "dense_rank",
-        .percent_rank => "percent_rank",
-        .cume_dist => "cume_dist",
-        .ntile => "ntile",
-        .lag => "lag",
-        .lead => "lead",
-        .first_value => "first_value",
-        .last_value => "last_value",
-        .nth_value => "nth_value",
-        .count => "count",
-        .sum => "sum",
-        .avg => "avg",
-        .min => "min",
-        .max => "max",
-        .bool_or => "bool_or",
-        .bool_and => "bool_and",
-    };
-}
-
-fn windowFunctionForName(name: []const u8) ?db_mod.types.RelationalRowsWindowFunction {
-    if (std.ascii.eqlIgnoreCase(name, "row_number")) return .row_number;
-    if (std.ascii.eqlIgnoreCase(name, "rank")) return .rank;
-    if (std.ascii.eqlIgnoreCase(name, "dense_rank")) return .dense_rank;
-    if (std.ascii.eqlIgnoreCase(name, "percent_rank")) return .percent_rank;
-    if (std.ascii.eqlIgnoreCase(name, "cume_dist")) return .cume_dist;
-    if (std.ascii.eqlIgnoreCase(name, "ntile")) return .ntile;
-    if (std.ascii.eqlIgnoreCase(name, "lag")) return .lag;
-    if (std.ascii.eqlIgnoreCase(name, "lead")) return .lead;
-    if (std.ascii.eqlIgnoreCase(name, "first_value")) return .first_value;
-    if (std.ascii.eqlIgnoreCase(name, "last_value")) return .last_value;
-    if (std.ascii.eqlIgnoreCase(name, "nth_value")) return .nth_value;
-    if (std.ascii.eqlIgnoreCase(name, "count")) return .count;
-    if (std.ascii.eqlIgnoreCase(name, "sum")) return .sum;
-    if (std.ascii.eqlIgnoreCase(name, "avg")) return .avg;
-    if (std.ascii.eqlIgnoreCase(name, "min")) return .min;
-    if (std.ascii.eqlIgnoreCase(name, "max")) return .max;
-    if (std.ascii.eqlIgnoreCase(name, "bool_or")) return .bool_or;
-    if (std.ascii.eqlIgnoreCase(name, "bool_and")) return .bool_and;
-    return null;
-}
-
-pub fn windowFunctionSupportsFilter(function: db_mod.types.RelationalRowsWindowFunction) bool {
-    return switch (function) {
-        .count, .sum, .avg, .min, .max, .bool_or, .bool_and => true,
-        else => false,
-    };
 }
 
 pub fn parseWindowFunction(
@@ -16549,7 +11966,7 @@ pub fn parseOptionalWindowFrame(
         .end = end.bound,
         .end_offset = end.offset,
     };
-    try validateWindowFrame(frame);
+    try expr_window.validateFrame(frame);
     return frame;
 }
 
@@ -16743,7 +12160,7 @@ pub fn parseWindowPartitionByAlloc(
         if (generated_item == null and generated_items != null) return error.UnsupportedSqlShape;
         const generated_expression = if (generated_item) |item| item.expression else null;
         try validateGeneratedSimpleGroupExpression(tokens, generated_expression);
-        const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+        const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
             alloc,
             tokens,
             pos,
@@ -16849,7 +12266,7 @@ pub fn parseWindowDefinitionAlloc(
         }
     }
     if (frame != null and order_by.items.len == 0) return error.UnsupportedSqlShape;
-    if (frame) |parsed_frame| try validateWindowFrameForOrder(options.schema, options.type_context, parsed_frame, order_by.items);
+    if (frame) |parsed_frame| try expr_window.validateFrameForOrder(options.schema, options.type_context, parsed_frame, order_by.items);
 
     const owned_partition_by = try partition_by.toOwnedSlice(alloc);
     var partition_transferred = false;
@@ -17104,10 +12521,10 @@ pub fn parseWindowSpecAlloc(
     const argument_start = pos.*;
     const value_expression: ?db_mod.types.RelationalRowsExpression = switch (function) {
         .row_number, .rank, .dense_rank, .percent_rank, .cume_dist, .ntile => null,
-        .lag, .lead, .first_value, .last_value, .nth_value => try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
-        .count => if (parser.matchToken(tokens, pos, .star) != null) null else try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
-        .sum, .avg, .min, .max => try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
-        .bool_or, .bool_and => try parseBooleanRowExpressionAlloc(alloc, tokens, pos, type_context, options.boolean_hooks),
+        .lag, .lead, .first_value, .last_value, .nth_value => try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
+        .count => if (parser.matchToken(tokens, pos, .star) != null) null else try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
+        .sum, .avg, .min, .max => try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks),
+        .bool_or, .bool_and => try expr_row_parse.parseBooleanRowExpressionAlloc(alloc, tokens, pos, type_context, options.boolean_hooks),
     };
     var value_expression_transferred = false;
     errdefer if (!value_expression_transferred) if (value_expression) |expression| freeExpression(alloc, expression);
@@ -17180,8 +12597,8 @@ pub fn parseWindowSpecAlloc(
         generated_filter_expression,
     );
     var filter_transferred = false;
-    errdefer if (!filter_transferred) freeAggregateFilter(alloc, filter);
-    if (!windowFunctionSupportsFilter(function) and !aggregateFilterIsEmpty(filter)) return error.UnsupportedSqlShape;
+    errdefer if (!filter_transferred) expr_aggregate.freeFilter(alloc, filter);
+    if (!expr_window.functionSupportsFilter(function) and !expr_aggregate.filterIsEmpty(filter)) return error.UnsupportedSqlShape;
     try parser.expectKeyword(tokens, pos, "over");
     const over_start = pos.* - 1;
     var generated_window_definition_options = window_definition_options;
@@ -17197,10 +12614,10 @@ pub fn parseWindowSpecAlloc(
     );
     var definition_transferred = false;
     errdefer if (!definition_transferred) plan_mod.freeNamedWindowDefinition(alloc, definition);
-    if (definition.order_by.len == 0 and windowFunctionRequiresOrder(function)) return error.UnsupportedSqlShape;
+    if (definition.order_by.len == 0 and expr_window.functionRequiresOrder(function)) return error.UnsupportedSqlShape;
     try validateGeneratedWindowOverClauseForSpec(tokens, function, over_start, pos.*, options.generated_expression_ast);
 
-    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, windowFunctionName(function));
+    const output = try grammar.parseProjectionOutputOwnedAlloc(alloc, tokens, pos, expr_window.functionName(function));
     var output_transferred = false;
     errdefer if (!output_transferred) alloc.free(output);
 
@@ -17231,210 +12648,6 @@ pub fn parseWindowSpecAlloc(
         .filter_expression_array_contains = filter.expression_array_contains,
         .filter_any = filter.any_groups,
         .filter_not = filter.not_groups,
-    };
-}
-
-pub fn aggregateOutputProjectedType(
-    aggregation: db_mod.types.RelationalRowsAggregateSpec,
-    input_type: ?runtime_schema.AntflyType,
-) !ProjectedColumnType {
-    return switch (aggregation.op) {
-        .array_agg => .{
-            .field_type = .array,
-            .array_item_type = input_type orelse return error.UnsupportedSqlShape,
-        },
-        .string_agg => .{ .field_type = .keyword },
-        .percentile_cont, .percentile_disc => .{
-            .field_type = if (aggregation.percentiles.len > 0) .array else .numeric,
-            .array_item_type = if (aggregation.percentiles.len > 0) .numeric else null,
-        },
-        .count, .sum, .avg => .{ .field_type = .numeric },
-        .min, .max, .mode => .{ .field_type = input_type orelse return error.UnsupportedSqlShape },
-        .bool_or, .bool_and => .{ .field_type = .boolean },
-    };
-}
-
-pub fn aggregateFilterIsEmpty(filter: AggregateFilter) bool {
-    return filter.predicates.len == 0 and
-        filter.array_any.len == 0 and
-        filter.array_contains.len == 0 and
-        filter.array_eq.len == 0 and
-        filter.in_predicates.len == 0 and
-        filter.json_contains.len == 0 and
-        filter.json_path_eq.len == 0 and
-        filter.json_path_exists.len == 0 and
-        filter.text_patterns.len == 0 and
-        filter.expressions.len == 0 and
-        filter.expression_array_contains.len == 0 and
-        filter.any_groups.len == 0 and
-        filter.not_groups.len == 0;
-}
-
-pub fn freeAggregateFilter(alloc: std.mem.Allocator, filter: AggregateFilter) void {
-    freeRelationalChecks(alloc, filter.predicates);
-    if (filter.predicates.len > 0) alloc.free(filter.predicates);
-    freeArrayAny(alloc, filter.array_any);
-    if (filter.array_any.len > 0) alloc.free(filter.array_any);
-    freeArrayContains(alloc, filter.array_contains);
-    if (filter.array_contains.len > 0) alloc.free(filter.array_contains);
-    freeArrayEq(alloc, filter.array_eq);
-    if (filter.array_eq.len > 0) alloc.free(filter.array_eq);
-    freeInPredicates(alloc, filter.in_predicates);
-    if (filter.in_predicates.len > 0) alloc.free(filter.in_predicates);
-    freeJsonContains(alloc, filter.json_contains);
-    if (filter.json_contains.len > 0) alloc.free(filter.json_contains);
-    freeJsonPathEq(alloc, filter.json_path_eq);
-    if (filter.json_path_eq.len > 0) alloc.free(filter.json_path_eq);
-    freeJsonPathExists(alloc, filter.json_path_exists);
-    if (filter.json_path_exists.len > 0) alloc.free(filter.json_path_exists);
-    freeTextPatterns(alloc, filter.text_patterns);
-    if (filter.text_patterns.len > 0) alloc.free(filter.text_patterns);
-    freeExpressionConditions(alloc, filter.expressions);
-    if (filter.expressions.len > 0) alloc.free(filter.expressions);
-    freeExpressionArrayContains(alloc, filter.expression_array_contains);
-    if (filter.expression_array_contains.len > 0) alloc.free(filter.expression_array_contains);
-    freeExpressionPredicateGroups(alloc, filter.any_groups);
-    if (filter.any_groups.len > 0) alloc.free(filter.any_groups);
-    freeExpressionPredicateGroups(alloc, filter.not_groups);
-    if (filter.not_groups.len > 0) alloc.free(filter.not_groups);
-}
-
-pub fn validateWindowFrame(frame: db_mod.types.RelationalRowsWindowFrame) !void {
-    try validateWindowFrameBoundOffset(frame.start, frame.start_offset);
-    try validateWindowFrameBoundOffset(frame.end, frame.end_offset);
-    if (frame.start == .unbounded_following or frame.end == .unbounded_preceding) return error.UnsupportedSqlShape;
-    if (windowFrameBoundOrdinal(frame.start, frame.start_offset) > windowFrameBoundOrdinal(frame.end, frame.end_offset)) return error.UnsupportedSqlShape;
-}
-
-pub fn validateWindowFrameForOrder(
-    schema: runtime_schema.TableSchema,
-    type_context: expr_type.RowExpressionTypeContext,
-    frame: db_mod.types.RelationalRowsWindowFrame,
-    order_by: []const db_mod.types.RelationalRowsQueryOrder,
-) !void {
-    if (frame.unit != .range) return;
-    if (frame.start != .offset_preceding and frame.start != .offset_following and frame.end != .offset_preceding and frame.end != .offset_following) return;
-    if (order_by.len == 0) return error.UnsupportedSqlShape;
-    const order = order_by[0];
-    if (order.null_test != null) return error.UnsupportedSqlShape;
-    if (order.expression) |expression| {
-        try type_context.validateNumericOrDatetimeRowExpression(expression);
-        return;
-    }
-    if (order.field.len == 0) return error.UnsupportedSqlShape;
-    const column = binder.relationalColumnForField(schema, order.field, null) orelse return error.InvalidSqlCatalog;
-    if (column.field_type != .numeric and column.field_type != .datetime) return error.UnsupportedSqlShape;
-}
-
-pub fn validateWindowFrameBoundOffset(
-    bound: db_mod.types.RelationalRowsWindowFrameBound,
-    offset: u32,
-) !void {
-    switch (bound) {
-        .offset_preceding, .offset_following => {
-            if (offset == 0) return error.UnsupportedSqlShape;
-        },
-        else => if (offset != 0) return error.UnsupportedSqlShape,
-    }
-}
-
-pub fn windowFrameBoundOrdinal(bound: db_mod.types.RelationalRowsWindowFrameBound, offset: u32) i64 {
-    return switch (bound) {
-        .unbounded_preceding => std.math.minInt(i64),
-        .offset_preceding => -@as(i64, @intCast(offset)),
-        .current_row => 0,
-        .offset_following => @as(i64, @intCast(offset)),
-        .unbounded_following => std.math.maxInt(i64),
-    };
-}
-
-pub fn windowValueExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        if (window.value_expression != null) count += 1;
-    }
-    return count;
-}
-
-pub fn windowDefaultCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        if (window.default_json.len > 0) count += 1;
-    }
-    return count;
-}
-
-pub fn windowFilterPredicateCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_predicates.len;
-    }
-    return count;
-}
-
-pub fn windowFilterExpressionCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_expressions.len;
-    }
-    return count;
-}
-
-pub fn windowFilterAccessCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_array_any.len +
-            window.filter_array_contains.len +
-            window.filter_array_eq.len +
-            window.filter_in_predicates.len +
-            window.filter_json_contains.len +
-            window.filter_json_path_eq.len +
-            window.filter_json_path_exists.len +
-            window.filter_text_patterns.len +
-            window.filter_expression_array_contains.len;
-    }
-    return count;
-}
-
-pub fn windowFilterGroupCount(windows: []const db_mod.types.RelationalRowsWindowSpec) usize {
-    var count: usize = 0;
-    for (windows) |window| {
-        count += window.filter_any.len + window.filter_not.len;
-    }
-    return count;
-}
-
-pub fn windowFrameSignature(windows: []const db_mod.types.RelationalRowsWindowSpec) u64 {
-    var signature: u64 = 0;
-    for (windows) |window| {
-        if (window.frame) |frame| {
-            signature = signature *% 131 +% 17;
-            signature = signature *% 131 +% windowFrameUnitCode(frame.unit);
-            signature = signature *% 131 +% windowFrameBoundCode(frame.start);
-            signature = signature *% 131 +% @as(u64, @intCast(frame.start_offset));
-            signature = signature *% 131 +% windowFrameBoundCode(frame.end);
-            signature = signature *% 131 +% @as(u64, @intCast(frame.end_offset));
-        } else {
-            signature = signature *% 131;
-        }
-    }
-    return signature;
-}
-
-fn windowFrameUnitCode(unit: db_mod.types.RelationalRowsWindowFrameUnit) u64 {
-    return switch (unit) {
-        .rows => 1,
-        .range => 2,
-    };
-}
-
-fn windowFrameBoundCode(bound: db_mod.types.RelationalRowsWindowFrameBound) u64 {
-    return switch (bound) {
-        .unbounded_preceding => 1,
-        .offset_preceding => 2,
-        .current_row => 3,
-        .offset_following => 4,
-        .unbounded_following => 5,
     };
 }
 
@@ -17470,9 +12683,9 @@ pub fn joinOutputColumnsAlloc(
         alloc.free(out);
     }
     for (select) |projection| {
-        if (aggregateOutputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
+        if (expr_projection.outputColumnExists(out[0..initialized], projection.output)) return error.UnsupportedSqlShape;
         const column = binder.relationalColumnForField(schema, projection.field, null) orelse return error.InvalidSqlCatalog;
-        out[initialized] = try projectedSourceColumnAlloc(alloc, projection.output, .{
+        out[initialized] = try expr_projection.projectedSourceColumnAlloc(alloc, projection.output, .{
             .name = column.name,
             .path = column.path,
             .field_type = column.field_type,
@@ -17516,598 +12729,6 @@ pub fn tailMentionsAnyQualifierBeforeClose(
         }
     }
     return false;
-}
-
-fn optionalStringEqual(lhs: ?[]const u8, rhs: ?[]const u8) bool {
-    if (lhs == null or rhs == null) return lhs == null and rhs == null;
-    return std.mem.eql(u8, lhs.?, rhs.?);
-}
-
-fn floatSlicesEqual(lhs: []const f64, rhs: []const f64) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |left, right| {
-        if (left != right) return false;
-    }
-    return true;
-}
-
-fn orderByEqual(lhs: []const db_mod.types.RelationalRowsQueryOrder, rhs: []const db_mod.types.RelationalRowsQueryOrder) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_order, rhs_order| {
-        if (lhs_order.direction != rhs_order.direction or
-            lhs_order.null_test != rhs_order.null_test or
-            !std.mem.eql(u8, lhs_order.field, rhs_order.field) or
-            !expr_equal.relationalRowsExpressionOptionalEqual(lhs_order.expression, rhs_order.expression))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn relationalChecksEqual(lhs: []const runtime_schema.RelationalCheck, rhs: []const runtime_schema.RelationalCheck) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_check, rhs_check| {
-        if (!std.mem.eql(u8, lhs_check.name, rhs_check.name) or
-            !std.mem.eql(u8, lhs_check.field, rhs_check.field) or
-            lhs_check.op != rhs_check.op or
-            !optionalStringEqual(lhs_check.value_json, rhs_check.value_json) or
-            !optionalStringEqual(lhs_check.collation, rhs_check.collation))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn structuredValuePredicatesEqual(lhs: anytype, rhs: @TypeOf(lhs)) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn inPredicatesEqual(
-    lhs: []const db_mod.types.RelationalRowsInPredicate,
-    rhs: []const db_mod.types.RelationalRowsInPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.values_json, rhs_predicate.values_json) or
-            lhs_predicate.negated != rhs_predicate.negated or
-            !optionalStringEqual(lhs_predicate.collation, rhs_predicate.collation))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn jsonContainsEqual(
-    lhs: []const db_mod.types.RelationalRowsJsonContainsPredicate,
-    rhs: []const db_mod.types.RelationalRowsJsonContainsPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn jsonPathEqEqual(
-    lhs: []const db_mod.types.RelationalRowsJsonPathEqPredicate,
-    rhs: []const db_mod.types.RelationalRowsJsonPathEqPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.path, rhs_predicate.path) or
-            !std.mem.eql(u8, lhs_predicate.value_json, rhs_predicate.value_json))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn jsonPathExistsEqual(
-    lhs: []const db_mod.types.RelationalRowsJsonPathExistsPredicate,
-    rhs: []const db_mod.types.RelationalRowsJsonPathExistsPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.path, rhs_predicate.path))
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-fn textPatternsEqual(
-    lhs: []const db_mod.types.RelationalRowsTextPatternPredicate,
-    rhs: []const db_mod.types.RelationalRowsTextPatternPredicate,
-) bool {
-    if (lhs.len != rhs.len) return false;
-    for (lhs, rhs) |lhs_predicate, rhs_predicate| {
-        if (!std.mem.eql(u8, lhs_predicate.field, rhs_predicate.field) or
-            !std.mem.eql(u8, lhs_predicate.pattern, rhs_predicate.pattern) or
-            lhs_predicate.case_insensitive != rhs_predicate.case_insensitive or
-            lhs_predicate.negated != rhs_predicate.negated)
-        {
-            return false;
-        }
-    }
-    return true;
-}
-
-pub fn selectorExpressionValueJsonAlloc(
-    alloc: std.mem.Allocator,
-    expression: db_mod.types.RelationalRowsExpression,
-    values: anytype,
-) ![]u8 {
-    return switch (expression.kind) {
-        .field => blk: {
-            if (expression.field_source != .row) return error.UnsupportedSqlShape;
-            const value_json = fieldValueJsonFor(values, expression.field) orelse return error.UnsupportedSqlShape;
-            break :blk try alloc.dupe(u8, value_json);
-        },
-        .value => try alloc.dupe(u8, expression.value_json),
-        .lower, .upper, .initcap, .md5 => blk: {
-            if (expression.operands.len != 1) return error.UnsupportedSqlShape;
-            const value_json = try selectorExpressionValueJsonAlloc(alloc, expression.operands[0], values);
-            defer alloc.free(value_json);
-            var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-            defer parsed.deinit();
-            switch (parsed.value) {
-                .null => break :blk try alloc.dupe(u8, "null"),
-                .string => |text| {
-                    const transformed = switch (expression.kind) {
-                        .lower => try std.ascii.allocLowerString(alloc, text),
-                        .upper => try std.ascii.allocUpperString(alloc, text),
-                        .initcap => try initcapTextAlloc(alloc, text),
-                        .md5 => try md5HexTextAlloc(alloc, text),
-                        else => unreachable,
-                    };
-                    defer alloc.free(transformed);
-                    break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = transformed }, .{});
-                },
-                else => return error.UnsupportedSqlShape,
-            }
-        },
-        .concat => blk: {
-            if (expression.operands.len == 0) return error.UnsupportedSqlShape;
-            var joined = std.ArrayListUnmanaged(u8).empty;
-            defer joined.deinit(alloc);
-            for (expression.operands) |operand| {
-                const value_json = try selectorExpressionValueJsonAlloc(alloc, operand, values);
-                defer alloc.free(value_json);
-                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-                defer parsed.deinit();
-                if (parsed.value == .null) continue;
-                const text = try selectorScalarJsonValueTextAlloc(alloc, parsed.value);
-                defer alloc.free(text);
-                try joined.appendSlice(alloc, text);
-            }
-            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
-        },
-        .concat_ws => blk: {
-            if (expression.operands.len < 2) return error.UnsupportedSqlShape;
-            const separator_json = try selectorExpressionValueJsonAlloc(alloc, expression.operands[0], values);
-            defer alloc.free(separator_json);
-            var parsed_separator = std.json.parseFromSlice(std.json.Value, alloc, separator_json, .{}) catch return error.UnsupportedSqlShape;
-            defer parsed_separator.deinit();
-            if (parsed_separator.value == .null) break :blk try alloc.dupe(u8, "null");
-            if (parsed_separator.value != .string) return error.UnsupportedSqlShape;
-
-            var joined = std.ArrayListUnmanaged(u8).empty;
-            defer joined.deinit(alloc);
-            var emitted = false;
-            for (expression.operands[1..]) |operand| {
-                const value_json = try selectorExpressionValueJsonAlloc(alloc, operand, values);
-                defer alloc.free(value_json);
-                var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
-                defer parsed.deinit();
-                if (parsed.value == .null) continue;
-                if (parsed.value != .string) return error.UnsupportedSqlShape;
-                if (emitted) try joined.appendSlice(alloc, parsed_separator.value.string);
-                try joined.appendSlice(alloc, parsed.value.string);
-                emitted = true;
-            }
-            break :blk try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = joined.items }, .{});
-        },
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-pub fn fieldValueJsonFor(values: anytype, field: []const u8) ?[]const u8 {
-    for (values) |value| {
-        if (std.mem.eql(u8, value.field, field)) return value.value_json;
-    }
-    return null;
-}
-
-pub fn fieldValuesContain(values: anytype, field: []const u8) bool {
-    return fieldValueJsonFor(values, field) != null;
-}
-
-pub fn fieldValuesMatchColumns(values: anytype, columns: []const []const u8) bool {
-    if (values.len != columns.len) return false;
-    for (columns) |column| {
-        if (fieldValueJsonFor(values, column) == null) return false;
-    }
-    return true;
-}
-
-pub fn writeFieldValuesObjectJson(
-    writer: *std.Io.Writer,
-    values: anytype,
-    columns: []const []const u8,
-) !void {
-    try writer.writeByte('{');
-    for (columns, 0..) |column, i| {
-        const value_json = fieldValueJsonFor(values, column) orelse return error.UnsupportedSqlShape;
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{f}:", .{std.json.fmt(column, .{})});
-        try writer.writeAll(value_json);
-    }
-    try writer.writeByte('}');
-}
-
-pub fn writeAllFieldValuesObjectJson(
-    writer: *std.Io.Writer,
-    values: anytype,
-) !void {
-    try writer.writeByte('{');
-    for (values, 0..) |value, i| {
-        if (i != 0) try writer.writeByte(',');
-        try writer.print("{f}:", .{std.json.fmt(value.field, .{})});
-        try writer.writeAll(value.value_json);
-    }
-    try writer.writeByte('}');
-}
-
-fn selectorScalarJsonValueTextAlloc(alloc: std.mem.Allocator, value: std.json.Value) ![]u8 {
-    return switch (value) {
-        .string => |text| try alloc.dupe(u8, text),
-        .integer => |integer| try std.fmt.allocPrint(alloc, "{d}", .{integer}),
-        .float => |float| try std.fmt.allocPrint(alloc, "{d}", .{float}),
-        .number_string => |text| try alloc.dupe(u8, text),
-        .bool => |enabled| try alloc.dupe(u8, if (enabled) "true" else "false"),
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-pub fn md5HexTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    const digest = std.crypto.hash.Md5.hashResult(text);
-    const out = try alloc.alloc(u8, 32);
-    for (digest, 0..) |byte, i| {
-        out[i * 2] = std.fmt.digitToChar(byte >> 4, .lower);
-        out[i * 2 + 1] = std.fmt.digitToChar(byte & 0x0f, .lower);
-    }
-    return out;
-}
-
-pub fn initcapTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    const out = try alloc.dupe(u8, text);
-    var at_word_start = true;
-    for (out) |*byte| {
-        if (std.ascii.isAlphanumeric(byte.*)) {
-            byte.* = if (at_word_start) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
-            at_word_start = false;
-        } else {
-            at_word_start = true;
-        }
-    }
-    return out;
-}
-
-pub fn selectorJsonValuesEqual(a: std.json.Value, b: std.json.Value) bool {
-    if (a == .null or b == .null) return a == .null and b == .null;
-    if (a == .bool and b == .bool) return a.bool == b.bool;
-    if (a == .string and b == .string) return std.mem.eql(u8, a.string, b.string);
-    if (selectorJsonNumber(a)) |left| {
-        if (selectorJsonNumber(b)) |right| return left == right;
-    }
-    return false;
-}
-
-pub const SelectorJsonOrder = enum { lt, eq, gt };
-
-pub fn selectorCompareJsonScalars(a: std.json.Value, b: std.json.Value) ?SelectorJsonOrder {
-    if (selectorJsonNumber(a)) |left| {
-        if (selectorJsonNumber(b)) |right| {
-            if (left < right) return .lt;
-            if (left > right) return .gt;
-            return .eq;
-        }
-    }
-    if (a == .string and b == .string) {
-        const order = std.mem.order(u8, a.string, b.string);
-        return switch (order) {
-            .lt => .lt,
-            .eq => .eq,
-            .gt => .gt,
-        };
-    }
-    return null;
-}
-
-fn selectorJsonNumber(value: std.json.Value) ?f64 {
-    return switch (value) {
-        .integer => |integer| @floatFromInt(integer),
-        .float => |float| float,
-        .number_string => |text| std.fmt.parseFloat(f64, text) catch null,
-        else => null,
-    };
-}
-
-pub fn windowOutputFieldIsUnique(
-    fields: []const []const u8,
-    windows: []const db_mod.types.RelationalRowsWindowSpec,
-    field: []const u8,
-) bool {
-    var matches: usize = 0;
-    for (fields) |candidate| {
-        if (std.mem.eql(u8, candidate, field)) matches += 1;
-    }
-    for (windows) |window| {
-        if (std.mem.eql(u8, window.output, field)) matches += 1;
-    }
-    return matches == 1;
-}
-
-pub fn findUniqueConstraintByColumnSet(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    values: anytype,
-) ?runtime_schema.UniqueConstraint {
-    for (schema.unique_constraints) |constraint| {
-        if (constraint.validation_state != .enforced) continue;
-        if (constraint.expressions.len != 0) continue;
-        if (uniqueConstraintMatchesPointSelector(alloc, constraint, values)) return constraint;
-    }
-    return null;
-}
-
-fn uniqueConstraintMatchesPointSelector(
-    alloc: std.mem.Allocator,
-    constraint: runtime_schema.UniqueConstraint,
-    values: anytype,
-) bool {
-    if (constraint.where.len == 0 and constraint.where_expressions.len == 0) return fieldValuesMatchColumns(values, constraint.columns);
-    for (constraint.columns) |column| {
-        if (fieldValueJsonFor(values, column) == null) return false;
-    }
-    for (values) |value| {
-        if (!uniqueConstraintAllowsPointSelectorField(constraint, value.field)) return false;
-    }
-    for (constraint.where) |predicate| {
-        if (!uniquePredicateProvenByFieldValues(predicate, values)) return false;
-    }
-    for (constraint.where_expressions) |condition| {
-        if (!(uniqueExpressionPredicateProvenByFieldValues(alloc, condition, values) catch false)) return false;
-    }
-    return true;
-}
-
-fn uniqueConstraintAllowsPointSelectorField(constraint: runtime_schema.UniqueConstraint, field: []const u8) bool {
-    if (stringSlicesContains(constraint.columns, field)) return true;
-    for (constraint.where) |predicate| {
-        if (std.mem.eql(u8, predicate.field, field)) return true;
-    }
-    for (constraint.where_expressions) |condition| {
-        if (expr_type.expressionConditionReferencesField(condition, field)) return true;
-    }
-    return false;
-}
-
-fn uniquePredicateProvenByFieldValues(predicate: runtime_schema.UniquePredicate, values: anytype) bool {
-    const value_json = fieldValueJsonFor(values, predicate.field) orelse return false;
-    return switch (predicate.op) {
-        .eq => if (predicate.value_json) |expected| std.mem.eql(u8, value_json, expected) else false,
-        .ne => if (predicate.value_json) |forbidden|
-            !std.mem.eql(u8, value_json, "null") and !std.mem.eql(u8, value_json, forbidden)
-        else
-            false,
-        .is_not_null => !std.mem.eql(u8, value_json, "null"),
-        .is_null => std.mem.eql(u8, value_json, "null"),
-    };
-}
-
-fn uniqueExpressionPredicateProvenByFieldValues(
-    alloc: std.mem.Allocator,
-    condition: db_mod.types.RelationalRowsExpressionCondition,
-    values: anytype,
-) !bool {
-    const lhs_json = try selectorExpressionValueJsonAlloc(alloc, condition.lhs, values);
-    defer alloc.free(lhs_json);
-    var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return false;
-    defer lhs.deinit();
-
-    return switch (condition.op) {
-        .is_null => lhs.value == .null,
-        .is_not_null => lhs.value != .null,
-        .eq, .ne, .is_distinct, .is_not_distinct => blk: {
-            if (condition.rhs.len != 1) return false;
-            const rhs_json = try selectorExpressionValueJsonAlloc(alloc, condition.rhs[0], values);
-            defer alloc.free(rhs_json);
-            var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return false;
-            defer rhs.deinit();
-            const equal = selectorJsonValuesEqual(lhs.value, rhs.value);
-            break :blk switch (condition.op) {
-                .eq, .is_not_distinct => equal,
-                .ne, .is_distinct => !equal,
-                else => unreachable,
-            };
-        },
-        .gt, .gte, .lt, .lte => blk: {
-            if (condition.rhs.len != 1) return false;
-            const rhs_json = try selectorExpressionValueJsonAlloc(alloc, condition.rhs[0], values);
-            defer alloc.free(rhs_json);
-            var rhs = std.json.parseFromSlice(std.json.Value, alloc, rhs_json, .{}) catch return false;
-            defer rhs.deinit();
-            const comparison = selectorCompareJsonScalars(lhs.value, rhs.value) orelse return false;
-            break :blk switch (condition.op) {
-                .gt => comparison == .gt,
-                .gte => comparison == .gt or comparison == .eq,
-                .lt => comparison == .lt,
-                .lte => comparison == .lt or comparison == .eq,
-                else => unreachable,
-            };
-        },
-    };
-}
-
-pub fn conflictInsertedValueForColumn(insert_columns: []const []const u8, row: []const []const u8, column: []const u8) ?[]const u8 {
-    if (insert_columns.len != row.len) return null;
-    for (insert_columns, row) |insert_column, value_json| {
-        if (std.mem.eql(u8, insert_column, column)) return value_json;
-    }
-    return null;
-}
-
-pub fn findUniqueConstraintByColumnsAndExpressions(
-    schema: runtime_schema.TableSchema,
-    columns: []const []const u8,
-    expressions: []const runtime_schema.UniqueExpression,
-    require_partial: bool,
-) ?runtime_schema.UniqueConstraint {
-    for (schema.unique_constraints) |constraint| {
-        if (constraint.validation_state != .enforced) continue;
-        if (require_partial and constraint.where.len == 0) continue;
-        if (!require_partial and constraint.where.len != 0) continue;
-        if (!stringSlicesEqual(constraint.columns, columns)) continue;
-        if (!expr_equal.uniqueExpressionsEqual(constraint.expressions, expressions)) continue;
-        return constraint;
-    }
-    return null;
-}
-
-pub fn findUniqueConstraintByColumnsExpressionsAndConflictWhere(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    columns: []const []const u8,
-    expressions: []const runtime_schema.UniqueExpression,
-    where_json: []const u8,
-    where_expressions: []const db_mod.types.RelationalRowsExpressionCondition,
-) !?runtime_schema.UniqueConstraint {
-    const has_field_where = where_json.len > 0;
-    const has_expression_where = where_expressions.len > 0;
-    if (has_field_where and has_expression_where) return error.UnsupportedSqlShape;
-
-    for (schema.unique_constraints) |constraint| {
-        if (constraint.validation_state != .enforced) continue;
-        if (!stringSlicesEqual(constraint.columns, columns)) continue;
-        if (!expr_equal.uniqueExpressionsEqual(constraint.expressions, expressions)) continue;
-
-        if (!has_field_where and !has_expression_where) {
-            if (constraint.where.len == 0 and constraint.where_expressions.len == 0) return constraint;
-            continue;
-        }
-
-        if (has_field_where) {
-            if (constraint.where.len != 0 and constraint.where_expressions.len == 0) {
-                validateUniqueWhereJsonMatches(alloc, where_json, constraint.where) catch continue;
-                return constraint;
-            }
-            if (constraint.where.len == 0 and constraint.where_expressions.len != 0) {
-                const predicates = try relationalChecksFromUniqueWhereJsonAlloc(alloc, where_json);
-                defer {
-                    freeRelationalChecks(alloc, predicates);
-                    if (predicates.len > 0) alloc.free(predicates);
-                }
-                if (try db_mod.DB.relationalRowsExpressionConditionsImpliedByEqualityPredicatesAlloc(
-                    alloc,
-                    predicates,
-                    constraint.where_expressions,
-                )) return constraint;
-            }
-            continue;
-        }
-
-        if (constraint.where.len != 0) continue;
-        if (expr_equal.relationalRowsExpressionConditionsEqual(constraint.where_expressions, where_expressions)) return constraint;
-    }
-    return null;
-}
-
-fn relationalChecksFromUniqueWhereJsonAlloc(
-    alloc: std.mem.Allocator,
-    where_json: []const u8,
-) ![]runtime_schema.RelationalCheck {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, where_json, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.UnsupportedSqlShape;
-    const all_value = parsed.value.object.get("all") orelse return error.UnsupportedSqlShape;
-    if (all_value != .array) return error.UnsupportedSqlShape;
-    const out = try alloc.alloc(runtime_schema.RelationalCheck, all_value.array.items.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |check| {
-            alloc.free(check.field);
-            if (check.value_json) |json| alloc.free(json);
-        }
-        alloc.free(out);
-    }
-    for (all_value.array.items) |item| {
-        if (item != .object) return error.UnsupportedSqlShape;
-        const field_value = item.object.get("field") orelse return error.UnsupportedSqlShape;
-        const op_value = item.object.get("op") orelse return error.UnsupportedSqlShape;
-        if (field_value != .string or op_value != .string) return error.UnsupportedSqlShape;
-        const op = expr_type.relationalCheckOpFromUniquePredicateToken(op_value.string) orelse return error.UnsupportedSqlShape;
-        const field = try alloc.dupe(u8, field_value.string);
-        var field_transferred = false;
-        errdefer if (!field_transferred) alloc.free(field);
-        const value_json: ?[]const u8 = if (item.object.get("value")) |value| try std.json.Stringify.valueAlloc(alloc, value, .{}) else null;
-        var value_transferred = false;
-        errdefer if (!value_transferred) if (value_json) |json| alloc.free(json);
-        out[initialized] = .{
-            .name = "",
-            .field = field,
-            .op = op,
-            .value_json = value_json,
-        };
-        initialized += 1;
-        field_transferred = true;
-        value_transferred = true;
-    }
-    return out;
-}
-
-fn validateUniqueWhereJsonMatches(alloc: std.mem.Allocator, where_json: []const u8, predicates: []const runtime_schema.UniquePredicate) !void {
-    var parsed = std.json.parseFromSlice(std.json.Value, alloc, where_json, .{}) catch return error.UnsupportedSqlShape;
-    defer parsed.deinit();
-    if (parsed.value != .object) return error.UnsupportedSqlShape;
-    const all_value = parsed.value.object.get("all") orelse return error.UnsupportedSqlShape;
-    if (all_value != .array or all_value.array.items.len != predicates.len) return error.UnsupportedSqlShape;
-    for (all_value.array.items, predicates) |item, predicate| {
-        if (item != .object) return error.UnsupportedSqlShape;
-        const field_value = item.object.get("field") orelse return error.UnsupportedSqlShape;
-        const op_value = item.object.get("op") orelse return error.UnsupportedSqlShape;
-        if (field_value != .string or !std.mem.eql(u8, field_value.string, predicate.field)) return error.UnsupportedSqlShape;
-        if (op_value != .string or !std.mem.eql(u8, op_value.string, expr_type.uniquePredicateOpToken(predicate.op))) return error.UnsupportedSqlShape;
-        const supplied_value = item.object.get("value");
-        if (predicate.value_json) |expected_json| {
-            const supplied = supplied_value orelse return error.UnsupportedSqlShape;
-            const supplied_json = try std.json.Stringify.valueAlloc(alloc, supplied, .{});
-            defer alloc.free(supplied_json);
-            if (!std.mem.eql(u8, supplied_json, expected_json)) return error.UnsupportedSqlShape;
-        } else if (supplied_value != null) {
-            return error.UnsupportedSqlShape;
-        }
-    }
 }
 
 const DirectGraphTableFunctionSource = struct {
@@ -19020,7 +13641,7 @@ pub fn parseAggregateAlloc(
     if (distinct_group_only) {
         if (group_by.items.len != 0 or having_predicates.items.len != 0 or having_expressions.items.len != 0 or having_any.items.len != 0 or having_not.items.len != 0) return error.UnsupportedSqlShape;
     } else {
-        try validateAggregateGroupBy(select.group_fields, select.group_expressions, group_by.items, group_expressions.items);
+        try expr_aggregate.validateGroupBy(select.group_fields, select.group_expressions, group_by.items, group_expressions.items);
     }
 
     const owned_group_by = if (distinct_group_only)
@@ -20093,7 +14714,7 @@ pub fn parseLateralSubqueryAlloc(
     if (generated_projection_end) |end| {
         if (pos.* != end) return error.UnsupportedSqlShape;
     }
-    const output_columns = try selectOutputColumnsAlloc(alloc, .{
+    const output_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{
         .alloc = alloc,
         .schema = right_parse_schema,
         .joined_source_schema = right_parse_schema,
@@ -20973,21 +15594,6 @@ fn stringSlicesIntersect(a: []const []const u8, b: []const []const u8) bool {
     return false;
 }
 
-pub fn validateExtensionFunctionArity(
-    kind: runtime_schema.RelationalRowsExpressionKind,
-    declared_arity: u16,
-    operand_count: usize,
-) !void {
-    if (operand_count != @as(usize, declared_arity)) return error.UnsupportedSqlShape;
-    switch (kind) {
-        .uuid_v4 => if (operand_count != 0) return error.UnsupportedSqlShape,
-        .lower, .upper, .md5 => if (operand_count != 1) return error.UnsupportedSqlShape,
-        .concat => if (operand_count == 0) return error.UnsupportedSqlShape,
-        .concat_ws => if (operand_count < 2) return error.UnsupportedSqlShape,
-        else => return error.UnsupportedSqlShape,
-    }
-}
-
 pub fn peekUnsupportedSimpleFieldTail(tokens: []const Token, pos: usize) bool {
     return parser.peekKind(tokens, pos, .lparen) or expr_operator.peekJsonExtractOperator(tokens, pos);
 }
@@ -21016,7 +15622,7 @@ pub fn parseGroupByAlloc(
     group_by: *std.ArrayListUnmanaged([]const u8),
 ) !void {
     while (true) {
-        const field = try parseRowExpressionFieldOwnedAlloc(
+        const field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
             alloc,
             tokens,
             pos,
@@ -21081,7 +15687,7 @@ pub fn parseCoalesceFieldOperandOrNullOwnedAlloc(
         return null;
     }
 
-    const field = try parseRowExpressionFieldOwnedAlloc(
+    const field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -21559,24 +16165,24 @@ pub fn parseOrderExpressionAlloc(
     tokens: []const Token,
     pos: *usize,
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
     type_context: expr_type.RowExpressionTypeContext,
     options: OrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
-    if (peekExtensionFunctionCall(tokens, pos.*, function_bindings.extension_functions) or
-        peekRoutineExpressionCall(tokens, pos.*, function_bindings.routine_expressions))
+    if (expr_row_parse.peekExtensionFunctionCall(tokens, pos.*, function_bindings.extension_functions) or
+        expr_row_parse.peekRoutineExpressionCall(tokens, pos.*, function_bindings.routine_expressions))
     {
         if (options.generated_expression_ast) |generated_expression| {
             if (generated_expression.kind != .function_call) return error.UnsupportedSqlShape;
         }
         const expression_start = pos.*;
-        const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
+        const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
-        try validateGeneratedRowExpressionIdentity(
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(
             tokens,
             expression_start,
             pos.*,
@@ -21593,7 +16199,7 @@ pub fn parseOrderExpressionAlloc(
     switch (start) {
         .parenthesized_null_test => {
             _ = parser.matchToken(tokens, pos, .lparen) orelse unreachable;
-            const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
+            const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
             defer alloc.free(parsed_field);
             const field = try binder.normalizeRowExpressionFieldAlloc(alloc, schema, parsed_field, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
             var field_transferred = false;
@@ -21615,10 +16221,10 @@ pub fn parseOrderExpressionAlloc(
         },
         .parenthesized => {
             const expression_start = pos.*;
-            const expression = try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, options.parenthesized);
+            const expression = try expr_row_parse.parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, options.parenthesized);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionIdentity(
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -21631,10 +16237,10 @@ pub fn parseOrderExpressionAlloc(
         },
         .pipe_concat => {
             const expression_start = pos.*;
-            const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
+            const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionIdentity(
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -21646,7 +16252,7 @@ pub fn parseOrderExpressionAlloc(
             return .{ .expression = expression };
         },
         .json_extract_field, .generated_or_concat, .general => {
-            if (try parseGeneratedFieldExpressionOrNullOwnedAlloc(
+            if (try expr_generated.parseGeneratedFieldExpressionOrNullOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -21656,10 +16262,10 @@ pub fn parseOrderExpressionAlloc(
                 defer_row_expression_field_validation,
             )) |field| return try orderForOwnedFieldAlloc(alloc, schema, field);
             const expression_start = pos.*;
-            const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
+            const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionIdentity(
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -21671,7 +16277,7 @@ pub fn parseOrderExpressionAlloc(
             return .{ .expression = expression };
         },
         .generated_or_case_fold => {
-            if (try parseGeneratedFieldExpressionOrNullOwnedAlloc(
+            if (try expr_generated.parseGeneratedFieldExpressionOrNullOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -21681,7 +16287,7 @@ pub fn parseOrderExpressionAlloc(
                 defer_row_expression_field_validation,
             )) |field| return try orderForOwnedFieldAlloc(alloc, schema, field);
             const expression_start = pos.*;
-            const expression = try parseCaseFoldRowExpressionAlloc(
+            const expression = try expr_row_parse.parseCaseFoldRowExpressionAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -21695,7 +16301,7 @@ pub fn parseOrderExpressionAlloc(
             );
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionIdentity(
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -21710,7 +16316,7 @@ pub fn parseOrderExpressionAlloc(
             return .{ .expression = expression };
         },
         .generated_or_md5 => {
-            if (try parseGeneratedFieldExpressionOrNullOwnedAlloc(
+            if (try expr_generated.parseGeneratedFieldExpressionOrNullOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -21720,10 +16326,10 @@ pub fn parseOrderExpressionAlloc(
                 defer_row_expression_field_validation,
             )) |field| return .{ .field = field };
             const expression_start = pos.*;
-            const expression = try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, options.fixed_unary);
+            const expression = try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, options.fixed_unary);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionIdentity(
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -21735,10 +16341,10 @@ pub fn parseOrderExpressionAlloc(
         },
         .unary_negative => {
             const expression_start = pos.*;
-            const expression = try parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
+            const expression = try expr_row_parse.parseRowExpressionAlloc(alloc, tokens, pos, type_context, options.row_expression_hooks, options.arithmetic_hooks, options.variadic_hooks);
             var expression_transferred = false;
             errdefer if (!expression_transferred) freeExpression(alloc, expression);
-            try validateGeneratedRowExpressionIdentity(
+            try expr_generated_validate.validateGeneratedRowExpressionIdentity(
                 tokens,
                 expression_start,
                 pos.*,
@@ -21752,7 +16358,7 @@ pub fn parseOrderExpressionAlloc(
         .field => {},
     }
 
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
     defer alloc.free(parsed_field);
     const field = try binder.normalizeRowExpressionFieldAlloc(alloc, schema, parsed_field, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
     var field_transferred = false;
@@ -21762,10 +16368,10 @@ pub fn parseOrderExpressionAlloc(
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         field_transferred = true;
         const expression_start = pos.* - 1;
-        const expression = try parseArithmeticExpressionRestAlloc(alloc, tokens, pos, .{ .kind = .field, .field = field }, 0, type_context, options.arithmetic_hooks);
+        const expression = try expr_row_parse.parseArithmeticExpressionRestAlloc(alloc, tokens, pos, .{ .kind = .field, .field = field }, 0, type_context, options.arithmetic_hooks);
         var expression_transferred = false;
         errdefer if (!expression_transferred) freeExpression(alloc, expression);
-        try validateGeneratedRowExpressionIdentity(
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(
             tokens,
             expression_start,
             pos.*,
@@ -21795,28 +16401,13 @@ fn orderForOwnedFieldAlloc(
     };
 }
 
-fn orderForOwnedOutputFieldAlloc(
-    alloc: std.mem.Allocator,
-    schema: runtime_schema.TableSchema,
-    field: []const u8,
-) !db_mod.types.RelationalRowsQueryOrder {
-    errdefer alloc.free(field);
-    const column = binder.relationalColumnForField(schema, field, null);
-    const collation = if (column) |resolved| if (resolved.collation) |value| try alloc.dupe(u8, value) else null else null;
-    errdefer if (collation) |value| alloc.free(value);
-    return .{
-        .field = field,
-        .collation = collation,
-    };
-}
-
 pub fn parseCaseExpressionConditionWithSelectSchemaAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     pos: *usize,
     schema: runtime_schema.TableSchema,
     context_hooks: SelectParserContextHooks,
-    hooks: CaseExpressionParserHooks,
+    hooks: expr_row_parse.CaseExpressionParserHooks,
 ) !db_mod.types.RelationalRowsExpressionCondition {
     return try parseCaseExpressionConditionWithSelectSchemaAndOperatorAlloc(
         alloc,
@@ -21835,7 +16426,7 @@ fn parseCaseExpressionConditionWithSelectSchemaAndOperatorAlloc(
     pos: *usize,
     schema: runtime_schema.TableSchema,
     context_hooks: SelectParserContextHooks,
-    hooks: CaseExpressionParserHooks,
+    hooks: expr_row_parse.CaseExpressionParserHooks,
     operator_token_index: ?*usize,
 ) !db_mod.types.RelationalRowsExpressionCondition {
     const previous_context = context_hooks.get_context(context_hooks.ptr);
@@ -21844,7 +16435,7 @@ fn parseCaseExpressionConditionWithSelectSchemaAndOperatorAlloc(
     context_hooks.set_context(context_hooks.ptr, context);
     defer context_hooks.set_context(context_hooks.ptr, previous_context);
 
-    return try parseCaseExpressionConditionWithOperatorAlloc(
+    return try expr_row_parse.parseCaseExpressionConditionWithOperatorAlloc(
         alloc,
         tokens,
         pos,
@@ -21885,7 +16476,7 @@ pub fn parseOrderExpressionWithSelectSchemaAlloc(
     tokens: []const Token,
     pos: *usize,
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     context_hooks: SelectParserContextHooks,
     hooks: OrderExpressionParserOptions,
 ) !db_mod.types.RelationalRowsQueryOrder {
@@ -21975,18 +16566,18 @@ pub const SelectItemStart = enum {
 
 pub const SelectFieldItemParserOptions = struct {
     type_context: expr_type.RowExpressionTypeContext,
-    arithmetic_hooks: ArithmeticExpressionParserHooks,
-    boolean_hooks: BooleanExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    boolean_hooks: expr_row_parse.BooleanExpressionParserHooks,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     require_exact_generated_expression: bool = false,
 };
 
 pub const SelectItemParserOptions = struct {
-    expression: ExpressionProjectionParserOptions,
-    json_value_expression: JsonValueExpressionProjectionParserOptions,
+    expression: expr_projection.ExpressionProjectionParserOptions,
+    json_value_expression: expr_projection.JsonValueExpressionProjectionParserOptions,
     select_field: SelectFieldItemParserOptions,
-    extension_function: ExtensionFunctionRowExpressionParserOptions,
-    routine_expression: RoutineExpressionRowExpressionParserOptions,
+    extension_function: expr_row_parse.ExtensionFunctionRowExpressionParserOptions,
+    routine_expression: expr_row_parse.RoutineExpressionRowExpressionParserOptions,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     require_exact_generated_expression: bool = false,
 };
@@ -21995,7 +16586,7 @@ pub const SelectListParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     output_schema: runtime_schema.TableSchema,
     select_item_schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     type_context: expr_type.RowExpressionTypeContext,
     field_expression_qualifiers: []const []const u8 = &.{},
     returning_expression_qualifiers: []const []const u8 = &.{},
@@ -22008,7 +16599,7 @@ pub const SelectListParserOptions = struct {
 
 pub const ReturningSelectItemParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     context_hooks: SelectParserContextHooks,
     select_item_options: SelectItemParserOptions,
@@ -22047,7 +16638,7 @@ pub fn parseReturningSelectItemWithQualifiersAlloc(
 
 pub const JoinedReturningSelectItemParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
@@ -22105,7 +16696,7 @@ pub const WindowSelectListParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     named_window_specs: []const plan_mod.NamedWindowSpec = &.{},
-    function_bindings: SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     order_expression_hooks: OrderExpressionParserOptions,
     window_definition_options: WindowDefinitionParserOptions,
     window_spec_options: WindowSpecParserOptions,
@@ -22175,10 +16766,10 @@ pub fn selectItemStartAt(tokens: []const Token, pos: usize) ?SelectItemStart {
     return null;
 }
 
-pub fn selectItemStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: SqlFunctionBindings) ?SelectItemStart {
+pub fn selectItemStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: expr_row_parse.SqlFunctionBindings) ?SelectItemStart {
     if (selectItemStartAt(tokens, pos)) |start| return start;
-    if (peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
-    if (peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
+    if (expr_row_parse.peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
+    if (expr_row_parse.peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
     return null;
 }
 
@@ -22279,7 +16870,7 @@ pub fn parseSelectListAlloc(
                     var output: []const u8 = try alloc.dupe(u8, field);
                     var output_transferred = false;
                     errdefer if (!output_transferred) alloc.free(output);
-                    try disambiguateSelectProjectionOutputIfNeededAlloc(
+                    try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(
                         alloc,
                         options.output_schema,
                         select_all,
@@ -22310,7 +16901,7 @@ pub fn parseSelectListAlloc(
                     alloc.free(projection.field);
                     alloc.free(projection.path);
                 };
-                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(
                     alloc,
                     options.output_schema,
                     select_all,
@@ -22334,7 +16925,7 @@ pub fn parseSelectListAlloc(
                     alloc.free(projection.output);
                     alloc.free(projection.field);
                 };
-                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(
                     alloc,
                     options.output_schema,
                     select_all,
@@ -22355,7 +16946,7 @@ pub fn parseSelectListAlloc(
                 var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) plan_mod.freeCoalesceProjection(alloc, projection);
-                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(
                     alloc,
                     options.output_schema,
                     select_all,
@@ -22381,7 +16972,7 @@ pub fn parseSelectListAlloc(
                 var projection = projection_value;
                 var projection_transferred = false;
                 errdefer if (!projection_transferred) freeExpressionProjection(alloc, projection);
-                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(
                     alloc,
                     options.output_schema,
                     select_all,
@@ -22405,7 +16996,7 @@ pub fn parseSelectListAlloc(
                     alloc.free(projection.output);
                     alloc.free(projection.field);
                 };
-                try disambiguateSelectProjectionOutputIfNeededAlloc(
+                try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(
                     alloc,
                     options.output_schema,
                     select_all,
@@ -22427,7 +17018,7 @@ pub fn parseSelectListAlloc(
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
 
-    try validateSelectListOutputs(
+    try expr_projection.validateSelectListOutputs(
         options.output_schema,
         select_all,
         fields.items,
@@ -22535,6 +17126,25 @@ fn windowSpecWithOutput(
     };
 }
 
+pub fn validateWindowSelectListOutputs(
+    fields: []const []const u8,
+    windows: []const db_mod.types.RelationalRowsWindowSpec,
+) !void {
+    for (fields, 0..) |field, i| {
+        for (fields[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, field, other)) return error.UnsupportedSqlShape;
+        }
+        for (windows) |window| {
+            if (std.mem.eql(u8, field, window.output)) return error.UnsupportedSqlShape;
+        }
+    }
+    for (windows, 0..) |window, i| {
+        for (windows[i + 1 ..]) |other| {
+            if (std.mem.eql(u8, window.output, other.output)) return error.UnsupportedSqlShape;
+        }
+    }
+}
+
 pub fn parseWindowSelectListAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -22615,7 +17225,7 @@ pub fn parseWindowSelectListAlloc(
             if (generated_expression) |expression| {
                 if (expression.kind != .token_range) return error.UnsupportedSqlShape;
             }
-            const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+            const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -22646,7 +17256,7 @@ pub fn parseWindowSelectListAlloc(
         if (parser.matchToken(tokens, pos, .comma) == null) break;
     }
 
-    try validateWindowSelectListOutputs(fields.items, windows.items);
+    try expr_window.validateSelectListOutputs(fields.items, windows.items);
 
     const owned_fields = try fields.toOwnedSlice(alloc);
     var fields_transferred = false;
@@ -22675,7 +17285,7 @@ pub fn parseSelectItemAlloc(
     pos: *usize,
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     defer_row_expression_field_validation: bool,
@@ -22690,67 +17300,67 @@ pub fn parseSelectItemAlloc(
     if (selectItemStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
         try validateGeneratedSelectItemStartForExpression(tokens, start, options.generated_expression_ast);
         switch (start) {
-            .pipe_concat => return .{ .expression = try parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
-            .unary_negative => return .{ .expression = try parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
-            .boolean_not => return .{ .expression = try parseBooleanExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
-            .extension_function => return .{ .expression = try parseExtensionFunctionExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.extension_functions, options.extension_function) },
-            .routine_expression => return .{ .expression = try parseRoutineExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.routine_expressions, options.routine_expression) },
-            .uuid_v4 => return .{ .expression = try parseUuidV4ExpressionProjectionAlloc(alloc, tokens, pos) },
-            .now => return .{ .expression = try parseNowExpressionProjectionAlloc(alloc, tokens, pos) },
-            .current_date => return .{ .expression = try parseCurrentDateExpressionProjectionAlloc(alloc, tokens, pos) },
-            .typed_datetime_literal => return .{ .expression = try parseTypedDatetimeLiteralExpressionProjectionAlloc(alloc, tokens, pos) },
-            .json_extract_path => return .{ .expression = try parseJsonExtractPathExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .json_typeof => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_typeof", options.expression) },
-            .json_array_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_array_length", options.expression) },
-            .json_build_object => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "jsonb_build_object", options.expression) },
-            .convert_from => return .{ .expression = try parseJsonValueExpressionProjectionAlloc(alloc, tokens, pos, "convert_from", options.json_value_expression) },
-            .to_jsonb => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "to_jsonb", options.expression) },
+            .pipe_concat => return .{ .expression = try expr_projection.parseTextExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .unary_negative => return .{ .expression = try expr_projection.parseGenericExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .boolean_not => return .{ .expression = try expr_projection.parseBooleanExpressionProjectionAlloc(alloc, tokens, pos, type_context, options.expression) },
+            .extension_function => return .{ .expression = try expr_projection.parseExtensionFunctionExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.extension_functions, options.extension_function) },
+            .routine_expression => return .{ .expression = try expr_projection.parseRoutineExpressionProjectionAlloc(alloc, tokens, pos, function_bindings.routine_expressions, options.routine_expression) },
+            .uuid_v4 => return .{ .expression = try expr_projection.parseUuidV4ExpressionProjectionAlloc(alloc, tokens, pos) },
+            .now => return .{ .expression = try expr_projection.parseNowExpressionProjectionAlloc(alloc, tokens, pos) },
+            .current_date => return .{ .expression = try expr_projection.parseCurrentDateExpressionProjectionAlloc(alloc, tokens, pos) },
+            .typed_datetime_literal => return .{ .expression = try expr_projection.parseTypedDatetimeLiteralExpressionProjectionAlloc(alloc, tokens, pos) },
+            .json_extract_path => return .{ .expression = try expr_projection.parseJsonExtractPathExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .json_typeof => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_typeof", options.expression) },
+            .json_array_length => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "json_array_length", options.expression) },
+            .json_build_object => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "jsonb_build_object", options.expression) },
+            .convert_from => return .{ .expression = try expr_projection.parseJsonValueExpressionProjectionAlloc(alloc, tokens, pos, "convert_from", options.json_value_expression) },
+            .to_jsonb => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "to_jsonb", options.expression) },
             .array_length => return .{ .expression = try parseArrayLengthExpressionProjectionAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source) },
-            .array_position => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .array_element_transform => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .array_to_string => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "array_to_string", options.expression) },
-            .string_to_array => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "string_to_array", options.expression) },
-            .coalesce => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "coalesce", options.expression) },
-            .case_fold => return .{ .expression = try parseDefaultOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .replace => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "replace", options.expression) },
-            .regexp_replace => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_replace", options.expression) },
-            .regexp_substr => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_substr", options.expression) },
-            .regexp_match => return .{ .expression = try parseRegexpMatchExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .regexp_count => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_count", options.expression) },
-            .regexp_instr => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_instr", options.expression) },
-            .translate => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "translate", options.expression) },
-            .concat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .nullif => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "nullif", options.expression) },
-            .text_length => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "length", options.expression) },
-            .ascii => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .chr => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .substring => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .overlay => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .split_part => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .strpos => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .left_right => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .pad => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .repeat => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .reverse => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .md5 => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .starts_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .ends_with => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .date_trunc => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .date_bin => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .date_part => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .abs => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "abs", options.expression) },
-            .round => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "round", options.expression) },
-            .trunc, .floor, .ceil, .sqrt, .sign => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .mod => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "mod", options.expression) },
-            .power => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "power", options.expression) },
-            .greatest_least => return .{ .expression = try parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
-            .case => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "case", options.expression) },
-            .cast => return .{ .expression = try parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "cast", options.expression) },
+            .array_position => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .array_element_transform => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .array_to_string => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "array_to_string", options.expression) },
+            .string_to_array => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "string_to_array", options.expression) },
+            .coalesce => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "coalesce", options.expression) },
+            .case_fold => return .{ .expression = try expr_projection.parseDefaultOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .replace => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "replace", options.expression) },
+            .regexp_replace => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_replace", options.expression) },
+            .regexp_substr => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_substr", options.expression) },
+            .regexp_match => return .{ .expression = try expr_projection.parseRegexpMatchExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .regexp_count => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_count", options.expression) },
+            .regexp_instr => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "regexp_instr", options.expression) },
+            .translate => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "translate", options.expression) },
+            .concat => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .nullif => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "nullif", options.expression) },
+            .text_length => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "length", options.expression) },
+            .ascii => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .chr => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .substring => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .overlay => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .split_part => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .strpos => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .left_right => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .pad => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .repeat => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .reverse => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .md5 => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .starts_with => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .ends_with => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .date_trunc => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .date_bin => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .date_part => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .abs => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "abs", options.expression) },
+            .round => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "round", options.expression) },
+            .trunc, .floor, .ceil, .sqrt, .sign => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .mod => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "mod", options.expression) },
+            .power => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "power", options.expression) },
+            .greatest_least => return .{ .expression = try expr_projection.parseOpOutputExpressionProjectionAlloc(alloc, tokens, pos, options.expression) },
+            .case => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "case", options.expression) },
+            .cast => return .{ .expression = try expr_projection.parseFixedOutputExpressionProjectionAlloc(alloc, tokens, pos, "cast", options.expression) },
             .parenthesized => {
                 if (peekParenthesizedNullTestProjection(tokens, pos.*)) {
-                    return .{ .expression = try parseParenthesizedNullTestExpressionProjectionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source, options.generated_expression_ast) };
+                    return .{ .expression = try expr_projection.parseParenthesizedNullTestExpressionProjectionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source, options.generated_expression_ast) };
                 }
-                return .{ .expression = try parseParenthesizedExpressionProjectionAlloc(alloc, tokens, pos, options.expression) };
+                return .{ .expression = try expr_projection.parseParenthesizedExpressionProjectionAlloc(alloc, tokens, pos, options.expression) };
             },
         }
     }
@@ -22785,7 +17395,7 @@ pub fn parseSelectFieldItemAlloc(
     options: SelectFieldItemParserOptions,
 ) !plan_mod.SelectItem {
     const expression_start = pos.*;
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
     defer alloc.free(parsed_field);
     const field = try binder.normalizeRowExpressionFieldAlloc(alloc, schema, parsed_field, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
     var field_owned = true;
@@ -22850,12 +17460,12 @@ pub fn parseSelectFieldItemAlloc(
     if (expr_operator.peekArithmeticOperator(tokens, pos.*)) |_| {
         if (column.field_type != .numeric and column.field_type != .datetime) return error.InvalidSqlCatalog;
         field_owned = false;
-        return .{ .expression = try parseArithmeticExpressionProjectionFromFieldAlloc(alloc, tokens, pos, expression_start, field, field_source, options.type_context, options.arithmetic_hooks, options.generated_expression_ast, options.require_exact_generated_expression) };
+        return .{ .expression = try expr_projection.parseArithmeticExpressionProjectionFromFieldAlloc(alloc, tokens, pos, expression_start, field, field_source, options.type_context, options.arithmetic_hooks, options.generated_expression_ast, options.require_exact_generated_expression) };
     }
     if (expr_operator.peekBooleanOperator(tokens, pos.*)) |_| {
         if (column.field_type != .boolean) return error.InvalidSqlCatalog;
         field_owned = false;
-        return .{ .expression = try parseBooleanExpressionProjectionFromFieldAlloc(alloc, tokens, pos, expression_start, field, field_source, options.type_context, options.boolean_hooks, options.generated_expression_ast, options.require_exact_generated_expression) };
+        return .{ .expression = try expr_projection.parseBooleanExpressionProjectionFromFieldAlloc(alloc, tokens, pos, expression_start, field, field_source, options.type_context, options.boolean_hooks, options.generated_expression_ast, options.require_exact_generated_expression) };
     }
     const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
     var alias_transferred = false;
@@ -22881,23 +17491,23 @@ pub fn parseSelectFieldItemAlloc(
 }
 
 pub const RowExpressionOperandParserOptions = struct {
-    extension_function: ExtensionFunctionRowExpressionParserOptions,
-    routine_expression: RoutineExpressionRowExpressionParserOptions,
-    parenthesized: ParenthesizedRowExpressionParserOptions,
-    cast: CastRowExpressionParserOptions,
-    case_expression: CaseExpressionParserHooks,
-    case_fold: CaseFoldRowExpressionParserOptions,
-    coalesce: CoalesceRowExpressionParserOptions,
-    fixed_unary: FixedUnaryRowExpressionParserOptions,
-    fixed_binary: FixedBinaryRowExpressionParserOptions,
-    variadic: VariadicRowExpressionParserHooks,
-    json_build_object: JsonBuildObjectRowExpressionParserOptions,
+    extension_function: expr_row_parse.ExtensionFunctionRowExpressionParserOptions,
+    routine_expression: expr_row_parse.RoutineExpressionRowExpressionParserOptions,
+    parenthesized: expr_row_parse.ParenthesizedRowExpressionParserOptions,
+    cast: expr_row_parse.CastRowExpressionParserOptions,
+    case_expression: expr_row_parse.CaseExpressionParserHooks,
+    case_fold: expr_row_parse.CaseFoldRowExpressionParserOptions,
+    coalesce: expr_row_parse.CoalesceRowExpressionParserOptions,
+    fixed_unary: expr_row_parse.FixedUnaryRowExpressionParserOptions,
+    fixed_binary: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    variadic: expr_row_parse.VariadicRowExpressionParserHooks,
+    json_build_object: expr_row_parse.JsonBuildObjectRowExpressionParserOptions,
 };
 
-pub fn rowExpressionOperandStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: SqlFunctionBindings) ?expr_parse.RowExpressionOperandStart {
+pub fn rowExpressionOperandStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: expr_row_parse.SqlFunctionBindings) ?expr_parse.RowExpressionOperandStart {
     if (expr_parse.rowExpressionOperandStartAt(tokens, pos)) |start| return start;
-    if (peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
-    if (peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
+    if (expr_row_parse.peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
+    if (expr_row_parse.peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
     return null;
 }
 
@@ -22908,7 +17518,7 @@ pub fn parseRowExpressionOperandAlloc(
     params: []const value_mod.SqlValue,
     schema: runtime_schema.TableSchema,
     joined_source_schema: ?runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_expression_qualifiers: []const []const u8,
     returning_expression_qualifiers: []const []const u8,
     joined_source_expression_qualifiers: []const []const u8,
@@ -22920,71 +17530,71 @@ pub fn parseRowExpressionOperandAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     if (rowExpressionOperandStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
         switch (start) {
-            .parenthesized => return try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, hooks.parenthesized),
+            .parenthesized => return try expr_row_parse.parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, hooks.parenthesized),
             .unary_negative => return try parseUnaryNegativeRowExpressionAlloc(alloc, tokens, pos, params, schema, joined_source_schema, function_bindings, field_expression_qualifiers, returning_expression_qualifiers, joined_source_expression_qualifiers, joined_target_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks),
             .boolean_not => return try parseBooleanNotRowExpressionAlloc(alloc, tokens, pos, params, schema, joined_source_schema, function_bindings, field_expression_qualifiers, returning_expression_qualifiers, joined_source_expression_qualifiers, joined_target_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks),
-            .extension_function => return (try parseExtensionFunctionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.extension_functions, hooks.extension_function)) orelse unreachable,
-            .routine_expression => return (try parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.routine_expressions, hooks.routine_expression)) orelse unreachable,
-            .cast => return try parseCastRowExpressionAlloc(alloc, tokens, pos, hooks.cast),
-            .case => return try parseCaseRowExpressionAlloc(alloc, tokens, pos, type_context, defer_row_expression_field_validation, hooks.case_expression),
+            .extension_function => return (try expr_row_parse.parseExtensionFunctionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.extension_functions, hooks.extension_function)) orelse unreachable,
+            .routine_expression => return (try expr_row_parse.parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.routine_expressions, hooks.routine_expression)) orelse unreachable,
+            .cast => return try expr_row_parse.parseCastRowExpressionAlloc(alloc, tokens, pos, hooks.cast),
+            .case => return try expr_row_parse.parseCaseRowExpressionAlloc(alloc, tokens, pos, type_context, defer_row_expression_field_validation, hooks.case_expression),
             .now => return try expr_build.parseSqlNowRowExpressionAlloc(alloc, tokens, pos),
             .current_date => return try expr_build.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos),
             .typed_datetime_literal => return try expr_build.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos),
             .uuid_v4 => return try expr_build.parseSqlUuidV4RowExpression(tokens, pos),
             .interval => return try expr_build.parseSqlIntervalRowExpressionAlloc(alloc, tokens, pos),
-            .case_fold => return try parseCaseFoldRowExpressionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks.case_fold),
-            .replace => return try parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .replace, type_context, hooks.variadic),
-            .regexp_replace => return try parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_replace, type_context, hooks.variadic),
-            .regexp_substr => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_substr, type_context, hooks.fixed_binary),
-            .regexp_match => return try parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_match, type_context, hooks.variadic),
-            .regexp_count => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_count, type_context, hooks.fixed_binary),
-            .regexp_instr => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_instr, type_context, hooks.fixed_binary),
-            .translate => return try parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .translate, type_context, hooks.variadic),
-            .concat => return try parseConcatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .coalesce => return try parseCoalesceRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.coalesce),
+            .case_fold => return try expr_row_parse.parseCaseFoldRowExpressionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks.case_fold),
+            .replace => return try expr_row_parse.parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .replace, type_context, hooks.variadic),
+            .regexp_replace => return try expr_row_parse.parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_replace, type_context, hooks.variadic),
+            .regexp_substr => return try expr_row_parse.parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_substr, type_context, hooks.fixed_binary),
+            .regexp_match => return try expr_row_parse.parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_match, type_context, hooks.variadic),
+            .regexp_count => return try expr_row_parse.parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_count, type_context, hooks.fixed_binary),
+            .regexp_instr => return try expr_row_parse.parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_instr, type_context, hooks.fixed_binary),
+            .translate => return try expr_row_parse.parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .translate, type_context, hooks.variadic),
+            .concat => return try expr_row_parse.parseConcatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .coalesce => return try expr_row_parse.parseCoalesceRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.coalesce),
             .nullif => return try parseNullifRowExpressionAlloc(alloc, tokens, pos, params, schema, joined_source_schema, function_bindings, field_expression_qualifiers, returning_expression_qualifiers, joined_source_expression_qualifiers, joined_target_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks),
-            .text_length => return try parseTextLengthRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_unary),
-            .ascii => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ascii, type_context, .text, hooks.fixed_unary),
-            .chr => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .chr, type_context, .numeric, hooks.fixed_unary),
-            .substring => return try parseSubstringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .overlay => return try parseOverlayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .split_part => return try parseSplitPartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .strpos => return try parseStrposRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .left_right => return try parseLeftRightRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
-            .pad => return try parsePadRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .repeat => return try parseRepeatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
-            .reverse => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .reverse, type_context, .text, hooks.fixed_unary),
-            .md5 => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, hooks.fixed_unary),
-            .starts_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .starts_with, type_context, hooks.fixed_binary),
-            .ends_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .ends_with, type_context, hooks.fixed_binary),
-            .date_trunc => return try parseDateTruncRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
-            .date_bin => return try parseDateBinRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .date_part => return try parseDatePartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .abs => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .abs, type_context, .numeric, hooks.fixed_unary),
-            .round => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .round, type_context, .numeric, hooks.fixed_unary),
-            .trunc => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .trunc, type_context, .numeric, hooks.fixed_unary),
-            .floor => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .floor, type_context, .numeric, hooks.fixed_unary),
-            .ceil => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ceil, type_context, .numeric, hooks.fixed_unary),
-            .sqrt => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sqrt, type_context, .numeric, hooks.fixed_unary),
-            .sign => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sign, type_context, .numeric, hooks.fixed_unary),
-            .mod => return try parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .mod, type_context, hooks.fixed_binary),
-            .power => return try parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .power, type_context, hooks.fixed_binary),
-            .greatest_least => return try parseGreatestLeastRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .json_extract_path => return try parseJsonExtractPathRowExpressionAlloc(alloc, tokens, pos, params, type_context, hooks.fixed_unary),
-            .json_typeof => return try parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_typeof, type_context, hooks.fixed_unary),
-            .json_array_length => return try parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_array_length, type_context, hooks.fixed_unary),
-            .json_build_object => return try parseJsonBuildObjectRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.json_build_object),
-            .to_jsonb => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .to_jsonb, type_context, .any, hooks.fixed_unary),
+            .text_length => return try expr_row_parse.parseTextLengthRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_unary),
+            .ascii => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ascii, type_context, .text, hooks.fixed_unary),
+            .chr => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .chr, type_context, .numeric, hooks.fixed_unary),
+            .substring => return try expr_row_parse.parseSubstringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .overlay => return try expr_row_parse.parseOverlayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .split_part => return try expr_row_parse.parseSplitPartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .strpos => return try expr_row_parse.parseStrposRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .left_right => return try expr_row_parse.parseLeftRightRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .pad => return try expr_row_parse.parsePadRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .repeat => return try expr_row_parse.parseRepeatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .reverse => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .reverse, type_context, .text, hooks.fixed_unary),
+            .md5 => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, hooks.fixed_unary),
+            .starts_with => return try expr_row_parse.parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .starts_with, type_context, hooks.fixed_binary),
+            .ends_with => return try expr_row_parse.parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .ends_with, type_context, hooks.fixed_binary),
+            .date_trunc => return try expr_row_parse.parseDateTruncRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .date_bin => return try expr_row_parse.parseDateBinRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .date_part => return try expr_row_parse.parseDatePartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .abs => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .abs, type_context, .numeric, hooks.fixed_unary),
+            .round => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .round, type_context, .numeric, hooks.fixed_unary),
+            .trunc => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .trunc, type_context, .numeric, hooks.fixed_unary),
+            .floor => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .floor, type_context, .numeric, hooks.fixed_unary),
+            .ceil => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ceil, type_context, .numeric, hooks.fixed_unary),
+            .sqrt => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sqrt, type_context, .numeric, hooks.fixed_unary),
+            .sign => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sign, type_context, .numeric, hooks.fixed_unary),
+            .mod => return try expr_row_parse.parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .mod, type_context, hooks.fixed_binary),
+            .power => return try expr_row_parse.parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .power, type_context, hooks.fixed_binary),
+            .greatest_least => return try expr_row_parse.parseGreatestLeastRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .json_extract_path => return try expr_row_parse.parseJsonExtractPathRowExpressionAlloc(alloc, tokens, pos, params, type_context, hooks.fixed_unary),
+            .json_typeof => return try expr_row_parse.parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_typeof, type_context, hooks.fixed_unary),
+            .json_array_length => return try expr_row_parse.parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_array_length, type_context, hooks.fixed_unary),
+            .json_build_object => return try expr_row_parse.parseJsonBuildObjectRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.json_build_object),
+            .to_jsonb => return try expr_row_parse.parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .to_jsonb, type_context, .any, hooks.fixed_unary),
             .convert_from => {
                 const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
                 errdefer alloc.free(value_json);
                 return .{ .kind = .value, .value_json = value_json };
             },
             .array_length => return try parseArrayLengthRowExpressionAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source),
-            .array_position => return try parseArrayPositionRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
-            .array_element_transform => return try parseArrayElementTransformRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .array_to_string => return try parseArrayToStringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
-            .string_to_array => return try parseStringToArrayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .array_position => return try expr_row_parse.parseArrayPositionRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .array_element_transform => return try expr_row_parse.parseArrayElementTransformRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .array_to_string => return try expr_row_parse.parseArrayToStringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .string_to_array => return try expr_row_parse.parseStringToArrayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
         }
     }
     if (try parseRowExpressionFieldOperandOrNullAlloc(
@@ -23013,7 +17623,7 @@ pub fn parseRowExpressionOperandFromContextAlloc(
     pos: *usize,
     params: []const value_mod.SqlValue,
     joined_source_schema: ?runtime_schema.TableSchema,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     field_source: db_mod.types.RelationalRowsExpressionFieldSource,
     select_context_hooks: SelectParserContextHooks,
     joined_context_hooks: JoinedExpressionParserContextHooks,
@@ -23072,7 +17682,7 @@ pub fn parseRowExpressionFieldOperandOrNullAlloc(
     const parsed_field = if (joined_source_expression_qualifiers.len != 0 or joined_target_expression_qualifiers.len != 0)
         try parseIdentifierOwnedAlloc(alloc, tokens, pos)
     else
-        try parseRowExpressionFieldOwnedAlloc(
+        try expr_generated.parseRowExpressionFieldOwnedAlloc(
             alloc,
             tokens,
             pos,
@@ -23220,521 +17830,6 @@ pub fn parseExpressionRegexpMatchConditionAlloc(
     return try expr_predicate.expressionRegexpMatchConditionAlloc(alloc, type_context, expression, pattern_expression, case_insensitive, negated);
 }
 
-pub fn validateGeneratedQuantifiedPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    quantifier_token_index: usize,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, .quantified_comparison, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    try rejectGeneratedUnsupportedSubqueryRightExpression(tokens, expression);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1 or
-        !expr_generated.generatedTokenKindIsComparisonOperator(tokens[operator_token_index].kind))
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const quantifier_tokens = expression.quantifier_tokens orelse return error.UnsupportedSqlShape;
-    if (quantifier_token_index >= tokens.len or
-        quantifier_tokens.start != quantifier_token_index or
-        quantifier_tokens.end != quantifier_token_index + 1 or
-        !expr_token.tokenAtIsAnySomeOrAll(tokens, quantifier_token_index))
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_tokens.end != quantifier_tokens.start or quantifier_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-}
-
-pub fn validateGeneratedExistsSubqueryPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != .exists_subquery) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloads(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1 or
-        !tokens[operator_token_index].matchesKeywordTag(.exists))
-    {
-        return error.UnsupportedSqlShape;
-    }
-}
-
-pub fn validateGeneratedPatternPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    tokens: []const Token,
-    operator_token_index: usize,
-    quantifier_token_index: ?usize,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloads(tokens, expression.*);
-    try rejectGeneratedUnsupportedSubqueryRightExpression(tokens, expression);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    switch (expected_kind) {
-        .like, .not_like => if (!tokens[operator_token_index].matchesKeywordTag(.like)) return error.UnsupportedSqlShape,
-        .ilike, .not_ilike => if (!tokens[operator_token_index].matchesKeywordTag(.ilike)) return error.UnsupportedSqlShape,
-        else => return error.UnsupportedSqlShape,
-    }
-    if (quantifier_token_index) |index| {
-        const quantifier_tokens = expression.quantifier_tokens orelse return error.UnsupportedSqlShape;
-        if (index >= tokens.len or
-            quantifier_tokens.start != index or
-            quantifier_tokens.end != index + 1 or
-            !expr_token.tokenAtIsAnySomeOrAll(tokens, index))
-        {
-            return error.UnsupportedSqlShape;
-        }
-        const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-        if (operator_tokens.end != quantifier_tokens.start or quantifier_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-    } else {
-        if (expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
-        const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-        if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-    }
-}
-
-fn validateGeneratedExpressionPredicateKind(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-) !void {
-    const expression = generated_expression_ast orelse return;
-    if (expression.kind != expected_kind) return error.UnsupportedSqlShape;
-}
-
-fn validateGeneratedNullishPredicateKind(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    const expression = generated_expression_ast orelse return;
-    switch (op) {
-        .is_null => switch (expression.kind) {
-            .is_null, .is_unknown => {},
-            else => return error.UnsupportedSqlShape,
-        },
-        .is_not_null => switch (expression.kind) {
-            .is_not_null, .is_not_unknown => {},
-            else => return error.UnsupportedSqlShape,
-        },
-        else => return error.UnsupportedSqlShape,
-    }
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or operator_tokens.start != operator_token_index) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionOperatorTokens(tokens, expression.kind, operator_tokens);
-}
-
-fn validateGeneratedBooleanIsPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-) !void {
-    switch (expected_kind) {
-        .is_true, .is_false, .is_not_true, .is_not_false => {},
-        else => return error.UnsupportedSqlShape,
-    }
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or operator_tokens.start != operator_token_index) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-}
-
-fn rejectGeneratedUnsupportedSubqueryPredicateExpression(
-    tokens: []const Token,
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-) !void {
-    const expression = generated_expression_ast orelse return;
-    switch (expression.kind) {
-        .exists_subquery,
-        .not_exists_subquery,
-        => {
-            try validateGeneratedExpressionPayloads(tokens, expression.*);
-            return error.UnsupportedSqlShape;
-        },
-        .quantified_comparison => {
-            if (expression.right_expression_kind == .subquery) {
-                try rejectGeneratedUnsupportedSubqueryRightExpression(tokens, expression);
-            }
-        },
-        else => {},
-    }
-}
-
-fn rejectGeneratedUnsupportedSubqueryRightExpression(
-    tokens: []const Token,
-    expression: *const generated_parser.GeneratedSqlExpressionAst,
-) !void {
-    if (expression.right_expression_kind != .subquery) return;
-    try validateGeneratedExpressionPayloads(tokens, expression.*);
-    return error.UnsupportedSqlShape;
-}
-
-fn validateGeneratedIsTailPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    is_tail: expr_operator.ExpressionIsTail,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expected_kind = generatedIsTailExpressionKind(is_tail);
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or operator_tokens.start != operator_token_index) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-}
-
-fn validateGeneratedPostfixNullPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expected_kind = generatedComparisonExpressionKindForOp(op);
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-}
-
-fn betweenModifierTokenIndex(tokens: []const Token, index: usize) ?usize {
-    if (index >= tokens.len) return null;
-    if (tokens[index].matchesKeywordTag(.asymmetric) or tokens[index].matchesKeywordTag(.symmetric)) return index;
-    return null;
-}
-
-pub fn validateGeneratedSingleOperatorPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    tokens: []const Token,
-    operator_token_index: usize,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    try rejectGeneratedUnsupportedSubqueryRightExpression(tokens, expression);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-    if (expression.negation_tokens != null or
-        expression.quantifier_tokens != null or
-        expression.between_modifier_tokens != null or
-        expression.between_modifier != null)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-    if (right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
-    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-}
-
-pub fn validateGeneratedSetOrBetweenPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    expected_kind: generated_parser.GeneratedSqlExpressionKind,
-    tokens: []const Token,
-    operator_token_index: usize,
-    negation_token_index: ?usize,
-    between_modifier_token_index: ?usize,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-
-    switch (expected_kind) {
-        .not_in_list, .not_between => {
-            const index = negation_token_index orelse return error.UnsupportedSqlShape;
-            const negation_tokens = expression.negation_tokens orelse return error.UnsupportedSqlShape;
-            if (index >= tokens.len or
-                negation_tokens.start != index or
-                negation_tokens.end != index + 1 or
-                negation_tokens.end != operator_tokens.start or
-                !tokens[index].matchesKeywordTag(.not))
-            {
-                return error.UnsupportedSqlShape;
-            }
-        },
-        .in_list, .between => {
-            if (negation_token_index != null or expression.negation_tokens != null) return error.UnsupportedSqlShape;
-        },
-        else => return error.UnsupportedSqlShape,
-    }
-
-    switch (expected_kind) {
-        .in_list, .not_in_list => {
-            if (between_modifier_token_index != null or expression.between_modifier_tokens != null or expression.between_modifier != null) return error.UnsupportedSqlShape;
-            const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-            if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-        },
-        .between, .not_between => {
-            const lower_tokens = expression.between_lower_tokens orelse return error.UnsupportedSqlShape;
-            const upper_tokens = expression.between_upper_tokens orelse return error.UnsupportedSqlShape;
-            const lower_start = if (between_modifier_token_index) |index| blk: {
-                const modifier_tokens = expression.between_modifier_tokens orelse return error.UnsupportedSqlShape;
-                if (index >= tokens.len or
-                    modifier_tokens.start != index or
-                    modifier_tokens.end != index + 1 or
-                    operator_tokens.end != modifier_tokens.start)
-                {
-                    return error.UnsupportedSqlShape;
-                }
-                const modifier = expression.between_modifier orelse return error.UnsupportedSqlShape;
-                switch (modifier) {
-                    .asymmetric => if (!tokens[index].matchesKeywordTag(.asymmetric)) return error.UnsupportedSqlShape,
-                    .symmetric => if (!tokens[index].matchesKeywordTag(.symmetric)) return error.UnsupportedSqlShape,
-                }
-                break :blk modifier_tokens.end;
-            } else blk: {
-                if (expression.between_modifier_tokens != null or expression.between_modifier != null) return error.UnsupportedSqlShape;
-                break :blk operator_tokens.end;
-            };
-            if (lower_start != lower_tokens.start or lower_tokens.end >= upper_tokens.start) return error.UnsupportedSqlShape;
-        },
-        else => return error.UnsupportedSqlShape,
-    }
-}
-
-fn validateGeneratedRegexPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    case_insensitive: bool,
-    negated: bool,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expected_kind = generatedRegexPredicateKind(case_insensitive, negated);
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const expected_token_kind: TokenKind = switch (expected_kind) {
-        .regex_match => .regex_match,
-        .regex_imatch => .regex_imatch,
-        .regex_not_match => .regex_not_match,
-        .regex_not_imatch => .regex_not_imatch,
-        else => return error.UnsupportedSqlShape,
-    };
-    if (tokens[operator_token_index].kind != expected_token_kind) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-    if (expression.negation_tokens != null or
-        expression.quantifier_tokens != null or
-        expression.between_modifier_tokens != null or
-        expression.between_modifier != null or
-        expression.escape_tokens != null or
-        expression.escape_expression_kind != null or
-        expression.escape_expression != null)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-    if (right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
-    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-}
-
-fn generatedRegexPredicateKind(
-    case_insensitive: bool,
-    negated: bool,
-) generated_parser.GeneratedSqlExpressionKind {
-    if (case_insensitive) {
-        return if (negated) .regex_not_imatch else .regex_imatch;
-    }
-    return if (negated) .regex_not_match else .regex_match;
-}
-
-fn generatedIsTailExpressionKind(
-    is_tail: expr_operator.ExpressionIsTail,
-) generated_parser.GeneratedSqlExpressionKind {
-    return switch (is_tail.kind) {
-        .distinct_comparison => if (is_tail.op == .is_not_distinct) .is_not_distinct_from else .is_distinct_from,
-        .null_test => if (is_tail.op == .is_not_null) .is_not_null else .is_null,
-        .boolean_unknown => if (is_tail.op == .is_not_null) .is_not_unknown else .is_unknown,
-        .boolean_literal => if (is_tail.boolean_negated)
-            if (is_tail.boolean_value) .is_not_true else .is_not_false
-        else if (is_tail.boolean_value)
-            .is_true
-        else
-            .is_false,
-    };
-}
-
-fn generatedComparisonExpressionKindForOp(
-    op: runtime_schema.RelationalCheckOp,
-) generated_parser.GeneratedSqlExpressionKind {
-    return switch (op) {
-        .is_null => .is_null,
-        .is_not_null => .is_not_null,
-        .is_distinct => .is_distinct_from,
-        .is_not_distinct => .is_not_distinct_from,
-        .eq, .ne, .gt, .gte, .lt, .lte => .comparison,
-    };
-}
-
-fn tokenKindForComparisonOp(op: runtime_schema.RelationalCheckOp) !TokenKind {
-    return switch (op) {
-        .eq => .eq,
-        .ne => .neq,
-        .gt => .gt,
-        .gte => .gte,
-        .lt => .lt,
-        .lte => .lte,
-        else => error.UnsupportedSqlShape,
-    };
-}
-
-fn validateGeneratedComparisonPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, .comparison, operator_token_index) orelse {
-        try validateRebasedGeneratedComparisonPredicateRoot(root, tokens, operator_token_index, op);
-        return;
-    };
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    try rejectGeneratedUnsupportedSubqueryRightExpression(tokens, expression);
-    const expected_token_kind = try tokenKindForComparisonOp(op);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or
-        operator_tokens.start != operator_token_index or
-        operator_tokens.end != operator_token_index + 1 or
-        tokens[operator_token_index].kind != expected_token_kind)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    if (expression.negation_tokens != null or
-        expression.quantifier_tokens != null or
-        expression.between_modifier_tokens != null or
-        expression.between_modifier != null)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-}
-
-fn validateRebasedGeneratedComparisonPredicateRoot(
-    root: *const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    if (root.kind != .comparison or
-        root.tokens != null or
-        root.operator_tokens != null or
-        root.left_tokens != null or
-        root.negation_tokens != null or
-        root.quantifier_tokens != null or
-        root.between_modifier_tokens != null or
-        root.between_modifier != null)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    const right_tokens = root.right_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or right_tokens.start != operator_token_index + 1 or right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) {
-        return error.UnsupportedSqlShape;
-    }
-    const expected_token_kind = try tokenKindForComparisonOp(op);
-    if (tokens[operator_token_index].kind != expected_token_kind) return error.UnsupportedSqlShape;
-}
-
-fn validateGeneratedDistinctPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    const expected_kind = generatedComparisonExpressionKindForOp(op);
-    switch (expected_kind) {
-        .is_distinct_from, .is_not_distinct_from => {},
-        else => return error.UnsupportedSqlShape,
-    }
-    const root = generated_expression_ast orelse return;
-    const expression = generatedExpressionForOperatorStart(root, expected_kind, operator_token_index) orelse return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionPayloadsIfRetained(tokens, expression.*);
-    const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_token_index >= tokens.len or operator_tokens.start != operator_token_index) return error.UnsupportedSqlShape;
-    try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
-    const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
-    if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
-}
-
-fn validateGeneratedRelationalPredicateExpression(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    switch (op) {
-        .eq, .ne, .gt, .gte, .lt, .lte => try validateGeneratedComparisonPredicateExpression(generated_expression_ast, tokens, operator_token_index, op),
-        .is_null, .is_not_null => try validateGeneratedNullishPredicateKind(generated_expression_ast, tokens, operator_token_index, op),
-        .is_distinct, .is_not_distinct => try validateGeneratedDistinctPredicateExpression(generated_expression_ast, tokens, operator_token_index, op),
-    }
-}
-
-pub fn validateGeneratedRelationalPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    op: runtime_schema.RelationalCheckOp,
-) !void {
-    try validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, operator_token_index, op);
-}
-
-pub fn validateGeneratedIsTailPredicateIdentity(
-    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
-    tokens: []const Token,
-    operator_token_index: usize,
-    is_tail: expr_operator.ExpressionIsTail,
-) !void {
-    try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, operator_token_index, is_tail);
-}
-
 pub fn parseWhereAtomAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -23758,7 +17853,7 @@ pub fn parseWhereAtomAlloc(
     realtime_ns: u64,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try rejectGeneratedUnsupportedSubqueryPredicateExpression(tokens, generated_expression_ast);
+    try expr_generated_validate.rejectGeneratedUnsupportedSubqueryPredicateExpression(tokens, generated_expression_ast);
 
     if (!negated and parser.matchKeyword(tokens, pos, "not")) {
         try parser.expectToken(tokens, pos, .lparen);
@@ -23767,7 +17862,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (!negated and valueEqualsAnyArrayPredicateCanStart(tokens, pos.*)) {
-        try validateGeneratedExpressionPredicateKind(generated_expression_ast, .quantified_comparison);
+        try expr_generated_validate.validateGeneratedExpressionPredicateKind(generated_expression_ast, .quantified_comparison);
     }
     if (!negated and try parseValueEqualsAnyArrayPredicateAlloc(
         alloc,
@@ -23783,13 +17878,13 @@ pub fn parseWhereAtomAlloc(
     )) {
         return;
     }
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation);
     defer alloc.free(parsed_field);
     if (try binder.normalizePeriodReferenceAlloc(alloc, schema, parsed_field, field_expression_qualifiers, returning_expression_qualifiers)) |period_field| {
         defer alloc.free(period_field);
         if (binder.relationalPeriodForDdl(schema.periods, period_field)) |period| {
             if (parser.matchToken(tokens, pos, .at_contains) != null) {
-                try validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .contains, tokens, pos.* - 1);
+                try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .contains, tokens, pos.* - 1);
                 if (negated) return error.UnsupportedSqlShape;
                 const start_column = binder.relationalColumnForField(schema, period.start_column, null) orelse return error.InvalidSqlCatalog;
                 const end_column = binder.relationalColumnForField(schema, period.end_column, null) orelse return error.InvalidSqlCatalog;
@@ -23801,7 +17896,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             }
             if (parser.matchToken(tokens, pos, .range_overlap) != null) {
-                try validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .overlaps, tokens, pos.* - 1);
+                try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .overlaps, tokens, pos.* - 1);
                 if (negated) return error.UnsupportedSqlShape;
                 const range = try parseSqlPeriodRangeValuePairAlloc(alloc, tokens, pos, params, schema, period, realtime_ns);
                 defer freePeriodRangeValuePair(alloc, range);
@@ -23823,7 +17918,7 @@ pub fn parseWhereAtomAlloc(
         errdefer if (!path_transferred) alloc.free(path);
         const op_token_index = pos.*;
         try parser.expectToken(tokens, pos, .eq);
-        try validateGeneratedComparisonPredicateExpression(generated_expression_ast, tokens, op_token_index, .eq);
+        try expr_generated_validate.validateGeneratedComparisonPredicateExpression(generated_expression_ast, tokens, op_token_index, .eq);
         const value_json = if (as_text)
             try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params)
         else
@@ -23845,7 +17940,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchToken(tokens, pos, .at_contains) != null) {
-        try validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .contains, tokens, pos.* - 1);
+        try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .contains, tokens, pos.* - 1);
         const column = maybe_column orelse return error.InvalidSqlCatalog;
         const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
         var value_transferred = false;
@@ -23870,7 +17965,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchToken(tokens, pos, .question) != null) {
-        try validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .json_key_exists, tokens, pos.* - 1);
+        try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_expression_ast, .json_key_exists, tokens, pos.* - 1);
         if (binder.relationalColumnForField(schema, field, .json) == null) return error.InvalidSqlCatalog;
         const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
         var path_transferred = false;
@@ -23892,7 +17987,7 @@ pub fn parseWhereAtomAlloc(
     })) |is_tail| {
         switch (is_tail.kind) {
             .distinct_comparison => {
-                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
                 var value_transferred = false;
                 errdefer if (!value_transferred) alloc.free(value_json);
@@ -23912,7 +18007,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             },
             .boolean_unknown => {
-                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 try predicates.append(alloc, .{
                     .name = "",
@@ -23924,7 +18019,7 @@ pub fn parseWhereAtomAlloc(
                 return;
             },
             .boolean_literal => {
-                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 if (is_tail.boolean_negated) {
                     try appendBooleanIsNotPredicateGroups(alloc, or_predicates, field, is_tail.boolean_value);
@@ -23945,7 +18040,7 @@ pub fn parseWhereAtomAlloc(
             },
             .null_test => {},
         }
-        try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+        try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
         try predicates.append(alloc, .{
             .name = "",
             .field = field,
@@ -23957,7 +18052,7 @@ pub fn parseWhereAtomAlloc(
     }
     const postfix_null_token_index = pos.*;
     if (expr_operator.matchPostfixNullTest(tokens, pos)) |op| {
-        try validateGeneratedPostfixNullPredicateExpression(generated_expression_ast, tokens, postfix_null_token_index, op);
+        try expr_generated_validate.validateGeneratedPostfixNullPredicateExpression(generated_expression_ast, tokens, postfix_null_token_index, op);
         try predicates.append(alloc, .{
             .name = "",
             .field = field,
@@ -23971,14 +18066,14 @@ pub fn parseWhereAtomAlloc(
         const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
         const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
         const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-        try validateGeneratedPatternPredicateIdentity(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+        try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
         try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, negated, realtime_ns);
         return;
     }
     if (parser.matchKeyword(tokens, pos, "between")) {
         const operator_token_index = pos.* - 1;
-        const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
-        try validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
+        const modifier_token_index = expr_generated_validate.betweenModifierTokenIndex(tokens, pos.*);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .between, tokens, operator_token_index, null, modifier_token_index);
         const symmetric = expr_token.matchBetweenSymmetricMode(tokens, pos);
         const lower_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
         defer alloc.free(lower_json);
@@ -23992,8 +18087,8 @@ pub fn parseWhereAtomAlloc(
         const negation_token_index = pos.* - 1;
         if (parser.matchKeyword(tokens, pos, "between")) {
             const operator_token_index = pos.* - 1;
-            const modifier_token_index = betweenModifierTokenIndex(tokens, pos.*);
-            try validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .not_between, tokens, operator_token_index, negation_token_index, modifier_token_index);
+            const modifier_token_index = expr_generated_validate.betweenModifierTokenIndex(tokens, pos.*);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .not_between, tokens, operator_token_index, negation_token_index, modifier_token_index);
             const symmetric = expr_token.matchBetweenSymmetricMode(tokens, pos);
             const lower_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
             defer alloc.free(lower_json);
@@ -24007,12 +18102,12 @@ pub fn parseWhereAtomAlloc(
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-            try validateGeneratedPatternPredicateIdentity(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_expression_ast, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, text_patterns, field, column, case_insensitive, true, realtime_ns);
             return;
         }
         try parser.expectKeyword(tokens, pos, "in");
-        try validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         var values_transferred = false;
@@ -24033,7 +18128,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (parser.matchKeyword(tokens, pos, "in")) {
-        try validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
+        try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_expression_ast, .in_list, tokens, pos.* - 1, null, null);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
         var values_transferred = false;
@@ -24057,7 +18152,7 @@ pub fn parseWhereAtomAlloc(
     const op_token_index = pos.*;
     const op = try expr_operator.parseComparisonOp(tokens, pos);
     if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -24080,7 +18175,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .ne and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -24095,7 +18190,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .eq and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -24106,7 +18201,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (op == .ne and parser.matchKeyword(tokens, pos, "all")) {
-        try validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
+        try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_expression_ast, tokens, op_token_index, pos.* - 1);
         if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
         try parser.expectToken(tokens, pos, .lparen);
         const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -24129,7 +18224,7 @@ pub fn parseWhereAtomAlloc(
         return;
     }
     if (negated) return error.UnsupportedSqlShape;
-    try validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, op_token_index, op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, op_token_index, op);
     const value_json = if (column.field_type == .array and op == .eq)
         try value_mod.parseArrayPredicateValueAlloc(alloc, tokens, pos, params)
     else
@@ -24213,7 +18308,7 @@ pub fn parseJoinWhereAlloc(
         const target_expression_or_predicates = if (side == .left) targets.left_expression_or_predicates else targets.right_expression_or_predicates;
 
         if (parser.matchToken(tokens, pos, .at_contains) != null) {
-            try validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .contains, tokens, pos.* - 1);
+            try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .contains, tokens, pos.* - 1);
             const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
             var value_transferred = false;
             errdefer if (!value_transferred) alloc.free(value_json);
@@ -24233,7 +18328,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchToken(tokens, pos, .question) != null) {
-            try validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
+            try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
             if (column.field_type != .json) return error.InvalidSqlCatalog;
             const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
             var path_transferred = false;
@@ -24251,7 +18346,7 @@ pub fn parseJoinWhereAlloc(
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-            try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
@@ -24262,13 +18357,13 @@ pub fn parseJoinWhereAlloc(
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
                 const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-                try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+                try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
                 try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, target_text_patterns, source.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
             }
             try parser.expectKeyword(tokens, pos, "in");
-            try validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -24288,7 +18383,7 @@ pub fn parseJoinWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
-            try validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -24313,7 +18408,7 @@ pub fn parseJoinWhereAlloc(
             .allow_boolean_literal = true,
             .allow_boolean_literal_negation = true,
         })) |is_tail| blk: {
-            try validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
+            try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
             switch (is_tail.kind) {
                 .distinct_comparison, .null_test => {},
                 .boolean_unknown => {
@@ -24323,7 +18418,7 @@ pub fn parseJoinWhereAlloc(
                 .boolean_literal => {
                     if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                     if (is_tail.boolean_negated) {
-                        try appendBooleanIsNotExpressionGroups(alloc, target_expression_or_predicates, source.field, is_tail.boolean_value);
+                        try expr_condition.appendBooleanIsNotExpressionGroups(alloc, target_expression_or_predicates, source.field, is_tail.boolean_value);
                         if (!parser.matchKeyword(tokens, pos, "and")) break;
                         continue;
                     }
@@ -24348,7 +18443,7 @@ pub fn parseJoinWhereAlloc(
             break :blk is_tail.op;
         } else try expr_operator.parseComparisonOp(tokens, pos);
         if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-            try validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
+            try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
@@ -24369,7 +18464,7 @@ pub fn parseJoinWhereAlloc(
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
         }
-        try validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
+        try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
         const value_json = if (op == .is_null or op == .is_not_null)
             null
         else if (column.field_type == .array and op == .eq)
@@ -24518,7 +18613,7 @@ pub fn parseJoinOnAlloc(
             .allow_boolean_unknown = true,
             .allow_boolean_literal = true,
         })) |is_tail| blk: {
-            try validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
+            try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
             switch (is_tail.kind) {
                 .distinct_comparison => unreachable,
                 .null_test => {},
@@ -24549,7 +18644,7 @@ pub fn parseJoinOnAlloc(
             }
             break :blk is_tail.op;
         } else try expr_operator.parseComparisonOp(tokens, pos);
-        try validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
+        try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
         if (op == .eq and parser.peekKind(tokens, pos.*, .identifier) and identifierContainsQualifier(tokens[pos.*].text)) {
             const rhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
             defer plan_mod.freeQualifiedField(alloc, rhs);
@@ -24786,7 +18881,7 @@ pub fn parseLateralWhereAlloc(
         const column = try binder.joinColumnForSide(schema, joined_source_schema, lhs_side, lhs.field);
 
         if (parser.matchToken(tokens, pos, .at_contains) != null) {
-            try validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .contains, tokens, pos.* - 1);
+            try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .contains, tokens, pos.* - 1);
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             const value_json = try value_mod.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, column);
             var value_transferred = false;
@@ -24807,7 +18902,7 @@ pub fn parseLateralWhereAlloc(
             continue;
         }
         if (parser.matchToken(tokens, pos, .question) != null) {
-            try validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
+            try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             if (column.field_type != .json) return error.InvalidSqlCatalog;
             const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
@@ -24827,7 +18922,7 @@ pub fn parseLateralWhereAlloc(
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-            try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeyword(tokens, pos, "and")) break;
             continue;
@@ -24839,13 +18934,13 @@ pub fn parseLateralWhereAlloc(
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
                 const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-                try validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+                try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
                 try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, targets.text_patterns, lhs.field, column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeyword(tokens, pos, "and")) break;
                 continue;
             }
             try parser.expectKeyword(tokens, pos, "in");
-            try validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -24865,7 +18960,7 @@ pub fn parseLateralWhereAlloc(
             continue;
         }
         if (parser.matchKeyword(tokens, pos, "in")) {
-            try validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             const values_json = try value_mod.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
@@ -24893,7 +18988,7 @@ pub fn parseLateralWhereAlloc(
             .allow_boolean_literal = true,
             .allow_boolean_literal_negation = true,
         })) |is_tail| blk: {
-            try validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
+            try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_atom_expression, tokens, op_token_index, is_tail);
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             switch (is_tail.kind) {
                 .distinct_comparison => unreachable,
@@ -24905,7 +19000,7 @@ pub fn parseLateralWhereAlloc(
                 .boolean_literal => {
                     if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                     if (is_tail.boolean_negated) {
-                        try appendBooleanIsNotExpressionGroups(alloc, targets.expression_or_predicates, lhs.field, is_tail.boolean_value);
+                        try expr_condition.appendBooleanIsNotExpressionGroups(alloc, targets.expression_or_predicates, lhs.field, is_tail.boolean_value);
                         if (!parser.matchKeyword(tokens, pos, "and")) break;
                         continue;
                     }
@@ -24930,7 +19025,7 @@ pub fn parseLateralWhereAlloc(
             break :blk is_tail.op;
         } else try expr_operator.parseComparisonOp(tokens, pos);
         if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-            try validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
+            try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             if (column.field_type == .array or column.field_type == .json) return error.InvalidSqlCatalog;
             try parser.expectToken(tokens, pos, .lparen);
@@ -24960,7 +19055,7 @@ pub fn parseLateralWhereAlloc(
             if (lhs_side == rhs_side) return error.UnsupportedSqlShape;
             const rhs_column = try binder.joinColumnForSide(schema, joined_source_schema, rhs_side, rhs.field);
             if (column.field_type != rhs_column.field_type) return error.UnsupportedSqlShape;
-            try validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
+            try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
             const left_source = if (lhs_side == .left) lhs.field else rhs.field;
             const right_source = if (lhs_side == .right) lhs.field else rhs.field;
             const left_field = try alloc.dupe(u8, left_source);
@@ -24973,7 +19068,7 @@ pub fn parseLateralWhereAlloc(
             left_transferred = true;
             right_transferred = true;
         } else {
-            try validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
+            try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_atom_expression, tokens, op_token_index, op);
             if (lhs_side != .right) return error.UnsupportedSqlShape;
             const value_json = if (op == .is_null or op == .is_not_null)
                 null
@@ -25153,7 +19248,7 @@ pub fn parseScalarWherePredicateAlloc(
     realtime_ns: u64,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !runtime_schema.RelationalCheck {
-    const parsed_field = try parseRowExpressionFieldOwnedAlloc(
+    const parsed_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
         alloc,
         tokens,
         pos,
@@ -25177,7 +19272,7 @@ pub fn parseScalarWherePredicateAlloc(
     })) |is_tail| {
         switch (is_tail.kind) {
             .distinct_comparison => {
-                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
                 var value_transferred = false;
                 errdefer if (!value_transferred) alloc.free(value_json);
@@ -25191,7 +19286,7 @@ pub fn parseScalarWherePredicateAlloc(
                 };
             },
             .boolean_unknown => {
-                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 field_transferred = true;
                 return .{
@@ -25202,7 +19297,7 @@ pub fn parseScalarWherePredicateAlloc(
                 };
             },
             .boolean_literal => {
-                try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+                try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
                 if (column.field_type != .boolean) return error.InvalidSqlCatalog;
                 const value_json = try alloc.dupe(u8, value_mod.booleanJson(is_tail.boolean_value));
                 var value_transferred = false;
@@ -25218,7 +19313,7 @@ pub fn parseScalarWherePredicateAlloc(
             },
             .null_test => {},
         }
-        try validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
+        try expr_generated_validate.validateGeneratedIsTailPredicateExpression(generated_expression_ast, tokens, is_tail_token_index, is_tail);
         field_transferred = true;
         return .{
             .name = "",
@@ -25230,7 +19325,7 @@ pub fn parseScalarWherePredicateAlloc(
 
     const postfix_null_token_index = pos.*;
     if (expr_operator.matchPostfixNullTest(tokens, pos)) |op| {
-        try validateGeneratedPostfixNullPredicateExpression(generated_expression_ast, tokens, postfix_null_token_index, op);
+        try expr_generated_validate.validateGeneratedPostfixNullPredicateExpression(generated_expression_ast, tokens, postfix_null_token_index, op);
         field_transferred = true;
         return .{
             .name = "",
@@ -25244,7 +19339,7 @@ pub fn parseScalarWherePredicateAlloc(
     if (parser.peekKeywordTag(tokens, pos.*, .between)) return error.UnsupportedSqlShape;
     const op_token_index = pos.*;
     const op = try expr_operator.parseComparisonOp(tokens, pos);
-    try validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, op_token_index, op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateExpression(generated_expression_ast, tokens, op_token_index, op);
     if (parser.peekKeywordTag(tokens, pos.*, .any) or parser.peekKeywordTag(tokens, pos.*, .some)) return error.UnsupportedSqlShape;
     const value_json = try value_mod.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
     var value_transferred = false;
@@ -25395,11 +19490,11 @@ pub fn parseBareBooleanWhereExpressionAlloc(
     options: BareBooleanWhereExpressionParserOptions,
 ) !void {
     const start = pos.*;
-    const expression = try parseBooleanRowExpressionAlloc(alloc, tokens, pos, type_context, options.boolean_hooks);
+    const expression = try expr_row_parse.parseBooleanRowExpressionAlloc(alloc, tokens, pos, type_context, options.boolean_hooks);
     var expression_transferred = false;
     errdefer if (!expression_transferred) freeExpression(alloc, expression);
     try type_context.validateBooleanRowExpression(expression);
-    try validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
     if (expression.kind == .value and std.mem.eql(u8, expression.value_json, "true")) {
         freeExpression(alloc, expression);
         expression_transferred = true;
@@ -25589,7 +19684,7 @@ pub fn canParseExpressionWhereCondition(
     if (rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
     if (parser.peekKind(tokens, pos, .minus)) return true;
     if (parser.peekKeyword(tokens, pos, "lower") or parser.peekKeyword(tokens, pos, "upper")) {
-        return !(try generatedExpressionCallHasGeneratedColumn(
+        return !(try expr_generated.generatedExpressionCallHasGeneratedColumn(
             alloc,
             tokens,
             pos,
@@ -25601,7 +19696,7 @@ pub fn canParseExpressionWhereCondition(
     }
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsInitcapFunction)) return true;
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function)) {
-        return !(try generatedExpressionCallHasGeneratedColumn(
+        return !(try expr_generated.generatedExpressionCallHasGeneratedColumn(
             alloc,
             tokens,
             pos,
@@ -25612,7 +19707,7 @@ pub fn canParseExpressionWhereCondition(
         ));
     }
     if (parser.peekKeyword(tokens, pos, "concat") or parser.peekKeyword(tokens, pos, "concat_ws")) {
-        return !(try generatedExpressionCallHasGeneratedColumn(
+        return !(try expr_generated.generatedExpressionCallHasGeneratedColumn(
             alloc,
             tokens,
             pos,
@@ -25700,54 +19795,6 @@ pub fn canParseExpressionWhereCondition(
     return false;
 }
 
-fn generatedExpressionCallHasGeneratedColumn(
-    alloc: std.mem.Allocator,
-    tokens: []const Token,
-    pos: usize,
-    schema: runtime_schema.TableSchema,
-    field_expression_qualifiers: []const []const u8,
-    returning_expression_qualifiers: []const []const u8,
-    defer_row_expression_field_validation: bool,
-) !bool {
-    if (parser.peekKeyword(tokens, pos, "concat") or parser.peekKeyword(tokens, pos, "concat_ws")) {
-        return (try generatedConcatColumnAt(
-            alloc,
-            tokens,
-            pos,
-            schema,
-            field_expression_qualifiers,
-            returning_expression_qualifiers,
-            defer_row_expression_field_validation,
-        )) != null;
-    }
-    const op: runtime_schema.RelationalGeneratedOp = if (parser.peekKeyword(tokens, pos, "lower"))
-        .lower
-    else if (parser.peekKeyword(tokens, pos, "upper"))
-        .upper
-    else if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsMd5Function))
-        .md5
-    else
-        return false;
-    if (pos + 3 >= tokens.len) return false;
-    if (tokens[pos + 1].kind != .lparen) return false;
-    const field = tokens[pos + 2];
-    if (field.kind != .identifier) return false;
-    if (tokens[pos + 3].kind != .rparen) return false;
-    const normalized_field = binder.normalizeRowExpressionFieldAlloc(
-        alloc,
-        schema,
-        field.text,
-        field_expression_qualifiers,
-        returning_expression_qualifiers,
-        defer_row_expression_field_validation,
-    ) catch |err| switch (err) {
-        error.InvalidSqlCatalog, error.UnsupportedSqlShape => return false,
-        else => return err,
-    };
-    defer alloc.free(normalized_field);
-    return generatedUnaryTextColumnForField(schema, op, normalized_field) != null;
-}
-
 fn parenthesizedBooleanIsPredicateCanStartAt(
     tokens: []const Token,
     index: usize,
@@ -25809,20 +19856,6 @@ pub fn nextIsUnsupportedQueryKeyword(tokens: []const Token, pos: usize) bool {
 }
 
 test "sql adapter expression keyword predicates classify function and tail tokens" {
-    try std.testing.expect(expr_token.sqlKeywordIsAnyOrSome("SOME"));
-    try std.testing.expect(expr_token.sqlKeywordStartsScalarPredicate("between"));
-    try std.testing.expect(expr_token.sqlKeywordIsArrayLengthFunction("cardinality"));
-    try std.testing.expectEqualStrings("cardinality", expr_token.arrayLengthDefaultOutput("cardinality"));
-    try std.testing.expect(expr_token.sqlKeywordIsJsonExtractPathFunction("jsonb_extract_path_text"));
-    try std.testing.expect(expr_token.sqlJsonExtractPathFunctionAsText("json_extract_path_text"));
-    try std.testing.expect(expr_token.sqlKeywordIsRegexpMatchFunction("regexp_like"));
-    try std.testing.expect(expr_token.rowExpressionBoundaryKeyword("returning") == false);
-    try std.testing.expect(expr_token.sqlWhereTailClauseKeyword("returning"));
-    try std.testing.expect(expr_token.sqlWindowTailClauseKeyword("fetch"));
-    try std.testing.expect(expr_token.rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "THEN", .keyword = .then }));
-    try std.testing.expect(expr_token.rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "ELSE", .keyword = .@"else" }));
-    try std.testing.expect(expr_token.rowExpressionBoundaryKeywordToken(.{ .kind = .identifier, .text = "END", .keyword = .end }));
-
     const tagged_expression_starts = [_]Token{
         .{ .kind = .identifier, .text = "CONCAT_WS", .keyword = .concat_ws },
         .{ .kind = .identifier, .text = "STRING_TO_ARRAY", .keyword = .string_to_array },
@@ -25842,8 +19875,6 @@ test "sql adapter expression keyword predicates classify function and tail token
     }
     const quoted_expression_name = Token{ .kind = .identifier, .text = "concat_ws", .source_start = 0, .source_end = 11 };
     try std.testing.expect(!expressionStartKeywordToken(quoted_expression_name));
-    const quoted_generated_name = Token{ .kind = .identifier, .text = "md5", .source_start = 0, .source_end = 5 };
-    try std.testing.expect(generatedUnaryOpToken(quoted_generated_name) == null);
 
     const unsupported_tail_tokens = [_]Token{.{ .kind = .identifier, .text = "LATERAL", .keyword = .lateral }};
     try std.testing.expect(nextIsUnsupportedQueryKeyword(unsupported_tail_tokens[0..], 0));
@@ -26388,12 +20419,12 @@ fn testOwnedBooleanConditionAlloc(
     lhs_value: bool,
     rhs_value: bool,
 ) !runtime_schema.RelationalRowsExpressionCondition {
-    const lhs = try booleanLiteralExpressionAlloc(alloc, lhs_value);
+    const lhs = try expr_condition.booleanLiteralExpressionAlloc(alloc, lhs_value);
     errdefer freeExpression(alloc, lhs);
 
     const rhs = try alloc.alloc(runtime_schema.RelationalRowsExpression, 1);
     errdefer alloc.free(rhs);
-    rhs[0] = try booleanLiteralExpressionAlloc(alloc, rhs_value);
+    rhs[0] = try expr_condition.booleanLiteralExpressionAlloc(alloc, rhs_value);
 
     return .{
         .lhs = lhs,
@@ -26484,7 +20515,7 @@ fn lowerQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredQueryPlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
@@ -26996,7 +21027,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
                 var array_tokens = right_expression.array_tokens orelse return error.TestUnexpectedResult;
                 array_tokens.start -= 1;
                 right_expression.array_tokens = array_tokens;
-                try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedSingleOperatorPredicateIdentity(
+                try std.testing.expectError(error.UnsupportedSqlShape, expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(
                     &read.where_expression,
                     .contains,
                     malformed_array_constructor_read.items(),
@@ -27043,7 +21074,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
                 read.where_expression.escape_tokens = null;
                 read.where_expression.escape_expression_kind = null;
                 read.where_expression.escape_expression = null;
-                try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedPatternPredicateIdentity(
+                try std.testing.expectError(error.UnsupportedSqlShape, expr_generated_validate.validateGeneratedPatternPredicateIdentity(
                     &read.where_expression,
                     .like,
                     malformed_pattern_escape_payload.items(),
@@ -27072,7 +21103,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
                 }
                 read.where_expression.between_upper_expression_kind = null;
                 read.where_expression.between_upper_expression = null;
-                try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedSetOrBetweenPredicateIdentity(
+                try std.testing.expectError(error.UnsupportedSqlShape, expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(
                     &read.where_expression,
                     .between,
                     malformed_between_child_payload.items(),
@@ -27102,7 +21133,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
                 }
                 read.where_expression.right_expression_kind = null;
                 read.where_expression.right_expression = null;
-                try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRelationalPredicateIdentity(
+                try std.testing.expectError(error.UnsupportedSqlShape, expr_generated_validate.validateGeneratedRelationalPredicateIdentity(
                     &read.where_expression,
                     malformed_comparison_child_payload.items(),
                     operator_tokens.start,
@@ -27130,7 +21161,7 @@ test "sql adapter lower expr validates retained generated read body payloads" {
                 }
                 read.where_expression.right_expression_kind = null;
                 read.where_expression.right_expression = null;
-                try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedRelationalPredicateIdentity(
+                try std.testing.expectError(error.UnsupportedSqlShape, expr_generated_validate.validateGeneratedRelationalPredicateIdentity(
                     &read.where_expression,
                     malformed_distinct_child_payload.items(),
                     operator_tokens.start,
@@ -27316,7 +21347,7 @@ fn lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredQueryPlan {
     const parser_context = @import("parser_context.zig");
 
@@ -27588,7 +21619,7 @@ fn lowerSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     sql: []const u8,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredSetOperationPlan {
     var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
     defer parsed_sql.deinit(alloc);
@@ -27600,7 +21631,7 @@ fn lowerParsedSetOperationPlanWithFunctionBindingsForLowerExprTestAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredSetOperationPlan {
     const parser_context = @import("parser_context.zig");
 
@@ -28630,7 +22661,7 @@ test "sql adapter lower expr lowers routine expression bindings into row express
         .kind = .lower,
         .operands = &normalize_operands,
     };
-    const bindings = [_]RoutineExpressionBinding{.{
+    const bindings = [_]expr_row_parse.RoutineExpressionBinding{.{
         .sql_name = "normalize_status",
         .arity = 1,
         .expression = normalize_expression,
@@ -28691,7 +22722,7 @@ test "sql adapter lower expr lowers routine expression bindings into row express
         .kind = .concat_ws,
         .operands = &overloaded_operands,
     };
-    const overloaded_bindings = [_]RoutineExpressionBinding{
+    const overloaded_bindings = [_]expr_row_parse.RoutineExpressionBinding{
         .{
             .sql_name = "status_label",
             .arity = 1,
@@ -28714,7 +22745,7 @@ test "sql adapter lower expr lowers routine expression bindings into row express
     try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.concat_ws, overloaded.plan.query.expressions[0].expression.kind);
     try std.testing.expectEqual(@as(usize, 2), overloaded.plan.query.expressions[0].expression.operands.len);
 
-    const strict_bindings = [_]RoutineExpressionBinding{.{
+    const strict_bindings = [_]expr_row_parse.RoutineExpressionBinding{.{
         .sql_name = "strict_normalize_status",
         .arity = 1,
         .expression = normalize_expression,
@@ -28739,7 +22770,7 @@ test "sql adapter lower expr lowers routine expression bindings into row express
         .{ .routine_expressions = &strict_bindings },
     ));
 
-    const duplicate_bindings = [_]RoutineExpressionBinding{
+    const duplicate_bindings = [_]expr_row_parse.RoutineExpressionBinding{
         .{ .sql_name = "normalize_status", .arity = 1, .expression = normalize_expression },
         .{ .sql_name = "normalize_status", .arity = 1, .expression = normalize_expression },
     };
@@ -36267,7 +30298,7 @@ test "sql adapter lower expr lowers scalar any predicates" {
                 }
                 read.where_expression.right_expression_kind = null;
                 read.where_expression.right_expression = null;
-                try std.testing.expectError(error.UnsupportedSqlShape, validateGeneratedQuantifiedPredicateIdentity(
+                try std.testing.expectError(error.UnsupportedSqlShape, expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(
                     &read.where_expression,
                     malformed_quantified_right_payload.items(),
                     operator_tokens.start,
@@ -39232,58 +33263,6 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     defer if (wildcard_like_prefix) |owned| alloc.free(owned);
     try std.testing.expect(wildcard_like_prefix == null);
 
-    var expression_conditions = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpressionCondition).empty;
-    defer {
-        freeExpressionConditions(alloc, expression_conditions.items);
-        expression_conditions.deinit(alloc);
-    }
-    try appendBooleanConstantExpressionCondition(alloc, &expression_conditions, false);
-    try std.testing.expectEqual(@as(usize, 1), expression_conditions.items.len);
-
-    var boolean_groups = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpressionPredicateGroup).empty;
-    defer {
-        freeExpressionPredicateGroups(alloc, boolean_groups.items);
-        boolean_groups.deinit(alloc);
-    }
-    try appendBooleanConstantExpressionGroup(alloc, &boolean_groups, true);
-    try appendBooleanConstantExpressionGroup(alloc, &boolean_groups, false);
-    const is_not_lhs = try booleanLiteralExpressionAlloc(alloc, true);
-    defer freeExpression(alloc, is_not_lhs);
-    try appendExpressionBooleanIsNotGroups(alloc, &boolean_groups, is_not_lhs, true);
-    try appendBooleanIsNotExpressionGroups(alloc, &boolean_groups, "enabled", false);
-    try std.testing.expectEqual(@as(usize, 6), boolean_groups.items.len);
-    try std.testing.expectEqual(@as(usize, 0), boolean_groups.items[0].conditions.len);
-    try std.testing.expectEqual(@as(usize, 1), boolean_groups.items[1].conditions.len);
-    try std.testing.expectEqual(@as(usize, 1), boolean_groups.items[2].conditions.len);
-    try std.testing.expectEqual(@as(usize, 1), boolean_groups.items[3].conditions.len);
-    try std.testing.expectEqual(@as(usize, 1), boolean_groups.items[4].conditions.len);
-    try std.testing.expectEqual(@as(usize, 1), boolean_groups.items[5].conditions.len);
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.ne, boolean_groups.items[4].conditions[0].op);
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_null, boolean_groups.items[5].conditions[0].op);
-    try std.testing.expectEqualStrings("enabled", boolean_groups.items[4].conditions[0].lhs.field);
-    try std.testing.expectEqualStrings("enabled", boolean_groups.items[5].conditions[0].lhs.field);
-
-    var appended_groups = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpressionPredicateGroup).empty;
-    defer {
-        freeExpressionPredicateGroups(alloc, appended_groups.items);
-        appended_groups.deinit(alloc);
-    }
-    const appended_condition = try testOwnedBooleanConditionAlloc(alloc, true, true);
-    try appendExpressionConditionGroup(alloc, &appended_groups, appended_condition);
-
-    const between_lhs = try booleanLiteralExpressionAlloc(alloc, true);
-    defer freeExpression(alloc, between_lhs);
-    const between_lower = try booleanLiteralExpressionAlloc(alloc, false);
-    defer freeExpression(alloc, between_lower);
-    const between_upper = try booleanLiteralExpressionAlloc(alloc, true);
-    defer freeExpression(alloc, between_upper);
-    try appendExpressionBetweenSymmetricGroups(alloc, &appended_groups, between_lhs, between_lower, between_upper, false);
-
-    try std.testing.expectEqual(@as(usize, 3), appended_groups.items.len);
-    try std.testing.expectEqual(@as(usize, 1), appended_groups.items[0].conditions.len);
-    try std.testing.expectEqual(@as(usize, 2), appended_groups.items[1].conditions.len);
-    try std.testing.expectEqual(@as(usize, 2), appended_groups.items[2].conditions.len);
-
     var scalar_branches = std.ArrayListUnmanaged(ScalarOrCheckBranch).empty;
     defer freeScalarOrCheckBranches(alloc, &scalar_branches);
     try scalar_branches.append(alloc, .empty);
@@ -39437,7 +33416,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqual(@as(usize, 2), using_pos);
     try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, using_order.direction);
 
-    const json_extract_expression = try expressionFromJsonExtractProjectionAlloc(alloc, .{
+    const json_extract_expression = try expr_projection.expressionFromJsonExtractProjectionAlloc(alloc, .{
         .output = "metadata_source",
         .field = "metadata",
         .path = "source",
@@ -39449,7 +33428,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expect(json_extract_expression.json_as_text);
     try std.testing.expectEqualStrings("metadata", json_extract_expression.operands[0].field);
 
-    const array_length_expression = try expressionFromArrayLengthProjectionAlloc(alloc, .{
+    const array_length_expression = try expr_projection.expressionFromArrayLengthProjectionAlloc(alloc, .{
         .output = "tag_count",
         .field = "tags",
     });
@@ -39457,7 +33436,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.array_length, array_length_expression.kind);
     try std.testing.expectEqualStrings("tags", array_length_expression.operands[0].field);
 
-    const coalesce_expression = try expressionFromCoalesceProjectionAlloc(alloc, .{
+    const coalesce_expression = try expr_projection.expressionFromCoalesceProjectionAlloc(alloc, .{
         .output = "status_coalesced",
         .operands = &.{
             .{ .kind = .field, .field = "status" },
@@ -39493,27 +33472,27 @@ test "sql adapter lower expr assembles boolean predicate groups" {
         },
         .select_all = true,
     };
-    var ordinal_base_order = try selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 1);
+    var ordinal_base_order = try expr_projection.selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 1);
     defer freeOrderBy(alloc, (&ordinal_base_order)[0..1]);
     try std.testing.expectEqualStrings("id", ordinal_base_order.field);
-    var ordinal_star_order = try selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 3);
+    var ordinal_star_order = try expr_projection.selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 3);
     defer freeOrderBy(alloc, (&ordinal_star_order)[0..1]);
     try std.testing.expectEqualStrings("tenant_id", ordinal_star_order.field);
     try std.testing.expectEqualStrings("tenant.case_insensitive", ordinal_star_order.collation.?);
-    var ordinal_projected_order = try selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 4);
+    var ordinal_projected_order = try expr_projection.selectOutputOrderByOrdinalAlloc(alloc, order_schema, order_select, 4);
     defer freeOrderBy(alloc, (&ordinal_projected_order)[0..1]);
     try std.testing.expectEqualStrings("status", ordinal_projected_order.field);
     try std.testing.expectEqualStrings("antfly.case_insensitive", ordinal_projected_order.collation.?);
     var alias_pos: usize = 0;
     const alias_tokens = [_]Token{.{ .kind = .identifier, .text = "tenant", .source_start = 0, .source_end = 6 }};
-    var alias_order = (try parseSelectOutputOrderByNameMaybeAlloc(alloc, alias_tokens[0..], &alias_pos, order_schema, order_select)).?;
+    var alias_order = (try expr_projection.parseSelectOutputOrderByNameMaybeAlloc(alloc, alias_tokens[0..], &alias_pos, order_schema, order_select)).?;
     defer freeOrderBy(alloc, (&alias_order)[0..1]);
     try std.testing.expectEqual(@as(usize, 1), alias_pos);
     try std.testing.expectEqualStrings("tenant_id", alias_order.field);
     try std.testing.expectEqualStrings("tenant.case_insensitive", alias_order.collation.?);
     var expression_pos: usize = 0;
     const expression_tokens = [_]Token{.{ .kind = .identifier, .text = "always_true", .source_start = 0, .source_end = 11 }};
-    var expression_order = (try parseSelectOutputOrderByNameMaybeAlloc(alloc, expression_tokens[0..], &expression_pos, order_schema, order_select)).?;
+    var expression_order = (try expr_projection.parseSelectOutputOrderByNameMaybeAlloc(alloc, expression_tokens[0..], &expression_pos, order_schema, order_select)).?;
     defer freeOrderBy(alloc, (&expression_order)[0..1]);
     try std.testing.expectEqual(@as(usize, 1), expression_pos);
     try std.testing.expect(expression_order.expression != null);
@@ -39523,7 +33502,7 @@ test "sql adapter lower expr assembles boolean predicate groups" {
         .{ .kind = .identifier, .text = "tenant", .source_start = 0, .source_end = 6 },
         .{ .kind = .plus, .text = "+", .source_start = 7, .source_end = 8 },
     };
-    try std.testing.expect((try parseSelectOutputOrderByNameMaybeAlloc(alloc, operator_tokens[0..], &operator_pos, order_schema, order_select)) == null);
+    try std.testing.expect((try expr_projection.parseSelectOutputOrderByNameMaybeAlloc(alloc, operator_tokens[0..], &operator_pos, order_schema, order_select)) == null);
     try std.testing.expectEqual(@as(usize, 0), operator_pos);
 
     var access_branches = std.ArrayListUnmanaged(AccessPredicateBranch).empty;
@@ -39551,28 +33530,6 @@ test "sql adapter lower expr assembles boolean predicate groups" {
     const owned_access_group = try accessPredicateBranchToGroupAlloc(alloc, &access_branches.items[0]);
     defer freeAccessPredicateGroup(alloc, owned_access_group);
     try std.testing.expect(accessPredicateGroupHasAnyPredicate(owned_access_group));
-
-    var left_conditions = try alloc.alloc(runtime_schema.RelationalRowsExpressionCondition, 2);
-    left_conditions[0] = try testOwnedBooleanConditionAlloc(alloc, true, true);
-    left_conditions[1] = try testOwnedBooleanConditionAlloc(alloc, true, false);
-
-    var right_conditions = try alloc.alloc(runtime_schema.RelationalRowsExpressionCondition, 1);
-    right_conditions[0] = try testOwnedBooleanConditionAlloc(alloc, false, false);
-
-    var groups = [_]runtime_schema.RelationalRowsExpressionPredicateGroup{
-        .{ .conditions = left_conditions },
-        .{ .conditions = right_conditions },
-    };
-    const expression = try booleanExpressionFromPredicateGroupsAlloc(alloc, &groups);
-    defer freeExpression(alloc, expression);
-
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.bool_or, expression.kind);
-    try std.testing.expectEqual(@as(usize, 2), expression.operands.len);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.bool_and, expression.operands[0].kind);
-    try std.testing.expectEqual(@as(usize, 2), expression.operands[0].operands.len);
-    try std.testing.expectEqual(runtime_schema.RelationalRowsExpressionKind.case, expression.operands[1].kind);
-    try std.testing.expectEqual(@as(usize, 0), groups[0].conditions.len);
-    try std.testing.expectEqual(@as(usize, 0), groups[1].conditions.len);
 }
 
 test "sql adapter lower expr validates distinct on order expressions" {
@@ -39620,26 +33577,26 @@ test "sql adapter lower expr validates aggregate helpers" {
         .field = "metadata",
         .value_json = "{\"source\":\"sql\"}",
     }};
-    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, aggregateOpForName("PERCENTILE_CONT").?);
-    try std.testing.expectEqualStrings("array_agg", aggregateOpName(.array_agg));
-    try validateSqlAggregatePercentile(0);
-    try validateSqlAggregatePercentile(1);
-    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlAggregatePercentile(-0.01));
-    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlAggregatePercentile(1.01));
-    try std.testing.expectError(error.UnsupportedSqlShape, validateSqlAggregatePercentile(std.math.inf(f64)));
-    const explicit_alias = try aggregateAliasOrDefaultAlloc(alloc, "total_amount", .sum, "amount");
+    try std.testing.expectEqual(db_mod.types.RelationalRowsAggregateOp.percentile_cont, expr_aggregate.opForName("PERCENTILE_CONT").?);
+    try std.testing.expectEqualStrings("array_agg", expr_aggregate.opName(.array_agg));
+    try expr_aggregate.validatePercentile(0);
+    try expr_aggregate.validatePercentile(1);
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.validatePercentile(-0.01));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.validatePercentile(1.01));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.validatePercentile(std.math.inf(f64)));
+    const explicit_alias = try expr_aggregate.aliasOrDefaultAlloc(alloc, "total_amount", .sum, "amount");
     defer alloc.free(explicit_alias);
     try std.testing.expectEqualStrings("total_amount", explicit_alias);
-    const field_alias = try aggregateAliasOrDefaultAlloc(alloc, null, .sum, "amount");
+    const field_alias = try expr_aggregate.aliasOrDefaultAlloc(alloc, null, .sum, "amount");
     defer alloc.free(field_alias);
     try std.testing.expectEqualStrings("sum_amount", field_alias);
-    const op_alias = try aggregateAliasOrDefaultAlloc(alloc, null, .count, null);
+    const op_alias = try expr_aggregate.aliasOrDefaultAlloc(alloc, null, .count, null);
     defer alloc.free(op_alias);
     try std.testing.expectEqualStrings("count", op_alias);
-    try std.testing.expect(isSqlPercentileAggregateOp(.percentile_disc));
-    try std.testing.expect(!isSqlPercentileAggregateOp(.array_agg));
-    try std.testing.expectEqual(@as(?f64, 1.5), sqlJsonNumberAsF64(.{ .number_string = "1.5" }));
-    try std.testing.expect(sqlJsonNumberAsF64(.{ .string = "1.5" }) == null);
+    try std.testing.expect(expr_aggregate.isPercentileOp(.percentile_disc));
+    try std.testing.expect(!expr_aggregate.isPercentileOp(.array_agg));
+    try std.testing.expectEqual(@as(?f64, 1.5), expr_aggregate.sqlJsonNumberAsF64(.{ .number_string = "1.5" }));
+    try std.testing.expect(expr_aggregate.sqlJsonNumberAsF64(.{ .string = "1.5" }) == null);
 
     const group_projection: db_mod.types.RelationalRowsExpressionProjection = .{
         .output = "status_lower",
@@ -39649,21 +33606,21 @@ test "sql adapter lower expr validates aggregate helpers" {
         .output = "status",
         .field = "status",
     };
-    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, (try jsonValueProjectedType(alloc, "\"open\"")).field_type);
-    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, (try jsonValueProjectedType(alloc, "42")).field_type);
-    try std.testing.expectEqual(runtime_schema.AntflyType.boolean, (try jsonValueProjectedType(alloc, "true")).field_type);
-    try std.testing.expectError(error.UnsupportedSqlShape, jsonValueProjectedType(alloc, "null"));
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, (try expr_projection.jsonValueProjectedType(alloc, "\"open\"")).field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, (try expr_projection.jsonValueProjectedType(alloc, "42")).field_type);
+    try std.testing.expectEqual(runtime_schema.AntflyType.boolean, (try expr_projection.jsonValueProjectedType(alloc, "true")).field_type);
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.jsonValueProjectedType(alloc, "null"));
     const coalesce_columns = [_]runtime_schema.RelationalColumn{.{
         .name = "status",
         .path = "status",
         .field_type = .keyword,
         .array_item_type = null,
     }};
-    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, (try coalesceOutputType(alloc, &coalesce_columns, .{
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, (try expr_projection.coalesceOutputType(alloc, &coalesce_columns, .{
         .output = "status_coalesced",
         .operands = &.{.{ .kind = .field, .field = "status" }},
     })).field_type);
-    const projected_column = try projectedColumnAlloc(alloc, "status", .keyword, null, true);
+    const projected_column = try expr_projection.projectedColumnAlloc(alloc, "status", .keyword, null, true);
     defer {
         alloc.free(projected_column.name);
         alloc.free(projected_column.path);
@@ -39672,46 +33629,46 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expectEqualStrings("status", projected_column.path);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, projected_column.field_type);
     try std.testing.expect(projected_column.nullable);
-    try std.testing.expectEqual(@as(usize, 1), selectListOutputCount(&.{"status"}, &.{}, &.{}, &.{}, &.{}, &.{}, "status"));
-    try std.testing.expectEqual(@as(usize, 2), selectListOutputCount(&.{"status"}, &.{}, &.{}, &.{}, &.{field_alias_projection}, &.{}, "status"));
+    try std.testing.expectEqual(@as(usize, 1), expr_projection.selectListOutputCount(&.{"status"}, &.{}, &.{}, &.{}, &.{}, &.{}, "status"));
+    try std.testing.expectEqual(@as(usize, 2), expr_projection.selectListOutputCount(&.{"status"}, &.{}, &.{}, &.{}, &.{field_alias_projection}, &.{}, "status"));
     const select_schema = runtime_schema.TableSchema{
         .storage_mode = .relational,
         .relational_columns = &.{.{ .name = "status", .path = "status", .field_type = .keyword, .collation = "status_collation" }},
     };
-    try validateSelectListOutputs(select_schema, false, &.{"status"}, &.{}, &.{}, &.{}, &.{}, &.{});
-    try validateSelectListOutputs(select_schema, false, &.{}, &.{.{
+    try expr_projection.validateSelectListOutputs(select_schema, false, &.{"status"}, &.{}, &.{}, &.{}, &.{}, &.{});
+    try expr_projection.validateSelectListOutputs(select_schema, false, &.{}, &.{.{
         .output = "status_json",
         .field = "payload",
         .path = "$.status",
         .as_text = true,
     }}, &.{}, &.{}, &.{}, &.{});
-    try std.testing.expectError(error.UnsupportedSqlShape, validateSelectListOutputs(select_schema, false, &.{"status"}, &.{}, &.{}, &.{}, &.{field_alias_projection}, &.{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.validateSelectListOutputs(select_schema, false, &.{"status"}, &.{}, &.{}, &.{}, &.{field_alias_projection}, &.{}));
     var disambiguated_status: []const u8 = try alloc.dupe(u8, "status");
     defer alloc.free(disambiguated_status);
-    try disambiguateSelectProjectionOutputIfNeededAlloc(alloc, select_schema, true, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &disambiguated_status);
+    try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(alloc, select_schema, true, &.{}, &.{}, &.{}, &.{}, &.{}, &.{}, &disambiguated_status);
     try std.testing.expectEqualStrings("status_2", disambiguated_status);
     var disambiguated_status_again: []const u8 = try alloc.dupe(u8, "status");
     defer alloc.free(disambiguated_status_again);
-    try disambiguateSelectProjectionOutputIfNeededAlloc(alloc, select_schema, true, &.{}, &.{.{
+    try expr_projection.disambiguateSelectProjectionOutputIfNeededAlloc(alloc, select_schema, true, &.{}, &.{.{
         .output = "status_2",
         .field = "payload",
         .path = "$.status",
         .as_text = true,
     }}, &.{}, &.{}, &.{}, &.{}, &disambiguated_status_again);
     try std.testing.expectEqualStrings("status_3", disambiguated_status_again);
-    try std.testing.expectError(error.UnsupportedSqlShape, validateSelectListOutputs(select_schema, true, &.{}, &.{.{
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.validateSelectListOutputs(select_schema, true, &.{}, &.{.{
         .output = "status",
         .field = "payload",
         .path = "$.status",
         .as_text = true,
     }}, &.{}, &.{}, &.{}, &.{}));
-    try validateSelectListOutputs(select_schema, true, &.{}, &.{.{
+    try expr_projection.validateSelectListOutputs(select_schema, true, &.{}, &.{.{
         .output = "status_2",
         .field = "payload",
         .path = "$.status",
         .as_text = true,
     }}, &.{}, &.{}, &.{}, &.{});
-    const select_columns = try selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = select_schema }, .{
+    const select_columns = try expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = select_schema }, .{
         .fields = &.{"status"},
         .json_extract = &.{.{ .output = "status_json", .field = "payload", .path = "$.status", .as_text = true }},
         .array_length = &.{.{ .output = "tag_count", .field = "tags" }},
@@ -39734,12 +33691,12 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, select_columns[2].field_type);
     try std.testing.expectEqualStrings("enabled", select_columns[3].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.boolean, select_columns[3].field_type);
-    try std.testing.expectError(error.UnsupportedSqlShape, selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = select_schema }, .{
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.selectOutputColumnsAlloc(alloc, .{ .alloc = alloc, .schema = select_schema }, .{
         .fields = &.{"status"},
         .outputs = &.{.{ .kind = .field, .index = 1 }},
     }));
-    try validateAggregateGroupBy(&.{"status"}, &.{group_projection}, &.{"status"}, &.{group_projection});
-    try std.testing.expectError(error.UnsupportedSqlShape, validateAggregateGroupBy(&.{"status"}, &.{}, &.{"tenant_id"}, &.{}));
+    try expr_aggregate.validateGroupBy(&.{"status"}, &.{group_projection}, &.{"status"}, &.{group_projection});
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.validateGroupBy(&.{"status"}, &.{}, &.{"tenant_id"}, &.{}));
 
     const aggregate_specs = [_]db_mod.types.RelationalRowsAggregateSpec{.{
         .name = "statuses",
@@ -39751,27 +33708,27 @@ test "sql adapter lower expr validates aggregate helpers" {
         .name = "status",
         .op = .count,
     }};
-    try std.testing.expect(aggregateOutputFieldIsUnique(&.{"status"}, &.{group_projection}, &aggregate_specs, "statuses"));
-    try std.testing.expect(!aggregateOutputFieldIsUnique(&.{"status"}, &.{group_projection}, &duplicate_aggregate_specs, "status"));
+    try std.testing.expect(expr_aggregate.outputFieldIsUnique(&.{"status"}, &.{group_projection}, &aggregate_specs, "statuses"));
+    try std.testing.expect(!expr_aggregate.outputFieldIsUnique(&.{"status"}, &.{group_projection}, &duplicate_aggregate_specs, "status"));
     const output_columns = [_]runtime_schema.RelationalColumn{.{ .name = "statuses", .path = "statuses", .field_type = .array }};
-    try std.testing.expect(aggregateOutputColumnExists(&output_columns, "statuses"));
-    try std.testing.expect(!aggregateOutputColumnExists(&output_columns, "missing"));
-    try validateAggregateSelectListOutputs(&.{"status"}, &.{group_projection}, &aggregate_specs);
-    try std.testing.expectError(error.UnsupportedSqlShape, validateAggregateSelectListOutputs(&.{"status"}, &.{group_projection}, &.{.{
+    try std.testing.expect(expr_projection.outputColumnExists(&output_columns, "statuses"));
+    try std.testing.expect(!expr_projection.outputColumnExists(&output_columns, "missing"));
+    try expr_aggregate.validateSelectListOutputs(&.{"status"}, &.{group_projection}, &aggregate_specs);
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.validateSelectListOutputs(&.{"status"}, &.{group_projection}, &.{.{
         .name = "status_lower",
         .op = .count,
     }}));
-    const ordinal_group_field = try aggregateOutputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 1);
+    const ordinal_group_field = try expr_aggregate.outputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 1);
     defer alloc.free(ordinal_group_field);
     try std.testing.expectEqualStrings("status", ordinal_group_field);
-    const ordinal_group_expression = try aggregateOutputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 2);
+    const ordinal_group_expression = try expr_aggregate.outputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 2);
     defer alloc.free(ordinal_group_expression);
     try std.testing.expectEqualStrings("status_lower", ordinal_group_expression);
-    const ordinal_aggregate = try aggregateOutputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 3);
+    const ordinal_aggregate = try expr_aggregate.outputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 3);
     defer alloc.free(ordinal_aggregate);
     try std.testing.expectEqualStrings("statuses", ordinal_aggregate);
-    try std.testing.expectError(error.UnsupportedSqlShape, aggregateOutputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 0));
-    try std.testing.expectError(error.UnsupportedSqlShape, aggregateOutputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 4));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.outputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 0));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.outputFieldByOrdinalAlloc(alloc, &.{"status"}, &.{group_projection}, &aggregate_specs, 4));
     const group_identifier_tokens = [_]Token{
         .{ .kind = .identifier, .text = "status" },
         .{ .kind = .comma, .text = "," },
@@ -39814,8 +33771,8 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expectEqualStrings("status_lower", bound_group_expressions.items[1].output);
     try appendAggregateGroupByFieldOrAlias(alloc, select_schema, &bound_group_fields, &bound_group_expressions, aggregate_select, try alloc.dupe(u8, "status"), &.{}, &.{}, false);
     try std.testing.expectEqualStrings("status", bound_group_fields.items[1]);
-    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, try aggregateInputType(select_schema, .{ .alloc = alloc, .schema = select_schema }, aggregate_specs[0]));
-    const aggregate_output_columns = try aggregateOutputColumnsAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, try expr_aggregate.inputType(select_schema, .{ .alloc = alloc, .schema = select_schema }, aggregate_specs[0]));
+    const aggregate_output_columns = try expr_aggregate.outputColumnsAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs);
     defer ddl_plan.freeDdlRelationalColumns(alloc, aggregate_output_columns);
     try std.testing.expectEqual(@as(usize, 3), aggregate_output_columns.len);
     try std.testing.expectEqualStrings("status", aggregate_output_columns[0].name);
@@ -39826,10 +33783,10 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expectEqualStrings("statuses", aggregate_output_columns[2].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.array, aggregate_output_columns[2].field_type);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, aggregate_output_columns[2].array_item_type.?);
-    const aggregate_status_lower = try aggregateOutputColumnForFieldAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs, "status_lower");
+    const aggregate_status_lower = try expr_aggregate.outputColumnForFieldAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs, "status_lower");
     defer ddl_plan.freeDdlRelationalColumn(alloc, aggregate_status_lower);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, aggregate_status_lower.field_type);
-    try std.testing.expectError(error.UnsupportedSqlShape, aggregateOutputColumnForFieldAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs, "missing"));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_aggregate.outputColumnForFieldAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, &.{"status"}, &.{group_projection}, &aggregate_specs, "missing"));
     const returning_schema = runtime_schema.TableSchema{
         .storage_mode = .relational,
         .relational_columns = &coalesce_columns,
@@ -39838,47 +33795,33 @@ test "sql adapter lower expr validates aggregate helpers" {
         .output = "status_lower",
         .expression = lower_status,
     };
-    try std.testing.expectEqual(@as(usize, 1), returningFieldOutputCount(&.{"status"}, "status"));
-    try std.testing.expectEqual(@as(usize, 1), returningExpressionOutputCount(&.{returning_expression}, "status_lower"));
-    try validateReturningProjectionOutputs(returning_schema, &.{"status"}, &.{returning_expression});
-    try std.testing.expectError(error.UnsupportedSqlShape, validateReturningProjectionOutputs(returning_schema, &.{ "status", "status" }, &.{}));
-    try std.testing.expectError(error.UnsupportedSqlShape, validateReturningProjectionOutputs(returning_schema, &.{"status"}, &.{.{
+    try std.testing.expectEqual(@as(usize, 1), expr_projection.returningFieldOutputCount(&.{"status"}, "status"));
+    try std.testing.expectEqual(@as(usize, 1), expr_projection.returningExpressionOutputCount(&.{returning_expression}, "status_lower"));
+    try expr_projection.validateReturningProjectionOutputs(returning_schema, &.{"status"}, &.{returning_expression});
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.validateReturningProjectionOutputs(returning_schema, &.{ "status", "status" }, &.{}));
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.validateReturningProjectionOutputs(returning_schema, &.{"status"}, &.{.{
         .output = "status",
         .expression = lower_status,
     }}));
-    try std.testing.expectError(error.UnsupportedSqlShape, validateReturningProjectionOutputs(returning_schema, &.{"*"}, &.{.{
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_projection.validateReturningProjectionOutputs(returning_schema, &.{"*"}, &.{.{
         .output = "status",
         .expression = lower_status,
     }}));
-    try std.testing.expectEqual(@as(usize, 1), expressionOrderCount(&order_by));
-    try std.testing.expectEqual(@as(usize, 0), aggregateFilterGroupCount(&aggregate_specs));
-    try std.testing.expectEqual(@as(usize, 0), aggregateFilterExpressionCount(&aggregate_specs));
-    try std.testing.expectEqual(@as(usize, 0), aggregateFilterExpressionArrayCount(&aggregate_specs));
-    try std.testing.expectEqual(@as(usize, 1), aggregateFilterJsonAccessCount(&aggregate_specs));
-    try std.testing.expectEqual(@as(usize, 0), aggregateFilterStructuredAccessCount(&aggregate_specs));
-    try std.testing.expectEqual(@as(usize, 0), aggregateInputExpressionCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 1), expr_projection.expressionOrderCount(&order_by));
+    try std.testing.expectEqual(@as(usize, 0), expr_aggregate.filterGroupCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), expr_aggregate.filterExpressionCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), expr_aggregate.filterExpressionArrayCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 1), expr_aggregate.filterJsonAccessCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), expr_aggregate.filterStructuredAccessCount(&aggregate_specs));
+    try std.testing.expectEqual(@as(usize, 0), expr_aggregate.inputExpressionCount(&aggregate_specs));
 
     const percentile_specs = [_]db_mod.types.RelationalRowsAggregateSpec{
         .{ .name = "p", .op = .percentile_cont, .field = "amount", .percentile_order = .desc, .percentiles = &.{ 0.5, 0.9 } },
         .{ .name = "m", .op = .mode, .field = "status" },
     };
-    try std.testing.expectEqual(@as(usize, 1), aggregateDescendingPercentileCount(&percentile_specs));
-    try std.testing.expectEqual(@as(usize, 1), aggregatePercentileArrayCount(&percentile_specs));
-    try std.testing.expectEqual(@as(usize, 1), aggregateModeCount(&percentile_specs));
-    const aggregate_schema = runtime_schema.TableSchema{
-        .storage_mode = .relational,
-        .relational_columns = &.{
-            .{ .name = "status", .path = "status", .field_type = .keyword },
-            .{ .name = "amount", .path = "amount", .field_type = .numeric },
-            .{ .name = "enabled", .path = "enabled", .field_type = .boolean },
-        },
-    };
-    const aggregate_type_context = expr_type.RowExpressionTypeContext{ .alloc = alloc, .schema = aggregate_schema };
-    try expr_type.validateAggregateInputExpression(aggregate_type_context, .sum, .{ .kind = .field, .field = "amount" });
-    try std.testing.expectError(error.InvalidSqlCatalog, expr_type.validateAggregateInputExpression(aggregate_type_context, .sum, .{ .kind = .field, .field = "status" }));
-    try expr_type.validateAggregateInputExpression(aggregate_type_context, .mode, .{ .kind = .field, .field = "enabled" });
-    try expr_type.validateAggregateMinMaxRowExpression(aggregate_type_context, .{ .kind = .field, .field = "status" });
-    try std.testing.expectError(error.UnsupportedSqlShape, expr_type.validateAggregateMinMaxRowExpression(aggregate_type_context, .{ .kind = .field, .field = "enabled" }));
+    try std.testing.expectEqual(@as(usize, 1), expr_aggregate.descendingPercentileCount(&percentile_specs));
+    try std.testing.expectEqual(@as(usize, 1), expr_aggregate.percentileArrayCount(&percentile_specs));
+    try std.testing.expectEqual(@as(usize, 1), expr_aggregate.modeCount(&percentile_specs));
 
     const window_specs = [_]db_mod.types.RelationalRowsWindowSpec{.{
         .output = "ranked",
@@ -39899,15 +33842,8 @@ test "sql adapter lower expr validates aggregate helpers" {
             .end = .current_row,
         },
     }};
-    try std.testing.expectEqual(@as(usize, 1), windowValueExpressionCount(&window_specs));
-    try std.testing.expectEqual(@as(usize, 1), windowDefaultCount(&window_specs));
-    try std.testing.expectEqual(@as(usize, 1), windowFilterPredicateCount(&window_specs));
-    try std.testing.expectEqual(@as(usize, 1), windowFilterExpressionCount(&window_specs));
-    try std.testing.expectEqual(@as(usize, 1), windowFilterAccessCount(&window_specs));
-    try std.testing.expectEqual(@as(usize, 0), windowFilterGroupCount(&window_specs));
-    try std.testing.expect(windowFrameSignature(&window_specs) != 0);
-    try validateWindowSelectListOutputs(&.{"status"}, &window_specs);
-    try std.testing.expectError(error.UnsupportedSqlShape, validateWindowSelectListOutputs(&.{"ranked"}, &window_specs));
+    try expr_window.validateSelectListOutputs(&.{"status"}, &window_specs);
+    try std.testing.expectError(error.UnsupportedSqlShape, expr_window.validateSelectListOutputs(&.{"ranked"}, &window_specs));
     const window_select = plan_mod.WindowSelectList{
         .fields = &.{"status"},
         .windows = &window_specs,
@@ -39916,10 +33852,10 @@ test "sql adapter lower expr validates aggregate helpers" {
             .{ .kind = .window, .index = 0 },
         },
     };
-    const window_ordinal_field = try windowOutputFieldByOrdinalAlloc(alloc, window_select, 2);
+    const window_ordinal_field = try expr_window.outputFieldByOrdinalAlloc(alloc, window_select, 2);
     defer alloc.free(window_ordinal_field);
     try std.testing.expectEqualStrings("ranked", window_ordinal_field);
-    const window_output_columns = try windowOutputColumnsAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, window_select);
+    const window_output_columns = try expr_window.outputColumnsAlloc(alloc, select_schema, .{ .alloc = alloc, .schema = select_schema }, window_select);
     defer ddl_plan.freeDdlRelationalColumns(alloc, window_output_columns);
     try std.testing.expectEqual(@as(usize, 2), window_output_columns.len);
     try std.testing.expectEqualStrings("status", window_output_columns[0].name);
@@ -39937,95 +33873,11 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expectEqualStrings("joined_status", join_output_columns[0].name);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, join_output_columns[0].field_type);
     try std.testing.expectEqualStrings("status_collation", join_output_columns[0].collation.?);
-    try std.testing.expect(windowFunctionRequiresOrder(.lag));
-    try std.testing.expect(!windowFunctionRequiresOrder(.count));
-    try std.testing.expectEqualStrings("row_number", windowFunctionName(.row_number));
-    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, try expr_type.windowOutputType(.row_number, null));
-    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, try expr_type.windowOutputType(.lag, .keyword));
-    try std.testing.expectError(error.UnsupportedSqlShape, expr_type.windowOutputType(.lag, null));
-    try validateWindowFrame(.{
-        .unit = .rows,
-        .start = .offset_preceding,
-        .start_offset = 1,
-        .end = .current_row,
-    });
-    try std.testing.expectError(error.UnsupportedSqlShape, validateWindowFrame(.{
-        .unit = .rows,
-        .start = .offset_following,
-        .start_offset = 1,
-        .end = .offset_preceding,
-        .end_offset = 1,
-    }));
-    const range_frame = db_mod.types.RelationalRowsWindowFrame{
-        .unit = .range,
-        .start = .offset_preceding,
-        .start_offset = 1,
-        .end = .current_row,
-    };
-    try validateWindowFrameForOrder(aggregate_schema, aggregate_type_context, range_frame, &.{.{ .field = "amount" }});
-    try std.testing.expectError(error.UnsupportedSqlShape, validateWindowFrameForOrder(aggregate_schema, aggregate_type_context, range_frame, &.{.{ .field = "status" }}));
-    try std.testing.expectError(error.UnsupportedSqlShape, validateWindowFrameForOrder(aggregate_schema, aggregate_type_context, range_frame, &.{.{ .field = "amount", .null_test = .is_null }}));
-    try std.testing.expectError(error.UnsupportedSqlShape, validateWindowFrameBoundOffset(.current_row, 1));
-    try std.testing.expect(windowFrameBoundOrdinal(.unbounded_preceding, 0) < windowFrameBoundOrdinal(.current_row, 0));
-    try std.testing.expect(windowFunctionSupportsFilter(.count));
-    try std.testing.expect(!windowFunctionSupportsFilter(.lag));
-    try std.testing.expectEqual(runtime_schema.AntflyType.array, (try aggregateOutputProjectedType(.{
-        .name = "values",
-        .op = .array_agg,
-    }, .keyword)).field_type);
-    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, (try aggregateOutputProjectedType(.{
-        .name = "values",
-        .op = .array_agg,
-    }, .keyword)).array_item_type.?);
-    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, (try aggregateOutputProjectedType(.{
-        .name = "p95",
-        .op = .percentile_cont,
-    }, null)).field_type);
-    try std.testing.expectEqual(runtime_schema.AntflyType.array, (try aggregateOutputProjectedType(.{
-        .name = "percentiles",
-        .op = .percentile_disc,
-        .percentiles = &.{ 0.5, 0.95 },
-    }, null)).field_type);
-    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, (try aggregateOutputProjectedType(.{
-        .name = "percentiles",
-        .op = .percentile_disc,
-        .percentiles = &.{ 0.5, 0.95 },
-    }, null)).array_item_type.?);
-    try std.testing.expectEqual(runtime_schema.AntflyType.datetime, (try aggregateOutputProjectedType(.{
-        .name = "latest",
-        .op = .max,
-    }, .datetime)).field_type);
-    try std.testing.expectError(error.UnsupportedSqlShape, aggregateOutputProjectedType(.{
-        .name = "missing",
-        .op = .array_agg,
-    }, null));
-    const interval_expression: runtime_schema.RelationalRowsExpression = .{
-        .kind = .interval_ns,
-        .operands = &.{.{ .kind = .value, .value_json = "1000" }},
-    };
-    const nested_interval_expression: runtime_schema.RelationalRowsExpression = .{
-        .kind = .add,
-        .operands = &.{
-            .{ .kind = .field, .field = "created_at" },
-            interval_expression,
-        },
-    };
-    try std.testing.expect(expr_type.sqlExpressionIsInterval(interval_expression));
-    try std.testing.expect(expr_type.sqlExpressionContainsInterval(nested_interval_expression));
-    try std.testing.expect(!expr_type.sqlExpressionContainsInterval(.{ .kind = .field, .field = "created_at" }));
-    try std.testing.expect(aggregateFilterIsEmpty(.{}));
-    const owned_filter_predicates = try alloc.alloc(runtime_schema.RelationalCheck, 1);
-    const owned_filter_field = try alloc.dupe(u8, "status");
-    const owned_filter_value = try alloc.dupe(u8, "\"open\"");
-    owned_filter_predicates[0] = .{
-        .name = "",
-        .field = owned_filter_field,
-        .op = .eq,
-        .value_json = owned_filter_value,
-    };
-    const owned_filter: AggregateFilter = .{ .predicates = owned_filter_predicates };
-    defer freeAggregateFilter(alloc, owned_filter);
-    try std.testing.expect(!aggregateFilterIsEmpty(owned_filter));
+    try std.testing.expect(expr_window.functionRequiresOrder(.lag));
+    try std.testing.expect(!expr_window.functionRequiresOrder(.count));
+    try std.testing.expectEqualStrings("row_number", expr_window.functionName(.row_number));
+    try std.testing.expect(expr_window.functionSupportsFilter(.count));
+    try std.testing.expect(!expr_window.functionSupportsFilter(.lag));
 
     try std.testing.expect(identifierContainsQualifier("left.status"));
     try std.testing.expect(!identifierContainsQualifier("status"));
@@ -40058,103 +33910,7 @@ test "sql adapter lower expr validates aggregate helpers" {
     try std.testing.expect(!joinProjectionOutputIsUnique(&duplicate_join_projections, "id"));
 }
 
-test "sql adapter lower expr handles selector expression helpers" {
-    const SelectorValue = struct {
-        field: []const u8,
-        value_json: []const u8,
-    };
-    const selector_values = [_]SelectorValue{
-        .{ .field = "status", .value_json = "\"Active User\"" },
-        .{ .field = "tenant_id", .value_json = "\"tenant-a\"" },
-        .{ .field = "amount", .value_json = "42" },
-    };
-    const lower_selector: runtime_schema.RelationalRowsExpression = .{
-        .kind = .lower,
-        .operands = &.{.{ .kind = .field, .field = "status", .field_source = .row }},
-    };
-    const lower_json = try selectorExpressionValueJsonAlloc(std.testing.allocator, lower_selector, &selector_values);
-    defer std.testing.allocator.free(lower_json);
-    try std.testing.expectEqualStrings("\"active user\"", lower_json);
-
-    const concat_selector: runtime_schema.RelationalRowsExpression = .{
-        .kind = .concat_ws,
-        .operands = &.{
-            .{ .kind = .value, .value_json = "\"/\"" },
-            .{ .kind = .field, .field = "tenant_id", .field_source = .row },
-            .{ .kind = .field, .field = "status", .field_source = .row },
-        },
-    };
-    const concat_json = try selectorExpressionValueJsonAlloc(std.testing.allocator, concat_selector, &selector_values);
-    defer std.testing.allocator.free(concat_json);
-    try std.testing.expectEqualStrings("\"tenant-a/Active User\"", concat_json);
-    try std.testing.expectEqualStrings("\"Active User\"", fieldValueJsonFor(&selector_values, "status").?);
-    try std.testing.expect(fieldValuesContain(&selector_values, "tenant_id"));
-    try std.testing.expect(!fieldValuesContain(&selector_values, "missing"));
-    try std.testing.expect(fieldValuesMatchColumns(&selector_values, &.{ "status", "tenant_id", "amount" }));
-    try std.testing.expect(!fieldValuesMatchColumns(&selector_values, &.{ "status", "tenant_id" }));
-
-    var selected_fields: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    errdefer selected_fields.deinit();
-    try writeFieldValuesObjectJson(&selected_fields.writer, &selector_values, &.{ "tenant_id", "status" });
-    const selected_json = try selected_fields.toOwnedSlice();
-    defer std.testing.allocator.free(selected_json);
-    try std.testing.expectEqualStrings("{\"tenant_id\":\"tenant-a\",\"status\":\"Active User\"}", selected_json);
-
-    var all_fields: std.Io.Writer.Allocating = .init(std.testing.allocator);
-    errdefer all_fields.deinit();
-    try writeAllFieldValuesObjectJson(&all_fields.writer, &selector_values);
-    const all_json = try all_fields.toOwnedSlice();
-    defer std.testing.allocator.free(all_json);
-    try std.testing.expectEqualStrings("{\"status\":\"Active User\",\"tenant_id\":\"tenant-a\",\"amount\":42}", all_json);
-
-    var left_number = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "42", .{});
-    defer left_number.deinit();
-    var right_number = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, "43", .{});
-    defer right_number.deinit();
-    try std.testing.expectEqual(SelectorJsonOrder.lt, selectorCompareJsonScalars(left_number.value, right_number.value) orelse return error.TestUnexpectedResult);
-    try std.testing.expect(selectorJsonValuesEqual(left_number.value, left_number.value));
-
-    const md5_hex = try md5HexTextAlloc(std.testing.allocator, "hello");
-    defer std.testing.allocator.free(md5_hex);
-    try std.testing.expectEqualStrings("5d41402abc4b2a76b9719d911017c592", md5_hex);
-    const initcap = try initcapTextAlloc(std.testing.allocator, "hello SQL-world");
-    defer std.testing.allocator.free(initcap);
-    try std.testing.expectEqualStrings("Hello Sql-World", initcap);
-    const arithmetic_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "amount" },
-        .{ .kind = .plus, .text = "+" },
-        .{ .kind = .identifier, .text = "interval" },
-    };
-    try std.testing.expectEqual(TokenKind.plus, expr_operator.peekArithmeticOperator(&arithmetic_tokens, 1).?.token);
-    try std.testing.expect(expr_operator.peekArithmeticRhsKeyword(&arithmetic_tokens, 0, "interval"));
-    try std.testing.expect(!expr_operator.peekArithmeticRhsKeyword(&arithmetic_tokens, 1, "interval"));
-    var comparison_pos: usize = 0;
-    const comparison_tokens = [_]Token{.{ .kind = .gte, .text = ">=" }};
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, try expr_operator.parseComparisonOp(&comparison_tokens, &comparison_pos));
-    try std.testing.expectEqual(@as(usize, 1), comparison_pos);
-    var postfix_pos: usize = 0;
-    const postfix_tokens = [_]Token{.{ .kind = .identifier, .text = "notnull" }};
-    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, expr_operator.matchPostfixNullTest(&postfix_tokens, &postfix_pos).?);
-    try std.testing.expectEqual(@as(usize, 1), postfix_pos);
-    try std.testing.expect(expr_operator.tokenKindIsJsonExtractOperator(.arrow_json));
-    try std.testing.expect(expr_operator.tokenKindIsJsonExtractOperator(.path_arrow_text));
-    try std.testing.expect(expr_operator.tokenKindIsJsonExtractTextOperator(.arrow_text));
-    try std.testing.expect(!expr_operator.tokenKindIsJsonExtractTextOperator(.arrow_json));
-    try std.testing.expect(expr_operator.tokenKindIsJsonExtractPathOperator(.path_arrow_json));
-    try std.testing.expect(!expr_operator.tokenKindIsJsonExtractPathOperator(.arrow_json));
-    const json_extract_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .arrow_text, .text = "->>" },
-        .{ .kind = .string, .text = "status" },
-        .{ .kind = .identifier, .text = "is" },
-        .{ .kind = .identifier, .text = "not" },
-        .{ .kind = .identifier, .text = "distinct" },
-        .{ .kind = .identifier, .text = "from" },
-        .{ .kind = .string, .text = "active" },
-    };
-    try std.testing.expect(expr_operator.jsonExtractExpressionCanStartAt(&json_extract_tokens, 0));
-    try std.testing.expect(!expr_operator.jsonExtractExpressionPredicateCanStartAt(&json_extract_tokens, 0));
-    try std.testing.expect(expr_operator.jsonExtractNullSafeDistinctPredicateCanStartAt(&json_extract_tokens, 0));
+test "sql adapter lower expr handles expression operator helpers" {
     const aggregate_json_eq_tokens = [_]Token{
         .{ .kind = .identifier, .text = "metadata" },
         .{ .kind = .arrow_text, .text = "->>" },
@@ -40163,30 +33919,6 @@ test "sql adapter lower expr handles selector expression helpers" {
         .{ .kind = .identifier, .text = "true" },
     };
     try std.testing.expect(aggregateJsonPathEqFilterCanStartAt(&aggregate_json_eq_tokens, 0));
-    const json_null_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .arrow_json, .text = "->" },
-        .{ .kind = .placeholder, .text = "$1" },
-        .{ .kind = .identifier, .text = "is" },
-        .{ .kind = .identifier, .text = "null" },
-    };
-    try std.testing.expect(expr_operator.jsonExtractNullTestPredicateCanStartAt(&json_null_tokens, 0));
-    const json_membership_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .arrow_text, .text = "->>" },
-        .{ .kind = .string, .text = "status" },
-        .{ .kind = .identifier, .text = "not" },
-        .{ .kind = .identifier, .text = "in" },
-    };
-    try std.testing.expect(expr_operator.jsonExtractMembershipPredicateCanStartAt(&json_membership_tokens, 0));
-    const json_all_membership_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .arrow_text, .text = "->>" },
-        .{ .kind = .string, .text = "status" },
-        .{ .kind = .eq, .text = "=" },
-        .{ .kind = .identifier, .text = "ALL", .keyword = .all },
-    };
-    try std.testing.expect(expr_operator.jsonExtractMembershipPredicateCanStartAt(&json_all_membership_tokens, 0));
     const not_group_tokens = [_]Token{
         .{ .kind = .identifier, .text = "not" },
         .{ .kind = .lparen, .text = "(" },
@@ -40209,300 +33941,16 @@ test "sql adapter lower expr handles selector expression helpers" {
     };
     try std.testing.expect(matchBooleanGroupOpen(&parenthesized_group_tokens, &group_pos));
     try std.testing.expectEqual(@as(usize, 1), group_pos);
-    var regex_pos: usize = 0;
-    const regex_tokens = [_]Token{.{ .kind = .regex_not_imatch, .text = "!~*" }};
-    const regex_operator = expr_operator.matchRegexPredicateOperator(&regex_tokens, &regex_pos) orelse return error.TestUnexpectedResult;
-    try std.testing.expect(regex_operator.case_insensitive);
-    try std.testing.expect(regex_operator.negated);
-    try std.testing.expectEqual(@as(usize, 1), regex_pos);
-    const regex_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .regex_not_imatch,
-        .operator_tokens = .{ .start = 0, .end = 1 },
-        .right_tokens = .{ .start = 1, .end = 2 },
-    };
-    const regex_expression_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "status" },
-        .{ .kind = .regex_not_imatch, .text = "!~*" },
-        .{ .kind = .string, .text = "closed.*" },
-    };
-    var ranged_regex_right_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .token_range,
-        .tokens = .{ .start = 2, .end = 3 },
-    };
-    const ranged_regex_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .regex_not_imatch,
-        .tokens = .{ .start = 0, .end = 3 },
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .right_tokens = .{ .start = 2, .end = 3 },
-        .right_expression_kind = .token_range,
-        .right_expression = &ranged_regex_right_expression,
-    };
-    try validateGeneratedRegexPredicateExpression(&ranged_regex_expression, &regex_expression_tokens, 1, true, true);
-    const stale_regex_payload_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .regex_not_imatch,
-        .tokens = .{ .start = 0, .end = 3 },
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .right_tokens = .{ .start = 2, .end = 3 },
-        .right_expression_kind = .token_range,
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRegexPredicateExpression(&stale_regex_payload_expression, &regex_expression_tokens, 1, true, true),
-    );
-    const stale_regex_tokens = [_]Token{.{ .kind = .regex_match, .text = "~" }};
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRegexPredicateExpression(&regex_expression, &stale_regex_tokens, 0, true, true),
-    );
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRegexPredicateExpression(&regex_expression, &regex_tokens, 0, false, false),
-    );
-    const regex_expression_without_right = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .regex_not_imatch,
-        .operator_tokens = .{ .start = 0, .end = 1 },
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRegexPredicateExpression(&regex_expression_without_right, &regex_tokens, 0, true, true),
-    );
-    const in_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "status" },
-        .{ .kind = .identifier, .text = "in", .keyword = .in },
-        .{ .kind = .lparen, .text = "(" },
-        .{ .kind = .string, .text = "active" },
-        .{ .kind = .rparen, .text = ")" },
-    };
-    const in_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .in_list,
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .right_tokens = .{ .start = 2, .end = 5 },
-    };
-    try validateGeneratedSetOrBetweenPredicateIdentity(&in_expression, .in_list, &in_tokens, 1, null, null);
-    const not_in_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "status" },
-        .{ .kind = .identifier, .text = "not", .keyword = .not },
-        .{ .kind = .identifier, .text = "in", .keyword = .in },
-        .{ .kind = .lparen, .text = "(" },
-        .{ .kind = .string, .text = "active" },
-        .{ .kind = .rparen, .text = ")" },
-    };
-    const not_in_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .not_in_list,
-        .negation_tokens = .{ .start = 1, .end = 2 },
-        .operator_tokens = .{ .start = 2, .end = 3 },
-        .right_tokens = .{ .start = 3, .end = 6 },
-    };
-    try validateGeneratedSetOrBetweenPredicateIdentity(&not_in_expression, .not_in_list, &not_in_tokens, 2, 1, null);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedSetOrBetweenPredicateIdentity(&not_in_expression, .not_in_list, &not_in_tokens, 2, null, null),
-    );
-    const between_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "amount" },
-        .{ .kind = .identifier, .text = "between", .keyword = .between },
-        .{ .kind = .identifier, .text = "symmetric", .keyword = .symmetric },
-        .{ .kind = .number, .text = "1" },
-        .{ .kind = .identifier, .text = "and", .keyword = .@"and" },
-        .{ .kind = .number, .text = "3" },
-    };
-    const between_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .between,
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .between_modifier_tokens = .{ .start = 2, .end = 3 },
-        .between_modifier = .symmetric,
-        .between_lower_tokens = .{ .start = 3, .end = 4 },
-        .between_upper_tokens = .{ .start = 5, .end = 6 },
-    };
-    try validateGeneratedSetOrBetweenPredicateIdentity(&between_expression, .between, &between_tokens, 1, null, 2);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedSetOrBetweenPredicateIdentity(&between_expression, .between, &between_tokens, 1, null, null),
-    );
-    const contains_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .at_contains, .text = "@>" },
-        .{ .kind = .string, .text = "{\"status\":\"active\"}" },
-    };
-    const contains_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .contains,
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .right_tokens = .{ .start = 2, .end = 3 },
-    };
-    try validateGeneratedSingleOperatorPredicateIdentity(&contains_expression, .contains, &contains_tokens, 1);
-    const stale_contains_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .range_overlap, .text = "&&" },
-        .{ .kind = .string, .text = "{\"status\":\"active\"}" },
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedSingleOperatorPredicateIdentity(&contains_expression, .contains, &stale_contains_tokens, 1),
-    );
-    const stale_contains_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .contains,
-        .operator_tokens = .{ .start = 2, .end = 3 },
-        .right_tokens = .{ .start = 2, .end = 3 },
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedSingleOperatorPredicateIdentity(&stale_contains_expression, .contains, &contains_tokens, 1),
-    );
-    const generated_comparison_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "amount" },
-        .{ .kind = .gte, .text = ">=" },
-        .{ .kind = .number, .text = "10" },
-    };
-    const generated_comparison_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .comparison,
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .right_tokens = .{ .start = 2, .end = 3 },
-    };
-    try validateGeneratedComparisonPredicateExpression(&generated_comparison_expression, &generated_comparison_tokens, 1, .gte);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedComparisonPredicateExpression(&generated_comparison_expression, &generated_comparison_tokens, 1, .gt),
-    );
-    const distinct_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "status" },
-        .{ .kind = .identifier, .text = "is", .keyword = .is },
-        .{ .kind = .identifier, .text = "not", .keyword = .not },
-        .{ .kind = .identifier, .text = "distinct", .keyword = .distinct },
-        .{ .kind = .identifier, .text = "from", .keyword = .from },
-        .{ .kind = .string, .text = "active" },
-    };
-    const distinct_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_distinct_from,
-        .tokens = .{ .start = 0, .end = 6 },
-        .operator_tokens = .{ .start = 1, .end = 5 },
-    };
-    try validateGeneratedIsTailPredicateExpression(&distinct_expression, &distinct_tokens, 1, .{
-        .op = .is_not_distinct,
-        .kind = .distinct_comparison,
-    });
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedIsTailPredicateExpression(&distinct_expression, &distinct_tokens, 2, .{
-            .op = .is_not_distinct,
-            .kind = .distinct_comparison,
-        }),
-    );
-    const stale_distinct_payload_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_distinct_from,
-        .tokens = .{ .start = 0, .end = 6 },
-        .operator_tokens = .{ .start = 1, .end = 5 },
-        .right_expression_kind = .token_range,
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedIsTailPredicateExpression(&stale_distinct_payload_expression, &distinct_tokens, 1, .{
-            .op = .is_not_distinct,
-            .kind = .distinct_comparison,
-        }),
-    );
-    const relational_distinct_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_distinct_from,
-        .operator_tokens = .{ .start = 1, .end = 5 },
-        .right_tokens = .{ .start = 5, .end = 6 },
-    };
-    try validateGeneratedRelationalPredicateIdentity(&relational_distinct_expression, &distinct_tokens, 1, .is_not_distinct);
-    const stale_relational_distinct_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_distinct_from,
-        .operator_tokens = .{ .start = 2, .end = 5 },
-        .right_tokens = .{ .start = 5, .end = 6 },
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRelationalPredicateIdentity(&stale_relational_distinct_expression, &distinct_tokens, 1, .is_not_distinct),
-    );
-    const postfix_null_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "status" },
-        .{ .kind = .identifier, .text = "notnull", .keyword = .notnull },
-    };
-    const postfix_null_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_null,
-        .tokens = .{ .start = 0, .end = 2 },
-        .operator_tokens = .{ .start = 1, .end = 2 },
-    };
-    try validateGeneratedPostfixNullPredicateExpression(&postfix_null_expression, &postfix_null_tokens, 1, .is_not_null);
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedPostfixNullPredicateExpression(&postfix_null_expression, &postfix_null_tokens, 1, .is_null),
-    );
-    const stale_postfix_null_payload_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_null,
-        .tokens = .{ .start = 0, .end = 2 },
-        .operator_tokens = .{ .start = 1, .end = 2 },
-        .right_expression_kind = .token_range,
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedPostfixNullPredicateExpression(&stale_postfix_null_payload_expression, &postfix_null_tokens, 1, .is_not_null),
-    );
-    const infix_null_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "status" },
-        .{ .kind = .identifier, .text = "is", .keyword = .is },
-        .{ .kind = .identifier, .text = "null", .keyword = .null },
-    };
-    const infix_null_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_null,
-        .tokens = .{ .start = 0, .end = 3 },
-        .operator_tokens = .{ .start = 1, .end = 3 },
-    };
-    try validateGeneratedRelationalPredicateIdentity(&infix_null_expression, &infix_null_tokens, 1, .is_null);
-    const stale_infix_null_payload_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_null,
-        .tokens = .{ .start = 0, .end = 3 },
-        .operator_tokens = .{ .start = 1, .end = 3 },
-        .right_expression_kind = .token_range,
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRelationalPredicateIdentity(&stale_infix_null_payload_expression, &infix_null_tokens, 1, .is_null),
-    );
-    const stale_infix_null_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_null,
-        .operator_tokens = .{ .start = 2, .end = 3 },
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRelationalPredicateIdentity(&stale_infix_null_expression, &infix_null_tokens, 1, .is_null),
-    );
-    const boolean_is_not_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "enabled" },
-        .{ .kind = .identifier, .text = "is", .keyword = .is },
-        .{ .kind = .identifier, .text = "not", .keyword = .not },
-        .{ .kind = .identifier, .text = "true", .keyword = .true },
-    };
-    const boolean_is_not_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_true,
-        .operator_tokens = .{ .start = 1, .end = 4 },
-    };
-    try validateGeneratedBooleanIsPredicateExpression(&boolean_is_not_expression, &boolean_is_not_tokens, 1, .is_not_true);
-    const stale_boolean_is_not_expression = generated_parser.GeneratedSqlExpressionAst{
-        .kind = .is_not_true,
-        .operator_tokens = .{ .start = 2, .end = 4 },
-    };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedBooleanIsPredicateExpression(&stale_boolean_is_not_expression, &boolean_is_not_tokens, 1, .is_not_true),
-    );
     const generated_field_tokens = [_]Token{.{ .kind = .identifier, .text = "status" }};
-    const generated_field_expression = db_mod.types.RelationalRowsExpression{ .kind = .field, .field = "status" };
     const generated_field_ast = generated_parser.GeneratedSqlExpressionAst{
         .kind = .token_range,
         .tokens = .{ .start = 0, .end = 1 },
     };
-    try validateGeneratedRowExpressionIdentity(&generated_field_tokens, 0, 1, generated_field_expression, &generated_field_ast);
     const stale_generated_field_ast = generated_parser.GeneratedSqlExpressionAst{
         .kind = .token_range,
         .tokens = .{ .start = 0, .end = 1 },
         .right_expression_kind = .token_range,
     };
-    try std.testing.expectError(
-        error.UnsupportedSqlShape,
-        validateGeneratedRowExpressionIdentity(&generated_field_tokens, 0, 1, generated_field_expression, &stale_generated_field_ast),
-    );
     try validateGeneratedSimpleGroupExpression(&generated_field_tokens, &generated_field_ast);
     try validateGeneratedSimpleReturningExpression(&generated_field_tokens, &generated_field_ast);
     try validateGeneratedSimpleOrderExpression(&generated_field_tokens, &generated_field_ast);
@@ -40518,11 +33966,6 @@ test "sql adapter lower expr handles selector expression helpers" {
         error.UnsupportedSqlShape,
         validateGeneratedSimpleOrderExpression(&generated_field_tokens, &stale_generated_field_ast),
     );
-    const json_key_set_tokens = [_]Token{
-        .{ .kind = .identifier, .text = "metadata" },
-        .{ .kind = .question_any, .text = "?|" },
-    };
-    try std.testing.expect(expr_operator.jsonKeySetExpressionCanStartAt(&json_key_set_tokens, 0));
 
     const generated_columns = [_]runtime_schema.RelationalColumn{
         .{
@@ -40533,9 +33976,9 @@ test "sql adapter lower expr handles selector expression helpers" {
         },
     };
     const generated_schema: runtime_schema.TableSchema = .{ .relational_columns = &generated_columns };
-    try std.testing.expectEqualStrings("status_lower", generatedUnaryTextColumnForField(generated_schema, .lower, "status").?.name);
-    try std.testing.expect(generatedUnaryTextColumnForField(generated_schema, .upper, "status") == null);
-    try std.testing.expect(generatedUnaryTextColumnForField(generated_schema, .concat, "status") == null);
+    try std.testing.expectEqualStrings("status_lower", expr_generated.generatedUnaryTextColumnForField(generated_schema, .lower, "status").?.name);
+    try std.testing.expect(expr_generated.generatedUnaryTextColumnForField(generated_schema, .upper, "status") == null);
+    try std.testing.expect(expr_generated.generatedUnaryTextColumnForField(generated_schema, .concat, "status") == null);
 }
 
 test "sql adapter lower expr lowers non recursive cte query plans" {

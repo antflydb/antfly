@@ -250,6 +250,27 @@ pub fn restoreLocalTable(
     owned_backend_runtime = null;
 }
 
+fn hasMatchingDeferredRestoreRepairState(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    plan: backups_api.TableRestorePlan,
+    group_id: u64,
+    snapshot_path: []const u8,
+) !bool {
+    var state = (try db_mod.DB.readRestoreStateForPath(alloc, path)) orelse return false;
+    defer state.deinit(alloc);
+
+    if (!state.primary_restored or state.runtime_repair_complete) return false;
+    if (state.group_id != group_id) return false;
+    if (!std.mem.eql(u8, state.backup_id, plan.manifest.backup_id)) return false;
+    if (!std.mem.eql(u8, state.snapshot_path, snapshot_path)) return false;
+    if (std.mem.eql(u8, state.location, plan.backup_root)) return true;
+
+    const file_location = try std.fmt.allocPrint(alloc, "file://{s}", .{plan.backup_root});
+    defer alloc.free(file_location);
+    return std.mem.eql(u8, state.location, file_location);
+}
+
 pub fn restoreProvisionedTableGroupDeferredRuntimeRepair(
     alloc: std.mem.Allocator,
     path: []const u8,
@@ -271,6 +292,16 @@ pub fn restoreProvisionedTableGroupDeferredRuntimeRepair(
         if (std.Io.Dir.cwd().statFile(restore_io_impl.io(), path, .{})) |_| break else |_| {}
         if (platform_time.monotonicNs() >= ready_deadline_ns) break;
         sleepNs(50 * std.time.ns_per_ms);
+    }
+
+    if (try hasMatchingDeferredRestoreRepairState(alloc, path, plan, group_id, snapshot_path)) {
+        std.log.info("provisioned restoreTable retry skipped restored primary awaiting runtime repair table={s} group_id={d} path={s} snapshot_root={s}", .{
+            table_name,
+            group_id,
+            path,
+            snapshot_root,
+        });
+        return;
     }
 
     if (before_restore_work) |run| run();

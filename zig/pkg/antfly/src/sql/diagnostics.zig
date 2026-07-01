@@ -187,6 +187,7 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         error.DocumentSqlBoundedScanByteCapExceeded => .document_sql_bounded_scan_byte_cap_exceeded,
         error.DocumentSqlBoundedScanIncompleteTopK => .document_sql_bounded_scan_incomplete_topk,
         error.DocumentSqlBoundedScanMissingExactProducer => .document_sql_bounded_scan_missing_exact_producer,
+        error.DocumentSqlIndexUnavailable => .document_sql_bounded_scan_missing_exact_producer,
         error.DocumentSqlBoundedScanPolicyRequired => .document_sql_bounded_scan_policy_required,
         error.DocumentSqlBoundedScanRowCapExceeded => .document_sql_bounded_scan_row_cap_exceeded,
         error.DocumentSqlBoundedScanUnboundedSource => .document_sql_bounded_scan_unbounded_source,
@@ -243,6 +244,21 @@ pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
     bulk_io_plan,
     cte_mutation_source_plan,
+    document_sql_bounded_scan_incomplete_topk,
+    document_sql_bounded_scan_missing_exact_producer,
+    document_sql_bounded_scan_unbounded_source,
+    document_sql_bounded_scan_unsupported_residual,
+    document_sql_view_mapping_catalog,
+    document_sql_view_mapping_unsupported,
+    document_sql_write_unsupported,
+    document_table_ddl_invalid_antfly_extension,
+    document_table_ddl_invalid_dynamic_template,
+    document_table_ddl_malformed_schema_json,
+    document_table_ddl_missing_default_type,
+    document_table_ddl_mixed_relational_shape,
+    document_table_ddl_multi_document_type_unsupported,
+    document_table_ddl_shorthand,
+    document_table_ddl_unknown_default_type,
     duplicate_conflict_update_target,
     duplicate_output_name,
     duplicate_row_batch_target,
@@ -341,6 +357,22 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
     return switch (reason) {
         .bulk_io_plan => .{ .category = .bulk_io_route, .auth_and_audit = true },
         .cte_mutation_source_plan => .{ .category = .stream_materialization, .materialization = true },
+        .document_sql_bounded_scan_incomplete_topk => .{ .category = .stream_materialization },
+        .document_sql_bounded_scan_missing_exact_producer => .{ .category = .stream_materialization },
+        .document_sql_bounded_scan_unbounded_source => .{ .category = .stream_materialization },
+        .document_sql_bounded_scan_unsupported_residual => .{ .category = .stream_materialization },
+        .document_sql_view_mapping_catalog => .{ .category = .catalog_lifecycle, .durable_metadata = true },
+        .document_sql_view_mapping_unsupported => .{ .category = .stream_materialization },
+        .document_sql_write_unsupported => .{ .category = .auth_row_filter, .auth_and_audit = true },
+        .document_table_ddl_invalid_antfly_extension,
+        .document_table_ddl_invalid_dynamic_template,
+        .document_table_ddl_malformed_schema_json,
+        .document_table_ddl_missing_default_type,
+        .document_table_ddl_mixed_relational_shape,
+        .document_table_ddl_multi_document_type_unsupported,
+        .document_table_ddl_shorthand,
+        .document_table_ddl_unknown_default_type,
+        => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .duplicate_conflict_update_target,
         .duplicate_row_batch_target,
         .duplicate_update_target,
@@ -398,6 +430,21 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_source_schema"));
     try std.testing.expect(classificationReasonTokenIsKnown("bulk_io_plan"));
     try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_incomplete_topk, classificationReasonFromToken("document_sql_bounded_scan_incomplete_topk").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_missing_exact_producer, classificationReasonFromToken("document_sql_bounded_scan_missing_exact_producer").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unbounded_source, classificationReasonFromToken("document_sql_bounded_scan_unbounded_source").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unsupported_residual, classificationReasonFromToken("document_sql_bounded_scan_unsupported_residual").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_catalog, classificationReasonFromToken("document_sql_view_mapping_catalog").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_unsupported, classificationReasonFromToken("document_sql_view_mapping_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_unsupported, classificationReasonFromToken("document_sql_write_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_invalid_antfly_extension, classificationReasonFromToken("document_table_ddl_invalid_antfly_extension").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_invalid_dynamic_template, classificationReasonFromToken("document_table_ddl_invalid_dynamic_template").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_malformed_schema_json, classificationReasonFromToken("document_table_ddl_malformed_schema_json").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_missing_default_type, classificationReasonFromToken("document_table_ddl_missing_default_type").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_mixed_relational_shape, classificationReasonFromToken("document_table_ddl_mixed_relational_shape").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_multi_document_type_unsupported, classificationReasonFromToken("document_table_ddl_multi_document_type_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_shorthand, classificationReasonFromToken("document_table_ddl_shorthand").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_unknown_default_type, classificationReasonFromToken("document_table_ddl_unknown_default_type").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.prepared_transaction_plan, classificationReasonFromToken("prepared_transaction_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.role_setting_plan, classificationReasonFromToken("role_setting_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_body_plan, classificationReasonFromToken("routine_body_plan").?);
@@ -443,6 +490,14 @@ test "sql adapter diagnostics map unsupported classifications to native requirem
     const prepared = nativeExecutionRequirement(.prepared_transaction_plan);
     try std.testing.expectEqual(NativeRequirementCategory.prepared_transaction_recovery, prepared.category);
     try std.testing.expect(prepared.coordinator_recovery);
+
+    const document_ddl = nativeExecutionRequirement(.document_table_ddl_missing_default_type);
+    try std.testing.expectEqual(NativeRequirementCategory.catalog_lifecycle, document_ddl.category);
+    try std.testing.expect(document_ddl.durable_metadata);
+
+    const document_write = nativeExecutionRequirement(.document_sql_write_unsupported);
+    try std.testing.expectEqual(NativeRequirementCategory.auth_row_filter, document_write.category);
+    try std.testing.expect(document_write.auth_and_audit);
 
     const rewrite = nativeExecutionRequirement(.row_rewrite_expression_plan);
     try std.testing.expectEqual(NativeRequirementCategory.schema_rewrite_backfill, rewrite.category);
@@ -527,6 +582,8 @@ test "sql diagnostics expose stable phase code and native model fields" {
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_missing_exact_producer, missing_exact.code);
     try std.testing.expectEqualStrings("document SQL requires an exact native producer or bounded scan", missing_exact.message);
     try std.testing.expectEqualStrings("Add a matching native index/materialization or provide a bounded scan policy with exact residual execution.", missing_exact.hint.?);
+    const index_unavailable = knownErrorDiagnostic(.plan, error.DocumentSqlIndexUnavailable) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_missing_exact_producer, index_unavailable.code);
 
     const row_cap = knownErrorDiagnostic(.execute, error.DocumentSqlBoundedScanRowCapExceeded) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_row_cap_exceeded, row_cap.code);

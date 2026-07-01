@@ -21,6 +21,7 @@ const db_mod = @import("../storage/db/mod.zig");
 const http_common = @import("../raft/transport/http_common.zig");
 const distributed_stats_mod = @import("../search/distributed_stats.zig");
 const routes = @import("http_routes.zig");
+const platform_time = @import("../platform/time.zig");
 const raft_routes = @import("../raft/transport/routes.zig");
 const txn_api = @import("distributed_txn.zig");
 const table_writes_api = @import("table_writes.zig");
@@ -30,6 +31,10 @@ const metadata_openapi = @import("antfly_metadata_openapi");
 
 fn parseJsonBody(comptime T: type, alloc: std.mem.Allocator, body: []const u8) !std.json.Parsed(T) {
     return try std.json.parseFromSlice(T, alloc, body, .{});
+}
+
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
 }
 
 fn isUriUnreserved(ch: u8) bool {
@@ -3560,7 +3565,8 @@ test "api http client round-trips public transaction commit route" {
     const table_writes = @import("table_writes.zig");
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-client-txn";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-client-txn");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -3657,7 +3663,8 @@ test "api http client round-trips long-lived public transaction session routes" 
     const raft_mod = @import("../raft/mod.zig");
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-client-session-txn";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-client-session-txn");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};

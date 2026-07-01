@@ -19,7 +19,11 @@ const binder = @import("binder.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
+const document_plan = @import("document_plan.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const expr_aggregate = @import("expr/aggregate.zig");
+const expr_projection = @import("expr/projection.zig");
+const expr_window = @import("expr/window.zig");
 const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -51,25 +55,25 @@ const LoweredRecursiveCteMemberPlan = plan_mod.LoweredRecursiveCteMemberPlan;
 const LoweredRecursiveCtePlan = plan_mod.LoweredRecursiveCtePlan;
 const LoweredSetOperationPlan = plan_mod.LoweredSetOperationPlan;
 const LoweredWindowPlan = plan_mod.LoweredWindowPlan;
-const aggregateDescendingPercentileCount = lower_expr.aggregateDescendingPercentileCount;
-const aggregateFilterExpressionArrayCount = lower_expr.aggregateFilterExpressionArrayCount;
-const aggregateFilterExpressionCount = lower_expr.aggregateFilterExpressionCount;
-const aggregateFilterGroupCount = lower_expr.aggregateFilterGroupCount;
-const aggregateFilterJsonAccessCount = lower_expr.aggregateFilterJsonAccessCount;
-const aggregateFilterStructuredAccessCount = lower_expr.aggregateFilterStructuredAccessCount;
-const aggregateInputExpressionCount = lower_expr.aggregateInputExpressionCount;
-const aggregateModeCount = lower_expr.aggregateModeCount;
-const aggregatePercentileArrayCount = lower_expr.aggregatePercentileArrayCount;
-const expressionOrderCount = lower_expr.expressionOrderCount;
+const aggregateDescendingPercentileCount = expr_aggregate.descendingPercentileCount;
+const aggregateFilterExpressionArrayCount = expr_aggregate.filterExpressionArrayCount;
+const aggregateFilterExpressionCount = expr_aggregate.filterExpressionCount;
+const aggregateFilterGroupCount = expr_aggregate.filterGroupCount;
+const aggregateFilterJsonAccessCount = expr_aggregate.filterJsonAccessCount;
+const aggregateFilterStructuredAccessCount = expr_aggregate.filterStructuredAccessCount;
+const aggregateInputExpressionCount = expr_aggregate.inputExpressionCount;
+const aggregateModeCount = expr_aggregate.modeCount;
+const aggregatePercentileArrayCount = expr_aggregate.percentileArrayCount;
+const expressionOrderCount = expr_projection.expressionOrderCount;
 const sqlRowClaimFingerprintName = row_claim.sqlRowClaimFingerprintName;
 const sourceQueryUsesExtendedPredicates = select_set.sourceQueryUsesExtendedPredicates;
-const windowDefaultCount = lower_expr.windowDefaultCount;
-const windowFilterAccessCount = lower_expr.windowFilterAccessCount;
-const windowFilterExpressionCount = lower_expr.windowFilterExpressionCount;
-const windowFilterGroupCount = lower_expr.windowFilterGroupCount;
-const windowFilterPredicateCount = lower_expr.windowFilterPredicateCount;
-const windowFrameSignature = lower_expr.windowFrameSignature;
-const windowValueExpressionCount = lower_expr.windowValueExpressionCount;
+const windowDefaultCount = expr_window.defaultCount;
+const windowFilterAccessCount = expr_window.filterAccessCount;
+const windowFilterExpressionCount = expr_window.filterExpressionCount;
+const windowFilterGroupCount = expr_window.filterGroupCount;
+const windowFilterPredicateCount = expr_window.filterPredicateCount;
+const windowFrameSignature = expr_window.frameSignature;
+const windowValueExpressionCount = expr_window.valueExpressionCount;
 
 pub const UnsupportedPlanFamily = enum {
     query,
@@ -290,6 +294,14 @@ pub const AppParityPlanSummary = struct {
     temporal_primary_key: ?bool = null,
     temporal_unique: ?usize = null,
     temporal_foreign_keys: ?usize = null,
+    document_source_table: ?[]const u8 = null,
+    document_view_mapping: ?[]const u8 = null,
+    document_native_request: ?[]const u8 = null,
+    document_projections: ?usize = null,
+    document_residual: ?bool = null,
+    document_order: ?bool = null,
+    document_unnest: ?bool = null,
+    document_limit: ?u32 = null,
     explain_subject: ?[]const u8 = null,
     explain_inner_kind: ?[]const u8 = null,
     explain_options: ?bool = null,
@@ -357,6 +369,14 @@ pub fn summaryHasFields(summary: AppParityPlanSummary) bool {
         summary.temporal_primary_key != null or
         summary.temporal_unique != null or
         summary.temporal_foreign_keys != null or
+        summary.document_source_table != null or
+        summary.document_view_mapping != null or
+        summary.document_native_request != null or
+        summary.document_projections != null or
+        summary.document_residual != null or
+        summary.document_order != null or
+        summary.document_unnest != null or
+        summary.document_limit != null or
         summary.explain_subject != null or
         summary.explain_inner_kind != null or
         summary.explain_options != null or
@@ -392,6 +412,784 @@ pub const AppParityCorpusEntry = struct {
     source_schema_json: []const u8 = "",
     catalog_tables: []const AppParityCatalogTable = &.{},
 };
+
+pub const AppParityParserFixtureSummary = struct {
+    starts_with_create: bool = false,
+    starts_with_delete: bool = false,
+    starts_with_merge: bool = false,
+    starts_with_truncate: bool = false,
+    starts_with_update: bool = false,
+    on_conflict: bool = false,
+    conflict_do_update: bool = false,
+    conflict_do_update_set: bool = false,
+    conflict_do_nothing: bool = false,
+    conflict_set_status_default: bool = false,
+    to_jsonb_function: bool = false,
+    lower_function: bool = false,
+    upper_function: bool = false,
+    excluded_identifier_prefix: bool = false,
+    jsonb_identifier_prefix: bool = false,
+    array_identifier_prefix: bool = false,
+    gen_random_uuid_function: bool = false,
+    uuid_generate_v4_function: bool = false,
+    metadata_pipe_concat: bool = false,
+    merge_when_matched_delete: bool = false,
+    pipe_concat_operator: bool = false,
+    set_status_lower_assignment: bool = false,
+    sum_function: bool = false,
+    mod_function: bool = false,
+    percent_operator: bool = false,
+    plus_operator: bool = false,
+    lt_or_lte_operator: bool = false,
+    gt_or_gte_operator: bool = false,
+    octet_length_function: bool = false,
+    bit_length_function: bool = false,
+    length_function: bool = false,
+    char_length_function: bool = false,
+    character_length_function: bool = false,
+    min_function: bool = false,
+    max_function: bool = false,
+    greatest_function: bool = false,
+    least_function: bool = false,
+    coalesce_function: bool = false,
+    amount_identifier: bool = false,
+    excluded_amount_identifier: bool = false,
+    excluded_next_status_identifier: bool = false,
+    excluded_status_identifier: bool = false,
+    excluded_enabled_identifier: bool = false,
+    status_identifier: bool = false,
+    quantity_identifier: bool = false,
+    enabled_identifier: bool = false,
+    usage_records_enabled_identifier: bool = false,
+    source_enabled_identifier: bool = false,
+    email_identifier: bool = false,
+    tenant_id_identifier: bool = false,
+    organization_id_identifier: bool = false,
+    plan_identifier: bool = false,
+    score_identifier: bool = false,
+    support_view_identifier: bool = false,
+    tag_identifier: bool = false,
+    tag_list_identifier: bool = false,
+    title_identifier: bool = false,
+    ilike_keyword: bool = false,
+    between_keyword: bool = false,
+    is_null_predicate: bool = false,
+    is_not_null_predicate: bool = false,
+    archived_records_identifier: bool = false,
+    archived_records_status_identifier: bool = false,
+    archived_records_organization_id_identifier: bool = false,
+    usage_records_status_identifier: bool = false,
+    usage_records_id_identifier: bool = false,
+    id_identifier: bool = false,
+    docs_underscore_id_identifier: bool = false,
+    source_underscore_id_identifier: bool = false,
+    underscore_doc_identifier: bool = false,
+    underscore_id_identifier: bool = false,
+    payload_identifier: bool = false,
+    source_identifier_prefix: bool = false,
+    status_string_literal: bool = false,
+    source_string_literal: bool = false,
+    document_string_literal: bool = false,
+    doc_string_literal: bool = false,
+    malformed_json_string_literal: bool = false,
+    o1_string_literal: bool = false,
+    customer_string_literal: bool = false,
+    order_string_literal: bool = false,
+    o_customer_id_identifier: bool = false,
+    o_kind_identifier: bool = false,
+    c_id_identifier: bool = false,
+    c_kind_identifier: bool = false,
+    regexp_replace_function: bool = false,
+    regexp_like_function: bool = false,
+    regexp_match_function: bool = false,
+    regexp_count_function: bool = false,
+    regexp_instr_function: bool = false,
+    regexp_substr_function: bool = false,
+    regex_match_operator: bool = false,
+    regex_not_imatch_operator: bool = false,
+    count_function: bool = false,
+    count_distinct_function: bool = false,
+    row_number_function: bool = false,
+    percentile_cont_function: bool = false,
+    percentile_disc_function: bool = false,
+    within_group_keywords: bool = false,
+    group_by_keywords: bool = false,
+    over_keyword: bool = false,
+    desc_keyword: bool = false,
+    as_keyword: bool = false,
+    nulls_identifier: bool = false,
+    customer_id_identifier: bool = false,
+    status_key_identifier: bool = false,
+    array_agg_distinct_function: bool = false,
+    arrow_json_operator: bool = false,
+    substring_function: bool = false,
+    substr_function: bool = false,
+    overlay_function: bool = false,
+    translate_function: bool = false,
+    split_part_function: bool = false,
+    strpos_function: bool = false,
+    position_function: bool = false,
+    left_function: bool = false,
+    right_function: bool = false,
+    btrim_function: bool = false,
+    ltrim_function: bool = false,
+    rtrim_function: bool = false,
+    lpad_function: bool = false,
+    rpad_function: bool = false,
+    repeat_function: bool = false,
+    reverse_function: bool = false,
+    initcap_function: bool = false,
+    md5_function: bool = false,
+    concat_ws_function: bool = false,
+    nullif_function: bool = false,
+    row_function: bool = false,
+    starts_with_function: bool = false,
+    ends_with_function: bool = false,
+    ascii_function: bool = false,
+    chr_function: bool = false,
+    jsonb_build_object_function: bool = false,
+    jsonb_extract_path_text_function: bool = false,
+    convert_from_utf8_function: bool = false,
+    cardinality_function: bool = false,
+    unnest_function: bool = false,
+    array_position_function: bool = false,
+    array_positions_function: bool = false,
+    array_append_function: bool = false,
+    array_cat_function: bool = false,
+    array_remove_function: bool = false,
+    array_replace_function: bool = false,
+    array_to_string_function: bool = false,
+    string_to_array_function: bool = false,
+    full_text_search_function: bool = false,
+    semantic_search_function: bool = false,
+    vector_search_function: bool = false,
+    hybrid_search_function: bool = false,
+    graph_traverse_function: bool = false,
+    graph_shortest_path_function: bool = false,
+    graph_k_shortest_paths_function: bool = false,
+    graph_metric_function: bool = false,
+    graph_metric_rerank_function: bool = false,
+    sources_json_identifier: bool = false,
+    antfly_source_function: bool = false,
+    multi_row_insert: bool = false,
+    computed_pattern: bool = false,
+    starts_with_with: bool = false,
+    with_recursive: bool = false,
+    insert_into: bool = false,
+    starts_with_commit: bool = false,
+    starts_with_rollback: bool = false,
+    starts_with_reset: bool = false,
+    starts_with_show: bool = false,
+    starts_with_discard: bool = false,
+    boolean_is_true_or_false: bool = false,
+    boolean_is_not_true_or_false: bool = false,
+    boolean_unknown_or_not_unknown: bool = false,
+    false_keyword: bool = false,
+    not_keyword: bool = false,
+    or_keyword: bool = false,
+    set_keyword: bool = false,
+    returning_keyword: bool = false,
+    in_keyword: bool = false,
+    where_keyword: bool = false,
+    in_select_from_keywords: bool = false,
+    where_exists_keywords: bool = false,
+    row_value_identifier_pair: bool = false,
+    case_when_keywords: bool = false,
+    set_row_assignment: bool = false,
+    default_keyword: bool = false,
+    postfix_null_test: bool = false,
+    having_boolean_predicate: bool = false,
+    having_boolean_is_not_predicate: bool = false,
+    filter_boolean_is_not_predicate: bool = false,
+    filter_boolean_unknown_predicate: bool = false,
+    tags_array_overlap: bool = false,
+    mixed_scalar_expression_or: bool = false,
+    order_using_operator: bool = false,
+    interval_1_second: bool = false,
+    interval_1_hour: bool = false,
+    interval_1_month: bool = false,
+    interval_1_month_1_day: bool = false,
+    now_function: bool = false,
+    current_timestamp_identifier: bool = false,
+    current_timestamp_function: bool = false,
+    current_date_identifier: bool = false,
+    date_trunc_hour_function: bool = false,
+    date_bin_function: bool = false,
+    date_part_hour_function: bool = false,
+    date_part_epoch_function: bool = false,
+    extract_function: bool = false,
+    dow_identifier: bool = false,
+    timestamptz_identifier: bool = false,
+    updated_at_ns_identifier: bool = false,
+    numrange_literal: bool = false,
+    daterange_literal: bool = false,
+    open_daterange_literal: bool = false,
+    lower_open_daterange_literal: bool = false,
+    inclusive_daterange_literal: bool = false,
+    lower_exclusive_daterange_literal: bool = false,
+    tsrange_literal: bool = false,
+    tstzrange_literal: bool = false,
+    numrange_function: bool = false,
+    daterange_function: bool = false,
+    tsrange_function: bool = false,
+    tstzrange_function: bool = false,
+    range_bound_inclusive_literal: bool = false,
+    range_bound_lower_exclusive_literal: bool = false,
+    range_contains_operator: bool = false,
+    range_overlap_operator: bool = false,
+    prices_sku_time_conflict_constraint: bool = false,
+    usage_records_pkey_conflict_constraint: bool = false,
+    usage_records_id_pk_conflict_constraint: bool = false,
+    unique_keyword: bool = false,
+    nulls_not_distinct: bool = false,
+    conflict_target_email_identifier: bool = false,
+    conflict_target_tenant_id_identifier: bool = false,
+    conflict_target_lower_function: bool = false,
+    conflict_target_upper_function: bool = false,
+    conflict_target_where: bool = false,
+    for_portion_of: bool = false,
+    valid_at_identifier: bool = false,
+    starts_with_copy: bool = false,
+    copy_to_stdin: bool = false,
+    copy_oids_option: bool = false,
+    copy_oids_false_option: bool = false,
+    copy_program_endpoint: bool = false,
+    graph_match_table_function: bool = false,
+    join_graph_match_table_function: bool = false,
+    row_lock_for_share: bool = false,
+    row_lock_for_update_of: bool = false,
+    row_lock_of_archived_records: bool = false,
+    row_lock_of_source: bool = false,
+    @"union": bool = false,
+    union_all: bool = false,
+    intersect: bool = false,
+    order_by: bool = false,
+    fetch_first: bool = false,
+    limit_null_offset_null: bool = false,
+    scoped_identifier: bool = false,
+    period_foreign_key: bool = false,
+    system_versioning: bool = false,
+    on_delete_set_null: bool = false,
+    on_delete_cascade: bool = false,
+    on_update_cascade: bool = false,
+    truncate_continue_identity: bool = false,
+    truncate_restart_identity: bool = false,
+    truncate_archived_records: bool = false,
+    truncate_cascade: bool = false,
+    document_identifier: bool = false,
+    document_schema_identifiers: bool = false,
+    antfly_storage_mode_identifier: bool = false,
+    antfly_default_type_identifier: bool = false,
+    alter_table: bool = false,
+    alter_table_set_access_method: bool = false,
+    alter_table_cluster_on: bool = false,
+    alter_table_set_without_cluster: bool = false,
+    alter_table_owner_to: bool = false,
+    alter_table_set: bool = false,
+    alter_table_set_unlogged: bool = false,
+    alter_table_reset: bool = false,
+    alter_table_set_tablespace: bool = false,
+    alter_table_trigger: bool = false,
+    alter_table_enable: bool = false,
+    alter_table_disable: bool = false,
+    alter_table_add_column_default: bool = false,
+    alter_table_validate_constraint: bool = false,
+    alter_table_drop_constraint: bool = false,
+    alter_table_drop_column: bool = false,
+    alter_table_set_default: bool = false,
+    alter_table_drop_default: bool = false,
+    alter_table_set_not_null: bool = false,
+    alter_table_drop_not_null: bool = false,
+    alter_table_type: bool = false,
+    alter_table_set_data_type: bool = false,
+    alter_table_rename_column: bool = false,
+    alter_table_rename_constraint: bool = false,
+    alter_table_drop_trigger: bool = false,
+    sequence_as_bigint_owned_by: bool = false,
+    sequence_as_integer_owned_by_none: bool = false,
+    external_security_identifiers: bool = false,
+    status_text_text_lower_body: bool = false,
+    prepare_as_with: bool = false,
+    prepare_as_with_recursive: bool = false,
+};
+
+pub const AppParityPlanFixtureSummary = struct {
+    uses_cte_stream: bool = false,
+    uses_returning_all: bool = false,
+    uses_conflict_where: bool = false,
+    applied_rebuild: bool = false,
+    applied_validation: bool = false,
+    applied_rewrite: bool = false,
+    read_query: bool = false,
+    read_aggregate: bool = false,
+    read_join: bool = false,
+    read_lateral: bool = false,
+    read_recursive_cte: bool = false,
+    read_set_operation: bool = false,
+    read_window: bool = false,
+    read_query_expression: bool = false,
+    read_source_expression: bool = false,
+};
+
+pub const AppParityBinderFixtureSummary = struct {
+    object_schema_generation: bool = false,
+    object_table_id: bool = false,
+    read_source: bool = false,
+    read_target: bool = false,
+    write_insert_source: bool = false,
+    write_joined_source: bool = false,
+    write_target: bool = false,
+
+    fn observeLogicalPlan(self: *@This(), plan: binder.LogicalSqlPlan) void {
+        switch (plan) {
+            .catalog_read => |read| {
+                for (read.bound_objects) |object| {
+                    self.observeObjectIdentity(object);
+                    switch (object.role) {
+                        .target => self.read_target = true,
+                        .source => self.read_source = true,
+                        else => {},
+                    }
+                }
+            },
+            .catalog_write => |write| {
+                for (write.bound_objects) |object| {
+                    self.observeObjectIdentity(object);
+                    switch (object.role) {
+                        .target => self.write_target = true,
+                        .insert_source => self.write_insert_source = true,
+                        .joined_source => self.write_joined_source = true,
+                        else => {},
+                    }
+                }
+            },
+            else => {},
+        }
+    }
+
+    fn observeObjectIdentity(self: *@This(), object: binder.BoundCatalogObject) void {
+        self.object_table_id = self.object_table_id or object.table_id != 0;
+        self.object_schema_generation = self.object_schema_generation or object.schema_generation != 0;
+    }
+};
+
+pub const AppParityStructuredFixtureSummary = struct {
+    parser: AppParityParserFixtureSummary = .{},
+    plan: AppParityPlanFixtureSummary = .{},
+    binder: AppParityBinderFixtureSummary = .{},
+    fixture: AppParityPlanSummary = .{},
+    native_requirement_reason: ?[]const u8 = null,
+    unsupported_reason: ?[]const u8 = null,
+
+    pub fn hasReason(self: @This(), reason: []const u8) bool {
+        if (self.native_requirement_reason) |native_reason| {
+            if (std.mem.eql(u8, native_reason, reason)) return true;
+        }
+        if (self.unsupported_reason) |unsupported| {
+            if (std.mem.eql(u8, unsupported, reason)) return true;
+        }
+        return false;
+    }
+};
+
+pub fn appParityStructuredFixtureSummary(
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) AppParityStructuredFixtureSummary {
+    const sql_tokens = parsed_sql.items();
+    const has_cte_expression = planHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
+    var summary = AppParityStructuredFixtureSummary{
+        .parser = .{
+            .starts_with_create = appParityTokensStartWithKeyword(sql_tokens, .create),
+            .starts_with_delete = appParityTokensStartWithKeyword(sql_tokens, .delete),
+            .starts_with_merge = appParityTokensStartWithKeyword(sql_tokens, .merge),
+            .starts_with_truncate = appParityTokensStartWithKeyword(sql_tokens, .truncate),
+            .starts_with_update = appParityTokensStartWithKeyword(sql_tokens, .update),
+            .on_conflict = entry.family == .insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .conflict }),
+            .conflict_do_update = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update }),
+            .conflict_do_update_set = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update, .set }),
+            .conflict_do_nothing = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }),
+            .conflict_set_status_default = appParityTokensHaveKeyword(sql_tokens, .set) and
+                appParityTokensHaveIdentifier(sql_tokens, "status") and
+                appParityTokensHaveKeyword(sql_tokens, .default),
+            .to_jsonb_function = appParityTokensHaveIdentifier(sql_tokens, "to_jsonb"),
+            .lower_function = appParityTokensHaveIdentifier(sql_tokens, "lower"),
+            .upper_function = appParityTokensHaveFunctionCall(sql_tokens, "upper"),
+            .excluded_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "excluded."),
+            .jsonb_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_"),
+            .array_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "array_"),
+            .gen_random_uuid_function = appParityTokensHaveIdentifier(sql_tokens, "gen_random_uuid"),
+            .uuid_generate_v4_function = appParityTokensHaveFunctionCall(sql_tokens, "uuid_generate_v4"),
+            .pipe_concat_operator = appParityTokensHaveKind(sql_tokens, .pipe_concat),
+            .metadata_pipe_concat = appParityTokensHaveIdentifier(sql_tokens, "metadata") and
+                appParityTokensHaveKind(sql_tokens, .pipe_concat),
+            .merge_when_matched_delete = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .when, .matched, .then, .delete }),
+            .set_status_lower_assignment = appParityTokensHaveSetFunctionAssignment(sql_tokens, "status", "lower"),
+            .sum_function = appParityTokensHaveFunctionCall(sql_tokens, "sum"),
+            .mod_function = appParityTokensHaveFunctionCall(sql_tokens, "mod"),
+            .percent_operator = appParityTokensHaveKind(sql_tokens, .percent),
+            .plus_operator = appParityTokensHaveKind(sql_tokens, .plus),
+            .lt_or_lte_operator = appParityTokensHaveKind(sql_tokens, .lt) or
+                appParityTokensHaveKind(sql_tokens, .lte),
+            .gt_or_gte_operator = appParityTokensHaveKind(sql_tokens, .gt) or
+                appParityTokensHaveKind(sql_tokens, .gte),
+            .octet_length_function = appParityTokensHaveFunctionCall(sql_tokens, "octet_length"),
+            .bit_length_function = appParityTokensHaveFunctionCall(sql_tokens, "bit_length"),
+            .length_function = appParityTokensHaveFunctionCall(sql_tokens, "length"),
+            .char_length_function = appParityTokensHaveFunctionCall(sql_tokens, "char_length"),
+            .character_length_function = appParityTokensHaveFunctionCall(sql_tokens, "character_length"),
+            .min_function = appParityTokensHaveFunctionCall(sql_tokens, "min"),
+            .max_function = appParityTokensHaveFunctionCall(sql_tokens, "max"),
+            .greatest_function = appParityTokensHaveFunctionCall(sql_tokens, "greatest"),
+            .least_function = appParityTokensHaveFunctionCall(sql_tokens, "least"),
+            .coalesce_function = appParityTokensHaveFunctionCall(sql_tokens, "coalesce"),
+            .amount_identifier = appParityTokensHaveIdentifier(sql_tokens, "amount"),
+            .excluded_amount_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.amount"),
+            .excluded_next_status_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status"),
+            .excluded_status_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.status"),
+            .excluded_enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.enabled"),
+            .status_identifier = appParityTokensHaveIdentifier(sql_tokens, "status"),
+            .quantity_identifier = appParityTokensHaveIdentifier(sql_tokens, "quantity"),
+            .enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "enabled"),
+            .usage_records_enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "usage_records.enabled"),
+            .source_enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "source.enabled"),
+            .email_identifier = appParityTokensHaveIdentifier(sql_tokens, "email"),
+            .tenant_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "tenant_id"),
+            .organization_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "organization_id"),
+            .plan_identifier = appParityTokensHaveIdentifier(sql_tokens, "plan"),
+            .score_identifier = appParityTokensHaveIdentifier(sql_tokens, "score"),
+            .support_view_identifier = appParityTokensHaveIdentifier(sql_tokens, "support_view"),
+            .tag_identifier = appParityTokensHaveIdentifier(sql_tokens, "tag"),
+            .tag_list_identifier = appParityTokensHaveIdentifier(sql_tokens, "tag_list"),
+            .title_identifier = appParityTokensHaveIdentifier(sql_tokens, "title"),
+            .ilike_keyword = appParityTokensHaveKeyword(sql_tokens, .ilike),
+            .between_keyword = appParityTokensHaveKeyword(sql_tokens, .between),
+            .is_null_predicate = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .null }),
+            .is_not_null_predicate = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .null }),
+            .archived_records_identifier = appParityTokensHaveIdentifier(sql_tokens, "archived_records"),
+            .archived_records_status_identifier = appParityTokensHaveIdentifier(sql_tokens, "archived_records.status"),
+            .archived_records_organization_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id"),
+            .usage_records_status_identifier = appParityTokensHaveIdentifier(sql_tokens, "usage_records.status"),
+            .usage_records_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "usage_records.id"),
+            .id_identifier = appParityTokensHaveIdentifier(sql_tokens, "id"),
+            .docs_underscore_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "docs._id"),
+            .source_underscore_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "source._id"),
+            .underscore_doc_identifier = appParityTokensHaveIdentifier(sql_tokens, "_doc"),
+            .underscore_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "_id"),
+            .payload_identifier = appParityTokensHaveIdentifier(sql_tokens, "payload"),
+            .source_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "source."),
+            .status_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "status"),
+            .source_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "source"),
+            .document_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "document"),
+            .doc_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "doc"),
+            .malformed_json_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "{bad json}"),
+            .o1_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "o1"),
+            .customer_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "customer"),
+            .order_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "order"),
+            .o_customer_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "o.customer_id"),
+            .o_kind_identifier = appParityTokensHaveIdentifier(sql_tokens, "o.kind"),
+            .c_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "c.id"),
+            .c_kind_identifier = appParityTokensHaveIdentifier(sql_tokens, "c.kind"),
+            .regexp_replace_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace"),
+            .regexp_like_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_like"),
+            .regexp_match_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_match"),
+            .regexp_count_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_count"),
+            .regexp_instr_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr"),
+            .regexp_substr_function = appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr"),
+            .regex_match_operator = appParityTokensHaveKind(sql_tokens, .regex_match),
+            .regex_not_imatch_operator = appParityTokensHaveKind(sql_tokens, .regex_not_imatch),
+            .count_function = appParityTokensHaveFunctionCall(sql_tokens, "count"),
+            .count_distinct_function = appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "count", .distinct),
+            .row_number_function = appParityTokensHaveFunctionCall(sql_tokens, "row_number"),
+            .percentile_cont_function = appParityTokensHaveFunctionCall(sql_tokens, "percentile_cont"),
+            .percentile_disc_function = appParityTokensHaveFunctionCall(sql_tokens, "percentile_disc"),
+            .within_group_keywords = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .within, .group }),
+            .group_by_keywords = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .group, .by }),
+            .over_keyword = appParityTokensHaveKeyword(sql_tokens, .over),
+            .desc_keyword = appParityTokensHaveKeyword(sql_tokens, .desc),
+            .as_keyword = appParityTokensHaveKeyword(sql_tokens, .as),
+            .nulls_identifier = appParityTokensHaveIdentifier(sql_tokens, "nulls"),
+            .customer_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "customer_id"),
+            .status_key_identifier = appParityTokensHaveIdentifier(sql_tokens, "status_key"),
+            .array_agg_distinct_function = appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "array_agg", .distinct),
+            .arrow_json_operator = appParityTokensHaveKind(sql_tokens, .arrow_json),
+            .substring_function = appParityTokensHaveFunctionCall(sql_tokens, "substring"),
+            .substr_function = appParityTokensHaveFunctionCall(sql_tokens, "substr"),
+            .overlay_function = appParityTokensHaveFunctionCall(sql_tokens, "overlay"),
+            .translate_function = appParityTokensHaveFunctionCall(sql_tokens, "translate"),
+            .split_part_function = appParityTokensHaveFunctionCall(sql_tokens, "split_part"),
+            .strpos_function = appParityTokensHaveFunctionCall(sql_tokens, "strpos"),
+            .position_function = appParityTokensHaveFunctionCall(sql_tokens, "position"),
+            .left_function = appParityTokensHaveFunctionCall(sql_tokens, "left"),
+            .right_function = appParityTokensHaveFunctionCall(sql_tokens, "right"),
+            .btrim_function = appParityTokensHaveFunctionCall(sql_tokens, "btrim"),
+            .ltrim_function = appParityTokensHaveFunctionCall(sql_tokens, "ltrim"),
+            .rtrim_function = appParityTokensHaveFunctionCall(sql_tokens, "rtrim"),
+            .lpad_function = appParityTokensHaveFunctionCall(sql_tokens, "lpad"),
+            .rpad_function = appParityTokensHaveFunctionCall(sql_tokens, "rpad"),
+            .repeat_function = appParityTokensHaveFunctionCall(sql_tokens, "repeat"),
+            .reverse_function = appParityTokensHaveFunctionCall(sql_tokens, "reverse"),
+            .initcap_function = appParityTokensHaveFunctionCall(sql_tokens, "initcap"),
+            .md5_function = appParityTokensHaveFunctionCall(sql_tokens, "md5"),
+            .concat_ws_function = appParityTokensHaveFunctionCall(sql_tokens, "concat_ws"),
+            .nullif_function = appParityTokensHaveFunctionCall(sql_tokens, "nullif"),
+            .row_function = appParityTokensHaveFunctionCall(sql_tokens, "row"),
+            .starts_with_function = appParityTokensHaveFunctionCall(sql_tokens, "starts_with"),
+            .ends_with_function = appParityTokensHaveFunctionCall(sql_tokens, "ends_with"),
+            .ascii_function = appParityTokensHaveFunctionCall(sql_tokens, "ascii"),
+            .chr_function = appParityTokensHaveFunctionCall(sql_tokens, "chr"),
+            .jsonb_build_object_function = appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object"),
+            .jsonb_extract_path_text_function = appParityTokensHaveFunctionCall(sql_tokens, "jsonb_extract_path_text"),
+            .convert_from_utf8_function = appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "convert_from", "UTF8"),
+            .cardinality_function = appParityTokensHaveFunctionCall(sql_tokens, "cardinality"),
+            .unnest_function = appParityTokensHaveFunctionCall(sql_tokens, "unnest") or
+                appParityTokensHaveIdentifier(sql_tokens, "unnest"),
+            .array_position_function = appParityTokensHaveFunctionCall(sql_tokens, "array_position"),
+            .array_positions_function = appParityTokensHaveFunctionCall(sql_tokens, "array_positions"),
+            .array_append_function = appParityTokensHaveFunctionCall(sql_tokens, "array_append"),
+            .array_cat_function = appParityTokensHaveFunctionCall(sql_tokens, "array_cat"),
+            .array_remove_function = appParityTokensHaveFunctionCall(sql_tokens, "array_remove"),
+            .array_replace_function = appParityTokensHaveFunctionCall(sql_tokens, "array_replace"),
+            .array_to_string_function = appParityTokensHaveFunctionCall(sql_tokens, "array_to_string"),
+            .string_to_array_function = appParityTokensHaveFunctionCall(sql_tokens, "string_to_array"),
+            .full_text_search_function = appParityTokensHaveFunctionCall(sql_tokens, "full_text_search"),
+            .semantic_search_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.semantic_search"),
+            .vector_search_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.vector_search"),
+            .hybrid_search_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.hybrid_search"),
+            .graph_traverse_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_traverse"),
+            .graph_shortest_path_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_shortest_path"),
+            .graph_k_shortest_paths_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_k_shortest_paths"),
+            .graph_metric_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_metric"),
+            .graph_metric_rerank_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_metric_rerank"),
+            .sources_json_identifier = appParityTokensHaveIdentifier(sql_tokens, "sources_json"),
+            .antfly_source_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.source"),
+            .multi_row_insert = entry.family == .insert and appParityTokensHaveKindSequence(sql_tokens, &.{ .rparen, .comma, .lparen }),
+            .computed_pattern = appParityParsedSqlHasComputedPattern(parsed_sql),
+            .starts_with_with = appParityTokensStartWithKeyword(sql_tokens, .with),
+            .with_recursive = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .with, .recursive }),
+            .insert_into = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .insert, .into }),
+            .starts_with_commit = appParityTokensStartWithKeyword(sql_tokens, .commit),
+            .starts_with_rollback = appParityTokensStartWithKeyword(sql_tokens, .rollback),
+            .starts_with_reset = appParityTokensStartWithKeyword(sql_tokens, .reset),
+            .starts_with_show = appParityTokensStartWithKeyword(sql_tokens, .show),
+            .starts_with_discard = appParityTokensStartWithKeyword(sql_tokens, .discard),
+            .boolean_is_true_or_false = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .true }) or
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .false }),
+            .boolean_is_not_true_or_false = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }) or
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .false }),
+            .boolean_unknown_or_not_unknown = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .unknown }) or
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .unknown }),
+            .false_keyword = appParityTokensHaveKeyword(sql_tokens, .false),
+            .not_keyword = appParityTokensHaveKeyword(sql_tokens, .not),
+            .or_keyword = appParityTokensHaveKeyword(sql_tokens, .@"or"),
+            .set_keyword = appParityTokensHaveKeyword(sql_tokens, .set),
+            .returning_keyword = appParityTokensHaveKeyword(sql_tokens, .returning),
+            .in_keyword = appParityTokensHaveKeyword(sql_tokens, .in),
+            .where_keyword = appParityTokensHaveKeyword(sql_tokens, .where),
+            .in_select_from_keywords = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .in, .select, .from }),
+            .where_exists_keywords = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }),
+            .row_value_identifier_pair = appParityTokensHaveKindSequence(sql_tokens, &.{ .lparen, .identifier, .comma, .identifier, .rparen }),
+            .case_when_keywords = appParityTokensHaveKeyword(sql_tokens, .case) and
+                appParityTokensHaveKeyword(sql_tokens, .when),
+            .set_row_assignment = appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen),
+            .default_keyword = appParityTokensHaveKeyword(sql_tokens, .default),
+            .postfix_null_test = appParityTokensHaveIdentifier(sql_tokens, "isnull") or
+                appParityTokensHaveIdentifier(sql_tokens, "notnull"),
+            .having_boolean_predicate = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .true }) or
+                appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .false }) or
+                appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .unknown }) or
+                appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .unknown }),
+            .having_boolean_is_not_predicate = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .true }) or
+                appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .false }),
+            .filter_boolean_is_not_predicate = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .true }) or
+                appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .false }),
+            .filter_boolean_unknown_predicate = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .unknown }) or
+                appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .unknown }),
+            .tags_array_overlap = appParityTokensHaveIdentifier(sql_tokens, "tags") and
+                appParityTokensHaveKind(sql_tokens, .range_overlap) and
+                appParityTokensHaveKeyword(sql_tokens, .array),
+            .mixed_scalar_expression_or = appParityTokensHaveIdentifier(sql_tokens, "id") and
+                appParityTokensHaveKeyword(sql_tokens, .@"or") and
+                appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+                appParityTokensHaveIdentifier(sql_tokens, "email"),
+            .order_using_operator = appParityTokensHaveKeyword(sql_tokens, .using),
+            .interval_1_second = appParityTokensHaveIdentifier(sql_tokens, "interval") and
+                appParityTokensHaveStringLiteral(sql_tokens, "1 second"),
+            .interval_1_hour = appParityTokensHaveIdentifier(sql_tokens, "interval") and
+                appParityTokensHaveStringLiteral(sql_tokens, "1 hour"),
+            .interval_1_month = appParityTokensHaveIdentifier(sql_tokens, "interval") and
+                appParityTokensHaveStringLiteral(sql_tokens, "1 month"),
+            .interval_1_month_1_day = appParityTokensHaveIdentifier(sql_tokens, "interval") and
+                appParityTokensHaveStringLiteral(sql_tokens, "1 month 1 day"),
+            .now_function = appParityTokensHaveFunctionCall(sql_tokens, "now"),
+            .current_timestamp_identifier = appParityTokensHaveIdentifier(sql_tokens, "current_timestamp"),
+            .current_timestamp_function = appParityTokensHaveFunctionCall(sql_tokens, "current_timestamp"),
+            .current_date_identifier = appParityTokensHaveIdentifier(sql_tokens, "current_date"),
+            .date_trunc_hour_function = appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_trunc", "hour"),
+            .date_bin_function = appParityTokensHaveFunctionCall(sql_tokens, "date_bin"),
+            .date_part_hour_function = appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_part", "hour"),
+            .date_part_epoch_function = appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_part", "epoch"),
+            .extract_function = appParityTokensHaveFunctionCall(sql_tokens, "extract"),
+            .dow_identifier = appParityTokensHaveIdentifier(sql_tokens, "dow"),
+            .timestamptz_identifier = appParityTokensHaveIdentifier(sql_tokens, "timestamptz"),
+            .updated_at_ns_identifier = appParityTokensHaveIdentifier(sql_tokens, "updated_at_ns"),
+            .numrange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "[1,10)"),
+            .daterange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01,2025-07-01)"),
+            .open_daterange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "[2026-01-01,)"),
+            .lower_open_daterange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "(,2026-01-01)"),
+            .inclusive_daterange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "2025-02-01]"),
+            .lower_exclusive_daterange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "(2025-01-01,"),
+            .tsrange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01 00:00:00,2025-01-02 00:00:00)"),
+            .tstzrange_literal = appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)"),
+            .numrange_function = appParityTokensHaveFunctionCall(sql_tokens, "numrange"),
+            .daterange_function = appParityTokensHaveFunctionCall(sql_tokens, "daterange"),
+            .tsrange_function = appParityTokensHaveFunctionCall(sql_tokens, "tsrange"),
+            .tstzrange_function = appParityTokensHaveFunctionCall(sql_tokens, "tstzrange"),
+            .range_bound_inclusive_literal = appParityTokensHaveStringLiteral(sql_tokens, "[]"),
+            .range_bound_lower_exclusive_literal = appParityTokensHaveStringLiteral(sql_tokens, "(]"),
+            .range_contains_operator = appParityTokensHaveKind(sql_tokens, .at_contains),
+            .range_overlap_operator = appParityTokensHaveKind(sql_tokens, .range_overlap),
+            .prices_sku_time_conflict_constraint = appParityTokensHaveConflictConstraint(sql_tokens, "prices_sku_time_key"),
+            .usage_records_pkey_conflict_constraint = appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_pkey"),
+            .usage_records_id_pk_conflict_constraint = appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_id_pk"),
+            .unique_keyword = appParityTokensHaveKeyword(sql_tokens, .unique),
+            .nulls_not_distinct = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .nulls, .not, .distinct }),
+            .conflict_target_email_identifier = appParityConflictTargetHasIdentifier(sql_tokens, "email"),
+            .conflict_target_tenant_id_identifier = appParityConflictTargetHasIdentifier(sql_tokens, "tenant_id"),
+            .conflict_target_lower_function = appParityConflictTargetHasFunctionCall(sql_tokens, "lower"),
+            .conflict_target_upper_function = appParityConflictTargetHasFunctionCall(sql_tokens, "upper"),
+            .conflict_target_where = appParityConflictTargetHasWhere(sql_tokens),
+            .for_portion_of = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }),
+            .valid_at_identifier = appParityTokensHaveIdentifier(sql_tokens, "valid_at"),
+            .starts_with_copy = appParityTokensStartWithKeyword(sql_tokens, .copy),
+            .copy_to_stdin = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .to, .stdin }),
+            .copy_oids_option = appParityTokensHaveKeyword(sql_tokens, .oids),
+            .copy_oids_false_option = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .oids, .false }),
+            .copy_program_endpoint = appParityTokensHaveKeyword(sql_tokens, .program),
+            .graph_match_table_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match"),
+            .join_graph_match_table_function = appParityTokensHaveKeyword(sql_tokens, .join) and
+                appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match"),
+            .row_lock_for_share = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .share }),
+            .row_lock_for_update_of = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }),
+            .row_lock_of_archived_records = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
+                appParityTokensHaveIdentifier(sql_tokens, "archived_records"),
+            .row_lock_of_source = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
+                appParityTokensHaveIdentifier(sql_tokens, "source"),
+            .@"union" = appParityTokensHaveKeyword(sql_tokens, .@"union"),
+            .union_all = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }),
+            .intersect = appParityTokensHaveKeyword(sql_tokens, .intersect),
+            .order_by = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }),
+            .fetch_first = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .fetch, .first }),
+            .limit_null_offset_null = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }),
+            .scoped_identifier = appParityTokensHaveIdentifier(sql_tokens, "scoped"),
+            .period_foreign_key = appParityTokensHaveKeyword(sql_tokens, .period) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .foreign, .key }),
+            .system_versioning = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .system, .versioning }),
+            .on_delete_set_null = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .delete, .set, .null }),
+            .on_delete_cascade = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .delete, .cascade }),
+            .on_update_cascade = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .update, .cascade }),
+            .truncate_continue_identity = entry.family == .truncate_source and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"continue", .identity }),
+            .truncate_restart_identity = entry.family == .truncate_source and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .restart, .identity }),
+            .truncate_archived_records = entry.family == .truncate_source and appParityTokensHaveIdentifier(sql_tokens, "archived_records"),
+            .truncate_cascade = entry.family == .truncate_source and appParityTokensHaveKeyword(sql_tokens, .cascade),
+            .document_identifier = appParityTokensHaveIdentifier(sql_tokens, "document"),
+            .document_schema_identifiers = appParityTokensHaveIdentifier(sql_tokens, "antfly.document_schema") or
+                appParityTokensHaveIdentifier(sql_tokens, "document_schema") or
+                appParityTokensHaveIdentifierPrefix(sql_tokens, "antfly.document_schema.") or
+                appParityTokensHaveIdentifierPrefix(sql_tokens, "document_schema."),
+            .antfly_storage_mode_identifier = appParityTokensHaveIdentifier(sql_tokens, "antfly.storage_mode") or
+                appParityTokensHaveIdentifier(sql_tokens, "storage_mode"),
+            .antfly_default_type_identifier = appParityTokensHaveIdentifier(sql_tokens, "antfly.default_type") or
+                appParityTokensHaveIdentifier(sql_tokens, "default_type"),
+            .alter_table = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }),
+            .alter_table_set_access_method = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .access, .method }),
+            .alter_table_cluster_on = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .cluster, .on }),
+            .alter_table_set_without_cluster = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .without, .cluster }),
+            .alter_table_owner_to = appParityTokensHaveIdentifier(sql_tokens, "owner") and appParityTokensHaveKeyword(sql_tokens, .to),
+            .alter_table_set = appParityTokensHaveKeyword(sql_tokens, .set),
+            .alter_table_set_unlogged = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .unlogged }),
+            .alter_table_reset = appParityTokensHaveKeyword(sql_tokens, .reset),
+            .alter_table_set_tablespace = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .tablespace }),
+            .alter_table_trigger = appParityTokensHaveKeyword(sql_tokens, .trigger),
+            .alter_table_enable = appParityTokensHaveIdentifier(sql_tokens, "enable"),
+            .alter_table_disable = appParityTokensHaveIdentifier(sql_tokens, "disable"),
+            .alter_table_add_column_default = appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .add, .column, .default }),
+            .alter_table_validate_constraint = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .validate, .constraint }),
+            .alter_table_drop_constraint = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .constraint }),
+            .alter_table_drop_column = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .column }),
+            .alter_table_set_default = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .default }),
+            .alter_table_drop_default = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .default }),
+            .alter_table_set_not_null = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .not, .null }),
+            .alter_table_drop_not_null = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .not, .null }),
+            .alter_table_type = appParityTokensHaveKeyword(sql_tokens, .type),
+            .alter_table_set_data_type = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .data, .type }),
+            .alter_table_rename_column = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .column }),
+            .alter_table_rename_constraint = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .constraint }),
+            .alter_table_drop_trigger = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .trigger }),
+            .sequence_as_bigint_owned_by = appParityTokensHaveKeyword(sql_tokens, .as) and
+                appParityTokensHaveIdentifier(sql_tokens, "bigint") and
+                appParityTokensHaveIdentifier(sql_tokens, "owned") and
+                appParityTokensHaveKeyword(sql_tokens, .by),
+            .sequence_as_integer_owned_by_none = appParityTokensHaveKeyword(sql_tokens, .as) and
+                appParityTokensHaveIdentifier(sql_tokens, "integer") and
+                appParityTokensHaveIdentifier(sql_tokens, "owned") and
+                appParityTokensHaveKeyword(sql_tokens, .by) and
+                appParityTokensHaveIdentifier(sql_tokens, "none"),
+            .external_security_identifiers = appParityTokensHaveIdentifier(sql_tokens, "external") and
+                appParityTokensHaveIdentifier(sql_tokens, "security"),
+            .status_text_text_lower_body = appParityTokensHaveIdentifier(sql_tokens, "status_text") and
+                appParityTokensHaveIdentifier(sql_tokens, "text") and
+                appParityTokensHaveStringLiteralContaining(sql_tokens, "lower(status_text)"),
+            .prepare_as_with = appParityTokensStartWithKeyword(sql_tokens, .prepare) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with }),
+            .prepare_as_with_recursive = appParityTokensStartWithKeyword(sql_tokens, .prepare) and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with, .recursive }),
+        },
+        .plan = .{
+            .uses_cte_stream = planHasNonZeroToken(entry.plan, ":ctes=") or planHasNonZeroToken(entry.plan, ":source_cte="),
+            .uses_returning_all = planHasNonZeroToken(entry.plan, ":returning_all="),
+            .uses_conflict_where = planHasNonZeroToken(entry.plan, ":conflict_where="),
+            .applied_rebuild = entry.applied_plan.len > 0 and planHasExactBoolToken(entry.applied_plan, "rebuild=", true),
+            .applied_validation = entry.applied_plan.len > 0 and planHasExactBoolToken(entry.applied_plan, "validation=", true),
+            .applied_rewrite = entry.applied_plan.len > 0 and planHasExactBoolToken(entry.applied_plan, "rewrite=", true),
+            .read_query = readPlanHasKind(entry.plan, "query"),
+            .read_aggregate = readPlanHasKind(entry.plan, "aggregate"),
+            .read_join = readPlanHasKind(entry.plan, "join"),
+            .read_lateral = readPlanHasKind(entry.plan, "lateral"),
+            .read_recursive_cte = readPlanHasKind(entry.plan, "recursive_cte"),
+            .read_set_operation = readPlanHasKind(entry.plan, "set_operation"),
+            .read_window = readPlanHasKind(entry.plan, "window"),
+            .read_query_expression = has_cte_expression or
+                planHasNonZeroToken(entry.plan, ":expr_pred=") or
+                planHasNonZeroToken(entry.plan, ":expr_or=") or
+                planHasNonZeroToken(entry.plan, ":expr_not=") or
+                planHasNonZeroToken(entry.plan, ":expr_array="),
+            .read_source_expression = has_cte_expression or
+                planHasNonZeroToken(entry.plan, ":source_expr_pred=") or
+                planHasNonZeroToken(entry.plan, ":source_expr_or=") or
+                planHasNonZeroToken(entry.plan, ":source_expr_not=") or
+                planHasNonZeroToken(entry.plan, ":source_expr_array="),
+        },
+        .fixture = entry.summary,
+    };
+    if (entry.classification_reason.len > 0 and corpusReasonHasNativeRequirement(entry.classification_reason)) {
+        summary.native_requirement_reason = entry.classification_reason;
+    }
+    if (corpusFixtureFamilyNeedsReason(entry.family)) {
+        summary.unsupported_reason = entry.classification_reason;
+    }
+    return summary;
+}
+
+pub fn appParityStructuredFixtureSummaryWithBinderAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !AppParityStructuredFixtureSummary {
+    var summary = appParityStructuredFixtureSummary(entry, parsed_sql);
+    summary.binder = try appParityBinderFixtureSummaryAlloc(alloc, entry, parsed_sql);
+    return summary;
+}
 
 pub const AppParityCatalogTable = struct {
     name: []const u8,
@@ -512,6 +1310,9 @@ pub fn appParityCatalogForEntryParsedSqlAlloc(
         }
     }
     if (entry.catalog_tables.len > 0) {
+        if (appParityEntryHasDocumentViewMappingCatalog(entry)) {
+            return try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, entry.catalog_tables);
+        }
         if (try appParityBindingCoverageCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql)) |catalog| {
             return catalog;
         }
@@ -520,6 +1321,70 @@ pub fn appParityCatalogForEntryParsedSqlAlloc(
     const source_table_name = (try appParitySourceTableNameParsedSqlAlloc(alloc, entry, parsed_sql)) orelse return null;
     defer alloc.free(@constCast(source_table_name));
     return try AppParitySourceSchemaCatalog.initSourceSchemaAlloc(alloc, source_table_name, entry.source_schema_json);
+}
+
+pub fn appParityEntryHasDocumentViewMappingCatalog(entry: AppParityCorpusEntry) bool {
+    if (!corpusFixtureCanUseDocumentViewMappingCatalog(entry)) return false;
+    for (entry.catalog_tables) |table| {
+        if (corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json)) return true;
+    }
+    return false;
+}
+
+fn appParityDocumentViewMappingCatalogContains(entry: AppParityCorpusEntry, pattern: []const u8) bool {
+    for (entry.catalog_tables) |table| {
+        if (corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json) and
+            std.mem.indexOf(u8, table.indexes_json, pattern) != null)
+        {
+            return true;
+        }
+    }
+    return false;
+}
+
+pub fn appParityBinderFixtureSummaryAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    parsed_sql: *const tokenized.ParsedSql,
+) !AppParityBinderFixtureSummary {
+    var summary = AppParityBinderFixtureSummary{};
+    var catalog = (try appParityBindingCoverageCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql)) orelse return summary;
+    defer catalog.deinit(alloc);
+    switch (entry.family) {
+        .read, .query, .aggregate, .join, .lateral, .window => {
+            var bound = binder.bindReadPlanCatalogStatementAlloc(alloc, parsed_sql, catalog.iface()) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound, error.UnsupportedSqlShape => return summary,
+                else => return err,
+            };
+            defer bound.deinit(alloc);
+            var logical = try binder.logicalReadPlanFromBoundStatement(&bound);
+            defer logical.deinit(alloc);
+            summary.observeLogicalPlan(logical);
+        },
+        .insert,
+        .insert_source,
+        .recursive_insert_source,
+        .update,
+        .delete,
+        .update_source,
+        .delete_source,
+        .truncate_source,
+        .update_joined_source,
+        .delete_joined_source,
+        .merge_mutation,
+        => {
+            var bound = binder.bindWritePlanCatalogStatementAlloc(alloc, parsed_sql, .{}, catalog.iface()) catch |err| switch (err) {
+                error.InvalidSqlCatalog, error.TableNotFound, error.UnsupportedSqlShape => return summary,
+                else => return err,
+            };
+            defer bound.deinit(alloc);
+            var logical = try binder.logicalWritePlanFromBoundStatement(&bound);
+            defer logical.deinit(alloc);
+            summary.observeLogicalPlan(logical);
+        },
+        else => {},
+    }
+    return summary;
 }
 
 fn appParityBindingCoverageCatalogForEntryParsedSqlAlloc(
@@ -620,7 +1485,9 @@ fn appParityBindingCoverageWriteSourceTableNameAlloc(
     parsed_sql: *const tokenized.ParsedSql,
 ) !?[]const u8 {
     switch (entry.family) {
-        .insert => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
+        .insert,
+        .unsupported_write,
+        => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
             if (try binder.insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) |resolved| {
                 var tables = resolved;
@@ -686,7 +1553,9 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
     if (entry.source_schema_json.len == 0) return null;
 
     switch (entry.family) {
-        .insert => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
+        .insert,
+        .unsupported_write,
+        => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
             var tables = (try binder.insertSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
             defer tables.deinit(alloc);
@@ -713,6 +1582,12 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
+        .unsupported_read => {
+            if (entry.summary.table_name) |table_name| return try alloc.dupe(u8, table_name);
+            var tables = (try binder.readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return error.InvalidSqlCatalog;
+            defer tables.deinit(alloc);
+            return try alloc.dupe(u8, tables.source);
+        },
         else => return error.InvalidSqlCatalog,
     }
 }
@@ -726,6 +1601,25 @@ pub const app_parity_unsupported_reason_fixture_format: u64 = 1;
 pub const app_parity_summary_assertion_fixture_format: u64 = 1;
 pub const app_parity_summary_regression_fixture_format: u64 = 1;
 pub const app_parity_source_corpus_format: u64 = 1;
+pub const document_sql_bounded_scan_inventory_format: u64 = 1;
+pub const document_sql_dependency_guard_format: u64 = 1;
+pub const document_sql_read_expansion_gate_format: u64 = 1;
+pub const relational_advanced_aggregate_inventory_format: u64 = 1;
+pub const relational_derived_access_inventory_format: u64 = 1;
+pub const relational_durable_schema_inventory_format: u64 = 1;
+pub const relational_expression_ast_inventory_format: u64 = 1;
+pub const relational_expression_completion_inventory_format: u64 = 1;
+pub const relational_json_array_inventory_format: u64 = 1;
+pub const relational_multi_row_dml_inventory_format: u64 = 1;
+pub const relational_point_crud_inventory_format: u64 = 1;
+pub const relational_production_chaos_inventory_format: u64 = 1;
+pub const relational_routed_execution_inventory_format: u64 = 1;
+pub const relational_routed_visibility_matrix_format: u64 = 1;
+pub const relational_semantic_implication_matrix_format: u64 = 1;
+pub const relational_sql_api_coverage_inventory_format: u64 = 1;
+pub const relational_sql_adapter_removal_inventory_format: u64 = 1;
+pub const sql_compatibility_wrapper_inventory_format: u64 = 1;
+pub const sql_parser_migration_table_format: u64 = 1;
 pub const sql_adapter_edge_case_fixture_format: u64 = 1;
 pub const sql_adapter_edge_coverage_fixture_format: u64 = 1;
 
@@ -825,6 +1719,553 @@ pub const AppParitySummaryAssertionRequirements = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeSummaryAssertionRequirementsRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const SqlCompatibilityWrapperEntry = struct {
+    id: []const u8,
+    family: []const u8,
+    wrapper_class: []const u8,
+    classification: []const u8,
+    file: []const u8,
+    symbol: []const u8,
+    contract_reason: []const u8,
+    compatibility_reason: []const u8,
+    typed_replacement: []const u8,
+    deletion_gate: []const u8,
+    deletion_evidence: SqlCompatibilityWrapperDeletionEvidence,
+    state_safety: SqlCompatibilityWrapperStateSafety,
+};
+
+pub const SqlCompatibilityWrapperDeletionEvidence = struct {
+    typed_parser: []const u8,
+    typed_binder: []const u8,
+    typed_plan: []const u8,
+    typed_runtime: []const u8,
+    parity: []const u8,
+};
+
+pub const SqlCompatibilityWrapperStateSafety = struct {
+    durable_catalog: []const u8,
+    durable_document: []const u8,
+    durable_row: []const u8,
+    proof: []const u8,
+};
+
+pub const SqlCompatibilityWrapperInventoryRoot = struct {
+    inventory_format: u64,
+    wrappers: []const SqlCompatibilityWrapperEntry,
+};
+
+pub const SqlCompatibilityWrapperInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: SqlCompatibilityWrapperInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeSqlCompatibilityWrapperInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const SqlParserMigrationTableEntry = struct {
+    family: []const u8,
+    compatibility_entry_point: []const u8,
+    generated_ast_entry_point: []const u8,
+    coverage_file: []const u8,
+    removal_gate: []const u8,
+};
+
+pub const SqlParserMigrationTableRoot = struct {
+    migration_format: u64,
+    families: []const SqlParserMigrationTableEntry,
+};
+
+pub const SqlParserMigrationTable = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: SqlParserMigrationTableRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.root.families.len > 0) alloc.free(self.root.families);
+        self.parsed.deinit();
+    }
+};
+
+pub const DocumentSqlDependencyGuardEntry = struct {
+    id: []const u8,
+    sql_slices_section: []const u8,
+    source_family: []const u8,
+    admission: []const u8,
+    parser_guard: []const u8,
+    session_guard: []const u8,
+    auth_guard: []const u8,
+    response_guard: []const u8,
+    expression_guard: []const u8,
+    durable_storage_guard: []const u8,
+    durable_catalog: []const u8,
+    durable_document: []const u8,
+    durable_row: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const DocumentSqlDependencyGuardRoot = struct {
+    guard_format: u64,
+    entries: []const DocumentSqlDependencyGuardEntry,
+};
+
+pub const DocumentSqlDependencyGuard = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: DocumentSqlDependencyGuardRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeDocumentSqlDependencyGuardRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const DocumentSqlBoundedScanInventoryEntry = struct {
+    id: []const u8,
+    sql_slices_section: []const u8,
+    contract_kind: []const u8,
+    status: []const u8,
+    source_fixture: []const u8,
+    runtime_evidence_file: []const u8,
+    runtime_evidence_symbol: []const u8,
+    scan_cap_evidence: []const u8,
+    byte_cap_evidence: []const u8,
+    residual_evidence: []const u8,
+    ordering_evidence: []const u8,
+    missing_producer_diagnostic: []const u8,
+    missing_or_next_evidence: []const u8,
+    release_gate: []const u8,
+};
+
+pub const DocumentSqlBoundedScanInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const DocumentSqlBoundedScanInventoryEntry,
+};
+
+pub const DocumentSqlBoundedScanInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: DocumentSqlBoundedScanInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeDocumentSqlBoundedScanInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const DocumentSqlReadExpansionGateEntry = struct {
+    id: []const u8,
+    sql_slices_section: []const u8,
+    expansion_surface: []const u8,
+    admission_status: []const u8,
+    source_corpus_requirement: []const u8,
+    coverage_bucket_requirement: []const u8,
+    runtime_parity_requirement: []const u8,
+    current_guard: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const DocumentSqlReadExpansionGateRoot = struct {
+    gate_format: u64,
+    entries: []const DocumentSqlReadExpansionGateEntry,
+};
+
+pub const DocumentSqlReadExpansionGate = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: DocumentSqlReadExpansionGateRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeDocumentSqlReadExpansionGateRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalDerivedAccessInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalDerivedAccessInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalDerivedAccessInventoryEntry,
+};
+
+pub const RelationalDerivedAccessInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalDerivedAccessInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalDerivedAccessInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalDurableSchemaInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalDurableSchemaInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalDurableSchemaInventoryEntry,
+};
+
+pub const RelationalDurableSchemaInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalDurableSchemaInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalDurableSchemaInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalExpressionAstInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    current_shape: []const u8,
+    owner: []const u8,
+    target_typed_node: []const u8,
+    deletion_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    status: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalExpressionAstInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalExpressionAstInventoryEntry,
+};
+
+pub const RelationalExpressionAstInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalExpressionAstInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalExpressionAstInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalExpressionCompletionInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalExpressionCompletionInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalExpressionCompletionInventoryEntry,
+};
+
+pub const RelationalExpressionCompletionInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalExpressionCompletionInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalExpressionCompletionInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalSemanticImplicationMatrixEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    proof_family: []const u8,
+    required_rule: []const u8,
+    unsafe_negative: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    coverage_contract: []const u8,
+    missing_or_next_evidence: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalSemanticImplicationMatrixRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalSemanticImplicationMatrixEntry,
+};
+
+pub const RelationalSemanticImplicationMatrix = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalSemanticImplicationMatrixRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalSemanticImplicationMatrixRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalRoutedVisibilityMatrixEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    routed_shape: []const u8,
+    visibility_outcome: []const u8,
+    evidence_kind: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    coverage_contract: []const u8,
+    missing_or_next_evidence: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalRoutedVisibilityMatrixRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalRoutedVisibilityMatrixEntry,
+};
+
+pub const RelationalRoutedVisibilityMatrix = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalRoutedVisibilityMatrixRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalRoutedVisibilityMatrixRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalAdvancedAggregateInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalAdvancedAggregateInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalAdvancedAggregateInventoryEntry,
+};
+
+pub const RelationalAdvancedAggregateInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalAdvancedAggregateInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalAdvancedAggregateInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalPointCrudInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalPointCrudInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalPointCrudInventoryEntry,
+};
+
+pub const RelationalPointCrudInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalPointCrudInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalPointCrudInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalMultiRowDmlInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalMultiRowDmlInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalMultiRowDmlInventoryEntry,
+};
+
+pub const RelationalMultiRowDmlInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalMultiRowDmlInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalMultiRowDmlInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalJsonArrayInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalJsonArrayInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalJsonArrayInventoryEntry,
+};
+
+pub const RelationalJsonArrayInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalJsonArrayInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalJsonArrayInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalRoutedExecutionInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalRoutedExecutionInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalRoutedExecutionInventoryEntry,
+};
+
+pub const RelationalRoutedExecutionInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalRoutedExecutionInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalRoutedExecutionInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalProductionChaosInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    scope: []const u8,
+    status: []const u8,
+    required_behavior: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalProductionChaosInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalProductionChaosInventoryEntry,
+};
+
+pub const RelationalProductionChaosInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalProductionChaosInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalProductionChaosInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalSqlApiCoverageInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    syntax_family: []const u8,
+    durable_surface: []const u8,
+    evidence_kind: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    coverage_contract: []const u8,
+    missing_or_next_evidence: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalSqlApiCoverageInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalSqlApiCoverageInventoryEntry,
+};
+
+pub const RelationalSqlApiCoverageInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalSqlApiCoverageInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalSqlApiCoverageInventoryRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const RelationalSqlAdapterRemovalInventoryEntry = struct {
+    id: []const u8,
+    relational_slices_section: []const u8,
+    surface: []const u8,
+    status: []const u8,
+    current_evidence: []const u8,
+    missing_evidence: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    release_gate: []const u8,
+};
+
+pub const RelationalSqlAdapterRemovalInventoryRoot = struct {
+    inventory_format: u64,
+    entries: []const RelationalSqlAdapterRemovalInventoryEntry,
+};
+
+pub const RelationalSqlAdapterRemovalInventory = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: RelationalSqlAdapterRemovalInventoryRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeRelationalSqlAdapterRemovalInventoryRoot(alloc, self.root);
         self.parsed.deinit();
     }
 };
@@ -1167,6 +2608,2493 @@ pub fn parseAppParitySummaryAssertionRequirementsAlloc(alloc: std.mem.Allocator)
     };
 }
 
+const sql_parser_migration_table_families = [_][]const u8{
+    "backups",
+    "ddl",
+    "dml",
+    "extensions",
+    "functions",
+    "lakes",
+    "maintenance",
+    "query",
+    "roles",
+};
+
+fn sqlParserMigrationFamilyKnown(name: []const u8) bool {
+    for (sql_parser_migration_table_families) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+const sql_compatibility_wrapper_classes = [_][]const u8{
+    "binder",
+    "parser",
+    "planner",
+    "runtime",
+};
+
+fn sqlCompatibilityWrapperClassKnown(name: []const u8) bool {
+    for (sql_compatibility_wrapper_classes) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn sqlCompatibilityWrapperClassificationKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "compatibility_contract") or
+        std.mem.eql(u8, name, "migration_blocker") or
+        std.mem.eql(u8, name, "removable_dead_path");
+}
+
+const sql_compatibility_wrapper_contract_reasons = [_][]const u8{
+    "bounded_document_query_scan",
+    "postgres_maintenance_tail_compatibility",
+};
+
+fn sqlCompatibilityWrapperContractReasonKnown(name: []const u8) bool {
+    for (sql_compatibility_wrapper_contract_reasons) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+pub fn parseSqlCompatibilityWrapperInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlCompatibilityWrapperInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "wrappers" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != sql_compatibility_wrapper_inventory_format) return error.TestUnexpectedResult;
+    const wrapper_values = switch (root.get("wrappers") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (wrapper_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var wrappers = std.ArrayListUnmanaged(SqlCompatibilityWrapperEntry).empty;
+    errdefer wrappers.deinit(alloc);
+    var seen_ids = std.StringHashMapUnmanaged(void){};
+    defer seen_ids.deinit(alloc);
+    var seen_classes = std.StringHashMapUnmanaged(void){};
+    defer seen_classes.deinit(alloc);
+
+    for (wrapper_values.items, 0..) |wrapper_value, i| {
+        const item = try fixtureJsonObject(wrapper_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "family",
+            "wrapper_class",
+            "classification",
+            "file",
+            "symbol",
+            "contract_reason",
+            "compatibility_reason",
+            "typed_replacement",
+            "deletion_gate",
+            "deletion_evidence",
+            "state_safety",
+        });
+        const id = try fixtureJsonOptionalString(item, "id", "");
+        const family = try fixtureJsonOptionalString(item, "family", "");
+        const wrapper_class = try fixtureJsonOptionalString(item, "wrapper_class", "");
+        const classification = try fixtureJsonOptionalString(item, "classification", "");
+        const file = try fixtureJsonOptionalString(item, "file", "");
+        const symbol = try fixtureJsonOptionalString(item, "symbol", "");
+        const contract_reason = try fixtureJsonOptionalString(item, "contract_reason", "");
+        const compatibility_reason = try fixtureJsonOptionalString(item, "compatibility_reason", "");
+        const typed_replacement = try fixtureJsonOptionalString(item, "typed_replacement", "");
+        const deletion_gate = try fixtureJsonOptionalString(item, "deletion_gate", "");
+        const deletion_evidence = try parseSqlCompatibilityWrapperDeletionEvidence(item.get("deletion_evidence") orelse return error.TestUnexpectedResult);
+        const state_safety = try parseSqlCompatibilityWrapperStateSafety(item.get("state_safety") orelse return error.TestUnexpectedResult);
+        if (id.len == 0 or
+            family.len == 0 or
+            wrapper_class.len == 0 or
+            classification.len == 0 or
+            file.len == 0 or
+            symbol.len == 0 or
+            compatibility_reason.len == 0 or
+            typed_replacement.len == 0 or
+            deletion_gate.len == 0 or
+            seen_ids.contains(id) or
+            !sqlParserMigrationFamilyKnown(family) or
+            !sqlCompatibilityWrapperClassKnown(wrapper_class) or
+            !sqlCompatibilityWrapperClassificationKnown(classification) or
+            !std.mem.startsWith(u8, file, "zig/pkg/antfly/src/sql/"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, classification, "compatibility_contract")) {
+            if (!sqlCompatibilityWrapperContractReasonKnown(contract_reason)) return error.TestUnexpectedResult;
+        } else if (contract_reason.len != 0) {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, classification, "compatibility_contract") and
+            (!sqlCompatibilityWrapperStateEffectIsSafe(state_safety.durable_catalog) or
+                !sqlCompatibilityWrapperStateEffectIsSafe(state_safety.durable_document) or
+                !sqlCompatibilityWrapperStateEffectIsSafe(state_safety.durable_row)))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, wrappers.items[i - 1].id, id)) return error.TestUnexpectedResult;
+        try seen_ids.put(alloc, id, {});
+        try seen_classes.put(alloc, wrapper_class, {});
+        try wrappers.append(alloc, .{
+            .id = id,
+            .family = family,
+            .wrapper_class = wrapper_class,
+            .classification = classification,
+            .file = file,
+            .symbol = symbol,
+            .contract_reason = contract_reason,
+            .compatibility_reason = compatibility_reason,
+            .typed_replacement = typed_replacement,
+            .deletion_gate = deletion_gate,
+            .deletion_evidence = deletion_evidence,
+            .state_safety = state_safety,
+        });
+    }
+    for (sql_compatibility_wrapper_classes) |wrapper_class| {
+        if (!seen_classes.contains(wrapper_class)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .wrappers = try wrappers.toOwnedSlice(alloc),
+    };
+}
+
+fn parseSqlCompatibilityWrapperStateSafety(value: std.json.Value) !SqlCompatibilityWrapperStateSafety {
+    const state_safety = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(state_safety, &.{ "durable_catalog", "durable_document", "durable_row", "proof" });
+    const durable_catalog = try fixtureJsonOptionalString(state_safety, "durable_catalog", "");
+    const durable_document = try fixtureJsonOptionalString(state_safety, "durable_document", "");
+    const durable_row = try fixtureJsonOptionalString(state_safety, "durable_row", "");
+    const proof = try fixtureJsonOptionalString(state_safety, "proof", "");
+    if (!sqlCompatibilityWrapperStateEffectKnown(durable_catalog) or
+        !sqlCompatibilityWrapperStateEffectKnown(durable_document) or
+        !sqlCompatibilityWrapperStateEffectKnown(durable_row) or
+        proof.len == 0)
+    {
+        return error.TestUnexpectedResult;
+    }
+    return .{
+        .durable_catalog = durable_catalog,
+        .durable_document = durable_document,
+        .durable_row = durable_row,
+        .proof = proof,
+    };
+}
+
+fn sqlCompatibilityWrapperStateEffectKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "none") or
+        std.mem.eql(u8, name, "read_only") or
+        std.mem.eql(u8, name, "unproven_migration_blocker");
+}
+
+fn sqlCompatibilityWrapperStateEffectIsSafe(name: []const u8) bool {
+    return std.mem.eql(u8, name, "none") or std.mem.eql(u8, name, "read_only");
+}
+
+fn parseSqlCompatibilityWrapperDeletionEvidence(value: std.json.Value) !SqlCompatibilityWrapperDeletionEvidence {
+    const evidence = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(evidence, &.{ "typed_parser", "typed_binder", "typed_plan", "typed_runtime", "parity" });
+    const typed_parser = try fixtureJsonOptionalString(evidence, "typed_parser", "");
+    const typed_binder = try fixtureJsonOptionalString(evidence, "typed_binder", "");
+    const typed_plan = try fixtureJsonOptionalString(evidence, "typed_plan", "");
+    const typed_runtime = try fixtureJsonOptionalString(evidence, "typed_runtime", "");
+    const parity = try fixtureJsonOptionalString(evidence, "parity", "");
+    if (typed_parser.len == 0 or
+        typed_binder.len == 0 or
+        typed_plan.len == 0 or
+        typed_runtime.len == 0 or
+        parity.len == 0)
+    {
+        return error.TestUnexpectedResult;
+    }
+    return .{
+        .typed_parser = typed_parser,
+        .typed_binder = typed_binder,
+        .typed_plan = typed_plan,
+        .typed_runtime = typed_runtime,
+        .parity = parity,
+    };
+}
+
+pub fn freeSqlCompatibilityWrapperInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: SqlCompatibilityWrapperInventoryRoot,
+) void {
+    if (root.wrappers.len > 0) alloc.free(root.wrappers);
+}
+
+pub fn parseSqlCompatibilityWrapperInventoryAlloc(alloc: std.mem.Allocator) !SqlCompatibilityWrapperInventory {
+    const inventory_json = @embedFile("fixtures/sql_compatibility_wrappers.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeSqlCompatibilityWrapperInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+pub fn parseSqlParserMigrationTableRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlParserMigrationTableRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "migration_format", "families" });
+    const migration_format = try fixtureJsonOptionalU64(root, "migration_format", 0);
+    if (migration_format != sql_parser_migration_table_format) return error.TestUnexpectedResult;
+    const family_values = switch (root.get("families") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (family_values.items.len != sql_parser_migration_table_families.len) return error.TestUnexpectedResult;
+
+    var families = std.ArrayListUnmanaged(SqlParserMigrationTableEntry).empty;
+    errdefer families.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (family_values.items, 0..) |family_value, i| {
+        const item = try fixtureJsonObject(family_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "family",
+            "compatibility_entry_point",
+            "generated_ast_entry_point",
+            "coverage_file",
+            "removal_gate",
+        });
+        const family = try fixtureJsonOptionalString(item, "family", "");
+        const compatibility_entry_point = try fixtureJsonOptionalString(item, "compatibility_entry_point", "");
+        const generated_ast_entry_point = try fixtureJsonOptionalString(item, "generated_ast_entry_point", "");
+        const coverage_file = try fixtureJsonOptionalString(item, "coverage_file", "");
+        const removal_gate = try fixtureJsonOptionalString(item, "removal_gate", "");
+        if (family.len == 0 or
+            compatibility_entry_point.len == 0 or
+            generated_ast_entry_point.len == 0 or
+            coverage_file.len == 0 or
+            removal_gate.len == 0 or
+            seen.contains(family) or
+            !sqlParserMigrationFamilyKnown(family))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, families.items[i - 1].family, family)) return error.TestUnexpectedResult;
+        try seen.put(alloc, family, {});
+        try families.append(alloc, .{
+            .family = family,
+            .compatibility_entry_point = compatibility_entry_point,
+            .generated_ast_entry_point = generated_ast_entry_point,
+            .coverage_file = coverage_file,
+            .removal_gate = removal_gate,
+        });
+    }
+    for (sql_parser_migration_table_families) |known| {
+        if (!seen.contains(known)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .migration_format = migration_format,
+        .families = try families.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeSqlParserMigrationTableRoot(
+    alloc: std.mem.Allocator,
+    root: SqlParserMigrationTableRoot,
+) void {
+    if (root.families.len > 0) alloc.free(root.families);
+}
+
+pub fn parseSqlParserMigrationTableAlloc(alloc: std.mem.Allocator) !SqlParserMigrationTable {
+    const migration_json = @embedFile("fixtures/sql_parser_migration_table.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, migration_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSqlParserMigrationTableRootAlloc(alloc, parsed.value);
+    errdefer freeSqlParserMigrationTableRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const document_sql_dependency_guard_ids = [_][]const u8{
+    "document-query-read",
+    "document-table-ddl",
+    "document-table-writes",
+    "document-view-mapping",
+};
+
+fn documentSqlDependencyGuardIdKnown(name: []const u8) bool {
+    for (document_sql_dependency_guard_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn documentSqlDependencySourceFamilyKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "document_query_read") or
+        std.mem.eql(u8, name, "document_table_ddl") or
+        std.mem.eql(u8, name, "document_table_write") or
+        std.mem.eql(u8, name, "document_view_mapping");
+}
+
+fn documentSqlDependencyAdmissionKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "admitted_read_only") or
+        std.mem.eql(u8, name, "blocked_until_native_parity") or
+        std.mem.eql(u8, name, "unsupported_fail_closed");
+}
+
+fn documentSqlDependencyGuardKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "blocked_in_sql_slices") or
+        std.mem.eql(u8, name, "explicit_unsupported_fixture") or
+        std.mem.eql(u8, name, "native_document_query_path") or
+        std.mem.eql(u8, name, "native_document_response_mapping") or
+        std.mem.eql(u8, name, "native_document_schema_required") or
+        std.mem.eql(u8, name, "native_document_write_required") or
+        std.mem.eql(u8, name, "not_applicable") or
+        std.mem.eql(u8, name, "shared_native_preflight_required") or
+        std.mem.eql(u8, name, "shared_relational_evidence") or
+        std.mem.eql(u8, name, "shared_schema_validator_required") or
+        std.mem.eql(u8, name, "typed_document_expression_required") or
+        std.mem.eql(u8, name, "typed_expression_evidence");
+}
+
+pub fn parseDocumentSqlDependencyGuardRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !DocumentSqlDependencyGuardRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "guard_format", "entries" });
+    const guard_format = try fixtureJsonOptionalU64(root, "guard_format", 0);
+    if (guard_format != document_sql_dependency_guard_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(DocumentSqlDependencyGuardEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "sql_slices_section",
+            "source_family",
+            "admission",
+            "parser_guard",
+            "session_guard",
+            "auth_guard",
+            "response_guard",
+            "expression_guard",
+            "durable_storage_guard",
+            "durable_catalog",
+            "durable_document",
+            "durable_row",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = DocumentSqlDependencyGuardEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .sql_slices_section = try fixtureJsonOptionalString(item, "sql_slices_section", ""),
+            .source_family = try fixtureJsonOptionalString(item, "source_family", ""),
+            .admission = try fixtureJsonOptionalString(item, "admission", ""),
+            .parser_guard = try fixtureJsonOptionalString(item, "parser_guard", ""),
+            .session_guard = try fixtureJsonOptionalString(item, "session_guard", ""),
+            .auth_guard = try fixtureJsonOptionalString(item, "auth_guard", ""),
+            .response_guard = try fixtureJsonOptionalString(item, "response_guard", ""),
+            .expression_guard = try fixtureJsonOptionalString(item, "expression_guard", ""),
+            .durable_storage_guard = try fixtureJsonOptionalString(item, "durable_storage_guard", ""),
+            .durable_catalog = try fixtureJsonOptionalString(item, "durable_catalog", ""),
+            .durable_document = try fixtureJsonOptionalString(item, "durable_document", ""),
+            .durable_row = try fixtureJsonOptionalString(item, "durable_row", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !documentSqlDependencyGuardIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.sql_slices_section, "Document SQL") or
+            !documentSqlDependencySourceFamilyKnown(entry.source_family) or
+            !documentSqlDependencyAdmissionKnown(entry.admission) or
+            !documentSqlDependencyGuardKnown(entry.parser_guard) or
+            !documentSqlDependencyGuardKnown(entry.session_guard) or
+            !documentSqlDependencyGuardKnown(entry.auth_guard) or
+            !documentSqlDependencyGuardKnown(entry.response_guard) or
+            !documentSqlDependencyGuardKnown(entry.expression_guard) or
+            !documentSqlDependencyGuardKnown(entry.durable_storage_guard) or
+            !sqlCompatibilityWrapperStateEffectKnown(entry.durable_catalog) or
+            !sqlCompatibilityWrapperStateEffectKnown(entry.durable_document) or
+            !sqlCompatibilityWrapperStateEffectKnown(entry.durable_row) or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        if (std.mem.eql(u8, entry.admission, "admitted_read_only") and
+            (!sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_catalog) or
+                !sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_document) or
+                !sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_row)))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, entry.admission, "blocked_until_native_parity") and
+            sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_catalog) and
+            sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_document) and
+            sqlCompatibilityWrapperStateEffectIsSafe(entry.durable_row))
+        {
+            return error.TestUnexpectedResult;
+        }
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (document_sql_dependency_guard_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .guard_format = guard_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeDocumentSqlDependencyGuardRoot(
+    alloc: std.mem.Allocator,
+    root: DocumentSqlDependencyGuardRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseDocumentSqlDependencyGuardAlloc(alloc: std.mem.Allocator) !DocumentSqlDependencyGuard {
+    const guard_json = @embedFile("fixtures/sql_document_dependency_guard.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, guard_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseDocumentSqlDependencyGuardRootAlloc(alloc, parsed.value);
+    errdefer freeDocumentSqlDependencyGuardRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const document_sql_bounded_scan_inventory_ids = [_][]const u8{
+    "mapped-view-residual-bounded-scan",
+};
+
+fn documentSqlBoundedScanInventoryIdKnown(name: []const u8) bool {
+    for (document_sql_bounded_scan_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn documentSqlBoundedScanContractKindKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "view_mapping_residual");
+}
+
+fn documentSqlBoundedScanStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "intentional_contract");
+}
+
+fn documentSqlBoundedScanSourceFixtureKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "document sql view mapping bounded residual read");
+}
+
+fn documentSqlBoundedScanEntryShapeMatches(entry: DocumentSqlBoundedScanInventoryEntry) bool {
+    if (std.mem.eql(u8, entry.id, "mapped-view-residual-bounded-scan")) {
+        return std.mem.eql(u8, entry.contract_kind, "view_mapping_residual") and
+            std.mem.eql(u8, entry.status, "intentional_contract") and
+            std.mem.eql(u8, entry.source_fixture, "document sql view mapping bounded residual read");
+    }
+    return false;
+}
+
+pub fn parseDocumentSqlBoundedScanInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !DocumentSqlBoundedScanInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != document_sql_bounded_scan_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(DocumentSqlBoundedScanInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "sql_slices_section",
+            "contract_kind",
+            "status",
+            "source_fixture",
+            "runtime_evidence_file",
+            "runtime_evidence_symbol",
+            "scan_cap_evidence",
+            "byte_cap_evidence",
+            "residual_evidence",
+            "ordering_evidence",
+            "missing_producer_diagnostic",
+            "missing_or_next_evidence",
+            "release_gate",
+        });
+        const entry = DocumentSqlBoundedScanInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .sql_slices_section = try fixtureJsonOptionalString(item, "sql_slices_section", ""),
+            .contract_kind = try fixtureJsonOptionalString(item, "contract_kind", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .source_fixture = try fixtureJsonOptionalString(item, "source_fixture", ""),
+            .runtime_evidence_file = try fixtureJsonOptionalString(item, "runtime_evidence_file", ""),
+            .runtime_evidence_symbol = try fixtureJsonOptionalString(item, "runtime_evidence_symbol", ""),
+            .scan_cap_evidence = try fixtureJsonOptionalString(item, "scan_cap_evidence", ""),
+            .byte_cap_evidence = try fixtureJsonOptionalString(item, "byte_cap_evidence", ""),
+            .residual_evidence = try fixtureJsonOptionalString(item, "residual_evidence", ""),
+            .ordering_evidence = try fixtureJsonOptionalString(item, "ordering_evidence", ""),
+            .missing_producer_diagnostic = try fixtureJsonOptionalString(item, "missing_producer_diagnostic", ""),
+            .missing_or_next_evidence = try fixtureJsonOptionalString(item, "missing_or_next_evidence", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !documentSqlBoundedScanInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.sql_slices_section, "Finish document query and view-mapping hardening") or
+            !documentSqlBoundedScanContractKindKnown(entry.contract_kind) or
+            !documentSqlBoundedScanStatusKnown(entry.status) or
+            !documentSqlBoundedScanSourceFixtureKnown(entry.source_fixture) or
+            !documentSqlBoundedScanEntryShapeMatches(entry) or
+            !std.mem.startsWith(u8, entry.runtime_evidence_file, "zig/") or
+            entry.runtime_evidence_symbol.len == 0 or
+            entry.scan_cap_evidence.len == 0 or
+            entry.byte_cap_evidence.len == 0 or
+            entry.residual_evidence.len == 0 or
+            entry.ordering_evidence.len == 0 or
+            !std.mem.eql(u8, entry.missing_producer_diagnostic, "document_sql_bounded_scan_missing_exact_producer") or
+            entry.missing_or_next_evidence.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "document-sql-hardening-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (document_sql_bounded_scan_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeDocumentSqlBoundedScanInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: DocumentSqlBoundedScanInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseDocumentSqlBoundedScanInventoryAlloc(alloc: std.mem.Allocator) !DocumentSqlBoundedScanInventory {
+    const inventory_json = @embedFile("fixtures/document_sql_bounded_scan_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseDocumentSqlBoundedScanInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeDocumentSqlBoundedScanInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const document_sql_read_expansion_gate_ids = [_][]const u8{
+    "additional-array-unnest-patterns",
+    "additional-mapped-fields",
+    "derived-index-producer-types",
+    "document-aggregates",
+    "lateral-view-mapping-joins",
+};
+
+fn documentSqlReadExpansionGateIdKnown(name: []const u8) bool {
+    for (document_sql_read_expansion_gate_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn documentSqlReadExpansionSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "array_unnest_patterns") or
+        std.mem.eql(u8, name, "mapped_fields") or
+        std.mem.eql(u8, name, "derived_index_producer_types") or
+        std.mem.eql(u8, name, "document_aggregates") or
+        std.mem.eql(u8, name, "lateral_view_mapping_joins");
+}
+
+fn documentSqlReadExpansionEntryShapeMatches(entry: DocumentSqlReadExpansionGateEntry) bool {
+    if (std.mem.eql(u8, entry.id, "additional-array-unnest-patterns")) {
+        return std.mem.eql(u8, entry.expansion_surface, "array_unnest_patterns");
+    }
+    if (std.mem.eql(u8, entry.id, "additional-mapped-fields")) {
+        return std.mem.eql(u8, entry.expansion_surface, "mapped_fields");
+    }
+    if (std.mem.eql(u8, entry.id, "derived-index-producer-types")) {
+        return std.mem.eql(u8, entry.expansion_surface, "derived_index_producer_types");
+    }
+    if (std.mem.eql(u8, entry.id, "document-aggregates")) {
+        return std.mem.eql(u8, entry.expansion_surface, "document_aggregates");
+    }
+    if (std.mem.eql(u8, entry.id, "lateral-view-mapping-joins")) {
+        return std.mem.eql(u8, entry.expansion_surface, "lateral_view_mapping_joins");
+    }
+    return false;
+}
+
+fn documentSqlReadExpansionRequirementNamesArtifact(
+    text: []const u8,
+    artifact: []const u8,
+) bool {
+    return std.mem.indexOf(u8, text, artifact) != null;
+}
+
+pub fn parseDocumentSqlReadExpansionGateRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !DocumentSqlReadExpansionGateRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "gate_format", "entries" });
+    const gate_format = try fixtureJsonOptionalU64(root, "gate_format", 0);
+    if (gate_format != document_sql_read_expansion_gate_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(DocumentSqlReadExpansionGateEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "sql_slices_section",
+            "expansion_surface",
+            "admission_status",
+            "source_corpus_requirement",
+            "coverage_bucket_requirement",
+            "runtime_parity_requirement",
+            "current_guard",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = DocumentSqlReadExpansionGateEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .sql_slices_section = try fixtureJsonOptionalString(item, "sql_slices_section", ""),
+            .expansion_surface = try fixtureJsonOptionalString(item, "expansion_surface", ""),
+            .admission_status = try fixtureJsonOptionalString(item, "admission_status", ""),
+            .source_corpus_requirement = try fixtureJsonOptionalString(item, "source_corpus_requirement", ""),
+            .coverage_bucket_requirement = try fixtureJsonOptionalString(item, "coverage_bucket_requirement", ""),
+            .runtime_parity_requirement = try fixtureJsonOptionalString(item, "runtime_parity_requirement", ""),
+            .current_guard = try fixtureJsonOptionalString(item, "current_guard", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !documentSqlReadExpansionGateIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.sql_slices_section, "Finish document query and view-mapping hardening") or
+            !documentSqlReadExpansionSurfaceKnown(entry.expansion_surface) or
+            !documentSqlReadExpansionEntryShapeMatches(entry) or
+            !std.mem.eql(u8, entry.admission_status, "blocked_until_corpus_and_runtime") or
+            !documentSqlReadExpansionRequirementNamesArtifact(entry.source_corpus_requirement, "sql_api_parity_source_corpus.json") or
+            !documentSqlReadExpansionRequirementNamesArtifact(entry.coverage_bucket_requirement, "sql_api_required_coverage.json") or
+            !documentSqlReadExpansionRequirementNamesArtifact(entry.runtime_parity_requirement, "runtime result-parity") or
+            entry.current_guard.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "document-sql-hardening-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (document_sql_read_expansion_gate_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .gate_format = gate_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeDocumentSqlReadExpansionGateRoot(
+    alloc: std.mem.Allocator,
+    root: DocumentSqlReadExpansionGateRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseDocumentSqlReadExpansionGateAlloc(alloc: std.mem.Allocator) !DocumentSqlReadExpansionGate {
+    const gate_json = @embedFile("fixtures/document_sql_read_expansion_gate.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, gate_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseDocumentSqlReadExpansionGateRootAlloc(alloc, parsed.value);
+    errdefer freeDocumentSqlReadExpansionGateRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_derived_access_inventory_ids = [_][]const u8{
+    "durable-ordered-composite-metadata",
+    "expression-derived-rebuild-promotion",
+    "stale-derived-artifact-safety",
+};
+
+fn relationalDerivedAccessInventoryIdKnown(name: []const u8) bool {
+    for (relational_derived_access_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalDerivedAccessSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "durable_ordered_composite_metadata") or
+        std.mem.eql(u8, name, "expression_derived_rebuild_promotion") or
+        std.mem.eql(u8, name, "stale_derived_artifact_safety");
+}
+
+fn relationalDerivedAccessStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalDerivedAccessInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalDerivedAccessInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_derived_access_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalDerivedAccessInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalDerivedAccessInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalDerivedAccessInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Planner trust and derived access paths") or
+            !relationalDerivedAccessSurfaceKnown(entry.surface) or
+            !relationalDerivedAccessStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_derived_access_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalDerivedAccessInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalDerivedAccessInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalDerivedAccessInventoryAlloc(alloc: std.mem.Allocator) !RelationalDerivedAccessInventory {
+    const inventory_json = @embedFile("fixtures/relational_derived_access_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalDerivedAccessInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalDerivedAccessInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_durable_schema_inventory_ids = [_][]const u8{
+    "concurrent-writer-generation-isolation",
+    "create-or-replace-table-schema-job",
+    "drop-table-cascade-recoverable-job",
+    "schema-job-operator-controls",
+};
+
+fn relationalDurableSchemaInventoryIdKnown(name: []const u8) bool {
+    for (relational_durable_schema_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalDurableSchemaSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "concurrent_writer_generation_isolation") or
+        std.mem.eql(u8, name, "create_or_replace_table") or
+        std.mem.eql(u8, name, "drop_table_cascade") or
+        std.mem.eql(u8, name, "operator_controls");
+}
+
+fn relationalDurableSchemaStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalDurableSchemaInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalDurableSchemaInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_durable_schema_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalDurableSchemaInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalDurableSchemaInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalDurableSchemaInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Durable schema and migration execution") or
+            !relationalDurableSchemaSurfaceKnown(entry.surface) or
+            !relationalDurableSchemaStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_durable_schema_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalDurableSchemaInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalDurableSchemaInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalDurableSchemaInventoryAlloc(alloc: std.mem.Allocator) !RelationalDurableSchemaInventory {
+    const inventory_json = @embedFile("fixtures/relational_durable_schema_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalDurableSchemaInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalDurableSchemaInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_expression_ast_inventory_ids = [_][]const u8{
+    "aggregate-input-filter-expression",
+    "cast-expression",
+    "check-generated-column-expression",
+    "conflict-action-expression",
+    "expression-index-partial-predicate",
+    "json-array-transform-expression",
+    "order-key-expression",
+    "returning-expression",
+    "rewrite-using-expression",
+    "update-transform-expression",
+    "window-expression",
+};
+
+fn relationalExpressionAstInventoryIdKnown(name: []const u8) bool {
+    for (relational_expression_ast_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalExpressionAstSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "aggregate_input_filter") or
+        std.mem.eql(u8, name, "cast") or
+        std.mem.eql(u8, name, "check_generated_column") or
+        std.mem.eql(u8, name, "conflict_action") or
+        std.mem.eql(u8, name, "expression_index_partial_predicate") or
+        std.mem.eql(u8, name, "json_array_transform") or
+        std.mem.eql(u8, name, "order_key") or
+        std.mem.eql(u8, name, "returning") or
+        std.mem.eql(u8, name, "rewrite_using") or
+        std.mem.eql(u8, name, "update_transform") or
+        std.mem.eql(u8, name, "window");
+}
+
+fn relationalExpressionAstStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "typed_ast_promoted") or
+        std.mem.eql(u8, name, "string_compat_tracked") or
+        std.mem.eql(u8, name, "mixed_requires_deletion_evidence");
+}
+
+pub fn parseRelationalExpressionAstInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalExpressionAstInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_expression_ast_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalExpressionAstInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "current_shape",
+            "owner",
+            "target_typed_node",
+            "deletion_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "status",
+            "release_gate",
+        });
+        const entry = RelationalExpressionAstInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .current_shape = try fixtureJsonOptionalString(item, "current_shape", ""),
+            .owner = try fixtureJsonOptionalString(item, "owner", ""),
+            .target_typed_node = try fixtureJsonOptionalString(item, "target_typed_node", ""),
+            .deletion_evidence = try fixtureJsonOptionalString(item, "deletion_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalExpressionAstInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Shared scalar expression AST completion") or
+            !relationalExpressionAstSurfaceKnown(entry.surface) or
+            entry.current_shape.len == 0 or
+            entry.owner.len == 0 or
+            entry.target_typed_node.len == 0 or
+            entry.deletion_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !relationalExpressionAstStatusKnown(entry.status) or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_expression_ast_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalExpressionAstInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalExpressionAstInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalExpressionAstInventoryAlloc(alloc: std.mem.Allocator) !RelationalExpressionAstInventory {
+    const inventory_json = @embedFile("fixtures/relational_expression_ast_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalExpressionAstInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalExpressionAstInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_expression_completion_inventory_ids = [_][]const u8{
+    "adapter-boundary-string-path-deletion",
+    "optimizer-expression-pushdown",
+    "rest-sdk-expression-exposure",
+};
+
+fn relationalExpressionCompletionInventoryIdKnown(name: []const u8) bool {
+    for (relational_expression_completion_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalExpressionCompletionSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "adapter_boundary_string_path_deletion") or
+        std.mem.eql(u8, name, "optimizer_expression_pushdown") or
+        std.mem.eql(u8, name, "rest_sdk_expression_exposure");
+}
+
+fn relationalExpressionCompletionStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalExpressionCompletionInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalExpressionCompletionInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_expression_completion_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalExpressionCompletionInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalExpressionCompletionInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalExpressionCompletionInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Shared scalar expression AST completion") or
+            !relationalExpressionCompletionSurfaceKnown(entry.surface) or
+            !relationalExpressionCompletionStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_expression_completion_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalExpressionCompletionInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalExpressionCompletionInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalExpressionCompletionInventoryAlloc(alloc: std.mem.Allocator) !RelationalExpressionCompletionInventory {
+    const inventory_json = @embedFile("fixtures/relational_expression_completion_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalExpressionCompletionInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalExpressionCompletionInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_semantic_implication_matrix_ids = [_][]const u8{
+    "case-insensitive-collation-implication",
+    "expression-partial-predicate-implication",
+    "json-null-partial-predicate-implication",
+    "null-distinct-unique-implication",
+    "unsafe-building-artifact-fail-closed",
+    "unsafe-ordered-index-fail-closed",
+    "unsafe-partial-predicate-mismatch",
+};
+
+fn relationalSemanticImplicationMatrixIdKnown(name: []const u8) bool {
+    for (relational_semantic_implication_matrix_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalSemanticImplicationProofFamilyKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "collation") or
+        std.mem.eql(u8, name, "equivalence_class") or
+        std.mem.eql(u8, name, "null_semantics") or
+        std.mem.eql(u8, name, "unsafe_artifact_lifecycle") or
+        std.mem.eql(u8, name, "unsafe_negative");
+}
+
+pub fn parseRelationalSemanticImplicationMatrixRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalSemanticImplicationMatrixRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_semantic_implication_matrix_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalSemanticImplicationMatrixEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "proof_family",
+            "required_rule",
+            "unsafe_negative",
+            "evidence_file",
+            "evidence_symbol",
+            "coverage_contract",
+            "missing_or_next_evidence",
+            "release_gate",
+        });
+        const entry = RelationalSemanticImplicationMatrixEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .proof_family = try fixtureJsonOptionalString(item, "proof_family", ""),
+            .required_rule = try fixtureJsonOptionalString(item, "required_rule", ""),
+            .unsafe_negative = try fixtureJsonOptionalString(item, "unsafe_negative", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .coverage_contract = try fixtureJsonOptionalString(item, "coverage_contract", ""),
+            .missing_or_next_evidence = try fixtureJsonOptionalString(item, "missing_or_next_evidence", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalSemanticImplicationMatrixIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Planner trust and derived access paths") or
+            !relationalSemanticImplicationProofFamilyKnown(entry.proof_family) or
+            entry.required_rule.len == 0 or
+            entry.unsafe_negative.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            entry.coverage_contract.len == 0 or
+            entry.missing_or_next_evidence.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_semantic_implication_matrix_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalSemanticImplicationMatrixRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalSemanticImplicationMatrixRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalSemanticImplicationMatrixAlloc(alloc: std.mem.Allocator) !RelationalSemanticImplicationMatrix {
+    const inventory_json = @embedFile("fixtures/relational_semantic_implication_matrix.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalSemanticImplicationMatrixRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalSemanticImplicationMatrixRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_routed_visibility_matrix_ids = [_][]const u8{
+    "cte-backed-join-fail-closed",
+    "live-write-pagination-gap",
+    "non-cte-ranged-join-fail-closed",
+    "routed-cte-revalidation",
+    "routed-merge-join-unsupported",
+    "routed-system-time-as-of",
+    "system-time-cte-provisioned",
+};
+
+fn relationalRoutedVisibilityMatrixIdKnown(name: []const u8) bool {
+    for (relational_routed_visibility_matrix_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalRoutedVisibilityShapeKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "cte_backed_join") or
+        std.mem.eql(u8, name, "live_write_pagination") or
+        std.mem.eql(u8, name, "non_cte_ranged_join") or
+        std.mem.eql(u8, name, "routed_cte") or
+        std.mem.eql(u8, name, "routed_merge_join") or
+        std.mem.eql(u8, name, "system_time_read") or
+        std.mem.eql(u8, name, "system_time_cte");
+}
+
+fn relationalRoutedVisibilityOutcomeKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "changed_row_fail_closed") or
+        std.mem.eql(u8, name, "changed_version_fail_closed") or
+        std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "stale_owner_fail_closed") or
+        std.mem.eql(u8, name, "topology_retry_required") or
+        std.mem.eql(u8, name, "unsupported_fixture");
+}
+
+fn relationalRoutedVisibilityEvidenceKindKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "execution_test") or
+        std.mem.eql(u8, name, "gap_inventory") or
+        std.mem.eql(u8, name, "unsupported_fixture");
+}
+
+pub fn parseRelationalRoutedVisibilityMatrixRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalRoutedVisibilityMatrixRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_routed_visibility_matrix_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalRoutedVisibilityMatrixEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "routed_shape",
+            "visibility_outcome",
+            "evidence_kind",
+            "evidence_file",
+            "evidence_symbol",
+            "coverage_contract",
+            "missing_or_next_evidence",
+            "release_gate",
+        });
+        const entry = RelationalRoutedVisibilityMatrixEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .routed_shape = try fixtureJsonOptionalString(item, "routed_shape", ""),
+            .visibility_outcome = try fixtureJsonOptionalString(item, "visibility_outcome", ""),
+            .evidence_kind = try fixtureJsonOptionalString(item, "evidence_kind", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .coverage_contract = try fixtureJsonOptionalString(item, "coverage_contract", ""),
+            .missing_or_next_evidence = try fixtureJsonOptionalString(item, "missing_or_next_evidence", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalRoutedVisibilityMatrixIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Routed reads, joins, CTEs, and streaming") or
+            !relationalRoutedVisibilityShapeKnown(entry.routed_shape) or
+            !relationalRoutedVisibilityOutcomeKnown(entry.visibility_outcome) or
+            !relationalRoutedVisibilityEvidenceKindKnown(entry.evidence_kind) or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            entry.coverage_contract.len == 0 or
+            entry.missing_or_next_evidence.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_routed_visibility_matrix_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalRoutedVisibilityMatrixRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalRoutedVisibilityMatrixRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalRoutedVisibilityMatrixAlloc(alloc: std.mem.Allocator) !RelationalRoutedVisibilityMatrix {
+    const inventory_json = @embedFile("fixtures/relational_routed_visibility_matrix.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalRoutedVisibilityMatrixRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalRoutedVisibilityMatrixRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_advanced_aggregate_inventory_ids = [_][]const u8{
+    "aggregate-expression-pushdown-capability",
+    "aggregate-resource-metrics",
+    "domain-rollup-execution-fixtures",
+    "spill-backed-window-execution",
+};
+
+fn relationalAdvancedAggregateInventoryIdKnown(name: []const u8) bool {
+    for (relational_advanced_aggregate_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalAdvancedAggregateSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "aggregate_expression_pushdown") or
+        std.mem.eql(u8, name, "aggregate_resource_metrics") or
+        std.mem.eql(u8, name, "domain_execution_fixtures") or
+        std.mem.eql(u8, name, "spill_backed_window");
+}
+
+fn relationalAdvancedAggregateStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalAdvancedAggregateInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalAdvancedAggregateInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_advanced_aggregate_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalAdvancedAggregateInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalAdvancedAggregateInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalAdvancedAggregateInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Advanced aggregates, windows, and rollups") or
+            !relationalAdvancedAggregateSurfaceKnown(entry.surface) or
+            !relationalAdvancedAggregateStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_advanced_aggregate_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalAdvancedAggregateInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalAdvancedAggregateInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalAdvancedAggregateInventoryAlloc(alloc: std.mem.Allocator) !RelationalAdvancedAggregateInventory {
+    const inventory_json = @embedFile("fixtures/relational_advanced_aggregate_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalAdvancedAggregateInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalAdvancedAggregateInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_point_crud_inventory_ids = [_][]const u8{
+    "committed-returning-parity",
+    "concurrent-conflict-action-state",
+    "non-unique-point-claim-safety",
+    "routed-conflict-range-movement-chaos",
+};
+
+fn relationalPointCrudInventoryIdKnown(name: []const u8) bool {
+    for (relational_point_crud_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalPointCrudSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "committed_returning") or
+        std.mem.eql(u8, name, "conflict_action_state") or
+        std.mem.eql(u8, name, "non_unique_point_claim") or
+        std.mem.eql(u8, name, "routed_conflict_range_movement");
+}
+
+fn relationalPointCrudStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalPointCrudInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalPointCrudInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_point_crud_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalPointCrudInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalPointCrudInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalPointCrudInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Point CRUD and conflict upsert hardening") or
+            !relationalPointCrudSurfaceKnown(entry.surface) or
+            !relationalPointCrudStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_point_crud_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalPointCrudInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalPointCrudInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalPointCrudInventoryAlloc(alloc: std.mem.Allocator) !RelationalPointCrudInventory {
+    const inventory_json = @embedFile("fixtures/relational_point_crud_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalPointCrudInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalPointCrudInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_multi_row_dml_inventory_ids = [_][]const u8{
+    "expired-claim-reopen-replay",
+    "hosted-participant-resolution-reopen",
+    "mutation-source-range-movement-chaos",
+    "non-lockable-derived-source-rejection",
+    "routed-queue-claim-fairness",
+};
+
+fn relationalMultiRowDmlInventoryIdKnown(name: []const u8) bool {
+    for (relational_multi_row_dml_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalMultiRowDmlSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "expired_claim_reopen_replay") or
+        std.mem.eql(u8, name, "hosted_participant_resolution") or
+        std.mem.eql(u8, name, "mutation_source_range_movement") or
+        std.mem.eql(u8, name, "non_lockable_source_rejection") or
+        std.mem.eql(u8, name, "routed_queue_claim_fairness");
+}
+
+fn relationalMultiRowDmlStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalMultiRowDmlInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalMultiRowDmlInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_multi_row_dml_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalMultiRowDmlInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalMultiRowDmlInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalMultiRowDmlInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Multi-row DML and queue claims") or
+            !relationalMultiRowDmlSurfaceKnown(entry.surface) or
+            !relationalMultiRowDmlStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_multi_row_dml_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalMultiRowDmlInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalMultiRowDmlInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalMultiRowDmlInventoryAlloc(alloc: std.mem.Allocator) !RelationalMultiRowDmlInventory {
+    const inventory_json = @embedFile("fixtures/relational_multi_row_dml_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalMultiRowDmlInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalMultiRowDmlInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_json_array_inventory_ids = [_][]const u8{
+    "embedded-document-index-bypass",
+    "embedded-json-schema-durable-rebuild",
+    "json-array-rest-sdk-typed-plan-exposure",
+    "unsupported-json-array-operator-fixtures",
+};
+
+fn relationalJsonArrayInventoryIdKnown(name: []const u8) bool {
+    for (relational_json_array_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalJsonArraySurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "embedded_document_index_bypass") or
+        std.mem.eql(u8, name, "embedded_json_schema_rebuild") or
+        std.mem.eql(u8, name, "rest_sdk_typed_plan_exposure") or
+        std.mem.eql(u8, name, "unsupported_operator_fixtures");
+}
+
+fn relationalJsonArrayStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalJsonArrayInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalJsonArrayInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_json_array_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalJsonArrayInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalJsonArrayInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalJsonArrayInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "JSONB, arrays, and embedded document fields") or
+            !relationalJsonArraySurfaceKnown(entry.surface) or
+            !relationalJsonArrayStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_json_array_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalJsonArrayInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalJsonArrayInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalJsonArrayInventoryAlloc(alloc: std.mem.Allocator) !RelationalJsonArrayInventory {
+    const inventory_json = @embedFile("fixtures/relational_json_array_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalJsonArrayInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalJsonArrayInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_routed_execution_inventory_ids = [_][]const u8{
+    "cte-stream-spill-resumability",
+    "live-write-pagination-range-movement",
+    "owner-stream-join-strategy-planning",
+    "routed-merge-join-order-proof",
+};
+
+fn relationalRoutedExecutionInventoryIdKnown(name: []const u8) bool {
+    for (relational_routed_execution_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalRoutedExecutionSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "cte_stream_spill") or
+        std.mem.eql(u8, name, "live_write_pagination") or
+        std.mem.eql(u8, name, "owner_stream_join_strategy") or
+        std.mem.eql(u8, name, "routed_merge_join_order_proof");
+}
+
+fn relationalRoutedExecutionStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalRoutedExecutionInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalRoutedExecutionInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_routed_execution_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalRoutedExecutionInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalRoutedExecutionInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalRoutedExecutionInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Routed reads, joins, CTEs, and streaming") or
+            !relationalRoutedExecutionSurfaceKnown(entry.surface) or
+            !relationalRoutedExecutionStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_routed_execution_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalRoutedExecutionInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalRoutedExecutionInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalRoutedExecutionInventoryAlloc(alloc: std.mem.Allocator) !RelationalRoutedExecutionInventory {
+    const inventory_json = @embedFile("fixtures/relational_routed_execution_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalRoutedExecutionInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalRoutedExecutionInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_production_chaos_inventory_ids = [_][]const u8{
+    "fk-action-page-chaos",
+    "insert-source-upsert-owner-chaos",
+    "table-emptying-secondary-index-chaos",
+};
+
+fn relationalProductionChaosInventoryIdKnown(name: []const u8) bool {
+    for (relational_production_chaos_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalProductionChaosScopeKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "fk_action_page") or
+        std.mem.eql(u8, name, "insert_source_upsert_owner_movement") or
+        std.mem.eql(u8, name, "table_emptying_secondary_index_rebuild");
+}
+
+fn relationalProductionChaosStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "missing_native_harness") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalProductionChaosInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalProductionChaosInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_production_chaos_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalProductionChaosInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "scope",
+            "status",
+            "required_behavior",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalProductionChaosInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .scope = try fixtureJsonOptionalString(item, "scope", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .required_behavior = try fixtureJsonOptionalString(item, "required_behavior", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalProductionChaosInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Release parity and production chaos gate") or
+            !relationalProductionChaosScopeKnown(entry.scope) or
+            !relationalProductionChaosStatusKnown(entry.status) or
+            entry.required_behavior.len == 0 or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_production_chaos_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalProductionChaosInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalProductionChaosInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn freeRelationalSqlApiCoverageInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalSqlApiCoverageInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalProductionChaosInventoryAlloc(alloc: std.mem.Allocator) !RelationalProductionChaosInventory {
+    const inventory_json = @embedFile("fixtures/relational_production_chaos_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalProductionChaosInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalProductionChaosInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_sql_api_coverage_inventory_ids = [_][]const u8{
+    "catalog-ddl-durable-state",
+    "copy-bulk-io-unsupported",
+    "insert-upsert-row-state",
+    "merge-joined-row-state",
+    "mutation-source-claimed-row-state",
+    "routine-auth-policy-catalog-state",
+    "truncate-table-emptying-state",
+};
+
+fn relationalSqlApiCoverageInventoryIdKnown(name: []const u8) bool {
+    for (relational_sql_api_coverage_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalSqlApiCoverageSyntaxFamilyKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "bulk_io_copy") or
+        std.mem.eql(u8, name, "catalog_ddl") or
+        std.mem.eql(u8, name, "insert_upsert") or
+        std.mem.eql(u8, name, "merge_joined_mutation") or
+        std.mem.eql(u8, name, "mutation_source") or
+        std.mem.eql(u8, name, "routine_auth_policy") or
+        std.mem.eql(u8, name, "truncate_table_emptying");
+}
+
+fn relationalSqlApiCoverageDurableSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "catalog") or
+        std.mem.eql(u8, name, "catalog_and_auth") or
+        std.mem.eql(u8, name, "catalog_and_row") or
+        std.mem.eql(u8, name, "row") or
+        std.mem.eql(u8, name, "unsupported_no_state");
+}
+
+fn relationalSqlApiCoverageEvidenceKindKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "deterministic_unsupported_fixture") or
+        std.mem.eql(u8, name, "execution_parity_test") or
+        std.mem.eql(u8, name, "golden_typed_plan");
+}
+
+pub fn parseRelationalSqlApiCoverageInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalSqlApiCoverageInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_sql_api_coverage_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalSqlApiCoverageInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "syntax_family",
+            "durable_surface",
+            "evidence_kind",
+            "evidence_file",
+            "evidence_symbol",
+            "coverage_contract",
+            "missing_or_next_evidence",
+            "release_gate",
+        });
+        const entry = RelationalSqlApiCoverageInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .syntax_family = try fixtureJsonOptionalString(item, "syntax_family", ""),
+            .durable_surface = try fixtureJsonOptionalString(item, "durable_surface", ""),
+            .evidence_kind = try fixtureJsonOptionalString(item, "evidence_kind", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .coverage_contract = try fixtureJsonOptionalString(item, "coverage_contract", ""),
+            .missing_or_next_evidence = try fixtureJsonOptionalString(item, "missing_or_next_evidence", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalSqlApiCoverageInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "Release parity and production chaos gate") or
+            !relationalSqlApiCoverageSyntaxFamilyKnown(entry.syntax_family) or
+            !relationalSqlApiCoverageDurableSurfaceKnown(entry.durable_surface) or
+            !relationalSqlApiCoverageEvidenceKindKnown(entry.evidence_kind) or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            entry.coverage_contract.len == 0 or
+            entry.missing_or_next_evidence.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_sql_api_coverage_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn parseRelationalSqlApiCoverageInventoryAlloc(alloc: std.mem.Allocator) !RelationalSqlApiCoverageInventory {
+    const inventory_json = @embedFile("fixtures/relational_sql_api_coverage_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalSqlApiCoverageInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalSqlApiCoverageInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+const relational_sql_adapter_removal_inventory_ids = [_][]const u8{
+    "application-migration-equivalence-corpus",
+    "catalog-snapshot-binding",
+    "legacy-wrapper-deletion",
+    "structural-sql-normalization",
+};
+
+fn relationalSqlAdapterRemovalInventoryIdKnown(name: []const u8) bool {
+    for (relational_sql_adapter_removal_inventory_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn relationalSqlAdapterRemovalSurfaceKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "application_migration_equivalence_corpus") or
+        std.mem.eql(u8, name, "catalog_snapshot_binding") or
+        std.mem.eql(u8, name, "legacy_wrapper_deletion") or
+        std.mem.eql(u8, name, "structural_sql_normalization");
+}
+
+fn relationalSqlAdapterRemovalStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "gap_tracked") or
+        std.mem.eql(u8, name, "partial_release_gated");
+}
+
+pub fn parseRelationalSqlAdapterRemovalInventoryRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !RelationalSqlAdapterRemovalInventoryRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "inventory_format", "entries" });
+    const inventory_format = try fixtureJsonOptionalU64(root, "inventory_format", 0);
+    if (inventory_format != relational_sql_adapter_removal_inventory_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(RelationalSqlAdapterRemovalInventoryEntry).empty;
+    errdefer entries.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "relational_slices_section",
+            "surface",
+            "status",
+            "current_evidence",
+            "missing_evidence",
+            "evidence_file",
+            "evidence_symbol",
+            "release_gate",
+        });
+        const entry = RelationalSqlAdapterRemovalInventoryEntry{
+            .id = try fixtureJsonOptionalString(item, "id", ""),
+            .relational_slices_section = try fixtureJsonOptionalString(item, "relational_slices_section", ""),
+            .surface = try fixtureJsonOptionalString(item, "surface", ""),
+            .status = try fixtureJsonOptionalString(item, "status", ""),
+            .current_evidence = try fixtureJsonOptionalString(item, "current_evidence", ""),
+            .missing_evidence = try fixtureJsonOptionalString(item, "missing_evidence", ""),
+            .evidence_file = try fixtureJsonOptionalString(item, "evidence_file", ""),
+            .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
+            .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
+        };
+        if (entry.id.len == 0 or
+            seen.contains(entry.id) or
+            !relationalSqlAdapterRemovalInventoryIdKnown(entry.id) or
+            !std.mem.eql(u8, entry.relational_slices_section, "SQL adapter and compatibility wrapper removal") or
+            !relationalSqlAdapterRemovalSurfaceKnown(entry.surface) or
+            !relationalSqlAdapterRemovalStatusKnown(entry.status) or
+            entry.current_evidence.len == 0 or
+            entry.missing_evidence.len == 0 or
+            !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
+            entry.evidence_symbol.len == 0 or
+            !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, entry.id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, entry.id, {});
+        try entries.append(alloc, entry);
+    }
+    for (relational_sql_adapter_removal_inventory_ids) |id| {
+        if (!seen.contains(id)) return error.TestUnexpectedResult;
+    }
+
+    return .{
+        .inventory_format = inventory_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+pub fn freeRelationalSqlAdapterRemovalInventoryRoot(
+    alloc: std.mem.Allocator,
+    root: RelationalSqlAdapterRemovalInventoryRoot,
+) void {
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseRelationalSqlAdapterRemovalInventoryAlloc(alloc: std.mem.Allocator) !RelationalSqlAdapterRemovalInventory {
+    const inventory_json = @embedFile("fixtures/relational_sql_adapter_removal_inventory.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, inventory_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseRelationalSqlAdapterRemovalInventoryRootAlloc(alloc, parsed.value);
+    errdefer freeRelationalSqlAdapterRemovalInventoryRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
 pub const SqlAdapterEdgeCaseAction = enum {
     select,
     update,
@@ -1451,6 +5379,14 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         "temporal_primary_key",
         "temporal_unique",
         "temporal_foreign_keys",
+        "document_source_table",
+        "document_view_mapping",
+        "document_native_request",
+        "document_projections",
+        "document_residual",
+        "document_order",
+        "document_unnest",
+        "document_limit",
         "explain_subject",
         "explain_inner_kind",
         "explain_options",
@@ -1517,6 +5453,14 @@ pub fn parseFixtureSummary(value: ?std.json.Value) !AppParityPlanSummary {
         .temporal_primary_key = try fixtureJsonOptionalBool(object, "temporal_primary_key"),
         .temporal_unique = try fixtureJsonOptionalUsize(object, "temporal_unique"),
         .temporal_foreign_keys = try fixtureJsonOptionalUsize(object, "temporal_foreign_keys"),
+        .document_source_table = try fixtureJsonOptionalStringField(object, "document_source_table"),
+        .document_view_mapping = try fixtureJsonOptionalStringField(object, "document_view_mapping"),
+        .document_native_request = try fixtureJsonOptionalStringField(object, "document_native_request"),
+        .document_projections = try fixtureJsonOptionalUsize(object, "document_projections"),
+        .document_residual = try fixtureJsonOptionalBool(object, "document_residual"),
+        .document_order = try fixtureJsonOptionalBool(object, "document_order"),
+        .document_unnest = try fixtureJsonOptionalBool(object, "document_unnest"),
+        .document_limit = try fixtureJsonOptionalU32(object, "document_limit"),
         .explain_subject = try fixtureJsonOptionalStringField(object, "explain_subject"),
         .explain_inner_kind = try fixtureJsonOptionalStringField(object, "explain_inner_kind"),
         .explain_options = try fixtureJsonOptionalBool(object, "explain_options"),
@@ -1696,6 +5640,11 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         errdefer freeFixtureEntry(alloc, entry);
         if (entry.name.len == 0 or seen_names.contains(entry.name)) return error.TestUnexpectedResult;
         var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
+            if (try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err)) {
+                try seen_names.put(alloc, entry.name, {});
+                try entries.append(alloc, entry);
+                continue;
+            }
             std.debug.print("source corpus parse failed: {s}: {s}: {}\n", .{ entry.name, entry.sql, err });
             return error.TestUnexpectedResult;
         };
@@ -1710,6 +5659,137 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
         .source_format = source_format,
         .entries = try entries.toOwnedSlice(alloc),
     };
+}
+
+fn sourceCorpusGeneratedParseFailureAllowed(err: anyerror) bool {
+    return err == error.UnexpectedToken or err == error.UnsupportedSqlShape;
+}
+
+fn sourceCorpusEntryHasClassificationReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
+    return std.mem.eql(u8, entry.classification_reason, reason) or
+        std.mem.indexOf(u8, entry.plan, reason) != null;
+}
+
+fn validateSourceCorpusGeneratedParseFailureEntryAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    err: anyerror,
+) !bool {
+    if (!sourceCorpusGeneratedParseFailureAllowed(err) or entry.family != .unsupported_ddl) return false;
+
+    var tokenized_sql = try tokenized.TokenizedSql.initAlloc(alloc, entry.sql);
+    defer tokenized_sql.deinit(alloc);
+    const tokens = tokenized_sql.items();
+    _ = tokens;
+    const starts_with_create = std.mem.indexOf(u8, entry.sql, "CREATE TABLE") != null;
+    const has_storage_mode = std.mem.indexOf(u8, entry.sql, "antfly.storage_mode") != null or
+        std.mem.indexOf(u8, entry.sql, "storage_mode") != null;
+    const has_default_type = std.mem.indexOf(u8, entry.sql, "antfly.default_type") != null or
+        std.mem.indexOf(u8, entry.sql, "default_type") != null;
+    const has_document_schema = std.mem.indexOf(u8, entry.sql, "antfly.document_schema") != null or
+        std.mem.indexOf(u8, entry.sql, "document_schema") != null;
+    const has_document_literal = std.mem.indexOf(u8, entry.sql, "'document'") != null;
+    const has_doc_literal = std.mem.indexOf(u8, entry.sql, "'doc'") != null;
+    const has_invoice_literal = std.mem.indexOf(u8, entry.sql, "'invoice'") != null;
+    const starts_with_create_document_table = std.mem.indexOf(u8, entry.sql, "CREATE DOCUMENT TABLE") != null;
+
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_unknown_default_type")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            !has_default_type or
+            !has_document_schema or
+            !has_document_literal or
+            !has_invoice_literal)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_antfly_extension")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            !has_default_type or
+            !has_document_schema or
+            !has_document_literal or
+            !has_doc_literal or
+            std.mem.indexOf(u8, entry.sql, "x-antfly-unknown") == null)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_dynamic_template")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            !has_default_type or
+            !has_document_schema or
+            !has_document_literal or
+            !has_doc_literal or
+            std.mem.indexOf(u8, entry.sql, "dynamic_templates") == null)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_multi_document_type_unsupported")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            !has_default_type or
+            !has_document_schema or
+            !has_document_literal or
+            !has_doc_literal or
+            std.mem.indexOf(u8, entry.sql, "document_schema.invoice") == null)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_malformed_schema_json")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            !has_default_type or
+            !has_document_schema or
+            !has_document_literal or
+            !has_doc_literal or
+            std.mem.indexOf(u8, entry.sql, "{bad json}") == null)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_missing_default_type")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            has_default_type or
+            !has_document_literal)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_mixed_relational_shape")) {
+        if (!starts_with_create or
+            !has_storage_mode or
+            !has_document_literal or
+            std.mem.indexOf(u8, entry.sql, "id") == null)
+        {
+            return error.TestUnexpectedResult;
+        }
+        return true;
+    }
+    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_shorthand")) {
+        if (!starts_with_create_document_table) return error.TestUnexpectedResult;
+        return true;
+    }
+    return false;
+}
+
+pub fn sourceCorpusGeneratedParseFailureEntryAlloc(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    err: anyerror,
+) !bool {
+    return validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err);
 }
 
 pub fn freeSourceCorpusRoot(alloc: std.mem.Allocator, root: AppParitySourceCorpusRoot) void {
@@ -2707,6 +6787,14 @@ fn fixtureWriteSummaryField(writer: anytype, first: *bool, summary: AppParityPla
     try fixtureWriteBoolSummaryField(writer, &summary_first, "temporal_primary_key", summary.temporal_primary_key);
     try fixtureWriteUsizeSummaryField(writer, &summary_first, "temporal_unique", summary.temporal_unique);
     try fixtureWriteUsizeSummaryField(writer, &summary_first, "temporal_foreign_keys", summary.temporal_foreign_keys);
+    if (summary.document_source_table) |table_name| try fixtureWriteStringField(writer, &summary_first, "        ", "document_source_table", table_name);
+    if (summary.document_view_mapping) |view_mapping| try fixtureWriteStringField(writer, &summary_first, "        ", "document_view_mapping", view_mapping);
+    if (summary.document_native_request) |request| try fixtureWriteStringField(writer, &summary_first, "        ", "document_native_request", request);
+    try fixtureWriteUsizeSummaryField(writer, &summary_first, "document_projections", summary.document_projections);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "document_residual", summary.document_residual);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "document_order", summary.document_order);
+    try fixtureWriteBoolSummaryField(writer, &summary_first, "document_unnest", summary.document_unnest);
+    try fixtureWriteU32SummaryField(writer, &summary_first, "document_limit", summary.document_limit);
     if (summary.explain_subject) |subject| try fixtureWriteStringField(writer, &summary_first, "        ", "explain_subject", subject);
     if (summary.explain_inner_kind) |kind| try fixtureWriteStringField(writer, &summary_first, "        ", "explain_inner_kind", kind);
     try fixtureWriteBoolSummaryField(writer, &summary_first, "explain_options", summary.explain_options);
@@ -2955,6 +7043,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
     if (corpusUnsupportedPlanFamily(family)) |unsupported_family| {
         return unsupportedPlanMatchesFamily(plan, unsupported_family);
     }
+    if (family == .read and documentQueryPlanMatchesReadFamily(plan)) return true;
 
     const prefix = switch (family) {
         .ddl => "ddl:",
@@ -3049,6 +7138,8 @@ pub fn corpusFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool 
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
+        .unsupported_read,
+        .unsupported_write,
         => true,
         else => false,
     };
@@ -3066,6 +7157,8 @@ pub fn corpusFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) 
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
+        .unsupported_read,
+        .unsupported_write,
         => true,
         else => false,
     };
@@ -3189,6 +7282,51 @@ pub fn corpusFixtureHasTemporalDdlSummary(entry: AppParityCorpusEntry) bool {
         entry.summary.temporal_primary_key != null or
         entry.summary.temporal_unique != null or
         entry.summary.temporal_foreign_keys != null;
+}
+
+pub fn corpusFixtureHasDocumentReadSummary(summary: AppParityPlanSummary) bool {
+    return summary.document_source_table != null or
+        summary.document_view_mapping != null or
+        summary.document_native_request != null or
+        summary.document_projections != null or
+        summary.document_residual != null or
+        summary.document_order != null or
+        summary.document_unnest != null or
+        summary.document_limit != null;
+}
+
+fn documentNativeRequestMatchesPlan(plan: []const u8, expected: []const u8) bool {
+    return planHasExactStringToken(plan, ":producer=", expected);
+}
+
+fn corpusFixtureDocumentReadSummaryMatchesPlan(entry: AppParityCorpusEntry) bool {
+    if (!corpusFixtureHasDocumentReadSummary(entry.summary)) return true;
+    if (entry.family != .read or !documentQueryPlanMatchesReadFamily(entry.plan)) return false;
+    if (entry.summary.document_source_table) |source_table| {
+        if (!planHasExactStringToken(entry.plan, ":source_table=", source_table)) return false;
+    }
+    if (entry.summary.document_view_mapping) |view_mapping| {
+        if (!planHasExactStringToken(entry.plan, ":view_mapping=", view_mapping)) return false;
+    }
+    if (entry.summary.document_native_request) |request| {
+        if (!documentNativeRequestMatchesPlan(entry.plan, request)) return false;
+    }
+    if (entry.summary.document_projections) |projections| {
+        if (!planHasExactUsizeToken(entry.plan, ":projections=", projections)) return false;
+    }
+    if (entry.summary.document_residual) |residual| {
+        if (!planHasExactUsizeToken(entry.plan, ":residual=", if (residual) 1 else 0)) return false;
+    }
+    if (entry.summary.document_order) |has_order| {
+        if (planHasStringToken(entry.plan, ":order=") != has_order) return false;
+    }
+    if (entry.summary.document_unnest) |has_unnest| {
+        if (planHasStringToken(entry.plan, ":unnest=") != has_unnest) return false;
+    }
+    if (entry.summary.document_limit) |limit| {
+        if (!planHasExactUsizeToken(entry.plan, ":limit=", @intCast(limit))) return false;
+    }
+    return true;
 }
 
 pub fn corpusFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_table_name: []const u8) bool {
@@ -3489,6 +7627,7 @@ fn validateCorpusMetadataCoreParsedSql(
             }
         }
     }
+    if (!corpusFixtureDocumentReadSummaryMatchesPlan(entry)) return error.TestUnexpectedResult;
     if (entry.applied_plan.len > 0 and entry.family != .ddl) return error.TestUnexpectedResult;
     if (entry.applied_plan.len > 0 and !appliedPlanIsStructured(entry.applied_plan)) return error.TestUnexpectedResult;
     if (!corpusFixtureExecutionPlanIsStructured(entry)) return error.TestUnexpectedResult;
@@ -3504,7 +7643,7 @@ fn validateCorpusMetadataCoreParsedSql(
     if (entry.source_schema_json.len > 0 and entry.catalog_tables.len > 0) {
         return error.TestUnexpectedResult;
     }
-    if (appParityEntryHasCatalogSchemas(entry) and !corpusFixtureFamilyAllowsSourceSchema(entry.family)) {
+    if (appParityEntryHasCatalogSchemas(entry) and !corpusFixtureEntryAllowsCatalogSchemas(entry)) {
         return error.TestUnexpectedResult;
     }
     if (!corpusFixtureCatalogTablesAreValid(entry)) return error.TestUnexpectedResult;
@@ -3599,6 +7738,14 @@ pub fn fixtureSchemaJsonIsRelationalTableAlloc(alloc: std.mem.Allocator, text: [
     return schema.storage_mode == .relational and schema.primary_key != null;
 }
 
+pub fn fixtureSchemaJsonIsDocumentTableAlloc(alloc: std.mem.Allocator, text: []const u8) !bool {
+    var parsed = schema_api.parseValidatedTableSchema(alloc, text) catch return false;
+    defer parsed.deinit(alloc);
+    const schema = schema_api.deriveRuntimeTableSchema(alloc, parsed) catch return false;
+    defer runtime_schema.freeSchema(alloc, schema);
+    return schema.storage_mode == .document;
+}
+
 fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
     if (entry.catalog_tables.len == 0) return true;
     for (entry.catalog_tables, 0..) |table, i| {
@@ -3606,6 +7753,7 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
         if (!corpusFixturePlanMatchesSourceTable(entry, table.name) and
             !(entry.family == .ddl and table.indexes_json.len > 0) and
             !corpusFixtureReadSetOperationCatalogTableIsTarget(entry, table.name) and
+            !corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json) and
             !corpusFixtureDdlCatalogTablesAreSchemaWide(entry))
         {
             return false;
@@ -3616,6 +7764,33 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
         }
     }
     return true;
+}
+
+fn corpusFixtureDocumentViewMappingCatalogTableIsTarget(
+    entry: AppParityCorpusEntry,
+    table_name: []const u8,
+    indexes_json: []const u8,
+) bool {
+    if (!corpusFixtureCanUseDocumentViewMappingCatalog(entry)) return false;
+    if (indexes_json.len == 0 or std.mem.indexOf(u8, indexes_json, "\"view_mappings\"") == null) return false;
+    if (std.mem.indexOf(u8, indexes_json, table_name) == null) return false;
+    return true;
+}
+
+fn corpusFixtureEntryAllowsCatalogSchemas(entry: AppParityCorpusEntry) bool {
+    return corpusFixtureFamilyAllowsSourceSchema(entry.family) or appParityEntryHasDocumentViewMappingCatalog(entry);
+}
+
+fn corpusFixtureCanUseDocumentViewMappingCatalog(entry: AppParityCorpusEntry) bool {
+    return (entry.family == .read and documentQueryPlanMatchesReadFamily(entry.plan)) or
+        (entry.family == .invalid_read and
+            std.mem.eql(u8, entry.classification_reason, "document_sql_view_mapping_catalog")) or
+        (entry.family == .unsupported_read and
+            (std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_incomplete_topk") or
+                std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_missing_exact_producer") or
+                std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_unsupported_residual") or
+                std.mem.eql(u8, entry.classification_reason, "document_sql_view_mapping_unsupported") or
+                std.mem.eql(u8, entry.classification_reason, "document_sql_bounded_scan_unbounded_source")));
 }
 
 fn corpusFixtureReadSetOperationCatalogTableIsTarget(entry: AppParityCorpusEntry, table_name: []const u8) bool {
@@ -5348,6 +9523,131 @@ pub fn windowFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWindowPl
     return fingerprint;
 }
 
+pub fn documentQueryPlanMatchesReadFamily(plan: []const u8) bool {
+    return std.mem.eql(u8, plan, "document_query") or
+        std.mem.startsWith(u8, plan, "document_query:");
+}
+
+fn documentProjectionKindCount(
+    projections: []const document_plan.DocumentProjection,
+    kind: document_plan.DocumentProjectionKind,
+) usize {
+    var count: usize = 0;
+    for (projections) |projection| {
+        if (projection.kind == kind) count += 1;
+    }
+    return count;
+}
+
+fn documentProducerFingerprintName(producer: document_plan.DocumentProducer) []const u8 {
+    return switch (producer) {
+        .id_lookup => "id_lookup",
+        .indexed_query => "indexed_query",
+        .bounded_scan => "bounded_scan",
+    };
+}
+
+fn appendDocumentProjectionFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    index: usize,
+    projection: document_plan.DocumentProjection,
+) ![]u8 {
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(
+        alloc,
+        "{s}:proj{d}={s}:{s}->{s}",
+        .{
+            owned_base,
+            index,
+            @tagName(projection.kind),
+            if (projection.field.len > 0) projection.field else "_",
+            projection.output,
+        },
+    );
+    alloc.free(owned_base);
+    return out;
+}
+
+fn appendDocumentProducerFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    producer: document_plan.DocumentProducer,
+) ![]u8 {
+    var fingerprint = owned_base;
+    switch (producer) {
+        .id_lookup => |lookup| {
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ids", lookup.ids.len);
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "residual", lookup.residual_filter_json != null);
+        },
+        .indexed_query => |query| {
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "index", query.index_name != null);
+            if (query.index_name) |index_name| {
+                fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "index_name", index_name);
+            }
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "native", query.native_query_json != null);
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "full_text", query.full_text_query != null);
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "filter", query.filter_query_json != null);
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "residual", query.residual_filter_json != null);
+            if (query.max_candidate_rows) |max_candidate_rows| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "candidate_rows", max_candidate_rows);
+            }
+        },
+        .bounded_scan => |scan| {
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "scan_rows", scan.max_rows);
+            if (scan.max_bytes) |max_bytes| {
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "scan_bytes", @intCast(max_bytes));
+            }
+            fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "residual", scan.residual_filter_json != null);
+        },
+    }
+    return fingerprint;
+}
+
+fn documentQueryFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    plan: document_plan.DocumentReadPlan,
+) ![]u8 {
+    var fingerprint = try std.fmt.allocPrint(
+        alloc,
+        "document_query:table={s}:producer={s}:projections={d}:id_proj={d}:doc_proj={d}:field_proj={d}:unnest_proj={d}:limit={d}",
+        .{
+            plan.table_name,
+            documentProducerFingerprintName(plan.producer),
+            plan.projection.len,
+            documentProjectionKindCount(plan.projection, .id),
+            documentProjectionKindCount(plan.projection, .doc),
+            documentProjectionKindCount(plan.projection, .field),
+            documentProjectionKindCount(plan.projection, .unnest_value),
+            appParityLimitValue(plan.limit),
+        },
+    );
+    if (plan.view_mapping) |view_mapping| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "view_mapping", view_mapping.name);
+        if (view_mapping.source_table.len > 0) {
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "source_table", view_mapping.source_table);
+        }
+        fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "required_indexes", view_mapping.required_indexes);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "required_indexes_ready", view_mapping.required_indexes_ready);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "source_generation_fresh", view_mapping.source_generation_fresh);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "source_schema_fingerprint_fresh", view_mapping.source_schema_fingerprint_fresh);
+    }
+    fingerprint = try appendDocumentProducerFingerprintAlloc(alloc, fingerprint, plan.producer);
+    for (plan.projection, 0..) |projection, i| {
+        fingerprint = try appendDocumentProjectionFingerprintAlloc(alloc, fingerprint, i, projection);
+    }
+    if (plan.order_by) |order_by| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "order", order_by.field);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "order_dir", @tagName(order_by.direction));
+    }
+    if (plan.unnest) |unnest| {
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "unnest", unnest.field);
+        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "unnest_alias", unnest.alias);
+        fingerprint = try appendBoolFingerprintAlloc(alloc, fingerprint, "unnest_filter", unnest.filter_value_json != null or unnest.filter_values_json != null);
+    }
+    return fingerprint;
+}
+
 pub fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPlan) ![]u8 {
     return switch (lowered) {
         .query => |query| blk: {
@@ -5358,7 +9658,7 @@ pub fn readPlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredReadPl
             fingerprint = try appendCteAccessPathFingerprintAlloc(alloc, fingerprint, query.plan.ctes);
             break :blk try readFingerprintWithPrefixAlloc(alloc, fingerprint, "query");
         },
-        .document_query => try alloc.dupe(u8, "document_query"),
+        .document_query => |document_query| try documentQueryFingerprintAlloc(alloc, document_query),
         .document_aggregate => try alloc.dupe(u8, "document_aggregate"),
         .set_operation => |set_operation| blk: {
             const fingerprint = try setOperationFingerprintAlloc(alloc, set_operation);
@@ -6359,6 +10659,1834 @@ test "sql adapter corpus validates unsupported reason manifest" {
     );
 }
 
+test "sql adapter corpus validates compatibility wrapper inventory" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseSqlCompatibilityWrapperInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(sql_compatibility_wrapper_inventory_format, inventory.root.inventory_format);
+    try std.testing.expect(inventory.root.wrappers.len > 0);
+    try std.testing.expectEqualStrings("binder-dml-source-token-scanners", inventory.root.wrappers[0].id);
+    try std.testing.expectEqualStrings("write-statement-kind-classifier", inventory.root.wrappers[inventory.root.wrappers.len - 1].id);
+    try std.testing.expectEqualStrings(
+        "GeneratedSqlDmlAst target/source ranges for INSERT source, recursive INSERT source, UPDATE FROM, DELETE USING, and MERGE.",
+        inventory.root.wrappers[0].deletion_evidence.typed_parser,
+    );
+    try std.testing.expectEqualStrings("unproven_migration_blocker", inventory.root.wrappers[0].state_safety.durable_row);
+    try std.testing.expectEqualStrings("bounded_document_query_scan", inventory.root.wrappers[3].contract_reason);
+
+    const unknown_class_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "bad-wrapper",
+        \\      "family": "query",
+        \\      "wrapper_class": "unknown",
+        \\      "classification": "migration_blocker",
+        \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
+        \\      "symbol": "readStatementKindIncludingGeneratedAst",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "read_only",
+        \\        "durable_row": "read_only",
+        \\        "proof": "safe"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_class = try std.json.parseFromSlice(std.json.Value, alloc, unknown_class_json, .{});
+    defer parsed_unknown_class.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unknown_class.value));
+
+    const unsorted_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "write-statement-kind-classifier",
+        \\      "family": "dml",
+        \\      "wrapper_class": "parser",
+        \\      "classification": "migration_blocker",
+        \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
+        \\      "symbol": "writeStatementKindIncludingGeneratedAst",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "none",
+        \\        "durable_row": "unproven_migration_blocker",
+        \\        "proof": "blocked"
+        \\      }
+        \\    },
+        \\    {
+        \\      "id": "binder-dml-source-token-scanners",
+        \\      "family": "dml",
+        \\      "wrapper_class": "binder",
+        \\      "classification": "migration_blocker",
+        \\      "file": "zig/pkg/antfly/src/sql/binder.zig",
+        \\      "symbol": "insertSourceTableNamesFromParsedSqlAlloc",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "none",
+        \\        "durable_row": "unproven_migration_blocker",
+        \\        "proof": "blocked"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
+    defer parsed_unsorted.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unsorted.value));
+
+    const outside_sql_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "bad-file",
+        \\      "family": "query",
+        \\      "wrapper_class": "parser",
+        \\      "classification": "migration_blocker",
+        \\      "file": "zig/pkg/antfly/src/storage/db.zig",
+        \\      "symbol": "readStatementKindIncludingGeneratedAst",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "read_only",
+        \\        "durable_row": "read_only",
+        \\        "proof": "safe"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_outside_sql = try std.json.parseFromSlice(std.json.Value, alloc, outside_sql_json, .{});
+    defer parsed_outside_sql.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_outside_sql.value));
+
+    const missing_evidence_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "missing-evidence",
+        \\      "family": "query",
+        \\      "wrapper_class": "parser",
+        \\      "classification": "migration_blocker",
+        \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
+        \\      "symbol": "readStatementKindIncludingGeneratedAst",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "read_only",
+        \\        "durable_row": "read_only",
+        \\        "proof": "safe"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_evidence = try std.json.parseFromSlice(std.json.Value, alloc, missing_evidence_json, .{});
+    defer parsed_missing_evidence.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_missing_evidence.value));
+
+    const misplaced_contract_reason_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "misplaced-contract-reason",
+        \\      "family": "query",
+        \\      "wrapper_class": "parser",
+        \\      "classification": "migration_blocker",
+        \\      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
+        \\      "symbol": "readStatementKindIncludingGeneratedAst",
+        \\      "contract_reason": "bounded_document_query_scan",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "read_only",
+        \\        "durable_row": "read_only",
+        \\        "proof": "safe"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_misplaced_contract_reason = try std.json.parseFromSlice(std.json.Value, alloc, misplaced_contract_reason_json, .{});
+    defer parsed_misplaced_contract_reason.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_misplaced_contract_reason.value));
+
+    const unknown_contract_reason_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "unknown-contract-reason",
+        \\      "family": "query",
+        \\      "wrapper_class": "runtime",
+        \\      "classification": "compatibility_contract",
+        \\      "file": "zig/pkg/antfly/src/sql/document_plan.zig",
+        \\      "symbol": "bounded document query scan fallbacks",
+        \\      "contract_reason": "unknown",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "read_only",
+        \\        "durable_row": "read_only",
+        \\        "proof": "safe"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_contract_reason = try std.json.parseFromSlice(std.json.Value, alloc, unknown_contract_reason_json, .{});
+    defer parsed_unknown_contract_reason.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unknown_contract_reason.value));
+
+    const unsafe_contract_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "wrappers": [
+        \\    {
+        \\      "id": "unsafe-contract",
+        \\      "family": "query",
+        \\      "wrapper_class": "runtime",
+        \\      "classification": "compatibility_contract",
+        \\      "file": "zig/pkg/antfly/src/sql/document_plan.zig",
+        \\      "symbol": "bounded document query scan fallbacks",
+        \\      "contract_reason": "bounded_document_query_scan",
+        \\      "compatibility_reason": "reason",
+        \\      "typed_replacement": "replacement",
+        \\      "deletion_gate": "gate",
+        \\      "deletion_evidence": {
+        \\        "typed_parser": "parser",
+        \\        "typed_binder": "binder",
+        \\        "typed_plan": "plan",
+        \\        "typed_runtime": "runtime",
+        \\        "parity": "parity"
+        \\      },
+        \\      "state_safety": {
+        \\        "durable_catalog": "none",
+        \\        "durable_document": "unproven_migration_blocker",
+        \\        "durable_row": "read_only",
+        \\        "proof": "not safe"
+        \\      }
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unsafe_contract = try std.json.parseFromSlice(std.json.Value, alloc, unsafe_contract_json, .{});
+    defer parsed_unsafe_contract.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlCompatibilityWrapperInventoryRootAlloc(alloc, parsed_unsafe_contract.value));
+}
+
+test "sql adapter corpus validates parser migration table manifest" {
+    const alloc = std.testing.allocator;
+    var table = try parseSqlParserMigrationTableAlloc(alloc);
+    defer table.deinit(alloc);
+    try std.testing.expectEqual(sql_parser_migration_table_format, table.root.migration_format);
+    try std.testing.expectEqual(sql_parser_migration_table_families.len, table.root.families.len);
+    try std.testing.expectEqualStrings("backups", table.root.families[0].family);
+    try std.testing.expectEqualStrings("roles", table.root.families[table.root.families.len - 1].family);
+
+    const unknown_json =
+        \\{
+        \\  "migration_format": 1,
+        \\  "families": [
+        \\    {
+        \\      "family": "unknown",
+        \\      "compatibility_entry_point": "compat",
+        \\      "generated_ast_entry_point": "generated",
+        \\      "coverage_file": "coverage.json",
+        \\      "removal_gate": "gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown = try std.json.parseFromSlice(std.json.Value, alloc, unknown_json, .{});
+    defer parsed_unknown.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationTableRootAlloc(alloc, parsed_unknown.value));
+
+    const unsorted_json =
+        \\{
+        \\  "migration_format": 1,
+        \\  "families": [
+        \\    {
+        \\      "family": "ddl",
+        \\      "compatibility_entry_point": "compat",
+        \\      "generated_ast_entry_point": "generated",
+        \\      "coverage_file": "coverage.json",
+        \\      "removal_gate": "gate"
+        \\    },
+        \\    {
+        \\      "family": "backups",
+        \\      "compatibility_entry_point": "compat",
+        \\      "generated_ast_entry_point": "generated",
+        \\      "coverage_file": "coverage.json",
+        \\      "removal_gate": "gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unsorted = try std.json.parseFromSlice(std.json.Value, alloc, unsorted_json, .{});
+    defer parsed_unsorted.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationTableRootAlloc(alloc, parsed_unsorted.value));
+
+    const incomplete_json =
+        \\{
+        \\  "migration_format": 1,
+        \\  "families": [
+        \\    {
+        \\      "family": "backups",
+        \\      "compatibility_entry_point": "compat",
+        \\      "generated_ast_entry_point": "generated",
+        \\      "coverage_file": "coverage.json",
+        \\      "removal_gate": "gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationTableRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates document sql dependency guard manifest" {
+    const alloc = std.testing.allocator;
+    var guard = try parseDocumentSqlDependencyGuardAlloc(alloc);
+    defer guard.deinit(alloc);
+    try std.testing.expectEqual(document_sql_dependency_guard_format, guard.root.guard_format);
+    try std.testing.expectEqual(document_sql_dependency_guard_ids.len, guard.root.entries.len);
+    try std.testing.expectEqualStrings("document-query-read", guard.root.entries[0].id);
+    try std.testing.expectEqualStrings("admitted_read_only", guard.root.entries[0].admission);
+    try std.testing.expectEqualStrings("read_only", guard.root.entries[0].durable_document);
+    try std.testing.expectEqualStrings("document-table-ddl", guard.root.entries[1].id);
+    try std.testing.expectEqualStrings("blocked_until_native_parity", guard.root.entries[1].admission);
+    try std.testing.expectEqualStrings("native_document_schema_required", guard.root.entries[1].durable_storage_guard);
+    try std.testing.expectEqualStrings("document-table-writes", guard.root.entries[2].id);
+    try std.testing.expectEqualStrings("unsupported_fail_closed", guard.root.entries[2].admission);
+    try std.testing.expectEqualStrings("document-view-mapping", guard.root.entries[3].id);
+
+    const unknown_guard_json =
+        \\{
+        \\  "guard_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "document-query-read",
+        \\      "sql_slices_section": "Document SQL",
+        \\      "source_family": "document_query_read",
+        \\      "admission": "admitted_read_only",
+        \\      "parser_guard": "sql_only_parser_bypass",
+        \\      "session_guard": "not_applicable",
+        \\      "auth_guard": "native_document_query_path",
+        \\      "response_guard": "native_document_response_mapping",
+        \\      "expression_guard": "typed_expression_evidence",
+        \\      "durable_storage_guard": "native_document_query_path",
+        \\      "durable_catalog": "none",
+        \\      "durable_document": "read_only",
+        \\      "durable_row": "none",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
+        \\      "evidence_symbol": "document SQL query corpus",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_guard = try std.json.parseFromSlice(std.json.Value, alloc, unknown_guard_json, .{});
+    defer parsed_unknown_guard.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlDependencyGuardRootAlloc(alloc, parsed_unknown_guard.value));
+
+    const unsafe_read_json =
+        \\{
+        \\  "guard_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "document-query-read",
+        \\      "sql_slices_section": "Document SQL",
+        \\      "source_family": "document_query_read",
+        \\      "admission": "admitted_read_only",
+        \\      "parser_guard": "shared_relational_evidence",
+        \\      "session_guard": "not_applicable",
+        \\      "auth_guard": "native_document_query_path",
+        \\      "response_guard": "native_document_response_mapping",
+        \\      "expression_guard": "typed_expression_evidence",
+        \\      "durable_storage_guard": "native_document_query_path",
+        \\      "durable_catalog": "none",
+        \\      "durable_document": "unproven_migration_blocker",
+        \\      "durable_row": "none",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
+        \\      "evidence_symbol": "document SQL query corpus",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unsafe_read = try std.json.parseFromSlice(std.json.Value, alloc, unsafe_read_json, .{});
+    defer parsed_unsafe_read.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlDependencyGuardRootAlloc(alloc, parsed_unsafe_read.value));
+
+    const incomplete_json =
+        \\{
+        \\  "guard_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "document-query-read",
+        \\      "sql_slices_section": "Document SQL",
+        \\      "source_family": "document_query_read",
+        \\      "admission": "admitted_read_only",
+        \\      "parser_guard": "shared_relational_evidence",
+        \\      "session_guard": "not_applicable",
+        \\      "auth_guard": "native_document_query_path",
+        \\      "response_guard": "native_document_response_mapping",
+        \\      "expression_guard": "typed_expression_evidence",
+        \\      "durable_storage_guard": "native_document_query_path",
+        \\      "durable_catalog": "none",
+        \\      "durable_document": "read_only",
+        \\      "durable_row": "none",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
+        \\      "evidence_symbol": "document SQL query corpus",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlDependencyGuardRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates document sql bounded scan inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseDocumentSqlBoundedScanInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(document_sql_bounded_scan_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(document_sql_bounded_scan_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("mapped-view-residual-bounded-scan", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("document sql view mapping bounded residual read", inventory.root.entries[0].source_fixture);
+    try std.testing.expectEqualStrings("intentional_contract", inventory.root.entries[0].status);
+
+    const unknown_status_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "mapped-view-residual-bounded-scan",
+        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "contract_kind": "view_mapping_residual",
+        \\      "status": "covered",
+        \\      "source_fixture": "document sql view mapping bounded residual read",
+        \\      "runtime_evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
+        \\      "runtime_evidence_symbol": "api.table_reads.docid document SQL bounded scan runtime diagnostics pin row and byte caps",
+        \\      "scan_cap_evidence": "scan",
+        \\      "byte_cap_evidence": "byte",
+        \\      "residual_evidence": "residual",
+        \\      "ordering_evidence": "ordering",
+        \\      "missing_producer_diagnostic": "document_sql_bounded_scan_missing_exact_producer",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "document-sql-hardening-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_status = try std.json.parseFromSlice(std.json.Value, alloc, unknown_status_json, .{});
+    defer parsed_unknown_status.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlBoundedScanInventoryRootAlloc(alloc, parsed_unknown_status.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "mapped-view-residual-bounded-scan",
+        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "contract_kind": "view_mapping_residual",
+        \\      "status": "intentional_contract",
+        \\      "source_fixture": "document sql view mapping bounded residual read",
+        \\      "runtime_evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
+        \\      "runtime_evidence_symbol": "api.table_reads.docid document SQL bounded scan runtime diagnostics pin row and byte caps",
+        \\      "scan_cap_evidence": "scan",
+        \\      "byte_cap_evidence": "byte",
+        \\      "residual_evidence": "residual",
+        \\      "ordering_evidence": "ordering",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "document-sql-hardening-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlBoundedScanInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates document sql read expansion gate manifest" {
+    const alloc = std.testing.allocator;
+    var gate = try parseDocumentSqlReadExpansionGateAlloc(alloc);
+    defer gate.deinit(alloc);
+    try std.testing.expectEqual(document_sql_read_expansion_gate_format, gate.root.gate_format);
+    try std.testing.expectEqual(document_sql_read_expansion_gate_ids.len, gate.root.entries.len);
+    try std.testing.expectEqualStrings("additional-array-unnest-patterns", gate.root.entries[0].id);
+    try std.testing.expectEqualStrings("array_unnest_patterns", gate.root.entries[0].expansion_surface);
+    try std.testing.expectEqualStrings("additional-mapped-fields", gate.root.entries[1].id);
+    try std.testing.expectEqualStrings("derived-index-producer-types", gate.root.entries[2].id);
+    try std.testing.expectEqualStrings("document-aggregates", gate.root.entries[3].id);
+    try std.testing.expectEqualStrings("lateral-view-mapping-joins", gate.root.entries[4].id);
+
+    const unknown_status_json =
+        \\{
+        \\  "gate_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "additional-mapped-fields",
+        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "expansion_surface": "mapped_fields",
+        \\      "admission_status": "admitted",
+        \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
+        \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
+        \\      "runtime_parity_requirement": "Add executable runtime result-parity tests.",
+        \\      "current_guard": "guard",
+        \\      "evidence_file": "zig/SQL_SLICES.md",
+        \\      "evidence_symbol": "Finish document query and view-mapping hardening",
+        \\      "release_gate": "document-sql-hardening-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_status = try std.json.parseFromSlice(std.json.Value, alloc, unknown_status_json, .{});
+    defer parsed_unknown_status.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlReadExpansionGateRootAlloc(alloc, parsed_unknown_status.value));
+
+    const missing_runtime_json =
+        \\{
+        \\  "gate_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "additional-mapped-fields",
+        \\      "sql_slices_section": "Finish document query and view-mapping hardening",
+        \\      "expansion_surface": "mapped_fields",
+        \\      "admission_status": "blocked_until_corpus_and_runtime",
+        \\      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures.",
+        \\      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets.",
+        \\      "runtime_parity_requirement": "Add tests.",
+        \\      "current_guard": "guard",
+        \\      "evidence_file": "zig/SQL_SLICES.md",
+        \\      "evidence_symbol": "Finish document query and view-mapping hardening",
+        \\      "release_gate": "document-sql-hardening-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_runtime = try std.json.parseFromSlice(std.json.Value, alloc, missing_runtime_json, .{});
+    defer parsed_missing_runtime.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseDocumentSqlReadExpansionGateRootAlloc(alloc, parsed_missing_runtime.value));
+}
+
+test "sql adapter corpus pins document sql bounded scan diagnostic fixture set" {
+    const alloc = std.testing.allocator;
+    var source = try parseAppParityExternalSourceCorpusAlloc(alloc);
+    defer source.deinit(alloc);
+    var resolved = try parseAppParityResolvedRequirementsAlloc(alloc);
+    defer resolved.deinit(alloc);
+
+    var coverage = AppParityCorpusCoverage{};
+    for (source.root.entries) |entry| try coverage.observe(alloc, entry);
+
+    const Expected = struct {
+        fixture: []const u8,
+        family: AppParityCorpusPlanFamily,
+        reason: []const u8,
+        coverage_bucket: []const u8,
+    };
+    const expected = [_]Expected{
+        .{
+            .fixture = "unsupported document sql view mapping unbounded read",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_unbounded_source",
+            .coverage_bucket = "document_query_view_mapping_rejected_unbounded_read",
+        },
+        .{
+            .fixture = "unsupported document sql view mapping ordered read without topk bound",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_incomplete_topk",
+            .coverage_bucket = "document_query_view_mapping_rejected_incomplete_topk",
+        },
+        .{
+            .fixture = "unsupported document sql bounded residual expression read",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_unsupported_residual",
+            .coverage_bucket = "document_query_view_mapping_rejected_unsupported_residual",
+        },
+        .{
+            .fixture = "unsupported document sql view mapping range read missing exact producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_view_mapping_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native vector search missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_vector_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native semantic search missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_semantic_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native hybrid search missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_hybrid_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native graph traverse missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_graph_traverse_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native graph shortest path missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_graph_shortest_path_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native graph metric missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_graph_metric_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "unsupported document sql native graph metric rerank missing producer",
+            .family = .unsupported_read,
+            .reason = "document_sql_bounded_scan_missing_exact_producer",
+            .coverage_bucket = "document_query_native_graph_metric_rerank_rejected_missing_exact_producer",
+        },
+        .{
+            .fixture = "invalid document sql view mapping missing required index",
+            .family = .invalid_read,
+            .reason = "document_sql_view_mapping_catalog",
+            .coverage_bucket = "invalid_read_document_view_mapping_missing_required_index",
+        },
+        .{
+            .fixture = "invalid document sql view mapping stale source generation",
+            .family = .invalid_read,
+            .reason = "document_sql_view_mapping_catalog",
+            .coverage_bucket = "invalid_read_document_view_mapping_stale_source_generation",
+        },
+        .{
+            .fixture = "invalid document sql view mapping stale source schema fingerprint",
+            .family = .invalid_read,
+            .reason = "document_sql_view_mapping_catalog",
+            .coverage_bucket = "invalid_read_document_view_mapping_stale_source_metadata",
+        },
+    };
+
+    for (expected) |want| {
+        var found_fixture = false;
+        for (source.root.entries) |entry| {
+            if (!std.mem.eql(u8, entry.name, want.fixture)) continue;
+            found_fixture = entry.family == want.family and
+                std.mem.eql(u8, entry.classification_reason, want.reason);
+            break;
+        }
+        if (!found_fixture) {
+            std.debug.print("missing document sql diagnostic fixture: {s}\n", .{want.fixture});
+            return error.TestUnexpectedResult;
+        }
+        try std.testing.expect(try appParityCoverageRequirementSatisfied(coverage, want.coverage_bucket));
+
+        var resolved_bucket = false;
+        for (resolved.root.resolved) |item| {
+            if (!std.mem.eql(u8, item.reason, want.reason)) continue;
+            resolved_bucket = stringListContains(item.coverage, want.coverage_bucket);
+            break;
+        }
+        if (!resolved_bucket) {
+            std.debug.print("missing document sql diagnostic resolved coverage: {s} -> {s}\n", .{
+                want.reason,
+                want.coverage_bucket,
+            });
+            return error.TestUnexpectedResult;
+        }
+    }
+}
+
+test "sql adapter corpus validates relational durable schema inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalDurableSchemaInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_durable_schema_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_durable_schema_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("concurrent-writer-generation-isolation", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("concurrent_writer_generation_isolation", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("drop-table-cascade-recoverable-job", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("schema-job-operator-controls", inventory.root.entries[3].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "concurrent-writer-generation-isolation",
+        \\      "relational_slices_section": "Durable schema and migration execution",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+        \\      "evidence_symbol": "metadata raft apply store applies table updates with schema rewrite jobs atomically",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalDurableSchemaInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "concurrent-writer-generation-isolation",
+        \\      "relational_slices_section": "Durable schema and migration execution",
+        \\      "surface": "concurrent_writer_generation_isolation",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+        \\      "evidence_symbol": "metadata raft apply store applies table updates with schema rewrite jobs atomically",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalDurableSchemaInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "concurrent-writer-generation-isolation",
+        \\      "relational_slices_section": "Durable schema and migration execution",
+        \\      "surface": "concurrent_writer_generation_isolation",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+        \\      "evidence_symbol": "metadata raft apply store applies table updates with schema rewrite jobs atomically",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalDurableSchemaInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational expression AST inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalExpressionAstInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_expression_ast_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_expression_ast_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("aggregate-input-filter-expression", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("aggregate_input_filter", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("RelationalRowsExpression and RelationalRowsExpressionCondition", inventory.root.entries[0].target_typed_node);
+    try std.testing.expectEqualStrings("cast-expression", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("typed_ast_promoted", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("window-expression", inventory.root.entries[10].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "cast-expression",
+        \\      "relational_slices_section": "Shared scalar expression AST completion",
+        \\      "surface": "mystery",
+        \\      "current_shape": "current",
+        \\      "owner": "owner",
+        \\      "target_typed_node": "target",
+        \\      "deletion_evidence": "deletion",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/lower_expr.zig",
+        \\      "evidence_symbol": "sql adapter lower expr lowers cast projections",
+        \\      "status": "typed_ast_promoted",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalExpressionAstInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_deletion_evidence_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "cast-expression",
+        \\      "relational_slices_section": "Shared scalar expression AST completion",
+        \\      "surface": "cast",
+        \\      "current_shape": "current",
+        \\      "owner": "owner",
+        \\      "target_typed_node": "target",
+        \\      "deletion_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/lower_expr.zig",
+        \\      "evidence_symbol": "sql adapter lower expr lowers cast projections",
+        \\      "status": "typed_ast_promoted",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_deletion = try std.json.parseFromSlice(std.json.Value, alloc, missing_deletion_evidence_json, .{});
+    defer parsed_missing_deletion.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalExpressionAstInventoryRootAlloc(alloc, parsed_missing_deletion.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "cast-expression",
+        \\      "relational_slices_section": "Shared scalar expression AST completion",
+        \\      "surface": "cast",
+        \\      "current_shape": "current",
+        \\      "owner": "owner",
+        \\      "target_typed_node": "target",
+        \\      "deletion_evidence": "deletion",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/lower_expr.zig",
+        \\      "evidence_symbol": "sql adapter lower expr lowers cast projections",
+        \\      "status": "typed_ast_promoted",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalExpressionAstInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational expression completion inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalExpressionCompletionInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_expression_completion_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_expression_completion_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("adapter-boundary-string-path-deletion", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("adapter_boundary_string_path_deletion", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("optimizer-expression-pushdown", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("rest-sdk-expression-exposure", inventory.root.entries[2].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "adapter-boundary-string-path-deletion",
+        \\      "relational_slices_section": "Shared scalar expression AST completion",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/relational_expression_ast_inventory.json",
+        \\      "evidence_symbol": "relational_expression_ast_inventory",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalExpressionCompletionInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "adapter-boundary-string-path-deletion",
+        \\      "relational_slices_section": "Shared scalar expression AST completion",
+        \\      "surface": "adapter_boundary_string_path_deletion",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/relational_expression_ast_inventory.json",
+        \\      "evidence_symbol": "relational_expression_ast_inventory",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalExpressionCompletionInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "adapter-boundary-string-path-deletion",
+        \\      "relational_slices_section": "Shared scalar expression AST completion",
+        \\      "surface": "adapter_boundary_string_path_deletion",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/relational_expression_ast_inventory.json",
+        \\      "evidence_symbol": "relational_expression_ast_inventory",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalExpressionCompletionInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational advanced aggregate inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalAdvancedAggregateInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_advanced_aggregate_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_advanced_aggregate_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("aggregate-expression-pushdown-capability", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("aggregate_expression_pushdown", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("domain-rollup-execution-fixtures", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("spill-backed-window-execution", inventory.root.entries[3].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "aggregate-expression-pushdown-capability",
+        \\      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows aggregate contract accepts typed expression inputs and filters",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalAdvancedAggregateInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "aggregate-expression-pushdown-capability",
+        \\      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+        \\      "surface": "aggregate_expression_pushdown",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows aggregate contract accepts typed expression inputs and filters",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalAdvancedAggregateInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "aggregate-expression-pushdown-capability",
+        \\      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+        \\      "surface": "aggregate_expression_pushdown",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows aggregate contract accepts typed expression inputs and filters",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalAdvancedAggregateInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational point CRUD inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalPointCrudInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_point_crud_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_point_crud_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("committed-returning-parity", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("committed_returning", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("non-unique-point-claim-safety", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("routed-conflict-range-movement-chaos", inventory.root.entries[3].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "committed-returning-parity",
+        \\      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows batch returning projects committed mutation images",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalPointCrudInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "committed-returning-parity",
+        \\      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+        \\      "surface": "committed_returning",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows batch returning projects committed mutation images",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalPointCrudInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "committed-returning-parity",
+        \\      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+        \\      "surface": "committed_returning",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows batch returning projects committed mutation images",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalPointCrudInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational multi-row DML inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalMultiRowDmlInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_multi_row_dml_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_multi_row_dml_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("expired-claim-reopen-replay", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("expired_claim_reopen_replay", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("non-lockable-derived-source-rejection", inventory.root.entries[3].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[3].status);
+    try std.testing.expectEqualStrings("routed-queue-claim-fairness", inventory.root.entries[4].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "expired-claim-reopen-replay",
+        \\      "relational_slices_section": "Multi-row DML and queue claims",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_writes/relational_mutation.zig",
+        \\      "evidence_symbol": "local mutation source staged claims recover after reopen before commit",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalMultiRowDmlInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "expired-claim-reopen-replay",
+        \\      "relational_slices_section": "Multi-row DML and queue claims",
+        \\      "surface": "expired_claim_reopen_replay",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_writes/relational_mutation.zig",
+        \\      "evidence_symbol": "local mutation source staged claims recover after reopen before commit",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalMultiRowDmlInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "expired-claim-reopen-replay",
+        \\      "relational_slices_section": "Multi-row DML and queue claims",
+        \\      "surface": "expired_claim_reopen_replay",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_writes/relational_mutation.zig",
+        \\      "evidence_symbol": "local mutation source staged claims recover after reopen before commit",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalMultiRowDmlInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational JSON array inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalJsonArrayInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_json_array_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_json_array_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("embedded-document-index-bypass", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("embedded_document_index_bypass", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("json-array-rest-sdk-typed-plan-exposure", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("unsupported-json-array-operator-fixtures", inventory.root.entries[3].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "embedded-document-index-bypass",
+        \\      "relational_slices_section": "JSONB, arrays, and embedded document fields",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+        \\      "evidence_symbol": "relational embedded json search intersects with top-level relational filters",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalJsonArrayInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "embedded-document-index-bypass",
+        \\      "relational_slices_section": "JSONB, arrays, and embedded document fields",
+        \\      "surface": "embedded_document_index_bypass",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+        \\      "evidence_symbol": "relational embedded json search intersects with top-level relational filters",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalJsonArrayInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "embedded-document-index-bypass",
+        \\      "relational_slices_section": "JSONB, arrays, and embedded document fields",
+        \\      "surface": "embedded_document_index_bypass",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/search_runtime.zig",
+        \\      "evidence_symbol": "relational embedded json search intersects with top-level relational filters",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalJsonArrayInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational routed execution inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalRoutedExecutionInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_routed_execution_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_routed_execution_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("cte-stream-spill-resumability", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("cte_stream_spill", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("live-write-pagination-range-movement", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("owner-stream-join-strategy-planning", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("routed-merge-join-order-proof", inventory.root.entries[3].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "cte-stream-spill-resumability",
+        \\      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+        \\      "evidence_symbol": "lowered sql recursive cte materialization admission uses stream spill policy",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalRoutedExecutionInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "cte-stream-spill-resumability",
+        \\      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+        \\      "surface": "cte_stream_spill",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+        \\      "evidence_symbol": "lowered sql recursive cte materialization admission uses stream spill policy",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalRoutedExecutionInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "cte-stream-spill-resumability",
+        \\      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+        \\      "surface": "cte_stream_spill",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+        \\      "evidence_symbol": "lowered sql recursive cte materialization admission uses stream spill policy",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalRoutedExecutionInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational derived access inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalDerivedAccessInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_derived_access_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_derived_access_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("durable-ordered-composite-metadata", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("durable_ordered_composite_metadata", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("expression-derived-rebuild-promotion", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("stale-derived-artifact-safety", inventory.root.entries[2].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "durable-ordered-composite-metadata",
+        \\      "relational_slices_section": "Planner trust and derived access paths",
+        \\      "surface": "parser_spelling",
+        \\      "status": "gap_tracked",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows query ignores ordered secondary indexes and scans base rows",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalDerivedAccessInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "durable-ordered-composite-metadata",
+        \\      "relational_slices_section": "Planner trust and derived access paths",
+        \\      "surface": "durable_ordered_composite_metadata",
+        \\      "status": "gap_tracked",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows query ignores ordered secondary indexes and scans base rows",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalDerivedAccessInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "durable-ordered-composite-metadata",
+        \\      "relational_slices_section": "Planner trust and derived access paths",
+        \\      "surface": "durable_ordered_composite_metadata",
+        \\      "status": "gap_tracked",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+        \\      "evidence_symbol": "relational rows query ignores ordered secondary indexes and scans base rows",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalDerivedAccessInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational semantic implication matrix manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalSemanticImplicationMatrixAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_semantic_implication_matrix_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_semantic_implication_matrix_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("case-insensitive-collation-implication", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("collation", inventory.root.entries[0].proof_family);
+    try std.testing.expectEqualStrings("unsafe-building-artifact-fail-closed", inventory.root.entries[4].id);
+    try std.testing.expectEqualStrings("unsafe_artifact_lifecycle", inventory.root.entries[4].proof_family);
+    try std.testing.expectEqualStrings("unsafe-partial-predicate-mismatch", inventory.root.entries[6].id);
+
+    const unknown_proof_family_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "case-insensitive-collation-implication",
+        \\      "relational_slices_section": "Planner trust and derived access paths",
+        \\      "proof_family": "parser_spelling",
+        \\      "required_rule": "required",
+        \\      "unsafe_negative": "negative",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_store.zig",
+        \\      "evidence_symbol": "relational partial unique predicates honor case-insensitive column collation",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_proof_family = try std.json.parseFromSlice(std.json.Value, alloc, unknown_proof_family_json, .{});
+    defer parsed_unknown_proof_family.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSemanticImplicationMatrixRootAlloc(alloc, parsed_unknown_proof_family.value));
+
+    const missing_negative_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "case-insensitive-collation-implication",
+        \\      "relational_slices_section": "Planner trust and derived access paths",
+        \\      "proof_family": "collation",
+        \\      "required_rule": "required",
+        \\      "unsafe_negative": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_store.zig",
+        \\      "evidence_symbol": "relational partial unique predicates honor case-insensitive column collation",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_negative = try std.json.parseFromSlice(std.json.Value, alloc, missing_negative_json, .{});
+    defer parsed_missing_negative.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSemanticImplicationMatrixRootAlloc(alloc, parsed_missing_negative.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "case-insensitive-collation-implication",
+        \\      "relational_slices_section": "Planner trust and derived access paths",
+        \\      "proof_family": "collation",
+        \\      "required_rule": "required",
+        \\      "unsafe_negative": "negative",
+        \\      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_store.zig",
+        \\      "evidence_symbol": "relational partial unique predicates honor case-insensitive column collation",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSemanticImplicationMatrixRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational routed visibility matrix manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalRoutedVisibilityMatrixAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_routed_visibility_matrix_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_routed_visibility_matrix_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("cte-backed-join-fail-closed", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("cte_backed_join", inventory.root.entries[0].routed_shape);
+    try std.testing.expectEqualStrings("live-write-pagination-gap", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("gap_inventory", inventory.root.entries[1].evidence_kind);
+    try std.testing.expectEqualStrings("system-time-cte-provisioned", inventory.root.entries[6].id);
+
+    const unknown_shape_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "routed-cte-revalidation",
+        \\      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+        \\      "routed_shape": "parser_spelling",
+        \\      "visibility_outcome": "changed_row_fail_closed",
+        \\      "evidence_kind": "execution_test",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+        \\      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_shape = try std.json.parseFromSlice(std.json.Value, alloc, unknown_shape_json, .{});
+    defer parsed_unknown_shape.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalRoutedVisibilityMatrixRootAlloc(alloc, parsed_unknown_shape.value));
+
+    const unknown_evidence_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "routed-cte-revalidation",
+        \\      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+        \\      "routed_shape": "routed_cte",
+        \\      "visibility_outcome": "changed_row_fail_closed",
+        \\      "evidence_kind": "comment",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+        \\      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_evidence = try std.json.parseFromSlice(std.json.Value, alloc, unknown_evidence_json, .{});
+    defer parsed_unknown_evidence.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalRoutedVisibilityMatrixRootAlloc(alloc, parsed_unknown_evidence.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "routed-cte-revalidation",
+        \\      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+        \\      "routed_shape": "routed_cte",
+        \\      "visibility_outcome": "changed_row_fail_closed",
+        \\      "evidence_kind": "execution_test",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+        \\      "evidence_symbol": "routed rows query plan executes over scanned owner rows with ctes",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "next",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalRoutedVisibilityMatrixRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational production chaos inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalProductionChaosInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_production_chaos_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_production_chaos_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("fk-action-page-chaos", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[0].status);
+    try std.testing.expectEqualStrings("insert-source-upsert-owner-chaos", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("missing_native_harness", inventory.root.entries[1].status);
+    try std.testing.expectEqualStrings("table-emptying-secondary-index-chaos", inventory.root.entries[2].id);
+
+    const unknown_status_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "insert-source-upsert-owner-chaos",
+        \\      "relational_slices_section": "Release parity and production chaos gate",
+        \\      "scope": "insert_source_upsert_owner_movement",
+        \\      "status": "covered",
+        \\      "required_behavior": "required",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/http_server.zig",
+        \\      "evidence_symbol": "applyLoweredPublicSqlInsertSource",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_status = try std.json.parseFromSlice(std.json.Value, alloc, unknown_status_json, .{});
+    defer parsed_unknown_status.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalProductionChaosInventoryRootAlloc(alloc, parsed_unknown_status.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "insert-source-upsert-owner-chaos",
+        \\      "relational_slices_section": "Release parity and production chaos gate",
+        \\      "scope": "insert_source_upsert_owner_movement",
+        \\      "status": "missing_native_harness",
+        \\      "required_behavior": "required",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/http_server.zig",
+        \\      "evidence_symbol": "applyLoweredPublicSqlInsertSource",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalProductionChaosInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational SQL API coverage inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalSqlApiCoverageInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_sql_api_coverage_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_sql_api_coverage_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("catalog-ddl-durable-state", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("golden_typed_plan", inventory.root.entries[0].evidence_kind);
+    try std.testing.expectEqualStrings("copy-bulk-io-unsupported", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("deterministic_unsupported_fixture", inventory.root.entries[1].evidence_kind);
+    try std.testing.expectEqualStrings("insert-upsert-row-state", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("execution_parity_test", inventory.root.entries[2].evidence_kind);
+    try std.testing.expectEqualStrings("truncate-table-emptying-state", inventory.root.entries[6].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "insert-upsert-row-state",
+        \\      "relational_slices_section": "Release parity and production chaos gate",
+        \\      "syntax_family": "insert_upsert",
+        \\      "durable_surface": "mystery",
+        \\      "evidence_kind": "execution_parity_test",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        \\      "evidence_symbol": "postgres sql adapter insert source unique conflict executes through relational storage",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "missing",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSqlApiCoverageInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const unknown_evidence_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "insert-upsert-row-state",
+        \\      "relational_slices_section": "Release parity and production chaos gate",
+        \\      "syntax_family": "insert_upsert",
+        \\      "durable_surface": "row",
+        \\      "evidence_kind": "handwave",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        \\      "evidence_symbol": "postgres sql adapter insert source unique conflict executes through relational storage",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "missing",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_evidence = try std.json.parseFromSlice(std.json.Value, alloc, unknown_evidence_json, .{});
+    defer parsed_unknown_evidence.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSqlApiCoverageInventoryRootAlloc(alloc, parsed_unknown_evidence.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "insert-upsert-row-state",
+        \\      "relational_slices_section": "Release parity and production chaos gate",
+        \\      "syntax_family": "insert_upsert",
+        \\      "durable_surface": "row",
+        \\      "evidence_kind": "execution_parity_test",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        \\      "evidence_symbol": "postgres sql adapter insert source unique conflict executes through relational storage",
+        \\      "coverage_contract": "contract",
+        \\      "missing_or_next_evidence": "missing",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSqlApiCoverageInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
+test "sql adapter corpus validates relational SQL adapter removal inventory manifest" {
+    const alloc = std.testing.allocator;
+    var inventory = try parseRelationalSqlAdapterRemovalInventoryAlloc(alloc);
+    defer inventory.deinit(alloc);
+    try std.testing.expectEqual(relational_sql_adapter_removal_inventory_format, inventory.root.inventory_format);
+    try std.testing.expectEqual(relational_sql_adapter_removal_inventory_ids.len, inventory.root.entries.len);
+    try std.testing.expectEqualStrings("application-migration-equivalence-corpus", inventory.root.entries[0].id);
+    try std.testing.expectEqualStrings("application_migration_equivalence_corpus", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("catalog-snapshot-binding", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("legacy-wrapper-deletion", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("structural-sql-normalization", inventory.root.entries[3].id);
+
+    const unknown_surface_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "application-migration-equivalence-corpus",
+        \\      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+        \\      "surface": "parser_spelling",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        \\      "evidence_symbol": "postgres sql adapter classifies fixture-backed application parity corpus",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_surface = try std.json.parseFromSlice(std.json.Value, alloc, unknown_surface_json, .{});
+    defer parsed_unknown_surface.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSqlAdapterRemovalInventoryRootAlloc(alloc, parsed_unknown_surface.value));
+
+    const missing_gap_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "application-migration-equivalence-corpus",
+        \\      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+        \\      "surface": "application_migration_equivalence_corpus",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        \\      "evidence_symbol": "postgres sql adapter classifies fixture-backed application parity corpus",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_missing_gap = try std.json.parseFromSlice(std.json.Value, alloc, missing_gap_json, .{});
+    defer parsed_missing_gap.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSqlAdapterRemovalInventoryRootAlloc(alloc, parsed_missing_gap.value));
+
+    const incomplete_json =
+        \\{
+        \\  "inventory_format": 1,
+        \\  "entries": [
+        \\    {
+        \\      "id": "application-migration-equivalence-corpus",
+        \\      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+        \\      "surface": "application_migration_equivalence_corpus",
+        \\      "status": "partial_release_gated",
+        \\      "current_evidence": "current",
+        \\      "missing_evidence": "missing",
+        \\      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+        \\      "evidence_symbol": "postgres sql adapter classifies fixture-backed application parity corpus",
+        \\      "release_gate": "relational-release-gate"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
+    defer parsed_incomplete.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseRelationalSqlAdapterRemovalInventoryRootAlloc(alloc, parsed_incomplete.value));
+}
+
 fn expectSourceCorpusResolvedRequirements(
     coverage: AppParityCorpusCoverage,
     resolved: []const AppParityResolvedRequirement,
@@ -6872,11 +13000,18 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(corpusPlanMatchesReason(.adapter_noop_ddl, "adapter_noop:ddl:reason=session_setting", "session_setting"));
     try std.testing.expect(corpusPlanMatchesFamily(.insert_source, "insert_source:table=usage_records"));
     try std.testing.expect(!corpusPlanMatchesFamily(.insert_source, "insert:table=usage_records"));
+    try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query"));
+    try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query:table=docs:producer=bounded_scan"));
+    try std.testing.expect(!corpusPlanMatchesFamily(.query, "document_query"));
 
     try std.testing.expect(corpusFixtureFamilyNeedsTableSummary(.update_source));
     try std.testing.expect(!corpusFixtureFamilyNeedsTableSummary(.ddl));
+    try std.testing.expect(!corpusFixtureFamilyNeedsTableSummary(.unsupported_read));
     try std.testing.expect(corpusFixtureFamilyAllowsSummary(.join));
-    try std.testing.expect(!corpusFixtureFamilyAllowsSummary(.unsupported_read));
+    try std.testing.expect(corpusFixtureFamilyAllowsSummary(.unsupported_write));
+    try std.testing.expect(corpusFixtureFamilyAllowsSummary(.unsupported_read));
+    try std.testing.expect(corpusFixtureFamilyAllowsSourceSchema(.unsupported_read));
+    try std.testing.expect(corpusFixtureFamilyAllowsSourceSchema(.unsupported_write));
     try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(.{ .name = "insert conflict", .family = .insert, .plan = "insert:table=usage_records:conflict_where=1", .sql = "INSERT INTO usage_records VALUES ('1') ON CONFLICT (id) WHERE status = 'active' DO NOTHING" }));
     try std.testing.expect(corpusFixtureAllowsConflictWhereSummary(.{ .name = "insert source conflict", .family = .insert_source, .plan = "insert_source:table=usage_records:conflict_where=1", .sql = "INSERT INTO usage_records SELECT * FROM usage_sources ON CONFLICT (id) WHERE status = 'active' DO NOTHING" }));
     try std.testing.expect(!corpusFixtureAllowsConflictWhereSummary(.{ .name = "delete source conflict", .family = .delete_source, .plan = "delete_source:table=usage_records:source_pred=1", .sql = "DELETE FROM usage_records WHERE status = 'closed'" }));
@@ -6911,7 +13046,11 @@ test "sql adapter corpus owns fixture family policies" {
         },
         .resolver_row_json = "{\"id\":\"u1\",\"tenant_id\":\"t1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
         .sql = parsed_expression_selector.sql(),
-    }, parsed_expression_selector.items(), try appParitySetupSqlSummaryAlloc(std.testing.allocator, &.{
+    }, .{
+        .email_identifier = true,
+        .tenant_id_identifier = true,
+        .status_identifier = true,
+    }, try appParitySetupSqlSummaryAlloc(std.testing.allocator, &.{
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, tenant_id text, email text, status text);",
         "CREATE UNIQUE INDEX usage_records_active_tenant_email_key ON usage_records (email) WHERE concat_ws(':', tenant_id, status) = 't1:active';",
         "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_tenant_email_key;",
@@ -6927,7 +13066,11 @@ test "sql adapter corpus owns fixture family policies" {
         },
         .resolver_row_json = "{\"id\":\"u1\",\"email\":\"a@example.test\",\"status\":\"active\"}",
         .sql = parsed_expression_selector.sql(),
-    }, parsed_expression_selector.items(), try appParitySetupSqlSummaryAlloc(std.testing.allocator, &.{
+    }, .{
+        .email_identifier = true,
+        .tenant_id_identifier = true,
+        .status_identifier = true,
+    }, try appParitySetupSqlSummaryAlloc(std.testing.allocator, &.{
         "CREATE TABLE usage_records (id uuid PRIMARY KEY, email text, status text);",
         "CREATE UNIQUE INDEX usage_records_active_email_key ON usage_records (email) WHERE status = 'active';",
         "ALTER TABLE ONLY usage_records VALIDATE CONSTRAINT usage_records_active_email_key;",
@@ -8061,13 +14204,13 @@ fn appParityExpressionConditionHasField(condition: db_mod.types.RelationalRowsEx
 
 fn appParityPointWriteHasExpressionPartialUniqueSelector(
     entry: AppParityCorpusEntry,
-    sql_tokens: []const tokenized.Token,
+    parser_summary: AppParityParserFixtureSummary,
     setup_summary: AppParitySetupSqlSummary,
     family: AppParityCorpusPlanFamily,
 ) bool {
     if (entry.family != family or entry.apply_setup_sql.len == 0 or entry.resolver_row_json.len == 0) return false;
     if (!setup_summary.create_unique_index or !setup_summary.partial_unique_index or !setup_summary.validated_constraint) return false;
-    if (!appParityTokensHaveIdentifier(sql_tokens, "email")) return false;
+    if (!parser_summary.email_identifier) return false;
 
     const point_write_matches = switch (family) {
         .update => corpusPlanMatchesFamily(.update, entry.plan) and
@@ -8081,10 +14224,10 @@ fn appParityPointWriteHasExpressionPartialUniqueSelector(
     if (!point_write_matches) return false;
 
     const concat_ws_partial = setup_summary.partial_expression_unique_concat_ws and
-        appParityTokensHaveIdentifier(sql_tokens, "tenant_id") and
-        appParityTokensHaveIdentifier(sql_tokens, "status");
+        parser_summary.tenant_id_identifier and
+        parser_summary.status_identifier;
     const inequality_partial = setup_summary.partial_expression_unique_amount_inequality and
-        appParityTokensHaveIdentifier(sql_tokens, "amount");
+        parser_summary.amount_identifier;
     return concat_ws_partial or inequality_partial;
 }
 
@@ -8411,11 +14554,48 @@ pub const AppParityCorpusCoverage = struct {
     update_joined_source_cte_mutation: bool = false,
     delete_joined_source: bool = false,
     delete_joined_source_cte_mutation: bool = false,
+    document_query_view_mapping: bool = false,
+    document_query_view_mapping_between_predicate: bool = false,
+    document_query_view_mapping_bounded_scan: bool = false,
+    document_query_view_mapping_in_predicate: bool = false,
+    document_query_view_mapping_in_predicate_native_equivalence: bool = false,
+    document_query_native_semantic_rejected_missing_exact_producer: bool = false,
+    document_query_native_vector_rejected_missing_exact_producer: bool = false,
+    document_query_native_hybrid_rejected_missing_exact_producer: bool = false,
+    document_query_native_graph_traverse_rejected_missing_exact_producer: bool = false,
+    document_query_native_graph_shortest_path_rejected_missing_exact_producer: bool = false,
+    document_query_native_graph_metric_rejected_missing_exact_producer: bool = false,
+    document_query_native_graph_metric_rerank_rejected_missing_exact_producer: bool = false,
+    document_query_view_mapping_full_text_backed_native_equivalence: bool = false,
+    document_query_view_mapping_native_equivalence: bool = false,
+    document_query_view_mapping_null_predicate: bool = false,
+    document_query_view_mapping_null_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_range_predicate: bool = false,
+    document_query_view_mapping_range_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_rejected_incomplete_topk: bool = false,
+    document_query_view_mapping_rejected_missing_exact_producer: bool = false,
+    document_query_view_mapping_rejected_unsupported_residual: bool = false,
+    document_query_view_mapping_rejected_unbounded_read: bool = false,
+    document_query_view_mapping_residual_predicate: bool = false,
+    document_query_view_mapping_residual_predicate_native_equivalence: bool = false,
+    document_query_view_mapping_bounded_order: bool = false,
+    document_query_view_mapping_ordered_topk_native_equivalence: bool = false,
+    document_query_view_mapping_unnest: bool = false,
+    document_query_view_mapping_unnest_native_equivalence: bool = false,
+    document_query_view_mapping_between_predicate_native_equivalence: bool = false,
     adapter_noop_ddl: bool = false,
     unsupported_read: bool = false,
     unsupported_ddl: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
+    unsupported_ddl_document_table_invalid_antfly_extension: bool = false,
+    unsupported_ddl_document_table_invalid_dynamic_template: bool = false,
+    unsupported_ddl_document_table_malformed_schema_json: bool = false,
+    unsupported_ddl_document_table_missing_default_type: bool = false,
+    unsupported_ddl_document_table_mixed_relational_shape: bool = false,
+    unsupported_ddl_document_table_multi_document_type_unsupported: bool = false,
+    unsupported_ddl_document_table_shorthand: bool = false,
+    unsupported_ddl_document_table_unknown_default_type: bool = false,
     unsupported_ddl_table_access_method: bool = false,
     unsupported_ddl_table_cluster_on: bool = false,
     unsupported_ddl_table_cluster_without: bool = false,
@@ -8426,6 +14606,24 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_table_tablespace: bool = false,
     unsupported_ddl_table_trigger_disable: bool = false,
     unsupported_ddl_table_trigger_enable: bool = false,
+    unsupported_read_document_view_mapping_function_predicate: bool = false,
+    unsupported_read_document_view_mapping_ilike_predicate: bool = false,
+    unsupported_read_document_view_mapping_not_in_predicate: bool = false,
+    unsupported_read_document_view_mapping_not_predicate: bool = false,
+    unsupported_read_document_view_mapping_or_predicate: bool = false,
+    unsupported_read_document_view_mapping_projection_expression: bool = false,
+    unsupported_read_document_view_mapping_projection_path: bool = false,
+    unsupported_read_document_view_mapping_regex_not_imatch_predicate: bool = false,
+    unsupported_read_document_view_mapping_regex_predicate: bool = false,
+    unsupported_write_document_sql_doc_update: bool = false,
+    unsupported_write_document_sql_exact_id_delete: bool = false,
+    unsupported_write_document_sql_full_document_insert: bool = false,
+    unsupported_write_document_sql_generated_id_insert: bool = false,
+    unsupported_write_document_sql_merge_delete: bool = false,
+    unsupported_write_document_sql_projection_insert: bool = false,
+    unsupported_write_document_sql_projection_update: bool = false,
+    unsupported_write_document_sql_truncate_table: bool = false,
+    unsupported_write_document_sql_write_unsupported: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
     ddl_temporal_fk_update_cascade_action: bool = false,
@@ -8453,6 +14651,9 @@ pub const AppParityCorpusCoverage = struct {
     invalid_update_multi_output_subquery_selector: bool = false,
     invalid_delete: bool = false,
     invalid_delete_multi_output_subquery_selector: bool = false,
+    invalid_read_document_view_mapping_missing_required_index: bool = false,
+    invalid_read_document_view_mapping_stale_source_generation: bool = false,
+    invalid_read_document_view_mapping_stale_source_metadata: bool = false,
     unsupported_insert: bool = false,
     unsupported_insert_overriding_value: bool = false,
     invalid_read_row_lock_target: bool = false,
@@ -8887,98 +15088,86 @@ pub const AppParityCorpusCoverage = struct {
                     planHasStringToken(entry.plan, ":returning=")));
     }
 
-    fn observeBoundCatalogLogicalPlan(self: *@This(), plan: binder.LogicalSqlPlan) void {
-        switch (plan) {
-            .catalog_read => |read| {
-                for (read.bound_objects) |object| {
-                    self.observeBoundCatalogObjectIdentity(object);
-                    switch (object.role) {
-                        .target => self.bound_catalog_read_target = true,
-                        .source => self.bound_catalog_read_source = true,
-                        else => {},
-                    }
-                }
-            },
-            .catalog_write => |write| {
-                for (write.bound_objects) |object| {
-                    self.observeBoundCatalogObjectIdentity(object);
-                    switch (object.role) {
-                        .target => self.bound_catalog_write_target = true,
-                        .insert_source => self.bound_catalog_write_insert_source = true,
-                        .joined_source => self.bound_catalog_write_joined_source = true,
-                        else => {},
-                    }
-                }
-            },
-            else => {},
+    fn observeGeneratedParseFailureEntryAlloc(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        entry: AppParityCorpusEntry,
+        err: anyerror,
+    ) !bool {
+        if (!(try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_antfly_extension")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_invalid_antfly_extension = true;
+            return true;
         }
-    }
-
-    fn observeBoundCatalogObjectIdentity(self: *@This(), object: binder.BoundCatalogObject) void {
-        self.bound_catalog_object_table_id = self.bound_catalog_object_table_id or object.table_id != 0;
-        self.bound_catalog_object_schema_generation = self.bound_catalog_object_schema_generation or object.schema_generation != 0;
-    }
-
-    fn observeBoundCatalogFacts(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry, parsed_sql: *const tokenized.ParsedSql) !void {
-        var catalog = (try appParityBindingCoverageCatalogForEntryParsedSqlAlloc(alloc, entry, parsed_sql)) orelse return;
-        defer catalog.deinit(alloc);
-        switch (entry.family) {
-            .read, .query, .aggregate, .join, .lateral, .window => {
-                var bound = binder.bindReadPlanCatalogStatementAlloc(alloc, parsed_sql, catalog.iface()) catch |err| switch (err) {
-                    error.InvalidSqlCatalog, error.TableNotFound, error.UnsupportedSqlShape => return,
-                    else => return err,
-                };
-                defer bound.deinit(alloc);
-                var logical = try binder.logicalReadPlanFromBoundStatement(&bound);
-                defer logical.deinit(alloc);
-                self.observeBoundCatalogLogicalPlan(logical);
-            },
-            .insert,
-            .insert_source,
-            .recursive_insert_source,
-            .update,
-            .delete,
-            .update_source,
-            .delete_source,
-            .truncate_source,
-            .update_joined_source,
-            .delete_joined_source,
-            .merge_mutation,
-            => {
-                var bound = binder.bindWritePlanCatalogStatementAlloc(alloc, parsed_sql, .{}, catalog.iface()) catch |err| switch (err) {
-                    error.InvalidSqlCatalog, error.TableNotFound, error.UnsupportedSqlShape => return,
-                    else => return err,
-                };
-                defer bound.deinit(alloc);
-                var logical = try binder.logicalWritePlanFromBoundStatement(&bound);
-                defer logical.deinit(alloc);
-                self.observeBoundCatalogLogicalPlan(logical);
-            },
-            else => {},
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_dynamic_template")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_invalid_dynamic_template = true;
+            return true;
         }
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_malformed_schema_json")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_malformed_schema_json = true;
+            return true;
+        }
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_missing_default_type")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_missing_default_type = true;
+            return true;
+        }
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_mixed_relational_shape")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_mixed_relational_shape = true;
+            return true;
+        }
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_multi_document_type_unsupported")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_multi_document_type_unsupported = true;
+            return true;
+        }
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_shorthand")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_shorthand = true;
+            return true;
+        }
+        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_unknown_default_type")) {
+            self.unsupported_ddl = true;
+            self.unsupported_ddl_document_table_unknown_default_type = true;
+            return true;
+        }
+        return false;
     }
 
     pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
-        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+        var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
+            if (try self.observeGeneratedParseFailureEntryAlloc(alloc, entry, err)) return;
+            return err;
+        };
         defer parsed_sql.deinit(alloc);
-        const sql_tokens = parsed_sql.items();
+        const structured_summary = try appParityStructuredFixtureSummaryWithBinderAlloc(alloc, entry, &parsed_sql);
 
-        const uses_cte_stream = sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") or sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=");
-        const uses_returning_all = sql_adapter.planHasNonZeroToken(entry.plan, ":returning_all=");
-        const uses_conflict_where = sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_where=");
-        const uses_insert_conflict = entry.family == .insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .conflict });
-        const uses_multi_row_insert = entry.family == .insert and appParityTokensHaveKindSequence(sql_tokens, &.{ .rparen, .comma, .lparen });
-        const uses_computed_pattern = appParityParsedSqlHasComputedPattern(&parsed_sql);
+        const uses_cte_stream = structured_summary.plan.uses_cte_stream;
+        const uses_returning_all = structured_summary.plan.uses_returning_all;
+        const uses_conflict_where = structured_summary.plan.uses_conflict_where;
+        const uses_insert_conflict = structured_summary.parser.on_conflict;
+        const uses_multi_row_insert = structured_summary.parser.multi_row_insert;
+        const uses_computed_pattern = structured_summary.parser.computed_pattern;
         const is_update_joined_source = entry.family == .update_joined_source;
         const is_delete_joined_source = entry.family == .delete_joined_source;
         const is_joined_source = is_update_joined_source or is_delete_joined_source;
-        const applied_rebuild = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true);
-        const applied_validation = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true);
-        const applied_rewrite = entry.applied_plan.len > 0 and sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
+        const applied_rebuild = structured_summary.plan.applied_rebuild;
+        const applied_validation = structured_summary.plan.applied_validation;
+        const applied_rewrite = structured_summary.plan.applied_rewrite;
         const setup_summary = try appParitySetupSqlSummaryAlloc(alloc, entry.apply_setup_sql);
-        try self.observeBoundCatalogFacts(alloc, entry, &parsed_sql);
+        self.bound_catalog_object_table_id = self.bound_catalog_object_table_id or structured_summary.binder.object_table_id;
+        self.bound_catalog_object_schema_generation = self.bound_catalog_object_schema_generation or structured_summary.binder.object_schema_generation;
+        self.bound_catalog_read_source = self.bound_catalog_read_source or structured_summary.binder.read_source;
+        self.bound_catalog_read_target = self.bound_catalog_read_target or structured_summary.binder.read_target;
+        self.bound_catalog_write_insert_source = self.bound_catalog_write_insert_source or structured_summary.binder.write_insert_source;
+        self.bound_catalog_write_joined_source = self.bound_catalog_write_joined_source or structured_summary.binder.write_joined_source;
+        self.bound_catalog_write_target = self.bound_catalog_write_target or structured_summary.binder.write_target;
         self.merge_mutation_data_modifying_cte = self.merge_mutation_data_modifying_cte or
-            (std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan") and
+            (structured_summary.hasReason("cte_mutation_source_plan") and
                 sql_adapter.planHasExactStringToken(entry.plan, "unsupported:merge_mutation:requires=", "cte_mutation_source_plan"));
         if (entry.params.len > 0) {
             switch (entry.family) {
@@ -9002,21 +15191,21 @@ pub const AppParityCorpusCoverage = struct {
             self.query_function_full_text = self.query_function_full_text or
                 sql_adapter.planHasNonZeroToken(entry.plan, ":text=");
             self.query_function_semantic = self.query_function_semantic or
-                (appParityTokensHaveIdentifier(sql_tokens, "antfly.semantic_search") and
+                (structured_summary.parser.semantic_search_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":dense="));
             self.query_function_vector = self.query_function_vector or
-                (appParityTokensHaveIdentifier(sql_tokens, "antfly.vector_search") and
+                (structured_summary.parser.vector_search_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":dense="));
             self.query_function_graph_search = self.query_function_graph_search or
                 sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search=");
             self.query_function_graph_traverse = self.query_function_graph_traverse or
-                (appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_traverse") and
+                (structured_summary.parser.graph_traverse_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_shortest_path = self.query_function_graph_shortest_path or
-                (appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_shortest_path") and
+                (structured_summary.parser.graph_shortest_path_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_k_shortest_paths = self.query_function_graph_k_shortest_paths or
-                (appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_k_shortest_paths") and
+                (structured_summary.parser.graph_k_shortest_paths_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_metric = self.query_function_graph_metric or
                 sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric=");
@@ -9028,37 +15217,36 @@ pub const AppParityCorpusCoverage = struct {
                         sql_adapter.planHasNonZeroToken(entry.plan, ":dense=") or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":graph_metric_rerank=")));
             self.query_function_hybrid_sources_json = self.query_function_hybrid_sources_json or
-                (appParityTokensHaveIdentifier(sql_tokens, "sources_json") and
+                (structured_summary.parser.sources_json_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":merge="));
             self.query_function_hybrid_source_helpers = self.query_function_hybrid_source_helpers or
-                (appParityTokensHaveIdentifier(sql_tokens, "antfly.source") and
+                (structured_summary.parser.antfly_source_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":merge="));
         }
-        self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or appParityTokensHaveIdentifier(sql_tokens, "to_jsonb");
+        self.to_jsonb_value_wrapper = self.to_jsonb_value_wrapper or structured_summary.parser.to_jsonb_function;
         self.to_jsonb_dynamic_expression = self.to_jsonb_dynamic_expression or
-            (appParityTokensHaveIdentifier(sql_tokens, "to_jsonb") and
-                (appParityTokensHaveIdentifier(sql_tokens, "lower") or appParityTokensHaveIdentifierPrefix(sql_tokens, "excluded.")));
+            (structured_summary.parser.to_jsonb_function and
+                (structured_summary.parser.lower_function or structured_summary.parser.excluded_identifier_prefix));
         self.update_source_json_set_expression = self.update_source_json_set_expression or
             (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":json_set_expr="));
         self.update_joined_source_json_set_expression = self.update_joined_source_json_set_expression or
             (entry.family == .update_joined_source and sql_adapter.planHasNonZeroToken(entry.plan, ":json_set_expr="));
-        self.point_update_jsonb = self.point_update_jsonb or (entry.family == .update and appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_"));
+        self.point_update_jsonb = self.point_update_jsonb or (entry.family == .update and structured_summary.parser.jsonb_identifier_prefix);
         self.point_update_jsonb_concat = self.point_update_jsonb_concat or (entry.family == .update and
-            appParityTokensHaveIdentifier(sql_tokens, "metadata") and
-            appParityTokensHaveKind(sql_tokens, .pipe_concat) and
+            structured_summary.parser.metadata_pipe_concat and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
-        self.point_update_array = self.point_update_array or (entry.family == .update and appParityTokensHaveIdentifierPrefix(sql_tokens, "array_"));
+        self.point_update_array = self.point_update_array or (entry.family == .update and structured_summary.parser.array_identifier_prefix);
         self.write_plan_insert_op_set = self.write_plan_insert_op_set or (entry.family == .insert and sql_adapter.planHasNonZeroToken(entry.plan, ":op_set="));
         self.write_plan_insert_op_inc = self.write_plan_insert_op_inc or (entry.family == .insert and sql_adapter.planHasNonZeroToken(entry.plan, ":op_inc="));
         self.write_plan_update_op_set = self.write_plan_update_op_set or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_set="));
         self.write_plan_update_op_push = self.write_plan_update_op_push or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_push="));
         self.write_plan_update_op_pull = self.write_plan_update_op_pull or (entry.family == .update and sql_adapter.planHasNonZeroToken(entry.plan, ":op_pull="));
-        self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and appParityTokensHaveIdentifier(sql_tokens, "gen_random_uuid"));
+        self.point_update_uuid_generation = self.point_update_uuid_generation or (entry.family == .update and structured_summary.parser.gen_random_uuid_function);
         self.point_update_patch_expression = self.point_update_patch_expression or
             (entry.family == .update and
                 planHasExactStringToken(entry.plan, "update:table=", "usage_records") and
                 planHasNonZeroToken(entry.plan, ":op_set=") and
-                appParityTokensHaveSetFunctionAssignment(sql_tokens, "status", "lower"));
+                structured_summary.parser.set_status_lower_assignment);
         self.update_source_claim_skip_locked = self.update_source_claim_skip_locked or (entry.family == .update_source and
             sql_adapter.planHasAnyExactStringToken(entry.plan, ":claim=", &.{ "skip_locked", "no_key_update_skip_locked" }));
         self.update_source_claim_nowait = self.update_source_claim_nowait or (entry.family == .update_source and
@@ -9067,212 +15255,208 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasAnyExactStringToken(entry.plan, ":claim=", &.{ "no_key_update", "no_key_update_nowait", "no_key_update_skip_locked" }));
         self.update_source_pagination = self.update_source_pagination or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":source_offset="));
         self.update_source_nullable_pagination = self.update_source_nullable_pagination or (entry.family == .update_source and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
+            structured_summary.parser.limit_null_offset_null and
             sql_adapter.planHasExactStringToken(entry.plan, ":source_limit=", "-1") and
             sql_adapter.planTokenAbsent(entry.plan, ":source_offset="));
         self.update_source_returning_expression = self.update_source_returning_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.schema_temporal_numrange_insert = self.schema_temporal_numrange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[1,10)") and
+            structured_summary.parser.numrange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_daterange_insert = self.schema_temporal_daterange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01,2025-07-01)") and
+            structured_summary.parser.daterange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_open_daterange_insert = self.schema_temporal_open_daterange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2026-01-01,)") and
+            structured_summary.parser.open_daterange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_open_daterange_insert = self.schema_temporal_lower_open_daterange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "(,2026-01-01)") and
+            structured_summary.parser.lower_open_daterange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_numrange_constructor_insert = self.schema_temporal_numrange_constructor_insert or (entry.family == .insert and
-            appParityTokensHaveFunctionCall(sql_tokens, "numrange") and
+            structured_summary.parser.numrange_function and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "price_intervals") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_daterange_constructor_insert = self.schema_temporal_daterange_constructor_insert or (entry.family == .insert and
-            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
+            structured_summary.parser.daterange_function and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_constructor_insert = self.schema_temporal_inclusive_daterange_constructor_insert or (entry.family == .insert and
-            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
-            appParityTokensHaveStringLiteral(sql_tokens, "[]") and
+            structured_summary.parser.daterange_function and
+            structured_summary.parser.range_bound_inclusive_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_inclusive_daterange_literal_insert = self.schema_temporal_inclusive_daterange_literal_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "2025-02-01]") and
+            structured_summary.parser.inclusive_daterange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_constructor_insert = self.schema_temporal_lower_exclusive_daterange_constructor_insert or (entry.family == .insert and
-            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
-            appParityTokensHaveStringLiteral(sql_tokens, "(]") and
+            structured_summary.parser.daterange_function and
+            structured_summary.parser.range_bound_lower_exclusive_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_lower_exclusive_daterange_literal_insert = self.schema_temporal_lower_exclusive_daterange_literal_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "(2025-01-01,") and
+            structured_summary.parser.lower_exclusive_daterange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "products") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_insert = self.schema_temporal_tsrange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01 00:00:00,2025-01-02 00:00:00)") and
+            structured_summary.parser.tsrange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tsrange_constructor_insert = self.schema_temporal_tsrange_constructor_insert or (entry.family == .insert and
-            appParityTokensHaveFunctionCall(sql_tokens, "tsrange") and
+            structured_summary.parser.tsrange_function and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "local_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_insert = self.schema_temporal_tstzrange_insert or (entry.family == .insert and
-            appParityTokensHaveStringLiteralContaining(sql_tokens, "[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)") and
+            structured_summary.parser.tstzrange_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_tstzrange_constructor_insert = self.schema_temporal_tstzrange_constructor_insert or (entry.family == .insert and
-            appParityTokensHaveFunctionCall(sql_tokens, "tstzrange") and
+            structured_summary.parser.tstzrange_function and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "published_prices") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_bound_query = self.schema_temporal_range_bound_query or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveFunctionCall(sql_tokens, "upper") and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.upper_function and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.schema_temporal_range_contains_query = self.schema_temporal_range_contains_query or (entry.family == .query and
-            appParityTokensHaveKind(sql_tokens, .at_contains) and
+            structured_summary.parser.range_contains_operator and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_range_overlap_query = self.schema_temporal_range_overlap_query or (entry.family == .query and
-            appParityTokensHaveKind(sql_tokens, .range_overlap) and
+            structured_summary.parser.range_overlap_operator and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "price_intervals") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_inclusive_daterange_overlap_query = self.schema_temporal_inclusive_daterange_overlap_query or (entry.family == .query and
-            appParityTokensHaveKind(sql_tokens, .range_overlap) and
-            appParityTokensHaveFunctionCall(sql_tokens, "daterange") and
-            appParityTokensHaveStringLiteral(sql_tokens, "[]") and
+            structured_summary.parser.range_overlap_operator and
+            structured_summary.parser.daterange_function and
+            structured_summary.parser.range_bound_inclusive_literal and
             sql_adapter.planHasExactStringToken(entry.plan, "query:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.schema_temporal_unique_conflict_upsert = self.schema_temporal_unique_conflict_upsert or (entry.family == .insert and
-            appParityTokensHaveConflictConstraint(sql_tokens, "prices_sku_time_key") and
+            structured_summary.parser.prices_sku_time_conflict_constraint and
             sql_adapter.planHasExactStringToken(entry.plan, "insert:table=", "prices") and
             sql_adapter.planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
             entry.apply_setup_sql.len > 0 and
             entry.resolver_row_json.len > 0);
         self.query_set_operation_order_limit = self.query_set_operation_order_limit or
             ((entry.family == .query or (entry.family == .read and sql_adapter.readPlanHasKind(entry.plan, "query"))) and
-                appParityTokensHaveKeyword(sql_tokens, .@"union") and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
+                structured_summary.parser.@"union" and
+                structured_summary.parser.order_by and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
                 sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "5")) or
             (entry.family == .read and
                 sql_adapter.readPlanHasKind(entry.plan, "set_operation") and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
+                structured_summary.parser.union_all and
+                structured_summary.parser.order_by and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":result_order=") and
                 sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "5"));
         self.read_set_operation_order_limit = self.read_set_operation_order_limit or (entry.family == .read and
-            (appParityTokensHaveKeyword(sql_tokens, .intersect) or
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all })) and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .order, .by }) and
+            (structured_summary.parser.intersect or structured_summary.parser.union_all) and
+            structured_summary.parser.order_by and
             (sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") or sql_adapter.readPlanHasKind(entry.plan, "set_operation")) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":result_order=") and
             sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "5"));
         self.set_operation_fetch_tail = self.set_operation_fetch_tail or
             ((entry.family == .query or entry.family == .read) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .fetch, .first }) and
+                structured_summary.parser.union_all and
+                structured_summary.parser.fetch_first and
                 (sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "1") or
                     sql_adapter.planHasExactStringToken(entry.plan, ":result_limit=", "1")));
         self.set_operation_null_pagination_tail = self.set_operation_null_pagination_tail or
             ((entry.family == .query or entry.family == .read) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
+                structured_summary.parser.union_all and
+                structured_summary.parser.limit_null_offset_null and
                 sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "none") and
                 sql_adapter.planTokenAbsent(entry.plan, ":offset="));
         self.cte_set_operation_tail = self.cte_set_operation_tail or
             ((entry.family == .query or entry.family == .read) and
-                appParityTokensStartWithKeyword(sql_tokens, .with) and
-                appParityTokensHaveIdentifier(sql_tokens, "scoped") and
-                appParityTokensHaveKeyword(sql_tokens, .@"union") and
+                structured_summary.parser.starts_with_with and
+                structured_summary.parser.scoped_identifier and
+                structured_summary.parser.@"union" and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.set_operation_numeric_range_disjoint = self.set_operation_numeric_range_disjoint or
             ((entry.family == .query or entry.family == .read) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
-                appParityTokensHaveIdentifier(sql_tokens, "amount") and
-                (appParityTokensHaveKind(sql_tokens, .lt) or appParityTokensHaveKind(sql_tokens, .lte)) and
-                (appParityTokensHaveKind(sql_tokens, .gt) or appParityTokensHaveKind(sql_tokens, .gte)) and
+                structured_summary.parser.union_all and
+                structured_summary.parser.amount_identifier and
+                structured_summary.parser.lt_or_lte_operator and
+                structured_summary.parser.gt_or_gte_operator and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":or="));
         self.set_operation_expression_numeric_range_disjoint = self.set_operation_expression_numeric_range_disjoint or
             ((entry.family == .query or entry.family == .read) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"union", .all }) and
-                appParityTokensHaveIdentifier(sql_tokens, "amount") and
-                appParityTokensHaveIdentifier(sql_tokens, "quantity") and
-                appParityTokensHaveKind(sql_tokens, .plus) and
-                (appParityTokensHaveKind(sql_tokens, .lt) or appParityTokensHaveKind(sql_tokens, .lte)) and
-                (appParityTokensHaveKind(sql_tokens, .gt) or appParityTokensHaveKind(sql_tokens, .gte)) and
+                structured_summary.parser.union_all and
+                structured_summary.parser.amount_identifier and
+                structured_summary.parser.quantity_identifier and
+                structured_summary.parser.plus_operator and
+                structured_summary.parser.lt_or_lte_operator and
+                structured_summary.parser.gt_or_gte_operator and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":expr_or="));
         self.schema_temporal_fk_ddl = self.schema_temporal_fk_ddl or (entry.family == .ddl and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal_fk=") and
-            appParityTokensHaveKeyword(sql_tokens, .period) and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .foreign, .key }));
+            structured_summary.parser.period_foreign_key);
         self.schema_system_versioned_table = self.schema_system_versioned_table or (entry.family == .ddl and
             sql_adapter.planHasExactUsizeToken(entry.plan, ":system_versioned=", 1) and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .system, .versioning }));
+            structured_summary.parser.system_versioning);
         self.schema_nulls_not_distinct_unique = self.schema_nulls_not_distinct_unique or (entry.family == .ddl and
-            appParityTokensHaveKeyword(sql_tokens, .unique) and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .nulls, .not, .distinct }));
+            structured_summary.parser.unique_keyword and
+            structured_summary.parser.nulls_not_distinct);
         self.schema_rich_expression_secondary_index = self.schema_rich_expression_secondary_index or (entry.family == .ddl and
             entry.summary.ddl_tag == .create_index and
             sql_adapter.planHasExactStringToken(entry.plan, ":generated_op=", "expression"));
         self.schema_temporal_portion_update = self.schema_temporal_portion_update or (entry.family == .update_source and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
+            structured_summary.parser.for_portion_of and
             sql_adapter.planHasExactStringToken(entry.plan, "update_source:table=", "prices") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_portion_delete = self.schema_temporal_portion_delete or (entry.family == .delete_source and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
+            structured_summary.parser.for_portion_of and
             sql_adapter.planHasExactStringToken(entry.plan, "delete_source:table=", "prices") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_column_portion_update = self.schema_temporal_range_column_portion_update or (entry.family == .update_source and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
-            appParityTokensHaveIdentifier(sql_tokens, "valid_at") and
+            structured_summary.parser.for_portion_of and
+            structured_summary.parser.valid_at_identifier and
             sql_adapter.planHasExactStringToken(entry.plan, "update_source:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.schema_temporal_range_column_portion_delete = self.schema_temporal_range_column_portion_delete or (entry.family == .delete_source and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .portion, .of }) and
-            appParityTokensHaveIdentifier(sql_tokens, "valid_at") and
+            structured_summary.parser.for_portion_of and
+            structured_summary.parser.valid_at_identifier and
             sql_adapter.planHasExactStringToken(entry.plan, "delete_source:table=", "products") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":temporal=") and
             entry.apply_setup_sql.len > 0);
         self.update_source_row_assignment = self.update_source_row_assignment or (entry.family == .update_source and
-            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+            structured_summary.parser.set_row_assignment and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_row_assignment_default = self.update_source_row_assignment_default or (entry.family == .update_source and
-            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-            appParityTokensHaveKeyword(sql_tokens, .default) and
+            structured_summary.parser.set_row_assignment and
+            structured_summary.parser.default_keyword and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_row_assignment_constructor = self.update_source_row_assignment_constructor or (entry.family == .update_source and
-            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-            appParityTokensHaveFunctionCall(sql_tokens, "row") and
+            structured_summary.parser.set_row_assignment and
+            structured_summary.parser.row_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_source_boolean_is_not_predicate = self.update_source_boolean_is_not_predicate or (entry.family == .update_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_or=") and
-            (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }) or
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .false })));
+            structured_summary.parser.boolean_is_not_true_or_false);
         self.delete_source_fetch_pagination = self.delete_source_fetch_pagination or (entry.family == .delete_source and
-            appParityTokensHaveKeyword(sql_tokens, .fetch) and
+            structured_summary.parser.fetch_first and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_offset="));
         self.delete_source_nullable_pagination = self.delete_source_nullable_pagination or (entry.family == .delete_source and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
+            structured_summary.parser.limit_null_offset_null and
             sql_adapter.planHasExactStringToken(entry.plan, ":source_limit=", "-1") and
             sql_adapter.planTokenAbsent(entry.plan, ":source_offset="));
         self.delete_source_boolean_unknown_predicate = self.delete_source_boolean_unknown_predicate or (entry.family == .delete_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_pred=") and
-            (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .unknown }) or
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .unknown })));
+            structured_summary.parser.boolean_unknown_or_not_unknown);
         self.delete_source_returning_expression = self.delete_source_returning_expression or (entry.family == .delete_source and sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.joined_source_ordered_pagination = self.joined_source_ordered_pagination or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order=") and
@@ -9295,193 +15479,442 @@ pub const AppParityCorpusCoverage = struct {
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.joined_source_returning_source_field = self.joined_source_returning_source_field or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            appParityTokensHaveKeyword(sql_tokens, .returning) and
-            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
+            structured_summary.parser.returning_keyword and
+            structured_summary.parser.source_identifier_prefix);
         self.joined_source_returning_source_expression = self.joined_source_returning_source_expression or (is_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            appParityTokensHaveKeyword(sql_tokens, .returning) and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
+            structured_summary.parser.returning_keyword and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.source_identifier_prefix);
         self.update_joined_source_returning_source_expression = self.update_joined_source_returning_source_expression or (entry.family == .update_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            appParityTokensHaveKeyword(sql_tokens, .returning) and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
+            structured_summary.parser.returning_keyword and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.source_identifier_prefix);
         self.delete_joined_source_returning_source_expression = self.delete_joined_source_returning_source_expression or (entry.family == .delete_joined_source and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=") and
-            appParityTokensHaveKeyword(sql_tokens, .returning) and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifierPrefix(sql_tokens, "source."));
+            structured_summary.parser.returning_keyword and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.source_identifier_prefix);
         self.update_joined_source_non_primary_semijoin = self.update_joined_source_non_primary_semijoin or (is_update_joined_source and
-            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .in, .select, .from }) and
-            appParityTokensHaveIdentifier(sql_tokens, "organization_id") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records") and
+            structured_summary.parser.in_select_from_keywords and
+            structured_summary.parser.organization_id_identifier and
+            structured_summary.parser.archived_records_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 1));
         self.delete_joined_source_non_primary_semijoin = self.delete_joined_source_non_primary_semijoin or (is_delete_joined_source and
-            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .in, .select, .from }) and
-            appParityTokensHaveIdentifier(sql_tokens, "organization_id") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records") and
+            structured_summary.parser.in_select_from_keywords and
+            structured_summary.parser.organization_id_identifier and
+            structured_summary.parser.archived_records_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 1));
         self.update_joined_source_correlated_semijoin = self.update_joined_source_correlated_semijoin or (is_update_joined_source and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.delete_joined_source_correlated_semijoin = self.delete_joined_source_correlated_semijoin or (is_delete_joined_source and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.update_joined_source_correlated_filtered_semijoin = self.update_joined_source_correlated_filtered_semijoin or (is_update_joined_source and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
-            appParityTokensHaveStringLiteral(sql_tokens, "o1") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.archived_records_organization_id_identifier and
+            structured_summary.parser.o1_string_literal and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 2));
         self.delete_joined_source_correlated_filtered_semijoin = self.delete_joined_source_correlated_filtered_semijoin or (is_delete_joined_source and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
-            appParityTokensHaveStringLiteral(sql_tokens, "o1") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.archived_records_organization_id_identifier and
+            structured_summary.parser.o1_string_literal and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 2));
         self.update_joined_source_semijoin_match_expression = self.update_joined_source_semijoin_match_expression or (is_update_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.delete_joined_source_semijoin_match_expression = self.delete_joined_source_semijoin_match_expression or (is_delete_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.update_joined_source_exists_semijoin = self.update_joined_source_exists_semijoin or (is_update_joined_source and
-            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.id") and
+            structured_summary.parser.where_exists_keywords and
+            structured_summary.parser.archived_records_organization_id_identifier and
+            structured_summary.parser.usage_records_id_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 1));
         self.delete_joined_source_exists_semijoin = self.delete_joined_source_exists_semijoin or (is_delete_joined_source and
-            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.organization_id") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.id") and
+            structured_summary.parser.where_exists_keywords and
+            structured_summary.parser.archived_records_organization_id_identifier and
+            structured_summary.parser.usage_records_id_identifier and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 1, 1));
         self.update_joined_source_exists_match_expression = self.update_joined_source_exists_match_expression or (is_update_joined_source and
-            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.where_exists_keywords and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.delete_joined_source_exists_match_expression = self.delete_joined_source_exists_match_expression or (is_delete_joined_source and
-            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .where, .exists }) and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveIdentifier(sql_tokens, "archived_records.status") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.status") and
+            structured_summary.parser.where_exists_keywords and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.archived_records_status_identifier and
+            structured_summary.parser.usage_records_status_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":match_expr_pred="));
         self.update_joined_source_row_value_semijoin = self.update_joined_source_row_value_semijoin or (is_update_joined_source and
-            appParityTokensHaveKeyword(sql_tokens, .where) and
-            appParityTokensHaveKindSequence(sql_tokens, &.{ .lparen, .identifier, .comma, .identifier, .rparen }) and
-            appParityTokensHaveKeyword(sql_tokens, .in) and
+            structured_summary.parser.where_keyword and
+            structured_summary.parser.row_value_identifier_pair and
+            structured_summary.parser.in_keyword and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.delete_joined_source_row_value_semijoin = self.delete_joined_source_row_value_semijoin or (is_delete_joined_source and
-            appParityTokensHaveKeyword(sql_tokens, .where) and
-            appParityTokensHaveKindSequence(sql_tokens, &.{ .lparen, .identifier, .comma, .identifier, .rparen }) and
-            appParityTokensHaveKeyword(sql_tokens, .in) and
+            structured_summary.parser.where_keyword and
+            structured_summary.parser.row_value_identifier_pair and
+            structured_summary.parser.in_keyword and
             sql_adapter.joinedSourcePlanHasCounts(entry.plan, 0, 2));
         self.update_joined_source_modulo_expression = self.update_joined_source_modulo_expression or (is_update_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "mod") and
-            appParityTokensHaveKind(sql_tokens, .percent) and
+            structured_summary.parser.mod_function and
+            structured_summary.parser.percent_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_regexp_expression = self.update_joined_source_regexp_expression or (is_update_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
+            structured_summary.parser.regexp_like_function and
+            structured_summary.parser.regexp_substr_function and
+            structured_summary.parser.regexp_count_function and
+            structured_summary.parser.regexp_instr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.delete_joined_source_regexp_expression = self.delete_joined_source_regexp_expression or (is_delete_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+            structured_summary.parser.regexp_like_function and
+            structured_summary.parser.regexp_substr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_array_expression = self.update_joined_source_array_expression or (is_update_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_append") and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_position") and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_to_string") and
+            structured_summary.parser.array_append_function and
+            structured_summary.parser.array_position_function and
+            structured_summary.parser.array_to_string_function and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.delete_joined_source_array_expression = self.delete_joined_source_array_expression or (is_delete_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_position") and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_to_string") and
+            structured_summary.parser.array_position_function and
+            structured_summary.parser.array_to_string_function and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_json_expression = self.update_joined_source_json_expression or (is_update_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object") and
-            appParityTokensHaveStringLiteral(sql_tokens, "status") and
-            appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") and
-            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_extract_path_text") and
+            structured_summary.parser.jsonb_build_object_function and
+            structured_summary.parser.status_string_literal and
+            structured_summary.parser.to_jsonb_function and
+            structured_summary.parser.jsonb_extract_path_text_function and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.delete_joined_source_json_expression = self.delete_joined_source_json_expression or (is_delete_joined_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object") and
-            appParityTokensHaveStringLiteral(sql_tokens, "source") and
-            appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") and
-            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_extract_path_text") and
+            structured_summary.parser.jsonb_build_object_function and
+            structured_summary.parser.source_string_literal and
+            structured_summary.parser.to_jsonb_function and
+            structured_summary.parser.jsonb_extract_path_text_function and
             sql_adapter.planHasNonZeroToken(entry.plan, "_expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_joined_source_row_assignment = self.update_joined_source_row_assignment or (is_update_joined_source and
-            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
+            structured_summary.parser.set_row_assignment and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_row_assignment_default = self.update_joined_source_row_assignment_default or (is_update_joined_source and
-            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-            appParityTokensHaveKeyword(sql_tokens, .default) and
+            structured_summary.parser.set_row_assignment and
+            structured_summary.parser.default_keyword and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_row_assignment_constructor = self.update_joined_source_row_assignment_constructor or (is_update_joined_source and
-            appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-            appParityTokensHaveFunctionCall(sql_tokens, "row") and
+            structured_summary.parser.set_row_assignment and
+            structured_summary.parser.row_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_assignments=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
         self.update_joined_source_boolean_expression_update = self.update_joined_source_boolean_expression_update or (is_update_joined_source and
-            appParityTokensHaveKeyword(sql_tokens, .set) and
-            appParityTokensHaveIdentifier(sql_tokens, "enabled") and
-            appParityTokensHaveIdentifier(sql_tokens, "usage_records.enabled") and
-            appParityTokensHaveIdentifier(sql_tokens, "source.enabled") and
-            appParityTokensHaveKeyword(sql_tokens, .@"or") and
+            structured_summary.parser.set_keyword and
+            structured_summary.parser.enabled_identifier and
+            structured_summary.parser.usage_records_enabled_identifier and
+            structured_summary.parser.source_enabled_identifier and
+            structured_summary.parser.or_keyword and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_patch_expression = self.update_source_patch_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_boolean_expression_update = self.update_source_boolean_expression_update or (entry.family == .update_source and
-            appParityTokensHaveKeyword(sql_tokens, .set) and
-            appParityTokensHaveIdentifier(sql_tokens, "enabled") and
-            appParityTokensHaveKeyword(sql_tokens, .@"or") and
-            appParityTokensHaveKeyword(sql_tokens, .false) and
+            structured_summary.parser.set_keyword and
+            structured_summary.parser.enabled_identifier and
+            structured_summary.parser.or_keyword and
+            structured_summary.parser.false_keyword and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_increment_expression = self.update_source_increment_expression or (entry.family == .update_source and sql_adapter.planHasNonZeroToken(entry.plan, ":increment_expr="));
         self.update_source_modulo_expression = self.update_source_modulo_expression or (entry.family == .update_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "mod") and
-            appParityTokensHaveKind(sql_tokens, .percent) and
+            structured_summary.parser.mod_function and
+            structured_summary.parser.percent_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.update_source_regexp_replace_expression = self.update_source_regexp_replace_expression or (entry.family == .update_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace") and
+            structured_summary.parser.regexp_replace_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_match_expression = self.update_source_regexp_match_expression or (entry.family == .update_source and
-            (appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") or
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_match")) and
+            (structured_summary.parser.regexp_like_function or
+                structured_summary.parser.regexp_match_function) and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_count_expression = self.update_source_regexp_count_expression or (entry.family == .update_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+            structured_summary.parser.regexp_count_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_instr_expression = self.update_source_regexp_instr_expression or (entry.family == .update_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
+            structured_summary.parser.regexp_instr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.update_source_regexp_substr_expression = self.update_source_regexp_substr_expression or (entry.family == .update_source and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+            structured_summary.parser.regexp_substr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":patch_expr="));
         self.observeMigrationEquivalentDataBackfill(entry);
         self.catalog_setup_sql = self.catalog_setup_sql or entry.apply_setup_sql.len > 0;
         self.catalog_tables_fixture_metadata = self.catalog_tables_fixture_metadata or entry.catalog_tables.len > 0;
+        self.document_query_view_mapping = self.document_query_view_mapping or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier);
+        self.document_query_view_mapping_bounded_scan = self.document_query_view_mapping_bounded_scan or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.where_keyword and
+                !structured_summary.parser.order_by and
+                !structured_summary.parser.unnest_function and
+                !appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
+        self.document_query_view_mapping_in_predicate = self.document_query_view_mapping_in_predicate or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.in_keyword and
+                !structured_summary.parser.not_keyword);
+        self.document_query_view_mapping_in_predicate_native_equivalence = self.document_query_view_mapping_in_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.in_keyword and
+                !structured_summary.parser.not_keyword and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_null_predicate = self.document_query_view_mapping_null_predicate or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                (structured_summary.parser.is_null_predicate or structured_summary.parser.is_not_null_predicate));
+        self.document_query_view_mapping_null_predicate_native_equivalence = self.document_query_view_mapping_null_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                (structured_summary.parser.is_null_predicate or structured_summary.parser.is_not_null_predicate) and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_range_predicate = self.document_query_view_mapping_range_predicate or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.score_identifier and
+                (structured_summary.parser.lt_or_lte_operator or structured_summary.parser.gt_or_gte_operator));
+        self.document_query_view_mapping_range_predicate_native_equivalence = self.document_query_view_mapping_range_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.score_identifier and
+                (structured_summary.parser.lt_or_lte_operator or structured_summary.parser.gt_or_gte_operator) and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_between_predicate = self.document_query_view_mapping_between_predicate or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.score_identifier and
+                structured_summary.parser.between_keyword);
+        self.document_query_view_mapping_between_predicate_native_equivalence = self.document_query_view_mapping_between_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.score_identifier and
+                structured_summary.parser.between_keyword and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_rejected_unbounded_read = self.document_query_view_mapping_rejected_unbounded_read or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_unbounded_source") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                !structured_summary.parser.where_keyword and
+                !structured_summary.parser.order_by);
+        self.document_query_view_mapping_rejected_incomplete_topk = self.document_query_view_mapping_rejected_incomplete_topk or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_incomplete_topk") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.where_keyword and
+                structured_summary.parser.order_by and
+                !structured_summary.parser.unnest_function);
+        self.document_query_view_mapping_rejected_unsupported_residual = self.document_query_view_mapping_rejected_unsupported_residual or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_unsupported_residual") and
+                structured_summary.parser.length_function and
+                structured_summary.parser.status_identifier and
+                structured_summary.parser.where_keyword);
+        self.document_query_view_mapping_rejected_missing_exact_producer = self.document_query_view_mapping_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.score_identifier and
+                structured_summary.parser.where_keyword and
+                structured_summary.parser.gt_or_gte_operator and
+                !structured_summary.parser.unnest_function);
+        self.document_query_native_semantic_rejected_missing_exact_producer = self.document_query_native_semantic_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.semantic_search_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_native_vector_rejected_missing_exact_producer = self.document_query_native_vector_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.vector_search_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_native_hybrid_rejected_missing_exact_producer = self.document_query_native_hybrid_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.hybrid_search_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_native_graph_traverse_rejected_missing_exact_producer = self.document_query_native_graph_traverse_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.graph_traverse_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_native_graph_shortest_path_rejected_missing_exact_producer = self.document_query_native_graph_shortest_path_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.graph_shortest_path_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_native_graph_metric_rejected_missing_exact_producer = self.document_query_native_graph_metric_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.graph_metric_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_native_graph_metric_rerank_rejected_missing_exact_producer = self.document_query_native_graph_metric_rerank_rejected_missing_exact_producer or
+            (entry.family == .unsupported_read and
+                structured_summary.hasReason("document_sql_bounded_scan_missing_exact_producer") and
+                structured_summary.parser.graph_metric_rerank_function and
+                structured_summary.parser.where_keyword);
+        self.document_query_view_mapping_native_equivalence = self.document_query_view_mapping_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_source_table != null and
+                entry.summary.document_view_mapping != null and
+                entry.summary.document_native_request != null and
+                entry.summary.document_projections != null and
+                entry.summary.document_residual != null and
+                entry.summary.document_order != null and
+                entry.summary.document_unnest != null and
+                entry.summary.document_limit != null);
+        self.document_query_view_mapping_full_text_backed_native_equivalence = self.document_query_view_mapping_full_text_backed_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_view_mapping != null and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_residual_predicate = self.document_query_view_mapping_residual_predicate or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.where_keyword and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\""));
+        self.document_query_view_mapping_residual_predicate_native_equivalence = self.document_query_view_mapping_residual_predicate_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_residual != null and
+                entry.summary.document_residual.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.status_identifier and
+                structured_summary.parser.where_keyword and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"path\":\"metadata.plan\""));
+        self.document_query_view_mapping_bounded_order = self.document_query_view_mapping_bounded_order or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.score_identifier and
+                structured_summary.parser.order_by and
+                structured_summary.parser.desc_keyword);
+        self.document_query_view_mapping_ordered_topk_native_equivalence = self.document_query_view_mapping_ordered_topk_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_order != null and
+                entry.summary.document_order.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.plan_identifier and
+                structured_summary.parser.score_identifier and
+                structured_summary.parser.order_by and
+                structured_summary.parser.desc_keyword and
+                sql_adapter.planHasNonZeroToken(entry.plan, ":candidate_rows=") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"full_text\""));
+        self.document_query_view_mapping_unnest = self.document_query_view_mapping_unnest or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                entry.catalog_tables.len > 0 and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.tag_identifier and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\""));
+        self.document_query_view_mapping_unnest_native_equivalence = self.document_query_view_mapping_unnest_native_equivalence or
+            (entry.family == .read and
+                sql_adapter.documentQueryPlanMatchesReadFamily(entry.plan) and
+                corpusFixtureHasDocumentReadSummary(entry.summary) and
+                entry.summary.document_native_request != null and
+                std.mem.eql(u8, entry.summary.document_native_request.?, "indexed_query") and
+                entry.summary.document_unnest != null and
+                entry.summary.document_unnest.? and
+                structured_summary.parser.support_view_identifier and
+                structured_summary.parser.unnest_function and
+                structured_summary.parser.tag_identifier and
+                appParityDocumentViewMappingCatalogContains(entry, "\"tag_list\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"type\":\"array_element\"") and
+                appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\""));
         if (entry.applied_plan.len > 0) {
             self.applied_catalog_plan = true;
             self.applied_catalog_rebuild = self.applied_catalog_rebuild or applied_rebuild;
@@ -9519,75 +15952,69 @@ pub const AppParityCorpusCoverage = struct {
                 self.cte_aggregate = self.cte_aggregate or uses_cte_stream;
                 self.aggregate_offset = self.aggregate_offset or sql_adapter.planHasNonZeroToken(entry.plan, ":offset=");
                 self.aggregate_input_expression = self.aggregate_input_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr=");
-                self.aggregate_modulo_expression = self.aggregate_modulo_expression or (appParityTokensHaveFunctionCall(sql_tokens, "sum") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "mod") and
-                    appParityTokensHaveKind(sql_tokens, .percent) and
+                self.aggregate_modulo_expression = self.aggregate_modulo_expression or (structured_summary.parser.sum_function and
+                    structured_summary.parser.mod_function and
+                    structured_summary.parser.percent_operator and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (appParityTokensHaveFunctionCall(sql_tokens, "octet_length") and
+                self.aggregate_octet_length_expression = self.aggregate_octet_length_expression or (structured_summary.parser.octet_length_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (appParityTokensHaveFunctionCall(sql_tokens, "bit_length") and
+                self.aggregate_bit_length_expression = self.aggregate_bit_length_expression or (structured_summary.parser.bit_length_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_scalar_minmax = self.aggregate_scalar_minmax or (appParityTokensHaveFunctionCall(sql_tokens, "min") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "max") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "lower") and
+                self.aggregate_scalar_minmax = self.aggregate_scalar_minmax or (structured_summary.parser.min_function and
+                    structured_summary.parser.max_function and
+                    structured_summary.parser.lower_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_regexp_numeric_expression = self.aggregate_regexp_numeric_expression or (appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
+                self.aggregate_regexp_numeric_expression = self.aggregate_regexp_numeric_expression or (structured_summary.parser.regexp_count_function and
+                    structured_summary.parser.regexp_instr_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
-                self.aggregate_regexp_text_expression = self.aggregate_regexp_text_expression or (appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "count", .distinct) and
-                    appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+                self.aggregate_regexp_text_expression = self.aggregate_regexp_text_expression or (structured_summary.parser.count_distinct_function and
+                    structured_summary.parser.regexp_substr_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr="));
                 self.aggregate_percentile_cont = self.aggregate_percentile_cont or
-                    appParityTokensHaveFunctionCall(sql_tokens, "percentile_cont");
+                    structured_summary.parser.percentile_cont_function;
                 self.aggregate_percentile_disc = self.aggregate_percentile_disc or
-                    appParityTokensHaveFunctionCall(sql_tokens, "percentile_disc");
+                    structured_summary.parser.percentile_disc_function;
                 self.aggregate_percentile_desc = self.aggregate_percentile_desc or
-                    (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .within, .group }) and
-                        appParityTokensHaveKeyword(sql_tokens, .desc));
+                    (structured_summary.parser.within_group_keywords and
+                        structured_summary.parser.desc_keyword);
                 self.aggregate_percentile_nulls = self.aggregate_percentile_nulls or
-                    (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .within, .group }) and
-                        appParityTokensHaveIdentifier(sql_tokens, "nulls"));
+                    (structured_summary.parser.within_group_keywords and
+                        structured_summary.parser.nulls_identifier);
                 self.aggregate_percentile_array = self.aggregate_percentile_array or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":percentile_array=");
                 self.aggregate_mode = self.aggregate_mode or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":mode=");
                 self.aggregate_duplicate_output_label = self.aggregate_duplicate_output_label or
-                    (appParityTokensHaveFunctionCall(sql_tokens, "count") and
-                        appParityTokensHaveKeyword(sql_tokens, .as) and
-                        appParityTokensHaveIdentifier(sql_tokens, "customer_id") and
+                    (structured_summary.parser.count_function and
+                        structured_summary.parser.as_keyword and
+                        structured_summary.parser.customer_id_identifier and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":group=", 1) and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":aggs=", 1));
                 self.aggregate_group_expression = self.aggregate_group_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=");
                 self.aggregate_group_expression_alias = self.aggregate_group_expression_alias or (sql_adapter.planHasNonZeroToken(entry.plan, ":group_expr=") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .group, .by }) and
-                    appParityTokensHaveIdentifier(sql_tokens, "status_key"));
+                    structured_summary.parser.group_by_keywords and
+                    structured_summary.parser.status_key_identifier);
                 self.aggregate_having_expression = self.aggregate_having_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":having_expr=");
                 self.aggregate_having_any = self.aggregate_having_any or sql_adapter.planHasNonZeroToken(entry.plan, ":having_any=");
                 self.aggregate_boolean_having_predicate = self.aggregate_boolean_having_predicate or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":having=") and
-                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .true }) or
-                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .false }) or
-                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .unknown }) or
-                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .unknown }));
+                        structured_summary.parser.having_boolean_predicate;
                 self.aggregate_boolean_is_not_having = self.aggregate_boolean_is_not_having or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":having_any=") and
-                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .true }) or
-                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .having, .is, .not, .false }));
+                        structured_summary.parser.having_boolean_is_not_predicate;
                 self.aggregate_filter_expression = self.aggregate_filter_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=");
                 self.aggregate_computed_pattern_filter = self.aggregate_computed_pattern_filter or
                     uses_computed_pattern and sql_adapter.planHasNonZeroToken(entry.plan, ":filter_expr=");
                 self.aggregate_filter_groups = self.aggregate_filter_groups or sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=");
                 self.aggregate_boolean_is_not_filter = self.aggregate_boolean_is_not_filter or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=") and
-                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .true }) or
-                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .false }));
+                        structured_summary.parser.filter_boolean_is_not_predicate;
                 self.aggregate_boolean_unknown_filter = self.aggregate_boolean_unknown_filter or
                     (sql_adapter.planHasNonZeroToken(entry.plan, ":filter_groups=") or sql_adapter.planHasNonZeroToken(entry.plan, ":aggs=")) and
-                        (appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .unknown }) or
-                            appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .filter, .where, .is, .not, .unknown }));
+                        structured_summary.parser.filter_boolean_unknown_predicate;
                 self.aggregate_distinct_json_array_expression = self.aggregate_distinct_json_array_expression or
-                    appParityTokensHaveFunctionCallWithKeyword(sql_tokens, "array_agg", .distinct) and
-                        appParityTokensHaveKind(sql_tokens, .arrow_json) and
+                    structured_summary.parser.array_agg_distinct_function and
+                        structured_summary.parser.arrow_json_operator and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":agg_expr=");
                 self.aggregate_distinct_group_projection = self.aggregate_distinct_group_projection or
                     (sql_adapter.planHasNonZeroToken(entry.plan, ":group=") and
@@ -9606,22 +16033,22 @@ pub const AppParityCorpusCoverage = struct {
                     sql_adapter.planHasNonZeroToken(entry.plan, ":left_json_contains=") or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":right_json_exists=");
                 self.join_on_side_predicate = self.join_on_side_predicate or
-                    appParityTokensHaveIdentifier(sql_tokens, "o.customer_id") and
-                        appParityTokensHaveIdentifier(sql_tokens, "c.id") and
-                        appParityTokensHaveIdentifier(sql_tokens, "c.kind") and
-                        appParityTokensHaveStringLiteral(sql_tokens, "customer");
+                    structured_summary.parser.o_customer_id_identifier and
+                        structured_summary.parser.c_id_identifier and
+                        structured_summary.parser.c_kind_identifier and
+                        structured_summary.parser.customer_string_literal;
                 self.join_on_preserved_side_predicate = self.join_on_preserved_side_predicate or
-                    appParityTokensHaveIdentifier(sql_tokens, "o.customer_id") and
-                        appParityTokensHaveIdentifier(sql_tokens, "c.id") and
-                        appParityTokensHaveIdentifier(sql_tokens, "o.kind") and
-                        appParityTokensHaveStringLiteral(sql_tokens, "order") and
+                    structured_summary.parser.o_customer_id_identifier and
+                        structured_summary.parser.c_id_identifier and
+                        structured_summary.parser.o_kind_identifier and
+                        structured_summary.parser.order_string_literal and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":on_expr_pred=");
                 self.join_on_computed_predicate = self.join_on_computed_predicate or
-                    appParityTokensHaveIdentifier(sql_tokens, "o.customer_id") and
-                        appParityTokensHaveIdentifier(sql_tokens, "c.id") and
-                        appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-                        appParityTokensHaveIdentifier(sql_tokens, "o.kind") and
-                        appParityTokensHaveIdentifier(sql_tokens, "c.kind") and
+                    structured_summary.parser.o_customer_id_identifier and
+                        structured_summary.parser.c_id_identifier and
+                        structured_summary.parser.lower_function and
+                        structured_summary.parser.o_kind_identifier and
+                        structured_summary.parser.c_kind_identifier and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":on_expr_pred=");
                 self.join_computed_pattern_side_filter = self.join_computed_pattern_side_filter or
                     uses_computed_pattern and
@@ -9725,13 +16152,13 @@ pub const AppParityCorpusCoverage = struct {
             .update_joined_source => {
                 self.update_joined_source = true;
                 self.update_joined_source_cte_mutation = self.update_joined_source_cte_mutation or
-                    (appParityTokensStartWithKeyword(sql_tokens, .with) and
+                    (structured_summary.parser.starts_with_with and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
             .delete_joined_source => {
                 self.delete_joined_source = true;
                 self.delete_joined_source_cte_mutation = self.delete_joined_source_cte_mutation or
-                    (appParityTokensStartWithKeyword(sql_tokens, .with) and
+                    (structured_summary.parser.starts_with_with and
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":ctes=", 1));
             },
             .merge_mutation => {
@@ -9749,49 +16176,103 @@ pub const AppParityCorpusCoverage = struct {
             .adapter_noop_ddl => self.adapter_noop_ddl = true,
             .invalid_read => {
                 self.invalid_read_row_lock_target = self.invalid_read_row_lock_target or
-                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
-                        appParityTokensHaveIdentifier(sql_tokens, "archived_records"));
+                    (structured_summary.hasReason("row_lock_mode_plan") and
+                        structured_summary.parser.row_lock_of_archived_records);
+                self.invalid_read_document_view_mapping_missing_required_index = self.invalid_read_document_view_mapping_missing_required_index or
+                    (structured_summary.hasReason("document_sql_view_mapping_catalog") and
+                        appParityDocumentViewMappingCatalogContains(entry, "\"required_indexes\"") and
+                        appParityDocumentViewMappingCatalogContains(entry, "missing_fts"));
+                self.invalid_read_document_view_mapping_stale_source_generation = self.invalid_read_document_view_mapping_stale_source_generation or
+                    (structured_summary.hasReason("document_sql_view_mapping_catalog") and
+                        appParityDocumentViewMappingCatalogContains(entry, "\"source_generation\""));
+                self.invalid_read_document_view_mapping_stale_source_metadata = self.invalid_read_document_view_mapping_stale_source_metadata or
+                    (structured_summary.hasReason("document_sql_view_mapping_catalog") and
+                        appParityDocumentViewMappingCatalogContains(entry, "\"source_schema_fingerprint\""));
             },
             .invalid_insert => {
                 self.invalid_insert = true;
-                self.invalid_duplicate_row_batch_target = self.invalid_duplicate_row_batch_target or std.mem.eql(u8, entry.classification_reason, "duplicate_row_batch_target");
-                self.invalid_duplicate_conflict_update_target = self.invalid_duplicate_conflict_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_conflict_update_target");
-                self.invalid_expression_conflict_target = self.invalid_expression_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_expression_conflict_target");
-                self.invalid_named_conflict_target = self.invalid_named_conflict_target or std.mem.eql(u8, entry.classification_reason, "invalid_named_conflict_target");
+                self.invalid_duplicate_row_batch_target = self.invalid_duplicate_row_batch_target or structured_summary.hasReason("duplicate_row_batch_target");
+                self.invalid_duplicate_conflict_update_target = self.invalid_duplicate_conflict_update_target or structured_summary.hasReason("duplicate_conflict_update_target");
+                self.invalid_expression_conflict_target = self.invalid_expression_conflict_target or structured_summary.hasReason("invalid_expression_conflict_target");
+                self.invalid_named_conflict_target = self.invalid_named_conflict_target or structured_summary.hasReason("invalid_named_conflict_target");
             },
             .invalid_update => {
                 self.invalid_update = true;
-                self.invalid_duplicate_update_target = self.invalid_duplicate_update_target or std.mem.eql(u8, entry.classification_reason, "duplicate_update_target");
-                self.invalid_update_multi_output_subquery_selector = self.invalid_update_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_update_selector");
+                self.invalid_duplicate_update_target = self.invalid_duplicate_update_target or structured_summary.hasReason("duplicate_update_target");
+                self.invalid_update_multi_output_subquery_selector = self.invalid_update_multi_output_subquery_selector or structured_summary.hasReason("multi_output_subquery_update_selector");
             },
             .invalid_delete => {
                 self.invalid_delete = true;
-                self.invalid_delete_multi_output_subquery_selector = self.invalid_delete_multi_output_subquery_selector or std.mem.eql(u8, entry.classification_reason, "multi_output_subquery_delete_selector");
+                self.invalid_delete_multi_output_subquery_selector = self.invalid_delete_multi_output_subquery_selector or structured_summary.hasReason("multi_output_subquery_delete_selector");
             },
             .invalid_update_source => {
                 self.invalid_update_source_row_lock_mode = self.invalid_update_source_row_lock_mode or
-                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .share }));
+                    (structured_summary.hasReason("row_lock_mode_plan") and
+                        structured_summary.parser.row_lock_for_share);
                 self.invalid_update_source_row_lock_target = self.invalid_update_source_row_lock_target or
-                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
-                        appParityTokensHaveIdentifier(sql_tokens, "archived_records"));
+                    (structured_summary.hasReason("row_lock_mode_plan") and
+                        structured_summary.parser.row_lock_of_archived_records);
             },
             .invalid_update_joined_source => {
                 self.invalid_update_joined_source_row_lock_target = self.invalid_update_joined_source_row_lock_target or
-                    (std.mem.eql(u8, entry.classification_reason, "row_lock_mode_plan") and
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"for", .update, .of }) and
-                        appParityTokensHaveIdentifier(sql_tokens, "source"));
+                    (structured_summary.hasReason("row_lock_mode_plan") and
+                        structured_summary.parser.row_lock_of_source);
             },
             .unsupported => {},
             .unsupported_read => self.unsupported_read = true,
             .unsupported_ddl => self.unsupported_ddl = true,
-            .unsupported_write => {},
+            .unsupported_write => {
+                self.unsupported_write_document_sql_doc_update = self.unsupported_write_document_sql_doc_update or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.underscore_id_identifier);
+                self.unsupported_write_document_sql_exact_id_delete = self.unsupported_write_document_sql_exact_id_delete or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_id_identifier);
+                self.unsupported_write_document_sql_full_document_insert = self.unsupported_write_document_sql_full_document_insert or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.underscore_id_identifier);
+                self.unsupported_write_document_sql_generated_id_insert = self.unsupported_write_document_sql_generated_id_insert or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.underscore_doc_identifier and
+                        !structured_summary.parser.underscore_id_identifier);
+                self.unsupported_write_document_sql_merge_delete = self.unsupported_write_document_sql_merge_delete or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_merge and
+                        structured_summary.parser.merge_when_matched_delete and
+                        structured_summary.parser.docs_underscore_id_identifier and
+                        structured_summary.parser.source_underscore_id_identifier);
+                self.unsupported_write_document_sql_projection_insert = self.unsupported_write_document_sql_projection_insert or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_update = self.unsupported_write_document_sql_projection_update or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_truncate_table = self.unsupported_write_document_sql_truncate_table or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_truncate);
+                self.unsupported_write_document_sql_write_unsupported = self.unsupported_write_document_sql_write_unsupported or
+                    structured_summary.hasReason("document_sql_write_unsupported");
+            },
             .unsupported_insert => {
                 self.unsupported_insert = true;
                 self.unsupported_insert_overriding_value = self.unsupported_insert_overriding_value or
-                    std.mem.eql(u8, entry.classification_reason, "insert_overriding_value_plan");
+                    structured_summary.hasReason("insert_overriding_value_plan");
             },
             .unsupported_update => {},
             .unsupported_update_source => {},
@@ -9800,30 +16281,18 @@ pub const AppParityCorpusCoverage = struct {
             .unsupported_delete_joined_source => {},
             .unsupported_merge_mutation => {
                 self.merge_mutation_data_modifying_cte = self.merge_mutation_data_modifying_cte or
-                    std.mem.eql(u8, entry.classification_reason, "cte_mutation_source_plan");
+                    structured_summary.hasReason("cte_mutation_source_plan");
             },
             .read => {
-                const is_read_query = sql_adapter.readPlanHasKind(entry.plan, "query");
-                const is_read_aggregate = sql_adapter.readPlanHasKind(entry.plan, "aggregate");
-                const is_read_join = sql_adapter.readPlanHasKind(entry.plan, "join");
-                const is_read_lateral = sql_adapter.readPlanHasKind(entry.plan, "lateral");
-                const is_read_recursive_cte = sql_adapter.readPlanHasKind(entry.plan, "recursive_cte");
-                const is_read_set_operation = sql_adapter.readPlanHasKind(entry.plan, "set_operation");
-                const is_read_window = sql_adapter.readPlanHasKind(entry.plan, "window");
-                const has_cte_expression =
-                    sql_adapter.planHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
-                const has_read_query_expression =
-                    has_cte_expression or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":expr_or=") or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":expr_not=") or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":expr_array=");
-                const has_read_source_expression =
-                    has_cte_expression or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_pred=") or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_or=") or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_not=") or
-                    sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_array=");
+                const is_read_query = structured_summary.plan.read_query;
+                const is_read_aggregate = structured_summary.plan.read_aggregate;
+                const is_read_join = structured_summary.plan.read_join;
+                const is_read_lateral = structured_summary.plan.read_lateral;
+                const is_read_recursive_cte = structured_summary.plan.read_recursive_cte;
+                const is_read_set_operation = structured_summary.plan.read_set_operation;
+                const is_read_window = structured_summary.plan.read_window;
+                const has_read_query_expression = structured_summary.plan.read_query_expression;
+                const has_read_source_expression = structured_summary.plan.read_source_expression;
                 self.read = true;
                 self.read_query = self.read_query or is_read_query;
                 self.read_recursive_cte_stream_plan = self.read_recursive_cte_stream_plan or is_read_recursive_cte;
@@ -9833,24 +16302,24 @@ pub const AppParityCorpusCoverage = struct {
                 self.read_window = self.read_window or is_read_window;
                 self.read_window_duplicate_output_label = self.read_window_duplicate_output_label or
                     (is_read_window and
-                        appParityTokensHaveFunctionCall(sql_tokens, "row_number") and
-                        appParityTokensHaveKeyword(sql_tokens, .over) and
-                        appParityTokensHaveKeyword(sql_tokens, .as) and
-                        appParityTokensHaveIdentifier(sql_tokens, "id"));
+                        structured_summary.parser.row_number_function and
+                        structured_summary.parser.over_keyword and
+                        structured_summary.parser.as_keyword and
+                        structured_summary.parser.id_identifier);
                 self.read_join_cross_table_source_schema_classifier = self.read_join_cross_table_source_schema_classifier or
                     (is_read_join and
                         appParityEntryHasCatalogSchemas(entry) and
                         sql_adapter.planHasExactStringToken(entry.plan, ":right=", "customer_records"));
                 self.read_graph_table_function_cte_join = self.read_graph_table_function_cte_join or
                     (is_read_join and
-                        appParityTokensStartWithKeyword(sql_tokens, .with) and
-                        appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match") and
+                        structured_summary.parser.starts_with_with and
+                        structured_summary.parser.graph_match_table_function and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_graph_table_function_inline_join = self.read_graph_table_function_inline_join or
                     (is_read_join and
-                        appParityTokensHaveKeyword(sql_tokens, .join) and
-                        appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match") and
+                        !structured_summary.parser.starts_with_with and
+                        structured_summary.parser.join_graph_match_table_function and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
@@ -9881,82 +16350,146 @@ pub const AppParityCorpusCoverage = struct {
         }
         if (entry.family == .unsupported_read) {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
-                (std.mem.eql(u8, entry.classification_reason, "set_operation_output_shape") and
-                    appParityTokensHaveKeyword(sql_tokens, .intersect));
+                (structured_summary.hasReason("set_operation_output_shape") and
+                    structured_summary.parser.intersect);
+            self.unsupported_read_document_view_mapping_projection_expression = self.unsupported_read_document_view_mapping_projection_expression or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.lower_function);
+            self.unsupported_read_document_view_mapping_projection_path = self.unsupported_read_document_view_mapping_projection_path or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.title_identifier and
+                    !structured_summary.parser.lower_function);
+            self.unsupported_read_document_view_mapping_ilike_predicate = self.unsupported_read_document_view_mapping_ilike_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.ilike_keyword);
+            self.unsupported_read_document_view_mapping_regex_predicate = self.unsupported_read_document_view_mapping_regex_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.regex_match_operator);
+            self.unsupported_read_document_view_mapping_regex_not_imatch_predicate = self.unsupported_read_document_view_mapping_regex_not_imatch_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.regex_not_imatch_operator);
+            self.unsupported_read_document_view_mapping_not_predicate = self.unsupported_read_document_view_mapping_not_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.not_keyword and
+                    !structured_summary.parser.in_keyword);
+            self.unsupported_read_document_view_mapping_not_in_predicate = self.unsupported_read_document_view_mapping_not_in_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.not_keyword and
+                    structured_summary.parser.in_keyword);
+            self.unsupported_read_document_view_mapping_or_predicate = self.unsupported_read_document_view_mapping_or_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.or_keyword);
+            self.unsupported_read_document_view_mapping_function_predicate = self.unsupported_read_document_view_mapping_function_predicate or
+                (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
+                    structured_summary.parser.support_view_identifier and
+                    structured_summary.parser.plan_identifier and
+                    structured_summary.parser.length_function);
         } else if (entry.family == .merge_mutation) {
             self.merge_mutation_default_expressions = self.merge_mutation_default_expressions or
-                (appParityTokensHaveKeyword(sql_tokens, .default) and
+                (structured_summary.parser.default_keyword and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":matched_update_expr=") and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":not_matched_insert_expr="));
         } else if (entry.family == .recursive_insert_source) {
             self.recursive_insert_source = self.recursive_insert_source or
                 (sql_adapter.planHasRootKind(entry.plan, "recursive_insert_source") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .with, .recursive }) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .insert, .into }));
+                    structured_summary.parser.with_recursive and
+                    structured_summary.parser.insert_into);
         } else if (entry.family == .truncate_source) {
             self.truncate_continue_identity = self.truncate_continue_identity or
-                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .@"continue", .identity }) and
+                (structured_summary.parser.truncate_continue_identity and
                     sql_adapter.planHasExactStringToken(entry.plan, "truncate_source:table=", "usage_records"));
             self.truncate_restart_identity = self.truncate_restart_identity or
-                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .restart, .identity }) and
+                (structured_summary.parser.truncate_restart_identity and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":restart_identity=", 1));
             self.truncate_multi_table_generation_barrier = self.truncate_multi_table_generation_barrier or
-                (appParityTokensHaveIdentifier(sql_tokens, "archived_records") and
+                (structured_summary.parser.truncate_archived_records and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":additional_tables=", 1));
             self.truncate_cascade_generation_barrier = self.truncate_cascade_generation_barrier or
-                (appParityTokensHaveKeyword(sql_tokens, .cascade) and
+                (structured_summary.parser.truncate_cascade and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":cascade=", 1));
         } else if (entry.family == .unsupported_ddl) {
             self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
-                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
-                    appParityTokensStartWithKeyword(sql_tokens, .copy) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .to, .stdin }));
+                (structured_summary.hasReason("bulk_io_plan") and
+                    structured_summary.parser.starts_with_copy and
+                    structured_summary.parser.copy_to_stdin);
             self.unsupported_ddl_copy_unsupported_options = self.unsupported_ddl_copy_unsupported_options or
-                (std.mem.eql(u8, entry.classification_reason, "bulk_io_plan") and
-                    appParityTokensStartWithKeyword(sql_tokens, .copy) and
-                    appParityTokensHaveKeyword(sql_tokens, .oids));
+                (structured_summary.hasReason("bulk_io_plan") and
+                    structured_summary.parser.starts_with_copy and
+                    structured_summary.parser.copy_oids_option);
+            self.unsupported_ddl_document_table_missing_default_type = self.unsupported_ddl_document_table_missing_default_type or
+                (structured_summary.hasReason("document_table_ddl_missing_default_type") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.antfly_storage_mode_identifier and
+                    structured_summary.parser.document_string_literal and
+                    structured_summary.parser.payload_identifier and
+                    !structured_summary.parser.antfly_default_type_identifier);
+            self.unsupported_ddl_document_table_mixed_relational_shape = self.unsupported_ddl_document_table_mixed_relational_shape or
+                (structured_summary.hasReason("document_table_ddl_mixed_relational_shape") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.antfly_storage_mode_identifier and
+                    structured_summary.parser.document_string_literal and
+                    structured_summary.parser.id_identifier);
+            self.unsupported_ddl_document_table_shorthand = self.unsupported_ddl_document_table_shorthand or
+                (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_shorthand") and
+                    std.mem.indexOf(u8, entry.sql, "CREATE DOCUMENT TABLE") != null);
             self.unsupported_ddl_table_access_method = self.unsupported_ddl_table_access_method or
-                (std.mem.eql(u8, entry.classification_reason, "table_access_method_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .access, .method }));
+                (structured_summary.hasReason("table_access_method_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set_access_method);
             self.unsupported_ddl_table_cluster_on = self.unsupported_ddl_table_cluster_on or
-                (std.mem.eql(u8, entry.classification_reason, "table_cluster_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .cluster, .on }));
+                (structured_summary.hasReason("table_cluster_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_cluster_on);
             self.unsupported_ddl_table_cluster_without = self.unsupported_ddl_table_cluster_without or
-                (std.mem.eql(u8, entry.classification_reason, "table_cluster_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .without, .cluster }));
+                (structured_summary.hasReason("table_cluster_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set_without_cluster);
             self.unsupported_ddl_table_owner = self.unsupported_ddl_table_owner or
-                (std.mem.eql(u8, entry.classification_reason, "table_owner_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeyword(sql_tokens, .to));
+                (structured_summary.hasReason("table_owner_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_owner_to);
             self.unsupported_ddl_table_persistence = self.unsupported_ddl_table_persistence or
-                (std.mem.eql(u8, entry.classification_reason, "table_persistence_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .unlogged }));
+                (structured_summary.hasReason("table_persistence_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set_unlogged);
             self.unsupported_ddl_table_storage_parameters = self.unsupported_ddl_table_storage_parameters or
-                (std.mem.eql(u8, entry.classification_reason, "table_storage_parameters_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeyword(sql_tokens, .set));
+                (structured_summary.hasReason("table_storage_parameters_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set);
             self.unsupported_ddl_table_storage_parameters_reset = self.unsupported_ddl_table_storage_parameters_reset or
-                (std.mem.eql(u8, entry.classification_reason, "table_storage_parameters_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeyword(sql_tokens, .reset));
+                (structured_summary.hasReason("table_storage_parameters_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_reset);
             self.unsupported_ddl_table_tablespace = self.unsupported_ddl_table_tablespace or
-                (std.mem.eql(u8, entry.classification_reason, "table_tablespace_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .tablespace }));
+                (structured_summary.hasReason("table_tablespace_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set_tablespace);
             self.unsupported_ddl_table_trigger_disable = self.unsupported_ddl_table_trigger_disable or
-                (std.mem.eql(u8, entry.classification_reason, "table_trigger_state_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveIdentifier(sql_tokens, "disable") and
-                    appParityTokensHaveKeyword(sql_tokens, .trigger));
+                (structured_summary.hasReason("table_trigger_state_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_disable and
+                    structured_summary.parser.alter_table_trigger);
             self.unsupported_ddl_table_trigger_enable = self.unsupported_ddl_table_trigger_enable or
-                (std.mem.eql(u8, entry.classification_reason, "table_trigger_state_plan") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .alter, .table }) and
-                    appParityTokensHaveIdentifier(sql_tokens, "enable") and
-                    appParityTokensHaveKeyword(sql_tokens, .trigger));
+                (structured_summary.hasReason("table_trigger_state_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_enable and
+                    structured_summary.parser.alter_table_trigger);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -9980,16 +16513,16 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_temporal_table = self.ddl_temporal_table or sql_adapter.planHasNonZeroToken(entry.plan, ":periods=");
                     self.ddl_system_versioned_table = self.ddl_system_versioned_table or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":system_versioned=", 1) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .system, .versioning }));
+                            structured_summary.parser.system_versioning);
                     self.ddl_temporal_fk_delete_set_null_action = self.ddl_temporal_fk_delete_set_null_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .delete, .set, .null }));
+                            structured_summary.parser.on_delete_set_null);
                     self.ddl_temporal_fk_delete_cascade_action = self.ddl_temporal_fk_delete_cascade_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .delete, .cascade }));
+                            structured_summary.parser.on_delete_cascade);
                     self.ddl_temporal_fk_update_cascade_action = self.ddl_temporal_fk_update_cascade_action or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":temporal_fk=", 1) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .on, .update, .cascade }));
+                            structured_summary.parser.on_update_cascade);
                     self.ddl_replace_table = self.ddl_replace_table or sql_adapter.planHasExactBoolToken(entry.plan, ":replace=", true);
                 },
                 .table_clone => self.ddl_table_clone = true,
@@ -10047,20 +16580,13 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_sequence_create = true;
                     self.ddl_sequence_create_if_not_exists = self.ddl_sequence_create_if_not_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_not_exists=", true);
                     self.ddl_sequence_create_typed_owned = self.ddl_sequence_create_typed_owned or
-                        (appParityTokensHaveKeyword(sql_tokens, .as) and
-                            appParityTokensHaveIdentifier(sql_tokens, "bigint") and
-                            appParityTokensHaveIdentifier(sql_tokens, "owned") and
-                            appParityTokensHaveKeyword(sql_tokens, .by));
+                        structured_summary.parser.sequence_as_bigint_owned_by;
                 },
                 .alter_sequence => {
                     self.ddl_sequence_alter = true;
                     self.ddl_sequence_alter_if_exists = self.ddl_sequence_alter_if_exists or sql_adapter.planHasExactBoolToken(entry.plan, ":if_exists=", true);
                     self.ddl_sequence_alter_typed_owned = self.ddl_sequence_alter_typed_owned or
-                        (appParityTokensHaveKeyword(sql_tokens, .as) and
-                            appParityTokensHaveIdentifier(sql_tokens, "integer") and
-                            appParityTokensHaveIdentifier(sql_tokens, "owned") and
-                            appParityTokensHaveKeyword(sql_tokens, .by) and
-                            appParityTokensHaveIdentifier(sql_tokens, "none"));
+                        structured_summary.parser.sequence_as_integer_owned_by_none;
                 },
                 .drop_sequence => {
                     self.ddl_sequence_drop = true;
@@ -10106,8 +16632,7 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_function_security = self.ddl_function_security or sql_adapter.planHasStringToken(entry.plan, ":security=");
                     self.ddl_function_external_security = self.ddl_function_external_security or
                         (sql_adapter.planHasStringToken(entry.plan, ":security=") and
-                            appParityTokensHaveIdentifier(sql_tokens, "external") and
-                            appParityTokensHaveIdentifier(sql_tokens, "security"));
+                            structured_summary.parser.external_security_identifiers);
                     self.ddl_function_null_input = self.ddl_function_null_input or sql_adapter.planHasStringToken(entry.plan, ":null_input=");
                     self.ddl_function_cost = self.ddl_function_cost or sql_adapter.planHasStringToken(entry.plan, ":cost=");
                     self.ddl_function_rows = self.ddl_function_rows or sql_adapter.planHasStringToken(entry.plan, ":rows=");
@@ -10132,9 +16657,7 @@ pub const AppParityCorpusCoverage = struct {
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
                             sql_adapter.planHasTrailingRowExpressionFragment(entry.plan, "lower[field[source:arg1]]") and
-                            appParityTokensHaveIdentifier(sql_tokens, "status_text") and
-                            appParityTokensHaveIdentifier(sql_tokens, "text") and
-                            appParityTokensHaveStringLiteralContaining(sql_tokens, "lower(status_text)"));
+                            structured_summary.parser.status_text_text_lower_body);
                     self.ddl_function_sql_expression_nested_body = self.ddl_function_sql_expression_nested_body or
                         (sql_adapter.planHasExactStringToken(entry.plan, ":body=", "sql_expression") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":hook=", "expression") and
@@ -10225,12 +16748,12 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_copy_log_verbosity = self.ddl_copy_log_verbosity or sql_adapter.planHasExactStringToken(entry.plan, ":log_verbosity=", "verbose");
                     self.ddl_copy_null_marker = self.ddl_copy_null_marker or sql_adapter.planHasExactStringToken(entry.plan, ":null_marker_hex=", "empty");
                     self.ddl_copy_oids_false_noop = self.ddl_copy_oids_false_noop or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .oids, .false }) and
+                        structured_summary.parser.copy_oids_false_option and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":op=", "import_rows") and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":native=", "rows_batch");
                     self.ddl_copy_on_error_ignore = self.ddl_copy_on_error_ignore or sql_adapter.planHasExactStringToken(entry.plan, ":on_error=", "ignore");
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
-                        appParityTokensHaveKeyword(sql_tokens, .program) and
+                        structured_summary.parser.copy_program_endpoint and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "program") and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":endpoint_kind=", "program");
                     self.ddl_copy_reject_limit = self.ddl_copy_reject_limit or sql_adapter.planHasExactUsizeToken(entry.plan, ":reject_limit=", 10);
@@ -10250,7 +16773,7 @@ pub const AppParityCorpusCoverage = struct {
                         (sql_adapter.planHasExactStringToken(entry.plan, ":format=", "text") and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":codec=", "postgres_text"));
                     self.ddl_copy_program_endpoint = self.ddl_copy_program_endpoint or
-                        appParityTokensHaveKeyword(sql_tokens, .program) and
+                        structured_summary.parser.copy_program_endpoint and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":stream=", "program") and
                             sql_adapter.bulkSqlIoExecutionPlanHasExactStringToken(entry.execution_plan, ":endpoint_kind=", "program");
                     self.ddl_copy_force_quote = self.ddl_copy_force_quote or sql_adapter.planHasExactStringToken(entry.plan, ":force_quote=", "all");
@@ -10397,17 +16920,14 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_prepare_statement_delete_family = self.ddl_prepare_statement_delete_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "delete");
                     self.ddl_prepare_statement_merge_family = self.ddl_prepare_statement_merge_family or sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "merge");
                     self.ddl_prepare_cte_write_statement = self.ddl_prepare_cte_write_statement or
-                        appParityTokensStartWithKeyword(sql_tokens, .prepare) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with }) and
+                        structured_summary.parser.prepare_as_with and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                     self.ddl_prepare_recursive_cte_read_statement = self.ddl_prepare_recursive_cte_read_statement or
-                        appParityTokensStartWithKeyword(sql_tokens, .prepare) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with, .recursive }) and
+                        structured_summary.parser.prepare_as_with_recursive and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "read") and
                             sql_adapter.planHasExactStringToken(entry.plan, ":statement=", "read");
                     self.ddl_prepare_recursive_cte_write_statement = self.ddl_prepare_recursive_cte_write_statement or
-                        appParityTokensStartWithKeyword(sql_tokens, .prepare) and
-                            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .as, .with, .recursive }) and
+                        structured_summary.parser.prepare_as_with_recursive and
                             sql_adapter.planHasExactStringToken(entry.plan, ":subject=", "write");
                 },
                 .prepare_transaction => {
@@ -10529,7 +17049,7 @@ pub const AppParityCorpusCoverage = struct {
                 .alter_table => {
                     self.ddl_alter_table = true;
                     self.ddl_add_column_default_rewrite = self.ddl_add_column_default_rewrite or
-                        appParityTokensHaveKeywordsInOrder(sql_tokens, &.{ .add, .column, .default }) and
+                        structured_summary.parser.alter_table_add_column_default and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", true) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", true) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", true);
@@ -10542,54 +17062,54 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_add_deferrable_unique_constraint = self.ddl_add_deferrable_unique_constraint or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":unique_deferrable=") and
                             sql_adapter.planHasNonZeroToken(entry.plan, ":unique_deferred=");
-                    self.ddl_validate_constraint = self.ddl_validate_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .validate, .constraint });
-                    self.ddl_drop_constraint = self.ddl_drop_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .constraint });
-                    self.ddl_drop_column = self.ddl_drop_column or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .column });
+                    self.ddl_validate_constraint = self.ddl_validate_constraint or structured_summary.parser.alter_table_validate_constraint;
+                    self.ddl_drop_constraint = self.ddl_drop_constraint or structured_summary.parser.alter_table_drop_constraint;
+                    self.ddl_drop_column = self.ddl_drop_column or structured_summary.parser.alter_table_drop_column;
                     self.ddl_alter_column_default = self.ddl_alter_column_default or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .default }) or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .default });
+                        structured_summary.parser.alter_table_set_default or
+                        structured_summary.parser.alter_table_drop_default;
                     self.ddl_drop_column_default = self.ddl_drop_column_default or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .default }) and
+                        structured_summary.parser.alter_table_drop_default and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
                     self.ddl_alter_column_not_null = self.ddl_alter_column_not_null or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .not, .null }) or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .not, .null });
+                        structured_summary.parser.alter_table_set_not_null or
+                        structured_summary.parser.alter_table_drop_not_null;
                     self.ddl_drop_column_not_null = self.ddl_drop_column_not_null or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .not, .null }) and
+                        structured_summary.parser.alter_table_drop_not_null and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
                             sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false);
                     self.ddl_alter_column_type = self.ddl_alter_column_type or
-                        appParityTokensHaveKeyword(sql_tokens, .type) or
-                        appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .data, .type });
+                        structured_summary.parser.alter_table_type or
+                        structured_summary.parser.alter_table_set_data_type;
                     self.ddl_alter_column_rewrite_expression = self.ddl_alter_column_rewrite_expression or
                         sql_adapter.planHasNonZeroToken(entry.plan, ":alter_type_rewrite_expr=") and
                             sql_adapter.appliedPlanHasRowImageRewriteExpression(entry.applied_plan);
-                    self.ddl_rename_column = self.ddl_rename_column or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .column });
-                    self.ddl_rename_constraint = self.ddl_rename_constraint or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .rename, .constraint });
-                    self.ddl_drop_update_policy = self.ddl_drop_update_policy or appParityTokensHaveKeywordSequence(sql_tokens, &.{ .drop, .trigger });
+                    self.ddl_rename_column = self.ddl_rename_column or structured_summary.parser.alter_table_rename_column;
+                    self.ddl_rename_constraint = self.ddl_rename_constraint or structured_summary.parser.alter_table_rename_constraint;
+                    self.ddl_drop_update_policy = self.ddl_drop_update_policy or structured_summary.parser.alter_table_drop_trigger;
                 },
                 .create_update_policy => self.ddl_create_update_policy = true,
             }
         } else if (entry.family == .adapter_noop_ddl) {
-            self.adapter_noop_transaction = self.adapter_noop_transaction or std.mem.eql(u8, entry.classification_reason, "transaction_control");
+            self.adapter_noop_transaction = self.adapter_noop_transaction or structured_summary.hasReason("transaction_control");
             self.adapter_noop_transaction_commit = self.adapter_noop_transaction_commit or
-                std.mem.eql(u8, entry.classification_reason, "transaction_control") and
-                    appParityTokensStartWithKeyword(sql_tokens, .commit);
+                structured_summary.hasReason("transaction_control") and
+                    structured_summary.parser.starts_with_commit;
             self.adapter_noop_transaction_rollback = self.adapter_noop_transaction_rollback or
-                std.mem.eql(u8, entry.classification_reason, "transaction_control") and
-                    appParityTokensStartWithKeyword(sql_tokens, .rollback);
-            self.adapter_noop_session = self.adapter_noop_session or std.mem.eql(u8, entry.classification_reason, "session_setting");
+                structured_summary.hasReason("transaction_control") and
+                    structured_summary.parser.starts_with_rollback;
+            self.adapter_noop_session = self.adapter_noop_session or structured_summary.hasReason("session_setting");
             self.adapter_noop_session_probe = self.adapter_noop_session_probe or
-                std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    (appParityTokensStartWithKeyword(sql_tokens, .reset) or appParityTokensStartWithKeyword(sql_tokens, .show));
-            self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or std.mem.eql(u8, entry.classification_reason, "schema_namespace");
-            self.adapter_noop_extension = self.adapter_noop_extension or std.mem.eql(u8, entry.classification_reason, "extension");
+                structured_summary.hasReason("session_setting") and
+                    (structured_summary.parser.starts_with_reset or structured_summary.parser.starts_with_show);
+            self.adapter_noop_schema_namespace = self.adapter_noop_schema_namespace or structured_summary.hasReason("schema_namespace");
+            self.adapter_noop_extension = self.adapter_noop_extension or structured_summary.hasReason("extension");
             self.session_discard = self.session_discard or
-                std.mem.eql(u8, entry.classification_reason, "session_setting") and
-                    appParityTokensStartWithKeyword(sql_tokens, .discard);
+                structured_summary.hasReason("session_setting") and
+                    structured_summary.parser.starts_with_discard;
         }
 
         self.scalar_membership = self.scalar_membership or sql_adapter.planHasAnyNonZeroToken(entry.plan, &.{
@@ -10602,24 +17122,19 @@ pub const AppParityCorpusCoverage = struct {
         });
         self.boolean_is_predicate = self.boolean_is_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .true }) or
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .false }));
+                structured_summary.parser.boolean_is_true_or_false;
         self.boolean_is_not_predicate = self.boolean_is_not_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":or=") and
-                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }) or
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .false }));
+                structured_summary.parser.boolean_is_not_true_or_false;
         self.boolean_unknown_predicate = self.boolean_unknown_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .unknown }) or
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .unknown }));
+                structured_summary.parser.boolean_unknown_or_not_unknown;
         self.postfix_null_test_predicate = self.postfix_null_test_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":pred=") and
-                (appParityTokensHaveIdentifier(sql_tokens, "isnull") or
-                    appParityTokensHaveIdentifier(sql_tokens, "notnull"));
+                structured_summary.parser.postfix_null_test;
         self.expression_postfix_null_test_predicate = self.expression_postfix_null_test_predicate or
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
-                (appParityTokensHaveIdentifier(sql_tokens, "isnull") or
-                    appParityTokensHaveIdentifier(sql_tokens, "notnull"));
+                structured_summary.parser.postfix_null_test;
         self.json_access_path = self.json_access_path or sql_adapter.planHasAnyNonZeroToken(entry.plan, &.{
             ":json_eq=",
             "_json_eq=",
@@ -10653,9 +17168,7 @@ pub const AppParityCorpusCoverage = struct {
             entry.family == .query and sql_adapter.planHasNonZeroToken(entry.plan, ":access_or=");
         self.query_array_overlap_access_or = self.query_array_overlap_access_or or
             entry.family == .query and
-                appParityTokensHaveIdentifier(sql_tokens, "tags") and
-                appParityTokensHaveKind(sql_tokens, .range_overlap) and
-                appParityTokensHaveKeyword(sql_tokens, .array) and
+                structured_summary.parser.tags_array_overlap and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":access_or=");
         self.query_access_not_predicates = self.query_access_not_predicates or
             entry.family == .query and sql_adapter.planHasNonZeroToken(entry.plan, ":access_not=");
@@ -10693,247 +17206,241 @@ pub const AppParityCorpusCoverage = struct {
         self.mixed_scalar_expression_or = self.mixed_scalar_expression_or or
             entry.family == .query and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":expr_or=") and
-                appParityTokensHaveIdentifier(sql_tokens, "id") and
-                appParityTokensHaveKeyword(sql_tokens, .@"or") and
-                appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-                appParityTokensHaveIdentifier(sql_tokens, "email");
+                structured_summary.parser.mixed_scalar_expression_or;
         self.expression_order = self.expression_order or sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr=") or sql_adapter.planHasNonZeroToken(entry.plan, "_order_expr=");
         self.query_order_using_operator = self.query_order_using_operator or (entry.family == .query and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.aggregate_order_using_operator = self.aggregate_order_using_operator or (entry.family == .aggregate and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.join_order_using_operator = self.join_order_using_operator or (entry.family == .join and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.lateral_order_using_operator = self.lateral_order_using_operator or (entry.family == .lateral and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.window_order_using_operator = self.window_order_using_operator or (entry.family == .window and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order="));
         self.update_source_order_using_operator = self.update_source_order_using_operator or (entry.family == .update_source and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_order="));
         self.delete_source_order_using_operator = self.delete_source_order_using_operator or (entry.family == .delete_source and
-            appParityTokensHaveKeyword(sql_tokens, .using) and
+            structured_summary.parser.order_using_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":source_order="));
         self.query_fixed_interval_expression = self.query_fixed_interval_expression or (entry.family == .query and
-            appParityTokensHaveIdentifier(sql_tokens, "interval") and
-            appParityTokensHaveStringLiteral(sql_tokens, "1 hour") and
+            structured_summary.parser.interval_1_hour and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_calendar_interval_expression = self.query_calendar_interval_expression or (entry.family == .query and
-            appParityTokensHaveIdentifier(sql_tokens, "interval") and
-            appParityTokensHaveStringLiteral(sql_tokens, "1 month") and
+            structured_summary.parser.interval_1_month and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_mixed_interval_expression = self.query_mixed_interval_expression or (entry.family == .query and
-            appParityTokensHaveIdentifier(sql_tokens, "interval") and
-            appParityTokensHaveStringLiteral(sql_tokens, "1 month 1 day") and
+            structured_summary.parser.interval_1_month_1_day and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_now_expression = self.query_now_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "now") and
+            structured_summary.parser.now_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_timestamp_expression = self.query_current_timestamp_expression or (entry.family == .query and
-            appParityTokensHaveIdentifier(sql_tokens, "current_timestamp") and
+            structured_summary.parser.current_timestamp_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_timestamp_precision_expression = self.query_current_timestamp_precision_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "current_timestamp") and
+            structured_summary.parser.current_timestamp_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_current_date_expression = self.query_current_date_expression or (entry.family == .query and
-            appParityTokensHaveIdentifier(sql_tokens, "current_date") and
+            structured_summary.parser.current_date_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_uuid_generation_expression = self.query_uuid_generation_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "gen_random_uuid") and
+            structured_summary.parser.gen_random_uuid_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_uuid_generate_v4_expression = self.query_uuid_generate_v4_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "uuid_generate_v4") and
+            structured_summary.parser.uuid_generate_v4_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_substring_expression = self.query_substring_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "substring") and
-            appParityTokensHaveFunctionCall(sql_tokens, "substr") and
+            structured_summary.parser.substring_function and
+            structured_summary.parser.substr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_overlay_expression = self.query_overlay_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "overlay") and
+            structured_summary.parser.overlay_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_translate_expression = self.query_translate_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "translate") and
+            structured_summary.parser.translate_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_split_part_expression = self.query_split_part_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "split_part") and
+            structured_summary.parser.split_part_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_strpos_expression = self.query_strpos_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "strpos") and
-            appParityTokensHaveFunctionCall(sql_tokens, "position") and
+            structured_summary.parser.strpos_function and
+            structured_summary.parser.position_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_left_right_expression = self.query_left_right_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "left") and
-            appParityTokensHaveFunctionCall(sql_tokens, "right") and
+            structured_summary.parser.left_function and
+            structured_summary.parser.right_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_trim_variant_expression = self.query_trim_variant_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "btrim") and
-            appParityTokensHaveFunctionCall(sql_tokens, "ltrim") and
-            appParityTokensHaveFunctionCall(sql_tokens, "rtrim") and
+            structured_summary.parser.btrim_function and
+            structured_summary.parser.ltrim_function and
+            structured_summary.parser.rtrim_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_replace_expression = self.query_regexp_replace_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace") and
+            structured_summary.parser.regexp_replace_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_substr_expression = self.query_regexp_substr_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
+            structured_summary.parser.regexp_substr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_match_expression = self.query_regexp_match_expression or (entry.family == .query and
-            appParityTokensHaveKind(sql_tokens, .regex_match) and
-            appParityTokensHaveKind(sql_tokens, .regex_not_imatch) and
+            structured_summary.parser.regex_match_operator and
+            structured_summary.parser.regex_not_imatch_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_regexp_count_expression = self.query_regexp_count_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
+            structured_summary.parser.regexp_count_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_regexp_instr_expression = self.query_regexp_instr_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
+            structured_summary.parser.regexp_instr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_pad_expression = self.query_pad_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "lpad") and
-            appParityTokensHaveFunctionCall(sql_tokens, "rpad") and
+            structured_summary.parser.lpad_function and
+            structured_summary.parser.rpad_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_repeat_expression = self.query_repeat_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "repeat") and
+            structured_summary.parser.repeat_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_reverse_expression = self.query_reverse_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "reverse") and
+            structured_summary.parser.reverse_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_initcap_expression = self.query_initcap_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "initcap") and
+            structured_summary.parser.initcap_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_text_length_expression = self.query_text_length_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "char_length") and
-            appParityTokensHaveFunctionCall(sql_tokens, "character_length") and
-            appParityTokensHaveFunctionCall(sql_tokens, "octet_length") and
+            structured_summary.parser.char_length_function and
+            structured_summary.parser.character_length_function and
+            structured_summary.parser.octet_length_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_bit_length_expression = self.query_bit_length_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "bit_length") and
+            structured_summary.parser.bit_length_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_md5_expression = self.query_md5_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "md5") and
+            structured_summary.parser.md5_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_concat_ws_expression = self.query_concat_ws_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "concat_ws") and
+            structured_summary.parser.concat_ws_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_nullif_expression = self.query_nullif_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "nullif") and
+            structured_summary.parser.nullif_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_extremum_expression = self.query_extremum_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "greatest") and
-            appParityTokensHaveFunctionCall(sql_tokens, "least") and
+            structured_summary.parser.greatest_function and
+            structured_summary.parser.least_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_nullable_pagination = self.query_nullable_pagination or (entry.family == .query and
-            appParityTokensHaveKeywordSequence(sql_tokens, &.{ .limit, .null, .offset, .null }) and
+            structured_summary.parser.limit_null_offset_null and
             sql_adapter.planHasExactStringToken(entry.plan, ":limit=", "none") and
             sql_adapter.planTokenAbsent(entry.plan, ":offset="));
         self.query_json_build_object_expression = self.query_json_build_object_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "jsonb_build_object") and
+            structured_summary.parser.jsonb_build_object_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_to_jsonb_expression = self.query_to_jsonb_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") and
+            structured_summary.parser.to_jsonb_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_convert_from_jsonb_expression = self.query_convert_from_jsonb_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "convert_from", "UTF8") and
+            structured_summary.parser.convert_from_utf8_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_cardinality_expression = self.query_cardinality_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "cardinality") and
+            structured_summary.parser.cardinality_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_array_position_expression = self.query_array_position_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_position") and
+            structured_summary.parser.array_position_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_array_positions_expression = self.query_array_positions_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_positions") and
+            structured_summary.parser.array_positions_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_array_element_transform_expression = self.query_array_element_transform_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_append") and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_cat") and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_remove") and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_replace") and
+            structured_summary.parser.array_append_function and
+            structured_summary.parser.array_cat_function and
+            structured_summary.parser.array_remove_function and
+            structured_summary.parser.array_replace_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_array_to_string_expression = self.query_array_to_string_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "array_to_string") and
+            structured_summary.parser.array_to_string_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred="));
         self.query_string_to_array_expression = self.query_string_to_array_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "string_to_array") and
+            structured_summary.parser.string_to_array_function and
             (sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") or sql_adapter.planHasNonZeroToken(entry.plan, ":expr_arr=")));
         self.query_starts_with_expression = self.query_starts_with_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "starts_with") and
+            structured_summary.parser.starts_with_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_ends_with_expression = self.query_ends_with_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "ends_with") and
+            structured_summary.parser.ends_with_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_ascii_chr_expression = self.query_ascii_chr_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "ascii") and
-            appParityTokensHaveFunctionCall(sql_tokens, "chr") and
+            structured_summary.parser.ascii_function and
+            structured_summary.parser.chr_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_modulo_expression = self.query_modulo_expression or (entry.family == .query and
-            appParityTokensHaveKind(sql_tokens, .percent) and
-            appParityTokensHaveFunctionCall(sql_tokens, "mod") and
+            structured_summary.parser.percent_operator and
+            structured_summary.parser.mod_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_date_trunc_expression = self.query_date_trunc_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_trunc", "hour") and
+            structured_summary.parser.date_trunc_hour_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_date_bin_expression = self.query_date_bin_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "date_bin") and
+            structured_summary.parser.date_bin_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_typed_datetime_literal_expression = self.query_typed_datetime_literal_expression or (entry.family == .query and
-            appParityTokensHaveIdentifier(sql_tokens, "timestamptz") and
+            structured_summary.parser.timestamptz_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr="));
         self.query_date_part_expression = self.query_date_part_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_part", "hour") and
-            appParityTokensHaveFunctionCall(sql_tokens, "extract") and
-            appParityTokensHaveIdentifier(sql_tokens, "dow") and
+            structured_summary.parser.date_part_hour_function and
+            structured_summary.parser.extract_function and
+            structured_summary.parser.dow_identifier and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_date_part_epoch_expression = self.query_date_part_epoch_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCallWithLiteral(sql_tokens, "date_part", "epoch") and
-            appParityTokensHaveFunctionCall(sql_tokens, "extract") and
+            structured_summary.parser.date_part_epoch_function and
+            structured_summary.parser.extract_function and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.query_nested_case_fold_text_expression = self.query_nested_case_fold_text_expression or (entry.family == .query and
-            appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-            appParityTokensHaveFunctionCall(sql_tokens, "upper") and
-            appParityTokensHaveKind(sql_tokens, .pipe_concat) and
+            structured_summary.parser.lower_function and
+            structured_summary.parser.upper_function and
+            structured_summary.parser.pipe_concat_operator and
             sql_adapter.planHasNonZeroToken(entry.plan, ":expr_pred=") and
             sql_adapter.planHasNonZeroToken(entry.plan, ":order_expr="));
         self.cte_stream = self.cte_stream or uses_cte_stream;
@@ -10964,157 +17471,150 @@ pub const AppParityCorpusCoverage = struct {
             }
         }
         if (uses_insert_conflict) {
-            self.conflict_do_update = self.conflict_do_update or (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update }) and sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
-            self.conflict_default_update = self.conflict_default_update or (appParityTokensHaveKeyword(sql_tokens, .set) and
-                appParityTokensHaveIdentifier(sql_tokens, "status") and
-                appParityTokensHaveKeyword(sql_tokens, .default) and
+            self.conflict_do_update = self.conflict_do_update or (structured_summary.parser.conflict_do_update and sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
+            self.conflict_default_update = self.conflict_default_update or (structured_summary.parser.conflict_set_status_default and
                 sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_coalesce_existing_update = self.conflict_coalesce_existing_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "coalesce") and
-                    appParityTokensHaveIdentifierPrefix(sql_tokens, "excluded.");
+                structured_summary.parser.coalesce_function and
+                    structured_summary.parser.excluded_identifier_prefix;
             self.conflict_numeric_expression_update = self.conflict_numeric_expression_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "greatest") and
-                    appParityTokensHaveIdentifier(sql_tokens, "amount") and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.amount");
+                structured_summary.parser.greatest_function and
+                    structured_summary.parser.amount_identifier and
+                    structured_summary.parser.excluded_amount_identifier;
             self.conflict_case_expression_update = self.conflict_case_expression_update or
-                appParityTokensHaveKeyword(sql_tokens, .case) and
-                    appParityTokensHaveKeyword(sql_tokens, .when) and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.amount") and
-                    appParityTokensHaveIdentifier(sql_tokens, "amount");
+                structured_summary.parser.case_when_keywords and
+                    structured_summary.parser.excluded_amount_identifier and
+                    structured_summary.parser.amount_identifier;
             self.conflict_current_timestamp_precision = self.conflict_current_timestamp_precision or
-                appParityTokensHaveFunctionCall(sql_tokens, "current_timestamp");
+                structured_summary.parser.current_timestamp_function;
             self.conflict_current_date_update = self.conflict_current_date_update or
-                appParityTokensHaveIdentifier(sql_tokens, "current_date");
+                structured_summary.parser.current_date_identifier;
             self.conflict_uuid_generation_update = self.conflict_uuid_generation_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "uuid_generate_v4") or
-                appParityTokensHaveFunctionCall(sql_tokens, "gen_random_uuid");
+                structured_summary.parser.uuid_generate_v4_function or
+                structured_summary.parser.gen_random_uuid_function;
             self.conflict_text_expression_update = self.conflict_text_expression_update or
-                (appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
-                    (appParityTokensHaveFunctionCall(sql_tokens, "length") or
-                        appParityTokensHaveFunctionCall(sql_tokens, "char_length") or
-                        appParityTokensHaveFunctionCall(sql_tokens, "character_length") or
-                        appParityTokensHaveFunctionCall(sql_tokens, "octet_length") or
-                        appParityTokensHaveFunctionCall(sql_tokens, "bit_length")));
+                (structured_summary.parser.excluded_next_status_identifier and
+                    (structured_summary.parser.length_function or
+                        structured_summary.parser.char_length_function or
+                        structured_summary.parser.character_length_function or
+                        structured_summary.parser.octet_length_function or
+                        structured_summary.parser.bit_length_function));
             self.conflict_octet_length_expression_update = self.conflict_octet_length_expression_update or
-                appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "octet_length");
+                structured_summary.parser.excluded_next_status_identifier and
+                    structured_summary.parser.octet_length_function;
             self.conflict_bit_length_expression_update = self.conflict_bit_length_expression_update or
-                appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "bit_length");
+                structured_summary.parser.excluded_next_status_identifier and
+                    structured_summary.parser.bit_length_function;
             self.conflict_regexp_replace_expression_update = self.conflict_regexp_replace_expression_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_replace") and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
+                structured_summary.parser.regexp_replace_function and
+                    structured_summary.parser.excluded_status_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_match_expression_update = self.conflict_regexp_match_expression_update or
-                (appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") or
-                    appParityTokensHaveFunctionCall(sql_tokens, "regexp_match")) and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
+                (structured_summary.parser.regexp_like_function or
+                    structured_summary.parser.regexp_match_function) and
+                    structured_summary.parser.excluded_status_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_count_expression_update = self.conflict_regexp_count_expression_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
+                structured_summary.parser.regexp_count_function and
+                    structured_summary.parser.excluded_status_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_instr_expression_update = self.conflict_regexp_instr_expression_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
+                structured_summary.parser.regexp_instr_function and
+                    structured_summary.parser.excluded_status_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_regexp_substr_expression_update = self.conflict_regexp_substr_expression_update or
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
+                structured_summary.parser.regexp_substr_function and
+                    structured_summary.parser.excluded_status_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms=");
             self.conflict_nested_text_expression_update = self.conflict_nested_text_expression_update or
-                (appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status") and
-                    appParityTokensHaveKind(sql_tokens, .pipe_concat) and
-                    appParityTokensHaveFunctionCall(sql_tokens, "lower") and
-                    (appParityTokensHaveFunctionCall(sql_tokens, "length") or
-                        appParityTokensHaveFunctionCall(sql_tokens, "char_length") or
-                        appParityTokensHaveFunctionCall(sql_tokens, "character_length")));
+                (structured_summary.parser.excluded_next_status_identifier and
+                    structured_summary.parser.pipe_concat_operator and
+                    structured_summary.parser.lower_function and
+                    (structured_summary.parser.length_function or
+                        structured_summary.parser.char_length_function or
+                        structured_summary.parser.character_length_function));
             self.conflict_jsonb_update = self.conflict_jsonb_update or
-                appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_") or
-                appParityTokensHaveFunctionCall(sql_tokens, "to_jsonb") or
-                (appParityTokensHaveIdentifier(sql_tokens, "metadata") and
-                    appParityTokensHaveKind(sql_tokens, .pipe_concat) and
+                structured_summary.parser.jsonb_identifier_prefix or
+                structured_summary.parser.to_jsonb_function or
+                (structured_summary.parser.metadata_pipe_concat and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":ops="));
             self.conflict_jsonb_concat_update = self.conflict_jsonb_concat_update or
-                appParityTokensHaveIdentifier(sql_tokens, "metadata") and
-                    appParityTokensHaveKind(sql_tokens, .pipe_concat) and
+                structured_summary.parser.metadata_pipe_concat and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":ops=");
-            self.multi_row_conflict_do_nothing = self.multi_row_conflict_do_nothing or (uses_multi_row_insert and appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }));
+            self.multi_row_conflict_do_nothing = self.multi_row_conflict_do_nothing or (uses_multi_row_insert and structured_summary.parser.conflict_do_nothing);
             self.multi_row_conflict_do_nothing_duplicate_target = self.multi_row_conflict_do_nothing_duplicate_target or (uses_multi_row_insert and
                 entry.resolver_exists == false and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }) and
+                structured_summary.parser.conflict_do_nothing and
                 sql_adapter.writePlanHasCounts(entry.plan, 1, 0));
             self.conflict_returning_expression = self.conflict_returning_expression or sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr=");
             self.conflict_do_nothing_returning_all = self.conflict_do_nothing_returning_all or (uses_returning_all and
                 sql_adapter.writePlanHasCounts(entry.plan, 0, 0) and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .nothing }));
+                structured_summary.parser.conflict_do_nothing);
             self.conflict_guard_where = self.conflict_guard_where or uses_conflict_where;
             self.conflict_guard_where_skip = self.conflict_guard_where_skip or (uses_conflict_where and
                 sql_adapter.writePlanHasCounts(entry.plan, 0, 0) and
                 sql_adapter.planHasExactUsizeToken(entry.plan, ":returning_rows=", 0));
             self.conflict_interval_update = self.conflict_interval_update or
-                (appParityTokensHaveIdentifier(sql_tokens, "interval") and
-                    appParityTokensHaveStringLiteral(sql_tokens, "1 second"));
+                structured_summary.parser.interval_1_second;
             self.conflict_mixed_interval_update = self.conflict_mixed_interval_update or
-                (appParityTokensHaveIdentifier(sql_tokens, "interval") and
-                    appParityTokensHaveStringLiteral(sql_tokens, "1 month 1 day"));
+                structured_summary.parser.interval_1_month_1_day;
             self.conflict_date_bin_update = self.conflict_date_bin_update or
-                (appParityTokensHaveFunctionCall(sql_tokens, "date_bin") and
-                    appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update, .set }) and
+                (structured_summary.parser.date_bin_function and
+                    structured_summary.parser.conflict_do_update_set and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_typed_datetime_literal_update = self.conflict_typed_datetime_literal_update or
-                (appParityTokensHaveKeywordSequence(sql_tokens, &.{ .do, .update, .set }) and
-                    appParityTokensHaveIdentifier(sql_tokens, "updated_at_ns") and
-                    appParityTokensHaveIdentifier(sql_tokens, "timestamptz") and
+                (structured_summary.parser.conflict_do_update_set and
+                    structured_summary.parser.updated_at_ns_identifier and
+                    structured_summary.parser.timestamptz_identifier and
                     sql_adapter.planHasNonZeroToken(entry.plan, "transforms="));
             self.conflict_row_assignment = self.conflict_row_assignment or
-                appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-                    appParityTokensHaveIdentifier(sql_tokens, "status") and
-                    appParityTokensHaveIdentifier(sql_tokens, "quantity");
+                structured_summary.parser.set_row_assignment and
+                    structured_summary.parser.status_identifier and
+                    structured_summary.parser.quantity_identifier;
             self.conflict_row_assignment_default = self.conflict_row_assignment_default or
-                (appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-                    appParityTokensHaveIdentifier(sql_tokens, "status") and
-                    appParityTokensHaveIdentifier(sql_tokens, "quantity") and
-                    appParityTokensHaveKeyword(sql_tokens, .default));
+                (structured_summary.parser.set_row_assignment and
+                    structured_summary.parser.status_identifier and
+                    structured_summary.parser.quantity_identifier and
+                    structured_summary.parser.default_keyword);
             self.conflict_row_assignment_constructor = self.conflict_row_assignment_constructor or
-                (appParityTokensHaveKeywordThenKind(sql_tokens, .set, .lparen) and
-                    appParityTokensHaveIdentifier(sql_tokens, "status") and
-                    appParityTokensHaveIdentifier(sql_tokens, "quantity") and
-                    appParityTokensHaveFunctionCall(sql_tokens, "row"));
+                (structured_summary.parser.set_row_assignment and
+                    structured_summary.parser.status_identifier and
+                    structured_summary.parser.quantity_identifier and
+                    structured_summary.parser.row_function);
             self.conflict_boolean_expression_update = self.conflict_boolean_expression_update or
-                appParityTokensHaveKeyword(sql_tokens, .set) and
-                    appParityTokensHaveIdentifier(sql_tokens, "enabled") and
-                    appParityTokensHaveIdentifier(sql_tokens, "excluded.enabled") and
-                    appParityTokensHaveKeyword(sql_tokens, .@"or") and
-                    appParityTokensHaveKeyword(sql_tokens, .false);
+                structured_summary.parser.conflict_do_update_set and
+                    structured_summary.parser.enabled_identifier and
+                    structured_summary.parser.excluded_enabled_identifier and
+                    structured_summary.parser.or_keyword and
+                    structured_summary.parser.false_keyword;
             self.schema_default_primary_named_conflict_target = self.schema_default_primary_named_conflict_target or
-                appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_pkey");
+                structured_summary.parser.usage_records_pkey_conflict_constraint;
             self.schema_custom_primary_named_conflict_target = self.schema_custom_primary_named_conflict_target or
                 (setup_summary.renamed_usage_records_primary_constraint and
-                    appParityTokensHaveConflictConstraint(sql_tokens, "usage_records_id_pk"));
+                    structured_summary.parser.usage_records_id_pk_conflict_constraint);
             self.schema_unique_conflict_target = self.schema_unique_conflict_target or (setup_summary.create_table_email_unique_constraint and
-                appParityConflictTargetHasIdentifier(sql_tokens, "email"));
+                structured_summary.parser.conflict_target_email_identifier);
             self.schema_additive_unique_conflict_target = self.schema_additive_unique_conflict_target or (setup_summary.alter_add_email_unique_constraint and
-                appParityConflictTargetHasIdentifier(sql_tokens, "email"));
+                structured_summary.parser.conflict_target_email_identifier);
             self.schema_partial_unique_conflict_target = self.schema_partial_unique_conflict_target or (setup_summary.partial_unique_index and
-                appParityConflictTargetHasIdentifier(sql_tokens, "email") and
-                appParityConflictTargetHasWhere(sql_tokens));
+                structured_summary.parser.conflict_target_email_identifier and
+                structured_summary.parser.conflict_target_where);
             self.schema_expression_unique_conflict_target = self.schema_expression_unique_conflict_target or (setup_summary.expression_unique_lower_upper and
-                (appParityConflictTargetHasFunctionCall(sql_tokens, "lower") or
-                    appParityConflictTargetHasFunctionCall(sql_tokens, "upper")));
+                (structured_summary.parser.conflict_target_lower_function or
+                    structured_summary.parser.conflict_target_upper_function));
             self.schema_mixed_expression_unique_conflict_target = self.schema_mixed_expression_unique_conflict_target or (setup_summary.mixed_expression_unique_tenant_lower and
-                appParityConflictTargetHasIdentifier(sql_tokens, "tenant_id") and
-                appParityConflictTargetHasFunctionCall(sql_tokens, "lower"));
+                structured_summary.parser.conflict_target_tenant_id_identifier and
+                structured_summary.parser.conflict_target_lower_function);
         }
         if (entry.family == .insert and !uses_insert_conflict) {
             self.multi_row_insert = self.multi_row_insert or uses_multi_row_insert;
             self.insert_typed_datetime_literal = self.insert_typed_datetime_literal or
-                appParityTokensHaveIdentifier(sql_tokens, "timestamptz");
+                structured_summary.parser.timestamptz_identifier;
         }
         self.point_update_expression_partial_unique_selector = self.point_update_expression_partial_unique_selector or
-            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, setup_summary, .update);
+            appParityPointWriteHasExpressionPartialUniqueSelector(entry, structured_summary.parser, setup_summary, .update);
         self.point_delete_expression_partial_unique_selector = self.point_delete_expression_partial_unique_selector or
-            appParityPointWriteHasExpressionPartialUniqueSelector(entry, sql_tokens, setup_summary, .delete);
+            appParityPointWriteHasExpressionPartialUniqueSelector(entry, structured_summary.parser, setup_summary, .delete);
         self.insert_source_cross_table_source_schema = self.insert_source_cross_table_source_schema or
             (entry.family == .insert_source and
                 appParityEntryHasCatalogSchemas(entry) and
@@ -11124,10 +17624,10 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasNonZeroToken(entry.plan, ":assignment_expr="));
         self.insert_source_regexp_expression_assignment = self.insert_source_regexp_expression_assignment or
             (entry.family == .insert_source and
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_like") and
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_instr") and
+                structured_summary.parser.regexp_like_function and
+                structured_summary.parser.regexp_substr_function and
+                structured_summary.parser.regexp_count_function and
+                structured_summary.parser.regexp_instr_function and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":source_expr_pred=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":assignment_expr=") and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
@@ -11147,23 +17647,21 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasNonZeroToken(entry.plan, ":returning_expr="));
         self.insert_source_conflict_default_update = self.insert_source_conflict_default_update or
             (entry.family == .insert_source and
-                appParityTokensHaveKeyword(sql_tokens, .set) and
-                appParityTokensHaveIdentifier(sql_tokens, "status") and
-                appParityTokensHaveKeyword(sql_tokens, .default) and
+                structured_summary.parser.conflict_set_status_default and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_ops="));
         self.insert_source_conflict_json_set_expression = self.insert_source_conflict_json_set_expression or
             (entry.family == .insert_source and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_json_set_expr="));
         self.insert_source_conflict_regexp_expression = self.insert_source_conflict_regexp_expression or
             (entry.family == .insert_source and
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_substr") and
-                appParityTokensHaveFunctionCall(sql_tokens, "regexp_count") and
-                appParityTokensHaveIdentifier(sql_tokens, "excluded.status") and
+                structured_summary.parser.regexp_substr_function and
+                structured_summary.parser.regexp_count_function and
+                structured_summary.parser.excluded_status_identifier and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_patch_expr="));
         self.insert_source_conflict_boolean_is_not_guard = self.insert_source_conflict_boolean_is_not_guard or
             (entry.family == .insert_source and
                 sql_adapter.planHasNonZeroToken(entry.plan, ":conflict_where_any=") and
-                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .true }));
+                structured_summary.parser.boolean_is_not_true_or_false);
         self.joined_source_cross_table_source_schema = self.joined_source_cross_table_source_schema or
             ((entry.family == .update_joined_source or entry.family == .delete_joined_source) and
                 appParityEntryHasCatalogSchemas(entry) and
@@ -11196,6 +17694,1520 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasExactStringToken(entry.plan, ":source=", "archived_records"));
     }
 };
+
+test "sql adapter corpus emits structured fixture summaries" {
+    const alloc = std.testing.allocator;
+
+    var unsupported_sql = try tokenized.ParsedSql.initAlloc(alloc, "COPY usage_records TO STDIN WITH (OIDS)");
+    defer unsupported_sql.deinit(alloc);
+    const unsupported = appParityStructuredFixtureSummary(.{
+        .name = "unsupported copy",
+        .sql = "COPY usage_records TO STDIN WITH (OIDS)",
+        .family = .unsupported_ddl,
+        .classification_reason = "bulk_io_plan",
+        .plan = "unsupported:ddl:requires=bulk_io_plan",
+    }, &unsupported_sql);
+    try std.testing.expect(unsupported.parser.starts_with_copy);
+    try std.testing.expect(unsupported.parser.copy_to_stdin);
+    try std.testing.expect(unsupported.parser.copy_oids_option);
+    try std.testing.expect(!unsupported.parser.copy_oids_false_option);
+    try std.testing.expect(!unsupported.parser.copy_program_endpoint);
+    try std.testing.expect(unsupported.hasReason("bulk_io_plan"));
+    try std.testing.expectEqualStrings("bulk_io_plan", unsupported.native_requirement_reason.?);
+    try std.testing.expectEqualStrings("bulk_io_plan", unsupported.unsupported_reason.?);
+
+    var document_delete_sql = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM docs WHERE _id = 'doc:a'");
+    defer document_delete_sql.deinit(alloc);
+    const document_delete = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql exact id delete",
+        .sql = "DELETE FROM docs WHERE _id = 'doc:a'",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_delete_sql);
+    try std.testing.expect(document_delete.parser.starts_with_delete);
+    try std.testing.expect(document_delete.parser.where_keyword);
+    try std.testing.expect(document_delete.parser.underscore_id_identifier);
+    try std.testing.expect(!document_delete.parser.underscore_doc_identifier);
+
+    var document_update_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'");
+    defer document_update_sql.deinit(alloc);
+    const document_update = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql doc update",
+        .sql = "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_update_sql);
+    try std.testing.expect(document_update.parser.starts_with_update);
+    try std.testing.expect(document_update.parser.set_keyword);
+    try std.testing.expect(document_update.parser.where_keyword);
+    try std.testing.expect(document_update.parser.underscore_doc_identifier);
+    try std.testing.expect(document_update.parser.underscore_id_identifier);
+
+    var document_view_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
+    defer document_view_unnest_sql.deinit(alloc);
+    const document_view_unnest = appParityStructuredFixtureSummary(.{
+        .name = "document sql view mapping unnest read",
+        .sql = "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10",
+        .family = .read,
+        .plan = "document_query",
+    }, &document_view_unnest_sql);
+    try std.testing.expect(document_view_unnest.parser.support_view_identifier);
+    try std.testing.expect(document_view_unnest.parser.unnest_function);
+    try std.testing.expect(document_view_unnest.parser.tag_identifier);
+    try std.testing.expect(document_view_unnest.parser.tag_list_identifier);
+
+    var document_projection_insert_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')");
+    defer document_projection_insert_sql.deinit(alloc);
+    const document_projection_insert = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql projection insert",
+        .sql = "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_projection_insert_sql);
+    try std.testing.expect(document_projection_insert.parser.insert_into);
+    try std.testing.expect(document_projection_insert.parser.title_identifier);
+    try std.testing.expect(document_projection_insert.parser.underscore_id_identifier);
+    try std.testing.expect(!document_projection_insert.parser.underscore_doc_identifier);
+
+    var document_projection_update_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'");
+    defer document_projection_update_sql.deinit(alloc);
+    const document_projection_update = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql projection update",
+        .sql = "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_projection_update_sql);
+    try std.testing.expect(document_projection_update.parser.starts_with_update);
+    try std.testing.expect(document_projection_update.parser.set_keyword);
+    try std.testing.expect(document_projection_update.parser.where_keyword);
+    try std.testing.expect(document_projection_update.parser.title_identifier);
+    try std.testing.expect(document_projection_update.parser.underscore_id_identifier);
+    try std.testing.expect(!document_projection_update.parser.underscore_doc_identifier);
+
+    var document_truncate_sql = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE docs");
+    defer document_truncate_sql.deinit(alloc);
+    const document_truncate = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql truncate table",
+        .sql = "TRUNCATE docs",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_truncate_sql);
+    try std.testing.expect(document_truncate.parser.starts_with_truncate);
+
+    var document_merge_sql = try tokenized.ParsedSql.initAlloc(alloc, "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE");
+    defer document_merge_sql.deinit(alloc);
+    const document_merge = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql merge matched delete",
+        .sql = "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_merge_sql);
+    try std.testing.expect(document_merge.parser.starts_with_merge);
+    try std.testing.expect(document_merge.parser.merge_when_matched_delete);
+    try std.testing.expect(document_merge.parser.docs_underscore_id_identifier);
+    try std.testing.expect(document_merge.parser.source_underscore_id_identifier);
+
+    var noop_commit_sql = try tokenized.ParsedSql.initAlloc(alloc, "COMMIT");
+    defer noop_commit_sql.deinit(alloc);
+    const noop_commit = appParityStructuredFixtureSummary(.{
+        .name = "adapter noop commit summary",
+        .sql = "COMMIT",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "transaction_control",
+        .plan = "adapter_noop:ddl:reason=transaction_control",
+    }, &noop_commit_sql);
+    try std.testing.expect(noop_commit.parser.starts_with_commit);
+    try std.testing.expect(!noop_commit.parser.starts_with_rollback);
+    try std.testing.expect(noop_commit.hasReason("transaction_control"));
+
+    var noop_rollback_sql = try tokenized.ParsedSql.initAlloc(alloc, "ROLLBACK");
+    defer noop_rollback_sql.deinit(alloc);
+    const noop_rollback = appParityStructuredFixtureSummary(.{
+        .name = "adapter noop rollback summary",
+        .sql = "ROLLBACK",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "transaction_control",
+        .plan = "adapter_noop:ddl:reason=transaction_control",
+    }, &noop_rollback_sql);
+    try std.testing.expect(noop_rollback.parser.starts_with_rollback);
+    try std.testing.expect(!noop_rollback.parser.starts_with_commit);
+    try std.testing.expect(noop_rollback.hasReason("transaction_control"));
+
+    var noop_session_probe_sql = try tokenized.ParsedSql.initAlloc(alloc, "SHOW search_path");
+    defer noop_session_probe_sql.deinit(alloc);
+    const noop_session_probe = appParityStructuredFixtureSummary(.{
+        .name = "adapter noop session probe summary",
+        .sql = "SHOW search_path",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "session_setting",
+        .plan = "adapter_noop:ddl:reason=session_setting",
+    }, &noop_session_probe_sql);
+    try std.testing.expect(noop_session_probe.parser.starts_with_show);
+    try std.testing.expect(!noop_session_probe.parser.starts_with_reset);
+    try std.testing.expect(!noop_session_probe.parser.starts_with_discard);
+    try std.testing.expect(noop_session_probe.hasReason("session_setting"));
+
+    var noop_discard_sql = try tokenized.ParsedSql.initAlloc(alloc, "DISCARD ALL");
+    defer noop_discard_sql.deinit(alloc);
+    const noop_discard = appParityStructuredFixtureSummary(.{
+        .name = "adapter noop discard summary",
+        .sql = "DISCARD ALL",
+        .family = .adapter_noop_ddl,
+        .classification_reason = "session_setting",
+        .plan = "adapter_noop:ddl:reason=session_setting",
+    }, &noop_discard_sql);
+    try std.testing.expect(noop_discard.parser.starts_with_discard);
+    try std.testing.expect(!noop_discard.parser.starts_with_show);
+    try std.testing.expect(noop_discard.hasReason("session_setting"));
+
+    var boolean_predicates_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE enabled IS TRUE OR enabled IS NOT FALSE OR enabled IS UNKNOWN");
+    defer boolean_predicates_sql.deinit(alloc);
+    const boolean_predicates = appParityStructuredFixtureSummary(.{
+        .name = "boolean predicate summary",
+        .sql = "SELECT id FROM usage_records WHERE enabled IS TRUE OR enabled IS NOT FALSE OR enabled IS UNKNOWN",
+        .family = .query,
+        .plan = "query:table=usage_records:pred=1:or=1",
+    }, &boolean_predicates_sql);
+    try std.testing.expect(boolean_predicates.parser.boolean_is_true_or_false);
+    try std.testing.expect(boolean_predicates.parser.boolean_is_not_true_or_false);
+    try std.testing.expect(boolean_predicates.parser.boolean_unknown_or_not_unknown);
+    try std.testing.expect(!boolean_predicates.parser.postfix_null_test);
+
+    var postfix_null_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status ISNULL OR metadata NOTNULL");
+    defer postfix_null_sql.deinit(alloc);
+    const postfix_null = appParityStructuredFixtureSummary(.{
+        .name = "postfix null predicate summary",
+        .sql = "SELECT id FROM usage_records WHERE status ISNULL OR metadata NOTNULL",
+        .family = .query,
+        .plan = "query:table=usage_records:pred=1:expr_pred=1",
+    }, &postfix_null_sql);
+    try std.testing.expect(postfix_null.parser.postfix_null_test);
+    try std.testing.expect(!postfix_null.parser.boolean_is_true_or_false);
+    try std.testing.expect(!postfix_null.parser.boolean_unknown_or_not_unknown);
+
+    var aggregate_boolean_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT tenant_id, count(*) FILTER (WHERE enabled IS NOT TRUE), count(*) FILTER (WHERE enabled IS UNKNOWN) FROM usage_records GROUP BY tenant_id HAVING bool_or(enabled) IS UNKNOWN OR bool_and(enabled) IS NOT TRUE");
+    defer aggregate_boolean_sql.deinit(alloc);
+    const aggregate_boolean = appParityStructuredFixtureSummary(.{
+        .name = "aggregate boolean predicate summary",
+        .sql = "SELECT tenant_id, count(*) FILTER (WHERE enabled IS NOT TRUE), count(*) FILTER (WHERE enabled IS UNKNOWN) FROM usage_records GROUP BY tenant_id HAVING bool_or(enabled) IS UNKNOWN OR bool_and(enabled) IS NOT TRUE",
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:having=1:having_any=1:filter_groups=2:aggs=2",
+    }, &aggregate_boolean_sql);
+    try std.testing.expect(aggregate_boolean.parser.having_boolean_predicate);
+    try std.testing.expect(aggregate_boolean.parser.having_boolean_is_not_predicate);
+    try std.testing.expect(aggregate_boolean.parser.filter_boolean_is_not_predicate);
+    try std.testing.expect(aggregate_boolean.parser.filter_boolean_unknown_predicate);
+
+    var array_overlap_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tags && ARRAY['vip']");
+    defer array_overlap_sql.deinit(alloc);
+    const array_overlap = appParityStructuredFixtureSummary(.{
+        .name = "array overlap access-or summary",
+        .sql = "SELECT id FROM usage_records WHERE tags && ARRAY['vip']",
+        .family = .query,
+        .plan = "query:table=usage_records:access_or=1",
+    }, &array_overlap_sql);
+    try std.testing.expect(array_overlap.parser.tags_array_overlap);
+    try std.testing.expect(!array_overlap.parser.mixed_scalar_expression_or);
+
+    var mixed_scalar_or_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE id = 'u1' OR lower(email) = 'a@example.com'");
+    defer mixed_scalar_or_sql.deinit(alloc);
+    const mixed_scalar_or = appParityStructuredFixtureSummary(.{
+        .name = "mixed scalar expression or summary",
+        .sql = "SELECT id FROM usage_records WHERE id = 'u1' OR lower(email) = 'a@example.com'",
+        .family = .query,
+        .plan = "query:table=usage_records:expr_or=1",
+    }, &mixed_scalar_or_sql);
+    try std.testing.expect(mixed_scalar_or.parser.mixed_scalar_expression_or);
+    try std.testing.expect(!mixed_scalar_or.parser.tags_array_overlap);
+
+    var order_using_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records ORDER BY amount USING >");
+    defer order_using_sql.deinit(alloc);
+    const order_using = appParityStructuredFixtureSummary(.{
+        .name = "order using operator summary",
+        .sql = "SELECT id FROM usage_records ORDER BY amount USING >",
+        .family = .query,
+        .plan = "query:table=usage_records:order=1",
+    }, &order_using_sql);
+    try std.testing.expect(order_using.parser.order_by);
+    try std.testing.expect(order_using.parser.order_using_operator);
+    try std.testing.expect(!order_using.parser.tags_array_overlap);
+
+    var datetime_intervals_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT created_at + interval '1 hour', created_at + interval '1 month', created_at + interval '1 month 1 day', updated_at_ns + interval '1 second' FROM usage_records");
+    defer datetime_intervals_sql.deinit(alloc);
+    const datetime_intervals = appParityStructuredFixtureSummary(.{
+        .name = "datetime interval summary",
+        .sql = "SELECT created_at + interval '1 hour', created_at + interval '1 month', created_at + interval '1 month 1 day', updated_at_ns + interval '1 second' FROM usage_records",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=4",
+    }, &datetime_intervals_sql);
+    try std.testing.expect(datetime_intervals.parser.interval_1_hour);
+    try std.testing.expect(datetime_intervals.parser.interval_1_month);
+    try std.testing.expect(datetime_intervals.parser.interval_1_month_1_day);
+    try std.testing.expect(datetime_intervals.parser.interval_1_second);
+    try std.testing.expect(datetime_intervals.parser.updated_at_ns_identifier);
+    try std.testing.expect(!datetime_intervals.parser.date_bin_function);
+
+    var datetime_functions_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT now(), current_timestamp, current_timestamp(3), current_date, date_trunc('hour', created_at), date_bin('1 hour', created_at, timestamptz '2025-01-01 00:00:00Z'), date_part('hour', created_at), date_part('epoch', created_at), extract(dow FROM created_at) FROM usage_records");
+    defer datetime_functions_sql.deinit(alloc);
+    const datetime_functions = appParityStructuredFixtureSummary(.{
+        .name = "datetime function summary",
+        .sql = "SELECT now(), current_timestamp, current_timestamp(3), current_date, date_trunc('hour', created_at), date_bin('1 hour', created_at, timestamptz '2025-01-01 00:00:00Z'), date_part('hour', created_at), date_part('epoch', created_at), extract(dow FROM created_at) FROM usage_records",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=9",
+    }, &datetime_functions_sql);
+    try std.testing.expect(datetime_functions.parser.now_function);
+    try std.testing.expect(datetime_functions.parser.current_timestamp_identifier);
+    try std.testing.expect(datetime_functions.parser.current_timestamp_function);
+    try std.testing.expect(datetime_functions.parser.current_date_identifier);
+    try std.testing.expect(datetime_functions.parser.date_trunc_hour_function);
+    try std.testing.expect(datetime_functions.parser.date_bin_function);
+    try std.testing.expect(datetime_functions.parser.date_part_hour_function);
+    try std.testing.expect(datetime_functions.parser.date_part_epoch_function);
+    try std.testing.expect(datetime_functions.parser.extract_function);
+    try std.testing.expect(datetime_functions.parser.dow_identifier);
+    try std.testing.expect(datetime_functions.parser.timestamptz_identifier);
+    try std.testing.expect(!datetime_functions.parser.interval_1_month_1_day);
+
+    var numeric_text_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT char_length(status), character_length(status), octet_length(status), bit_length(status), greatest(amount, quantity), least(amount, quantity), quantity % mod(amount, 10) FROM usage_records");
+    defer numeric_text_sql.deinit(alloc);
+    const numeric_text = appParityStructuredFixtureSummary(.{
+        .name = "numeric and text function summary",
+        .sql = "SELECT char_length(status), character_length(status), octet_length(status), bit_length(status), greatest(amount, quantity), least(amount, quantity), quantity % mod(amount, 10) FROM usage_records",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=7:order_expr=1",
+    }, &numeric_text_sql);
+    try std.testing.expect(numeric_text.parser.char_length_function);
+    try std.testing.expect(numeric_text.parser.character_length_function);
+    try std.testing.expect(numeric_text.parser.octet_length_function);
+    try std.testing.expect(numeric_text.parser.bit_length_function);
+    try std.testing.expect(numeric_text.parser.greatest_function);
+    try std.testing.expect(numeric_text.parser.least_function);
+    try std.testing.expect(numeric_text.parser.percent_operator);
+    try std.testing.expect(numeric_text.parser.mod_function);
+    try std.testing.expect(numeric_text.parser.amount_identifier);
+    try std.testing.expect(!numeric_text.parser.coalesce_function);
+
+    var conflict_text_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, amount, status) VALUES ('u1', 1, 'new') ON CONFLICT (id) DO UPDATE SET amount = greatest(amount, excluded.amount), status = coalesce(excluded.next_status, lower(excluded.next_status) || character_length(excluded.next_status)::text)");
+    defer conflict_text_sql.deinit(alloc);
+    const conflict_text = appParityStructuredFixtureSummary(.{
+        .name = "conflict numeric text summary",
+        .sql = "INSERT INTO usage_records (id, amount, status) VALUES ('u1', 1, 'new') ON CONFLICT (id) DO UPDATE SET amount = greatest(amount, excluded.amount), status = coalesce(excluded.next_status, lower(excluded.next_status) || character_length(excluded.next_status)::text)",
+        .family = .insert,
+        .plan = "insert:table=usage_records:transforms=2",
+    }, &conflict_text_sql);
+    try std.testing.expect(conflict_text.parser.coalesce_function);
+    try std.testing.expect(conflict_text.parser.greatest_function);
+    try std.testing.expect(conflict_text.parser.amount_identifier);
+    try std.testing.expect(conflict_text.parser.excluded_amount_identifier);
+    try std.testing.expect(conflict_text.parser.excluded_identifier_prefix);
+    try std.testing.expect(conflict_text.parser.excluded_next_status_identifier);
+    try std.testing.expect(conflict_text.parser.lower_function);
+    try std.testing.expect(conflict_text.parser.character_length_function);
+    try std.testing.expect(conflict_text.parser.pipe_concat_operator);
+
+    var nested_text_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT lower(status) || upper(status) FROM usage_records");
+    defer nested_text_sql.deinit(alloc);
+    const nested_text = appParityStructuredFixtureSummary(.{
+        .name = "nested text operator summary",
+        .sql = "SELECT lower(status) || upper(status) FROM usage_records",
+        .family = .query,
+        .plan = "query:table=usage_records:expr_pred=1:order_expr=1",
+    }, &nested_text_sql);
+    try std.testing.expect(nested_text.parser.lower_function);
+    try std.testing.expect(nested_text.parser.upper_function);
+    try std.testing.expect(nested_text.parser.pipe_concat_operator);
+    try std.testing.expect(!nested_text.parser.coalesce_function);
+
+    var copy_oids_false_sql = try tokenized.ParsedSql.initAlloc(alloc, "COPY usage_records FROM STDIN WITH (OIDS FALSE)");
+    defer copy_oids_false_sql.deinit(alloc);
+    const copy_oids_false = appParityStructuredFixtureSummary(.{
+        .name = "copy oids false",
+        .sql = "COPY usage_records FROM STDIN WITH (OIDS FALSE)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .copy_from },
+        .plan = "ddl:copy:from:table=usage_records:format=text",
+    }, &copy_oids_false_sql);
+    try std.testing.expect(copy_oids_false.parser.starts_with_copy);
+    try std.testing.expect(copy_oids_false.parser.copy_oids_option);
+    try std.testing.expect(copy_oids_false.parser.copy_oids_false_option);
+    try std.testing.expect(!copy_oids_false.parser.copy_program_endpoint);
+
+    var copy_program_sql = try tokenized.ParsedSql.initAlloc(alloc, "COPY usage_records TO PROGRAM 'cat'");
+    defer copy_program_sql.deinit(alloc);
+    const copy_program = appParityStructuredFixtureSummary(.{
+        .name = "copy program endpoint",
+        .sql = "COPY usage_records TO PROGRAM 'cat'",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .copy_to },
+        .plan = "ddl:copy:to:table=usage_records:stream=program",
+    }, &copy_program_sql);
+    try std.testing.expect(copy_program.parser.starts_with_copy);
+    try std.testing.expect(!copy_program.parser.copy_oids_option);
+    try std.testing.expect(!copy_program.parser.copy_oids_false_option);
+    try std.testing.expect(copy_program.parser.copy_program_endpoint);
+
+    var temporal_table_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE account_prices_history (account_id text, valid_at daterange, price numeric, PERIOD FOR valid_at) WITH SYSTEM VERSIONING");
+    defer temporal_table_sql.deinit(alloc);
+    const temporal_table = appParityStructuredFixtureSummary(.{
+        .name = "system versioned table summary",
+        .sql = "CREATE TABLE account_prices_history (account_id text, valid_at daterange, price numeric, PERIOD FOR valid_at) WITH SYSTEM VERSIONING",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .temporal_periods = 1 },
+        .plan = "ddl:create_table:table=account_prices_history:periods=1:system_versioned=1",
+    }, &temporal_table_sql);
+    try std.testing.expect(temporal_table.parser.system_versioning);
+    try std.testing.expect(!temporal_table.parser.period_foreign_key);
+    try std.testing.expect(!temporal_table.parser.on_delete_set_null);
+    try std.testing.expect(!temporal_table.parser.on_delete_cascade);
+    try std.testing.expect(!temporal_table.parser.on_update_cascade);
+
+    var temporal_fk_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE account_prices_child (account_id text, valid_at daterange, PERIOD FOR valid_at, FOREIGN KEY (account_id, PERIOD valid_at) REFERENCES account_prices_history (account_id, PERIOD valid_at) ON DELETE SET NULL ON UPDATE CASCADE)");
+    defer temporal_fk_sql.deinit(alloc);
+    const temporal_fk = appParityStructuredFixtureSummary(.{
+        .name = "temporal foreign key summary",
+        .sql = "CREATE TABLE account_prices_child (account_id text, valid_at daterange, PERIOD FOR valid_at, FOREIGN KEY (account_id, PERIOD valid_at) REFERENCES account_prices_history (account_id, PERIOD valid_at) ON DELETE SET NULL ON UPDATE CASCADE)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .temporal_foreign_keys = 1 },
+        .plan = "ddl:create_table:table=account_prices_child:periods=1:temporal_fk=1",
+    }, &temporal_fk_sql);
+    try std.testing.expect(!temporal_fk.parser.system_versioning);
+    try std.testing.expect(temporal_fk.parser.period_foreign_key);
+    try std.testing.expect(temporal_fk.parser.on_delete_set_null);
+    try std.testing.expect(!temporal_fk.parser.on_delete_cascade);
+    try std.testing.expect(temporal_fk.parser.on_update_cascade);
+
+    var temporal_fk_cascade_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE account_prices_child (account_id text, valid_at daterange, PERIOD FOR valid_at, FOREIGN KEY (account_id, PERIOD valid_at) REFERENCES account_prices_history (account_id, PERIOD valid_at) ON DELETE CASCADE)");
+    defer temporal_fk_cascade_sql.deinit(alloc);
+    const temporal_fk_cascade = appParityStructuredFixtureSummary(.{
+        .name = "temporal foreign key cascade summary",
+        .sql = "CREATE TABLE account_prices_child (account_id text, valid_at daterange, PERIOD FOR valid_at, FOREIGN KEY (account_id, PERIOD valid_at) REFERENCES account_prices_history (account_id, PERIOD valid_at) ON DELETE CASCADE)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .create_table, .temporal_foreign_keys = 1 },
+        .plan = "ddl:create_table:table=account_prices_child:periods=1:temporal_fk=1",
+    }, &temporal_fk_cascade_sql);
+    try std.testing.expect(temporal_fk_cascade.parser.period_foreign_key);
+    try std.testing.expect(!temporal_fk_cascade.parser.on_delete_set_null);
+    try std.testing.expect(temporal_fk_cascade.parser.on_delete_cascade);
+    try std.testing.expect(!temporal_fk_cascade.parser.on_update_cascade);
+
+    var temporal_range_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO products (valid_at) VALUES ('[1,10)'), ('[2025-01-01,2025-07-01)'), ('[2026-01-01,)'), ('(,2026-01-01)'), ('[2025-01-01,2025-02-01]'), ('(2025-01-01,2025-02-01)'), ('[2025-01-01 00:00:00,2025-01-02 00:00:00)'), ('[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)'), (daterange('2025-01-01', '2025-02-01', '[]')), (daterange('2025-01-01', '2025-02-01', '(]')), (numrange(1, 10)), (tsrange('2025-01-01 00:00:00', '2025-01-02 00:00:00')), (tstzrange('2025-01-01T01:30:00+01:30', '2025-01-02T00:00:00Z'))");
+    defer temporal_range_sql.deinit(alloc);
+    const temporal_range = appParityStructuredFixtureSummary(.{
+        .name = "temporal range literal and constructor summary",
+        .sql = "INSERT INTO products (valid_at) VALUES ('[1,10)'), ('[2025-01-01,2025-07-01)'), ('[2026-01-01,)'), ('(,2026-01-01)'), ('[2025-01-01,2025-02-01]'), ('(2025-01-01,2025-02-01)'), ('[2025-01-01 00:00:00,2025-01-02 00:00:00)'), ('[2025-01-01T01:30:00+01:30,2025-01-02T00:00:00Z)'), (daterange('2025-01-01', '2025-02-01', '[]')), (daterange('2025-01-01', '2025-02-01', '(]')), (numrange(1, 10)), (tsrange('2025-01-01 00:00:00', '2025-01-02 00:00:00')), (tstzrange('2025-01-01T01:30:00+01:30', '2025-01-02T00:00:00Z'))",
+        .family = .insert,
+        .plan = "insert:table=products:values=13",
+    }, &temporal_range_sql);
+    try std.testing.expect(temporal_range.parser.numrange_literal);
+    try std.testing.expect(temporal_range.parser.daterange_literal);
+    try std.testing.expect(temporal_range.parser.open_daterange_literal);
+    try std.testing.expect(temporal_range.parser.lower_open_daterange_literal);
+    try std.testing.expect(temporal_range.parser.inclusive_daterange_literal);
+    try std.testing.expect(temporal_range.parser.lower_exclusive_daterange_literal);
+    try std.testing.expect(temporal_range.parser.tsrange_literal);
+    try std.testing.expect(temporal_range.parser.tstzrange_literal);
+    try std.testing.expect(temporal_range.parser.numrange_function);
+    try std.testing.expect(temporal_range.parser.daterange_function);
+    try std.testing.expect(temporal_range.parser.tsrange_function);
+    try std.testing.expect(temporal_range.parser.tstzrange_function);
+    try std.testing.expect(temporal_range.parser.range_bound_inclusive_literal);
+    try std.testing.expect(temporal_range.parser.range_bound_lower_exclusive_literal);
+
+    var temporal_range_operator_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT lower(valid_at), upper(valid_at) FROM price_intervals WHERE span @> 5 OR span && numrange(1, 10)");
+    defer temporal_range_operator_sql.deinit(alloc);
+    const temporal_range_operator = appParityStructuredFixtureSummary(.{
+        .name = "temporal range operator summary",
+        .sql = "SELECT lower(valid_at), upper(valid_at) FROM price_intervals WHERE span @> 5 OR span && numrange(1, 10)",
+        .family = .query,
+        .plan = "query:table=price_intervals:expr=2:or=1",
+    }, &temporal_range_operator_sql);
+    try std.testing.expect(temporal_range_operator.parser.lower_function);
+    try std.testing.expect(temporal_range_operator.parser.upper_function);
+    try std.testing.expect(temporal_range_operator.parser.range_contains_operator);
+    try std.testing.expect(temporal_range_operator.parser.range_overlap_operator);
+    try std.testing.expect(temporal_range_operator.parser.numrange_function);
+    try std.testing.expect(temporal_range_operator.parser.valid_at_identifier);
+
+    var temporal_conflict_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO prices (sku, valid_at, price) VALUES ('s1', '[2025-01-01,2025-02-01)', 10) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price");
+    defer temporal_conflict_sql.deinit(alloc);
+    const temporal_conflict = appParityStructuredFixtureSummary(.{
+        .name = "temporal conflict target summary",
+        .sql = "INSERT INTO prices (sku, valid_at, price) VALUES ('s1', '[2025-01-01,2025-02-01)', 10) ON CONFLICT ON CONSTRAINT prices_sku_time_key DO UPDATE SET price = excluded.price",
+        .family = .insert,
+        .plan = "insert:table=prices:on_conflict=1:transforms=1",
+    }, &temporal_conflict_sql);
+    try std.testing.expect(temporal_conflict.parser.prices_sku_time_conflict_constraint);
+    try std.testing.expect(temporal_conflict.parser.valid_at_identifier);
+    try std.testing.expect(temporal_conflict.parser.conflict_do_update);
+
+    var temporal_portion_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-01-01' TO DATE '2025-02-01' SET price = 10");
+    defer temporal_portion_sql.deinit(alloc);
+    const temporal_portion = appParityStructuredFixtureSummary(.{
+        .name = "temporal portion dml summary",
+        .sql = "UPDATE products FOR PORTION OF valid_at FROM DATE '2025-01-01' TO DATE '2025-02-01' SET price = 10",
+        .family = .update_source,
+        .plan = "update_source:table=products:temporal=1",
+    }, &temporal_portion_sql);
+    try std.testing.expect(temporal_portion.parser.for_portion_of);
+    try std.testing.expect(temporal_portion.parser.valid_at_identifier);
+
+    var unsupported_owner_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records OWNER TO app_role");
+    defer unsupported_owner_sql.deinit(alloc);
+    const unsupported_owner = appParityStructuredFixtureSummary(.{
+        .name = "unsupported alter table owner",
+        .sql = "ALTER TABLE usage_records OWNER TO app_role",
+        .family = .unsupported_ddl,
+        .classification_reason = "table_owner_plan",
+        .plan = "unsupported:ddl:requires=table_owner_plan",
+    }, &unsupported_owner_sql);
+    try std.testing.expect(unsupported_owner.parser.alter_table);
+    try std.testing.expect(unsupported_owner.parser.alter_table_owner_to);
+    try std.testing.expect(!unsupported_owner.parser.alter_table_set_unlogged);
+    try std.testing.expect(unsupported_owner.hasReason("table_owner_plan"));
+
+    var unsupported_persistence_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records SET UNLOGGED");
+    defer unsupported_persistence_sql.deinit(alloc);
+    const unsupported_persistence = appParityStructuredFixtureSummary(.{
+        .name = "unsupported alter table persistence",
+        .sql = "ALTER TABLE usage_records SET UNLOGGED",
+        .family = .unsupported_ddl,
+        .classification_reason = "table_persistence_plan",
+        .plan = "unsupported:ddl:requires=table_persistence_plan",
+    }, &unsupported_persistence_sql);
+    try std.testing.expect(unsupported_persistence.parser.alter_table);
+    try std.testing.expect(!unsupported_persistence.parser.alter_table_owner_to);
+    try std.testing.expect(unsupported_persistence.parser.alter_table_set_unlogged);
+    try std.testing.expect(unsupported_persistence.hasReason("table_persistence_plan"));
+
+    var alter_add_default_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD COLUMN status_text text DEFAULT lower(status)");
+    defer alter_add_default_sql.deinit(alloc);
+    const alter_add_default = appParityStructuredFixtureSummary(.{
+        .name = "alter table add column default summary",
+        .sql = "ALTER TABLE usage_records ADD COLUMN status_text text DEFAULT lower(status)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_add_default_sql);
+    try std.testing.expect(alter_add_default.parser.alter_table);
+    try std.testing.expect(alter_add_default.parser.alter_table_add_column_default);
+    try std.testing.expect(!alter_add_default.parser.alter_table_drop_column);
+
+    var alter_constraint_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records VALIDATE CONSTRAINT usage_records_status_check");
+    defer alter_constraint_sql.deinit(alloc);
+    const alter_constraint = appParityStructuredFixtureSummary(.{
+        .name = "alter table validate constraint summary",
+        .sql = "ALTER TABLE usage_records VALIDATE CONSTRAINT usage_records_status_check",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_constraint_sql);
+    try std.testing.expect(alter_constraint.parser.alter_table_validate_constraint);
+    try std.testing.expect(!alter_constraint.parser.alter_table_drop_constraint);
+
+    var alter_drop_constraint_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_check");
+    defer alter_drop_constraint_sql.deinit(alloc);
+    const alter_drop_constraint = appParityStructuredFixtureSummary(.{
+        .name = "alter table drop constraint summary",
+        .sql = "ALTER TABLE usage_records DROP CONSTRAINT usage_records_status_check",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_drop_constraint_sql);
+    try std.testing.expect(!alter_drop_constraint.parser.alter_table_validate_constraint);
+    try std.testing.expect(alter_drop_constraint.parser.alter_table_drop_constraint);
+    try std.testing.expect(!alter_drop_constraint.parser.alter_table_drop_column);
+
+    var alter_drop_column_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records DROP COLUMN status_text");
+    defer alter_drop_column_sql.deinit(alloc);
+    const alter_drop_column = appParityStructuredFixtureSummary(.{
+        .name = "alter table drop column summary",
+        .sql = "ALTER TABLE usage_records DROP COLUMN status_text",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_drop_column_sql);
+    try std.testing.expect(alter_drop_column.parser.alter_table_drop_column);
+    try std.testing.expect(!alter_drop_column.parser.alter_table_drop_constraint);
+
+    var alter_set_default_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'queued'");
+    defer alter_set_default_sql.deinit(alloc);
+    const alter_set_default = appParityStructuredFixtureSummary(.{
+        .name = "alter table set default summary",
+        .sql = "ALTER TABLE usage_records ALTER COLUMN status SET DEFAULT 'queued'",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_set_default_sql);
+    try std.testing.expect(alter_set_default.parser.alter_table_set_default);
+    try std.testing.expect(!alter_set_default.parser.alter_table_drop_default);
+
+    var alter_drop_default_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status DROP DEFAULT");
+    defer alter_drop_default_sql.deinit(alloc);
+    const alter_drop_default = appParityStructuredFixtureSummary(.{
+        .name = "alter table drop default summary",
+        .sql = "ALTER TABLE usage_records ALTER COLUMN status DROP DEFAULT",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_drop_default_sql);
+    try std.testing.expect(!alter_drop_default.parser.alter_table_set_default);
+    try std.testing.expect(alter_drop_default.parser.alter_table_drop_default);
+
+    var alter_set_not_null_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL");
+    defer alter_set_not_null_sql.deinit(alloc);
+    const alter_set_not_null = appParityStructuredFixtureSummary(.{
+        .name = "alter table set not null summary",
+        .sql = "ALTER TABLE usage_records ALTER COLUMN status SET NOT NULL",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_set_not_null_sql);
+    try std.testing.expect(alter_set_not_null.parser.alter_table_set_not_null);
+    try std.testing.expect(!alter_set_not_null.parser.alter_table_drop_not_null);
+
+    var alter_drop_not_null_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL");
+    defer alter_drop_not_null_sql.deinit(alloc);
+    const alter_drop_not_null = appParityStructuredFixtureSummary(.{
+        .name = "alter table drop not null summary",
+        .sql = "ALTER TABLE usage_records ALTER COLUMN status DROP NOT NULL",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_drop_not_null_sql);
+    try std.testing.expect(!alter_drop_not_null.parser.alter_table_set_not_null);
+    try std.testing.expect(alter_drop_not_null.parser.alter_table_drop_not_null);
+
+    var alter_type_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status TYPE text USING lower(status)");
+    defer alter_type_sql.deinit(alloc);
+    const alter_type = appParityStructuredFixtureSummary(.{
+        .name = "alter table type summary",
+        .sql = "ALTER TABLE usage_records ALTER COLUMN status TYPE text USING lower(status)",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_type_sql);
+    try std.testing.expect(alter_type.parser.alter_table_type);
+    try std.testing.expect(!alter_type.parser.alter_table_set_data_type);
+
+    var alter_set_data_type_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET DATA TYPE text");
+    defer alter_set_data_type_sql.deinit(alloc);
+    const alter_set_data_type = appParityStructuredFixtureSummary(.{
+        .name = "alter table set data type summary",
+        .sql = "ALTER TABLE usage_records ALTER COLUMN status SET DATA TYPE text",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_set_data_type_sql);
+    try std.testing.expect(alter_set_data_type.parser.alter_table_type);
+    try std.testing.expect(alter_set_data_type.parser.alter_table_set_data_type);
+
+    var alter_rename_column_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records RENAME COLUMN status TO state");
+    defer alter_rename_column_sql.deinit(alloc);
+    const alter_rename_column = appParityStructuredFixtureSummary(.{
+        .name = "alter table rename column summary",
+        .sql = "ALTER TABLE usage_records RENAME COLUMN status TO state",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_rename_column_sql);
+    try std.testing.expect(alter_rename_column.parser.alter_table_rename_column);
+    try std.testing.expect(!alter_rename_column.parser.alter_table_rename_constraint);
+
+    var alter_rename_constraint_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_state_check");
+    defer alter_rename_constraint_sql.deinit(alloc);
+    const alter_rename_constraint = appParityStructuredFixtureSummary(.{
+        .name = "alter table rename constraint summary",
+        .sql = "ALTER TABLE usage_records RENAME CONSTRAINT usage_records_status_check TO usage_records_state_check",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_rename_constraint_sql);
+    try std.testing.expect(!alter_rename_constraint.parser.alter_table_rename_column);
+    try std.testing.expect(alter_rename_constraint.parser.alter_table_rename_constraint);
+
+    var alter_drop_trigger_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records DROP TRIGGER usage_records_update_policy");
+    defer alter_drop_trigger_sql.deinit(alloc);
+    const alter_drop_trigger = appParityStructuredFixtureSummary(.{
+        .name = "alter table drop trigger summary",
+        .sql = "ALTER TABLE usage_records DROP TRIGGER usage_records_update_policy",
+        .family = .ddl,
+        .summary = .{ .ddl_tag = .alter_table },
+        .plan = "ddl:alter_table:table=usage_records:actions=1",
+    }, &alter_drop_trigger_sql);
+    try std.testing.expect(alter_drop_trigger.parser.alter_table_trigger);
+    try std.testing.expect(alter_drop_trigger.parser.alter_table_drop_trigger);
+
+    var truncate_continue_sql = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE TABLE usage_records CONTINUE IDENTITY RESTRICT");
+    defer truncate_continue_sql.deinit(alloc);
+    const truncate_continue = appParityStructuredFixtureSummary(.{
+        .name = "truncate continue identity",
+        .sql = "TRUNCATE TABLE usage_records CONTINUE IDENTITY RESTRICT",
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records",
+    }, &truncate_continue_sql);
+    try std.testing.expect(truncate_continue.parser.truncate_continue_identity);
+    try std.testing.expect(!truncate_continue.parser.truncate_restart_identity);
+    try std.testing.expect(!truncate_continue.parser.truncate_archived_records);
+    try std.testing.expect(!truncate_continue.parser.truncate_cascade);
+
+    var truncate_restart_sql = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE TABLE usage_records RESTART IDENTITY");
+    defer truncate_restart_sql.deinit(alloc);
+    const truncate_restart = appParityStructuredFixtureSummary(.{
+        .name = "truncate restart identity",
+        .sql = "TRUNCATE TABLE usage_records RESTART IDENTITY",
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records:restart_identity=1",
+    }, &truncate_restart_sql);
+    try std.testing.expect(!truncate_restart.parser.truncate_continue_identity);
+    try std.testing.expect(truncate_restart.parser.truncate_restart_identity);
+
+    var truncate_multi_sql = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE TABLE usage_records, archived_records");
+    defer truncate_multi_sql.deinit(alloc);
+    const truncate_multi = appParityStructuredFixtureSummary(.{
+        .name = "truncate additional table",
+        .sql = "TRUNCATE TABLE usage_records, archived_records",
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records:additional_tables=1",
+    }, &truncate_multi_sql);
+    try std.testing.expect(truncate_multi.parser.truncate_archived_records);
+    try std.testing.expect(!truncate_multi.parser.truncate_cascade);
+
+    var truncate_cascade_sql = try tokenized.ParsedSql.initAlloc(alloc, "TRUNCATE TABLE usage_records CASCADE");
+    defer truncate_cascade_sql.deinit(alloc);
+    const truncate_cascade = appParityStructuredFixtureSummary(.{
+        .name = "truncate cascade",
+        .sql = "TRUNCATE TABLE usage_records CASCADE",
+        .family = .truncate_source,
+        .plan = "truncate_source:table=usage_records:cascade=1",
+    }, &truncate_cascade_sql);
+    try std.testing.expect(!truncate_cascade.parser.truncate_archived_records);
+    try std.testing.expect(truncate_cascade.parser.truncate_cascade);
+
+    var recursive_insert_sql = try tokenized.ParsedSql.initAlloc(alloc, "WITH RECURSIVE source AS (SELECT id FROM archived_records) INSERT INTO usage_records (id) SELECT id FROM source");
+    defer recursive_insert_sql.deinit(alloc);
+    const recursive_insert = appParityStructuredFixtureSummary(.{
+        .name = "recursive insert source",
+        .sql = "WITH RECURSIVE source AS (SELECT id FROM archived_records) INSERT INTO usage_records (id) SELECT id FROM source",
+        .family = .recursive_insert_source,
+        .plan = "recursive_insert_source:table=usage_records:ctes=1",
+    }, &recursive_insert_sql);
+    try std.testing.expect(recursive_insert.parser.starts_with_with);
+    try std.testing.expect(recursive_insert.parser.with_recursive);
+    try std.testing.expect(recursive_insert.parser.insert_into);
+
+    var joined_update_cte_sql = try tokenized.ParsedSql.initAlloc(alloc, "WITH source AS (SELECT id FROM archived_records) UPDATE usage_records SET status = source.id FROM source WHERE usage_records.id = source.id");
+    defer joined_update_cte_sql.deinit(alloc);
+    const joined_update_cte = appParityStructuredFixtureSummary(.{
+        .name = "joined update cte source",
+        .sql = "WITH source AS (SELECT id FROM archived_records) UPDATE usage_records SET status = source.id FROM source WHERE usage_records.id = source.id",
+        .family = .update_joined_source,
+        .plan = "update_joined_source:table=usage_records:ctes=1",
+    }, &joined_update_cte_sql);
+    try std.testing.expect(joined_update_cte.parser.starts_with_with);
+    try std.testing.expect(!joined_update_cte.parser.with_recursive);
+    try std.testing.expect(!joined_update_cte.parser.insert_into);
+
+    var graph_cte_sql = try tokenized.ParsedSql.initAlloc(alloc, "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records')) SELECT d.id FROM usage_records AS d JOIN gm ON d.id = gm.id");
+    defer graph_cte_sql.deinit(alloc);
+    const graph_cte = appParityStructuredFixtureSummary(.{
+        .name = "graph table function cte join",
+        .sql = "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records')) SELECT d.id FROM usage_records AS d JOIN gm ON d.id = gm.id",
+        .family = .read,
+        .plan = "read:join:left=usage_records:right=usage_records:ctes=1:right_source_cte=1",
+    }, &graph_cte_sql);
+    try std.testing.expect(graph_cte.parser.starts_with_with);
+    try std.testing.expect(graph_cte.parser.graph_match_table_function);
+    try std.testing.expect(graph_cte.parser.join_graph_match_table_function);
+
+    var graph_inline_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d.id FROM usage_records AS d JOIN antfly.graph_match(table_name => 'usage_records') AS gm ON d.id = gm.id");
+    defer graph_inline_sql.deinit(alloc);
+    const graph_inline = appParityStructuredFixtureSummary(.{
+        .name = "graph table function inline join",
+        .sql = "SELECT d.id FROM usage_records AS d JOIN antfly.graph_match(table_name => 'usage_records') AS gm ON d.id = gm.id",
+        .family = .read,
+        .plan = "read:join:left=usage_records:right=usage_records:ctes=1:right_source_cte=1",
+    }, &graph_inline_sql);
+    try std.testing.expect(!graph_inline.parser.starts_with_with);
+    try std.testing.expect(graph_inline.parser.graph_match_table_function);
+    try std.testing.expect(graph_inline.parser.join_graph_match_table_function);
+
+    var conflict_update_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'queued') ON CONFLICT (id) DO UPDATE SET status = DEFAULT");
+    defer conflict_update_sql.deinit(alloc);
+    const conflict_update = appParityStructuredFixtureSummary(.{
+        .name = "conflict update action summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'queued') ON CONFLICT (id) DO UPDATE SET status = DEFAULT",
+        .family = .insert,
+        .plan = "insert:table=usage_records:transforms=1",
+    }, &conflict_update_sql);
+    try std.testing.expect(conflict_update.parser.on_conflict);
+    try std.testing.expect(conflict_update.parser.conflict_do_update);
+    try std.testing.expect(conflict_update.parser.conflict_do_update_set);
+    try std.testing.expect(!conflict_update.parser.conflict_do_nothing);
+    try std.testing.expect(conflict_update.parser.conflict_set_status_default);
+
+    var conflict_nothing_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES ('u1', 'queued'), ('u2', 'open') ON CONFLICT (id) DO NOTHING RETURNING *");
+    defer conflict_nothing_sql.deinit(alloc);
+    const conflict_nothing = appParityStructuredFixtureSummary(.{
+        .name = "conflict do nothing action summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES ('u1', 'queued'), ('u2', 'open') ON CONFLICT (id) DO NOTHING RETURNING *",
+        .family = .insert,
+        .plan = "insert:table=usage_records:returning_all=1",
+    }, &conflict_nothing_sql);
+    try std.testing.expect(conflict_nothing.parser.on_conflict);
+    try std.testing.expect(conflict_nothing.parser.multi_row_insert);
+    try std.testing.expect(!conflict_nothing.parser.conflict_do_update);
+    try std.testing.expect(!conflict_nothing.parser.conflict_do_update_set);
+    try std.testing.expect(conflict_nothing.parser.conflict_do_nothing);
+    try std.testing.expect(!conflict_nothing.parser.conflict_set_status_default);
+
+    var insert_source_conflict_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) SELECT id, status FROM archived_records ON CONFLICT (id) DO UPDATE SET status = DEFAULT");
+    defer insert_source_conflict_sql.deinit(alloc);
+    const insert_source_conflict = appParityStructuredFixtureSummary(.{
+        .name = "insert source conflict default summary",
+        .sql = "INSERT INTO usage_records (id, status) SELECT id, status FROM archived_records ON CONFLICT (id) DO UPDATE SET status = DEFAULT",
+        .family = .insert_source,
+        .plan = "insert_source:table=usage_records:source_table=archived_records:conflict_ops=1",
+    }, &insert_source_conflict_sql);
+    try std.testing.expect(!insert_source_conflict.parser.on_conflict);
+    try std.testing.expect(insert_source_conflict.parser.conflict_do_update);
+    try std.testing.expect(insert_source_conflict.parser.conflict_do_update_set);
+    try std.testing.expect(!insert_source_conflict.parser.conflict_do_nothing);
+    try std.testing.expect(insert_source_conflict.parser.conflict_set_status_default);
+
+    var conflict_source_shapes_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status, quantity, enabled) VALUES ('u1', 'queued', 1, true) ON CONFLICT ON CONSTRAINT usage_records_pkey DO UPDATE SET (status, quantity) = ROW(CASE WHEN excluded.amount > amount THEN 'high' ELSE status END, DEFAULT), enabled = enabled OR excluded.enabled OR false");
+    defer conflict_source_shapes_sql.deinit(alloc);
+    const conflict_source_shapes = appParityStructuredFixtureSummary(.{
+        .name = "conflict source-write shape summary",
+        .sql = "INSERT INTO usage_records (id, status, quantity, enabled) VALUES ('u1', 'queued', 1, true) ON CONFLICT ON CONSTRAINT usage_records_pkey DO UPDATE SET (status, quantity) = ROW(CASE WHEN excluded.amount > amount THEN 'high' ELSE status END, DEFAULT), enabled = enabled OR excluded.enabled OR false",
+        .family = .insert,
+        .plan = "insert:table=usage_records:on_conflict=1:transforms=2",
+    }, &conflict_source_shapes_sql);
+    try std.testing.expect(conflict_source_shapes.parser.usage_records_pkey_conflict_constraint);
+    try std.testing.expect(conflict_source_shapes.parser.case_when_keywords);
+    try std.testing.expect(conflict_source_shapes.parser.excluded_amount_identifier);
+    try std.testing.expect(conflict_source_shapes.parser.amount_identifier);
+    try std.testing.expect(conflict_source_shapes.parser.set_row_assignment);
+    try std.testing.expect(conflict_source_shapes.parser.set_keyword);
+    try std.testing.expect(conflict_source_shapes.parser.status_identifier);
+    try std.testing.expect(conflict_source_shapes.parser.quantity_identifier);
+    try std.testing.expect(conflict_source_shapes.parser.row_function);
+    try std.testing.expect(conflict_source_shapes.parser.default_keyword);
+    try std.testing.expect(conflict_source_shapes.parser.enabled_identifier);
+    try std.testing.expect(conflict_source_shapes.parser.excluded_enabled_identifier);
+    try std.testing.expect(conflict_source_shapes.parser.or_keyword);
+    try std.testing.expect(conflict_source_shapes.parser.false_keyword);
+
+    var joined_boolean_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET enabled = usage_records.enabled OR source.enabled FROM source_records AS source WHERE usage_records.id = source.id");
+    defer joined_boolean_sql.deinit(alloc);
+    const joined_boolean = appParityStructuredFixtureSummary(.{
+        .name = "joined source boolean update summary",
+        .sql = "UPDATE usage_records SET enabled = usage_records.enabled OR source.enabled FROM source_records AS source WHERE usage_records.id = source.id",
+        .family = .update_joined_source,
+        .plan = "update_joined_source:target=usage_records:source=source_records:patch_expr=1",
+    }, &joined_boolean_sql);
+    try std.testing.expect(joined_boolean.parser.set_keyword);
+    try std.testing.expect(joined_boolean.parser.enabled_identifier);
+    try std.testing.expect(joined_boolean.parser.usage_records_enabled_identifier);
+    try std.testing.expect(joined_boolean.parser.source_enabled_identifier);
+    try std.testing.expect(joined_boolean.parser.or_keyword);
+    try std.testing.expect(!joined_boolean.parser.false_keyword);
+
+    var conflict_target_shapes_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (tenant_id, email, status) VALUES ('t1', 'a@example.test', 'active') ON CONFLICT (tenant_id, lower(email), upper(status)) WHERE email IS NOT NULL DO NOTHING");
+    defer conflict_target_shapes_sql.deinit(alloc);
+    const conflict_target_shapes = appParityStructuredFixtureSummary(.{
+        .name = "conflict target shape summary",
+        .sql = "INSERT INTO usage_records (tenant_id, email, status) VALUES ('t1', 'a@example.test', 'active') ON CONFLICT (tenant_id, lower(email), upper(status)) WHERE email IS NOT NULL DO NOTHING",
+        .family = .insert,
+        .plan = "insert:table=usage_records:on_conflict=1:conflict_where=1",
+    }, &conflict_target_shapes_sql);
+    try std.testing.expect(conflict_target_shapes.parser.conflict_target_email_identifier);
+    try std.testing.expect(conflict_target_shapes.parser.conflict_target_tenant_id_identifier);
+    try std.testing.expect(conflict_target_shapes.parser.conflict_target_lower_function);
+    try std.testing.expect(conflict_target_shapes.parser.conflict_target_upper_function);
+    try std.testing.expect(conflict_target_shapes.parser.conflict_target_where);
+    try std.testing.expect(!conflict_target_shapes.parser.usage_records_pkey_conflict_constraint);
+
+    var point_update_jsonb_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET metadata = jsonb_set(metadata, '{status}', to_jsonb(lower(status))) WHERE id = 'u1'");
+    defer point_update_jsonb_sql.deinit(alloc);
+    const point_update_jsonb = appParityStructuredFixtureSummary(.{
+        .name = "point update jsonb expression summary",
+        .sql = "UPDATE usage_records SET metadata = jsonb_set(metadata, '{status}', to_jsonb(lower(status))) WHERE id = 'u1'",
+        .family = .update,
+        .plan = "update:table=usage_records:op_set=1:ops=1",
+    }, &point_update_jsonb_sql);
+    try std.testing.expect(point_update_jsonb.parser.to_jsonb_function);
+    try std.testing.expect(point_update_jsonb.parser.lower_function);
+    try std.testing.expect(point_update_jsonb.parser.jsonb_identifier_prefix);
+    try std.testing.expect(!point_update_jsonb.parser.array_identifier_prefix);
+    try std.testing.expect(!point_update_jsonb.parser.excluded_identifier_prefix);
+
+    var point_update_array_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET tags = array_append(tags, 'queued') WHERE id = 'u1'");
+    defer point_update_array_sql.deinit(alloc);
+    const point_update_array = appParityStructuredFixtureSummary(.{
+        .name = "point update array expression summary",
+        .sql = "UPDATE usage_records SET tags = array_append(tags, 'queued') WHERE id = 'u1'",
+        .family = .update,
+        .plan = "update:table=usage_records:op_set=1",
+    }, &point_update_array_sql);
+    try std.testing.expect(!point_update_array.parser.jsonb_identifier_prefix);
+    try std.testing.expect(point_update_array.parser.array_identifier_prefix);
+    try std.testing.expect(!point_update_array.parser.gen_random_uuid_function);
+
+    var point_update_uuid_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET id = gen_random_uuid() WHERE id = 'u1'");
+    defer point_update_uuid_sql.deinit(alloc);
+    const point_update_uuid = appParityStructuredFixtureSummary(.{
+        .name = "point update uuid generation summary",
+        .sql = "UPDATE usage_records SET id = gen_random_uuid() WHERE id = 'u1'",
+        .family = .update,
+        .plan = "update:table=usage_records:op_set=1",
+    }, &point_update_uuid_sql);
+    try std.testing.expect(point_update_uuid.parser.gen_random_uuid_function);
+    try std.testing.expect(!point_update_uuid.parser.uuid_generate_v4_function);
+    try std.testing.expect(!point_update_uuid.parser.metadata_pipe_concat);
+
+    var query_uuid_v4_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT uuid_generate_v4() FROM usage_records");
+    defer query_uuid_v4_sql.deinit(alloc);
+    const query_uuid_v4 = appParityStructuredFixtureSummary(.{
+        .name = "query uuid_generate_v4 summary",
+        .sql = "SELECT uuid_generate_v4() FROM usage_records",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=1",
+    }, &query_uuid_v4_sql);
+    try std.testing.expect(query_uuid_v4.parser.uuid_generate_v4_function);
+    try std.testing.expect(!query_uuid_v4.parser.gen_random_uuid_function);
+
+    var point_update_concat_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET metadata = metadata || '{\"status\":\"queued\"}' WHERE id = 'u1'");
+    defer point_update_concat_sql.deinit(alloc);
+    const point_update_concat = appParityStructuredFixtureSummary(.{
+        .name = "point update metadata concat summary",
+        .sql = "UPDATE usage_records SET metadata = metadata || '{\"status\":\"queued\"}' WHERE id = 'u1'",
+        .family = .update,
+        .plan = "update:table=usage_records:op_set=1:ops=1",
+    }, &point_update_concat_sql);
+    try std.testing.expect(point_update_concat.parser.metadata_pipe_concat);
+    try std.testing.expect(!point_update_concat.parser.to_jsonb_function);
+
+    var point_update_lower_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = lower(status) WHERE id = 'u1'");
+    defer point_update_lower_sql.deinit(alloc);
+    const point_update_lower = appParityStructuredFixtureSummary(.{
+        .name = "point update lower assignment summary",
+        .sql = "UPDATE usage_records SET status = lower(status) WHERE id = 'u1'",
+        .family = .update,
+        .plan = "update:table=usage_records:op_set=1",
+    }, &point_update_lower_sql);
+    try std.testing.expect(point_update_lower.parser.lower_function);
+    try std.testing.expect(point_update_lower.parser.set_status_lower_assignment);
+    try std.testing.expect(!point_update_lower.parser.to_jsonb_function);
+
+    var conflict_excluded_json_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, metadata) VALUES ('u1', '{}') ON CONFLICT (id) DO UPDATE SET metadata = to_jsonb(excluded.metadata)");
+    defer conflict_excluded_json_sql.deinit(alloc);
+    const conflict_excluded_json = appParityStructuredFixtureSummary(.{
+        .name = "conflict excluded json summary",
+        .sql = "INSERT INTO usage_records (id, metadata) VALUES ('u1', '{}') ON CONFLICT (id) DO UPDATE SET metadata = to_jsonb(excluded.metadata)",
+        .family = .insert,
+        .plan = "insert:table=usage_records:transforms=1",
+    }, &conflict_excluded_json_sql);
+    try std.testing.expect(conflict_excluded_json.parser.to_jsonb_function);
+    try std.testing.expect(conflict_excluded_json.parser.excluded_identifier_prefix);
+    try std.testing.expect(!conflict_excluded_json.parser.set_status_lower_assignment);
+
+    var aggregate_modulo_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT sum(quantity % mod(amount, 10)) FROM usage_records");
+    defer aggregate_modulo_sql.deinit(alloc);
+    const aggregate_modulo = appParityStructuredFixtureSummary(.{
+        .name = "aggregate modulo expression summary",
+        .sql = "SELECT sum(quantity % mod(amount, 10)) FROM usage_records",
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:agg_expr=1",
+    }, &aggregate_modulo_sql);
+    try std.testing.expect(aggregate_modulo.parser.sum_function);
+    try std.testing.expect(aggregate_modulo.parser.mod_function);
+    try std.testing.expect(aggregate_modulo.parser.percent_operator);
+    try std.testing.expect(!aggregate_modulo.parser.octet_length_function);
+
+    var aggregate_length_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT octet_length(status), bit_length(status) FROM usage_records");
+    defer aggregate_length_sql.deinit(alloc);
+    const aggregate_length = appParityStructuredFixtureSummary(.{
+        .name = "aggregate length expression summary",
+        .sql = "SELECT octet_length(status), bit_length(status) FROM usage_records",
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:agg_expr=2",
+    }, &aggregate_length_sql);
+    try std.testing.expect(aggregate_length.parser.octet_length_function);
+    try std.testing.expect(aggregate_length.parser.bit_length_function);
+    try std.testing.expect(!aggregate_length.parser.sum_function);
+
+    var aggregate_minmax_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT min(lower(status)), max(lower(status)) FROM usage_records");
+    defer aggregate_minmax_sql.deinit(alloc);
+    const aggregate_minmax = appParityStructuredFixtureSummary(.{
+        .name = "aggregate scalar minmax summary",
+        .sql = "SELECT min(lower(status)), max(lower(status)) FROM usage_records",
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:agg_expr=2",
+    }, &aggregate_minmax_sql);
+    try std.testing.expect(aggregate_minmax.parser.min_function);
+    try std.testing.expect(aggregate_minmax.parser.max_function);
+    try std.testing.expect(aggregate_minmax.parser.lower_function);
+    try std.testing.expect(!aggregate_minmax.parser.regexp_count_function);
+
+    var aggregate_regexp_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT regexp_count(status, 'a'), regexp_instr(status, 'a'), count(DISTINCT regexp_substr(status, 'a')) FROM usage_records");
+    defer aggregate_regexp_sql.deinit(alloc);
+    const aggregate_regexp = appParityStructuredFixtureSummary(.{
+        .name = "aggregate regexp expression summary",
+        .sql = "SELECT regexp_count(status, 'a'), regexp_instr(status, 'a'), count(DISTINCT regexp_substr(status, 'a')) FROM usage_records",
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:agg_expr=3",
+    }, &aggregate_regexp_sql);
+    try std.testing.expect(aggregate_regexp.parser.regexp_count_function);
+    try std.testing.expect(aggregate_regexp.parser.regexp_instr_function);
+    try std.testing.expect(aggregate_regexp.parser.regexp_substr_function);
+    try std.testing.expect(aggregate_regexp.parser.count_distinct_function);
+    try std.testing.expect(!aggregate_regexp.parser.percent_operator);
+
+    var query_regexp_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT regexp_replace(status, 'a', 'b'), regexp_substr(status, 'a'), regexp_count(status, 'a'), regexp_instr(status, 'a') FROM usage_records WHERE status ~ 'a' AND status !~* 'b' ORDER BY regexp_instr(status, 'a')");
+    defer query_regexp_sql.deinit(alloc);
+    const query_regexp = appParityStructuredFixtureSummary(.{
+        .name = "query regexp expression summary",
+        .sql = "SELECT regexp_replace(status, 'a', 'b'), regexp_substr(status, 'a'), regexp_count(status, 'a'), regexp_instr(status, 'a') FROM usage_records WHERE status ~ 'a' AND status !~* 'b' ORDER BY regexp_instr(status, 'a')",
+        .family = .query,
+        .plan = "query:table=usage_records:expr_pred=1:expr=4:order_expr=1",
+    }, &query_regexp_sql);
+    try std.testing.expect(query_regexp.parser.regexp_replace_function);
+    try std.testing.expect(query_regexp.parser.regexp_substr_function);
+    try std.testing.expect(query_regexp.parser.regexp_count_function);
+    try std.testing.expect(query_regexp.parser.regexp_instr_function);
+    try std.testing.expect(query_regexp.parser.regex_match_operator);
+    try std.testing.expect(query_regexp.parser.regex_not_imatch_operator);
+    try std.testing.expect(!query_regexp.parser.regexp_like_function);
+
+    var conflict_regexp_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, status) VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET status = regexp_replace(excluded.status, 'a', 'b'), next_status = regexp_substr(excluded.status, 'a'), amount = regexp_count(excluded.status, 'a') + regexp_instr(excluded.status, 'a') WHERE regexp_like(excluded.status, 'a') OR regexp_match(excluded.status, 'a') IS NOT NULL");
+    defer conflict_regexp_sql.deinit(alloc);
+    const conflict_regexp = appParityStructuredFixtureSummary(.{
+        .name = "conflict regexp expression summary",
+        .sql = "INSERT INTO usage_records (id, status) VALUES (1, 'new') ON CONFLICT (id) DO UPDATE SET status = regexp_replace(excluded.status, 'a', 'b'), next_status = regexp_substr(excluded.status, 'a'), amount = regexp_count(excluded.status, 'a') + regexp_instr(excluded.status, 'a') WHERE regexp_like(excluded.status, 'a') OR regexp_match(excluded.status, 'a') IS NOT NULL",
+        .family = .insert,
+        .plan = "insert:table=usage_records:on_conflict=1:conflict_ops=3:transforms=3",
+    }, &conflict_regexp_sql);
+    try std.testing.expect(conflict_regexp.parser.excluded_status_identifier);
+    try std.testing.expect(conflict_regexp.parser.regexp_replace_function);
+    try std.testing.expect(conflict_regexp.parser.regexp_like_function);
+    try std.testing.expect(conflict_regexp.parser.regexp_match_function);
+    try std.testing.expect(conflict_regexp.parser.regexp_count_function);
+    try std.testing.expect(conflict_regexp.parser.regexp_instr_function);
+    try std.testing.expect(conflict_regexp.parser.regexp_substr_function);
+    try std.testing.expect(!conflict_regexp.parser.regex_match_operator);
+
+    var query_string_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT substring(status, 1, 2), substr(status, 2, 3), overlay(status placing 'x' from 1 for 1), translate(status, 'a', 'b'), split_part(status, '-', 1), strpos(status, 'a'), position('a' in status), left(status, 2), right(status, 2), btrim(status), ltrim(status), rtrim(status), lpad(status, 4, '0'), rpad(status, 4, '0'), repeat(status, 2), reverse(status), initcap(status), md5(status), concat_ws('-', status, next_status), nullif(status, ''), starts_with(status, 'a'), ends_with(status, 'z'), ascii(status), chr(65) FROM usage_records");
+    defer query_string_sql.deinit(alloc);
+    const query_string = appParityStructuredFixtureSummary(.{
+        .name = "query string expression summary",
+        .sql = "SELECT substring(status, 1, 2), substr(status, 2, 3), overlay(status placing 'x' from 1 for 1), translate(status, 'a', 'b'), split_part(status, '-', 1), strpos(status, 'a'), position('a' in status), left(status, 2), right(status, 2), btrim(status), ltrim(status), rtrim(status), lpad(status, 4, '0'), rpad(status, 4, '0'), repeat(status, 2), reverse(status), initcap(status), md5(status), concat_ws('-', status, next_status), nullif(status, ''), starts_with(status, 'a'), ends_with(status, 'z'), ascii(status), chr(65) FROM usage_records",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=24:expr_pred=1:order_expr=1",
+    }, &query_string_sql);
+    try std.testing.expect(query_string.parser.substring_function);
+    try std.testing.expect(query_string.parser.substr_function);
+    try std.testing.expect(query_string.parser.overlay_function);
+    try std.testing.expect(query_string.parser.translate_function);
+    try std.testing.expect(query_string.parser.split_part_function);
+    try std.testing.expect(query_string.parser.strpos_function);
+    try std.testing.expect(query_string.parser.position_function);
+    try std.testing.expect(query_string.parser.left_function);
+    try std.testing.expect(query_string.parser.right_function);
+    try std.testing.expect(query_string.parser.btrim_function);
+    try std.testing.expect(query_string.parser.ltrim_function);
+    try std.testing.expect(query_string.parser.rtrim_function);
+    try std.testing.expect(query_string.parser.lpad_function);
+    try std.testing.expect(query_string.parser.rpad_function);
+    try std.testing.expect(query_string.parser.repeat_function);
+    try std.testing.expect(query_string.parser.reverse_function);
+    try std.testing.expect(query_string.parser.initcap_function);
+    try std.testing.expect(query_string.parser.md5_function);
+    try std.testing.expect(query_string.parser.concat_ws_function);
+    try std.testing.expect(query_string.parser.nullif_function);
+    try std.testing.expect(query_string.parser.starts_with_function);
+    try std.testing.expect(query_string.parser.ends_with_function);
+    try std.testing.expect(query_string.parser.ascii_function);
+    try std.testing.expect(query_string.parser.chr_function);
+    try std.testing.expect(!query_string.parser.jsonb_build_object_function);
+
+    var query_json_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT jsonb_build_object('status', status), to_jsonb(metadata), jsonb_extract_path_text(metadata, 'source'), convert_from(metadata_bytes, 'UTF8') FROM usage_records WHERE convert_from(metadata_bytes, 'UTF8') = 'ok'");
+    defer query_json_sql.deinit(alloc);
+    const query_json = appParityStructuredFixtureSummary(.{
+        .name = "query json expression summary",
+        .sql = "SELECT jsonb_build_object('status', status), to_jsonb(metadata), jsonb_extract_path_text(metadata, 'source'), convert_from(metadata_bytes, 'UTF8') FROM usage_records WHERE convert_from(metadata_bytes, 'UTF8') = 'ok'",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=3:expr_pred=1",
+    }, &query_json_sql);
+    try std.testing.expect(query_json.parser.jsonb_build_object_function);
+    try std.testing.expect(query_json.parser.jsonb_extract_path_text_function);
+    try std.testing.expect(query_json.parser.to_jsonb_function);
+    try std.testing.expect(query_json.parser.convert_from_utf8_function);
+    try std.testing.expect(query_json.parser.status_string_literal);
+    try std.testing.expect(query_json.parser.source_string_literal);
+    try std.testing.expect(!query_json.parser.array_append_function);
+
+    var query_array_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT cardinality(tags), array_positions(tags, 'a'), array_append(tags, 'b'), array_cat(tags, ARRAY['c']), array_remove(tags, 'd'), array_replace(tags, 'e', 'f'), array_to_string(tags, ','), string_to_array(status, ',') FROM usage_records WHERE array_position(tags, 'a') > 0");
+    defer query_array_sql.deinit(alloc);
+    const query_array = appParityStructuredFixtureSummary(.{
+        .name = "query array expression summary",
+        .sql = "SELECT cardinality(tags), array_positions(tags, 'a'), array_append(tags, 'b'), array_cat(tags, ARRAY['c']), array_remove(tags, 'd'), array_replace(tags, 'e', 'f'), array_to_string(tags, ','), string_to_array(status, ',') FROM usage_records WHERE array_position(tags, 'a') > 0",
+        .family = .query,
+        .plan = "query:table=usage_records:expr=8:expr_pred=1",
+    }, &query_array_sql);
+    try std.testing.expect(query_array.parser.cardinality_function);
+    try std.testing.expect(query_array.parser.array_position_function);
+    try std.testing.expect(query_array.parser.array_positions_function);
+    try std.testing.expect(query_array.parser.array_append_function);
+    try std.testing.expect(query_array.parser.array_cat_function);
+    try std.testing.expect(query_array.parser.array_remove_function);
+    try std.testing.expect(query_array.parser.array_replace_function);
+    try std.testing.expect(query_array.parser.array_to_string_function);
+    try std.testing.expect(query_array.parser.string_to_array_function);
+    try std.testing.expect(!query_array.parser.regexp_count_function);
+
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document schema malformed generated parse failure",
+        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{bad json}')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_malformed_schema_json",
+        .plan = "unsupported:ddl:requires=document_table_ddl_malformed_schema_json",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document missing default generated parse failure",
+        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_missing_default_type",
+        .plan = "unsupported:ddl:requires=document_table_ddl_missing_default_type",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document unknown default type generated parse failure",
+        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice', antfly.document_schema.doc = '{\"type\":\"object\"}')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_unknown_default_type",
+        .plan = "unsupported:ddl:requires=document_table_ddl_unknown_default_type",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document invalid antfly extension generated parse failure",
+        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"x-antfly-unknown\":true}')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_invalid_antfly_extension",
+        .plan = "unsupported:ddl:requires=document_table_ddl_invalid_antfly_extension",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document invalid dynamic template generated parse failure",
+        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"dynamic_templates\":\"bad\"}')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_invalid_dynamic_template",
+        .plan = "unsupported:ddl:requires=document_table_ddl_invalid_dynamic_template",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document multi type generated parse failure",
+        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\"}', antfly.document_schema.invoice = '{\"type\":\"object\"}')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_multi_document_type_unsupported",
+        .plan = "unsupported:ddl:requires=document_table_ddl_multi_document_type_unsupported",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document mixed relational generated parse failure",
+        .sql = "CREATE TABLE docs (id uuid PRIMARY KEY) WITH (antfly.storage_mode = 'document')",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_mixed_relational_shape",
+        .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+    }, error.UnexpectedToken));
+    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
+        .name = "document shorthand generated parse failure",
+        .sql = "CREATE DOCUMENT TABLE docs",
+        .family = .unsupported_ddl,
+        .classification_reason = "document_table_ddl_shorthand",
+        .plan = "unsupported:ddl:requires=document_table_ddl_shorthand",
+    }, error.UnexpectedToken));
+
+    var aggregate_shape_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT lower(status) AS status_key, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC NULLS LAST), percentile_disc(0.5) WITHIN GROUP (ORDER BY amount), count(*) AS customer_id, array_agg(DISTINCT metadata->'source') FROM usage_records GROUP BY status_key");
+    defer aggregate_shape_sql.deinit(alloc);
+    const aggregate_shape = appParityStructuredFixtureSummary(.{
+        .name = "aggregate structured shape summary",
+        .sql = "SELECT lower(status) AS status_key, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC NULLS LAST), percentile_disc(0.5) WITHIN GROUP (ORDER BY amount), count(*) AS customer_id, array_agg(DISTINCT metadata->'source') FROM usage_records GROUP BY status_key",
+        .family = .aggregate,
+        .plan = "aggregate:table=usage_records:group_expr=1:aggs=4:agg_expr=1",
+    }, &aggregate_shape_sql);
+    try std.testing.expect(aggregate_shape.parser.percentile_cont_function);
+    try std.testing.expect(aggregate_shape.parser.percentile_disc_function);
+    try std.testing.expect(aggregate_shape.parser.within_group_keywords);
+    try std.testing.expect(aggregate_shape.parser.group_by_keywords);
+    try std.testing.expect(aggregate_shape.parser.desc_keyword);
+    try std.testing.expect(aggregate_shape.parser.nulls_identifier);
+    try std.testing.expect(aggregate_shape.parser.count_function);
+    try std.testing.expect(aggregate_shape.parser.as_keyword);
+    try std.testing.expect(aggregate_shape.parser.customer_id_identifier);
+    try std.testing.expect(aggregate_shape.parser.status_key_identifier);
+    try std.testing.expect(aggregate_shape.parser.array_agg_distinct_function);
+    try std.testing.expect(aggregate_shape.parser.arrow_json_operator);
+
+    var join_shape_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT o.id FROM orders AS o JOIN customers AS c ON o.customer_id = c.id AND c.kind = 'customer' AND lower(o.kind) = lower(c.kind) WHERE o.kind = 'order'");
+    defer join_shape_sql.deinit(alloc);
+    const join_shape = appParityStructuredFixtureSummary(.{
+        .name = "join structured predicate summary",
+        .sql = "SELECT o.id FROM orders AS o JOIN customers AS c ON o.customer_id = c.id AND c.kind = 'customer' AND lower(o.kind) = lower(c.kind) WHERE o.kind = 'order'",
+        .family = .join,
+        .plan = "join:left=orders:right=customers:on_expr_pred=1",
+    }, &join_shape_sql);
+    try std.testing.expect(join_shape.parser.o_customer_id_identifier);
+    try std.testing.expect(join_shape.parser.c_id_identifier);
+    try std.testing.expect(join_shape.parser.c_kind_identifier);
+    try std.testing.expect(join_shape.parser.o_kind_identifier);
+    try std.testing.expect(join_shape.parser.customer_string_literal);
+    try std.testing.expect(join_shape.parser.order_string_literal);
+    try std.testing.expect(join_shape.parser.lower_function);
+    try std.testing.expect(!join_shape.parser.percentile_cont_function);
+
+    var joined_source_shape_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = source.status FROM source_records AS source WHERE (usage_records.id, organization_id) IN (SELECT id, organization_id FROM archived_records) AND EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status AND lower(archived_records.status) = lower(usage_records.status)) RETURNING lower(source.status), source.id");
+    defer joined_source_shape_sql.deinit(alloc);
+    const joined_source_shape = appParityStructuredFixtureSummary(.{
+        .name = "joined source semijoin summary",
+        .sql = "UPDATE usage_records SET status = source.status FROM source_records AS source WHERE (usage_records.id, organization_id) IN (SELECT id, organization_id FROM archived_records) AND EXISTS (SELECT 1 FROM archived_records WHERE archived_records.organization_id = 'o1' AND archived_records.status = usage_records.status AND lower(archived_records.status) = lower(usage_records.status)) RETURNING lower(source.status), source.id",
+        .family = .update_joined_source,
+        .plan = "update_joined_source:table=usage_records:match_expr_pred=1:returning_expr=1",
+    }, &joined_source_shape_sql);
+    try std.testing.expect(joined_source_shape.parser.returning_keyword);
+    try std.testing.expect(joined_source_shape.parser.source_identifier_prefix);
+    try std.testing.expect(joined_source_shape.parser.in_select_from_keywords);
+    try std.testing.expect(joined_source_shape.parser.organization_id_identifier);
+    try std.testing.expect(joined_source_shape.parser.archived_records_identifier);
+    try std.testing.expect(joined_source_shape.parser.archived_records_status_identifier);
+    try std.testing.expect(joined_source_shape.parser.usage_records_status_identifier);
+    try std.testing.expect(joined_source_shape.parser.archived_records_organization_id_identifier);
+    try std.testing.expect(joined_source_shape.parser.o1_string_literal);
+    try std.testing.expect(joined_source_shape.parser.usage_records_id_identifier);
+    try std.testing.expect(joined_source_shape.parser.where_exists_keywords);
+    try std.testing.expect(joined_source_shape.parser.where_keyword);
+    try std.testing.expect(joined_source_shape.parser.in_keyword);
+    try std.testing.expect(joined_source_shape.parser.row_value_identifier_pair);
+
+    var window_shape_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT row_number() OVER (ORDER BY id) AS id FROM usage_records");
+    defer window_shape_sql.deinit(alloc);
+    const window_shape = appParityStructuredFixtureSummary(.{
+        .name = "window duplicate label summary",
+        .sql = "SELECT row_number() OVER (ORDER BY id) AS id FROM usage_records",
+        .family = .read,
+        .plan = "read:window:table=usage_records:window_expr=1",
+    }, &window_shape_sql);
+    try std.testing.expect(window_shape.parser.row_number_function);
+    try std.testing.expect(window_shape.parser.over_keyword);
+    try std.testing.expect(window_shape.parser.as_keyword);
+    try std.testing.expect(window_shape.parser.id_identifier);
+    try std.testing.expect(!window_shape.parser.percentile_cont_function);
+
+    var query_function_search_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT * FROM antfly.semantic_search(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.vector_search(table_name => 'usage_records') UNION ALL SELECT * FROM full_text_search('body:alpha')");
+    defer query_function_search_sql.deinit(alloc);
+    const query_function_search = appParityStructuredFixtureSummary(.{
+        .name = "query function search summary",
+        .sql = "SELECT * FROM antfly.semantic_search(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.vector_search(table_name => 'usage_records') UNION ALL SELECT * FROM full_text_search('body:alpha')",
+        .family = .query_function,
+        .plan = "query_function:table=usage_records:dense=1",
+    }, &query_function_search_sql);
+    try std.testing.expect(query_function_search.parser.full_text_search_function);
+    try std.testing.expect(query_function_search.parser.semantic_search_function);
+    try std.testing.expect(query_function_search.parser.vector_search_function);
+    try std.testing.expect(!query_function_search.parser.hybrid_search_function);
+    try std.testing.expect(!query_function_search.parser.graph_traverse_function);
+    try std.testing.expect(!query_function_search.parser.sources_json_identifier);
+
+    var query_function_graph_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT * FROM antfly.graph_traverse(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_shortest_path(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric_rerank(table_name => 'usage_records')");
+    defer query_function_graph_sql.deinit(alloc);
+    const query_function_graph = appParityStructuredFixtureSummary(.{
+        .name = "query function graph summary",
+        .sql = "SELECT * FROM antfly.graph_traverse(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_shortest_path(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric_rerank(table_name => 'usage_records')",
+        .family = .query_function,
+        .plan = "query_function:table=usage_records:graph_search=1",
+    }, &query_function_graph_sql);
+    try std.testing.expect(query_function_graph.parser.graph_traverse_function);
+    try std.testing.expect(query_function_graph.parser.graph_shortest_path_function);
+    try std.testing.expect(query_function_graph.parser.graph_k_shortest_paths_function);
+    try std.testing.expect(query_function_graph.parser.graph_metric_function);
+    try std.testing.expect(query_function_graph.parser.graph_metric_rerank_function);
+    try std.testing.expect(!query_function_graph.parser.semantic_search_function);
+
+    var query_function_hybrid_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT * FROM antfly.hybrid_search(table_name => 'usage_records', sources_json => sources_json, source => antfly.source('dense'))");
+    defer query_function_hybrid_sql.deinit(alloc);
+    const query_function_hybrid = appParityStructuredFixtureSummary(.{
+        .name = "query function hybrid helper summary",
+        .sql = "SELECT * FROM antfly.hybrid_search(table_name => 'usage_records', sources_json => sources_json, source => antfly.source('dense'))",
+        .family = .query_function,
+        .plan = "query_function:table=usage_records:merge=1",
+    }, &query_function_hybrid_sql);
+    try std.testing.expect(query_function_hybrid.parser.hybrid_search_function);
+    try std.testing.expect(query_function_hybrid.parser.sources_json_identifier);
+    try std.testing.expect(query_function_hybrid.parser.antfly_source_function);
+    try std.testing.expect(!query_function_hybrid.parser.vector_search_function);
+
+    var set_operation_fetch_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records ORDER BY id FETCH FIRST 1 ROW ONLY");
+    defer set_operation_fetch_sql.deinit(alloc);
+    const set_operation_fetch = appParityStructuredFixtureSummary(.{
+        .name = "set operation fetch tail",
+        .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records ORDER BY id FETCH FIRST 1 ROW ONLY",
+        .family = .read,
+        .plan = "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:right=right:table=archived_records:result_order=1:result_limit=1",
+    }, &set_operation_fetch_sql);
+    try std.testing.expect(set_operation_fetch.parser.@"union");
+    try std.testing.expect(set_operation_fetch.parser.union_all);
+    try std.testing.expect(!set_operation_fetch.parser.intersect);
+    try std.testing.expect(set_operation_fetch.parser.order_by);
+    try std.testing.expect(set_operation_fetch.parser.fetch_first);
+    try std.testing.expect(!set_operation_fetch.parser.limit_null_offset_null);
+    try std.testing.expect(!set_operation_fetch.parser.scoped_identifier);
+    try std.testing.expect(set_operation_fetch.plan.read_set_operation);
+
+    var set_operation_null_tail_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records LIMIT NULL OFFSET NULL");
+    defer set_operation_null_tail_sql.deinit(alloc);
+    const set_operation_null_tail = appParityStructuredFixtureSummary(.{
+        .name = "set operation null pagination tail",
+        .sql = "SELECT id FROM usage_records UNION ALL SELECT id FROM archived_records LIMIT NULL OFFSET NULL",
+        .family = .query,
+        .plan = "query:table=usage_records:or=2:limit=none",
+    }, &set_operation_null_tail_sql);
+    try std.testing.expect(set_operation_null_tail.parser.@"union");
+    try std.testing.expect(set_operation_null_tail.parser.union_all);
+    try std.testing.expect(!set_operation_null_tail.parser.order_by);
+    try std.testing.expect(!set_operation_null_tail.parser.fetch_first);
+    try std.testing.expect(set_operation_null_tail.parser.limit_null_offset_null);
+
+    var cte_set_operation_sql = try tokenized.ParsedSql.initAlloc(alloc, "WITH scoped AS (SELECT id FROM usage_records) SELECT id FROM scoped WHERE id = 'a' UNION SELECT id FROM scoped WHERE id = 'b' ORDER BY id");
+    defer cte_set_operation_sql.deinit(alloc);
+    const cte_set_operation = appParityStructuredFixtureSummary(.{
+        .name = "cte set operation tail",
+        .sql = "WITH scoped AS (SELECT id FROM usage_records) SELECT id FROM scoped WHERE id = 'a' UNION SELECT id FROM scoped WHERE id = 'b' ORDER BY id",
+        .family = .query,
+        .plan = "query:table=usage_records:ctes=1:source_cte=1:or=2:order=1",
+    }, &cte_set_operation_sql);
+    try std.testing.expect(cte_set_operation.parser.starts_with_with);
+    try std.testing.expect(cte_set_operation.parser.scoped_identifier);
+    try std.testing.expect(cte_set_operation.parser.@"union");
+    try std.testing.expect(!cte_set_operation.parser.union_all);
+    try std.testing.expect(cte_set_operation.parser.order_by);
+    try std.testing.expect(!cte_set_operation.parser.fetch_first);
+    try std.testing.expect(!cte_set_operation.parser.limit_null_offset_null);
+
+    var set_operation_numeric_range_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT amount FROM usage_records WHERE amount < 10 UNION ALL SELECT amount FROM archived_records WHERE amount >= 20");
+    defer set_operation_numeric_range_sql.deinit(alloc);
+    const set_operation_numeric_range = appParityStructuredFixtureSummary(.{
+        .name = "set operation numeric range summary",
+        .sql = "SELECT amount FROM usage_records WHERE amount < 10 UNION ALL SELECT amount FROM archived_records WHERE amount >= 20",
+        .family = .query,
+        .plan = "query:table=usage_records:or=2",
+    }, &set_operation_numeric_range_sql);
+    try std.testing.expect(set_operation_numeric_range.parser.union_all);
+    try std.testing.expect(set_operation_numeric_range.parser.amount_identifier);
+    try std.testing.expect(set_operation_numeric_range.parser.lt_or_lte_operator);
+    try std.testing.expect(set_operation_numeric_range.parser.gt_or_gte_operator);
+    try std.testing.expect(!set_operation_numeric_range.parser.quantity_identifier);
+    try std.testing.expect(!set_operation_numeric_range.parser.plus_operator);
+
+    var set_operation_expression_range_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT amount + quantity FROM usage_records WHERE amount + quantity <= 10 UNION ALL SELECT amount + quantity FROM archived_records WHERE amount + quantity > 20");
+    defer set_operation_expression_range_sql.deinit(alloc);
+    const set_operation_expression_range = appParityStructuredFixtureSummary(.{
+        .name = "set operation expression range summary",
+        .sql = "SELECT amount + quantity FROM usage_records WHERE amount + quantity <= 10 UNION ALL SELECT amount + quantity FROM archived_records WHERE amount + quantity > 20",
+        .family = .query,
+        .plan = "query:table=usage_records:expr_or=2",
+    }, &set_operation_expression_range_sql);
+    try std.testing.expect(set_operation_expression_range.parser.union_all);
+    try std.testing.expect(set_operation_expression_range.parser.amount_identifier);
+    try std.testing.expect(set_operation_expression_range.parser.quantity_identifier);
+    try std.testing.expect(set_operation_expression_range.parser.plus_operator);
+    try std.testing.expect(set_operation_expression_range.parser.lt_or_lte_operator);
+    try std.testing.expect(set_operation_expression_range.parser.gt_or_gte_operator);
+
+    var nulls_not_distinct_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT");
+    defer nulls_not_distinct_sql.deinit(alloc);
+    const nulls_not_distinct = appParityStructuredFixtureSummary(.{
+        .name = "nulls not distinct unique summary",
+        .sql = "CREATE UNIQUE INDEX usage_records_email_nulls_key ON usage_records (email) NULLS NOT DISTINCT",
+        .family = .ddl,
+        .plan = "ddl:create_index:table=usage_records:unique=1:nulls_not_distinct=1",
+    }, &nulls_not_distinct_sql);
+    try std.testing.expect(nulls_not_distinct.parser.unique_keyword);
+    try std.testing.expect(nulls_not_distinct.parser.nulls_not_distinct);
+    try std.testing.expect(!nulls_not_distinct.parser.sequence_as_bigint_owned_by);
+
+    var create_sequence_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id");
+    defer create_sequence_sql.deinit(alloc);
+    const create_sequence = appParityStructuredFixtureSummary(.{
+        .name = "create sequence typed owned summary",
+        .sql = "CREATE SEQUENCE public.usage_records_id_seq AS bigint START WITH 1 OWNED BY public.usage_records.id",
+        .family = .ddl,
+        .plan = "ddl:create_sequence:name=usage_records_id_seq:type=bigint:owned_by=usage_records.id",
+    }, &create_sequence_sql);
+    try std.testing.expect(create_sequence.parser.sequence_as_bigint_owned_by);
+    try std.testing.expect(!create_sequence.parser.sequence_as_integer_owned_by_none);
+
+    var alter_sequence_sql = try tokenized.ParsedSql.initAlloc(alloc, "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE");
+    defer alter_sequence_sql.deinit(alloc);
+    const alter_sequence = appParityStructuredFixtureSummary(.{
+        .name = "alter sequence typed owned none summary",
+        .sql = "ALTER SEQUENCE IF EXISTS usage_records_id_seq AS integer OWNED BY NONE",
+        .family = .ddl,
+        .plan = "ddl:alter_sequence:name=usage_records_id_seq:type=integer:owned_by=none",
+    }, &alter_sequence_sql);
+    try std.testing.expect(!alter_sequence.parser.sequence_as_bigint_owned_by);
+    try std.testing.expect(alter_sequence.parser.sequence_as_integer_owned_by_none);
+
+    var function_security_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE FUNCTION external_secure_audit() RETURNS trigger LANGUAGE plpgsql EXTERNAL SECURITY DEFINER");
+    defer function_security_sql.deinit(alloc);
+    const function_security = appParityStructuredFixtureSummary(.{
+        .name = "function external security summary",
+        .sql = "CREATE FUNCTION external_secure_audit() RETURNS trigger LANGUAGE plpgsql EXTERNAL SECURITY DEFINER",
+        .family = .ddl,
+        .plan = "ddl:create_function:name=external_secure_audit:security=definer",
+    }, &function_security_sql);
+    try std.testing.expect(function_security.parser.external_security_identifiers);
+    try std.testing.expect(!function_security.parser.status_text_text_lower_body);
+
+    var function_named_arg_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE FUNCTION normalize_named_status(status_text text) RETURNS text LANGUAGE sql AS $$SELECT lower(status_text)$$");
+    defer function_named_arg_sql.deinit(alloc);
+    const function_named_arg = appParityStructuredFixtureSummary(.{
+        .name = "function named arg expression body summary",
+        .sql = "CREATE FUNCTION normalize_named_status(status_text text) RETURNS text LANGUAGE sql AS $$SELECT lower(status_text)$$",
+        .family = .ddl,
+        .plan = "ddl:create_function:name=normalize_named_status:body=sql_expression:hook=expression",
+    }, &function_named_arg_sql);
+    try std.testing.expect(!function_named_arg.parser.external_security_identifiers);
+    try std.testing.expect(function_named_arg.parser.status_text_text_lower_body);
+
+    var prepare_cte_sql = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)");
+    defer prepare_cte_sql.deinit(alloc);
+    const prepare_cte = appParityStructuredFixtureSummary(.{
+        .name = "prepare cte summary",
+        .sql = "PREPARE cte_write_plan AS WITH source_rows AS (SELECT id FROM usage_records) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows)",
+        .family = .ddl,
+        .plan = "ddl:prepare_statement:subject=write:statement=update",
+    }, &prepare_cte_sql);
+    try std.testing.expect(prepare_cte.parser.prepare_as_with);
+    try std.testing.expect(!prepare_cte.parser.prepare_as_with_recursive);
+
+    var prepare_recursive_cte_sql = try tokenized.ParsedSql.initAlloc(alloc, "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows");
+    defer prepare_recursive_cte_sql.deinit(alloc);
+    const prepare_recursive_cte = appParityStructuredFixtureSummary(.{
+        .name = "prepare recursive cte summary",
+        .sql = "PREPARE recursive_usage_read_plan AS WITH RECURSIVE source_rows AS (SELECT id FROM usage_records) SELECT id FROM source_rows",
+        .family = .ddl,
+        .plan = "ddl:prepare_statement:subject=read:statement=read",
+    }, &prepare_recursive_cte_sql);
+    try std.testing.expect(prepare_recursive_cte.parser.prepare_as_with);
+    try std.testing.expect(prepare_recursive_cte.parser.prepare_as_with_recursive);
+
+    var invalid_read_lock_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records");
+    defer invalid_read_lock_sql.deinit(alloc);
+    const invalid_read_lock = appParityStructuredFixtureSummary(.{
+        .name = "invalid read row lock target",
+        .sql = "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records",
+        .family = .invalid_read,
+        .classification_reason = "row_lock_mode_plan",
+        .plan = "invalid:read:reason=row_lock_mode_plan",
+    }, &invalid_read_lock_sql);
+    try std.testing.expect(invalid_read_lock.parser.row_lock_for_update_of);
+    try std.testing.expect(invalid_read_lock.parser.row_lock_of_archived_records);
+    try std.testing.expect(!invalid_read_lock.parser.row_lock_of_source);
+    try std.testing.expect(invalid_read_lock.hasReason("row_lock_mode_plan"));
+
+    var invalid_update_lock_mode_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id");
+    defer invalid_update_lock_mode_sql.deinit(alloc);
+    const invalid_update_lock_mode = appParityStructuredFixtureSummary(.{
+        .name = "invalid update source row lock mode",
+        .sql = "UPDATE usage_records SET status = 'processing' WHERE status = 'queued' FOR SHARE RETURNING id",
+        .family = .invalid_update_source,
+        .classification_reason = "row_lock_mode_plan",
+        .plan = "invalid:update_source:reason=row_lock_mode_plan",
+    }, &invalid_update_lock_mode_sql);
+    try std.testing.expect(invalid_update_lock_mode.parser.row_lock_for_share);
+    try std.testing.expect(!invalid_update_lock_mode.parser.row_lock_for_update_of);
+    try std.testing.expect(invalid_update_lock_mode.hasReason("row_lock_mode_plan"));
+
+    var invalid_joined_lock_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id");
+    defer invalid_joined_lock_sql.deinit(alloc);
+    const invalid_joined_lock = appParityStructuredFixtureSummary(.{
+        .name = "invalid joined update source row lock target",
+        .sql = "UPDATE usage_records AS target SET status = source.status FROM source_records AS source WHERE target.id = source.id FOR UPDATE OF source RETURNING target.id",
+        .family = .invalid_update_joined_source,
+        .classification_reason = "row_lock_mode_plan",
+        .plan = "invalid:update_joined_source:reason=row_lock_mode_plan",
+    }, &invalid_joined_lock_sql);
+    try std.testing.expect(invalid_joined_lock.parser.row_lock_for_update_of);
+    try std.testing.expect(!invalid_joined_lock.parser.row_lock_of_archived_records);
+    try std.testing.expect(invalid_joined_lock.parser.row_lock_of_source);
+    try std.testing.expect(invalid_joined_lock.hasReason("row_lock_mode_plan"));
+
+    var read_sql = try tokenized.ParsedSql.initAlloc(alloc, "WITH scoped AS (SELECT lower(status) AS status FROM usage_records) SELECT status FROM scoped WHERE status LIKE 'a%'");
+    defer read_sql.deinit(alloc);
+    const read = appParityStructuredFixtureSummary(.{
+        .name = "read query summary",
+        .sql = "WITH scoped AS (SELECT lower(status) AS status FROM usage_records) SELECT status FROM scoped WHERE status LIKE 'a%'",
+        .family = .read,
+        .summary = .{ .table_name = "usage_records", .ctes = 1, .select = 1 },
+        .plan = "read:query:table=usage_records:ctes=1:source_cte=1:expr_pred=1:cte0_expr_pred=1:select=1",
+    }, &read_sql);
+    try std.testing.expect(read.parser.computed_pattern);
+    try std.testing.expect(read.plan.uses_cte_stream);
+    try std.testing.expect(read.plan.read_query);
+    try std.testing.expect(read.plan.read_query_expression);
+    try std.testing.expectEqual(@as(?usize, 1), read.fixture.ctes);
+    try std.testing.expect(read.native_requirement_reason == null);
+    try std.testing.expect(read.unsupported_reason == null);
+
+    var bound_read_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tenant_id = 't1'");
+    defer bound_read_sql.deinit(alloc);
+    const bound_read = try appParityStructuredFixtureSummaryWithBinderAlloc(alloc, .{
+        .name = "bound read summary",
+        .sql = "SELECT id FROM usage_records WHERE tenant_id = 't1'",
+        .family = .query,
+        .summary = .{ .table_name = "usage_records", .predicates = 1, .select = 1 },
+        .plan = "query:table=usage_records:pred=1:select=1",
+        .source_schema_json = app_parity_default_schema_json,
+    }, &bound_read_sql);
+    try std.testing.expect(bound_read.binder.object_table_id);
+    try std.testing.expect(bound_read.binder.read_target);
+    try std.testing.expect(!bound_read.binder.write_target);
+
+    var bound_insert_source_sql = try tokenized.ParsedSql.initAlloc(alloc, "INSERT INTO usage_records (id, tenant_id) SELECT id, tenant_id FROM archived_records");
+    defer bound_insert_source_sql.deinit(alloc);
+    const bound_insert_source = try appParityStructuredFixtureSummaryWithBinderAlloc(alloc, .{
+        .name = "bound insert source summary",
+        .sql = "INSERT INTO usage_records (id, tenant_id) SELECT id, tenant_id FROM archived_records",
+        .family = .insert_source,
+        .summary = .{ .table_name = "usage_records", .source_assignments = 2 },
+        .plan = "insert_source:table=usage_records:source_table=archived_records:assignments=2",
+        .catalog_tables = &.{
+            .{ .name = "usage_records", .schema_json = app_parity_default_schema_json },
+            .{ .name = "archived_records", .schema_json = app_parity_default_schema_json },
+        },
+    }, &bound_insert_source_sql);
+    try std.testing.expect(bound_insert_source.binder.object_table_id);
+    try std.testing.expect(bound_insert_source.binder.write_target);
+    try std.testing.expect(bound_insert_source.binder.write_insert_source);
+}
+
+test "sql adapter corpus guards coverage observer raw token scan baseline" {
+    const source = @embedFile("corpus.zig");
+    const start_marker = "    pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {";
+    const end_marker = "\n};\n\ntest \"sql adapter corpus emits structured fixture summaries\"";
+    const start = std.mem.indexOf(u8, source, start_marker) orelse return error.TestUnexpectedResult;
+    const end = std.mem.indexOfPos(u8, source, start, end_marker) orelse return error.TestUnexpectedResult;
+    const observe_source = source[start..end];
+
+    var raw_token_scans: usize = 0;
+    var cursor: usize = 0;
+    while (std.mem.indexOfPos(u8, observe_source, cursor, "appParityTokens")) |index| {
+        raw_token_scans += 1;
+        cursor = index + "appParityTokens".len;
+    }
+
+    try std.testing.expectEqual(@as(usize, 0), raw_token_scans);
+}
 
 test "sql adapter corpus validates fixture metadata core policy" {
     const alloc = std.testing.allocator;

@@ -18,13 +18,14 @@ const binder = @import("binder.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
 const tokenized = @import("tokenized.zig");
 
 pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !binder.LogicalSqlPlan {
     return try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
 }
@@ -32,7 +33,7 @@ pub fn planLogicalDdlPlanParsedSqlWithFunctionBindingsAlloc(
 pub fn planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     bound: *binder.BoundSqlStatement,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !binder.LogicalSqlPlan {
     _ = alloc;
     _ = function_bindings;

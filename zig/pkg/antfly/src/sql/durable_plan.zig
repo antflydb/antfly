@@ -21,6 +21,7 @@ const ddl_plan = @import("ddl_plan.zig");
 const executor = @import("executor.zig");
 const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const tokenized = @import("tokenized.zig");
 
 pub const DurableSqlPlan = union(enum) {
@@ -100,7 +101,7 @@ pub const DurableSqlPlanOrAdapterNoop = union(enum) {
 pub fn planDurableSqlPlanOrAdapterNoopParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlanOrAdapterNoop {
     var logical_plan = try executor.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = table_catalog.unavailableCatalogSource(),
@@ -113,7 +114,7 @@ pub fn planDurableSqlPlanOrAdapterNoopParsedSqlWithFunctionBindingsAlloc(
 pub fn planDurableSqlPlanBoundStatementWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     bound: *binder.BoundSqlStatement,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlan {
     var logical_plan = try lower_ddl.planLogicalDdlPlanBoundStatementWithFunctionBindingsAlloc(alloc, bound, function_bindings);
     errdefer logical_plan.deinit(alloc);
@@ -159,7 +160,7 @@ pub fn planDurableDdlSqlWithSessionAuthorizationEvidenceAlloc(
 pub fn planDurableSqlPlanParsedSqlWithFunctionBindingsAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlan {
     var logical_plan = try executor.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = table_catalog.unavailableCatalogSource(),
@@ -174,7 +175,7 @@ pub fn planDurableSqlPlanParsedSqlWithCatalogSessionFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !DurableSqlPlan {
     var logical_plan = try executor.planParsedSqlWithSessionAlloc(alloc, parsed_sql, .{
         .catalog = catalog,

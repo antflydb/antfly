@@ -17,6 +17,8 @@ const std = @import("std");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
+const document_plan = @import("document_plan.zig");
+const expr_aggregate = @import("expr/aggregate.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
 const plan_mod = @import("plan.zig");
@@ -53,7 +55,15 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
     if (result) |_| {
         return error.TestExpectedError;
     } else |err| switch (err) {
-        error.UnsupportedSqlShape, error.InvalidSqlCatalog => return,
+        error.UnsupportedSqlShape,
+        error.InvalidSqlCatalog,
+        error.DocumentSqlWriteUnsupported,
+        error.DocumentSqlBoundedScanIncompleteTopK,
+        error.DocumentSqlBoundedScanMissingExactProducer,
+        error.DocumentSqlBoundedScanUnboundedSource,
+        error.DocumentSqlBoundedScanUnsupportedResidual,
+        error.DocumentSqlIndexUnavailable,
+        => return,
         else => return err,
     }
 }
@@ -191,7 +201,8 @@ pub fn expectAppParityReadSummary(summary: corpus.AppParityPlanSummary, lowered:
             try expectOptionalUsize(summary.ctes, query.plan.ctes.len);
             try expectQuerySummary(summary, query.plan.query);
         },
-        .document_query, .document_aggregate => if (summary.table_name != null) return error.TestUnexpectedResult,
+        .document_query => |document| try expectDocumentReadSummary(summary, document),
+        .document_aggregate => if (summary.table_name != null or corpus.corpusFixtureHasDocumentReadSummary(summary)) return error.TestUnexpectedResult,
         .set_operation => |set_operation| {
             try expectOptionalTableName(summary.table_name, set_operation.left.table_name);
             try expectOptionalUsize(summary.ctes, set_operation.ctes.len + set_operation.left.plan.ctes.len + set_operation.right.plan.ctes.len);
@@ -215,7 +226,7 @@ pub fn expectAppParityReadSummary(summary: corpus.AppParityPlanSummary, lowered:
             try expectOptionalUsize(summary.group_by, aggregate.plan.aggregate.group_by.len);
             try expectOptionalUsize(summary.group_expressions, aggregate.plan.aggregate.group_expressions.len);
             try expectOptionalUsize(summary.aggregations, aggregate.plan.aggregate.aggregations.len);
-            try expectOptionalUsize(summary.filter_groups, lower_expr.aggregateFilterGroupCount(aggregate.plan.aggregate.aggregations));
+            try expectOptionalUsize(summary.filter_groups, expr_aggregate.filterGroupCount(aggregate.plan.aggregate.aggregations));
             try expectOptionalUsize(summary.having, aggregate.plan.aggregate.having_predicates.len);
             try expectOptionalUsize(summary.having_expressions, aggregate.plan.aggregate.having_expressions.len);
             try expectOptionalUsize(summary.having_any, aggregate.plan.aggregate.having_any.len);
@@ -254,6 +265,48 @@ pub fn expectAppParityReadSummary(summary: corpus.AppParityPlanSummary, lowered:
             if (summary.offset) |expected| try std.testing.expectEqual(expected, window.plan.window.offset);
         },
     }
+}
+
+fn documentProducerNativeRequestName(producer: document_plan.DocumentProducer) []const u8 {
+    return switch (producer) {
+        .id_lookup => "id_lookup",
+        .indexed_query => "indexed_query",
+        .bounded_scan => "bounded_scan",
+    };
+}
+
+fn documentProducerHasResidual(producer: document_plan.DocumentProducer) bool {
+    return switch (producer) {
+        .id_lookup => false,
+        .indexed_query => |query| query.residual_filter_json != null,
+        .bounded_scan => |scan| scan.residual_filter_json != null,
+    };
+}
+
+fn expectDocumentReadSummary(summary: corpus.AppParityPlanSummary, document: document_plan.DocumentReadPlan) !void {
+    if (summary.table_name != null) return error.TestUnexpectedResult;
+    if (summary.document_source_table) |source_table| {
+        const view_mapping = document.view_mapping orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(source_table, view_mapping.source_table);
+    }
+    if (summary.document_view_mapping) |mapping_name| {
+        const view_mapping = document.view_mapping orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(mapping_name, view_mapping.name);
+    }
+    if (summary.document_native_request) |request| {
+        try std.testing.expectEqualStrings(request, documentProducerNativeRequestName(document.producer));
+    }
+    try expectOptionalUsize(summary.document_projections, document.projection.len);
+    if (summary.document_residual) |has_residual| {
+        try std.testing.expectEqual(has_residual, documentProducerHasResidual(document.producer));
+    }
+    if (summary.document_order) |has_order| {
+        try std.testing.expectEqual(has_order, document.order_by != null);
+    }
+    if (summary.document_unnest) |has_unnest| {
+        try std.testing.expectEqual(has_unnest, document.unnest != null);
+    }
+    try expectOptionalU32(summary.document_limit, document.limit);
 }
 
 pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered: plan_mod.LoweredWritePlan) !void {

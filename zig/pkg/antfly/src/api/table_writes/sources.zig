@@ -1116,13 +1116,13 @@ pub const ProvisionedTableWriteSource = struct {
         else
             try loadTableIdentityNamespaceForGroup(cache.alloc, self.catalog, table_name, group_id);
         const expected_identity_namespace = identity_namespace;
-        if (mode == .status_only) {
+        if (mode == .status_only or mode == .query_readonly) {
             lockAtomic(&self.local_db_mutex);
             defer self.local_db_mutex.unlock();
             if (finish_expired_auto_bulk_now_ns) |now_ns| {
                 _ = try cache.finishExpiredAutoBulkIngestLocked(now_ns);
             }
-            const cached = try cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only);
+            const cached = try cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, mode);
             try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
             return cached;
         }
@@ -7228,10 +7228,10 @@ pub const HostedProvisionedTableWriteSource = struct {
             null
         else
             identity_namespace;
-        if (mode == .status_only) {
+        if (mode == .status_only or mode == .query_readonly) {
             lockAtomic(&cache.mutex);
             defer cache.mutex.unlock();
-            const cached = try cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, .status_only);
+            const cached = try cache.write_cache.getOrOpenLockedMode(path, self.catalog, group_id, lsm_root_generation, table_name, mode);
             try validateProvisionedDbIdentityNamespaceExpected(expected_identity_namespace, cached.db);
             return cached;
         }
@@ -13145,7 +13145,8 @@ test "provisioned table write source serializes same-table same-group operations
 
 test "api.table_writes.docid provisioned table write source routes same-owner identity rewrites and rejects cross-owner rewrites" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-identity-rewrite-routing";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-identity-rewrite-routing");
+    defer alloc.free(path);
 
     const FakeCatalog = struct {
         fn iface() table_catalog.CatalogSource {
@@ -14496,7 +14497,8 @@ test "provisioned table write source full_index materializes graph shorthand doc
 
 test "api.table_writes.query_visibility read preparation invalidates readers without closing dirty writer cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-cache-read-prep";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-cache-read-prep");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -15879,7 +15881,8 @@ test "api.table_writes.query_visibility managed publish hook updates runtime sta
 
 test "api.table_writes.query_visibility read preparation does not block on same-table batch after early dirty publication" {
     const alloc = std.testing.allocator;
-    const replica_root_dir = "/tmp/antfly-api-provisioned-read-prep-active-batch";
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-prep-active-batch");
+    defer alloc.free(replica_root_dir);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -16393,7 +16396,8 @@ test "provisioned table write source runtime statuses reconcile empty embeddings
 
 test "provisioned table write source runtime status stays cache-only without shared snapshot" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-runtime-cache";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-runtime-cache");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -16469,7 +16473,8 @@ test "provisioned table write source runtime status stays cache-only without sha
 
 test "provisioned table write source runtime status prefers shared snapshot cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-write-runtime-prefers-snapshot";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-write-runtime-prefers-snapshot");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18571,7 +18576,8 @@ test "auto bulk best-effort finish does not spin when writer cache lock is busy"
 
 test "auto bulk max-window request waits for idle finish" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-auto-bulk-roll-without-next-write";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-auto-bulk-roll-without-next-write");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18877,7 +18883,8 @@ test "auto bulk group writes release leases so idle finish can publish" {
 
 test "bound table write source resolves internal group transactions into visible documents" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-txn-group-local";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-txn-group-local");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18907,7 +18914,8 @@ test "bound table write source resolves internal group transactions into visible
 
 test "bound table write source provisions default full text index on create" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-create";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-create");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18930,7 +18938,8 @@ test "bound table write source provisions default full text index on create" {
 
 test "bound table write source rejects invalid batch writes against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-batch-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18958,7 +18967,8 @@ test "bound table write source rejects invalid batch writes against persisted sc
 
 test "bound table write source enforces nested required fields and array items" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-nested-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-nested-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -18998,7 +19008,8 @@ test "bound table write source enforces nested required fields and array items" 
 
 test "bound table write source enforces enums numeric bounds and anyOf" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-enum-bounds-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-enum-bounds-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19037,7 +19048,8 @@ test "bound table write source enforces enums numeric bounds and anyOf" {
 
 test "bound table write source enforces oneOf allOf pattern and item cardinality" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-pattern-compose-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-pattern-compose-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19082,7 +19094,8 @@ test "bound table write source enforces oneOf allOf pattern and item cardinality
 
 test "bound table write source enforces string length and object cardinality" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-length-cardinality-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-length-cardinality-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19250,7 +19263,8 @@ test "bound table write source backs up and restores a portable local table" {
 
 test "bound table write source enforces root conditionals not and unique items" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-conditional-unique-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-conditional-unique-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19295,7 +19309,8 @@ test "bound table write source enforces root conditionals not and unique items" 
 
 test "bound table write source enforces property names and dependent required" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-property-names-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-property-names-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19331,7 +19346,8 @@ test "bound table write source enforces property names and dependent required" {
 
 test "bound table write source enforces dependent schemas" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-dependent-schemas";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-dependent-schemas");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19370,7 +19386,8 @@ test "bound table write source enforces dependent schemas" {
 
 test "bound table write source enforces additional properties" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-additional-properties";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-additional-properties");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19406,7 +19423,8 @@ test "bound table write source enforces additional properties" {
 
 test "bound table write source enforces contains semantics" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-contains";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-contains");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19445,7 +19463,8 @@ test "bound table write source enforces contains semantics" {
 
 test "bound table write source enforces prefix items and pattern properties" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-prefix-pattern";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-prefix-pattern");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19487,7 +19506,8 @@ test "bound table write source enforces prefix items and pattern properties" {
 
 test "bound table write source enforces exclusive numeric bounds and multipleOf" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-exclusive-multiple";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-exclusive-multiple");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19526,7 +19546,8 @@ test "bound table write source enforces exclusive numeric bounds and multipleOf"
 
 test "bound table write source enforces nullable and type-array fields" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-nullable-types";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-nullable-types");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19562,7 +19583,8 @@ test "bound table write source enforces nullable and type-array fields" {
 
 test "bound table write source enforces local defs and refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-defs-refs";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-defs-refs");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19598,7 +19620,8 @@ test "bound table write source enforces local defs and refs" {
 
 test "bound table write source enforces ref siblings and nested local defs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ref-siblings-local-defs";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-ref-siblings-local-defs");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19637,7 +19660,8 @@ test "bound table write source enforces ref siblings and nested local defs" {
 
 test "bound table write source enforces recursive root refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-recursive-root-refs";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-recursive-root-refs");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19673,7 +19697,8 @@ test "bound table write source enforces recursive root refs" {
 
 test "bound table write source enforces format and additionalItems" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-format-additional-items";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-format-additional-items");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19718,7 +19743,8 @@ test "bound table write source enforces format and additionalItems" {
 
 test "bound table write source enforces broader string formats" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-broader-formats";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-broader-formats");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19766,7 +19792,8 @@ test "bound table write source enforces broader string formats" {
 
 test "bound table write source enforces unevaluated properties and items" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19805,7 +19832,8 @@ test "bound table write source enforces unevaluated properties and items" {
 
 test "bound table write source enforces composed unevaluated coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-unevaluated-composed";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-unevaluated-composed");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19847,7 +19875,8 @@ test "bound table write source enforces composed unevaluated coverage" {
 
 test "bound table write source enforces root unevaluated properties" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-root-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-root-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19880,7 +19909,8 @@ test "bound table write source enforces root unevaluated properties" {
 
 test "bound table write source enforces conditional and dependency unevaluated coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-conditional-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-conditional-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19922,7 +19952,8 @@ test "bound table write source enforces conditional and dependency unevaluated c
 
 test "bound table write source enforces anyOf and oneOf branch evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-branch-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-branch-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -19967,7 +19998,8 @@ test "bound table write source enforces anyOf and oneOf branch evaluation covera
 
 test "bound table write source enforces anyOf and oneOf array evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-array-branch-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-array-branch-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20012,7 +20044,8 @@ test "bound table write source enforces anyOf and oneOf array evaluation coverag
 
 test "bound table write source enforces composed contains-driven array evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-array-contains-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-array-contains-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20057,7 +20090,8 @@ test "bound table write source enforces composed contains-driven array evaluatio
 
 test "bound table write source enforces composed pattern and additional properties evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-pattern-additional-unevaluated";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-pattern-additional-unevaluated");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20102,7 +20136,8 @@ test "bound table write source enforces composed pattern and additional properti
 
 test "bound table write source enforces composed ref closure evaluation coverage" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ref-pattern-additional";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-ref-pattern-additional");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20141,7 +20176,8 @@ test "bound table write source enforces composed ref closure evaluation coverage
 
 test "bound table write source enforces nullable composed refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-nullable-composed-refs";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-nullable-composed-refs");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20177,7 +20213,8 @@ test "bound table write source enforces nullable composed refs" {
 
 test "bound table write source enforces recursive ref closure semantics" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-recursive-closure";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-recursive-closure");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20216,7 +20253,8 @@ test "bound table write source enforces recursive ref closure semantics" {
 
 test "bound table write source enforces escaped ref tokens and direct fragment refs" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ref-escaped-hash";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-ref-escaped-hash");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20255,7 +20293,8 @@ test "bound table write source enforces escaped ref tokens and direct fragment r
 
 test "bound table write source enforces legacy dependencies keyword" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-legacy-dependencies";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-legacy-dependencies");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20294,7 +20333,8 @@ test "bound table write source enforces legacy dependencies keyword" {
 
 test "bound table write source rejects invalid commit writes against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-commit-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-commit-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20321,7 +20361,8 @@ test "bound table write source rejects invalid commit writes against persisted s
 
 test "bound table write source rejects invalid commit transforms against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-commit-transform-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-commit-transform-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20356,7 +20397,8 @@ test "bound table write source rejects invalid commit transforms against persist
 
 test "bound table write source rejects invalid txn prepare writes against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-prepare-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-prepare-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20384,7 +20426,8 @@ test "bound table write source rejects invalid txn prepare writes against persis
 
 test "bound table write source rejects invalid txn prepare transforms against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-prepare-transform-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-prepare-transform-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20420,7 +20463,8 @@ test "bound table write source rejects invalid txn prepare transforms against pe
 
 test "bound table write source rejects invalid batch transforms against persisted schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-batch-transform-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20454,7 +20498,8 @@ test "bound table write source rejects invalid batch transforms against persiste
 
 test "bound table write source validates transforms against same-batch writes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-same-request-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-batch-transform-same-request-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20494,7 +20539,8 @@ test "bound table write source validates transforms against same-batch writes" {
 
 test "bound table write source validates non-upsert transforms against same-batch deletes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-delete-no-upsert-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-batch-transform-delete-no-upsert-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20533,7 +20579,8 @@ test "bound table write source validates non-upsert transforms against same-batc
 
 test "bound table write source rejects upsert transforms against same-batch deletes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch-transform-delete-upsert-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-batch-transform-delete-upsert-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20569,7 +20616,8 @@ test "bound table write source rejects upsert transforms against same-batch dele
 
 test "bound table write source derives ttl timestamps from ttl_field values" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-ttl-field-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-ttl-field-schema");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -20610,7 +20658,8 @@ test "bound table write source derives ttl timestamps from ttl_field values" {
 
 test "bound table write source applies batch writes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-batch";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-batch");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -21808,7 +21857,8 @@ test "api.table_writes.query_visibility read preparation keeps write cache dirty
 
 test "api.table_writes.docid provisioned foreign key action job drains owner range page" {
     const alloc = std.testing.allocator;
-    const replica_root_dir = "/tmp/antfly-api-fk-action-job-owner-range";
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-fk-action-job-owner-range");
+    defer alloc.free(replica_root_dir);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
@@ -21923,7 +21973,8 @@ test "api.table_writes.docid provisioned foreign key action job drains owner ran
 
 test "api.table_writes.docid provisioned same-table foreign key action job routes runtime parent through catalog owner range" {
     const alloc = std.testing.allocator;
-    const replica_root_dir = "/tmp/antfly-api-fk-action-job-same-table-owner-range";
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-fk-action-job-same-table-owner-range");
+    defer alloc.free(replica_root_dir);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
@@ -22783,7 +22834,8 @@ test "provisioned table write source drop index does not hold local db mutex dur
 
 test "provisioned table write source create table provisions local indexes and schema" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-create-schema";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-create-schema");
+    defer alloc.free(path);
     const schema_json =
         "{\"default_type\":\"doc\",\"enforce_types\":true,\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}}}}";
 
@@ -22850,8 +22902,10 @@ test "provisioned table write source create table provisions local indexes and s
 
 test "provisioned table write source restore table does not hold local db mutex during restore work" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-table-restore-mutex";
-    const backup_root = "/tmp/antfly-api-provisioned-table-restore-mutex-out";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-restore-mutex");
+    defer alloc.free(path);
+    const backup_root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-table-restore-mutex-out");
+    defer alloc.free(backup_root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -22922,12 +22976,13 @@ test "provisioned table write source restore table does not hold local db mutex 
 
     const Worker = struct {
         source: *ProvisionedTableWriteSource,
+        backup_root: []const u8,
         manifest: *const backups_api.TableBackupManifest,
         err: ?anyerror = null,
 
         fn run(self: *@This()) void {
             _ = self.source.source().restoreTable(std.heap.page_allocator, "docs", .{
-                .backup_root = backup_root,
+                .backup_root = self.backup_root,
                 .manifest = self.manifest,
             }) catch |err| {
                 self.err = err;
@@ -22973,6 +23028,7 @@ test "provisioned table write source restore table does not hold local db mutex 
 
     var worker = Worker{
         .source = &source,
+        .backup_root = backup_root,
         .manifest = &manifest,
     };
     const thread = try std.Thread.spawn(.{}, Worker.run, .{&worker});

@@ -16,6 +16,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const Allocator = std.mem.Allocator;
 const fs_paths = @import("../../common/fs_paths.zig");
+const platform_time = @import("../../platform/time.zig");
 const storage_io = @import("../lsm_backend/storage_io.zig");
 
 const rebuild_state_name = "rebuild.state";
@@ -223,7 +224,9 @@ fn keyToU64(key: []const u8) u64 {
 }
 
 test "rebuild state round trips and clears" {
-    const path = "/tmp/antfly-backfill-state-test";
+    const alloc = std.testing.allocator;
+    const path = try std.fmt.allocPrint(alloc, "/tmp/antfly-backfill-state-test-{d}", .{platform_time.monotonicNs()});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -231,13 +234,13 @@ test "rebuild state round trips and clears" {
     try fs_paths.createDirPathPortable(io_impl.io(), path);
 
     const state = RebuildState.init(path);
-    try std.testing.expect((try state.check(std.testing.allocator)) == null);
+    try std.testing.expect((try state.check(alloc)) == null);
     try state.update("doc:m");
-    const loaded = (try state.check(std.testing.allocator)) orelse return error.TestExpectedEqual;
-    defer std.testing.allocator.free(loaded);
+    const loaded = (try state.check(alloc)) orelse return error.TestExpectedEqual;
+    defer alloc.free(loaded);
     try std.testing.expectEqualStrings("doc:m", loaded);
     try state.clear();
-    try std.testing.expect((try state.check(std.testing.allocator)) == null);
+    try std.testing.expect((try state.check(alloc)) == null);
 }
 
 test "rebuild state estimates progress from resume key" {

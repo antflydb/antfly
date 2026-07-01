@@ -1,0 +1,49 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "aggregate-expression-pushdown-capability",
+      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+      "surface": "aggregate_expression_pushdown",
+      "status": "partial_release_gated",
+      "current_evidence": "Typed aggregate expressions and filters execute through the lake bridge and row-plan aggregate contract.",
+      "missing_evidence": "Aggregate expression pushdown still needs a typed-plan capability bit, exact expression semantics proof, collation/null safety, and deterministic fallback to non-pushdown execution.",
+      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+      "evidence_symbol": "relational rows aggregate contract accepts typed expression inputs and filters",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "aggregate-resource-metrics",
+      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+      "surface": "aggregate_resource_metrics",
+      "status": "gap_tracked",
+      "current_evidence": "Shared routed-row materialization tests gate spill and hard-cap accounting for row materialization paths.",
+      "missing_evidence": "Aggregate execution still needs per-group and per-metric memory, spill bytes, reload cost, and failure-class counters exposed through diagnostics.",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "routed rows materialization tracker uses shared spill and hard cap policy",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "domain-rollup-execution-fixtures",
+      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+      "surface": "domain_execution_fixtures",
+      "status": "gap_tracked",
+      "current_evidence": "Representative aggregate, window, CTE, and typed read parity fixtures exist, but they are not domain-shaped workload fixtures.",
+      "missing_evidence": "Add SQL versus REST/SDK typed-plan execution fixtures for usage rollups, RBAC membership queries, wake-one queries, dashboards, and migration/backfill validation queries.",
+      "evidence_file": "zig/RELATIONAL.md",
+      "evidence_symbol": "Add execution fixtures for usage rollups, RBAC membership queries, wake-one queries, dashboards, and migration/backfill validation queries",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "spill-backed-window-execution",
+      "relational_slices_section": "Advanced aggregates, windows, and rollups",
+      "surface": "spill_backed_window",
+      "status": "partial_release_gated",
+      "current_evidence": "Typed row-number windows and global ordered windows across ranges are release-gated.",
+      "missing_evidence": "Window execution still needs partition spill for partitions above bounded caps, per-partition memory limits, spill bytes, reload accounting, and failure classes.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows query across ranges merges ordered windows globally",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

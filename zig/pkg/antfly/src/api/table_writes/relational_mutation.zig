@@ -578,7 +578,11 @@ const LocalRelationalMutationWriteSource = struct {
 
 test "mutation source autocommit rejects non-exclusive claims before opening transaction" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-mutation-source-autocommit-claim-admission";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/mutation-source-autocommit-claim-admission", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -652,7 +656,11 @@ test "mutation source autocommit rejects non-exclusive claims before opening tra
 
 test "local mutation source staged claims recover after reopen before commit" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-local-mutation-source-reopen-staged-claim";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/local-mutation-source-reopen-staged-claim", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -782,7 +790,11 @@ test "local mutation source staged claims recover after reopen before commit" {
 
 test "bound table write source stages joined mutation from materialized source rows" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-bound-joined-mutation-source-rows";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/bound-joined-mutation-source-rows", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -891,7 +903,11 @@ test "bound table write source stages joined mutation from materialized source r
 
 test "recursive cte joined mutation source executes through typed read materialization and write staging" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-recursive-joined-mutation-source";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/recursive-joined-mutation-source", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1002,7 +1018,11 @@ test "recursive cte joined mutation source executes through typed read materiali
 
 test "recursive cte merge mutation executes through typed read materialization and merge batch staging" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-recursive-merge-mutation";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/recursive-merge-mutation", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};

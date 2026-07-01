@@ -9153,6 +9153,678 @@
       "sql": "ALTER TABLE usage_records DROP COLUMN metadata;"
     },
     {
+      "name": "unsupported document table ddl malformed schema json",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_malformed_schema_json",
+      "classification_reason": "document_table_ddl_malformed_schema_json",
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{bad json}')"
+    },
+    {
+      "name": "unsupported document table ddl missing default type",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_missing_default_type",
+      "classification_reason": "document_table_ddl_missing_default_type",
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document')"
+    },
+    {
+      "name": "unsupported document table ddl unknown default type",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_unknown_default_type",
+      "classification_reason": "document_table_ddl_unknown_default_type",
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice', antfly.document_schema.doc = '{\"type\":\"object\"}')"
+    },
+    {
+      "name": "unsupported document table ddl invalid antfly extension",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_invalid_antfly_extension",
+      "classification_reason": "document_table_ddl_invalid_antfly_extension",
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"x-antfly-unknown\":true}')"
+    },
+    {
+      "name": "unsupported document table ddl invalid dynamic template",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_invalid_dynamic_template",
+      "classification_reason": "document_table_ddl_invalid_dynamic_template",
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"dynamic_templates\":\"bad\"}')"
+    },
+    {
+      "name": "unsupported document table ddl multi document type",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_multi_document_type_unsupported",
+      "classification_reason": "document_table_ddl_multi_document_type_unsupported",
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\"}', antfly.document_schema.invoice = '{\"type\":\"object\"}')"
+    },
+    {
+      "name": "unsupported document table ddl mixed relational syntax",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (id uuid PRIMARY KEY) WITH (antfly.storage_mode = 'document')"
+    },
+    {
+      "name": "unsupported document table ddl shorthand",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_shorthand",
+      "classification_reason": "document_table_ddl_shorthand",
+      "sql": "CREATE DOCUMENT TABLE docs"
+    },
+    {
+      "name": "document sql view mapping read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 10
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=10:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=field:/metadata/plan->plan",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "name": "document sql view mapping bounded ordered read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 3,
+        "document_residual": false,
+        "document_order": true,
+        "document_unnest": false,
+        "document_limit": 3
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=3:id_proj=1:doc_proj=0:field_proj=2:unnest_proj=0:limit=3:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:candidate_rows=10000:proj0=id:_->_id:proj1=field:/metadata/plan->plan:proj2=field:/metrics/score->score:order=/metrics/score:order_dir=desc",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"},\"metrics\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, plan, score FROM support_view WHERE plan = 'pro' ORDER BY score DESC LIMIT 3"
+    },
+    {
+      "name": "document sql view mapping bounded residual read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "bounded_scan",
+        "document_projections": 2,
+        "document_residual": true,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=bounded_scan:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes_ready=0:source_generation_fresh=0:source_schema_fingerprint_fresh=0:scan_rows=10000:residual=1:proj0=id:_->_id:proj1=field:/metadata/plan->plan",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 5"
+    },
+    {
+      "name": "unsupported document sql view mapping range read missing exact producer",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metrics\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, score FROM support_view WHERE score >= 10 LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping indexed residual read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": true,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=1:index_name=plan_fts:native=0:full_text=1:filter=0:residual=1:candidate_rows=10000:proj0=id:_->_id:proj1=field:/metadata/plan->plan",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE full_text_search('metadata.plan:pro') AND status = 'active' LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping in predicate read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=field:/metadata/plan->plan",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan IN ('pro', 'team') LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping null predicate read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=field:/metadata/plan->plan",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan IS NULL LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping not null predicate read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=field:/metadata/plan->plan",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"plan_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}},\"plan_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metadata.plan\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan IS NOT NULL LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping range predicate read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=field:/metrics/score->score",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metrics\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"score_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"score_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metrics.score\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, score FROM support_view WHERE score >= 10 LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping between predicate read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": false,
+        "document_limit": 5
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=1:unnest_proj=0:limit=5:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=field:/metrics/score->score",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metrics\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"score_fts\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}},\"score_fts\":{\"type\":\"full_text\",\"scalar_paths\":[\"metrics.score\"],\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT _id, score FROM support_view WHERE score BETWEEN 10 AND 20 LIMIT 5"
+    },
+    {
+      "name": "document sql view mapping unnest read",
+      "family": "read",
+      "summary": {
+        "document_source_table": "docs",
+        "document_view_mapping": "support_view",
+        "document_native_request": "indexed_query",
+        "document_projections": 2,
+        "document_residual": false,
+        "document_order": false,
+        "document_unnest": true,
+        "document_limit": 10
+      },
+      "plan": "document_query:table=support_view:producer=indexed_query:projections=2:id_proj=1:doc_proj=0:field_proj=0:unnest_proj=1:limit=10:view_mapping=support_view:source_table=docs:required_indexes=1:required_indexes_ready=1:source_generation_fresh=0:source_schema_fingerprint_fresh=0:index=0:native=0:full_text=0:filter=1:residual=0:proj0=id:_->_id:proj1=unnest_value:_->tag:unnest=/tags:unnest_alias=tag:unnest_filter=1",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[{\"name\":\"tags_array\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}],\"fields\":[{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}},\"tags_array\":{\"type\":\"array_element\",\"path\":\"tags\",\"lifecycle\":\"ready\",\"generation\":4,\"source_generation\":7}}"
+        }
+      ],
+      "sql": "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping unbounded read",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_unbounded_source",
+      "classification_reason": "document_sql_bounded_scan_unbounded_source",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view"
+    },
+    {
+      "name": "unsupported document sql view mapping ordered read without topk bound",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_incomplete_topk",
+      "classification_reason": "document_sql_bounded_scan_incomplete_topk",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"},\"metrics\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' ORDER BY score DESC"
+    },
+    {
+      "name": "unsupported document sql bounded residual expression read",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_unsupported_residual",
+      "classification_reason": "document_sql_bounded_scan_unsupported_residual",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE length(status) = 6 LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql native vector search missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5) LIMIT 5"
+    },
+    {
+      "name": "unsupported document sql native semantic search missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.semantic_search(table_name => 'docs', index => 'docs_body_semantic', query => 'automatic embeddings', limit => 7) LIMIT 7"
+    },
+    {
+      "name": "unsupported document sql native hybrid search missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', full_text_index => 'docs_body_fts', semantic_index => 'docs_body_semantic', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', field => 'body', query => 'hybrid refund', fusion => 'rrf', limit => 9) LIMIT 9"
+    },
+    {
+      "name": "unsupported document sql native graph traverse missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', edge_types => 'cites, references', max_depth => 2, max_results => 11, metrics => 'pagerank', freshness => 'fresh', include_metric_status => true, include_paths => true, limit => 11) LIMIT 11"
+    },
+    {
+      "name": "unsupported document sql native graph shortest path missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_shortest_path(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', direction => 'both', max_depth => 4, weight_mode => 'min_weight', limit => 4) LIMIT 4"
+    },
+    {
+      "name": "unsupported document sql native graph metric missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, freshness => 'fresh', limit => 2) LIMIT 2"
+    },
+    {
+      "name": "unsupported document sql native graph metric rerank missing producer",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:read:requires=document_sql_bounded_scan_missing_exact_producer",
+      "classification_reason": "document_sql_bounded_scan_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"body\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "SELECT _id FROM docs WHERE antfly.graph_metric_rerank(table_name => 'docs', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25, limit => 6) LIMIT 6"
+    },
+    {
+      "name": "invalid document sql view mapping missing required index",
+      "family": "invalid_read",
+      "plan": "invalid:read:reason=document_sql_view_mapping_catalog",
+      "classification_reason": "document_sql_view_mapping_catalog",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"required_indexes\":[\"missing_fts\"],\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "name": "invalid document sql view mapping stale source generation",
+      "family": "invalid_read",
+      "plan": "invalid:read:reason=document_sql_view_mapping_catalog",
+      "classification_reason": "document_sql_view_mapping_catalog",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_generation\":8,\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "name": "invalid document sql view mapping stale source schema fingerprint",
+      "family": "invalid_read",
+      "plan": "invalid:read:reason=document_sql_view_mapping_catalog",
+      "classification_reason": "document_sql_view_mapping_catalog",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"source_schema_fingerprint\":\"stale-schema\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping projection expression",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, lower(plan) AS plan_lower FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping ilike predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan ILIKE 'pro%' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping projection path",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, title FROM support_view WHERE plan = 'pro' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping regex predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan ~ '^pro' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping regex not imatch predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan !~* 'internal' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping not predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE NOT (plan = 'internal') LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping not in predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan NOT IN ('internal', 'legacy') LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping or predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"},\"region\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"},{\"name\":\"region\",\"path\":\"region\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE plan = 'pro' OR region = 'west' LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql view mapping function predicate",
+      "family": "unsupported_read",
+      "plan": "unsupported:read:requires=document_sql_view_mapping_unsupported",
+      "classification_reason": "document_sql_view_mapping_unsupported",
+      "catalog_tables": [
+        {
+          "name": "docs",
+          "schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+          "indexes_json": "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\"}]}}}"
+        }
+      ],
+      "sql": "SELECT _id, plan FROM support_view WHERE length(plan) = 3 LIMIT 10"
+    },
+    {
+      "name": "unsupported document sql full document insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')"
+    },
+    {
+      "name": "unsupported document sql generated id insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_doc) VALUES ('{}')"
+    },
+    {
+      "name": "unsupported document sql exact id delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql doc update",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql projection insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')"
+    },
+    {
+      "name": "unsupported document sql projection update",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql truncate table",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "TRUNCATE docs"
+    },
+    {
+      "name": "unsupported document sql merge matched delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE"
+    },
+    {
       "name": "unsupported alter table access method",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=table_access_method_plan",
@@ -10570,7 +11242,7 @@
         "offset": 6,
         "windows": 16
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=16:window_expr=9:window_default=1:window_frame_sig=4618562537789841559:select=2:order=2:limit=5:window_scalar_minmax=2:offset=6",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=16:window_expr=9:window_default=1:window_frame_sig=10668708848583820258:select=2:order=2:limit=5:window_scalar_minmax=2:offset=6",
       "sql": "SELECT tenant_id, id, row_number() OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) AS row_num, rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS rank, dense_rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS dense_rank, percent_rank() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS percent_rank, cume_dist() OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS cume_dist, ntile(4) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS amount_bucket, lag(amount, 1, 0) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS prev_amount, lead(status) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS next_status, first_value(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS first_amount, last_value(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN CURRENT ROW AND UNBOUNDED FOLLOWING) AS last_amount, count(*) OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN 1 PRECEDING AND 1 FOLLOWING) AS partition_count, count(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC RANGE BETWEEN CURRENT ROW AND 25 FOLLOWING) AS range_amount_count, sum(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_sum, avg(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_avg, min(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_min, max(amount) OVER (PARTITION BY tenant_id ORDER BY amount DESC) AS running_max FROM usage_records WHERE status = 'open' ORDER BY 3 ASC NULLS LAST LIMIT 5 OFFSET 6"
     },
     {
@@ -10600,7 +11272,7 @@
         "limit": 5,
         "windows": 2
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=0:window_default=0:window_frame_sig=17972907067872603248:select=2:order=1:limit=5",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=2:window_expr=0:window_default=0:window_frame_sig=17884070226615768048:select=2:order=1:limit=5",
       "sql": "SELECT tenant_id, id, row_number() OVER usage_window AS row_num, rank() OVER usage_window AS usage_rank FROM usage_records WHERE status = 'open' WINDOW usage_window AS (PARTITION BY tenant_id ORDER BY amount DESC, id ASC ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW) ORDER BY row_num ASC LIMIT 5"
     },
     {
@@ -10627,7 +11299,7 @@
         "select": 1,
         "windows": 1
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=656444837645:select=1:order=0:limit=-1",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=0:windows=1:window_expr=0:window_default=0:window_frame_sig=300352130476042257:select=1:order=0:limit=-1",
       "sql": "SELECT id, count(*) OVER (ORDER BY amount DESC, id ASC RANGE BETWEEN 1 PRECEDING AND CURRENT ROW) AS range_count FROM usage_records"
     },
     {
@@ -10642,7 +11314,7 @@
         "limit": 5,
         "windows": 1
       },
-      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=1:window_expr=0:window_default=0:window_frame_sig=656152568786:select=2:order=1:limit=5",
+      "plan": "window:table=usage_records:ctes=0:source_cte=0:source_pred=1:windows=1:window_expr=0:window_default=0:window_frame_sig=5710837960204888122:select=2:order=1:limit=5",
       "sql": "SELECT tenant_id, id, count(*) OVER (PARTITION BY tenant_id ORDER BY amount DESC ROWS BETWEEN CURRENT ROW AND 1 FOLLOWING) AS current_and_next_count FROM usage_records WHERE status = 'open' ORDER BY current_and_next_count DESC LIMIT 5"
     },
     {

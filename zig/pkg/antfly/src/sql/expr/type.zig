@@ -2048,6 +2048,27 @@ test "sql expr_type names every row expression kind" {
     }
 }
 
+test "sql expr_type validates expression output and interval helpers" {
+    try std.testing.expectEqual(runtime_schema.AntflyType.numeric, try windowOutputType(.row_number, null));
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, try windowOutputType(.lag, .keyword));
+    try std.testing.expectError(error.UnsupportedSqlShape, windowOutputType(.lag, null));
+
+    const interval_expression: runtime_schema.RelationalRowsExpression = .{
+        .kind = .interval_ns,
+        .operands = &.{.{ .kind = .value, .value_json = "1000" }},
+    };
+    const nested_interval_expression: runtime_schema.RelationalRowsExpression = .{
+        .kind = .add,
+        .operands = &.{
+            .{ .kind = .field, .field = "created_at" },
+            interval_expression,
+        },
+    };
+    try std.testing.expect(sqlExpressionIsInterval(interval_expression));
+    try std.testing.expect(sqlExpressionContainsInterval(nested_interval_expression));
+    try std.testing.expect(!sqlExpressionContainsInterval(.{ .kind = .field, .field = "created_at" }));
+}
+
 test "sql expr_type detects deterministic row expressions" {
     const status_field: runtime_schema.RelationalRowsExpression = .{ .kind = .field, .field = "status" };
     const literal: runtime_schema.RelationalRowsExpression = .{ .kind = .value, .value_json = "\"open\"" };
@@ -2175,6 +2196,21 @@ test "sql expr_type validates catalog check expression types" {
     try std.testing.expect(sqlAggregateModeTypeAllowed(.boolean));
     try std.testing.expect(sqlExpressionTypeIsOrderKey(.json));
     try std.testing.expect(sqlExpressionResultTypesCompatible(.keyword, .text));
+
+    const aggregate_schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = &.{
+            .{ .name = "status", .path = "status", .field_type = .keyword },
+            .{ .name = "amount", .path = "amount", .field_type = .numeric },
+            .{ .name = "enabled", .path = "enabled", .field_type = .boolean },
+        },
+    };
+    const aggregate_type_context = RowExpressionTypeContext{ .alloc = std.testing.allocator, .schema = aggregate_schema };
+    try validateAggregateInputExpression(aggregate_type_context, .sum, .{ .kind = .field, .field = "amount" });
+    try std.testing.expectError(error.InvalidSqlCatalog, validateAggregateInputExpression(aggregate_type_context, .sum, .{ .kind = .field, .field = "status" }));
+    try validateAggregateInputExpression(aggregate_type_context, .mode, .{ .kind = .field, .field = "enabled" });
+    try validateAggregateMinMaxRowExpression(aggregate_type_context, .{ .kind = .field, .field = "status" });
+    try std.testing.expectError(error.UnsupportedSqlShape, validateAggregateMinMaxRowExpression(aggregate_type_context, .{ .kind = .field, .field = "enabled" }));
 }
 
 test "sql expr_type validates DDL expression catalog constraints" {

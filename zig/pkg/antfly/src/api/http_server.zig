@@ -23079,6 +23079,10 @@ fn sqlDdlTimestampNs() u64 {
     return platform_time.realtimeNs();
 }
 
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
+
 fn freeBackupShards(alloc: std.mem.Allocator, shards: []const backups_api.ShardSnapshot) void {
     for (shards) |shard| shard.deinit(alloc);
     alloc.free(@constCast(shards));
@@ -30357,7 +30361,8 @@ test "api http server routes prepared transaction SQL DDL to coordinator recover
 
 test "api http server persists prepared transaction SQL DDL through durable session store fallback" {
     const alloc = std.testing.allocator;
-    const session_path = "/tmp/antfly-api-http-prepared-transaction-fallback";
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-prepared-transaction-fallback");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -36555,7 +36560,8 @@ test "api http server decodes percent-encoded lookup keys" {
         title: []const u8,
     };
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-lookup-encoded";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-lookup-encoded");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -36624,7 +36630,8 @@ test "api http server decodes percent-encoded lookup keys" {
 
 test "api http server serves lookup through mcp tool" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-mcp-lookup";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-mcp-lookup");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -36745,7 +36752,8 @@ test "api http server serves lookup through mcp tool" {
 
 test "api http server serves fielded full-text search through mcp tools" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-mcp-fielded-search";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-mcp-fielded-search");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -37017,7 +37025,8 @@ test "api http server serves table scan as ndjson" {
         title: []const u8,
     };
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-scan";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-scan");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -37073,7 +37082,8 @@ test "api http server serves table scan as ndjson" {
 
 test "api http server serves table query response envelope" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-query";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-query");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -37137,7 +37147,8 @@ test "api http server serves table query response envelope" {
 
 test "api http server serves table query with SearchAF-shaped terms aggregations" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-searchaf-aggregations";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-searchaf-aggregations");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -37213,7 +37224,8 @@ test "api http server serves table query with SearchAF-shaped terms aggregations
 
 test "api http server serves retrieval agent response envelope" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-retrieval";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-retrieval");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -37342,7 +37354,8 @@ test "api http server maps retrieval agent doc identity mismatch to unavailable"
 
 test "api http server serves retrieval agent event stream" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-retrieval-stream";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-retrieval-stream");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -38265,7 +38278,8 @@ test "api http server serves table batch writes" {
     const StoredTitle = struct {
         title: []const u8,
     };
-    const path = "/tmp/antfly-api-http-batch";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-batch");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -38353,7 +38367,8 @@ test "api http server serves table batch writes" {
 
 test "api http server exposes relational foreign key integrity repair" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-fk-integrity";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-fk-integrity");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -38973,7 +38988,8 @@ test "api http server exposes relational foreign key integrity repair" {
 
 test "api http server exposes relational unique integrity repair" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-unique-integrity";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-unique-integrity");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -39182,7 +39198,8 @@ test "api http server serves table batch transforms" {
         status: []const u8,
         version: i64,
     };
-    const path = "/tmp/antfly-api-http-batch-transform";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-batch-transform");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -41692,7 +41709,8 @@ test "api http server surfaces structured torn-state conflicts when txn record i
 test "api http server serves long-lived public transaction session routes" {
     const SessionCommitResponse = transactions_api.SessionCommitResponse;
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-session-txn";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-txn");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42126,8 +42144,10 @@ test "api http server reloads durable transaction sessions after restart" {
     const StoredTitle = struct {
         title: []const u8,
     };
-    const path = "/tmp/antfly-api-http-session-restart";
-    const session_path = "/tmp/antfly-api-http-session-restart-sessions";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-restart");
+    defer alloc.free(path);
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-restart-sessions");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42229,8 +42249,10 @@ test "api http server reloads durable transaction sessions after restart" {
 
 test "api http server enforces configured savepoint limits and exposes remaining capacity" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-session-savepoint-limit";
-    const session_path = "/tmp/antfly-api-http-session-savepoint-limit-sessions";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-savepoint-limit");
+    defer alloc.free(path);
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-savepoint-limit-sessions");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -42336,7 +42358,8 @@ test "api http server enforces configured savepoint limits and exposes remaining
 
 test "api http server enforces session adoption timeout when configured" {
     const alloc = std.testing.allocator;
-    const session_path = "/tmp/antfly-api-http-session-adopt-timeout";
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-adopt-timeout");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -42432,7 +42455,8 @@ test "api http server enforces session adoption timeout when configured" {
 
 test "api http server renews owned session leases on request cadence" {
     const alloc = std.testing.allocator;
-    const session_path = "/tmp/antfly-api-http-session-renew-cadence";
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-renew-cadence");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -42542,7 +42566,8 @@ test "api http server renews owned session leases on request cadence" {
 
 test "api http server can renew owned session leases via explicit maintenance hook" {
     const alloc = std.testing.allocator;
-    const session_path = "/tmp/antfly-api-http-session-renew-maintenance";
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-renew-maintenance");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -42653,7 +42678,8 @@ test "api http server can renew owned session leases via explicit maintenance ho
 
 test "api http server runs session maintenance for internal group routes" {
     const alloc = std.testing.allocator;
-    const session_path = "/tmp/antfly-api-http-session-renew-internal-route";
+    const session_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-session-renew-internal-route");
+    defer alloc.free(session_path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), session_path) catch {};
@@ -42944,7 +42970,8 @@ test "api http server serves internal group transaction routes" {
     const StoredTitle = struct {
         title: []const u8,
     };
-    const path = "/tmp/antfly-api-http-txn";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-txn");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -43486,7 +43513,8 @@ test "api http server index status is cache only" {
 
 test "api http server reports table storage empty from read visibility" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-table-storage-empty";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-table-storage-empty");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -43720,7 +43748,8 @@ test "api http server serves local index runtime backfill status" {
             local: ?Stats = null,
         },
     };
-    const path = "/tmp/antfly-api-http-index-status";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-index-status");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -43824,7 +43853,8 @@ test "api http server serves local index runtime backfill status" {
 
 test "api http server graph metric action endpoint returns updated status" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-http-graph-metric-action";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-graph-metric-action");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -44308,7 +44338,8 @@ test "api http server serves provisioned index runtime backfill status across sh
             local: ?Stats = null,
         },
     };
-    const path = "/tmp/antfly-api-http-provisioned-index-status";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-http-provisioned-index-status");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};

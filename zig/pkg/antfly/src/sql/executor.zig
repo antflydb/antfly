@@ -19,6 +19,7 @@ const table_catalog = @import("../metadata/catalog/source.zig");
 const binder = @import("binder.zig");
 const lower_ddl = @import("lower_ddl.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const plan_mod = @import("plan.zig");
 const tokenized = @import("tokenized.zig");
 
@@ -28,7 +29,7 @@ pub const PlanParsedSqlOptions = struct {
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession = catalog_resources.SqlCatalogSession.default(),
     write_options: plan_mod.LowerWritePlanOptions = .{},
-    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     authorization: binder.BoundSqlAuthorizationOptions = .{},
 };
 

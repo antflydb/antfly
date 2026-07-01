@@ -1,80 +1,65 @@
 # Antfly SQL Grammar Remaining Slices
 
-Ordered largest first. Check a slice only when the implementation, diagnostics,
-and verification evidence are all in place.
+This tracker lists only remaining migration work. Completed read-plan and DML
+cutover slices are intentionally omitted from the active checklist; keep durable
+evidence for completed work in grammar notes, tests, and corpus manifests.
 
-- [x] Full generated read-plan lowering cutover
-  - [x] Add SQL/API parity coverage for generated-backed simple/select reads, including projection expressions, predicates, grouping, ordering, pagination, and row locks.
-  - [x] Add SQL/API parity coverage for generated-backed direct set-operation reads, including result-tail ordering, pagination, and chained set-operation shapes.
-  - [x] Add SQL/API parity coverage for generated-backed aggregate reads, including aggregate arguments, aggregate-local ordering, `FILTER`, `WITHIN GROUP`, grouping, `HAVING`, ordering, and pagination.
-  - [x] Add SQL/API parity coverage for generated-backed window reads, including inline `OVER`, named windows, partition/order lists, frame bounds, predicates, ordering, and pagination.
-  - [x] Add SQL/API parity coverage for generated-backed non-recursive and recursive CTE reads, including CTE aliases, body projections, anchor/member/final reads, and outer result tails.
-  - [x] Add SQL/API parity coverage for generated-backed join and lateral reads, including source aliases, join predicates, lateral subquery payloads, projections, ordering, and pagination.
-  - [x] Add fail-closed retained-AST corruption coverage for simple/select and direct set-operation reads.
-  - [x] Add fail-closed retained-AST corruption coverage for aggregate reads, including argument lists, aggregate-local ordering, `FILTER`, and `WITHIN GROUP`.
-  - [x] Add fail-closed retained-AST corruption coverage for window reads, including inline `OVER`, named windows, partition/order lists, and frame payload semantics.
-  - [x] Add fail-closed retained-AST corruption coverage for non-recursive CTE bodies, recursive CTE anchor/member/final reads, and generated CTE aliases.
-  - [x] Add fail-closed retained-AST corruption coverage for join and lateral reads, including join-source, predicate, projection, pagination, and result-tail metadata.
-  - [x] Audit generated-backed read lowerers for remaining token-first dispatch that should be generated AST dispatch or an explicit unsupported-shape diagnostic.
-
-- [x] Full generated DML semantic lowering cutover
-  - [x] Lower assignment expressions from generated expression ASTs for top-level `UPDATE`, conflict actions, and `MERGE` update arms.
-  - [x] Lower mutation predicates from generated expression ASTs for `UPDATE`, `DELETE`, conflict predicates, and `MERGE` arm predicates.
-  - [x] Lower `RETURNING` projections from generated list/expression ASTs without reparsing returning tails.
-  - [x] Lower conflict targets/actions from generated target, predicate, and assignment payloads end to end.
-  - [x] Lower `MERGE` action bodies from generated arm-local payloads end to end.
-  - [x] Promote generated-covered DML statement heads only after coverage matches the currently supported typed DML surface.
-  - [x] Expand unsupported-shape diagnostics for valid PostgreSQL DML shapes that Antfly does not execute.
-
-- [ ] Rich DDL metadata and semantic coverage
-  - [ ] Represent remaining DDL semantic subshapes natively in generated AST metadata instead of broad operation tails.
-  - [ ] Broaden `ALTER TABLE` generated operation coverage beyond the currently supported runtime operation families.
-  - [ ] Broaden generated metadata for rich `CREATE`/`ALTER`/`DROP` catalog variants that still delegate through coarse tails.
-  - [ ] Convert valid-but-unplanned DDL shapes into explicit generated unsupported diagnostics with stable reasons.
-  - [ ] Add field-level fail-closed tests for each newly represented DDL subshape.
+Feature work is listed first, followed by parser cutover, diagnostics, and
+evidence/performance hardening. Check a slice only when the implementation,
+diagnostics, and verification evidence are all in place.
 
 - [ ] Join execution model expansion
-  - [ ] Add generated-aware planning for N-way join trees beyond the current validated binary join contract.
-  - [ ] Add row-plan/API semantics for right and full outer joins.
-  - [ ] Lower right/full joins directly from generated join-kind/operator metadata once execution semantics exist.
-  - [ ] Expand join binding tests for aliases, `ON`, `USING`, natural joins, lateral inputs, and mixed join trees.
+  - [ ] Represent generated join trees as executable N-way or binary-tree row-plan nodes instead of validating only the current binary join contract.
+  - [ ] Add row engine/API semantics for right and full outer joins, including null-extension behavior, projection binding, predicate evaluation, and pagination/order interactions.
+  - [ ] Lower generated `RIGHT [OUTER] JOIN` and `FULL [OUTER] JOIN` from generated join-kind metadata only after execution semantics and parity fixtures exist.
+  - [ ] Expand join binding/parity fixtures for `JOIN ... ON`, `JOIN ... USING (...)`, `CROSS JOIN`, `NATURAL JOIN`, lateral joins, aliases, CTE-body joins, and mixed multi-join trees.
 
 - [ ] Native subquery semantics
-  - [ ] Add plan nodes for scalar subqueries in expressions.
-  - [ ] Add semijoin/existence predicate plan nodes for `IN`, `EXISTS`, and `NOT EXISTS`.
-  - [ ] Add quantified comparison and quantified pattern predicate execution for `ANY`/`ALL`/`SOME`.
-  - [ ] Lower subquery predicates from generated subquery AST payloads instead of fail-closing after validation.
-  - [ ] Add SQL/API parity cases for scalar, semijoin, quantified, and nested subquery execution.
+  - [ ] Add typed plan/execution nodes for scalar subqueries in projections, predicates, assignments, defaults, and generated expressions, including cardinality errors.
+  - [ ] Add semijoin/antijoin/existence plan nodes for `IN`, `NOT IN`, `EXISTS`, and `NOT EXISTS`, including null semantics and correlated references.
+  - [ ] Add quantified comparison/pattern execution for `ANY`/`SOME`/`ALL`, including array-vs-subquery distinction and null/empty-set behavior.
+  - [ ] Lower generated subquery expression payloads directly from retained child read ASTs, and keep malformed payloads fail-closed before legacy expression parsing.
+  - [ ] Add SQL/API parity and malformed-payload fixtures for scalar, semijoin, quantified, correlated, nested, and CTE-contained subqueries.
 
 - [ ] Function and expression semantic completion
-  - [ ] Lower richer generated expression AST nodes directly rather than only validating token layout.
-  - [ ] Complete specialized operator semantics for generated arithmetic, JSON/path, containment, overlap, regex, pattern, null-safe, and boolean families.
-  - [ ] Complete semantic planning for generic functions, aggregate functions, ordered-set aggregates, `FILTER`, `WITHIN GROUP`, casts, `CASE`, arrays, `EXTRACT`, and temporal literals.
-  - [ ] Keep malformed or unsupported generated expression shapes fail-closed with stable diagnostics.
+  - [ ] Replace token-layout validation with direct lowering for generated expression nodes that already carry child payloads: `CASE`, casts, arrays, `EXTRACT`, temporal literals, generic functions, and aggregate/window function arguments.
+  - [ ] Complete executable semantics for arithmetic, comparison, boolean, null-safe, pattern, regex, JSON/path, containment, overlap, and array operators from generated operator metadata.
+  - [ ] Complete aggregate/function planning for `FILTER`, `WITHIN GROUP`, ordered-set aggregates, aggregate-local ordering, variadic/generic functions, casts, and type coercion.
+  - [ ] Add stable unsupported diagnostics for generated expression shapes that parse but do not yet have executable semantics.
+  - [ ] Add parity/fail-closed fixtures for each newly lowered expression family, including corrupted child-expression/list payloads.
 
 - [ ] Graph DSL and Antfly extension cutover
-  - [ ] Add semantic planning for non-table-function graph query syntax such as `MATCH ... RETURN`.
-  - [ ] Expand graph unsupported diagnostics for valid graph syntax that is not executable.
-  - [ ] Keep table-function graph sources generated-owned through binding, planning, HTTP, Lite, and document paths.
-  - [ ] Add parity and fail-closed tests for graph DSL subjects, graph metrics, graph rerank, and joined graph sources.
+  - [ ] Add generated AST and typed planning for non-table-function graph syntax such as `MATCH ... RETURN`, including graph source binding, projection binding, filters, ordering, and limits.
+  - [ ] Keep unsupported graph syntax as generated unsupported statements with stable reason and exact subject span, including unsupported `MATCH` variants, path predicates, and return forms.
+  - [ ] Keep `antfly.*` graph table-function sources generated-owned through binder, planner, HTTP, Lite, document SQL, and row execution entrypoints; remove raw SQL reparsing from these paths.
+  - [ ] Add parity and fail-closed fixtures for graph subjects, graph metrics, graph metric rerank, joined graph sources, CTE graph sources, and corrupted graph semantic payloads.
 
-- [ ] Broader generated unsupported PostgreSQL diagnostics
-  - [ ] Add closed generated variants for remaining PostgreSQL utility, administration, and catalog statements that Antfly should recognize but not execute.
-  - [ ] Give each unsupported family a stable diagnostic reason and exact subject span.
-  - [ ] Ensure generated unsupported statements are only published after LR parser acceptance and retained AST validation.
-  - [ ] Expand corpus coverage for PostgreSQL dump/admin compatibility shapes.
+- [ ] Rich DDL metadata and semantic coverage
+  - [ ] Add native generated AST fields for `GRANT`/`REVOKE`: privilege lists, grant targets, grantees, grant options, revoke grant-option mode, and cascade/restrict behavior.
+  - [ ] Add native generated AST fields for `COMMENT ON`: object class, object name/signature, comment value, and null-comment clearing.
+  - [ ] Extend routine metadata beyond signature/language/return type: body/`AS` clauses, volatility, security, strictness, cost/rows, support, transform, parallel, leakproof, and `SET` options.
+  - [ ] Extend row-policy metadata beyond table and role targets: `FOR` command, `USING` predicate, and `WITH CHECK` predicate retained expression ranges/payloads.
+  - [ ] Extend publication/subscription metadata beyond current table/publication/enabled fields: publication publish/options, table filters/column lists, subscription options, refresh/copy/slot state, and owner/connection mutations.
+  - [ ] Extend generated `ALTER TABLE` operation items beyond currently typed add/drop/rename/alter/constraint/row-security paths: partitions, inheritance, ownership/schema/storage/persistence/tablespace, trigger state, replica identity, and statistics/storage parameters.
+  - [ ] Route every valid-but-unplanned generated-owned DDL shape to a typed unsupported statement with stable reason, exact subject span, and retained-AST validation before any catalog/DDL fallback can run.
+  - [ ] For every new DDL metadata field, add generated AST shape coverage, parsed-entrypoint corruption tests, logical-DDL corruption tests where applicable, and SQL/API parity or unsupported-reason fixture coverage.
 
 - [ ] Production ingress parser cutover
-  - [ ] Remove production dependence on hand-written statement parsing for every migrated family.
-  - [ ] Keep legacy-only admission only for statement shapes outside generated grammar coverage.
-  - [ ] Replace remaining parser probes and string scans with generated AST dispatch or explicit unsupported diagnostics.
-  - [ ] Audit public SQL, pgwire, HTTP, Lite, binder, and typed lowerer entrypoints for raw SQL reparsing.
-  - [ ] Add regression tests that corrupt retained generated AST payloads at each public boundary and verify fail-closed behavior.
+  - [ ] Inventory public SQL entrypoints (`tokenized`, SQL adapter, pgwire, HTTP, Lite, binder, document SQL, durable/executor paths) and mark which statement families still call hand-written parser probes.
+  - [ ] Replace remaining generated-covered token scans/string probes with generated AST dispatch or generated unsupported diagnostics; leave legacy admission only for shapes outside generated grammar coverage.
+  - [ ] Add public-boundary corruption tests for retained AST payload removal/staleness across read, DML, DDL, graph, unsupported, prepared, cursor, session, and transaction families.
+  - [ ] Add regression fixtures proving generated-owned malformed statements cannot recover by re-entering legacy DDL/read/write parsing.
+
+- [ ] Broader generated unsupported PostgreSQL diagnostics
+  - [ ] Audit generated unsupported enum/reason coverage against PostgreSQL utility/admin/catalog heads used by dumps and migrations; add missing heads before they can fall through to parser/DDL fallback.
+  - [ ] For each unsupported family, validate kind, reason, command span, subject span, explain options, and family-specific payloads at parsed-statement publication.
+  - [ ] Add corpus rows for PostgreSQL dump/admin compatibility shapes: ownership, privileges, comments, security labels, extensions, foreign-data objects, text search, operator classes/families, maintenance, and bulk I/O.
+  - [ ] Add corruption tests that mutate unsupported kind/reason/subject/option payloads and verify parsed entrypoints fail closed.
 
 - [ ] Evidence and performance hardening
-  - [ ] Expand accepted PostgreSQL-compatible corpus coverage as each family is cut over.
-  - [ ] Expand Antfly-specific corpus coverage for query functions, graph, document, Lite, and API paths.
-  - [ ] Expand deterministic malformed SQL diagnostics coverage for incomplete DDL, DML, read, CTE, unsupported, and graph shapes.
-  - [ ] Keep short mutation/fuzz coverage in default tests and longer generated parser fuzzing behind `sql-parser-fuzz`.
-  - [ ] Track parser throughput, allocation count, parse-table size, compile-time impact, and binary size through parser benchmarks.
-  - [ ] Require SQL/API parity evidence before marking a migrated family complete.
+  - [ ] Expand accepted PostgreSQL-compatible corpus coverage as each generated family is cut over, with required coverage manifests updated in the same change.
+  - [ ] Expand Antfly-specific corpus coverage for query functions, graph, Lite, table APIs, and routed execution paths; for document SQL, update the dedicated `document_sql_corpus.json`, `sql_document_dependency_guard.json`, `document_sql_bounded_scan_inventory.json`, and `document_sql_read_expansion_gate.json` fixtures alongside SQL/API parity rows.
+  - [ ] Expand deterministic malformed SQL diagnostics for incomplete DDL, DML, read, CTE, unsupported, graph, and expression payload shapes.
+  - [ ] Keep short mutation/fuzz coverage in default tests; keep longer generated parser fuzzing behind `sql-parser-fuzz` with documented seed/replay workflow.
+  - [ ] Track parser throughput, allocation count, parse-table size, compile-time impact, and binary size through parser benchmarks before production cutover.
+  - [ ] Require SQL/API parity evidence, unsupported-reason fixture updates, and fail-closed retained-AST corruption tests before marking any migrated family complete.

@@ -26,6 +26,7 @@ const raft_reconciler = @import("../raft/reconciler.zig");
 const catalog_table_ddl = @import("catalog/table_ddl.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const backend_types = @import("../storage/backend_types.zig");
+const platform_time = @import("../platform/time.zig");
 const secrets = @import("../common/secrets.zig");
 const pattern_filter = @import("../search/pattern_filter.zig");
 
@@ -33,6 +34,10 @@ const Allocator = std.mem.Allocator;
 // CDC checkpoints are external resume positions. Only publish progress after
 // the applied row is visible through query/index paths.
 const cdc_apply_sync_level = db_mod.types.SyncLevel.full_index;
+
+fn uniqueTestTmpPathAlloc(alloc: Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
 
 fn classifyReplicationError(err: anyerror) []const u8 {
     return switch (err) {
@@ -1936,7 +1941,8 @@ test "metadata replication derives stable snapshot order field from simple key t
 
 test "metadata replication backfill applies postgres snapshot rows through bound write source" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-backfill";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-backfill");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2119,7 +2125,8 @@ test "metadata replication backfill applies postgres snapshot rows through bound
 
 test "metadata replication backfill prefers prepared exact cutover snapshot when supported" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-prepared-snapshot";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-prepared-snapshot");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2269,7 +2276,8 @@ test "metadata replication backfill prefers prepared exact cutover snapshot when
 
 test "metadata replication backfill applies configured update transforms" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-backfill-transforms";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-backfill-transforms");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2607,7 +2615,8 @@ test "metadata replication source parser detects delete document op" {
 
 test "metadata replication backfill coordinator resumes and then skips completed sources" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-backfill-coordinator";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-backfill-coordinator");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2825,7 +2834,8 @@ test "metadata replication backfill coordinator resumes and then skips completed
 
 test "metadata replication backfill marks existing-slot fallback as slot_resumed" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-slot-resumed";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-slot-resumed");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -2918,7 +2928,8 @@ test "metadata replication backfill marks existing-slot fallback as slot_resumed
 
 test "metadata replication backfill rejects existing-slot fallback when exact cutover is required" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-exact-cutover-required";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-exact-cutover-required");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -3014,7 +3025,8 @@ test "metadata replication backfill rejects existing-slot fallback when exact cu
 
 test "metadata replication stream applies insert update and delete through bound write source" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-stream";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-stream");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -3161,7 +3173,8 @@ test "metadata replication stream applies insert update and delete through bound
 
 test "metadata replication stream delete document op removes the full document" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-stream-delete-document";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-stream-delete-document");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -3457,7 +3470,8 @@ test "metadata replication stream routes matching rows to target tables" {
 
 test "metadata replication stream applies configured update and derived delete transforms" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-metadata-replication-stream-transforms";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-stream-transforms");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -4271,7 +4285,8 @@ test "metadata replication live snapshot and later streaming insert through runn
     defer alloc.free(wal_level);
     if (!std.ascii.eqlIgnoreCase(std.mem.trim(u8, wal_level, &std.ascii.whitespace), "logical")) return error.SkipZigTest;
 
-    const path = "/tmp/antfly-metadata-replication-live-runner";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-metadata-replication-live-runner");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};

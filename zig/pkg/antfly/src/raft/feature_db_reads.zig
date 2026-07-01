@@ -16,7 +16,12 @@ const std = @import("std");
 const db_mod = @import("../storage/db/mod.zig");
 const db_query_search = @import("../storage/db/query/search_exec.zig");
 const feature_reads = @import("feature_reads.zig");
+const platform_time = @import("../platform/time.zig");
 const read_gate = @import("read_gate.zig");
+
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
 
 fn cleanupTestDir(path: []const u8) void {
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
@@ -171,7 +176,8 @@ test "feature db reads honor per-read consistency" {
     };
 
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-feature-db-reads";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-feature-db-reads");
+    defer alloc.free(path);
     cleanupTestDir(path);
 
     var db = try db_mod.DB.open(alloc, path, .{});

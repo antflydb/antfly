@@ -5,106 +5,157 @@ completed tracking context and keeps only slices that still need implementation,
 parity proof, or cleanup. Each checkbox should describe a landable artifact:
 code behavior, diagnostics, fixture coverage, runtime parity, or a deletion.
 
+Feature and plan-parity coverage belongs in named entries in
+`zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`, with new
+required buckets added to the coverage manifest when a feature becomes part of
+the tracked contract. Runtime result parity that needs seeded rows should live
+in executable Zig integration tests, with the JSON corpus naming the SQL shapes,
+plan summaries, and coverage buckets. Local Zig tests should otherwise prove
+helper behavior such as structured-summary extraction, fixture validators,
+inventory validators, and diagnostic classifiers.
+
 ## Document SQL
 
 - [ ] **Admit document table DDL through SQL**
-  - [ ] Parse `CREATE TABLE ... WITH (antfly.storage_mode = 'document', ...)`
-        plus one or more `DOCUMENT SCHEMA name AS JSON '...'` clauses.
-  - [ ] Reject document-profile `CREATE TABLE` statements that also use a
-        relational column list, relational constraints, generated columns, or
-        other PostgreSQL column semantics.
-  - [ ] Lower document table DDL to native `TableSchema` catalog mutations with
-        `storage_mode = document`, `default_type`, and `document_schemas`;
-        store no raw SQL text as durable schema metadata.
-  - [ ] Validate document-schema JSON through the shared schema validators,
-        including Antfly extensions, dynamic templates, `default_type`
-        existence, and multi-document-type shape.
-  - [ ] Keep `CREATE DOCUMENT TABLE` out of the canonical grammar for now, or
-        accept it only as sugar that lowers to the same typed plan.
-  - [ ] Add DDL/native parity fixtures comparing SQL-created document table
-        schemas with equivalent native/API schema mutations.
-  - [ ] Add stable unsupported-shape diagnostics for malformed JSON, missing
-        default type, mixed relational/document syntax, and unsupported document
-        schema shorthand.
+  - [ ] Parse canonical document-table DDL in the generated parser:
+        `CREATE TABLE ... WITH (antfly.storage_mode = 'document',
+        antfly.default_type = ..., ...)` plus one or more
+        `DOCUMENT SCHEMA name AS JSON '...'` clauses.
+  - [ ] Bind the parsed DDL into a typed catalog request summary containing
+        table name, `storage_mode = document`, `default_type`, and normalized
+        `document_schemas`; durable schema metadata must not preserve raw SQL
+        text.
+  - [ ] Add source-corpus success fixtures for the canonical DDL shape and
+        required coverage buckets for document-table DDL admission.
+  - [ ] Decide and fixture the `CREATE DOCUMENT TABLE` shorthand contract:
+        either parsed structural rejection, or sugar for the same typed
+        document-table DDL request.
+  - [ ] Promote generated-failure placeholders for mixed relational/document
+        DDL into parsed diagnostic fixtures once document-table DDL parses:
+        relational columns, relational constraints, generated columns, and
+        other PostgreSQL column-table semantics on a document table.
+  - [ ] Promote generated-failure placeholders for schema validation failures
+        into parsed diagnostic fixtures once document-table DDL parses:
+        malformed schema JSON, missing or unknown `default_type`, invalid
+        Antfly extensions, invalid dynamic templates, and unsupported
+        multi-document-type shape.
+  - [ ] Add SQL/native catalog parity fixtures proving SQL-created document
+        table schemas match equivalent native/API schema mutations.
+  - [ ] Remove or rename the old generated-parse-failure tracking entries after
+        every formerly unparsed DDL shape has a parsed success or parsed
+        diagnostic fixture.
 
 - [ ] **Admit document writes through SQL**
-  - [ ] Add a shared document-write preflight used by native writes and SQL
-        document writes.
-    - [ ] Match native rejection behavior for unauthorized writes,
-          row-filter-denied writes, and audit-required writes before SQL write
-          lowering is admitted.
-    - [ ] Preserve the native audit and row-filter ordering in SQL write tests.
-    - [x] Keep document-table `INSERT`, `UPDATE`, `DELETE`, `TRUNCATE`, and
-          `MERGE` fail-closed with `DocumentSqlWriteUnsupported` until native
-          document-write preflight and lowering are shared.
-    - [x] Keep writes through document SQL views rejected until view write
-          semantics are deliberately admitted.
-  - [ ] Admit document-table writes in the required design order:
-        full-document insert/upsert, exact `_id` delete, explicit `_doc` JSON
-        patch/update expressions, and only then projection-column writes.
-  - [ ] Define and implement full-document `INSERT`.
-    - [ ] Accept `INSERT INTO docs (_id, _doc) VALUES (...)` with explicit
-          document keys and JSON documents.
-    - [ ] Accept `INSERT INTO docs (_doc) VALUES (...)` only when the native
-          document write policy can generate document ids.
-    - [ ] Reject duplicate `_id`, malformed `_doc`, unsupported generated-id
-          policy, generated-field writes, and schema-validation failures with
-          stable diagnostics.
-    - [ ] Lower admitted inserts to the native document insert/upsert path, not
-          relational row batches.
-    - [ ] Add SQL/native parity tests for inserted document shape, `_id`
-          behavior, rejection behavior, and audit behavior.
-  - [ ] Define and implement exact document-key `DELETE`.
-    - [ ] Accept `DELETE FROM docs WHERE _id = ...` and `_id IN (...)` as the
-          first delete forms.
-    - [ ] Reject non-identity delete predicates until they lower to exact
-          native document query/delete semantics with boundedness, row-filter,
-          authorization, audit, and no-match behavior pinned.
-    - [ ] Lower admitted deletes to native document delete paths.
-    - [ ] Add SQL/native parity tests for deleted document identity,
-          row-filter/audit behavior, no-match behavior, and rejection behavior.
-  - [ ] Define and implement explicit `_doc` JSON patch/update expressions.
-    - [ ] Accept `_doc` updates through proven JSON update expressions such as
-          `jsonb_set(_doc, ...)` or Antfly-owned helpers such as
-          `antfly.json_patch(_doc, patch)` once they lower to typed native
-          document patch requests.
-    - [ ] Specify JSON path assignment, removal, merge, null handling, array
-          semantics, type validation, stale-filter behavior, conflict handling,
-          and audit ordering.
-    - [ ] Reject generated-field updates, unsupported JSON patch shapes, and
-          broad projection-field updates with stable diagnostics until their
-          semantics are pinned.
-    - [ ] Lower admitted updates to native document patch/update paths.
-    - [ ] Add SQL/native parity tests for patch shape, matched-row behavior,
-          no-match behavior, rejection behavior, and audit behavior.
-  - [ ] Define projection-column document writes as a later virtual-schema
-        layer.
-    - [ ] Specify accepted projection-column insert/update forms only after
-          virtual schema write semantics prove field paths, nullability, type
-          validation, defaults, generated-field rejection, and
-          `additionalProperties` behavior.
-    - [ ] Lower projection writes by constructing JSON documents or native
-          document patches, never relational row inserts or mutation-source
-          plans.
-    - [ ] Add stable unsupported-shape diagnostics for projection writes before
-          this layer is admitted.
+  - [ ] Keep unsupported write fixtures in the source corpus for broad insert,
+        update, delete, truncate, and merge shapes until each shape is admitted
+        by a named slice below.
+  - [ ] Add one shared document-write preflight used by native writes and SQL
+        document writes; fixture the rejection order for authorization,
+        row-filter, audit-required, conflict, and no-match behavior before any
+        write form is admitted.
+  - [ ] Admit explicit-key full-document insert/upsert:
+        `INSERT INTO docs (_id, _doc) VALUES (...)` lowers to native document
+        insert/upsert and has corpus parity for document shape, duplicate key,
+        malformed `_doc`, schema validation, generated-field rejection, and
+        audit behavior.
+  - [ ] Admit generated-id full-document insert only after native document id
+        generation policy is shared and fixture the SQL/native `_id` behavior.
+  - [ ] Admit exact-key delete:
+        `DELETE FROM docs WHERE _id = ...` and `_id IN (...)` lower to native
+        document delete and have corpus parity for deleted identity,
+        row-filter/audit behavior, no-match behavior, and rejection behavior.
+  - [ ] Keep non-identity delete predicates rejected until boundedness,
+        row-filter, authorization, audit, and no-match semantics have explicit
+        source-corpus diagnostics.
+  - [ ] Pick one explicit `_doc` patch/update surface, such as
+        `jsonb_set(_doc, ...)` or an Antfly-owned
+        `antfly.json_patch(_doc, patch)` helper, and fixture JSON path
+        assignment, removal, merge, null handling, arrays, type validation,
+        stale-filter behavior, conflict handling, and audit ordering.
+  - [ ] Admit the selected `_doc` patch/update surface by lowering to native
+        document patch/update requests; keep generated-field updates,
+        unsupported JSON patch shapes, and broad projection-field updates as
+        stable diagnostics.
+  - [ ] Admit projection-column writes only after virtual-schema write
+        semantics are proven for field paths, nullability, type validation,
+        defaults, generated-field rejection, and `additionalProperties`; admitted
+        fixtures must construct JSON documents or native document patches, never
+        relational row inserts or mutation-source plans.
+  - [ ] Admit `TRUNCATE docs` only after document table-emptying semantics have
+        bounded deletion, audit, row-filter, and identity-reset behavior pinned.
+  - [ ] Admit `MERGE INTO docs ...` only after document match, insert, update,
+        delete, no-op, conflict, audit, and row-filter ordering semantics are
+        pinned.
+
+- [ ] **Finish document query and view-mapping hardening**
+  The current tracking manifests are
+  `zig/pkg/antfly/src/sql/fixtures/document_sql_bounded_scan_inventory.json` and
+  `zig/pkg/antfly/src/sql/fixtures/document_sql_read_expansion_gate.json`. Keep
+  those manifests in sync with this section whenever an admitted bounded-scan
+  contract is removed or a blocked read-expansion surface is admitted.
+  The current single-array equality-filtered `UNNEST` shape is proven by
+  `api.table_reads.docid document sql view mapping runtime results match native
+  document reads`, which requires
+  `DocumentSqlCapabilities.indexed_array_element_paths` and asserts the native
+  `indexed_query` path.
+  Bounded-scan admission is narrowed to the
+  `mapped-view-residual-bounded-scan` inventory entry; uninventoried mapped-view
+  range, `IN`, ordered, array/`UNNEST`, and other predicate families now require
+  an exact indexed/native producer or fail with
+  `document_sql_bounded_scan_missing_exact_producer`.
+
+  - [ ] Prove bounded-scan residual behavior is exact before deleting the last
+        fallback. The remaining `mapped-view-residual-bounded-scan` contract
+        needs runtime evidence for row caps, byte caps, residual filtering,
+        limit interaction, ordering rejection, and the stable
+        `document_sql_bounded_scan_missing_exact_producer` diagnostic. Delete
+        the inventory entry only in the same patch that replaces it with an
+        exact native/indexed producer and matching runtime parity test.
+  - [ ] Admit `additional-array-unnest-patterns`: add JSON corpus fixtures for
+        multiple arrays, nested arrays, aliasing, non-equality predicates, empty
+        arrays, missing arrays, and rejected cartesian-expansion shapes; add
+        required coverage buckets and executable runtime parity tests proving
+        exact native `array_any`/indexed-array behavior before expanding the
+        current single-array equality-filtered contract.
+  - [ ] Admit `additional-mapped-fields`: add JSON corpus fixtures for scalar,
+        numeric, boolean, text, optional, missing, nested, and multi-field view
+        mappings; add required coverage buckets and executable runtime parity
+        tests proving exact native/indexed producers, projection shape, residual
+        behavior, and stable diagnostics for unmapped or mistyped fields.
+  - [ ] Admit `derived-index-producer-types`: add JSON corpus fixtures for every
+        document derived-index producer shape SQL can select, including stale,
+        missing, partial, ordered, and rebuild-in-progress indexes; add required
+        coverage buckets and executable runtime parity tests proving SQL and
+        native derived-index reads choose the same producer or emit the same
+        rejection.
+  - [ ] Admit `document-aggregates`: add JSON corpus fixtures for mapped-field
+        `COUNT`, `MIN`/`MAX`, `SUM`/`AVG`, grouped aggregates, `HAVING`, order,
+        and limit shapes; add required coverage buckets and executable runtime
+        parity tests proving aggregate results, residual filtering, empty input,
+        null handling, and rejection of unbounded aggregate scans.
+  - [ ] Admit `lateral-view-mapping-joins`: add JSON corpus fixtures for each
+        allowed lateral document/view-mapping join shape, join predicate family,
+        limit interaction, and unsupported correlated form; add required
+        coverage buckets and executable runtime parity tests proving row
+        identity, cardinality, residual filtering, and stable diagnostics.
 
 ## Whole SQL Adapter
 
 - [ ] **Migrate parser and grammar paths family by family**
-  - [ ] Add a migration table that names each statement family, its
-        compatibility entry point, generated-AST entry point, coverage file,
-        and removal gate.
-  - [ ] Select the next family and add raw generated-AST fixtures before binder
-        validation for every supported syntax shape in that family.
-  - [ ] Add binder and lowering fixtures for the selected family, including
-        stable unsupported-shape diagnostics for rejected shapes.
-  - [ ] Add API/runtime parity evidence for the selected family before marking
-        it migrated.
-  - [ ] Delete the selected family's compatibility parser path only after raw
-        AST, binder, lowering, and parity evidence exist.
-  - [ ] Repeat the migration table workflow for DDL, DML, query, roles,
-        extensions, backups, lakes, functions, and maintenance commands.
+  - [ ] Pick one family from
+        `zig/pkg/antfly/src/sql/fixtures/sql_parser_migration_table.json` and
+        add raw generated-AST fixtures for every currently supported syntax
+        shape before binder validation.
+  - [ ] Add binder and lowering fixtures for that family in
+        `sql_api_parity_source_corpus.json`, including stable diagnostics for
+        stale generated metadata and rejected unsupported shapes.
+  - [ ] Add API/runtime parity evidence for the selected family and update the
+        migration-table removal gate with the exact fixture names that prove it.
+  - [ ] Delete one selected compatibility parser path only after raw AST,
+        binder, lowering, runtime, and API/native parity evidence all exist.
+  - [ ] Repeat the same fixture-backed workflow for the remaining migration
+        table families: DDL, DML, query, roles, extensions, backups, lakes,
+        functions, and maintenance commands.
 
 - [ ] **Expand shared typed expression coverage**
   - [ ] Publish one shared typed-expression contract for text, JSON, array,
@@ -124,47 +175,42 @@ code behavior, diagnostics, fixture coverage, runtime parity, or a deletion.
   - [ ] Add diagnostics tests proving unsupported expression classifications
         remain structural and allocation-light.
 
-- [ ] **Build structured parity tooling**
-  - [ ] Emit structured parser, binder, plan, native-requirement, and
-        unsupported-shape summaries from SQL fixtures.
-  - [ ] Replace SQL-string rescans in fixtures with structured summaries or
-        explicit coverage bits.
-  - [x] Split fixture freshness checks from behavioral parity checks so stale
-        fixture detection does not hide runtime parity failures.
-  - [x] Add coverage gates for native requirements and unsupported reasons.
-  - [x] Add an app-parity coverage report that lists all missing required
-        coverage buckets.
-  - [x] Label each missing app-parity coverage bucket with the next broad
-        artifact category: parser, binder, lowering, runtime, or native parity.
-  - [x] Extend the report from broad artifact categories to feature-owned
-        next actions with file paths, fixture names, and test targets.
-  - [x] Have app-parity coverage gates consume the structured next-action
-        report instead of failing on the first raw coverage bucket.
-
 - [ ] **Prove cross-surface parity**
-  - [ ] Define native-model equivalence checks that can compare SQL plans with
-        HTTP, SDK, MCP, A2A, CLI, and internal native API requests.
+  - [ ] Define a canonical native-equivalence summary for SQL plans and
+        native/API requests, covering catalog mutations, row writes, document
+        writes, reads, and derived-index lifecycle operations.
   - [ ] Add DDL parity fixtures that compare SQL catalog plans with equivalent
-        native/API catalog mutations.
+        native/API catalog mutations and pin unsupported-case diagnostics.
   - [ ] Add DML parity fixtures that compare SQL row/document write plans with
-        equivalent native/API mutation requests.
+        equivalent native/API mutation requests, including authorization,
+        row-filter, audit, and no-match behavior where applicable.
   - [ ] Add read/query parity fixtures that compare SQL read plans with
-        equivalent native/API query requests.
+        equivalent native/API query requests, including residual predicates,
+        bounded scans, ordering, limits, aggregates, and UNNEST behavior.
   - [ ] Add derived-index lifecycle parity fixtures that compare SQL index DDL
-        with equivalent native/API derived-index lifecycle requests.
-  - [ ] Add roles, extensions, backups, lakes, and unsupported-case parity
-        fixtures across SQL and native/API surfaces.
-  - [ ] Gate supported SQL features on lowering to the same native model as
+        with equivalent native/API derived-index lifecycle requests, including
+        rebuild, drop, stale-index, and native-query parity.
+  - [ ] Add roles, extensions, backups, lakes, and maintenance parity fixtures
+        that classify each shape as native-equivalent, explicit no-op, or
+        unsupported with stable diagnostics.
+  - [ ] Gate each supported SQL feature on lowering to the same native model as
         the equivalent Antfly-native API call.
 
 - [ ] **Remove compatibility wrappers**
-  - [ ] Inventory string-only parser, binder, planner, and runtime
-        compatibility wrappers with file paths and owning feature families.
-  - [ ] Classify each wrapper as a migration blocker, compatibility contract,
-        or removable dead path.
-  - [ ] For migration blockers, name the typed parser, binder, plan, runtime,
-        and parity evidence required before deletion.
-  - [ ] Delete one wrapper class at a time with focused regression tests for
-        the removed compatibility path.
+  - [ ] Pick one wrapper entry from
+        `zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json` whose
+        deletion gate is fully satisfied, then delete that wrapper and its
+        fallback call sites in one focused patch.
+  - [ ] Add regression tests proving the deleted compatibility path now uses
+        the typed parser, binder, plan, runtime, and parity route named by its
+        inventory entry.
+  - [ ] Update the compatibility-wrapper inventory in the same patch that
+        deletes a wrapper, either removing the entry or narrowing it to the
+        remaining compatibility contract.
   - [ ] Keep only wrappers with a named compatibility reason that cannot change
         durable catalog, document, or row state.
+    - [ ] For any kept compatibility contract, keep its `contract_reason` in the
+          validator allowlist and preserve the durable-state proof that it is
+          read-only or no-op.
+    - [ ] For any remaining migration blocker, keep explicit typed parser,
+          binder, plan, runtime, and parity deletion evidence in the inventory.

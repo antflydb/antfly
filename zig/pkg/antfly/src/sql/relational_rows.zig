@@ -15,6 +15,7 @@
 const std = @import("std");
 
 const db_mod = @import("../storage/db/mod.zig");
+const expr_text = @import("expr/text.zig");
 const expr_type = @import("expr/type.zig");
 const json_helpers = @import("../common/json_helpers.zig");
 const algebraic_segment = @import("../serverless/algebraic_segment/mod.zig");
@@ -14852,8 +14853,8 @@ fn expressionValueJsonWithExplicitSourceAlloc(
                     const transformed = switch (expression.kind) {
                         .lower => try std.ascii.allocLowerString(alloc, text),
                         .upper => try std.ascii.allocUpperString(alloc, text),
-                        .initcap => try initcapTextAlloc(alloc, text),
-                        .md5 => try md5HexTextAlloc(alloc, text),
+                        .initcap => try expr_text.initcapTextAlloc(alloc, text),
+                        .md5 => try expr_text.md5HexTextAlloc(alloc, text),
                         else => unreachable,
                     };
                     defer alloc.free(transformed);
@@ -16088,36 +16089,6 @@ fn reverseTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
     return try out.toOwnedSlice(alloc);
 }
 
-fn initcapTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    try validateUtf8Text(text);
-    const out = try alloc.dupe(u8, text);
-    var at_word_start = true;
-    for (out) |*byte| {
-        if (std.ascii.isAlphanumeric(byte.*)) {
-            byte.* = if (at_word_start) std.ascii.toUpper(byte.*) else std.ascii.toLower(byte.*);
-            at_word_start = false;
-        } else {
-            at_word_start = true;
-        }
-    }
-    return out;
-}
-
-fn md5HexTextAlloc(alloc: std.mem.Allocator, text: []const u8) ![]u8 {
-    const digest = std.crypto.hash.Md5.hashResult(text);
-    return try hexBytesAlloc(alloc, digest[0..]);
-}
-
-fn hexBytesAlloc(alloc: std.mem.Allocator, bytes: []const u8) ![]u8 {
-    const hex = "0123456789abcdef";
-    const out = try alloc.alloc(u8, bytes.len * 2);
-    for (bytes, 0..) |byte, index| {
-        out[index * 2] = hex[byte >> 4];
-        out[index * 2 + 1] = hex[byte & 0x0f];
-    }
-    return out;
-}
-
 fn validateUtf8Text(text: []const u8) !void {
     var index: usize = 0;
     while (index < text.len) {
@@ -17287,7 +17258,7 @@ fn generatedColumnValueJsonAlloc(
             const folded = switch (generated.op) {
                 .lower => try std.ascii.allocLowerString(alloc, source),
                 .upper => try std.ascii.allocUpperString(alloc, source),
-                .md5 => try md5HexTextAlloc(alloc, source),
+                .md5 => try expr_text.md5HexTextAlloc(alloc, source),
                 .concat => unreachable,
                 .concat_ws => unreachable,
                 .expression => unreachable,

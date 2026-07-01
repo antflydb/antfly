@@ -1406,6 +1406,15 @@ fn documentSqlAppendNativeFilterOperatorAlloc(
         try documentSqlAppendNativeFieldValueOperatorAlloc(alloc, out, "terms", field, terms_value);
         return true;
     }
+    if (std.mem.eql(u8, op, "array_any")) {
+        const path_value = spec.get("path") orelse spec.get("field") orelse return false;
+        const item_value = spec.get("value") orelse return false;
+        if (path_value != .string) return false;
+        const field = try documentSqlStorageFilterFieldAlloc(alloc, path_value.string);
+        defer alloc.free(field);
+        try documentSqlAppendNativeExplicitFieldValueOperatorAlloc(alloc, out, "array_any", field, item_value);
+        return true;
+    }
     if (std.mem.eql(u8, op, "prefix")) {
         const path_value = spec.get("path") orelse spec.get("field") orelse return false;
         const prefix_value = spec.get("value") orelse return false;
@@ -1487,6 +1496,23 @@ fn documentSqlAppendNativeFieldValueOperatorAlloc(
     try out.appendSlice(alloc, ":{");
     try appendJsonString(alloc, out, field);
     try out.append(alloc, ':');
+    try documentSqlAppendNativeFilterValueAlloc(alloc, out, value);
+    try out.appendSlice(alloc, "}}");
+}
+
+fn documentSqlAppendNativeExplicitFieldValueOperatorAlloc(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    op: []const u8,
+    field: []const u8,
+    value: std.json.Value,
+) anyerror!void {
+    try out.append(alloc, '{');
+    try appendJsonString(alloc, out, op);
+    try out.appendSlice(alloc, ":{");
+    var first = true;
+    try appendJsonFieldString(alloc, out, &first, "field", field);
+    try appendJsonFieldName(alloc, out, &first, "value");
     try documentSqlAppendNativeFilterValueAlloc(alloc, out, value);
     try out.appendSlice(alloc, "}}");
 }
@@ -3086,6 +3112,17 @@ test "document sql native filter rewrite only maps field identifiers" {
     try std.testing.expectEqualStrings(
         "{\"bool\":{\"filter\":[{\"term\":{\"metadata.status\":\"/active\"}},{\"terms\":{\"tenant\":[\"/t1\"]}}]}}",
         native_filter,
+    );
+
+    const native_array_filter = try documentSqlNativeFilterQueryJsonAlloc(
+        alloc,
+        "{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}}",
+    );
+    defer alloc.free(native_array_filter);
+
+    try std.testing.expectEqualStrings(
+        "{\"array_any\":{\"field\":\"tags\",\"value\":\"urgent\"}}",
+        native_array_filter,
     );
 }
 

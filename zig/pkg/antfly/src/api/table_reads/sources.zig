@@ -145,6 +145,10 @@ const validateAlgebraicProgramPartialsProof = table_read_remote_wire.validateAlg
 const algebraicTensorProgramOutputExpressionsForIndexAlloc = table_read_remote_wire.algebraicTensorProgramOutputExpressionsForIndexAlloc;
 const algebraicTensorAccessPathValuesAlloc = table_read_remote_wire.algebraicTensorAccessPathValuesAlloc;
 
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
+
 const algebraicConstraintsForRequestAlloc = table_read_fanout.algebraicConstraintsForRequestAlloc;
 const freeAlgebraicConstraints = table_read_fanout.freeAlgebraicConstraints;
 const ParallelFanoutKind = table_read_fanout.ParallelFanoutKind;
@@ -6630,7 +6634,8 @@ fn openTestGroupDb(alloc: std.mem.Allocator, path: []const u8, group_id: u64) !d
 
 test "bound table read source uses feature db reads and returns version" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-reads";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-reads");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -6677,7 +6682,8 @@ test "bound table read source uses feature db reads and returns version" {
 
 test "bound table read source executes SQL system-time as-of by commit sequence" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-system-time";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-system-time");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -7003,7 +7009,8 @@ test "bound table read source executes SQL system-time as-of by commit sequence"
 
 test "provisioned table read source composes local system-time as-of with cte plans" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-system-time-cte";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-system-time-cte");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -7919,9 +7926,115 @@ test "hosted lookup remote routes preserve remote failures" {
     try std.testing.expectEqual(@as(usize, 3), executor_state.calls);
 }
 
+test "api.table_reads.docid document SQL bounded scan runtime diagnostics pin row and byte caps" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        scan_payload: []const u8,
+        lookup_json: []const u8 = "{\"status\":\"other\"}",
+
+        fn source(self: *@This()) document_sql_runtime.Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: document_sql_runtime.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.LookupResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = key;
+            _ = opts;
+            _ = consistency;
+            return .{
+                .json = try lookup_alloc.dupe(u8, self.lookup_json),
+                .version = 1,
+            };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: document_sql_runtime.ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return .{ .ndjson = try scan_alloc.dupe(u8, self.scan_payload) };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: document_sql_runtime.QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?document_sql_runtime.QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return error.DocumentSqlIndexUnavailable;
+        }
+    };
+
+    var projection = [_]sql_adapter.DocumentProjection{.{ .kind = .id, .output = "_id" }};
+
+    const byte_capped_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 10,
+            .max_bytes = 1,
+        } },
+    };
+    var byte_source = MockSource{ .scan_payload = "{\"key\":\"doc:a\"}\n" };
+    try std.testing.expectError(
+        error.DocumentSqlBoundedScanByteCapExceeded,
+        document_sql_runtime.executeReadPlanAlloc(alloc, byte_source.source(), byte_capped_plan, .stale),
+    );
+
+    const row_capped_plan = sql_adapter.DocumentReadPlan{
+        .table_name = "docs",
+        .projection = projection[0..],
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 1,
+            .residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"missing\"}}",
+        } },
+        .limit = 1,
+    };
+    var row_source = MockSource{ .scan_payload = "{\"key\":\"doc:a\"}\n" };
+    try std.testing.expectError(
+        error.DocumentSqlBoundedScanRowCapExceeded,
+        document_sql_runtime.executeReadPlanAlloc(alloc, row_source.source(), row_capped_plan, .stale),
+    );
+}
+
 test "api.table_reads.docid lowered document sql read plans execute native lookup and bounded scan" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-document-sql-read";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-document-sql-read");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -8632,7 +8745,8 @@ test "api.table_reads.docid lowered document sql read plans execute native looku
 
 test "api.table_reads.docid lowered document sql unnest read plan matches native scan expansion" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-document-sql-unnest-parity";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-document-sql-unnest-parity");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -8732,6 +8846,313 @@ test "api.table_reads.docid lowered document sql unnest read plan matches native
     }, .read_index)).?;
     defer native_scan.deinit(alloc);
 
+    var urgent_matches: usize = 0;
+    var lines = std.mem.splitScalar(u8, native_scan.ndjson, '\n');
+    while (lines.next()) |line| {
+        if (line.len == 0) continue;
+        var parsed = try parseJsonTestBody(std.json.Value, alloc, line);
+        defer parsed.deinit();
+        const key = parsed.value.object.get("key").?.string;
+        const tags = parsed.value.object.get("tags").?.array.items;
+        for (tags) |tag| {
+            if (tag != .string or !std.mem.eql(u8, tag.string, "urgent")) continue;
+            switch (urgent_matches) {
+                0 => try std.testing.expectEqualStrings("doc:a", key),
+                1 => try std.testing.expectEqualStrings("doc:c", key),
+                else => return error.TestUnexpectedResult,
+            }
+            urgent_matches += 1;
+        }
+    }
+    try std.testing.expectEqual(@as(usize, 2), urgent_matches);
+}
+
+test "api.table_reads.docid document sql view mapping runtime results match native document reads" {
+    const alloc = std.testing.allocator;
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-document-sql-view-mapping-parity");
+    defer alloc.free(path);
+
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
+    try db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"metadata\":{\"plan\":\"pro\"},\"metrics\":{\"score\":9},\"tags\":[\"urgent\",\"vip\"]}" },
+            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"active\",\"metadata\":{\"plan\":\"free\"},\"metrics\":{\"score\":2},\"tags\":[\"normal\"]}" },
+            .{ .key = "doc:c", .value = "{\"title\":\"alpha\",\"status\":\"archived\",\"metadata\":{\"plan\":\"pro\"},\"metrics\":{\"score\":7},\"tags\":[\"urgent\"]}" },
+            .{ .key = "doc:d", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"metadata\":{\"plan\":\"team\"},\"metrics\":{\"score\":5},\"tags\":[\"vip\"]}" },
+            .{ .key = "doc:e", .value = "{\"title\":\"gamma\",\"status\":\"active\",\"metrics\":{\"score\":4},\"tags\":[]}" },
+        },
+        .sync_level = .full_index,
+    });
+
+    var parsed_schema = try schema_api.parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","additionalProperties":true}}}}
+    );
+    defer parsed_schema.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, schema);
+
+    const indexes_json =
+        \\{
+        \\  "full_text_index_v0":{"type":"full_text","lifecycle":"ready","scalar_paths":["metadata.plan","metrics.score"]},
+        \\  "tags_array":{"type":"array_element","path":"tags","lifecycle":"ready"},
+        \\  "view_mappings":{
+        \\    "support_view":{
+        \\      "source_table":"docs",
+        \\      "required_indexes":[
+        \\        {"name":"full_text_index_v0","lifecycle":"ready"},
+        \\        {"name":"tags_array","lifecycle":"ready"}
+        \\      ],
+        \\      "fields":[
+        \\        {"name":"title","path":"title"},
+        \\        {"name":"status","path":"status","type":"keyword"},
+        \\        {"name":"plan","path":"metadata.plan","type":"keyword","nullable":true},
+        \\        {"name":"score","path":"metrics.score","type":"numeric","nullable":true},
+        \\        {"name":"tag_list","path":"tags","type":"array","item_type":"keyword"}
+        \\      ]
+        \\    }
+        \\  }
+        \\}
+    ;
+
+    var virtual_schema = try sql_adapter.documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(alloc, schema, indexes_json);
+    defer sql_adapter.deinitDocumentSqlSchema(alloc, &virtual_schema);
+    const indexed_scalar_paths = [_][]const u8{ "/metadata/plan", "/metrics/score" };
+    const indexed_array_paths = [_][]const u8{ "tags", "/tags" };
+    const capabilities = sql_adapter.DocumentSqlCapabilities{
+        .full_text_filters = true,
+        .indexed_scalar_filter_paths = indexed_scalar_paths[0..],
+        .indexed_array_element_paths = indexed_array_paths[0..],
+        .bounded_scan = .{ .max_rows = 100 },
+    };
+
+    var source = BoundTableReadSource.init("docs", 77, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var adapter = table_read_document_sql.RuntimeSourceAdapter{
+        .source = source.source(),
+        .target = .{
+            .database_name = catalog_resources.default_database_name,
+            .namespace_name = catalog_resources.default_namespace_name,
+            .table_name = "docs",
+        },
+        .native_table_name = "docs",
+        .public_table_name = "support_view",
+    };
+
+    const Harness = struct {
+        fn expectRows(
+            allocator: std.mem.Allocator,
+            runtime_source: document_sql_runtime.Source,
+            table_schema: storage_schema.TableSchema,
+            document_sql_schema: sql_adapter.DocumentSqlSchema,
+            document_capabilities: sql_adapter.DocumentSqlCapabilities,
+            sql: []const u8,
+            expected_total: u32,
+            expected_rows: []const []const u8,
+        ) !sql_adapter.DocumentReadPlan {
+            var parsed_sql = try sql_adapter.ParsedSql.initAlloc(allocator, sql);
+            defer parsed_sql.deinit(allocator);
+            var document_plan = try sql_adapter.lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(
+                allocator,
+                &parsed_sql,
+                table_schema,
+                document_sql_schema,
+                document_capabilities,
+            );
+            errdefer document_plan.deinit(allocator);
+            try std.testing.expect(document_plan.view_mapping != null);
+            try std.testing.expectEqualStrings("support_view", document_plan.view_mapping.?.name);
+            try std.testing.expectEqualStrings("docs", document_plan.view_mapping.?.source_table);
+
+            var result = (try document_sql_runtime.executeReadPlanAlloc(
+                allocator,
+                runtime_source,
+                document_plan,
+                .read_index,
+            )).?;
+            defer result.deinit(allocator);
+            try std.testing.expectEqual(expected_total, result.total);
+            try std.testing.expectEqual(expected_rows.len, result.rows.len);
+            for (expected_rows, 0..) |expected, i| {
+                try std.testing.expectEqualStrings(expected, result.rows[i]);
+            }
+            return document_plan;
+        }
+
+        fn expectIndexedFilter(plan: sql_adapter.DocumentReadPlan) !void {
+            switch (plan.producer) {
+                .indexed_query => |query| if (query.filter_query_json == null) return error.TestUnexpectedResult,
+                else => return error.TestUnexpectedResult,
+            }
+        }
+    };
+
+    var equality = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"plan\":\"pro\"}",
+            "{\"_id\":\"doc:c\",\"plan\":\"pro\"}",
+        },
+    );
+    defer equality.deinit(alloc);
+    try Harness.expectIndexedFilter(equality);
+
+    var in_list = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, plan FROM support_view WHERE plan IN ('team', 'free') LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:b\",\"plan\":\"free\"}",
+            "{\"_id\":\"doc:d\",\"plan\":\"team\"}",
+        },
+    );
+    defer in_list.deinit(alloc);
+    try Harness.expectIndexedFilter(in_list);
+
+    var is_null = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, plan FROM support_view WHERE plan IS NULL LIMIT 10",
+        1,
+        &.{
+            "{\"_id\":\"doc:e\",\"plan\":null}",
+        },
+    );
+    defer is_null.deinit(alloc);
+    try Harness.expectIndexedFilter(is_null);
+
+    var is_not_null = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, plan FROM support_view WHERE plan IS NOT NULL LIMIT 10",
+        4,
+        &.{
+            "{\"_id\":\"doc:a\",\"plan\":\"pro\"}",
+            "{\"_id\":\"doc:b\",\"plan\":\"free\"}",
+            "{\"_id\":\"doc:c\",\"plan\":\"pro\"}",
+            "{\"_id\":\"doc:d\",\"plan\":\"team\"}",
+        },
+    );
+    defer is_not_null.deinit(alloc);
+    try Harness.expectIndexedFilter(is_not_null);
+
+    var range = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, score FROM support_view WHERE score >= 5 LIMIT 10",
+        3,
+        &.{
+            "{\"_id\":\"doc:a\",\"score\":9}",
+            "{\"_id\":\"doc:c\",\"score\":7}",
+            "{\"_id\":\"doc:d\",\"score\":5}",
+        },
+    );
+    defer range.deinit(alloc);
+    try Harness.expectIndexedFilter(range);
+
+    var between = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, score FROM support_view WHERE score BETWEEN 4 AND 7 LIMIT 10",
+        3,
+        &.{
+            "{\"_id\":\"doc:c\",\"score\":7}",
+            "{\"_id\":\"doc:d\",\"score\":5}",
+            "{\"_id\":\"doc:e\",\"score\":4}",
+        },
+    );
+    defer between.deinit(alloc);
+    try Harness.expectIndexedFilter(between);
+
+    var ordered = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, plan, score FROM support_view WHERE plan = 'pro' ORDER BY score DESC LIMIT 1",
+        1,
+        &.{
+            "{\"_id\":\"doc:a\",\"plan\":\"pro\",\"score\":9}",
+        },
+    );
+    defer ordered.deinit(alloc);
+    try std.testing.expect(ordered.order_by != null);
+    try Harness.expectIndexedFilter(ordered);
+
+    var residual = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT _id, title, status FROM support_view WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"title\":\"alpha\",\"status\":\"active\"}",
+            "{\"_id\":\"doc:d\",\"title\":\"alpha\",\"status\":\"active\"}",
+        },
+    );
+    defer residual.deinit(alloc);
+    try std.testing.expect(residual.producer.indexed_query.residual_filter_json != null);
+    var native_full_text = (try source.source().query(alloc, "docs", .{
+        .query = .{ .match = .{ .field = "title", .text = "alpha" } },
+        .index_name = residual.producer.indexed_query.index_name,
+        .limit = 100,
+    }, .read_index)).?;
+    defer native_full_text.deinit(alloc);
+    try expectNativeQueryTotal(alloc, native_full_text.json, 3);
+
+    var unnest = try Harness.expectRows(
+        alloc,
+        adapter.runtimeSource(),
+        schema,
+        virtual_schema,
+        capabilities,
+        "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10",
+        2,
+        &.{
+            "{\"_id\":\"doc:a\",\"tag\":\"urgent\"}",
+            "{\"_id\":\"doc:c\",\"tag\":\"urgent\"}",
+        },
+    );
+    defer unnest.deinit(alloc);
+    try std.testing.expect(unnest.unnest != null);
+    try Harness.expectIndexedFilter(unnest);
+    var native_scan = (try source.source().scan(alloc, "docs", "", "", .{
+        .include_documents = true,
+        .fields = &.{"tags"},
+        .include_all_fields = false,
+        .limit = 100,
+    }, .read_index)).?;
+    defer native_scan.deinit(alloc);
     var urgent_matches: usize = 0;
     var lines = std.mem.splitScalar(u8, native_scan.ndjson, '\n');
     while (lines.next()) |line| {
@@ -9001,7 +9422,8 @@ test "api.table_reads.docid document sql catalog read producers treat catalog mi
 
 test "api.table_reads.docid lowered document sql aggregate executes native grouped avg materialization" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-document-sql-grouped-avg";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-document-sql-grouped-avg");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9269,7 +9691,8 @@ test "api.table_reads.docid lowered document sql aggregate uses catalog target f
 
 test "bound table read source scans keys as ndjson" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-scan";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-scan");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9309,7 +9732,8 @@ test "bound table read source scans keys as ndjson" {
 
 test "bound table read source formats query responses" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-query";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-query");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9340,7 +9764,8 @@ test "bound table read source formats query responses" {
 
 test "bound table read source preflights query requests" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-preflight";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-preflight");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9381,7 +9806,8 @@ test "bound table read source preflights query requests" {
 
 test "bound table read source reranks hits after materialization" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-table-rerank";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-table-rerank");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9471,7 +9897,8 @@ test "bound table read source reranks hits after materialization" {
 
 test "provisioned table read source routes lookup and scan across ranges" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-reads";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-reads");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9653,7 +10080,8 @@ test "api.table_reads.docid provisioned standby read gate permits stale reads an
 
 test "provisioned table read source merges query results across ranges" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9760,7 +10188,8 @@ test "provisioned table read source merges query results across ranges" {
 
 test "provisioned table read source serves dense queries for explicit external embeddings" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-dense");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9868,7 +10297,8 @@ test "provisioned table read source serves dense queries for explicit external e
 
 test "provisioned local query execution returns stamped identity request" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-stamped-identity";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-stamped-identity");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -9975,7 +10405,8 @@ test "provisioned local query execution returns stamped identity request" {
 
 test "provisioned table read source serves public dense query requests with read_index" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-public";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-dense-public");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10052,7 +10483,8 @@ test "provisioned table read source serves public dense query requests with read
 
 test "provisioned table read source serves profiled public dense query requests with read_index" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-public-profiled";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-dense-public-profiled");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10133,7 +10565,8 @@ test "provisioned table read source serves profiled public dense query requests 
 
 test "provisioned table read source serves public dense query requests without explicit indexes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-public-implicit-index";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-dense-public-implicit-index");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10210,7 +10643,8 @@ test "provisioned table read source serves public dense query requests without e
 
 test "provisioned table read source serves benchmark-shaped packed dense query with full-text present" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-dense-benchmark-shaped";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-dense-benchmark-shaped");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10294,7 +10728,8 @@ test "provisioned table read source serves benchmark-shaped packed dense query w
 
 test "provisioned table read source preflights every local group" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-preflight-multigroup";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-preflight-multigroup");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10385,7 +10820,8 @@ test "provisioned table read source preflights every local group" {
 
 test "provisioned local runtime statuses reconcile empty managed embeddings indexes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-runtime-status-managed";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-runtime-status-managed");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10462,7 +10898,8 @@ test "provisioned local runtime statuses reconcile empty managed embeddings inde
 
 test "provisioned query db installs asset producer from indexes_json without read-side replay" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-asset-enrichment";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-asset-enrichment");
+    defer alloc.free(path);
     const indexes_json =
         \\{"search_idx":{"type":"full_text","field":"body","enrichments":[{"name":"generated_title_v1","kind":"asset","field":"body","content_type":"text/plain","producer_json":"{\"type\":\"generator\",\"config\":{\"provider\":\"antfly\",\"model\":\"local-model\"}}"}]}}
     ;
@@ -10592,7 +11029,8 @@ test "provisioned query db installs asset producer from indexes_json without rea
 
 test "provisioned table read source runtime status stays cache-only without shared snapshot" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-runtime-cache";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-runtime-cache");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10727,7 +11165,8 @@ test "provisioned table read source runtime status falls back to shared snapshot
 
 test "provisioned table read source runtime status prefers shared snapshot cache" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-runtime-prefers-snapshot";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-runtime-prefers-snapshot");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -10829,7 +11268,8 @@ test "provisioned table read source runtime status prefers shared snapshot cache
 
 test "provisioned table read source falls back from read_index to stale on not leader" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-fallback";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-fallback");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11299,7 +11739,8 @@ test "api.table_reads.docid explicit text stats requests preserve identity gener
 
 test "api.table_reads.docid explicit text stats requests carry resolved doc filters and apply exact projection" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-text-stats-resolved-doc-filter";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-text-stats-resolved-doc-filter");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11386,7 +11827,8 @@ test "api.table_reads.docid explicit text stats requests carry resolved doc filt
 
 test "api.table_reads.docid explicit text stats requests reject stale identity generation" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-text-stats-stale-identity-generation";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-text-stats-stale-identity-generation");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11643,7 +12085,8 @@ test "provisioned distributed aggregations collect path terms nested cardinality
 
 test "api.table_reads.docid algebraic partial request fails closed when lifecycle is stale" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-algebraic-partials-stale-lifecycle";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-algebraic-partials-stale-lifecycle");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11691,7 +12134,8 @@ test "api.table_reads.docid algebraic partial request fails closed when lifecycl
 
 test "api.table_reads.docid algebraic partial request accepts current identity generation and rejects stale" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-algebraic-partials-stale-identity-generation";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-algebraic-partials-stale-identity-generation");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11746,7 +12190,8 @@ test "api.table_reads.docid algebraic partial request accepts current identity g
 
 test "hosted textStatsGroupLocal serves only the local group" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-local-text-stats";
+    const path = try uniqueTestTmpPathAlloc(test_alloc, "antfly-api-hosted-local-text-stats");
+    defer test_alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -11886,7 +12331,8 @@ test "hosted textStatsGroupLocal serves only the local group" {
 
 test "hosted table read source preflights query locally" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-local-preflight";
+    const path = try uniqueTestTmpPathAlloc(test_alloc, "antfly-api-hosted-local-preflight");
+    defer test_alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -12013,7 +12459,8 @@ test "hosted table read source preflights query locally" {
 
 test "hosted table read source preflights every local group" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-local-preflight-multigroup";
+    const path = try uniqueTestTmpPathAlloc(test_alloc, "antfly-api-hosted-local-preflight-multigroup");
+    defer test_alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -12157,7 +12604,8 @@ test "hosted table read source preflights every local group" {
 
 test "hosted table read source preflights mixed local and remote groups" {
     const test_alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-preflight-mixed";
+    const path = try uniqueTestTmpPathAlloc(test_alloc, "antfly-api-hosted-preflight-mixed");
+    defer test_alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -12282,7 +12730,8 @@ test "hosted table read source preflights mixed local and remote groups" {
 
 test "hosted cross-range graph query expands explicit local start keys" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-hosted-cross-range-graph-explicit";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-cross-range-graph-explicit");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -14575,7 +15024,8 @@ test "hosted cross-range graph metric fan-in rejects unpublished or incompatible
 
 test "provisioned primary lookup lease fails on identity namespace mismatch" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-primary-lookup-identity-mismatch";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-primary-lookup-identity-mismatch");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

@@ -1,0 +1,49 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "committed-returning-parity",
+      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+      "surface": "committed_returning",
+      "status": "partial_release_gated",
+      "current_evidence": "Local SQL and typed row-plan paths gate committed mutation images for insert, update, delete, conflict update, conflict do-nothing, merge, insert-source, and joined mutation RETURNING shapes.",
+      "missing_evidence": "Committed-row RETURNING still needs one parity fixture comparing SQL, REST/SDK typed plans, local storage execution, and routed execution for inserted, updated, conflict-updated, conflict-noop, and deleted rows.",
+      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+      "evidence_symbol": "relational rows batch returning projects committed mutation images",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "concurrent-conflict-action-state",
+      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+      "surface": "conflict_action_state",
+      "status": "partial_release_gated",
+      "current_evidence": "Conflict target upsert resolves expression unique owners, temporal unique overlap owners, partial unique predicates, primary existence, and typed increment/patch expressions.",
+      "missing_evidence": "Concurrent-write conflict action tests still need to prove reads of excluded, existing row state, defaults, generated columns, sequence values, and committed-row images under contention.",
+      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+      "evidence_symbol": "relational rows conflict target upsert resolves temporal unique overlap owner",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "non-unique-point-claim-safety",
+      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+      "surface": "non_unique_point_claim",
+      "status": "partial_release_gated",
+      "current_evidence": "Claimed mutation-source parsing, non-lockable row-lock rejection, invalid row-lock targets, and storage-bound row-claim tests gate the current lockable-source contract.",
+      "missing_evidence": "Every new non-unique point mutation shape must remain on explicit claimed mutation-source plans, with fallback scans rejected before remote routing or owner-local staging.",
+      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+      "evidence_symbol": "relational rows mutation source contract parses claimed update plans",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "routed-conflict-range-movement-chaos",
+      "relational_slices_section": "Point CRUD and conflict upsert hardening",
+      "surface": "routed_conflict_range_movement",
+      "status": "gap_tracked",
+      "current_evidence": "Hosted mutation-source routing already gates stale topology epoch rejection, collect retry before staging, and global planned candidate staging.",
+      "missing_evidence": "Add range-movement chaos around routed insert-source conflict lookup, conflict guard evaluation, staged write commit, and temporal unique overlap selection.",
+      "evidence_file": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+      "evidence_symbol": "hosted mutation source retries remote collect after topology change",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

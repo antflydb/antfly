@@ -501,6 +501,10 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "defaults", createTablePlanDefaultColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "generated", createTablePlanGeneratedColumnCount(plan));
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "on_update", createTablePlanUpdatePolicyColumnCount(plan));
+            if (plan.storage_mode == .document) {
+                fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "storage_mode", "document");
+                fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "document_schemas", plan.document_schemas.len);
+            }
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "system_versioned", plan.system_versioned);
             fingerprint = try appendConstraintTimingFingerprintsAlloc(alloc, fingerprint, countCreateTableConstraintTimingFingerprints(plan));
             fingerprint = try appendNamedConstraintFingerprintsAlloc(alloc, fingerprint, countNamedCreateTableConstraints(plan));

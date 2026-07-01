@@ -128,6 +128,12 @@ fn appParityFixtureAppliedPlanMatchesDerived(
     return std.mem.eql(u8, entry.applied_plan, derived);
 }
 
+fn appParityFixtureAllowsDocumentSourceSchema(entry: corpus.AppParityCorpusEntry) bool {
+    return (entry.family == .read and corpus.corpusFixtureHasDocumentReadSummary(entry.summary)) or
+        ((entry.family == .unsupported_read or entry.family == .unsupported_write) and
+            std.mem.startsWith(u8, entry.classification_reason, "document_sql_"));
+}
+
 pub fn validateAppParityFixtureMetadataWithBaseSchema(
     alloc: std.mem.Allocator,
     entry: corpus.AppParityCorpusEntry,
@@ -135,7 +141,10 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     seen_names: *std.StringHashMapUnmanaged(void),
     callbacks: AppParityFixtureMetadataCallbacks,
 ) !void {
-    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch return error.TestUnexpectedResult;
+    var parsed_sql = tokenized.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
+        if (try corpus.sourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err)) return;
+        return error.TestUnexpectedResult;
+    };
     defer parsed_sql.deinit(alloc);
     try corpus.validateFixtureMetadataCoreParsedSql(entry, &parsed_sql);
     if (!corpus.corpusFixtureSqlParameterCoverageMatchesParsedSql(entry, &parsed_sql)) return error.TestUnexpectedResult;
@@ -155,11 +164,19 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
     if (entry.apply_setup_sql.len > 0 and !(try appParitySetupSqlIsValid(alloc, entry.apply_setup_sql, callbacks))) {
         return error.TestUnexpectedResult;
     }
-    if (entry.source_schema_json.len > 0 and !(try corpus.fixtureSchemaJsonIsRelationalTableAlloc(alloc, entry.source_schema_json))) {
-        return error.TestUnexpectedResult;
+    if (entry.source_schema_json.len > 0) {
+        var source_schema_valid = try corpus.fixtureSchemaJsonIsRelationalTableAlloc(alloc, entry.source_schema_json);
+        if (!source_schema_valid and appParityFixtureAllowsDocumentSourceSchema(entry)) {
+            source_schema_valid = try corpus.fixtureSchemaJsonIsDocumentTableAlloc(alloc, entry.source_schema_json);
+        }
+        if (!source_schema_valid) return error.TestUnexpectedResult;
     }
     for (entry.catalog_tables) |catalog_table| {
-        if (!(try corpus.fixtureSchemaJsonIsRelationalTableAlloc(alloc, catalog_table.schema_json))) {
+        var catalog_schema_valid = try corpus.fixtureSchemaJsonIsRelationalTableAlloc(alloc, catalog_table.schema_json);
+        if (!catalog_schema_valid and corpus.appParityEntryHasDocumentViewMappingCatalog(entry)) {
+            catalog_schema_valid = try corpus.fixtureSchemaJsonIsDocumentTableAlloc(alloc, catalog_table.schema_json);
+        }
+        if (!catalog_schema_valid) {
             return error.TestUnexpectedResult;
         }
         if (entry.summary.table_name) |target_table_name| {
@@ -170,10 +187,24 @@ pub fn validateAppParityFixtureMetadataWithBaseSchema(
         const source_table_name = (corpus.appParitySourceTableNameParsedSqlAlloc(alloc, entry, &parsed_sql) catch return error.TestUnexpectedResult) orelse return error.TestUnexpectedResult;
         defer alloc.free(@constCast(source_table_name));
         if (source_table_name.len == 0) return error.TestUnexpectedResult;
+        if (appParityFixtureAllowsDocumentSourceSchema(entry) and try corpus.fixtureSchemaJsonIsDocumentTableAlloc(alloc, entry.source_schema_json)) {
+            if (entry.summary.table_name) |target_table_name| {
+                if (!std.mem.eql(u8, source_table_name, target_table_name)) return error.TestUnexpectedResult;
+            }
+            return validateAppParityFixtureRowsAndName(alloc, entry, seen_names);
+        }
         if (!corpus.corpusFixturePlanMatchesSourceTable(entry, source_table_name)) {
             return error.TestUnexpectedResult;
         }
     }
+    return validateAppParityFixtureRowsAndName(alloc, entry, seen_names);
+}
+
+fn validateAppParityFixtureRowsAndName(
+    alloc: std.mem.Allocator,
+    entry: corpus.AppParityCorpusEntry,
+    seen_names: *std.StringHashMapUnmanaged(void),
+) !void {
     for (entry.returning_rows) |returning_row| {
         if (!(try corpus.fixtureJsonTextIsObjectAlloc(alloc, returning_row))) return error.TestUnexpectedResult;
     }

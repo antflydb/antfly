@@ -1,0 +1,49 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "cte-stream-spill-resumability",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "surface": "cte_stream_spill",
+      "status": "partial_release_gated",
+      "current_evidence": "Recursive CTE lowering admits materialization through stream spill policy and routed materialization tracking shares spill and hard-cap accounting for bounded execution.",
+      "missing_evidence": "CTE and recursive CTE execution still needs durable spill-store streaming with backpressure, resumable cursors, bounded memory, spill accounting, and reopen/resume evidence instead of bounded in-memory materialization only.",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/relational_rows.zig",
+      "evidence_symbol": "lowered sql recursive cte materialization admission uses stream spill policy",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "live-write-pagination-range-movement",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "surface": "live_write_pagination",
+      "status": "gap_tracked",
+      "current_evidence": "Routed read visibility inventory tracks live-write pagination as an explicit release-gated gap while routed scans and CTE-owner revalidation cover stable-shape execution and fail-closed stale owner cases.",
+      "missing_evidence": "Live-write and range-movement pagination tests still need to prove stable ordering, no duplicates, no missing rows, and deterministic retry or fail-closed behavior across routed reads.",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/relational_routed_visibility_matrix.json",
+      "evidence_symbol": "live-write-pagination-gap",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "owner-stream-join-strategy-planning",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "surface": "owner_stream_join_strategy",
+      "status": "partial_release_gated",
+      "current_evidence": "Storage join strategy selection records explicit strategy choices and fails closed for unproven merge input ordering.",
+      "missing_evidence": "Owner-stream join planning still needs cardinality and index hints in typed plans with deterministic lookup, hash, and merge choices plus parity cases proving fallback when stats are missing.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/types.zig",
+      "evidence_symbol": "relational rows join strategy selection is explicit and fail closed for unproven merge",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "routed-merge-join-order-proof",
+      "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
+      "surface": "routed_merge_join_order_proof",
+      "status": "partial_release_gated",
+      "current_evidence": "Sorted input proof requires leading ascending join-key order, and routed merge joins currently reject range fanout, input filters, and limit/offset pagination before scanning.",
+      "missing_evidence": "Routed merge joins must remain fail-closed until every non-materialized routed source shape has durable proof of global leading ascending join-key order after owner scans, topology retry, filtering, and pagination.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/types.zig",
+      "evidence_symbol": "relational rows join sorted input proof requires leading ascending join key order",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

@@ -20,6 +20,7 @@ const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const metadata_api = @import("../metadata/api.zig");
 const metadata_table_manager = @import("../metadata/table_manager.zig");
 const metadata_transition_state = @import("../metadata/transition_state.zig");
@@ -63,7 +64,7 @@ pub const ReadPlanLoweringCallbacks = struct {
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveCtePlan,
     lower_join_with_schemas: *const fn (
         std.mem.Allocator,
@@ -77,7 +78,7 @@ pub const ReadPlanLoweringCallbacks = struct {
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredQueryPlan,
     lower_set_operation_optional_source_schema: *const fn (
         std.mem.Allocator,
@@ -85,7 +86,7 @@ pub const ReadPlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         ?runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredSetOperationPlan,
 };
 
@@ -95,7 +96,7 @@ pub const ReadPlanLoweringContext = struct {
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     callbacks: ReadPlanLoweringCallbacks,
     statement_kind: ?sql_statement_kind.SqlReadStatementKind = null,
     parsed_sql: ?*const tokenized.ParsedSql = null,
@@ -4808,7 +4809,7 @@ pub const CatalogReadPlanLoweringCallbacks = struct {
         *const tokenized.ParsedSql,
         source_binding.DocumentBinding,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_with_source_schema: *const fn (
         std.mem.Allocator,
@@ -4816,14 +4817,14 @@ pub const CatalogReadPlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_without_source_schema: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
 };
 
@@ -4832,7 +4833,7 @@ pub const CatalogReadPlanLoweringContext = struct {
     sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     callbacks: CatalogReadPlanLoweringCallbacks,
     parsed_sql: ?*const tokenized.ParsedSql = null,
 
@@ -4944,7 +4945,7 @@ fn lowerDocumentTargetParsedSqlForLoweringContextTestAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     document: source_binding.DocumentBinding,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredReadPlan {
     _ = params;
     _ = function_bindings;
@@ -4992,7 +4993,7 @@ fn lowerReadPlanWithSourceSchemaParsedSqlForLoweringContextTestAlloc(
     schema: runtime_schema.TableSchema,
     source_schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredReadPlan {
     return try lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(alloc, parsed_sql, schema, source_schema, params, function_bindings);
 }
@@ -5002,7 +5003,7 @@ fn lowerReadPlanParsedSqlForLoweringContextTestAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredReadPlan {
     return try lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(alloc, parsed_sql, schema, null, params, function_bindings);
 }
@@ -5013,7 +5014,7 @@ fn lowerReadPlanWithOptionalSourceSchemaParsedSqlForLoweringContextTestAlloc(
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredReadPlan {
     var context = ReadPlanLoweringContext{
         .alloc = alloc,
@@ -5082,7 +5083,7 @@ fn lowerQueryParsedSqlForLoweringContextTestAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredQueryPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
@@ -5278,7 +5279,7 @@ fn lowerRecursiveCteParsedSqlForLoweringContextTestAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) anyerror!plan.LoweredRecursiveCtePlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
@@ -5304,7 +5305,7 @@ fn lowerSetOperationParsedSqlForLoweringContextTestAlloc(
     schema: runtime_schema.TableSchema,
     source_schema: ?runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredSetOperationPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     if (source_schema) |joined_source_schema| {
@@ -9144,7 +9145,7 @@ pub const CatalogWritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         plan.LowerWritePlanOptions,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredWritePlan,
 };
 
@@ -9153,7 +9154,7 @@ pub const CatalogWritePlanLoweringContext = struct {
     sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     callbacks: CatalogWritePlanLoweringCallbacks,
     parsed_sql: ?*const tokenized.ParsedSql = null,
 
@@ -9231,7 +9232,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         plan.LowerWritePlanOptions,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredWritePlan,
     lower_recursive_insert_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9240,7 +9241,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveInsertSource,
     lower_recursive_update_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9249,7 +9250,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveJoinedMutationSource,
     lower_recursive_delete_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9258,7 +9259,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveJoinedMutationSource,
     lower_recursive_merge_mutation_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9266,7 +9267,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredRecursiveMergeMutation,
     lower_insert_with_resolver: *const fn (
         std.mem.Allocator,
@@ -9274,7 +9275,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredInsert,
     lower_insert_source_with_resolver: *const fn (
         std.mem.Allocator,
@@ -9282,7 +9283,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredInsertSource,
     lower_insert_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9291,7 +9292,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredInsertSource,
     lower_update_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9300,7 +9301,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredJoinedMutationSource,
     classify_update_selector: *const fn (
         std.mem.Allocator,
@@ -9315,7 +9316,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutation,
     lower_update_source: *const fn (
         std.mem.Allocator,
@@ -9323,7 +9324,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutationSource,
     lower_delete_joined_source_with_schemas: *const fn (
         std.mem.Allocator,
@@ -9332,7 +9333,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredJoinedMutationSource,
     classify_delete_selector: *const fn (
         std.mem.Allocator,
@@ -9347,7 +9348,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         relational_rows.UniqueSelectorResolver,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutation,
     lower_delete_source: *const fn (
         std.mem.Allocator,
@@ -9355,7 +9356,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         db_mod.types.RowClaimRequest,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredMutationSource,
     lower_truncate_source: *const fn (
         std.mem.Allocator,
@@ -9369,7 +9370,7 @@ pub const WritePlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredMergeMutationPlan,
 };
 
@@ -9378,7 +9379,7 @@ pub const WritePlanLoweringContext = struct {
     sql: []const u8 = "",
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     callbacks: WritePlanLoweringCallbacks,
     parsed_sql: ?*const tokenized.ParsedSql = null,
 
@@ -9559,14 +9560,14 @@ pub const ExplainPlanLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         table_catalog.CatalogSource,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_read_without_catalog: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_write_with_catalog: *const fn (
         std.mem.Allocator,
@@ -9591,7 +9592,7 @@ pub const ExplainPlanLoweringContext = struct {
     params: []const value_mod.SqlValue,
     options: plan.LowerWritePlanOptions,
     catalog: ?table_catalog.CatalogSource,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     callbacks: ExplainPlanLoweringCallbacks,
 
     pub fn lower(self: *@This(), sql: []const u8) !plan.LoweredExplainPlan {
@@ -9636,14 +9637,14 @@ pub const RelationPopulationLoweringCallbacks = struct {
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         table_catalog.CatalogSource,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
     lower_read_without_catalog: *const fn (
         std.mem.Allocator,
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
         []const value_mod.SqlValue,
-        lower_expr.SqlFunctionBindings,
+        expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredReadPlan,
 };
 
@@ -9652,7 +9653,7 @@ pub const RelationPopulationLoweringContext = struct {
     schema: runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
     catalog: ?table_catalog.CatalogSource,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     callbacks: RelationPopulationLoweringCallbacks,
 
     pub fn lower(self: *@This(), sql: []const u8) !plan.LoweredRelationPopulationPlan {

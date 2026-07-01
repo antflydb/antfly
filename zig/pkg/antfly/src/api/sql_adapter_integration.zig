@@ -1253,7 +1253,7 @@ fn expectAppParityUnsupportedPlanEntry(
 ) !void {
     switch (entry.family) {
         .unsupported => try expectFailClosedUnsupported(lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
-        .unsupported_read => try expectFailClosedUnsupported(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
+        .unsupported_read => try expectFailClosedUnsupported(lowerAppParityReadPlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql)),
         .unsupported_ddl => try expectFailClosedUnsupported(planLogicalDdlParsedForAppParityAlloc(alloc, parsed_sql)),
         .unsupported_write => try expectFailClosedUnsupported(lowerAppParityWritePlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql, unique_resolver, row_claim)),
         .unsupported_insert => try expectFailClosedUnsupported(lowerInsertWithResolverParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
@@ -1285,7 +1285,7 @@ fn expectAppParityInvalidPlanEntry(
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
     switch (entry.family) {
-        .invalid_read => try expectTypedInvalid(lowerReadPlanWithFunctionBindingsParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{})),
+        .invalid_read => try expectTypedInvalid(lowerAppParityReadPlanParsedSqlAlloc(alloc, effective_schema, entry, parsed_sql)),
         .invalid_insert => try expectTypedInvalid(lowerInsertWithResolverStrictParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
         .invalid_update => try expectTypedInvalid(lowerUpdateStrictParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
         .invalid_delete => try expectTypedInvalid(lowerDeleteParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, unique_resolver)),
@@ -1309,6 +1309,23 @@ fn expectAppParityInvalidPlanEntry(
     try expectAppParityPlan(entry.plan, fingerprint);
 }
 
+fn expectAppParityGeneratedParseFailureEntry(
+    alloc: std.mem.Allocator,
+    entry: AppParityCorpusEntry,
+    err: anyerror,
+) !bool {
+    if (!(try sql_adapter.sourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
+    const fingerprint_family = sql_adapter.corpusUnsupportedPlanFamily(entry.family) orelse return error.TestUnexpectedResult;
+    const diagnostic_reason = sql_adapter.classificationReasonFromToken(entry.classification_reason) orelse return error.TestUnexpectedResult;
+    const fingerprint = sql_adapter.unsupportedFingerprintAlloc(alloc, fingerprint_family, diagnostic_reason) catch |fingerprint_err| switch (fingerprint_err) {
+        error.UnsupportedSqlShape => return error.TestUnexpectedResult,
+        else => return fingerprint_err,
+    };
+    defer alloc.free(fingerprint);
+    try expectAppParityPlan(entry.plan, fingerprint);
+    return true;
+}
+
 fn expectAppParityCorpusEntry(
     alloc: std.mem.Allocator,
     base_schema_json: []const u8,
@@ -1317,7 +1334,10 @@ fn expectAppParityCorpusEntry(
     unique_resolver: relational_rows.UniqueSelectorResolver,
     row_claim: db_mod.types.RowClaimRequest,
 ) !void {
-    var parsed_sql = try sql_adapter.ParsedSql.initAlloc(alloc, entry.sql);
+    var parsed_sql = sql_adapter.ParsedSql.initAlloc(alloc, entry.sql) catch |err| {
+        if (try expectAppParityGeneratedParseFailureEntry(alloc, entry, err)) return;
+        return err;
+    };
     defer parsed_sql.deinit(alloc);
 
     var effective_schema = schema;

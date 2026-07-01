@@ -982,6 +982,10 @@ pub const ProvisionedTableWriteCache = struct {
         prepared: PreparedOpen,
     };
 
+    fn managedModeUsesOwnedReadOnlyDb(mode: ManagedDbOpenMode) bool {
+        return mode == .query_readonly or mode == .status_only;
+    }
+
     pub const Entry = struct {
         group_id: u64,
         lsm_root_generation: u64,
@@ -1495,7 +1499,7 @@ pub const ProvisionedTableWriteCache = struct {
         if (mode != .status_only and mode != .query_readonly and self.hasRetiredActiveLeaseForGroupTableLocked(group_id, table_name)) {
             return error.LsmRootWriterAlreadyOpen;
         }
-        if (mode == .status_only) {
+        if (managedModeUsesOwnedReadOnlyDb(mode)) {
             const opened = try openDbForMode(
                 self.alloc,
                 path,
@@ -1712,6 +1716,22 @@ pub const ProvisionedTableWriteCache = struct {
         mode: ManagedDbOpenMode,
         prepared: *PreparedOpen,
     ) !CachedDb {
+        if (managedModeUsesOwnedReadOnlyDb(mode)) {
+            var db = opened.* orelse unreachable;
+            opened.* = null;
+            errdefer db.close();
+
+            const owned_db = try self.alloc.create(db_mod.DB);
+            errdefer self.alloc.destroy(owned_db);
+            owned_db.* = db;
+            return .{
+                .cache = self,
+                .db = owned_db,
+                .schema_json = null,
+                .owned_db = owned_db,
+            };
+        }
+
         try self.pruneStaleEntriesForGroupTableLocked(group_id, lsm_root_generation, table_name);
         for (self.entries.items) |entry| {
             if (entry.group_id == group_id and entry.lsm_root_generation == lsm_root_generation and std.mem.eql(u8, entry.table_name, table_name)) {
@@ -2651,6 +2671,38 @@ test "managed status-only cache open skips shared bulk ingest session state" {
     try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
     try std.testing.expect(write_cache.entries.items[0].bulk_ingest_session_open);
     try std.testing.expectEqual(@as(usize, 1), write_cache.active_bulk_ingest_sessions.items.len);
+}
+
+test "managed query-readonly cache open skips writer cache entry" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const replica_root_dir = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-query-readonly-owned", .{tmp.sub_path});
+    defer alloc.free(replica_root_dir);
+    const path = try std.fmt.allocPrint(alloc, "{s}/group-7001/table-db", .{replica_root_dir});
+    defer alloc.free(path);
+
+    {
+        var seed = try db_mod.DB.open(alloc, path, .{});
+        defer seed.close();
+    }
+
+    const catalog = testingEmptyIndexesCatalog();
+    var write_cache = ProvisionedTableWriteCache.init(alloc);
+    defer write_cache.deinit();
+
+    var readonly = try write_cache.getOrOpenLockedMode(path, catalog, 7001, 0, "docs", .query_readonly);
+    defer readonly.deinit(alloc);
+    try std.testing.expect(readonly.entry == null);
+    try std.testing.expect(readonly.owned_db != null);
+    try std.testing.expectEqual(@as(usize, 0), write_cache.entries.items.len);
+
+    var writer = try write_cache.getOrOpenLocked(path, catalog, 7001, 0, "docs");
+    defer writer.deinit(alloc);
+    try std.testing.expect(writer.entry != null);
+    try std.testing.expectEqual(@as(usize, 1), write_cache.entries.items.len);
 }
 
 test "full text memory attribution aggregation includes norm bytes" {

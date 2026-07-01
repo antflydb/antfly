@@ -3967,9 +3967,13 @@ pub fn addAPITableTestSteps(
     addFocusedAPITestStep(b, "sql-api-parity-fixture-check", "Check that the SQL/API typed-plan parity fixture matches the source corpus", sql_api_parity_fixture_check);
 
     const relational_release_gate = b.step("relational-release-gate", "Run relational rows, SQL/API parity, and fixture freshness release gates");
-    relational_release_gate.dependOn(&rows.step);
-    relational_release_gate.dependOn(&sql_api_parity.step);
-    relational_release_gate.dependOn(&sql_api_parity_fixture_check.step);
+    const release_rows = addSimpleAPITestRun(b, modules.rows, &APITestFilters.rows, true);
+    const release_sql_api_parity = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity, false);
+    release_sql_api_parity.step.dependOn(&release_rows.step);
+    const release_sql_api_parity_fixture_check = addSimpleAPITestRun(b, modules.rows, &APITestFilters.sql_api_parity_fixture, false);
+    release_sql_api_parity_fixture_check.setEnvironmentVariable("ANTFLY_SQL_API_PARITY_FIXTURE_CHECK", "pkg/antfly/src/sql/fixtures/sql_api_parity_corpus.json");
+    release_sql_api_parity_fixture_check.step.dependOn(&release_sql_api_parity.step);
+    relational_release_gate.dependOn(&release_sql_api_parity_fixture_check.step);
 
     return .{
         .docid = docid,

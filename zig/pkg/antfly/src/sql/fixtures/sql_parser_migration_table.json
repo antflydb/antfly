@@ -1,0 +1,68 @@
+{
+  "migration_format": 1,
+  "families": [
+    {
+      "family": "backups",
+      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "Add raw generated-AST fixtures, binder/lowering diagnostics, and API parity for BACKUP/RESTORE before deleting token-tail fallback."
+    },
+    {
+      "family": "ddl",
+      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "Every supported DDL subfamily has raw generated-AST fixtures, generated-AST-to-plan parity, app-parity corpus coverage, and stale-AST fail-closed tests."
+    },
+    {
+      "family": "dml",
+      "compatibility_entry_point": "lower_dml token parser paths without generated_dml_ast options",
+      "generated_ast_entry_point": "tokenized.ParsedSql.writeStatementKindIncludingGeneratedAst plus lower_dml generated_dml_ast parser options",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "INSERT, UPDATE, DELETE, TRUNCATE, MERGE, and mutation-source writes have raw generated-AST fixtures, binder/lowering parity, runtime parity, and stale-AST diagnostics."
+    },
+    {
+      "family": "extensions",
+      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "Extension DDL and extension-index DDL have generated-AST coverage, unsupported-shape diagnostics, and native/API parity."
+    },
+    {
+      "family": "functions",
+      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "Function, procedure, trigger, aggregate, operator, and cast catalog plans have generated-AST fixtures, binder/lowering parity, and stable unsupported diagnostics."
+    },
+    {
+      "family": "lakes",
+      "compatibility_entry_point": "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst",
+      "generated_ast_entry_point": "generated_parser.GeneratedSqlReadAst",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "External lake reads and query functions have raw generated-read fixtures, bound source parity, runtime parity, and explicit unsupported diagnostics."
+    },
+    {
+      "family": "maintenance",
+      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance commands have generated-AST fixtures and app-parity coverage."
+    },
+    {
+      "family": "query",
+      "compatibility_entry_point": "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst",
+      "generated_ast_entry_point": "generated_parser.GeneratedSqlReadAst",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "Query, aggregate, join, lateral, window, recursive CTE, and set-operation plans have raw generated-read fixtures, binder/lowering parity, runtime parity, and stale-AST diagnostics."
+    },
+    {
+      "family": "roles",
+      "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
+      "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
+      "removal_gate": "Role, privilege, row-security, schema-namespace, and session-setting commands have generated-AST fixtures, native/API parity, and explicit no-op or unsupported classifications."
+    }
+  ]
+}

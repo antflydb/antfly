@@ -1,0 +1,89 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "catalog-ddl-durable-state",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "catalog_ddl",
+      "durable_surface": "catalog",
+      "evidence_kind": "golden_typed_plan",
+      "evidence_file": "zig/pkg/antfly/src/sql/ddl_plan.zig",
+      "evidence_symbol": "sql adapter ddl plan lowers create table ddl into typed schema plan",
+      "coverage_contract": "PostgreSQL-shaped catalog DDL that can affect durable schema state must lower to typed catalog/schema plans or deterministic unsupported catalog plans before execution.",
+      "missing_or_next_evidence": "Remaining destructive multi-table catalog DDL must add crash/reopen and idempotent replay evidence before its inventory row can move from plan coverage to execution parity.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "copy-bulk-io-unsupported",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "bulk_io_copy",
+      "durable_surface": "unsupported_no_state",
+      "evidence_kind": "deterministic_unsupported_fixture",
+      "evidence_file": "zig/pkg/antfly/src/sql/ddl_plan.zig",
+      "evidence_symbol": "sql adapter generated copy unsupported AST lowers to bulk io plan",
+      "coverage_contract": "COPY-shaped PostgreSQL syntax must either route through an explicit bulk-io plan or remain a deterministic unsupported fixture before it can affect durable table state.",
+      "missing_or_next_evidence": "Native COPY execution remains outside relational durable row mutation coverage until it has typed row ingestion, auth, row-claim, and rollback evidence.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "insert-upsert-row-state",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "insert_upsert",
+      "durable_surface": "row",
+      "evidence_kind": "execution_parity_test",
+      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+      "evidence_symbol": "postgres sql adapter insert source unique conflict executes through relational storage",
+      "coverage_contract": "INSERT, INSERT ... SELECT, ON CONFLICT, partial/temporal conflict targets, grouped guards, defaults, generated values, and RETURNING must have typed plans plus SQL/API execution parity or unsupported fixtures.",
+      "missing_or_next_evidence": "Hosted/provisioned owner-movement chaos for insert-source upsert remains tracked separately by the production chaos inventory.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "merge-joined-row-state",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "merge_joined_mutation",
+      "durable_surface": "row",
+      "evidence_kind": "execution_parity_test",
+      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+      "evidence_symbol": "postgres sql adapter merge mutation batch executes through relational storage",
+      "coverage_contract": "MERGE and joined mutation syntax that can update, delete, insert, or return durable rows must have generated metadata rejection, typed plans, and execution parity or unsupported fixtures.",
+      "missing_or_next_evidence": "Range-movement and remote-owner replay chaos for derived mutation-source stages remains tracked under multi-row DML slices.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "mutation-source-claimed-row-state",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "mutation_source",
+      "durable_surface": "row",
+      "evidence_kind": "execution_parity_test",
+      "evidence_file": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+      "evidence_symbol": "hosted mutation source stages global planned candidates across remote owners",
+      "coverage_contract": "UPDATE/DELETE source syntax that claims base rows must prove typed lowering, non-lockable source rejection, owner-local staging, claim resolution, and SQL/API parity.",
+      "missing_or_next_evidence": "Live split/merge/leader handoff fairness and crash/reopen replay remain tracked under multi-row DML and queue claim slices.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "routine-auth-policy-catalog-state",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "routine_auth_policy",
+      "durable_surface": "catalog_and_auth",
+      "evidence_kind": "execution_parity_test",
+      "evidence_file": "zig/pkg/antfly/src/api/auth_sql_adapter.zig",
+      "evidence_symbol": "sql auth adapter applies row security policies through user manager",
+      "coverage_contract": "Routine, role, grant, and row-security policy syntax that affects durable catalog or authorization state must have native runtime application evidence or deterministic unsupported fixtures.",
+      "missing_or_next_evidence": "Additional routine trigger and policy combinations must keep parser, binder, runtime, auth, and reopen evidence before being removed from compatibility inventories.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "truncate-table-emptying-state",
+      "relational_slices_section": "Release parity and production chaos gate",
+      "syntax_family": "truncate_table_emptying",
+      "durable_surface": "catalog_and_row",
+      "evidence_kind": "golden_typed_plan",
+      "evidence_file": "zig/pkg/antfly/src/sql/lower_dml.zig",
+      "evidence_symbol": "sql adapter lower dml lowers truncate into claimed table-emptying mutation source",
+      "coverage_contract": "TRUNCATE, ONLY-qualified TRUNCATE, RESTART/CONTINUE IDENTITY, multi-table barriers, and CASCADE must lower to typed table-emptying work or unsupported fixtures before durable state changes.",
+      "missing_or_next_evidence": "Combined table-emptying plus secondary-index chaos remains tracked separately by the production chaos inventory.",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

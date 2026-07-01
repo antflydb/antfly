@@ -25,6 +25,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const db_embedder = @import("../../storage/db/enrichment/embedder.zig");
 const hbc_mod = @import("../../storage/hbc_adapter.zig");
 const lsm_backend = @import("../../storage/lsm_backend/mod.zig");
+const platform_time = @import("../../platform/time.zig");
 const resource_manager_mod = @import("../../storage/resource_manager.zig");
 const runtime_status = @import("../runtime_status.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
@@ -32,6 +33,10 @@ const tables_api = @import("../../metadata/catalog/table_ddl.zig");
 const Io = std.Io;
 
 const backend_current_root_generation: u64 = 0;
+
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
 
 pub const ProvisionedTableReadCache = struct {
     alloc: std.mem.Allocator,
@@ -803,7 +808,8 @@ pub fn validateOpenedProvisionedDbIdentityNamespace(
 
 test "provisioned query runtime db opens with catalog identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-runtime-identity-namespace";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-runtime-identity-namespace");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -864,7 +870,8 @@ test "provisioned query runtime db opens with catalog identity namespace" {
 
 test "provisioned query runtime db rejects stale identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-query-runtime-stale-identity-namespace";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-query-runtime-stale-identity-namespace");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -938,7 +945,8 @@ test "provisioned query runtime db rejects stale identity namespace" {
 
 test "provisioned lookup db opens with identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-lookup-identity-namespace";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-lookup-identity-namespace");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -958,7 +966,8 @@ test "provisioned lookup db opens with identity namespace" {
 
 test "provisioned warm status db opens with identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-warm-status-identity-namespace";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-warm-status-identity-namespace");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -978,8 +987,10 @@ test "provisioned warm status db opens with identity namespace" {
 
 test "provisioned direct read db opens reject stale identity namespace" {
     const alloc = std.testing.allocator;
-    const lookup_path = "/tmp/antfly-api-provisioned-lookup-stale-identity-namespace";
-    const status_path = "/tmp/antfly-api-provisioned-status-stale-identity-namespace";
+    const lookup_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-lookup-stale-identity-namespace");
+    defer alloc.free(lookup_path);
+    const status_path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-status-stale-identity-namespace");
+    defer alloc.free(status_path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1034,7 +1045,8 @@ test "provisioned direct read db opens reject stale identity namespace" {
 
 test "provisioned read cache keys entries by lsm root generation" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-generation";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-cache-generation");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1102,7 +1114,8 @@ test "provisioned read cache keys entries by lsm root generation" {
 
 test "provisioned read cache keys entries by identity namespace" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-identity-namespace";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-cache-identity-namespace");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1176,7 +1189,8 @@ test "provisioned read cache keys entries by identity namespace" {
 
 test "provisioned read cache invalidates repeated ownership moves with pinned leases" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-ownership-moves";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-cache-ownership-moves");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1287,7 +1301,8 @@ test "provisioned read cache clear preserves in-flight pending opens and bumps e
 
 test "provisioned read cache invalidate removes entries without dropping pending opens" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-invalidate";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-cache-invalidate");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1357,7 +1372,8 @@ test "provisioned read cache invalidate removes entries without dropping pending
 
 test "provisioned read cache retires invalidated entries until the last lease is released" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-provisioned-read-cache-no-retire";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-provisioned-read-cache-no-retire");
+    defer alloc.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -1436,7 +1452,8 @@ test "provisioned read cache retires invalidated entries until the last lease is
 test "provisioned read cache keeps leased entry cleanup reachable when retirement bookkeeping allocation fails" {
     var failing = std.testing.FailingAllocator.init(std.testing.allocator, .{});
     const alloc = failing.allocator();
-    const path = "/tmp/antfly-api-provisioned-read-cache-retire-oom";
+    const path = try uniqueTestTmpPathAlloc(std.testing.allocator, "antfly-api-provisioned-read-cache-retire-oom");
+    defer std.testing.allocator.free(path);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

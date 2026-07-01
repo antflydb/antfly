@@ -23,6 +23,7 @@ const raft_mod = @import("../../raft/mod.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const doc_set = @import("../../storage/db/doc_set.zig");
+const platform_time = @import("../../platform/time.zig");
 const distributed_graph = @import("../distributed_graph.zig");
 const table_catalog = @import("../../metadata/catalog/routing.zig");
 const tables_api = @import("../../metadata/catalog/table_ddl.zig");
@@ -30,6 +31,10 @@ const table_read_cache = @import("cache.zig");
 
 const algebraic_ir = db_mod.algebraic.ir;
 const algebraic_law = db_mod.algebraic.law;
+
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
 
 pub const GraphMetricFanInShardRequest = struct {
     req: db_mod.types.SearchRequest,
@@ -242,7 +247,8 @@ test "graph hydrate resolved doc filter applies include and exclude sets" {
 
 test "graph edge local read rejects stale identity generation" {
     const alloc = std.testing.allocator;
-    const root = "/tmp/antfly-api-graph-edge-stale-identity-generation";
+    const root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-graph-edge-stale-identity-generation");
+    defer alloc.free(root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
@@ -324,7 +330,8 @@ test "graph edge local read rejects stale identity generation" {
 
 test "graph edge local read rejects stale identity namespace" {
     const alloc = std.testing.allocator;
-    const root = "/tmp/antfly-api-graph-edge-stale-identity-namespace";
+    const root = try uniqueTestTmpPathAlloc(alloc, "antfly-api-graph-edge-stale-identity-namespace");
+    defer alloc.free(root);
 
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();

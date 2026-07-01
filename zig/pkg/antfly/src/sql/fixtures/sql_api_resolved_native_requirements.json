@@ -23,6 +23,121 @@
       ]
     },
     {
+      "reason": "document_sql_bounded_scan_incomplete_topk",
+      "coverage": [
+        "document_query_view_mapping_rejected_incomplete_topk"
+      ]
+    },
+    {
+      "reason": "document_sql_bounded_scan_missing_exact_producer",
+      "coverage": [
+        "document_query_native_graph_metric_rejected_missing_exact_producer",
+        "document_query_native_graph_metric_rerank_rejected_missing_exact_producer",
+        "document_query_native_graph_shortest_path_rejected_missing_exact_producer",
+        "document_query_native_graph_traverse_rejected_missing_exact_producer",
+        "document_query_native_hybrid_rejected_missing_exact_producer",
+        "document_query_native_semantic_rejected_missing_exact_producer",
+        "document_query_native_vector_rejected_missing_exact_producer",
+        "document_query_view_mapping_rejected_missing_exact_producer"
+      ]
+    },
+    {
+      "reason": "document_sql_bounded_scan_unbounded_source",
+      "coverage": [
+        "document_query_view_mapping_rejected_unbounded_read"
+      ]
+    },
+    {
+      "reason": "document_sql_bounded_scan_unsupported_residual",
+      "coverage": [
+        "document_query_view_mapping_rejected_unsupported_residual"
+      ]
+    },
+    {
+      "reason": "document_sql_view_mapping_catalog",
+      "coverage": [
+        "invalid_read_document_view_mapping_missing_required_index",
+        "invalid_read_document_view_mapping_stale_source_generation",
+        "invalid_read_document_view_mapping_stale_source_metadata"
+      ]
+    },
+    {
+      "reason": "document_sql_view_mapping_unsupported",
+      "coverage": [
+        "unsupported_read_document_view_mapping_function_predicate",
+        "unsupported_read_document_view_mapping_ilike_predicate",
+        "unsupported_read_document_view_mapping_not_in_predicate",
+        "unsupported_read_document_view_mapping_not_predicate",
+        "unsupported_read_document_view_mapping_or_predicate",
+        "unsupported_read_document_view_mapping_projection_expression",
+        "unsupported_read_document_view_mapping_projection_path",
+        "unsupported_read_document_view_mapping_regex_not_imatch_predicate",
+        "unsupported_read_document_view_mapping_regex_predicate"
+      ]
+    },
+    {
+      "reason": "document_sql_write_unsupported",
+      "coverage": [
+        "unsupported_write_document_sql_doc_update",
+        "unsupported_write_document_sql_exact_id_delete",
+        "unsupported_write_document_sql_full_document_insert",
+        "unsupported_write_document_sql_generated_id_insert",
+        "unsupported_write_document_sql_merge_delete",
+        "unsupported_write_document_sql_projection_insert",
+        "unsupported_write_document_sql_projection_update",
+        "unsupported_write_document_sql_truncate_table",
+        "unsupported_write_document_sql_write_unsupported"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_invalid_antfly_extension",
+      "coverage": [
+        "unsupported_ddl_document_table_invalid_antfly_extension"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_invalid_dynamic_template",
+      "coverage": [
+        "unsupported_ddl_document_table_invalid_dynamic_template"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_malformed_schema_json",
+      "coverage": [
+        "unsupported_ddl_document_table_malformed_schema_json"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_missing_default_type",
+      "coverage": [
+        "unsupported_ddl_document_table_missing_default_type"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_mixed_relational_shape",
+      "coverage": [
+        "unsupported_ddl_document_table_mixed_relational_shape"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_multi_document_type_unsupported",
+      "coverage": [
+        "unsupported_ddl_document_table_multi_document_type_unsupported"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_shorthand",
+      "coverage": [
+        "unsupported_ddl_document_table_shorthand"
+      ]
+    },
+    {
+      "reason": "document_table_ddl_unknown_default_type",
+      "coverage": [
+        "unsupported_ddl_document_table_unknown_default_type"
+      ]
+    },
+    {
       "reason": "duplicate_conflict_update_target",
       "coverage": [
         "invalid_duplicate_conflict_update_target"

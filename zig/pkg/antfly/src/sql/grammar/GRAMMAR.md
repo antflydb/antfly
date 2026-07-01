@@ -235,8 +235,10 @@ catalog plans directly from generated AST ranges. `CREATE`/`DROP`
 database/schema/extension statement heads now require generated parser success
 at the `ParsedSql` boundary, so malformed generated-owned catalog DDL fails
 closed instead of probing the legacy DDL classifier. Generated-covered
-`ALTER DATABASE` and `ALTER EXTENSION` statement heads now use the same strict
-generated parser boundary for catalog-setting and extension-update forms.
+`CREATE EXTENSION`, `DROP EXTENSION`, `ALTER DATABASE`, and `ALTER EXTENSION`
+statement heads now use the same strict generated parser boundary for retained
+extension option ranges, drop behavior flags, catalog-setting, and
+extension-update forms.
 Generated DDL lowering
 also validates the retained statement span, command span, and command-kind
 metadata before dispatching to catalog, table, index, or alter-table planning.
@@ -255,7 +257,14 @@ so DDL expression hooks for CHECK constraints, generated columns, and rewrite
 expressions consume the same token stream that the generated AST validated.
 Generated `serial`/`bigserial` identity-allocation tables now fail closed when
 retained generated identity metadata is stale instead of retrying ordinary
-create-table lowering; quoted `"serial"` column names remain ordinary
+create-table lowering. Generated `CREATE TABLE (...)` ASTs now retain the
+definition range plus first/last top-level definition item ranges and item
+count, and identity allocator lowering requires that metadata to match the
+parsed identity column and additional-column count before planning succeeds;
+`TEMP`/`TEMPORARY`/`UNLOGGED` relation-lifetime create-table lowering also
+requires the retained definition metadata to match the parsed table and first
+column before planning succeeds;
+quoted `"serial"` column names remain ordinary
 create-table columns because generated identity detection checks the first
 column type token position.
 Plain view catalog DDL heads, including `CREATE VIEW`, `CREATE OR REPLACE VIEW`,
@@ -1153,6 +1162,92 @@ Generated row-security table alterations additionally retain explicit
 enable/disable metadata, and the row-security DDL lowerer requires that
 metadata to match the retained operation tail before producing a typed catalog
 plan.
+Generated rename-oriented catalog DDL for schemas, tablespaces, collations, and
+views now retains the `RENAME TO` target as native metadata, and generated
+lowerers require that retained target range before producing typed rename
+plans.
+Generated `ALTER DATABASE ... SET ...` DDL retains both the database setting
+name and literal value ranges, and the generated database lowerer requires
+those retained ranges to match the supported `SET name TO|= value` operation
+before producing typed alter-database plans.
+Generated `ALTER EXTENSION ... UPDATE [TO version]` DDL validates the retained
+operation range against the exact update form and requires retained version
+metadata to agree with typed target-version plans.
+Generated `ALTER TYPE ... ADD VALUE ...` DDL retains the enum label, optional
+neighbor label, optional `IF NOT EXISTS`, and `BEFORE`/`AFTER` placement
+metadata, and generated enum-type validation requires those fields before
+lowering typed enum add-value plans.
+Generated `ALTER DOMAIN ...` DDL retains top-level domain operation item ranges
+for supported `SET/DROP NOT NULL` and `SET/DROP DEFAULT` operations, and
+generated domain validation requires each retained operation item to match the
+typed domain alteration sequence before producing catalog plans.
+Generated `ALTER SEQUENCE ...` DDL retains adjacent sequence operation item
+ranges for supported type, ownership, restart, bounds, increment, cache, and
+cycle operations, and generated sequence validation requires each retained item
+to match the typed alteration sequence before producing catalog plans.
+Generated logical-replication DDL now retains publication table-list metadata,
+publication all-table metadata, subscription connection-value metadata,
+subscription publication-list metadata, and subscription enable/disable
+metadata, and generated validation compares those retained fields plus retained
+publication/subscription names and drop `IF EXISTS` flags against the typed
+publication/subscription catalog plans.
+Generated row-security policy DDL now validates retained policy/table names and
+role-target metadata against typed create/alter/drop policy plans, so targeted
+policy role lists fail closed if retained generated list metadata is missing or
+stale.
+Generated role authorization DDL now validates retained role names for
+create/alter/drop role plans and retains `ALTER ROLE ... IN DATABASE ...`
+scope, setting-name, and setting-value ranges so typed role-setting plans fail
+closed when generated setting metadata is missing or stale.
+Generated aggregate type-system DDL now retains `CREATE/DROP AGGREGATE`
+argument-list metadata plus `CREATE AGGREGATE` option-list metadata, and
+generated validation compares those retained list ranges and counts against
+typed aggregate catalog plans before planning succeeds.
+Generated operator type-system DDL now retains symbolic operator-name ranges,
+`CREATE OPERATOR` option-list metadata, and `DROP OPERATOR` argument-list
+metadata, and generated validation compares those fields against typed
+operator catalog plans before planning succeeds.
+Generated cast type-system DDL now retains source/target type ranges,
+`CREATE CAST` function-name and function-argument metadata, and explicit
+assignment/implicit context metadata, and generated validation compares those
+fields against typed cast catalog plans before planning succeeds.
+Generated collation type-system DDL now retains `CREATE COLLATION` option-list
+metadata and validates retained create/rename/drop collation names plus create
+option counts against typed collation catalog plans before planning succeeds.
+Generated routine catalog DDL now retains routine signature argument-list
+metadata plus `RETURNS` and `LANGUAGE` value ranges, and generated routine
+validation compares those fields against typed create/drop routine plans before
+planning succeeds.
+Generated view catalog DDL now retains create-view operation metadata, including
+explicit output-column lists and the `AS` query range, and generated validation
+compares retained names, flags, rename targets, drop behavior, and explicit
+column lists against typed view catalog plans before planning succeeds.
+Generated materialized-view catalog DDL now reuses retained view metadata for
+create output-column lists and `AS` query ranges, and generated validation
+compares retained names, `IF [NOT] EXISTS`, drop cascade, refresh
+`CONCURRENTLY`, and `WITH [NO] DATA` population semantics against typed
+materialized-view plans before planning succeeds.
+Generated domain catalog DDL now retains the create-domain base type range, and
+generated validation compares retained domain names, base type names, drop
+`IF EXISTS`, and drop cascade metadata against typed domain catalog plans before
+planning succeeds.
+Generated sequence catalog DDL now retains `CREATE SEQUENCE` option item ranges
+using the same sequence operation metadata as `ALTER SEQUENCE`, and generated
+validation compares retained create option items, sequence names, `IF [NOT]
+EXISTS`, and drop cascade metadata against typed sequence catalog plans before
+planning succeeds.
+Generated enum type catalog DDL now retains `CREATE TYPE ... AS ENUM (...)`
+value-list metadata, and generated validation compares retained enum names,
+literal lists, drop `IF EXISTS`, and drop cascade metadata against typed enum
+catalog plans before planning succeeds.
+Generated tablespace catalog DDL now retains `CREATE TABLESPACE ... LOCATION`
+value metadata, reuses retained rename-target metadata, and validates retained
+tablespace names, location values, rename targets, and drop `IF EXISTS`
+metadata against typed tablespace catalog plans before planning succeeds.
+Generated `ALTER TABLE` planning now cross-checks retained operation item
+ranges against the typed operation tags they produce, so stale generated item
+metadata for add, drop, rename, alter-column, validate, and constraint
+operation families fails closed before a typed alter-table plan is accepted.
 Valid but unplanned `ALTER TABLE ... SET ACCESS METHOD ...`,
 `ALTER TABLE ... CLUSTER ON ...`/`SET WITHOUT CLUSTER`,
 `ALTER TABLE ... OWNER TO ...`,
@@ -2296,7 +2391,10 @@ variants for:
   methods, index element lists, covering-index include lists, partial-index
   predicates, index options, extension options, unique-index flags, and drop
   behavior, plus generated-first AST-to-plan parity checks for covered
-  create-index clauses
+  create-index clauses. Generated `CREATE INDEX` lowering now requires retained
+  index-element, include-list, option-list, and partial-predicate ranges plus
+  generated flag metadata, and fails closed if that generated metadata is
+  missing or stale.
 - graph statement, including a generated AST payload for command spans and
   graph-specific AST-to-plan wrappers for executable explicit-edge/extraction
   graph index and graph metric DDL;
@@ -2416,7 +2514,9 @@ Generated grammar work needs evidence at multiple levels:
   have generated AST-to-plan parity tests for their generated-covered forms;
   simple catalog DDL also has generated
   field-level checks for object names, option flags, version strings, drop
-  behavior, ALTER TABLE operation tails, fail-closed unsupported clauses, and
+  behavior, create-index element/include/option/predicate ranges and flags,
+  ALTER TABLE operation tails,
+  fail-closed unsupported clauses, and
   malformed database/schema/extension catalog DDL heads that no longer fall
   back to legacy DDL probing.
   Parsed-entrypoint regression coverage now also verifies that malformed
@@ -2429,7 +2529,8 @@ Generated grammar work needs evidence at multiple levels:
   transactions, graph DDL, database/schema/extension
   catalog DDL, generated
   `ALTER DATABASE ... SET ...` and `ALTER EXTENSION ... UPDATE` catalog DDL,
-  `CREATE TABLE` including serial identity-allocation tables, `DROP TABLE`,
+  `CREATE TABLE` including retained definition range/count metadata for serial
+  identity-allocation and relation-lifetime tables, `DROP TABLE`,
   generated schema namespace rename DDL for `ALTER SCHEMA ... RENAME TO ...`,
   generated tablespace catalog DDL for `CREATE TABLESPACE`, `ALTER TABLESPACE`,
   and `DROP TABLESPACE`,

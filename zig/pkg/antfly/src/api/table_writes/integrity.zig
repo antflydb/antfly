@@ -18,6 +18,7 @@ const metadata_admin = @import("../../metadata/admin.zig");
 const metadata_api = @import("../../metadata/api.zig");
 const metadata_table_manager = @import("../../metadata/table_manager.zig");
 const platform_clock = @import("../../platform/clock.zig");
+const platform_time = @import("../../platform/time.zig");
 const sql_schema_mutation = @import("../../sql/schema_mutation.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
@@ -59,6 +60,10 @@ const UniqueConstraintOwnerTopology = integrity_types.UniqueConstraintOwnerTopol
 const TableWriteSource = table_write_core.TableWriteSource;
 const applyLocalTableSchemaJson = table_write_managed_db.applyLocalTableSchemaJson;
 const loadLocalTableSchemaJson = table_write_managed_db.loadLocalTableSchemaJson;
+
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
 
 pub fn runUniqueConstraintIntegritySchemaControllerMaintenanceForTable(
     alloc: std.mem.Allocator,
@@ -3738,7 +3743,8 @@ test "foreign key integrity job diagnostics merge samples across passes" {
 
 test "foreign key integrity job records diagnostics across incomplete passes" {
     const alloc = std.testing.allocator;
-    const path = "/tmp/antfly-api-fk-job-pass-diagnostics";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-fk-job-pass-diagnostics");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};

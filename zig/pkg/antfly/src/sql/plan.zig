@@ -3113,11 +3113,121 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
 ) !LoweredRelationPopulationPlan {
     var parsed = try grammar.parseRelationPopulationParsedSqlAlloc(alloc, parsed_sql);
     defer parsed.deinit(alloc);
+    try validateGeneratedRelationPopulationMetadata(alloc, parsed_sql, parsed);
     var parsed_source = try relationPopulationSourceParsedSqlAlloc(alloc, parsed_sql, parsed);
     defer parsed_source.deinit(alloc);
     var source = try hooks.lower_read(hooks.ptr, &parsed_source.parsed);
     errdefer source.deinit(alloc);
     return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
+}
+
+fn validateGeneratedRelationPopulationMetadata(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    parsed: grammar.RelationPopulationSyntax,
+) !void {
+    if (parsed_sql.generatedStatementKind() != .ddl) return;
+    const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
+    const ddl_ast = switch (generated_ast) {
+        .ddl => |ddl| ddl,
+        else => return error.UnsupportedSqlShape,
+    };
+    if (ddl_ast.kind != .relation_population or ddl_ast.relation_population_source_read == null) return error.UnsupportedSqlShape;
+    if (parsed.mode != .create_table_as) return;
+    if (ddl_ast.if_not_exists != parsed.if_not_exists) return error.UnsupportedSqlShape;
+
+    const tokens = parsed_sql.items();
+    const target_range = ddl_ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    const generated_target = try generatedSqlObjectIdentifierAlloc(alloc, tokens, target_range);
+    defer alloc.free(generated_target);
+    const parsed_target = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, parsed.target_identifier);
+    defer alloc.free(parsed_target);
+    if (!std.ascii.eqlIgnoreCase(generated_target, parsed_target)) return error.UnsupportedSqlShape;
+
+    const source_start = parsed.source_token_start orelse return error.UnsupportedSqlShape;
+    const source_end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
+    const source_range = ddl_ast.relation_population_source_tokens orelse return error.UnsupportedSqlShape;
+    if (source_range.start != source_start or source_range.end != source_end or source_range.start >= source_range.end) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const populate = ddl_ast.relation_population_populate orelse return error.UnsupportedSqlShape;
+    if (populate != parsed.populate) return error.UnsupportedSqlShape;
+
+    const statement_end = relationPopulationStatementTokenEnd(tokens);
+    if (ddl_ast.relation_population_data_clause_tokens) |data_clause| {
+        if (data_clause.start != source_end or data_clause.end != statement_end or data_clause.start >= data_clause.end) return error.UnsupportedSqlShape;
+        if (data_clause.start + 2 == data_clause.end and
+            tokens[data_clause.start].matchesKeywordTag(.with) and
+            tokens[data_clause.start + 1].matchesKeywordTag(.data))
+        {
+            if (!populate) return error.UnsupportedSqlShape;
+        } else if (data_clause.start + 3 == data_clause.end and
+            tokens[data_clause.start].matchesKeywordTag(.with) and
+            tokens[data_clause.start + 1].matchesKeywordTag(.no) and
+            tokens[data_clause.start + 2].matchesKeywordTag(.data))
+        {
+            if (populate) return error.UnsupportedSqlShape;
+        } else return error.UnsupportedSqlShape;
+    } else if (source_end != statement_end) {
+        return error.UnsupportedSqlShape;
+    }
+}
+
+fn relationPopulationStatementTokenEnd(tokens: []const Token) usize {
+    var end = tokens.len;
+    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    return end;
+}
+
+fn generatedSqlObjectIdentifierAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) ![]const u8 {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (range.end != range.start + 1) return error.UnsupportedSqlShape;
+    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
+}
+
+test "sql adapter relation population validates retained generated ctas metadata" {
+    const alloc = std.testing.allocator;
+
+    const Hooks = struct {
+        fn lowerRead(_: *anyopaque, _: *const tokenized.ParsedSql) anyerror!LoweredReadPlan {
+            return error.TestUnexpectedResult;
+        }
+    };
+    var dummy: u8 = 0;
+    const hooks = RelationPopulationLoweringHooks{
+        .ptr = &dummy,
+        .lower_read = Hooks.lowerRead,
+    };
+
+    var missing_source = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH NO DATA;");
+    defer missing_source.deinit(alloc);
+    if (missing_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.relation_population_source_tokens = null,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &missing_source, hooks));
+
+    var corrupt_populate = try tokenized.ParsedSql.initAlloc(alloc, "CREATE TABLE usage_archive AS SELECT account_id FROM usage_records WITH NO DATA;");
+    defer corrupt_populate.deinit(alloc);
+    if (corrupt_populate.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.relation_population_populate = true,
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &corrupt_populate, hooks));
 }
 
 fn relationPopulationSourceParsedSqlAlloc(

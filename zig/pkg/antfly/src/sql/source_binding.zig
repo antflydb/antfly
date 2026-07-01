@@ -59,12 +59,22 @@ pub const DocumentSqlVirtualField = struct {
     path: []const u8,
     source: DocumentSqlVirtualFieldSource,
     field_type: ?runtime_schema.AntflyType = null,
+    array_item_type: ?runtime_schema.AntflyType = null,
     nullable: ?bool = null,
 };
 
 pub const DocumentSqlTypedPath = struct {
     path: []const u8,
     field_type: runtime_schema.AntflyType,
+};
+
+pub const DocumentSqlViewMappingSummary = struct {
+    name: []const u8,
+    source_table: []const u8 = "",
+    required_indexes: usize = 0,
+    required_indexes_ready: bool = false,
+    source_generation_fresh: bool = false,
+    source_schema_fingerprint_fresh: bool = false,
 };
 
 pub const DocumentSqlSchema = struct {
@@ -74,6 +84,8 @@ pub const DocumentSqlSchema = struct {
     owns_fields: bool = false,
     typed_paths: []const DocumentSqlTypedPath = &.{},
     owns_typed_paths: bool = false,
+    view_mappings: []const DocumentSqlViewMappingSummary = &.{},
+    owns_view_mappings: bool = false,
 };
 
 pub const DocumentSqlFullTextIndex = struct {
@@ -352,11 +364,13 @@ pub fn documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(
 ) !DocumentSqlSchema {
     var fields = std.ArrayListUnmanaged(DocumentSqlVirtualField).empty;
     var typed_paths = std.ArrayListUnmanaged(DocumentSqlTypedPath).empty;
+    var view_mapping_summaries = std.ArrayListUnmanaged(DocumentSqlViewMappingSummary).empty;
     errdefer deinitDocumentSqlVirtualFieldList(alloc, &fields);
     errdefer deinitDocumentSqlTypedPathList(alloc, &typed_paths);
+    errdefer deinitDocumentSqlViewMappingSummaryList(alloc, &view_mapping_summaries);
 
     for (schema.relational_columns) |column| {
-        try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, &fields, column.name, column.path, .declared_schema, column.field_type, column.nullable);
+        try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, &fields, column.name, column.path, .declared_schema, column.field_type, column.array_item_type, column.nullable);
     }
 
     if (indexes_json.len > 0) {
@@ -382,6 +396,16 @@ pub fn documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(
         }
         try appendDocumentSqlVirtualFieldsFromCatalogMetadataValue(alloc, &fields, parsed.value);
         try appendDocumentSqlTypedPathsFromCatalogMetadataValue(alloc, &typed_paths, parsed.value);
+        if (parsed.value.object.get("view_mappings")) |mapping_value| {
+            try appendDocumentSqlViewMappingSummariesValue(
+                alloc,
+                &view_mapping_summaries,
+                mapping_value,
+                parsed.value,
+                expected_source_generation,
+                expected_source_schema_fingerprint,
+            );
+        }
     }
 
     var virtual_schema = DocumentSqlSchema{};
@@ -393,6 +417,10 @@ pub fn documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(
     if (typed_paths.items.len > 0) {
         virtual_schema.typed_paths = try typed_paths.toOwnedSlice(alloc);
         virtual_schema.owns_typed_paths = true;
+    }
+    if (view_mapping_summaries.items.len > 0) {
+        virtual_schema.view_mappings = try view_mapping_summaries.toOwnedSlice(alloc);
+        virtual_schema.owns_view_mappings = true;
     }
     return virtual_schema;
 }
@@ -451,6 +479,94 @@ fn documentSqlViewMappingHasSourceTable(value: std.json.Value, source_table: []c
     if (value != .object) return false;
     const actual = documentSqlStringField(value, "source_table") orelse return false;
     return std.ascii.eqlIgnoreCase(actual, source_table);
+}
+
+fn appendDocumentSqlViewMappingSummariesValue(
+    alloc: std.mem.Allocator,
+    summaries: *std.ArrayListUnmanaged(DocumentSqlViewMappingSummary),
+    value: std.json.Value,
+    catalog_metadata: std.json.Value,
+    expected_source_generation: ?u64,
+    expected_source_schema_fingerprint: ?[]const u8,
+) !void {
+    if (value == .array) {
+        for (value.array.items) |item| {
+            try appendDocumentSqlViewMappingSummaryValue(alloc, summaries, item, null, catalog_metadata, expected_source_generation, expected_source_schema_fingerprint);
+        }
+        return;
+    }
+    if (value != .object) return error.InvalidSqlCatalog;
+    if (value.object.get("fields") != null) {
+        try appendDocumentSqlViewMappingSummaryValue(alloc, summaries, value, null, catalog_metadata, expected_source_generation, expected_source_schema_fingerprint);
+        return;
+    }
+    var it = value.object.iterator();
+    while (it.next()) |entry| {
+        try appendDocumentSqlViewMappingSummaryValue(alloc, summaries, entry.value_ptr.*, entry.key_ptr.*, catalog_metadata, expected_source_generation, expected_source_schema_fingerprint);
+    }
+}
+
+fn appendDocumentSqlViewMappingSummaryValue(
+    alloc: std.mem.Allocator,
+    summaries: *std.ArrayListUnmanaged(DocumentSqlViewMappingSummary),
+    value: std.json.Value,
+    fallback_name: ?[]const u8,
+    catalog_metadata: std.json.Value,
+    expected_source_generation: ?u64,
+    expected_source_schema_fingerprint: ?[]const u8,
+) !void {
+    if (value != .object) return error.InvalidSqlCatalog;
+    const name =
+        documentSqlStringField(value, "name") orelse
+        documentSqlStringField(value, "view") orelse
+        documentSqlStringField(value, "view_name") orelse
+        fallback_name orelse
+        return;
+    const source_table = documentSqlStringField(value, "source_table") orelse "";
+    const required_indexes = try documentSqlViewMappingRequiredIndexCount(value, catalog_metadata);
+    const source_generation_fresh = if (expected_source_generation) |expected|
+        documentSqlViewMappingOptionalSourceGenerationMatches(value, expected)
+    else
+        false;
+    const source_schema_fingerprint_fresh = if (expected_source_schema_fingerprint) |expected|
+        try documentSqlViewMappingOptionalSourceSchemaFingerprintMatches(value, expected)
+    else
+        false;
+    const owned_name = try alloc.dupe(u8, name);
+    errdefer alloc.free(owned_name);
+    const owned_source_table = try alloc.dupe(u8, source_table);
+    errdefer alloc.free(owned_source_table);
+    try summaries.append(alloc, .{
+        .name = owned_name,
+        .source_table = owned_source_table,
+        .required_indexes = required_indexes,
+        .required_indexes_ready = required_indexes > 0,
+        .source_generation_fresh = source_generation_fresh,
+        .source_schema_fingerprint_fresh = source_schema_fingerprint_fresh,
+    });
+}
+
+fn documentSqlViewMappingRequiredIndexCount(value: std.json.Value, catalog_metadata: std.json.Value) !usize {
+    const required_indexes = value.object.get("required_indexes") orelse return 0;
+    if (required_indexes != .array) return error.InvalidSqlCatalog;
+    for (required_indexes.array.items) |item| {
+        const name = try documentSqlRequiredIndexName(item);
+        _ = documentSqlCatalogIndexConfigByName(catalog_metadata, name) orelse return error.InvalidSqlCatalog;
+    }
+    return required_indexes.array.items.len;
+}
+
+fn documentSqlViewMappingOptionalSourceGenerationMatches(value: std.json.Value, expected: u64) bool {
+    const actual = documentSqlOptionalU64Field(value, "source_generation") catch return false;
+    return if (actual) |generation| generation == expected else false;
+}
+
+fn documentSqlViewMappingOptionalSourceSchemaFingerprintMatches(value: std.json.Value, expected: []const u8) !bool {
+    const actual =
+        try documentSqlOptionalStringField(value, "source_schema_fingerprint") orelse
+        try documentSqlOptionalStringField(value, "schema_fingerprint") orelse
+        return false;
+    return std.mem.eql(u8, actual, expected);
 }
 
 fn validateDocumentSqlViewMappingsSourceGenerationValue(value: std.json.Value, expected_source_generation: u64) !void {
@@ -699,7 +815,7 @@ fn validateDocumentSqlViewMappingFieldsDeclaredShapeValue(value: std.json.Value,
 
 fn validateDocumentSqlViewMappingNamedFieldDeclaredShapeValue(value: std.json.Value, schema: runtime_schema.TableSchema) !void {
     if (value == .string) {
-        try validateDocumentSqlViewMappingPathAgainstDeclaredShapeValue(value.string, null, null, schema);
+        try validateDocumentSqlViewMappingPathAgainstDeclaredShapeValue(value.string, null, null, null, schema);
         return;
     }
     try validateDocumentSqlViewMappingFieldDeclaredShapeValue(value, schema);
@@ -709,13 +825,15 @@ fn validateDocumentSqlViewMappingFieldDeclaredShapeValue(value: std.json.Value, 
     if (value != .object) return error.InvalidSqlCatalog;
     const raw_path = documentSqlStringField(value, "path") orelse documentSqlStringField(value, "field") orelse return error.InvalidSqlCatalog;
     const field_type = try documentSqlFieldTypeFromViewMappingFieldValue(value);
+    const array_item_type = try documentSqlArrayItemTypeFromViewMappingFieldValue(value);
     const nullable = try documentSqlOptionalBoolField(value, "nullable");
-    try validateDocumentSqlViewMappingPathAgainstDeclaredShapeValue(raw_path, field_type, nullable, schema);
+    try validateDocumentSqlViewMappingPathAgainstDeclaredShapeValue(raw_path, field_type, array_item_type, nullable, schema);
 }
 
 fn validateDocumentSqlViewMappingPathAgainstDeclaredShapeValue(
     path: []const u8,
     field_type: ?runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
     nullable: ?bool,
     schema: runtime_schema.TableSchema,
 ) !void {
@@ -723,6 +841,9 @@ fn validateDocumentSqlViewMappingPathAgainstDeclaredShapeValue(
         if (column.default_value != null or column.on_update_value != null or column.generated != null) return error.InvalidSqlCatalog;
         if (field_type) |declared_type| {
             if (declared_type != column.field_type) return error.InvalidSqlCatalog;
+        }
+        if (array_item_type) |declared_item_type| {
+            if (column.array_item_type != declared_item_type) return error.InvalidSqlCatalog;
         }
         if (nullable) |declared_nullable| {
             if (declared_nullable != column.nullable) return error.InvalidSqlCatalog;
@@ -744,12 +865,26 @@ pub fn deinitDocumentSqlSchema(alloc: std.mem.Allocator, schema: *DocumentSqlSch
         }
         alloc.free(schema.typed_paths);
     }
+    if (schema.owns_view_mappings) {
+        for (schema.view_mappings) |mapping| {
+            alloc.free(@constCast(mapping.name));
+            if (mapping.source_table.len > 0) alloc.free(@constCast(mapping.source_table));
+        }
+        alloc.free(schema.view_mappings);
+    }
     schema.* = .{};
 }
 
 pub fn documentSqlTypedPathType(schema: DocumentSqlSchema, path: []const u8) ?runtime_schema.AntflyType {
     for (schema.typed_paths) |candidate| {
         if (documentScalarFilterPathEqual(candidate.path, path)) return candidate.field_type;
+    }
+    return null;
+}
+
+pub fn documentSqlViewMappingSummaryForView(schema: DocumentSqlSchema, view_name: []const u8) ?DocumentSqlViewMappingSummary {
+    for (schema.view_mappings) |mapping| {
+        if (std.ascii.eqlIgnoreCase(mapping.name, view_name)) return mapping;
     }
     return null;
 }
@@ -958,7 +1093,7 @@ fn appendDocumentSqlVirtualFieldFromViewMappingNamedFieldValue(
     if (value == .string) {
         const path = try documentSqlViewMappingPathAlloc(alloc, value.string);
         defer alloc.free(path);
-        try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, null, null);
+        try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, null, null, null);
         return;
     }
     if (value != .object) return error.InvalidSqlCatalog;
@@ -966,8 +1101,9 @@ fn appendDocumentSqlVirtualFieldFromViewMappingNamedFieldValue(
     const path = try documentSqlViewMappingPathAlloc(alloc, raw_path);
     defer alloc.free(path);
     const field_type = try documentSqlFieldTypeFromViewMappingFieldValue(value);
+    const array_item_type = try documentSqlArrayItemTypeFromViewMappingFieldValue(value);
     const nullable = try documentSqlOptionalBoolField(value, "nullable");
-    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, nullable);
+    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, array_item_type, nullable);
 }
 
 fn appendDocumentSqlVirtualFieldFromViewMappingFieldValue(
@@ -981,8 +1117,9 @@ fn appendDocumentSqlVirtualFieldFromViewMappingFieldValue(
     const path = try documentSqlViewMappingPathAlloc(alloc, raw_path);
     defer alloc.free(path);
     const field_type = try documentSqlFieldTypeFromViewMappingFieldValue(value);
+    const array_item_type = try documentSqlArrayItemTypeFromViewMappingFieldValue(value);
     const nullable = try documentSqlOptionalBoolField(value, "nullable");
-    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, nullable);
+    try appendDocumentSqlViewMappingVirtualFieldAlloc(alloc, fields, name, path, field_type, array_item_type, nullable);
 }
 
 fn appendDocumentSqlVirtualFieldsFromPathValue(
@@ -1053,7 +1190,25 @@ fn documentSqlFieldTypeFromTypedPathTypeName(type_name: []const u8) ?runtime_sch
     if (std.mem.eql(u8, type_name, "numeric")) return .numeric;
     if (std.mem.eql(u8, type_name, "boolean")) return .boolean;
     if (std.mem.eql(u8, type_name, "datetime")) return .datetime;
+    if (std.mem.eql(u8, type_name, "array")) return .array;
     return null;
+}
+
+fn documentSqlArrayItemTypeFromViewMappingFieldValue(value: std.json.Value) !?runtime_schema.AntflyType {
+    const item_value = value.object.get("item_type") orelse
+        value.object.get("item_kind") orelse
+        value.object.get("array_item_type") orelse
+        value.object.get("array_item_kind") orelse
+        value.object.get("items") orelse return null;
+    switch (item_value) {
+        .string => |item_type| return documentSqlFieldTypeFromTypedPathTypeName(item_type) orelse error.InvalidSqlCatalog,
+        .object => |object| {
+            const type_value = object.get("type") orelse object.get("kind") orelse return error.InvalidSqlCatalog;
+            if (type_value != .string) return error.InvalidSqlCatalog;
+            return documentSqlFieldTypeFromTypedPathTypeName(type_value.string) orelse error.InvalidSqlCatalog;
+        },
+        else => return error.InvalidSqlCatalog,
+    }
 }
 
 fn appendDocumentSqlVirtualFieldFromTypedPathAlloc(
@@ -1270,7 +1425,7 @@ fn appendDocumentSqlVirtualFieldAlloc(
     source: DocumentSqlVirtualFieldSource,
     field_type: ?runtime_schema.AntflyType,
 ) !void {
-    return try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, fields, name, path, source, field_type, null);
+    return try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, fields, name, path, source, field_type, null, null);
 }
 
 fn appendDocumentSqlViewMappingVirtualFieldAlloc(
@@ -1279,10 +1434,11 @@ fn appendDocumentSqlViewMappingVirtualFieldAlloc(
     name: []const u8,
     path: []const u8,
     field_type: ?runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
     nullable: ?bool,
 ) !void {
     if (documentSqlVirtualFieldNameExists(fields.*, name)) return error.InvalidSqlCatalog;
-    try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, fields, name, path, .view_mapping, field_type, nullable);
+    try appendDocumentSqlVirtualFieldWithNullabilityAlloc(alloc, fields, name, path, .view_mapping, field_type, array_item_type, nullable);
 }
 
 fn appendDocumentSqlVirtualFieldWithNullabilityAlloc(
@@ -1292,6 +1448,7 @@ fn appendDocumentSqlVirtualFieldWithNullabilityAlloc(
     path: []const u8,
     source: DocumentSqlVirtualFieldSource,
     field_type: ?runtime_schema.AntflyType,
+    array_item_type: ?runtime_schema.AntflyType,
     nullable: ?bool,
 ) !void {
     if (name.len == 0 or path.len == 0) return error.InvalidSqlCatalog;
@@ -1307,6 +1464,7 @@ fn appendDocumentSqlVirtualFieldWithNullabilityAlloc(
         .path = owned_path,
         .source = source,
         .field_type = field_type,
+        .array_item_type = array_item_type,
         .nullable = nullable,
     });
 }
@@ -1337,6 +1495,17 @@ fn deinitDocumentSqlTypedPathList(
         alloc.free(@constCast(path.path));
     }
     paths.deinit(alloc);
+}
+
+fn deinitDocumentSqlViewMappingSummaryList(
+    alloc: std.mem.Allocator,
+    summaries: *std.ArrayListUnmanaged(DocumentSqlViewMappingSummary),
+) void {
+    for (summaries.items) |summary| {
+        alloc.free(@constCast(summary.name));
+        if (summary.source_table.len > 0) alloc.free(@constCast(summary.source_table));
+    }
+    summaries.deinit(alloc);
 }
 
 fn documentSqlTopLevelPathSegment(path: []const u8) ?[]const u8 {
@@ -2058,15 +2227,22 @@ test "source binding classifies relational document and lake schemas" {
     var view_mapping_virtual_schema = try documentSqlSchemaForRuntimeSchemaAndIndexesJsonAlloc(
         alloc,
         unavailable_schema,
-        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true}]}}}",
+        "{\"view_mappings\":{\"support_view\":{\"source_table\":\"docs\",\"fields\":[{\"name\":\"plan\",\"path\":\"metadata.plan\",\"type\":\"keyword\",\"nullable\":false},{\"name\":\"score\",\"path\":\"metrics.score\",\"type\":\"numeric\",\"nullable\":true},{\"name\":\"tag_list\",\"path\":\"tags\",\"type\":\"array\",\"item_type\":\"keyword\"}]}}}",
     );
     defer deinitDocumentSqlSchema(alloc, &view_mapping_virtual_schema);
-    try std.testing.expectEqual(@as(usize, 4), view_mapping_virtual_schema.fields.len);
-    try std.testing.expectEqual(@as(usize, 2), view_mapping_virtual_schema.typed_paths.len);
+    try std.testing.expectEqual(@as(usize, 5), view_mapping_virtual_schema.fields.len);
+    try std.testing.expectEqual(@as(usize, 3), view_mapping_virtual_schema.typed_paths.len);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(view_mapping_virtual_schema, "/metadata/plan").?);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, documentSqlTypedPathType(view_mapping_virtual_schema, "/metrics/score").?);
+    try std.testing.expectEqual(runtime_schema.AntflyType.array, documentSqlTypedPathType(view_mapping_virtual_schema, "/tags").?);
+    try std.testing.expectEqual(@as(usize, 1), view_mapping_virtual_schema.view_mappings.len);
+    try std.testing.expectEqualStrings("support_view", view_mapping_virtual_schema.view_mappings[0].name);
+    try std.testing.expectEqual(@as(usize, 0), view_mapping_virtual_schema.view_mappings[0].required_indexes);
+    try std.testing.expect(!view_mapping_virtual_schema.view_mappings[0].required_indexes_ready);
+    try std.testing.expect(documentSqlViewMappingSummaryForView(view_mapping_virtual_schema, "support_view") != null);
     var saw_plan_view_field = false;
     var saw_score_view_field = false;
+    var saw_tags_view_field = false;
     for (view_mapping_virtual_schema.fields) |field| {
         if (std.mem.eql(u8, field.name, "plan")) {
             saw_plan_view_field = true;
@@ -2082,9 +2258,17 @@ test "source binding classifies relational document and lake schemas" {
             try std.testing.expectEqual(runtime_schema.AntflyType.numeric, field.field_type.?);
             try std.testing.expectEqual(true, field.nullable.?);
         }
+        if (std.mem.eql(u8, field.name, "tag_list")) {
+            saw_tags_view_field = true;
+            try std.testing.expectEqual(DocumentSqlVirtualFieldSource.view_mapping, field.source);
+            try std.testing.expectEqualStrings("/tags", field.path);
+            try std.testing.expectEqual(runtime_schema.AntflyType.array, field.field_type.?);
+            try std.testing.expectEqual(runtime_schema.AntflyType.keyword, field.array_item_type.?);
+        }
     }
     try std.testing.expect(saw_plan_view_field);
     try std.testing.expect(saw_score_view_field);
+    try std.testing.expect(saw_tags_view_field);
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
         alloc,
         unavailable_schema,
@@ -2101,6 +2285,7 @@ test "source binding classifies relational document and lake schemas" {
     );
     defer deinitDocumentSqlSchema(alloc, &source_generation_view_schema);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(source_generation_view_schema, "/metadata/plan").?);
+    try std.testing.expect(source_generation_view_schema.view_mappings[0].source_generation_fresh);
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(
         alloc,
         unavailable_schema,
@@ -2119,6 +2304,7 @@ test "source binding classifies relational document and lake schemas" {
     );
     defer deinitDocumentSqlSchema(alloc, &source_schema_fingerprint_view_schema);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(source_schema_fingerprint_view_schema, "/metadata/plan").?);
+    try std.testing.expect(source_schema_fingerprint_view_schema.view_mappings[0].source_schema_fingerprint_fresh);
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithBindingAlloc(
         alloc,
         unavailable_schema,
@@ -2143,6 +2329,8 @@ test "source binding classifies relational document and lake schemas" {
     );
     defer deinitDocumentSqlSchema(alloc, &required_index_view_schema);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(required_index_view_schema, "/metadata/plan").?);
+    try std.testing.expectEqual(@as(usize, 1), required_index_view_schema.view_mappings[0].required_indexes);
+    try std.testing.expect(required_index_view_schema.view_mappings[0].required_indexes_ready);
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
         alloc,
         unavailable_schema,
@@ -2157,6 +2345,8 @@ test "source binding classifies relational document and lake schemas" {
     );
     defer deinitDocumentSqlSchema(alloc, &required_index_metadata_view_schema);
     try std.testing.expectEqual(runtime_schema.AntflyType.keyword, documentSqlTypedPathType(required_index_metadata_view_schema, "/metadata/plan").?);
+    try std.testing.expectEqual(@as(usize, 1), required_index_metadata_view_schema.view_mappings[0].required_indexes);
+    try std.testing.expect(required_index_metadata_view_schema.view_mappings[0].required_indexes_ready);
     try std.testing.expectError(error.InvalidSqlCatalog, documentSqlSchemaForRuntimeSchemaAndIndexesJsonWithSourceTableAlloc(
         alloc,
         unavailable_schema,

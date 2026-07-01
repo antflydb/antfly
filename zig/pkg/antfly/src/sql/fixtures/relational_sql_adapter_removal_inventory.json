@@ -1,0 +1,49 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "application-migration-equivalence-corpus",
+      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "surface": "application_migration_equivalence_corpus",
+      "status": "partial_release_gated",
+      "current_evidence": "Application parity fixtures are freshness-checked and classified through the SQL adapter integration suite, and SQL/API durable-state coverage enumerates catalog and row-state syntax families.",
+      "missing_evidence": "Every PostgreSQL-shaped syntax path that can affect relational catalog or row state still needs release-gated classification as a golden typed plan, adapter-only no-op, or explicit unsupported shape naming the missing native feature.",
+      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+      "evidence_symbol": "postgres sql adapter classifies fixture-backed application parity corpus",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "catalog-snapshot-binding",
+      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "surface": "catalog_snapshot_binding",
+      "status": "partial_release_gated",
+      "current_evidence": "Catalog-backed read plans execute across source schemas and stale-catalog fixture coverage rejects invalid catalog references before runtime execution.",
+      "missing_evidence": "Each runtime statement and native migration step still needs binding against Antfly catalog snapshots before planning, with fail-closed behavior for stale or ambiguous catalog references across DDL, DML, and read paths.",
+      "evidence_file": "zig/pkg/antfly/src/api/sql_adapter_integration.zig",
+      "evidence_symbol": "postgres sql adapter catalog-backed read plans execute across source schemas",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "legacy-wrapper-deletion",
+      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "surface": "legacy_wrapper_deletion",
+      "status": "gap_tracked",
+      "current_evidence": "Compatibility wrapper and parser migration inventories enumerate parser, binder, planner, and runtime wrapper classes with typed parser, binder, plan, runtime, parity, and state-safety evidence required before deletion.",
+      "missing_evidence": "Legacy string-only compatibility wrappers still need to be removed one at a time behind the recorded parser, binder, plan, runtime, and parity evidence.",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json",
+      "evidence_symbol": "sql_compatibility_wrappers",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "structural-sql-normalization",
+      "relational_slices_section": "SQL adapter and compatibility wrapper removal",
+      "surface": "structural_sql_normalization",
+      "status": "partial_release_gated",
+      "current_evidence": "Generated DML metadata rejection tests already fail closed for stale aliases, generated names, returning metadata, conflict targets, and generated CTE-prefix payloads.",
+      "missing_evidence": "Placeholders, aliases, table targets, generated names, and conflict targets still need structural normalization everywhere instead of SQL string scans.",
+      "evidence_file": "zig/pkg/antfly/src/sql/lower_dml.zig",
+      "evidence_symbol": "sql adapter lower dml rejects stale generated returning alias metadata",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

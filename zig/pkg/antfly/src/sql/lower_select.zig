@@ -20,6 +20,7 @@ const document_plan = @import("document_plan.zig");
 const generated_parser_mod = @import("generated_parser.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const lowering_context = @import("lowering_context.zig");
 const parser_context = @import("parser_context.zig");
 const parser_mod = @import("parser.zig");
@@ -56,8 +57,8 @@ const sql_adapter = struct {
 };
 
 pub const SqlValue = value_mod.SqlValue;
-pub const ExtensionFunctionBinding = lower_expr.ExtensionFunctionBinding;
-pub const SqlFunctionBindings = lower_expr.SqlFunctionBindings;
+pub const ExtensionFunctionBinding = expr_row_parse.ExtensionFunctionBinding;
+pub const SqlFunctionBindings = expr_row_parse.SqlFunctionBindings;
 
 const LoweredAggregate = plan.LoweredAggregate;
 const LoweredAggregatePlan = plan.LoweredAggregatePlan;

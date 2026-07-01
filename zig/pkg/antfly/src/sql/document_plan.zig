@@ -307,6 +307,21 @@ pub const DocumentUnnest = struct {
     }
 };
 
+pub const DocumentReadViewMapping = struct {
+    name: []const u8,
+    source_table: []const u8 = "",
+    required_indexes: usize = 0,
+    required_indexes_ready: bool = false,
+    source_generation_fresh: bool = false,
+    source_schema_fingerprint_fresh: bool = false,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.name.len > 0) alloc.free(@constCast(self.name));
+        if (self.source_table.len > 0) alloc.free(@constCast(self.source_table));
+        self.* = undefined;
+    }
+};
+
 pub const DocumentIdLookup = struct {
     ids: []const []const u8,
     residual_filter_json: ?[]const u8 = null,
@@ -347,6 +362,7 @@ pub const BoundedDocumentScan = struct {
 
 pub const DocumentReadPlan = struct {
     table_name: []const u8,
+    view_mapping: ?DocumentReadViewMapping = null,
     projection: []DocumentProjection,
     producer: DocumentProducer,
     order_by: ?DocumentOrderBy = null,
@@ -355,6 +371,7 @@ pub const DocumentReadPlan = struct {
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
+        if (self.view_mapping) |*view_mapping| view_mapping.deinit(alloc);
         for (self.projection) |*projection| projection.deinit(alloc);
         if (self.projection.len > 0) alloc.free(self.projection);
         self.producer.deinit(alloc);
@@ -565,6 +582,26 @@ fn boundedDocumentScanFromPolicy(policy: source_binding.BoundedScanPolicy) !Boun
     };
 }
 
+fn documentReadViewMappingFromVirtualSchemaAlloc(
+    alloc: std.mem.Allocator,
+    virtual_schema: source_binding.DocumentSqlSchema,
+    table_name: []const u8,
+) !?DocumentReadViewMapping {
+    const summary = source_binding.documentSqlViewMappingSummaryForView(virtual_schema, table_name) orelse return null;
+    const name = try alloc.dupe(u8, summary.name);
+    errdefer alloc.free(name);
+    const source_table = try alloc.dupe(u8, summary.source_table);
+    errdefer alloc.free(source_table);
+    return .{
+        .name = name,
+        .source_table = source_table,
+        .required_indexes = summary.required_indexes,
+        .required_indexes_ready = summary.required_indexes_ready,
+        .source_generation_fresh = summary.source_generation_fresh,
+        .source_schema_fingerprint_fresh = summary.source_schema_fingerprint_fresh,
+    };
+}
+
 fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
@@ -594,8 +631,13 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     if (from_index + 1 >= statement_end or tokens[from_index + 1].kind != .identifier) return error.UnsupportedSqlShape;
     const table_name = try alloc.dupe(u8, tokens[from_index + 1].text);
     errdefer alloc.free(table_name);
+    const view_mapping = try documentReadViewMappingFromVirtualSchemaAlloc(alloc, virtual_schema, table_name);
+    errdefer if (view_mapping) |mapping| {
+        var mutable = mapping;
+        mutable.deinit(alloc);
+    };
 
-    var from_binding = try parseDocumentFromTailAlloc(alloc, tokens[from_index + 1].text, tokens[from_index + 2 .. tail_start], schema);
+    var from_binding = try parseDocumentFromTailAlloc(alloc, tokens[from_index + 1].text, tokens[from_index + 2 .. tail_start], schema, virtual_schema);
     errdefer from_binding.deinit(alloc);
     switch (try validatedDocumentReadStatementKind(parsed_sql)) {
         .query => {},
@@ -619,8 +661,8 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     var producer = if (where_index) |idx| blk: {
         const end_index = order_index orelse limit_index orelse statement_end;
         break :blk parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, if (from_binding.unnest) |*unnest| unnest else null) catch |err| switch (err) {
-            error.DocumentSqlIndexUnavailable => if (whereRangeHasFullTextPredicate(tokens, idx, end_index))
-                return err
+            error.DocumentSqlIndexUnavailable => if (whereRangeHasExactProducerPredicate(tokens, idx, end_index))
+                return error.DocumentSqlBoundedScanMissingExactProducer
             else
                 try parseWhereBoundedScanProducerAlloc(
                     alloc,
@@ -648,6 +690,9 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
         var mutable = producer;
         mutable.deinit(alloc);
     }
+    if (view_mapping != null and !documentViewMappingBoundedScanProducerAdmitted(producer, order_by, limit, from_binding.unnest)) {
+        return error.DocumentSqlBoundedScanMissingExactProducer;
+    }
     if (limit == null and bounded_scan_policy != null) switch (producer) {
         .indexed_query, .bounded_scan => return error.DocumentSqlBoundedScanIncompleteTopK,
         .id_lookup => {},
@@ -662,6 +707,7 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
     };
     return .{
         .table_name = table_name,
+        .view_mapping = view_mapping,
         .projection = projection,
         .producer = producer,
         .order_by = order_by,
@@ -674,6 +720,26 @@ fn lowerDocumentReadPlanInternalParsedSqlAlloc(
         } else null,
         .limit = limit,
     };
+}
+
+fn documentViewMappingBoundedScanProducerAdmitted(
+    producer: DocumentProducer,
+    order_by: ?DocumentOrderBy,
+    limit: ?u32,
+    unnest: ?DocumentUnnest,
+) bool {
+    const bounded_scan = switch (producer) {
+        .bounded_scan => |scan| scan,
+        else => return true,
+    };
+    if (order_by != null or limit == null or unnest != null) return false;
+    const residual_filter_json = bounded_scan.residual_filter_json orelse return false;
+    return documentViewMappingResidualBoundedScanFilterAdmitted(residual_filter_json);
+}
+
+fn documentViewMappingResidualBoundedScanFilterAdmitted(filter_json: []const u8) bool {
+    return std.mem.startsWith(u8, filter_json, "{\"term\":{\"path\":\"/metadata/plan\",\"value\":") and
+        std.mem.endsWith(u8, filter_json, "}}");
 }
 
 fn parseWhereBoundedScanProducerAlloc(
@@ -783,8 +849,8 @@ fn lowerDocumentAlgebraicAggregatePlanWithBoundedScanPolicyInternalParsedSqlAllo
     const filter_query_json: ?[]const u8 = if (where_index) |idx| blk: {
         const end_index = group_index orelse having_index orelse order_index orelse limit_index orelse statement_end;
         var producer = parseWhereProducerAlloc(alloc, tokens, idx, end_index, schema, virtual_schema, source_ref, producer_capabilities, null) catch |err| switch (err) {
-            error.DocumentSqlIndexUnavailable => if (whereRangeHasFullTextPredicate(tokens, idx, end_index))
-                return err
+            error.DocumentSqlIndexUnavailable => if (whereRangeHasExactProducerPredicate(tokens, idx, end_index))
+                return error.DocumentSqlBoundedScanMissingExactProducer
             else
                 try parseWhereBoundedScanProducerAlloc(
                     alloc,
@@ -1381,6 +1447,7 @@ fn documentVirtualField(
         .path = column.name,
         .source = .declared_schema,
         .field_type = column.field_type,
+        .array_item_type = column.array_item_type,
     };
 }
 
@@ -2003,6 +2070,7 @@ fn documentScalarFilterObjectIndexReady(capabilities: DocumentProducerCapabiliti
     if (documentScalarFilterOperatorPath(object, "terms")) |path| return documentProducerScalarPathReady(capabilities, path);
     if (documentScalarFilterOperatorPath(object, "prefix")) |path| return documentProducerScalarPathReady(capabilities, path);
     if (documentScalarFilterOperatorPath(object, "wildcard")) |path| return documentProducerScalarPathReady(capabilities, path);
+    if (documentScalarFilterOperatorPath(object, "array_any")) |path| return documentProducerArrayElementPathReady(capabilities, path);
     if (documentScalarFilterOperatorPath(object, "numeric_range")) |path| return documentProducerScalarPathReady(capabilities, path);
     if (documentScalarFilterOperatorPath(object, "date_range")) |path| return documentProducerScalarPathReady(capabilities, path);
     if (documentScalarFilterOperatorPath(object, "term_range")) |path| return documentProducerScalarPathReady(capabilities, path);
@@ -2607,10 +2675,23 @@ fn parseFullTextQueryAlloc(alloc: std.mem.Allocator, tokens: []const Token) !?[]
     return try alloc.dupe(u8, tokens[2].text);
 }
 
-fn whereRangeHasFullTextPredicate(tokens: []const Token, where_index: usize, end_index: usize) bool {
+fn whereRangeHasExactProducerPredicate(tokens: []const Token, where_index: usize, end_index: usize) bool {
     if (where_index + 1 >= end_index) return false;
     for (tokens[where_index + 1 .. end_index]) |token| {
         if (token.matchesKeywordTag(.full_text_search)) return true;
+        if (tokenMatchesAntflyQualifiedKeywordTagOnly(token, .semantic_search) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .vector_search) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .hybrid_search) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_traverse) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_neighbors) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_shortest_path) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_k_shortest_paths) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_match) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_metric) or
+            tokenMatchesAntflyQualifiedKeywordTagOnly(token, .graph_metric_rerank))
+        {
+            return true;
+        }
     }
     return false;
 }
@@ -2978,16 +3059,33 @@ fn buildDocumentUnnestIndexedFilterClauseAlloc(
     if (unnest.filter_value_json) |value_json| {
         return try std.fmt.allocPrint(
             alloc,
-            "{{\"term\":{{\"path\":{f},\"value\":{s}}}}}",
+            "{{\"array_any\":{{\"path\":{f},\"value\":{s}}}}}",
             .{ std.json.fmt(unnest.field, .{}), value_json },
         );
     }
     if (unnest.filter_values_json) |values_json| {
-        return try std.fmt.allocPrint(
-            alloc,
-            "{{\"terms\":{{\"path\":{f},\"values\":{s}}}}}",
-            .{ std.json.fmt(unnest.field, .{}), values_json },
-        );
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, values_json, .{});
+        defer parsed.deinit();
+        if (parsed.value != .array) return error.UnsupportedSqlShape;
+        if (parsed.value.array.items.len == 0) return try alloc.dupe(u8, "{\"match_none\":{}}");
+
+        var out: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer out.deinit(alloc);
+        try out.appendSlice(alloc, "{\"disjuncts\":[");
+        for (parsed.value.array.items, 0..) |value, i| {
+            if (i > 0) try out.append(alloc, ',');
+            const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+            defer alloc.free(value_json);
+            const clause = try std.fmt.allocPrint(
+                alloc,
+                "{{\"array_any\":{{\"path\":{f},\"value\":{s}}}}}",
+                .{ std.json.fmt(unnest.field, .{}), value_json },
+            );
+            defer alloc.free(clause);
+            try out.appendSlice(alloc, clause);
+        }
+        try out.appendSlice(alloc, "]}");
+        return try out.toOwnedSlice(alloc);
     }
     return error.UnsupportedSqlShape;
 }
@@ -3600,6 +3698,7 @@ fn parseDocumentFromTailAlloc(
     table_name: []const u8,
     tokens: []const Token,
     schema: runtime_schema.TableSchema,
+    virtual_schema: source_binding.DocumentSqlSchema,
 ) !DocumentFromBinding {
     const comma = findComma(tokens, 0);
     if (comma == null) {
@@ -3615,7 +3714,7 @@ fn parseDocumentFromTailAlloc(
         .table_name = table_name,
         .alias = try parseFromTailAlias(tokens[0..split]),
     };
-    var unnest = try parseDocumentUnnestAlloc(alloc, tokens[split + 1 ..], schema, source_ref);
+    var unnest = try parseDocumentUnnestAlloc(alloc, tokens[split + 1 ..], schema, virtual_schema, source_ref);
     errdefer unnest.deinit(alloc);
     return .{
         .source_ref = source_ref,
@@ -3627,6 +3726,7 @@ fn parseDocumentUnnestAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     schema: runtime_schema.TableSchema,
+    virtual_schema: source_binding.DocumentSqlSchema,
     source_ref: DocumentSourceRef,
 ) !DocumentUnnest {
     if (tokens.len < 5 or tokens[0].kind != .identifier or !std.ascii.eqlIgnoreCase(tokens[0].text, "unnest")) return error.UnsupportedSqlShape;
@@ -3659,7 +3759,7 @@ fn parseDocumentUnnestAlloc(
     if (field_tokens.len != 1 or field_tokens[0].kind != .identifier) return error.UnsupportedSqlShape;
     const field_name = try documentIdentifierName(field_tokens[0], source_ref);
     if (std.mem.eql(u8, field_name, "_id") or std.mem.eql(u8, field_name, "_doc")) return error.UnsupportedSqlShape;
-    const column = documentFieldColumn(schema, field_name) orelse return error.InvalidSqlCatalog;
+    const column = documentVirtualField(schema, virtual_schema, field_name) orelse return error.InvalidSqlCatalog;
     if (column.field_type != .array) return error.DocumentSqlUnnestRequiresArray;
     return .{
         .field = try documentFilterPathAlloc(alloc, column.path),
@@ -5054,7 +5154,7 @@ test "document SQL lowers vector search predicate to native query producer" {
     };
     var no_vector = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id FROM docs WHERE antfly.vector_search(table_name => 'docs', index => 'docs_embedding_hnsw', vector => '[0.1,0.2,0.3]', limit => 5)");
     defer no_vector.deinit(alloc);
-    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentReadPlanParsedSqlAlloc(alloc, &no_vector, no_vector_schema));
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanParsedSqlAlloc(alloc, &no_vector, no_vector_schema));
 }
 
 test "document SQL rejects antfly query functions as scalar predicates" {
@@ -5088,7 +5188,7 @@ test "document SQL capability-aware lowering requires full text producer" {
     var parsed = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5");
     defer parsed.deinit(alloc);
 
-    try std.testing.expectError(error.DocumentSqlIndexUnavailable, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanWithCapabilitiesParsedSqlAlloc(alloc, &parsed, schema, .{
         .full_text_filters = false,
         .bounded_scan = .{ .max_rows = 25 },
     }));
@@ -5376,16 +5476,40 @@ test "document SQL lowers json path equality to indexed filter producer" {
             .{ .path = "/metadata/plan", .field_type = .keyword },
             .{ .path = "/metrics/score", .field_type = .numeric },
         },
+        .view_mappings = &.{
+            .{
+                .name = "support_view",
+                .source_table = "docs",
+                .required_indexes = 1,
+                .required_indexes_ready = true,
+                .source_generation_fresh = true,
+                .source_schema_fingerprint_fresh = true,
+            },
+        },
     };
     var mapped_view = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, plan, score FROM support_view WHERE plan = 'pro' ORDER BY score DESC LIMIT 3");
     defer mapped_view.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_view, .{
+        .storage_mode = .document,
+    }, mapped_view_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
     var mapped_view_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_view, .{
         .storage_mode = .document,
     }, mapped_view_schema, .{
+        .indexed_scalar_filter_paths = &.{"/metadata/plan"},
         .bounded_scan = .{ .max_rows = 25 },
     });
     defer mapped_view_lowered.deinit(alloc);
     try std.testing.expectEqual(@as(usize, 3), mapped_view_lowered.projection.len);
+    try std.testing.expect(mapped_view_lowered.view_mapping != null);
+    try std.testing.expectEqualStrings("support_view", mapped_view_lowered.view_mapping.?.name);
+    try std.testing.expectEqualStrings("docs", mapped_view_lowered.view_mapping.?.source_table);
+    try std.testing.expectEqual(@as(usize, 1), mapped_view_lowered.view_mapping.?.required_indexes);
+    try std.testing.expect(mapped_view_lowered.view_mapping.?.required_indexes_ready);
+    try std.testing.expect(mapped_view_lowered.view_mapping.?.source_generation_fresh);
+    try std.testing.expect(mapped_view_lowered.view_mapping.?.source_schema_fingerprint_fresh);
     try std.testing.expectEqualStrings("/metadata/plan", mapped_view_lowered.projection[1].field);
     try std.testing.expectEqualStrings("plan", mapped_view_lowered.projection[1].output);
     try std.testing.expectEqualStrings("/metrics/score", mapped_view_lowered.projection[2].field);
@@ -5395,11 +5519,12 @@ test "document SQL lowers json path equality to indexed filter producer" {
     try std.testing.expectEqualStrings("/metrics/score", mapped_view_lowered.order_by.?.field);
     try std.testing.expectEqual(runtime_schema.AntflyType.numeric, mapped_view_lowered.order_by.?.field_type);
     try std.testing.expectEqual(DocumentOrderDirection.desc, mapped_view_lowered.order_by.?.direction);
-    const mapped_view_scan = switch (mapped_view_lowered.producer) {
-        .bounded_scan => |scan| scan,
+    const mapped_view_indexed = switch (mapped_view_lowered.producer) {
+        .indexed_query => |query| query,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expect(std.mem.indexOf(u8, mapped_view_scan.residual_filter_json orelse return error.TestUnexpectedResult, "\"/metadata/plan\"") != null);
+    try std.testing.expectEqualStrings("{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}", mapped_view_indexed.filter_query_json.?);
+    try std.testing.expectEqual(@as(?u32, 25), mapped_view_indexed.max_candidate_rows);
 
     const base_path_schema = source_binding.DocumentSqlSchema{
         .fields = &.{
@@ -5416,6 +5541,7 @@ test "document SQL lowers json path equality to indexed filter producer" {
     var equivalent_base_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &equivalent_base, .{
         .storage_mode = .document,
     }, base_path_schema, .{
+        .indexed_scalar_filter_paths = &.{"/metadata/plan"},
         .bounded_scan = .{ .max_rows = 25 },
     });
     defer equivalent_base_lowered.deinit(alloc);
@@ -5423,16 +5549,33 @@ test "document SQL lowers json path equality to indexed filter producer" {
     try std.testing.expectEqualStrings(equivalent_base_lowered.projection[1].output, mapped_view_lowered.projection[1].output);
     try std.testing.expectEqualStrings(equivalent_base_lowered.projection[2].field, mapped_view_lowered.projection[2].field);
     try std.testing.expectEqualStrings(equivalent_base_lowered.projection[2].output, mapped_view_lowered.projection[2].output);
-    const equivalent_base_scan = switch (equivalent_base_lowered.producer) {
-        .bounded_scan => |scan| scan,
+    const equivalent_base_indexed = switch (equivalent_base_lowered.producer) {
+        .indexed_query => |query| query,
         else => return error.TestUnexpectedResult,
     };
-    try std.testing.expectEqualStrings(equivalent_base_scan.residual_filter_json.?, mapped_view_scan.residual_filter_json.?);
+    try std.testing.expectEqualStrings(equivalent_base_indexed.filter_query_json.?, mapped_view_indexed.filter_query_json.?);
+    try std.testing.expectEqual(equivalent_base_indexed.max_candidate_rows, mapped_view_indexed.max_candidate_rows);
     try std.testing.expectEqual(mapped_view_lowered.limit, equivalent_base_lowered.limit);
     try std.testing.expect(equivalent_base_lowered.order_by != null);
     try std.testing.expectEqualStrings(equivalent_base_lowered.order_by.?.field, mapped_view_lowered.order_by.?.field);
     try std.testing.expectEqual(equivalent_base_lowered.order_by.?.field_type, mapped_view_lowered.order_by.?.field_type);
     try std.testing.expectEqual(equivalent_base_lowered.order_by.?.direction, mapped_view_lowered.order_by.?.direction);
+
+    var mapped_view_in = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, plan FROM support_view WHERE plan IN ('pro', 'team') LIMIT 5");
+    defer mapped_view_in.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_view_in, .{
+        .storage_mode = .document,
+    }, mapped_view_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
+
+    var mapped_view_range = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, score FROM support_view WHERE score >= 10 LIMIT 5");
+    defer mapped_view_range.deinit(alloc);
+    try std.testing.expectError(error.DocumentSqlBoundedScanMissingExactProducer, lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &mapped_view_range, .{
+        .storage_mode = .document,
+    }, mapped_view_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    }));
 
     var indexed_view = try tokenized.ParsedSql.initAlloc(alloc, "SELECT _id, plan FROM support_view WHERE plan = 'pro' LIMIT 10");
     defer indexed_view.deinit(alloc);
@@ -6724,6 +6867,55 @@ test "document SQL lowers explicit array unnest over bounded scan" {
     try std.testing.expect(in_filter_lowered.unnest != null);
     try std.testing.expect(in_filter_lowered.unnest.?.filter_value_json == null);
     try std.testing.expectEqualStrings("[\"urgent\",\"vip\"]", in_filter_lowered.unnest.?.filter_values_json.?);
+
+    const view_mapping_virtual_schema = source_binding.DocumentSqlSchema{
+        .fields = &.{
+            .{
+                .name = "tag_list",
+                .path = "/tags",
+                .source = .view_mapping,
+                .field_type = .array,
+                .array_item_type = .keyword,
+            },
+        },
+    };
+    var view_mapping_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
+    defer view_mapping_unnest.deinit(alloc);
+    var view_mapping_unnest_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_unnest, schema, view_mapping_virtual_schema, .{
+        .bounded_scan = .{ .max_rows = 25 },
+    });
+    defer view_mapping_unnest_lowered.deinit(alloc);
+
+    try std.testing.expect(view_mapping_unnest_lowered.unnest != null);
+    try std.testing.expectEqualStrings("/tags", view_mapping_unnest_lowered.unnest.?.field);
+    try std.testing.expectEqualStrings("tag", view_mapping_unnest_lowered.unnest.?.alias);
+    try std.testing.expectEqual(runtime_schema.AntflyType.keyword, view_mapping_unnest_lowered.unnest.?.item_type);
+    try std.testing.expectEqualStrings("\"urgent\"", view_mapping_unnest_lowered.unnest.?.filter_value_json.?);
+
+    var view_mapping_indexed_unnest = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
+    defer view_mapping_indexed_unnest.deinit(alloc);
+    var view_mapping_indexed_unnest_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_lowered.deinit(alloc);
+
+    try std.testing.expect(view_mapping_indexed_unnest_lowered.unnest != null);
+    try std.testing.expectEqualStrings(
+        "{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}}",
+        view_mapping_indexed_unnest_lowered.producer.indexed_query.filter_query_json.?,
+    );
+
+    var view_mapping_indexed_unnest_in = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag IN ('urgent', 'vip') LIMIT 10");
+    defer view_mapping_indexed_unnest_in.deinit(alloc);
+    var view_mapping_indexed_unnest_in_lowered = try lowerDocumentReadPlanWithCapabilitiesAndVirtualSchemaParsedSqlAlloc(alloc, &view_mapping_indexed_unnest_in, schema, view_mapping_virtual_schema, .{
+        .indexed_array_element_paths = &.{"/tags"},
+    });
+    defer view_mapping_indexed_unnest_in_lowered.deinit(alloc);
+
+    try std.testing.expectEqualStrings(
+        "{\"disjuncts\":[{\"array_any\":{\"path\":\"/tags\",\"value\":\"urgent\"}},{\"array_any\":{\"path\":\"/tags\",\"value\":\"vip\"}}]}",
+        view_mapping_indexed_unnest_in_lowered.producer.indexed_query.filter_query_json.?,
+    );
 
     var residual = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' AND status = 'active' LIMIT 10");
     defer residual.deinit(alloc);

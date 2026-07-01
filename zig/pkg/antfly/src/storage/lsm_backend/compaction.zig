@@ -102,9 +102,14 @@ pub fn flushMutable(comptime BackendType: type, backend: *BackendType) !void {
     const start_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) backend.writeStatsNowNs() else 0;
     var flushed = backend.mutable;
     backend.mutable = .{};
-    errdefer flushed.deinit(backend.allocator);
+    defer flushed.deinit(backend.allocator);
     const input_entries = flushed.entries.items.len;
-    var new_runs = try makeRuns(BackendType, backend, &flushed);
+    var flushed_state = if (flushed.arena_owner == null)
+        try flushed.toStateMove(backend.allocator)
+    else
+        try flushed.clone(backend.allocator);
+    errdefer flushed_state.deinit(backend.allocator);
+    var new_runs = try makeRuns(BackendType, backend, &flushed_state);
     errdefer deinitRunList(backend.allocator, &new_runs);
     if (@hasDecl(BackendType, "recordFlushWriteStats")) {
         const elapsed_ns = if (@hasDecl(BackendType, "writeStatsNowNs")) elapsedNs(BackendType, backend, start_ns) else 0;

@@ -21,14 +21,21 @@ const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const expr_build = @import("expr/build.zig");
+const expr_condition = @import("expr/condition.zig");
 const expr_equal = @import("expr/equal.zig");
+const expr_generated = @import("expr/generated.zig");
+const expr_generated_validate = @import("expr/generated_validate.zig");
 const expr_operator = @import("expr/operator.zig");
 const expr_predicate = @import("expr/predicate.zig");
+const expr_projection = @import("expr/projection.zig");
+const expr_selector = @import("expr/selector.zig");
+const expr_text = @import("expr/text.zig");
 const expr_token = @import("expr/token.zig");
 const expr_type = @import("expr/type.zig");
 const generated_parser = @import("generated_parser.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const lowering_context = @import("lowering_context.zig");
 const parser = @import("parser.zig");
 const plan_mod = @import("plan.zig");
@@ -110,7 +117,7 @@ pub const MergeMutationParserContextHooks = struct {
 pub const MergeMutationParserOptions = struct {
     params: []const sql_value.SqlValue = &.{},
     schema: runtime_schema.TableSchema,
-    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     joined_source_schema: ?runtime_schema.TableSchema = null,
     defer_row_expression_field_validation: bool = false,
     context_hooks: MergeMutationParserContextHooks,
@@ -120,7 +127,7 @@ pub const MergeMutationParserOptions = struct {
     generated_merge_arms: ?*const generated_parser.GeneratedSqlMergeArmListAst = null,
     mutation_context_hooks: MutationSourceParserContextHooks,
     mutation_assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -138,7 +145,7 @@ pub const MergeMutationBodyOptions = struct {
 pub const ConflictTargetParserOptions = struct {
     type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool = false,
-    case_expression_hooks: lower_expr.CaseExpressionParserHooks,
+    case_expression_hooks: expr_row_parse.CaseExpressionParserHooks,
     generated_target_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
     generated_target_kind: ?generated_parser.GeneratedSqlConflictTargetKind = null,
     generated_target_items: ?*const generated_parser.GeneratedSqlListAst = null,
@@ -167,9 +174,9 @@ pub const JsonSetSqlValueParserOptions = struct {
     insert_columns: []const []const u8,
     type_context: expr_type.RowExpressionTypeContext,
     defer_row_expression_field_validation: bool,
-    row_expression_hooks: lower_expr.RowExpressionParserHooks,
-    arithmetic_hooks: lower_expr.ArithmeticExpressionParserHooks,
-    variadic_hooks: lower_expr.VariadicRowExpressionParserHooks,
+    row_expression_hooks: expr_row_parse.RowExpressionParserHooks,
+    arithmetic_hooks: expr_row_parse.ArithmeticExpressionParserHooks,
+    variadic_hooks: expr_row_parse.VariadicRowExpressionParserHooks,
     conflict_dispatch_options: ConflictExpressionDispatchOptions,
 };
 
@@ -501,7 +508,7 @@ pub const SemiJoinSourceQueryParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     context_hooks: SemiJoinSourceQueryParserContextHooks,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -519,7 +526,7 @@ pub const ExistsSemiJoinMutationTailParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -550,7 +557,7 @@ pub const SemiJoinMutationSourceParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -574,7 +581,7 @@ pub const ExistsJoinedMutationSourceParserOptions = struct {
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -594,7 +601,7 @@ pub const DeleteJoinedMutationSourceParserOptions = struct {
     string_to_array_predicate_is_containment: bool,
     context_hooks: JoinedMutationSourceParserContextHooks,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -621,7 +628,7 @@ pub const UpdateJoinedMutationSourceParserOptions = struct {
     generated_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -731,7 +738,7 @@ fn parseRowsBatchRequestWithWriteOptionsAlloc(
 pub const MutationSourceParserOptions = struct {
     params: []const sql_value.SqlValue = &.{},
     schema: runtime_schema.TableSchema,
-    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     row_claim: db_mod.types.RowClaimRequest,
     realtime_ns: u64,
     defer_row_expression_field_validation: bool = false,
@@ -739,7 +746,7 @@ pub const MutationSourceParserOptions = struct {
     assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
     generated_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -2880,15 +2887,15 @@ pub fn insertSourceExpressionFromSelectOutputAlloc(
         },
         .json_extract => blk: {
             if (output.index >= source_query.json_extract.len) return error.UnsupportedSqlShape;
-            break :blk try lower_expr.expressionFromJsonExtractProjectionAlloc(alloc, source_query.json_extract[output.index]);
+            break :blk try expr_projection.expressionFromJsonExtractProjectionAlloc(alloc, source_query.json_extract[output.index]);
         },
         .array_length => blk: {
             if (output.index >= source_query.array_length.len) return error.UnsupportedSqlShape;
-            break :blk try lower_expr.expressionFromArrayLengthProjectionAlloc(alloc, source_query.array_length[output.index]);
+            break :blk try expr_projection.expressionFromArrayLengthProjectionAlloc(alloc, source_query.array_length[output.index]);
         },
         .coalesce => blk: {
             if (output.index >= source_query.coalesce.len) return error.UnsupportedSqlShape;
-            break :blk try lower_expr.expressionFromCoalesceProjectionAlloc(alloc, source_query.coalesce[output.index]);
+            break :blk try expr_projection.expressionFromCoalesceProjectionAlloc(alloc, source_query.coalesce[output.index]);
         },
         .field_alias => blk: {
             if (output.index >= source_query.field_aliases.len) return error.UnsupportedSqlShape;
@@ -3225,7 +3232,7 @@ pub fn conflictColumnIdentityAlloc(
     const writer = &out.writer;
     try writer.print("{f}:[", .{std.json.fmt(label, .{})});
     for (target_columns, 0..) |target_column, i| {
-        const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
+        const value_json = expr_selector.conflictInsertedValueForColumn(insert_columns, row, target_column) orelse return error.UnsupportedSqlShape;
         if (i != 0) try writer.writeByte(',');
         try writer.print("{f}:", .{std.json.fmt(target_column, .{})});
         try writer.writeAll(value_json);
@@ -3261,14 +3268,14 @@ pub fn conflictExpressionValueAlloc(
         defer parsed.deinit();
         return try relational_rows.expressionValueJsonAlloc(alloc, parsed.value, row_expression);
     }
-    const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, row, expression.field) orelse return error.UnsupportedSqlShape;
+    const value_json = expr_selector.conflictInsertedValueForColumn(insert_columns, row, expression.field) orelse return error.UnsupportedSqlShape;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.UnsupportedSqlShape;
     defer parsed.deinit();
     if (parsed.value != .string) return error.UnsupportedSqlShape;
     return switch (expression.op) {
         .lower => try std.ascii.allocLowerString(alloc, parsed.value.string),
         .upper => try std.ascii.allocUpperString(alloc, parsed.value.string),
-        .md5 => try lower_expr.md5HexTextAlloc(alloc, parsed.value.string),
+        .md5 => try expr_text.md5HexTextAlloc(alloc, parsed.value.string),
         .expression => unreachable,
     };
 }
@@ -3315,7 +3322,7 @@ pub fn conflictExcludedJsonObjectValueAlloc(
     insert_values: []const []const u8,
 ) ![]const u8 {
     _ = binder.relationalColumnForField(schema, source, null) orelse return error.InvalidSqlCatalog;
-    const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
+    const value_json = expr_selector.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, value_json);
 }
 
@@ -3329,7 +3336,7 @@ pub fn conflictExcludedValueJsonAlloc(
 ) ![]const u8 {
     const source_column = binder.relationalColumnForField(schema, source, null) orelse return error.InvalidSqlCatalog;
     if (source_column.field_type != column.field_type) return error.UnsupportedSqlShape;
-    const value_json = lower_expr.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
+    const value_json = expr_selector.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, value_json);
 }
 
@@ -3344,7 +3351,7 @@ pub fn conflictExcludedArrayElementValueJsonAlloc(
     const item_type = column.array_item_type orelse return error.InvalidSqlCatalog;
     const source_column = binder.relationalColumnForField(schema, source, null) orelse return error.InvalidSqlCatalog;
     if (source_column.field_type != item_type) return error.UnsupportedSqlShape;
-    const insert_value = lower_expr.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
+    const insert_value = expr_selector.conflictInsertedValueForColumn(insert_columns, insert_values, source) orelse return error.UnsupportedSqlShape;
     try sql_value.validateSqlArrayElementValueJson(alloc, column, insert_value);
     return try alloc.dupe(u8, insert_value);
 }
@@ -3571,7 +3578,7 @@ pub fn parseJsonSetSqlValueAlloc(
             options.conflict_dispatch_options,
         )
     else
-        try lower_expr.parseRowExpressionAlloc(
+        try expr_row_parse.parseRowExpressionAlloc(
             alloc,
             tokens,
             pos,
@@ -3763,16 +3770,16 @@ pub fn parsePointWhereJsonAlloc(
         const op_token_index = pos.*;
         const value_json = if (try expr_operator.parseExpressionIsTailIf(tokens, pos, .{ .allow_distinct = false })) |is_tail| blk: {
             if (is_tail.op != .is_null) return error.UnsupportedSqlShape;
-            try lower_expr.validateGeneratedIsTailPredicateIdentity(generated_expression_ast, tokens, op_token_index, is_tail);
+            try expr_generated_validate.validateGeneratedIsTailPredicateIdentity(generated_expression_ast, tokens, op_token_index, is_tail);
             break :blk try alloc.dupe(u8, "null");
         } else blk: {
             try parser.expectToken(tokens, pos, .eq);
-            try lower_expr.validateGeneratedRelationalPredicateIdentity(generated_expression_ast, tokens, op_token_index, .eq);
+            try expr_generated_validate.validateGeneratedRelationalPredicateIdentity(generated_expression_ast, tokens, op_token_index, .eq);
             break :blk try sql_value.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, realtime_ns);
         };
         var value_transferred = false;
         errdefer if (!value_transferred) alloc.free(value_json);
-        if (lower_expr.fieldValuesContain(values.items, field)) return error.UnsupportedSqlShape;
+        if (expr_selector.fieldValuesContain(values.items, field)) return error.UnsupportedSqlShape;
         try values.append(alloc, .{
             .field = field,
             .value_json = value_json,
@@ -3782,23 +3789,23 @@ pub fn parsePointWhereJsonAlloc(
         if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
 
-    if (lower_expr.fieldValuesMatchColumns(values.items, primary_key.columns)) {
+    if (expr_selector.fieldValuesMatchColumns(values.items, primary_key.columns)) {
         var out: std.Io.Writer.Allocating = .init(alloc);
         errdefer out.deinit();
         const writer = &out.writer;
         try writer.writeAll("{\"primary\":");
-        try lower_expr.writeFieldValuesObjectJson(writer, values.items, primary_key.columns);
+        try expr_selector.writeFieldValuesObjectJson(writer, values.items, primary_key.columns);
         try writer.writeByte('}');
         return try out.toOwnedSlice();
     }
 
-    const unique_constraint = lower_expr.findUniqueConstraintByColumnSet(alloc, schema, values.items) orelse return error.UnsupportedSqlShape;
+    const unique_constraint = expr_selector.findUniqueConstraintByColumnSet(alloc, schema, values.items) orelse return error.UnsupportedSqlShape;
 
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
     const writer = &out.writer;
     try writer.print("{{\"unique\":{{\"name\":{f},\"values\":", .{std.json.fmt(unique_constraint.name, .{})});
-    try lower_expr.writeAllFieldValuesObjectJson(writer, values.items);
+    try expr_selector.writeAllFieldValuesObjectJson(writer, values.items);
     try writer.writeAll("}}");
     return try out.toOwnedSlice();
 }
@@ -5649,7 +5656,7 @@ pub fn parseMergeArmPredicateAlloc(
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
     })) |is_tail| blk: {
-        try lower_expr.validateGeneratedIsTailPredicateIdentity(generated_expression_ast, tokens, op_token_index, is_tail);
+        try expr_generated_validate.validateGeneratedIsTailPredicateIdentity(generated_expression_ast, tokens, op_token_index, is_tail);
         switch (is_tail.kind) {
             .distinct_comparison => unreachable,
             .null_test => {},
@@ -5677,7 +5684,7 @@ pub fn parseMergeArmPredicateAlloc(
         }
         break :blk is_tail.op;
     } else try expr_operator.parseComparisonOp(tokens, pos);
-    try lower_expr.validateGeneratedRelationalPredicateIdentity(generated_expression_ast, tokens, op_token_index, op);
+    try expr_generated_validate.validateGeneratedRelationalPredicateIdentity(generated_expression_ast, tokens, op_token_index, op);
     const value_json = if (op == .is_null or op == .is_not_null)
         null
     else
@@ -5832,7 +5839,7 @@ pub fn parseConflictAssignmentExpressionAlloc(
     } else if (column.field_type == .numeric) {
         try options.type_context.validateNumericRowExpression(expression);
     }
-    try lower_expr.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
     expression_owned = false;
     return expression;
 }
@@ -6550,7 +6557,7 @@ pub fn parseConflictExpressionConditionAlloc(
         const condition = try parseBareBooleanConflictExpressionConditionAlloc(alloc, tokens, pos, column, insert_columns, type_context, options);
         var condition_transferred = false;
         errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-        try lower_expr.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
+        try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
         condition_transferred = true;
         return condition;
     }
@@ -6564,17 +6571,17 @@ pub fn parseConflictExpressionConditionAlloc(
         .allow_boolean_unknown = true,
         .allow_boolean_literal = true,
     })) |is_tail| blk: {
-        try lower_expr.validateGeneratedIsTailPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, is_tail);
+        try expr_generated_validate.validateGeneratedIsTailPredicateIdentity(options.generated_expression_ast, tokens, op_token_index, is_tail);
         switch (is_tail.kind) {
             .distinct_comparison, .null_test => {},
             .boolean_unknown => {
                 try type_context.validateBooleanRowExpression(lhs);
                 lhs_transferred = true;
-                return lower_expr.expressionNullTestCondition(lhs, is_tail.op);
+                return expr_condition.expressionNullTestCondition(lhs, is_tail.op);
             },
             .boolean_literal => {
                 try type_context.validateBooleanRowExpression(lhs);
-                const condition = try lower_expr.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
+                const condition = try expr_condition.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
                 lhs_transferred = true;
                 return condition;
             },
@@ -6618,7 +6625,7 @@ pub fn parseConflictExpressionConditionAlloc(
         .op = op,
         .rhs = rhs,
     };
-    try lower_expr.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
+    try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, options.generated_expression_ast);
     return condition;
 }
 
@@ -6641,7 +6648,7 @@ pub fn parseConflictActionWhereConditionAlternatives(
     const condition_start = pos.*;
     if (canParseBareBooleanConflictExpression(alloc, tokens, pos.*, schema, conflict_existing_qualifiers, insert_columns)) {
         const condition = try parseConflictExpressionConditionAlloc(alloc, tokens, pos, params, schema, conflict_existing_qualifiers, column, insert_columns, type_context, defer_row_expression_field_validation, condition_options);
-        try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+        try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
         if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
         return;
     }
@@ -6672,28 +6679,28 @@ pub fn parseConflictActionWhereConditionAlternatives(
             .distinct_comparison, .null_test => {},
             .boolean_unknown => {
                 try type_context.validateBooleanRowExpression(lhs);
-                const condition = lower_expr.expressionNullTestCondition(lhs, is_tail.op);
-                try lower_expr.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, condition_options.generated_expression_ast);
+                const condition = expr_condition.expressionNullTestCondition(lhs, is_tail.op);
+                try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, condition_options.generated_expression_ast);
                 lhs_transferred = true;
-                try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+                try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
                 if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
                 return;
             },
             .boolean_literal => {
                 try type_context.validateBooleanRowExpression(lhs);
                 if (is_tail.boolean_negated) {
-                    try lower_expr.appendExpressionBooleanIsNotGroups(alloc, alternatives, lhs, is_tail.boolean_value);
+                    try expr_condition.appendExpressionBooleanIsNotGroups(alloc, alternatives, lhs, is_tail.boolean_value);
                     freeExpression(alloc, lhs);
                     lhs_transferred = true;
                     if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
                     return;
                 }
-                const condition = try lower_expr.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
+                const condition = try expr_condition.expressionBooleanComparisonConditionAlloc(alloc, lhs, is_tail.op, is_tail.boolean_value);
                 var condition_transferred = false;
                 errdefer if (!condition_transferred) freeExpressionCondition(alloc, condition);
-                try lower_expr.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, condition_options.generated_expression_ast);
+                try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, condition_options.generated_expression_ast);
                 lhs_transferred = true;
-                try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+                try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
                 condition_transferred = true;
                 if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
                 return;
@@ -6749,10 +6756,10 @@ pub fn parseConflictActionWhereConditionAlternatives(
         .op = op,
         .rhs = rhs,
     };
-    try lower_expr.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, condition_options.generated_expression_ast);
+    try expr_generated_validate.validateGeneratedExpressionConditionIdentityStrict(tokens, condition_start, pos.*, condition, condition_options.generated_expression_ast);
     lhs_transferred = true;
     rhs_transferred = true;
-    try lower_expr.appendExpressionConditionGroup(alloc, alternatives, condition);
+    try expr_condition.appendExpressionConditionGroup(alloc, alternatives, condition);
     if (parenthesized) try parser.expectToken(tokens, pos, .rparen);
 }
 
@@ -6875,7 +6882,7 @@ fn parseConflictActionWhereBranchGroupsAlloc(
             condition_options,
             dispatch_options,
         );
-        try lower_expr.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
+        try expr_condition.andExpressionPredicateAlternatives(alloc, &groups, alternatives.items);
         freeExpressionPredicateGroups(alloc, alternatives.items);
         if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
     }
@@ -6963,7 +6970,7 @@ pub fn parseConflictBooleanExpressionAlloc(
     const expression = try parseConflictBooleanExpressionWithHooksAlloc(alloc, tokens, pos, column, insert_columns, type_context, operand_parser.hooks());
     var expression_owned = true;
     errdefer if (expression_owned) freeExpression(alloc, expression);
-    try lower_expr.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
     expression_owned = false;
     return expression;
 }
@@ -7097,7 +7104,7 @@ pub fn parseConflictCaseFoldExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     if (expected_type) |field_type| if (!expr_type.sqlExpressionTypeIsTextLike(field_type)) return error.UnsupportedSqlShape;
     const kind = try expr_token.parseCaseFoldFunctionCallStart(tokens, pos);
-    if (try lower_expr.parsePeriodBoundRowExpressionAlloc(
+    if (try expr_row_parse.parsePeriodBoundRowExpressionAlloc(
         alloc,
         tokens,
         pos,
@@ -9207,7 +9214,7 @@ pub fn parseJoinedMutationWhereAlloc(
         const lhs_expression_or_predicates = if (lhs_side == .left) targets.left_expression_or_predicates else targets.right_expression_or_predicates;
 
         if (parser.matchToken(tokens, pos, .at_contains) != null) {
-            try lower_expr.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .contains, tokens, pos.* - 1);
+            try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .contains, tokens, pos.* - 1);
             const value_json = try sql_value.parseStructuredPredicateValueAlloc(alloc, tokens, pos, params, lhs_column);
             var value_transferred = false;
             errdefer if (!value_transferred) alloc.free(value_json);
@@ -9227,7 +9234,7 @@ pub fn parseJoinedMutationWhereAlloc(
             continue;
         }
         if (parser.matchToken(tokens, pos, .question) != null) {
-            try lower_expr.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
+            try expr_generated_validate.validateGeneratedSingleOperatorPredicateIdentity(generated_atom_expression, .json_key_exists, tokens, pos.* - 1);
             if (lhs_column.field_type != .json) return error.InvalidSqlCatalog;
             const path = try sql_value.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
             var path_transferred = false;
@@ -9245,7 +9252,7 @@ pub fn parseJoinedMutationWhereAlloc(
             const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
             const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .ilike else .like;
             const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-            try lower_expr.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+            try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
             try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, false, realtime_ns);
             if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
             continue;
@@ -9256,13 +9263,13 @@ pub fn parseJoinedMutationWhereAlloc(
                 const case_insensitive = tokens[pos.* - 1].matchesKeywordTag(.ilike);
                 const generated_kind: generated_parser.GeneratedSqlExpressionKind = if (case_insensitive) .not_ilike else .not_like;
                 const generated_quantifier_token_index: ?usize = if (expr_token.tokenAtIsAnySomeOrAll(tokens, pos.*)) pos.* else null;
-                try lower_expr.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
+                try expr_generated_validate.validateGeneratedPatternPredicateIdentity(generated_atom_expression, generated_kind, tokens, pos.* - 1, generated_quantifier_token_index);
                 try expr_predicate.parseAndAppendTextPatternPredicateAlloc(alloc, tokens, pos, params, lhs_text_patterns, lhs.field, lhs_column, case_insensitive, true, realtime_ns);
                 if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                 continue;
             }
             try parser.expectKeywordTag(tokens, pos, .in);
-            try lower_expr.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .not_in_list, tokens, pos.* - 1, negation_token_index, null);
             const values_json = try sql_value.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
             errdefer if (!values_transferred) alloc.free(values_json);
@@ -9272,7 +9279,7 @@ pub fn parseJoinedMutationWhereAlloc(
             continue;
         }
         if (parser.matchKeywordTag(tokens, pos, .in)) {
-            try lower_expr.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
+            try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_atom_expression, .in_list, tokens, pos.* - 1, null, null);
             const values_json = try sql_value.parseSqlInValuesJsonAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
             errdefer if (!values_transferred) alloc.free(values_json);
@@ -9289,7 +9296,7 @@ pub fn parseJoinedMutationWhereAlloc(
             .allow_boolean_literal = true,
             .allow_boolean_literal_negation = true,
         })) |is_tail| blk: {
-            try lower_expr.validateGeneratedIsTailPredicateIdentity(generated_atom_expression, tokens, op_token_index, is_tail);
+            try expr_generated_validate.validateGeneratedIsTailPredicateIdentity(generated_atom_expression, tokens, op_token_index, is_tail);
             switch (is_tail.kind) {
                 .distinct_comparison => unreachable,
                 .null_test => {},
@@ -9300,7 +9307,7 @@ pub fn parseJoinedMutationWhereAlloc(
                 .boolean_literal => {
                     if (lhs_column.field_type != .boolean) return error.InvalidSqlCatalog;
                     if (is_tail.boolean_negated) {
-                        try lower_expr.appendBooleanIsNotExpressionGroups(alloc, lhs_expression_or_predicates, lhs.field, is_tail.boolean_value);
+                        try expr_condition.appendBooleanIsNotExpressionGroups(alloc, lhs_expression_or_predicates, lhs.field, is_tail.boolean_value);
                         if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
                         continue;
                     }
@@ -9325,7 +9332,7 @@ pub fn parseJoinedMutationWhereAlloc(
             break :blk is_tail.op;
         } else try expr_operator.parseComparisonOp(tokens, pos);
         if (op == .eq and expr_token.matchAnyOrSomeKeyword(tokens, pos)) {
-            try lower_expr.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
+            try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try sql_value.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -9334,7 +9341,7 @@ pub fn parseJoinedMutationWhereAlloc(
             try appendJoinedMutationInPredicate(alloc, lhs_in_predicates, lhs.field, lhs_column, values_json, false);
             values_transferred = true;
         } else if (op == .ne and parser.matchKeywordTag(tokens, pos, .all)) {
-            try lower_expr.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
+            try expr_generated_validate.validateGeneratedQuantifiedPredicateIdentity(generated_atom_expression, tokens, op_token_index, pos.* - 1);
             try parser.expectToken(tokens, pos, .lparen);
             const values_json = try sql_value.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
             var values_transferred = false;
@@ -9344,7 +9351,7 @@ pub fn parseJoinedMutationWhereAlloc(
             values_transferred = true;
         } else if (parser.peekKind(tokens, pos.*, .identifier) and lower_expr.identifierContainsQualifier(tokens[pos.*].text)) {
             if (op != .eq) return error.UnsupportedSqlShape;
-            try lower_expr.validateGeneratedRelationalPredicateIdentity(generated_atom_expression, tokens, op_token_index, op);
+            try expr_generated_validate.validateGeneratedRelationalPredicateIdentity(generated_atom_expression, tokens, op_token_index, op);
             const rhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
             defer plan_mod.freeQualifiedField(alloc, rhs);
             const rhs_side = try binder.joinSideForQualifier(rhs.qualifier, target_alias, source_alias);
@@ -9363,7 +9370,7 @@ pub fn parseJoinedMutationWhereAlloc(
             left_transferred = true;
             right_transferred = true;
         } else {
-            try lower_expr.validateGeneratedRelationalPredicateIdentity(generated_atom_expression, tokens, op_token_index, op);
+            try expr_generated_validate.validateGeneratedRelationalPredicateIdentity(generated_atom_expression, tokens, op_token_index, op);
             const value_json = if (op == .is_null or op == .is_not_null)
                 null
             else if (lhs_column.field_type == .array and op == .eq)
@@ -9582,7 +9589,7 @@ pub fn parseConflictTargetAlloc(
         return .primary;
     }
 
-    const constraint = try lower_expr.findUniqueConstraintByColumnsExpressionsAndConflictWhere(alloc, schema, columns.items, expressions.items, where_json, where_expressions) orelse return error.InvalidSqlCatalog;
+    const constraint = try expr_selector.findUniqueConstraintByColumnsExpressionsAndConflictWhere(alloc, schema, columns.items, expressions.items, where_json, where_expressions) orelse return error.InvalidSqlCatalog;
     return try conflictTargetForUniqueConstraintAlloc(alloc, constraint);
 }
 
@@ -9768,7 +9775,7 @@ fn validateGeneratedConflictTargetUniqueExpressionIdentity(
     }
 
     const row_expression = expression.expression orelse return error.UnsupportedSqlShape;
-    try lower_expr.validateGeneratedRowExpressionIdentityStrict(tokens, inner_tokens.start, inner_tokens.end, row_expression, generated_inner);
+    try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, inner_tokens.start, inner_tokens.end, row_expression, generated_inner);
 }
 
 fn conflictTargetForNamedConstraintAlloc(
@@ -9917,7 +9924,7 @@ pub fn parseSemiJoinSourceSubqueryHeaderAlloc(
         parsed_source_fields.deinit(alloc);
     }
     while (true) {
-        const parsed_source_field = try lower_expr.parseRowExpressionFieldOwnedAlloc(
+        const parsed_source_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
             alloc,
             tokens,
             pos,
@@ -10009,7 +10016,7 @@ pub fn parseExistsSemiJoinMutationTailAlloc(
     errdefer if (row_claim.owner_id.len > 0) alloc.free(row_claim.owner_id);
 
     try parser.expectKeywordTag(tokens, pos, .exists);
-    try lower_expr.validateGeneratedExistsSubqueryPredicateIdentity(options.generated_where_expression, tokens, pos.* - 1);
+    try expr_generated_validate.validateGeneratedExistsSubqueryPredicateIdentity(options.generated_where_expression, tokens, pos.* - 1);
     try parser.expectToken(tokens, pos, .lparen);
     try parser.expectKeywordTag(tokens, pos, .select);
 
@@ -10145,7 +10152,7 @@ pub fn parseSemiJoinMutationSourceAlloc(
 
     const in_token_index = pos.*;
     try parser.expectKeywordTag(tokens, pos, .in);
-    try lower_expr.validateGeneratedSetOrBetweenPredicateIdentity(generated_where_expression, .in_list, tokens, in_token_index, null, null);
+    try expr_generated_validate.validateGeneratedSetOrBetweenPredicateIdentity(generated_where_expression, .in_list, tokens, in_token_index, null, null);
     try parser.expectToken(tokens, pos, .lparen);
     try parser.expectKeywordTag(tokens, pos, .select);
 
@@ -10811,7 +10818,7 @@ pub fn parseSemiJoinTargetFieldsAlloc(
 
     if (parser.matchToken(tokens, pos, .lparen) != null) {
         while (true) {
-            const parsed_target_field = try lower_expr.parseRowExpressionFieldOwnedAlloc(
+            const parsed_target_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
                 alloc,
                 tokens,
                 pos,
@@ -10826,7 +10833,7 @@ pub fn parseSemiJoinTargetFieldsAlloc(
         }
         try parser.expectToken(tokens, pos, .rparen);
     } else {
-        const parsed_target_field = try lower_expr.parseRowExpressionFieldOwnedAlloc(
+        const parsed_target_field = try expr_generated.parseRowExpressionFieldOwnedAlloc(
             alloc,
             tokens,
             pos,
@@ -11864,7 +11871,7 @@ pub fn parseMutationSourceQueryTailAlloc(
     tokens: []const Token,
     pos: *usize,
     schema: runtime_schema.TableSchema,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     params: []const sql_value.SqlValue,
     field_expression_qualifiers: []const []const u8,
     returning_qualifiers: []const []const u8,
@@ -11872,7 +11879,7 @@ pub fn parseMutationSourceQueryTailAlloc(
     allow_table_wide: bool,
     row_claim: db_mod.types.RowClaimRequest,
     realtime_ns: u64,
-    fixed_binary_hooks: lower_expr.FixedBinaryRowExpressionParserOptions,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
     expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
     expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
@@ -15811,7 +15818,7 @@ fn lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     var context = lowering_context.WritePlanLoweringContext{
         .alloc = alloc,
@@ -15849,7 +15856,7 @@ fn lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsA
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredRecursiveInsertSource {
     _ = function_bindings;
     return try lowerRecursiveInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver);
@@ -15861,7 +15868,7 @@ fn lowerInsertWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredInsert {
     _ = function_bindings;
     return try lowerInsertWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
@@ -15873,7 +15880,7 @@ fn lowerInsertSourceWithResolverParsedSqlForDmlTestWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredInsertSource {
     _ = function_bindings;
     return try lowerInsertSourceWithResolverParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
@@ -15886,7 +15893,7 @@ fn lowerInsertSourceWithSchemasParsedSqlForDmlTestWithFunctionBindingsAlloc(
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredInsertSource {
     _ = function_bindings;
     return try lowerInsertSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, unique_resolver);
@@ -15899,7 +15906,7 @@ fn lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBind
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredJoinedMutationSource {
     _ = function_bindings;
     return try lowerUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
@@ -15911,7 +15918,7 @@ fn lowerUpdateParsedSqlForDmlTestWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredMutation {
     _ = function_bindings;
     return try lowerUpdateParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
@@ -15923,7 +15930,7 @@ fn lowerUpdateMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredMutationSource {
     _ = function_bindings;
     return try lowerUpdateMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
@@ -15936,7 +15943,7 @@ fn lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFunctionBind
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredJoinedMutationSource {
     _ = function_bindings;
     return try lowerDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
@@ -15948,7 +15955,7 @@ fn lowerDeleteParsedSqlForDmlTestWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     unique_resolver: relational_rows.UniqueSelectorResolver,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredMutation {
     _ = function_bindings;
     return try lowerDeleteParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, unique_resolver);
@@ -15960,7 +15967,7 @@ fn lowerDeleteMutationSourceParsedSqlForDmlTestWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredMutationSource {
     _ = function_bindings;
     return try lowerDeleteMutationSourceParsedSqlForDmlTestAlloc(alloc, parsed_sql, schema, params, row_claim);
@@ -15972,7 +15979,7 @@ fn lowerMergeMutationPlanParsedSqlForDmlTestWithFunctionBindingsAlloc(
     target_schema: runtime_schema.TableSchema,
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredMergeMutationPlan {
     _ = function_bindings;
     return try lowerMergeMutationPlanParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
@@ -15985,7 +15992,7 @@ fn lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFun
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
     _ = function_bindings;
     return try lowerRecursiveUpdateJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
@@ -15998,7 +16005,7 @@ fn lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestWithFun
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     row_claim: db_mod.types.RowClaimRequest,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredRecursiveJoinedMutationSource {
     _ = function_bindings;
     return try lowerRecursiveDeleteJoinedMutationSourceWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params, row_claim);
@@ -16010,7 +16017,7 @@ fn lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestWithFunctionBindings
     target_schema: runtime_schema.TableSchema,
     source_schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredRecursiveMergeMutation {
     _ = function_bindings;
     return try lowerRecursiveMergeMutationWithSchemasParsedSqlForDmlTestAlloc(alloc, parsed_sql, target_schema, source_schema, params);
@@ -16034,7 +16041,7 @@ pub fn lowerWritePlanFromGeneratedDmlAstDirectWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     const published_write = parsed_sql.writeStatementIncludingGeneratedAst() orelse return error.UnsupportedSqlShape;
     switch (parsed_sql.statement) {
@@ -17377,7 +17384,7 @@ fn insertValuesFromGeneratedDmlAstWithFunctionBindingsAlloc(
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
     options: plan_mod.LowerWritePlanOptions,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredInsert {
     if (ast.kind != .insert_values) return error.UnsupportedSqlShape;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
@@ -19460,7 +19467,7 @@ pub fn lowerWritePlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
     options: plan_mod.LowerWritePlanOptions,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = lowering_context.CatalogWritePlanLoweringContext{
@@ -19481,7 +19488,7 @@ pub fn lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
     bound: *binder.BoundSqlStatement,
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = lowering_context.CatalogWritePlanLoweringContext{
@@ -19502,7 +19509,7 @@ pub fn lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
     logical: *binder.LogicalSqlPlan,
     schema: runtime_schema.TableSchema,
     params: []const sql_value.SqlValue,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
     var context = lowering_context.CatalogWritePlanLoweringContext{

@@ -1,0 +1,49 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "concurrent-writer-generation-isolation",
+      "relational_slices_section": "Durable schema and migration execution",
+      "surface": "concurrent_writer_generation_isolation",
+      "status": "partial_release_gated",
+      "current_evidence": "Metadata table updates with schema rewrite jobs apply atomically, schema progress waits for hosting nodes, and schema rewrite workers invalidate stale range jobs before rewriting rows.",
+      "missing_evidence": "Concurrent-reader/writer tests still need to prove no operation observes or writes mixed schema generations during rewrite/backfill, table-emptying, CAS promotion, or restart-identity sequence reset.",
+      "evidence_file": "zig/pkg/antfly/src/metadata/storage/raft_apply_store.zig",
+      "evidence_symbol": "metadata raft apply store applies table updates with schema rewrite jobs atomically",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "create-or-replace-table-schema-job",
+      "relational_slices_section": "Durable schema and migration execution",
+      "surface": "create_or_replace_table",
+      "status": "gap_tracked",
+      "current_evidence": "Applied SQL DDL can schedule typed, row-plan, and full-row schema rewrite jobs and promote completed rewrite work through table schema CAS.",
+      "missing_evidence": "CREATE OR REPLACE TABLE still needs one durable schema job owning rebuild, validation, rewrite, backfill, CAS promotion, retry, abort, reopen, and idempotent replay state.",
+      "evidence_file": "zig/pkg/antfly/src/metadata/catalog/jobs.zig",
+      "evidence_symbol": "catalog jobs schedules full row schema rewrite jobs from applied SQL DDL work",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "drop-table-cascade-recoverable-job",
+      "relational_slices_section": "Durable schema and migration execution",
+      "surface": "drop_table_cascade",
+      "status": "partial_release_gated",
+      "current_evidence": "SQL DROP TABLE CASCADE updates child schemas, records catalog work items, and drop-table API paths wait for metadata lifecycle absence.",
+      "missing_evidence": "DROP TABLE CASCADE still needs a recoverable multi-table schema job with table-generation promotion, child updates, range cleanup, sequence cleanup, partial-progress recovery, and idempotent restart convergence.",
+      "evidence_file": "zig/pkg/antfly/src/metadata/http_server.zig",
+      "evidence_symbol": "metadata catalog validation applies sql drop table cascade through child schema updates",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "schema-job-operator-controls",
+      "relational_slices_section": "Durable schema and migration execution",
+      "surface": "operator_controls",
+      "status": "partial_release_gated",
+      "current_evidence": "Schema rewrite and table-emptying jobs expose durable lifecycle operations, progress records, stale lease rejection, wake loops, and busy-only worker passes.",
+      "missing_evidence": "Large table-emptying and schema rewrite jobs still need operator-facing progress API, pause, resume, abort, retry, stale lease takeover controls, worker admission bounds, and surfaced failure classes.",
+      "evidence_file": "zig/pkg/antfly/src/metadata/table_manager.zig",
+      "evidence_symbol": "table manager applies schema rewrite job lifecycle operations",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

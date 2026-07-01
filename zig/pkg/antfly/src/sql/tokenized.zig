@@ -1951,6 +1951,7 @@ fn generatedDdlAstHasValidClassificationPayload(
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_options_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.index_where_tokens)) return false;
     if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.alter_table_operation_tokens)) return false;
+    if (!generatedDdlOptionalTokenRangeIsValid(tokens, end, ddl_ast.rename_target_tokens)) return false;
     if (!generatedDdlShapePayloadIsValid(tokens, end, ddl_ast)) return false;
     return generatedDdlRequiredRangesArePresent(ddl_ast);
 }
@@ -2146,16 +2147,12 @@ fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDd
         .alter_table,
         .alter_database,
         .alter_extension,
-        .alter_schema,
-        .alter_tablespace,
-        .alter_view,
         .alter_domain,
         .alter_sequence,
         .alter_enum_type,
         .alter_publication,
         .alter_subscription,
         .alter_role,
-        .alter_collation,
         .drop_table,
         .drop_view,
         .drop_materialized_view,
@@ -2176,6 +2173,11 @@ fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDd
         .drop_extension,
         .refresh_materialized_view,
         => ddl_ast.object_name_tokens != null,
+        .alter_schema,
+        .alter_tablespace,
+        .alter_view,
+        .alter_collation,
+        => ddl_ast.object_name_tokens != null and ddl_ast.rename_target_tokens != null,
         .relation_population => ddl_ast.object_name_tokens != null and ddl_ast.relation_population_source_read != null,
         .create_policy,
         .alter_policy,

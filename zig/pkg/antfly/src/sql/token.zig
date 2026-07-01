@@ -77,6 +77,7 @@ pub const TokenKeyword = enum {
     ascii,
     as,
     asc,
+    assignment,
     asymmetric,
     avg,
     base_weight,
@@ -183,6 +184,7 @@ pub const TokenKeyword = enum {
     ilike,
     include,
     import,
+    implicit,
     in,
     index,
     initcap,
@@ -217,6 +219,7 @@ pub const TokenKeyword = enum {
     like,
     limit,
     listen,
+    location,
     load,
     locked,
     lock,
@@ -537,6 +540,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.length, keywordFromIdentifier("LENGTH").?);
     try std.testing.expectEqual(TokenKeyword.like, keywordFromIdentifier("LIKE").?);
     try std.testing.expectEqual(TokenKeyword.listen, keywordFromIdentifier("LISTEN").?);
+    try std.testing.expectEqual(TokenKeyword.location, keywordFromIdentifier("LOCATION").?);
     try std.testing.expectEqual(TokenKeyword.load, keywordFromIdentifier("LOAD").?);
     try std.testing.expectEqual(TokenKeyword.lock, keywordFromIdentifier("LOCK").?);
     try std.testing.expectEqual(TokenKeyword.lpad, keywordFromIdentifier("LPAD").?);

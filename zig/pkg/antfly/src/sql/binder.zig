@@ -29,6 +29,7 @@ const sql_statement_kind = @import("statement_kind.zig");
 const grammar = @import("grammar.zig");
 const lexer = @import("lexer.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const lowering_context = @import("lowering_context.zig");
 const plan_mod = @import("plan.zig");
 const parser = @import("parser.zig");
@@ -2963,7 +2964,7 @@ fn resolveDdlCatalogFactsFromParsedSqlWithSessionAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !CatalogBoundDdlPlanFacts {
     return try resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, function_bindings, .{});
 }
@@ -2973,7 +2974,7 @@ fn resolveDdlCatalogFactsFromParsedSqlWithSessionAndAuthorizationAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !CatalogBoundDdlPlanFacts {
     var logical_plan = try ddl_plan.parseLogicalDdlPlanAlloc(alloc, parsed_sql, function_bindings);
@@ -3047,7 +3048,7 @@ pub fn bindDdlStatementWithCatalogSessionAndFunctionBindingsAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !BoundSqlStatement {
     return try bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(alloc, parsed_sql, catalog, session, function_bindings, .{});
 }
@@ -3057,7 +3058,7 @@ pub fn bindDdlStatementWithCatalogSessionFunctionBindingsAndAuthorizationAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
-    function_bindings: lower_expr.SqlFunctionBindings,
+    function_bindings: expr_row_parse.SqlFunctionBindings,
     authorization_options: BoundSqlAuthorizationOptions,
 ) !BoundSqlStatement {
     try requireParsedDdlStatement(parsed_sql.statement);

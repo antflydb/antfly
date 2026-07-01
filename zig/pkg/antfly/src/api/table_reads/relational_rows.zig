@@ -21,6 +21,7 @@ const db_mod = @import("../../storage/db/mod.zig");
 const storage_schema = @import("../../storage/schema.zig");
 const document_sql_runtime = @import("../../sql/document_runtime.zig");
 const sql_adapter = @import("../../sql/mod.zig");
+const platform_time = @import("../../platform/time.zig");
 const raft_mod = @import("../../raft/mod.zig");
 const raft_reconciler = @import("../../raft/reconciler.zig");
 const schema_api = @import("../../schema/mod.zig");
@@ -37,6 +38,10 @@ const LookupResponse = core.LookupResponse;
 const ScanResponse = core.ScanResponse;
 const appendScanLine = core.appendScanLine;
 const nativeCatalogTableNameAlloc = table_catalog.nativeTableNameForCatalogTargetAlloc;
+
+fn uniqueTestTmpPathAlloc(alloc: std.mem.Allocator, prefix: []const u8) ![]u8 {
+    return try std.fmt.allocPrint(alloc, "/tmp/{s}-{d}", .{ prefix, platform_time.monotonicNs() });
+}
 
 fn recursiveDmlFullRowSourceQuery(req: db_mod.types.RelationalRowsQueryRequest) db_mod.types.RelationalRowsQueryRequest {
     var query = req;
@@ -1682,7 +1687,8 @@ test "lowered sql recursive merge mutation plans build batches from routed scans
     const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
     defer storage_schema.freeSchema(alloc, schema);
 
-    const path = "/tmp/antfly-api-recursive-merge-routed-scans";
+    const path = try uniqueTestTmpPathAlloc(alloc, "antfly-api-recursive-merge-routed-scans");
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -4768,6 +4774,21 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
     try std.testing.expectEqual(@as(usize, 1), missing_lateral_fake.scan_calls);
     try std.testing.expectEqual(@as(usize, 3), missing_lateral_fake.lookup_calls);
 
+    var missing_ranged_join_fake = FakeRoutedSource{ .lookup_mode = .missing };
+    var missing_ranged_join_source = missing_ranged_join_fake.source();
+    try std.testing.expectError(error.TopologyChanged, missing_ranged_join_source.rowsJoinPlan(alloc, "orders", schema, .{
+        .left_ranges = ranges[0..],
+        .right_ranges = ranges[0..],
+        .join = .{
+            .left = .{},
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), missing_ranged_join_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), missing_ranged_join_fake.lookup_calls);
+
     var changed_fake = FakeRoutedSource{ .lookup_mode = .changed };
     var changed_source = changed_fake.source();
     try std.testing.expectError(error.TopologyChanged, changed_source.rowsAggregatePlan(alloc, "orders", schema, .{
@@ -4837,6 +4858,21 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
         .read_index,
     ));
 
+    var changed_ranged_join_fake = FakeRoutedSource{ .lookup_mode = .changed };
+    var changed_ranged_join_source = changed_ranged_join_fake.source();
+    try std.testing.expectError(error.TopologyChanged, changed_ranged_join_source.rowsJoinPlan(alloc, "orders", schema, .{
+        .left_ranges = ranges[0..],
+        .right_ranges = ranges[0..],
+        .join = .{
+            .left = .{},
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), changed_ranged_join_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), changed_ranged_join_fake.lookup_calls);
+
     var version_changed_fake = FakeRoutedSource{ .lookup_mode = .version_changed };
     var version_changed_source = version_changed_fake.source();
     try std.testing.expectError(error.TopologyChanged, version_changed_source.rowsQueryPlan(alloc, "orders", schema, .{
@@ -4886,6 +4922,21 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
             .select = join_select[0..],
         },
     }, .read_index));
+
+    var version_changed_ranged_join_fake = FakeRoutedSource{ .lookup_mode = .version_changed };
+    var version_changed_ranged_join_source = version_changed_ranged_join_fake.source();
+    try std.testing.expectError(error.TopologyChanged, version_changed_ranged_join_source.rowsJoinPlan(alloc, "orders", schema, .{
+        .left_ranges = ranges[0..],
+        .right_ranges = ranges[0..],
+        .join = .{
+            .left = .{},
+            .right = .{},
+            .on = join_on[0..],
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(@as(usize, 2), version_changed_ranged_join_fake.scan_calls);
+    try std.testing.expectEqual(@as(usize, 3), version_changed_ranged_join_fake.lookup_calls);
 
     var missing_version_fake = FakeRoutedSource{ .lookup_mode = .missing_version };
     var missing_version_source = missing_version_fake.source();
@@ -4988,6 +5039,23 @@ test "routed rows query plan executes over scanned owner rows with ctes" {
         },
     }, .read_index));
     try std.testing.expectEqual(scans_before_paged_merge, fake.scan_calls);
+
+    const scans_before_offset_merge = fake.scan_calls;
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.rowsJoinPlan(alloc, "orders", schema, .{
+        .ctes = ctes[0..],
+        .join = .{
+            .left = .{
+                .source_cte = "open_rows",
+                .order_by = &.{.{ .field = "status", .direction = .asc }},
+                .offset = 1,
+            },
+            .right = .{ .order_by = &.{.{ .field = "status", .direction = .asc }} },
+            .on = join_on[0..],
+            .strategy = .merge,
+            .select = join_select[0..],
+        },
+    }, .read_index));
+    try std.testing.expectEqual(scans_before_offset_merge, fake.scan_calls);
 
     var join_result = (try source.rowsJoinPlan(alloc, "orders", schema, .{
         .ctes = ctes[0..],

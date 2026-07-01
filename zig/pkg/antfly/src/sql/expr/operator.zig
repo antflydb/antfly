@@ -259,3 +259,85 @@ pub fn parseExpressionCastType(tokens: []const Token, pos: *usize) !db_mod.types
         std.ascii.eqlIgnoreCase(token.text, "date")) return .datetime;
     return error.UnsupportedSqlShape;
 }
+
+test "sql expr_operator handles expression operator helpers" {
+    const arithmetic_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "amount" },
+        .{ .kind = .plus, .text = "+" },
+        .{ .kind = .identifier, .text = "interval" },
+    };
+    try std.testing.expectEqual(TokenKind.plus, peekArithmeticOperator(&arithmetic_tokens, 1).?.token);
+    try std.testing.expect(peekArithmeticRhsKeyword(&arithmetic_tokens, 0, "interval"));
+    try std.testing.expect(!peekArithmeticRhsKeyword(&arithmetic_tokens, 1, "interval"));
+
+    var comparison_pos: usize = 0;
+    const comparison_tokens = [_]Token{.{ .kind = .gte, .text = ">=" }};
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.gte, try parseComparisonOp(&comparison_tokens, &comparison_pos));
+    try std.testing.expectEqual(@as(usize, 1), comparison_pos);
+
+    var postfix_pos: usize = 0;
+    const postfix_tokens = [_]Token{.{ .kind = .identifier, .text = "notnull" }};
+    try std.testing.expectEqual(runtime_schema.RelationalCheckOp.is_not_null, matchPostfixNullTest(&postfix_tokens, &postfix_pos).?);
+    try std.testing.expectEqual(@as(usize, 1), postfix_pos);
+
+    try std.testing.expect(tokenKindIsJsonExtractOperator(.arrow_json));
+    try std.testing.expect(tokenKindIsJsonExtractOperator(.path_arrow_text));
+    try std.testing.expect(tokenKindIsJsonExtractTextOperator(.arrow_text));
+    try std.testing.expect(!tokenKindIsJsonExtractTextOperator(.arrow_json));
+    try std.testing.expect(tokenKindIsJsonExtractPathOperator(.path_arrow_json));
+    try std.testing.expect(!tokenKindIsJsonExtractPathOperator(.arrow_json));
+
+    const json_extract_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .arrow_text, .text = "->>" },
+        .{ .kind = .string, .text = "status" },
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "not" },
+        .{ .kind = .identifier, .text = "distinct" },
+        .{ .kind = .identifier, .text = "from" },
+        .{ .kind = .string, .text = "active" },
+    };
+    try std.testing.expect(jsonExtractExpressionCanStartAt(&json_extract_tokens, 0));
+    try std.testing.expect(!jsonExtractExpressionPredicateCanStartAt(&json_extract_tokens, 0));
+    try std.testing.expect(jsonExtractNullSafeDistinctPredicateCanStartAt(&json_extract_tokens, 0));
+
+    const json_null_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .arrow_json, .text = "->" },
+        .{ .kind = .placeholder, .text = "$1" },
+        .{ .kind = .identifier, .text = "is" },
+        .{ .kind = .identifier, .text = "null" },
+    };
+    try std.testing.expect(jsonExtractNullTestPredicateCanStartAt(&json_null_tokens, 0));
+
+    const json_membership_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .arrow_text, .text = "->>" },
+        .{ .kind = .string, .text = "status" },
+        .{ .kind = .identifier, .text = "not" },
+        .{ .kind = .identifier, .text = "in" },
+    };
+    try std.testing.expect(jsonExtractMembershipPredicateCanStartAt(&json_membership_tokens, 0));
+
+    const json_all_membership_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .arrow_text, .text = "->>" },
+        .{ .kind = .string, .text = "status" },
+        .{ .kind = .eq, .text = "=" },
+        .{ .kind = .identifier, .text = "ALL", .keyword = .all },
+    };
+    try std.testing.expect(jsonExtractMembershipPredicateCanStartAt(&json_all_membership_tokens, 0));
+
+    var regex_pos: usize = 0;
+    const regex_tokens = [_]Token{.{ .kind = .regex_not_imatch, .text = "!~*" }};
+    const regex_operator = matchRegexPredicateOperator(&regex_tokens, &regex_pos) orelse return error.TestUnexpectedResult;
+    try std.testing.expect(regex_operator.case_insensitive);
+    try std.testing.expect(regex_operator.negated);
+    try std.testing.expectEqual(@as(usize, 1), regex_pos);
+
+    const json_key_set_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "metadata" },
+        .{ .kind = .question_any, .text = "?|" },
+    };
+    try std.testing.expect(jsonKeySetExpressionCanStartAt(&json_key_set_tokens, 0));
+}

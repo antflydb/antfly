@@ -1,0 +1,70 @@
+{
+  "gate_format": 1,
+  "entries": [
+    {
+      "id": "additional-array-unnest-patterns",
+      "sql_slices_section": "Finish document query and view-mapping hardening",
+      "expansion_surface": "array_unnest_patterns",
+      "admission_status": "blocked_until_corpus_and_runtime",
+      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures for each admitted array path, aliasing, filter, projection, nesting, and multi-array UNNEST shape.",
+      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets for each admitted array/UNNEST family and native-equivalence contract.",
+      "runtime_parity_requirement": "Add executable runtime result-parity tests comparing SQL UNNEST output, ordering, limits, residual filters, and total counts with native document reads or exact array-element producers.",
+      "current_guard": "The current single-array equality-filtered UNNEST shape has exact array-element indexed runtime parity; additional array paths, aliases, filters, ordering, nesting, and multi-array shapes remain blocked until their own corpus and runtime evidence lands.",
+      "evidence_file": "zig/pkg/antfly/src/api/table_reads/sources.zig",
+      "evidence_symbol": "api.table_reads.docid document sql view mapping runtime results match native document reads",
+      "release_gate": "document-sql-hardening-gate"
+    },
+    {
+      "id": "additional-mapped-fields",
+      "sql_slices_section": "Finish document query and view-mapping hardening",
+      "expansion_surface": "mapped_fields",
+      "admission_status": "blocked_until_corpus_and_runtime",
+      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures for every newly admitted mapped field type, nullability mode, JSON path form, projection form, predicate family, and required-index metadata shape.",
+      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets for each new mapped-field predicate/projection family and native-equivalence contract.",
+      "runtime_parity_requirement": "Add executable runtime result-parity tests comparing SQL mapped-field projections, predicates, null behavior, ordering, limits, and residual filtering against native document reads.",
+      "current_guard": "Current mapped scalar families are limited to the source-corpus fixtures and runtime parity test named by the view-mapping coverage buckets.",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_required_coverage.json",
+      "evidence_symbol": "document_query_view_mapping_*",
+      "release_gate": "document-sql-hardening-gate"
+    },
+    {
+      "id": "derived-index-producer-types",
+      "sql_slices_section": "Finish document query and view-mapping hardening",
+      "expansion_surface": "derived_index_producer_types",
+      "admission_status": "blocked_until_corpus_and_runtime",
+      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures for each newly admitted native/derived-index producer, including exact request summaries and stale/missing producer diagnostics.",
+      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets for each new derived-index producer type and native/API equivalence contract.",
+      "runtime_parity_requirement": "Add executable runtime result-parity tests comparing SQL producer requests with native document API requests, including stale lifecycle and missing-producer failures.",
+      "current_guard": "Semantic, vector, hybrid, graph traverse, graph shortest path, graph metric, and graph metric rerank reads remain rejected with missing exact producer diagnostics until exact producers are implemented.",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_resolved_native_requirements.json",
+      "evidence_symbol": "document_sql_bounded_scan_missing_exact_producer",
+      "release_gate": "document-sql-hardening-gate"
+    },
+    {
+      "id": "document-aggregates",
+      "sql_slices_section": "Finish document query and view-mapping hardening",
+      "expansion_surface": "document_aggregates",
+      "admission_status": "blocked_until_corpus_and_runtime",
+      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures for each admitted document aggregate shape, including grouping, filters, ordering, limits, residual predicates, and native aggregate producer summaries.",
+      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets for each aggregate family and native/API equivalence contract.",
+      "runtime_parity_requirement": "Add executable runtime result-parity tests comparing SQL aggregate rows, totals, grouping keys, null behavior, and ordering with native document aggregate/materialization requests.",
+      "current_guard": "Document read hardening does not admit new aggregate shapes without separate corpus and runtime parity evidence.",
+      "evidence_file": "zig/SQL_SLICES.md",
+      "evidence_symbol": "Finish document query and view-mapping hardening",
+      "release_gate": "document-sql-hardening-gate"
+    },
+    {
+      "id": "lateral-view-mapping-joins",
+      "sql_slices_section": "Finish document query and view-mapping hardening",
+      "expansion_surface": "lateral_view_mapping_joins",
+      "admission_status": "blocked_until_corpus_and_runtime",
+      "source_corpus_requirement": "Add named sql_api_parity_source_corpus.json fixtures for each admitted lateral mapped-view join shape, including join side binding, correlation, residual filters, limits, and unsupported diagnostics.",
+      "coverage_bucket_requirement": "Add required sql_api_required_coverage.json buckets for each lateral view-mapping family and native/API equivalence contract.",
+      "runtime_parity_requirement": "Add executable runtime result-parity tests comparing SQL lateral join output, correlation behavior, ordering, limits, and residual filtering with native document or relational/document hybrid reads.",
+      "current_guard": "No lateral view-mapping joins are admitted by the current document read set.",
+      "evidence_file": "zig/SQL_SLICES.md",
+      "evidence_symbol": "Finish document query and view-mapping hardening",
+      "release_gate": "document-sql-hardening-gate"
+    }
+  ]
+}

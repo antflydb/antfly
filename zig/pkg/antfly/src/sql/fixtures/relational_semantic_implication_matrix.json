@@ -1,0 +1,89 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "case-insensitive-collation-implication",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "collation",
+      "required_rule": "Partial unique and derived predicate implication must compare keyword predicates with the source column collation.",
+      "unsafe_negative": "The same predicate must not imply a case-sensitive partial predicate when only case-insensitive equality would match.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_store.zig",
+      "evidence_symbol": "relational partial unique predicates honor case-insensitive column collation",
+      "coverage_contract": "Proves row tuple construction and predicate implication accept case-insensitive matches and reject the opposite predicate.",
+      "missing_or_next_evidence": "Extend this row when additional collations become accepted derived-access-path inputs.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "expression-partial-predicate-implication",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "equivalence_class",
+      "required_rule": "Expression partial predicates may be trusted only when typed field/value conditions are implied by query predicates.",
+      "unsafe_negative": "Expression partial predicates must not be trusted when the same spelling lacks the required source-column collation.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows expression partial predicate implication honors source column collation",
+      "coverage_contract": "Proves expression-predicate implication succeeds for the collation-aware source column and fails for exact comparison.",
+      "missing_or_next_evidence": "Add rows for type coercion and volatility before enabling broader expression-index planning.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "json-null-partial-predicate-implication",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "null_semantics",
+      "required_rule": "IS NOT NULL implication must parse JSON null as SQL-null-equivalent and distinguish the string \"null\" and non-null values.",
+      "unsafe_negative": "Pretty JSON null and invalid JSON predicates must not imply an IS NOT NULL partial unique predicate.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_store.zig",
+      "evidence_symbol": "relational partial unique is-not-null implication parses json null literals",
+      "coverage_contract": "Proves parsed null, string null, numeric, and invalid JSON predicate cases for partial unique implication.",
+      "missing_or_next_evidence": "Add ordered-composite NULLS FIRST/LAST implication rows before ordered indexes become planner inputs.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "null-distinct-unique-implication",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "null_semantics",
+      "required_rule": "Unique expression tuple derivation must preserve source-column collation and null distinctness semantics.",
+      "unsafe_negative": "Null tuple components must not collide with non-null expression-derived tuple values.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_store.zig",
+      "evidence_symbol": "relational unique ast field expressions honor source column collation and null distinctness",
+      "coverage_contract": "Proves expression tuple equality under source-column collation while keeping absent/null values distinct.",
+      "missing_or_next_evidence": "Add multi-column ordered null-semantics rows when ordered-composite access paths are promoted.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "unsafe-building-artifact-fail-closed",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "unsafe_artifact_lifecycle",
+      "required_rule": "A building secondary index cannot be used as a query-answering access path even when its key shape matches.",
+      "unsafe_negative": "Queries must scan base rows when a building artifact is incomplete or has missing index keys.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows query ignores building secondary indexes and scans base rows",
+      "coverage_contract": "Deletes one matching index key and proves the query still returns both rows through the base-row path.",
+      "missing_or_next_evidence": "Repeat for derived ordered/expression artifacts after generation metadata is durable.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "unsafe-ordered-index-fail-closed",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "unsafe_artifact_lifecycle",
+      "required_rule": "Ordered secondary index metadata is not a trusted query-answering path until lifecycle validation is implemented.",
+      "unsafe_negative": "Queries must ignore ordered secondary indexes and return base-row results when ordered keys are incomplete.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows query ignores ordered secondary indexes and scans base rows",
+      "coverage_contract": "Deletes ordered index keys and proves matching rows remain visible through base-row scanning.",
+      "missing_or_next_evidence": "Replace with generation/CAS promotion coverage once ordered indexes can be accepted planner paths.",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "unsafe-partial-predicate-mismatch",
+      "relational_slices_section": "Planner trust and derived access paths",
+      "proof_family": "unsafe_negative",
+      "required_rule": "Partial secondary indexes may be used only when query predicates imply the partial-index predicate.",
+      "unsafe_negative": "A predicate on the indexed column alone must not use the partial index because it would omit non-matching rows.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows query only uses partial secondary index when predicates imply it",
+      "coverage_contract": "Proves email-only queries return active and inactive rows, while email plus status can use the partial path.",
+      "missing_or_next_evidence": "Add volatility/type-coercion negatives before expression pushdown becomes planner-driven.",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

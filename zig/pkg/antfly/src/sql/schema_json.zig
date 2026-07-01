@@ -53,7 +53,7 @@ pub fn schemaJsonFromCreateTablePlanAlloc(
 pub fn validateDdlAppliedSchemaJsonAlloc(alloc: std.mem.Allocator, schema_json: []const u8) !void {
     const runtime = try runtimeSchemaFromSchemaJsonAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, runtime);
-    if (runtime.storage_mode != .relational) return error.InvalidSqlCatalog;
+    if (runtime.storage_mode != .relational and runtime.storage_mode != .document) return error.InvalidSqlCatalog;
 }
 
 pub fn schemaJsonFromTableClonePlanAlloc(
@@ -73,6 +73,12 @@ pub fn schemaJsonFromTableClonePlanAlloc(
 }
 
 pub fn schemaJsonValueFromCreateTablePlanAlloc(alloc: std.mem.Allocator, plan: ddl_plan.CreateTablePlan) !std.json.Value {
+    if (plan.storage_mode == .document) {
+        const schema_json = try ddl_plan.documentSchemaJsonFromCreateTablePlanAlloc(alloc, plan);
+        defer alloc.free(schema_json);
+        return try std.json.parseFromSliceLeaky(std.json.Value, alloc, schema_json, .{ .allocate = .alloc_always });
+    }
+
     var properties = std.json.ObjectMap.empty;
     for (plan.columns) |column| {
         try properties.put(alloc, try alloc.dupe(u8, column.name), try schemaJsonPropertyFromColumnAlloc(alloc, column));

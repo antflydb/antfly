@@ -1,0 +1,38 @@
+{
+  "inventory_format": 1,
+  "entries": [
+    {
+      "id": "adapter-boundary-string-path-deletion",
+      "relational_slices_section": "Shared scalar expression AST completion",
+      "surface": "adapter_boundary_string_path_deletion",
+      "status": "partial_release_gated",
+      "current_evidence": "Expression-AST inventory enumerates promoted surfaces with owner, target typed node, and deletion evidence required before each string-shaped compatibility path can disappear.",
+      "missing_evidence": "Each remaining expression case still needs one typed expression AST node, one binder path at the adapter boundary, and same-change deletion or fail-closed behavior for its string-shaped compatibility path.",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/relational_expression_ast_inventory.json",
+      "evidence_symbol": "relational_expression_ast_inventory",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "optimizer-expression-pushdown",
+      "relational_slices_section": "Shared scalar expression AST completion",
+      "surface": "optimizer_expression_pushdown",
+      "status": "partial_release_gated",
+      "current_evidence": "Expression partial-predicate implication already honors source-column collation and fail-closed semantic implication rows track unsafe predicate and stale-artifact cases.",
+      "missing_evidence": "Expression pushdown still needs to be an optimizer decision over typed expression properties, with negative tests for unsafe collation, null, volatility, and type-coercion cases instead of parser spelling.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows expression partial predicate implication honors source column collation",
+      "release_gate": "relational-release-gate"
+    },
+    {
+      "id": "rest-sdk-expression-exposure",
+      "relational_slices_section": "Shared scalar expression AST completion",
+      "surface": "rest_sdk_expression_exposure",
+      "status": "partial_release_gated",
+      "current_evidence": "Typed row query execution projects generic expression outputs, and baseline coverage includes typed casts across REST/SDK-style row plans and SQL lowering.",
+      "missing_evidence": "Every promoted typed expression node still needs REST/SDK row-plan exposure proving SQL and non-SQL callers execute the same expression contract.",
+      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
+      "evidence_symbol": "relational rows query projects typed expression outputs",
+      "release_gate": "relational-release-gate"
+    }
+  ]
+}

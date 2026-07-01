@@ -1149,14 +1149,19 @@ test "table provisioner fingerprint changes with hosted index metadata" {
 }
 
 test "table provisioner materializes metadata indexes into hosted group dbs" {
-    const path = "/tmp/antfly-metadata-table-provisioner";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const summary = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2001 },
@@ -1177,9 +1182,9 @@ test "table provisioner materializes metadata indexes into hosted group dbs" {
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
     try std.testing.expectEqual(@as(usize, 0), summary.indexes_removed);
 
-    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
-    defer std.testing.allocator.free(db_path);
-    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.textIndex("full_text_index_v0") != null);
 }
@@ -1279,15 +1284,20 @@ fn groupDbHasAlgebraicDocFactScalarKeyContaining(alloc: std.mem.Allocator, db_pa
 }
 
 test "table provisioner reconciliation is non-mutating for query read-only dbs" {
-    const path = "/tmp/antfly-metadata-table-provisioner-readonly-reconcile";
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-readonly-reconcile", .{tmp.sub_path});
+    defer alloc.free(path);
     const indexes_json = "{\"full_text_index_v0\":{\"type\":\"full_text\"}}";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     {
-        var writer = try db_mod.DB.open(std.testing.allocator, path, .{
+        var writer = try db_mod.DB.open(alloc, path, .{
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
@@ -1295,14 +1305,14 @@ test "table provisioner reconciliation is non-mutating for query read-only dbs" 
     }
 
     {
-        var reader = try db_mod.DB.open(std.testing.allocator, path, .{
+        var reader = try db_mod.DB.open(alloc, path, .{
             .open_mode = .query_readonly,
             .start_index_workers = false,
             .ttl_cleanup = .{ .enabled = false },
         });
         defer reader.close();
 
-        const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &reader, indexes_json, .{});
+        const summary = try reconcileDbIndexesWithOptions(alloc, &reader, indexes_json, .{});
         try std.testing.expect(!summary.indexManagerCatalogChanged());
         try std.testing.expect(reader.core.textIndex("full_text_index_v0") == null);
         try std.testing.expectError(error.ReadOnly, reader.addIndex(.{
@@ -1313,25 +1323,30 @@ test "table provisioner reconciliation is non-mutating for query read-only dbs" 
         try std.testing.expect(reader.core.textIndex("full_text_index_v0") == null);
     }
 
-    var writer = try db_mod.DB.open(std.testing.allocator, path, .{
+    var writer = try db_mod.DB.open(alloc, path, .{
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
     });
     defer writer.close();
-    const summary = try reconcileDbIndexesWithOptions(std.testing.allocator, &writer, indexes_json, .{});
+    const summary = try reconcileDbIndexesWithOptions(alloc, &writer, indexes_json, .{});
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
     try std.testing.expect(writer.core.textIndex("full_text_index_v0") != null);
 }
 
 test "table provisioner reconciles stored algebraic metadata without public type" {
-    const path = "/tmp/antfly-metadata-table-provisioner-algebraic-existing";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-algebraic-existing", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
-    defer std.testing.allocator.free(db_path);
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
     const config_json =
@@ -1343,14 +1358,14 @@ test "table provisioner reconciles stored algebraic metadata without public type
         \\  "materializations": []
         \\}
     ;
-    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    var db = try db_mod.DB.open(alloc, db_path, .{});
     defer db.close();
     try db.addIndex(.{ .name = "alg", .kind = .algebraic, .config_json = config_json });
 
     const indexes_json =
         \\{"alg":{"version":1,"table":"docs","schema_version":1,"group_fields":[{"name":"product","path":"product","type":"string"}],"materializations":[]}}
     ;
-    const summary = try ensureIndexes(std.testing.allocator, &db, indexes_json);
+    const summary = try ensureIndexes(alloc, &db, indexes_json);
     try std.testing.expectEqual(@as(usize, 0), summary.added);
     try std.testing.expectEqual(@as(usize, 0), summary.removed);
     try std.testing.expect(db.core.index_manager.algebraicIndex("alg") != null);
@@ -1388,14 +1403,19 @@ test "table provisioner recognizes legacy stored algebraic metadata" {
 }
 
 test "table provisioner registers top-level enrichments without creating enrichment index" {
-    const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-enrichments-top-level", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     const summary = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2001 },
@@ -1415,15 +1435,15 @@ test "table provisioner registers top-level enrichments without creating enrichm
     try std.testing.expectEqual(@as(usize, 1), summary.indexes_added);
     try std.testing.expectEqual(@as(usize, 1), summary.enrichments_added);
 
-    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
-    defer std.testing.allocator.free(db_path);
-    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
+    var db = try db_mod.DB.open(alloc, db_path, .{});
     defer db.close();
     try std.testing.expect(db.core.index_manager.has("full_text_index_v0"));
     try std.testing.expect(!db.core.index_manager.has("enrichments"));
 
-    const enrichments = try db.listEnrichments(std.testing.allocator);
-    defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
+    const enrichments = try db.listEnrichments(alloc);
+    defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
     try std.testing.expectEqual(@as(usize, 1), enrichments.len);
     try std.testing.expectEqualStrings("memory_embed", enrichments[0].name);
     try std.testing.expectEqual(db_mod.types.EnrichmentKind.embedding, enrichments[0].kind);
@@ -1431,8 +1451,13 @@ test "table provisioner registers top-level enrichments without creating enrichm
 }
 
 test "table provisioner registers a resolver declared in the table index config" {
-    const path = "/tmp/antfly-metadata-table-provisioner-resolver";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-resolver", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1453,7 +1478,7 @@ test "table provisioner registers a resolver declared in the table index config"
     ;
 
     const summary = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2001 },
@@ -1476,26 +1501,26 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 1), summary.resolvers_added);
     try std.testing.expectEqual(@as(usize, 0), summary.resolvers_updated);
 
-    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2001);
-    defer std.testing.allocator.free(db_path);
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2001);
+    defer alloc.free(db_path);
     {
-        var db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+        var db = try db_mod.DB.open(alloc, db_path, .{});
         defer db.close();
 
         try std.testing.expect(db.core.index_manager.has("relations_graph"));
         try std.testing.expect(!db.core.index_manager.has("resolvers"));
 
-        const enrichments = try db.listEnrichments(std.testing.allocator);
-        defer db_mod.types.freeEnrichmentConfigs(std.testing.allocator, enrichments);
+        const enrichments = try db.listEnrichments(alloc);
+        defer db_mod.types.freeEnrichmentConfigs(alloc, enrichments);
         try std.testing.expectEqual(@as(usize, 1), enrichments.len);
         try std.testing.expectEqualStrings("relations_v1", enrichments[0].name);
         try std.testing.expectEqual(db_mod.types.EnrichmentKind.asset, enrichments[0].kind);
         try std.testing.expectEqualStrings("relations", enrichments[0].field);
 
-        const resolvers = try db.listResolvers(std.testing.allocator);
+        const resolvers = try db.listResolvers(alloc);
         defer {
-            for (resolvers) |*cfg| cfg.deinit(std.testing.allocator);
-            std.testing.allocator.free(resolvers);
+            for (resolvers) |*cfg| cfg.deinit(alloc);
+            alloc.free(resolvers);
         }
         try std.testing.expectEqual(@as(usize, 1), resolvers.len);
         try std.testing.expectEqualStrings("kg", resolvers[0].name);
@@ -1518,7 +1543,7 @@ test "table provisioner registers a resolver declared in the table index config"
     ;
 
     const bumped_summary = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2001 },
@@ -1539,12 +1564,12 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 1), bumped_summary.resolvers_updated);
 
     {
-        var bumped_db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+        var bumped_db = try db_mod.DB.open(alloc, db_path, .{});
         defer bumped_db.close();
-        const bumped_resolvers = try bumped_db.listResolvers(std.testing.allocator);
+        const bumped_resolvers = try bumped_db.listResolvers(alloc);
         defer {
-            for (bumped_resolvers) |*cfg| cfg.deinit(std.testing.allocator);
-            std.testing.allocator.free(bumped_resolvers);
+            for (bumped_resolvers) |*cfg| cfg.deinit(alloc);
+            alloc.free(bumped_resolvers);
         }
         try std.testing.expectEqual(@as(usize, 1), bumped_resolvers.len);
         try std.testing.expectEqualStrings("kg", bumped_resolvers[0].name);
@@ -1561,7 +1586,7 @@ test "table provisioner registers a resolver declared in the table index config"
     ;
 
     const removed_summary = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2001 },
@@ -1582,19 +1607,23 @@ test "table provisioner registers a resolver declared in the table index config"
     try std.testing.expectEqual(@as(usize, 0), removed_summary.resolvers_updated);
     try std.testing.expectEqual(@as(usize, 1), removed_summary.resolvers_removed);
 
-    var removed_db = try db_mod.DB.open(std.testing.allocator, db_path, .{});
+    var removed_db = try db_mod.DB.open(alloc, db_path, .{});
     defer removed_db.close();
-    const removed_resolvers = try removed_db.listResolvers(std.testing.allocator);
+    const removed_resolvers = try removed_db.listResolvers(alloc);
     defer {
-        for (removed_resolvers) |*cfg| cfg.deinit(std.testing.allocator);
-        std.testing.allocator.free(removed_resolvers);
+        for (removed_resolvers) |*cfg| cfg.deinit(alloc);
+        alloc.free(removed_resolvers);
     }
     try std.testing.expectEqual(@as(usize, 0), removed_resolvers.len);
 }
 
 test "table provisioner registers explicit document enrichments from index config" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-enrichments";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-enrichments-explicit", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1645,7 +1674,11 @@ test "table provisioner registers explicit document enrichments from index confi
 
 test "table provisioner rejects conflicting inline enrichment definitions" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichments";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-conflicting-enrichments", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1681,7 +1714,11 @@ test "table provisioner rejects conflicting inline enrichment definitions" {
 
 test "table provisioner rejects conflicting enrichment kinds under the same artifact name" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-conflicting-enrichment-kinds";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-conflicting-enrichment-kinds", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1716,7 +1753,11 @@ test "table provisioner rejects conflicting enrichment kinds under the same arti
 
 test "table provisioner updates changed enrichment config under the same name" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-changed-enrichment";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-changed-enrichment", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1789,7 +1830,11 @@ test "table provisioner updates changed enrichment config under the same name" {
 
 test "table provisioner replaces enrichment kind under the same artifact name" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-replace-enrichment-kind";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-replace-enrichment-kind", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1863,7 +1908,11 @@ test "table provisioner replaces enrichment kind under the same artifact name" {
 
 test "table provisioner applies artifact enrichments in dependency order" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-enrichment-dependency-order";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-enrichment-dependency-order", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1923,7 +1972,11 @@ test "table provisioner compares full text index configs semantically" {
 
 test "table provisioner treats duplicate identical inline enrichments as one desired artifact" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-shared-enrichment";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-shared-enrichment", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -1973,7 +2026,11 @@ test "table provisioner treats duplicate identical inline enrichments as one des
 
 test "table provisioner updates full text artifact mapping and cleans removed enrichments" {
     const alloc = std.heap.c_allocator;
-    const path = "/tmp/antfly-metadata-table-provisioner-enrichment-remap";
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-enrichment-remap", .{tmp.sub_path});
+    defer alloc.free(path);
     var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
@@ -2392,18 +2449,23 @@ test "table provisioner removes indexes missing from metadata" {
 }
 
 test "table provisioner reconcile does not replay pending derived batches" {
-    const path = "/tmp/antfly-metadata-table-provisioner-no-replay";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-no-replay", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2006);
-    defer std.testing.allocator.free(db_path);
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2006);
+    defer alloc.free(db_path);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
 
     {
-        var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
+        var db = try db_mod.DB.open(alloc, db_path, .{
             .start_index_workers = false,
         });
         defer db.close();
@@ -2412,42 +2474,42 @@ test "table provisioner reconcile does not replay pending derived batches" {
             .kind = .dense_vector,
             .config_json = "{\"field\":\"embedding\",\"dims\":2}",
         });
-        const stored_key = try db_mod.internal_keys.documentKeyAlloc(std.testing.allocator, "doc:a");
-        defer std.testing.allocator.free(stored_key);
+        const stored_key = try db_mod.internal_keys.documentKeyAlloc(alloc, "doc:a");
+        defer alloc.free(stored_key);
         try db.core.store.putBatch(&.{
             .{ .key = stored_key, .value = "{\"title\":\"alpha\"}" },
         }, &.{});
 
-        const artifact_key = try db_mod.internal_keys.embeddingArtifactKeyForDocumentAlloc(std.testing.allocator, "doc:a", "embed_idx");
-        defer std.testing.allocator.free(artifact_key);
-        const payload = try db_mod.enrichment_artifact_codec.encodeDenseEmbeddingAlloc(std.testing.allocator, null, &[_]f32{ 1, 0 });
-        defer std.testing.allocator.free(payload);
+        const artifact_key = try db_mod.internal_keys.embeddingArtifactKeyForDocumentAlloc(alloc, "doc:a", "embed_idx");
+        defer alloc.free(artifact_key);
+        const payload = try db_mod.enrichment_artifact_codec.encodeDenseEmbeddingAlloc(alloc, null, &[_]f32{ 1, 0 });
+        defer alloc.free(payload);
         try db.core.store.putBatch(&.{
             .{ .key = artifact_key, .value = payload },
         }, &.{});
 
-        var dense_embeddings = try std.testing.allocator.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
+        var dense_embeddings = try alloc.alloc(db_mod.derived_types.DerivedDenseEmbeddingWrite, 1);
         var batch = db_mod.derived_types.DerivedBatch{
             .dense_embeddings = dense_embeddings,
         };
-        defer db_mod.derived_types.deinitDerivedBatch(std.testing.allocator, &batch);
+        defer db_mod.derived_types.deinitDerivedBatch(alloc, &batch);
         dense_embeddings[0] = .{
-            .index_name = try std.testing.allocator.dupe(u8, "embed_idx"),
-            .doc_key = try std.testing.allocator.dupe(u8, "doc:a"),
-            .artifact_key = try std.testing.allocator.dupe(u8, artifact_key),
-            .vector = try std.testing.allocator.dupe(f32, &[_]f32{ 1, 0 }),
+            .index_name = try alloc.dupe(u8, "embed_idx"),
+            .doc_key = try alloc.dupe(u8, "doc:a"),
+            .artifact_key = try alloc.dupe(u8, artifact_key),
+            .vector = try alloc.dupe(f32, &[_]f32{ 1, 0 }),
         };
 
         const sequence = db.core.store.nextReplaySequence(1);
-        var record = try change_journal_mod.recordFromDerivedBatch(std.testing.allocator, batch, sequence);
-        defer change_journal_mod.deinitRecord(std.testing.allocator, &record);
-        const encoded = try change_journal_mod.encodeRecord(std.testing.allocator, record);
-        defer std.testing.allocator.free(encoded);
-        try db.core.store.appendReplayOpaque(std.testing.allocator, sequence, encoded);
+        var record = try change_journal_mod.recordFromDerivedBatch(alloc, batch, sequence);
+        defer change_journal_mod.deinitRecord(alloc, &record);
+        const encoded = try change_journal_mod.encodeRecord(alloc, record);
+        defer alloc.free(encoded);
+        try db.core.store.appendReplayOpaque(alloc, sequence, encoded);
     }
 
     const summary = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2006 },
@@ -2467,15 +2529,15 @@ test "table provisioner reconcile does not replay pending derived batches" {
     try std.testing.expectEqual(@as(usize, 1), summary.dbs_opened);
 
     {
-        var reopened_without_replay = try db_mod.DB.open(std.testing.allocator, db_path, .{
+        var reopened_without_replay = try db_mod.DB.open(alloc, db_path, .{
             .open_mode = .query_readonly,
             .start_index_workers = false,
         });
         defer reopened_without_replay.close();
-        const skipped_applied = try reopened_without_replay.core.loadAppliedSequence(std.testing.allocator, "embed_idx");
+        const skipped_applied = try reopened_without_replay.core.loadAppliedSequence(alloc, "embed_idx");
         try std.testing.expectEqual(@as(u64, 0), skipped_applied);
 
-        var skipped_result = try reopened_without_replay.search(std.testing.allocator, .{
+        var skipped_result = try reopened_without_replay.search(alloc, .{
             .index_name = "embed_idx",
             .dense = .{
                 .vector = &[_]f32{ 1, 0 },
@@ -2487,23 +2549,28 @@ test "table provisioner reconcile does not replay pending derived batches" {
         try std.testing.expectEqual(@as(u32, 0), skipped_result.total_hits);
     }
 
-    var reopened = try db_mod.DB.open(std.testing.allocator, db_path, .{
+    var reopened = try db_mod.DB.open(alloc, db_path, .{
         .start_index_workers = false,
     });
     defer reopened.close();
-    const applied = try reopened.core.loadAppliedSequence(std.testing.allocator, "embed_idx");
+    const applied = try reopened.core.loadAppliedSequence(alloc, "embed_idx");
     try std.testing.expect(applied > 0);
 }
 
 test "table provisioner reports local schema progress once all local shards have the target full-text index" {
-    const path = "/tmp/antfly-metadata-table-provisioner-progress";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-progress", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
     _ = try reconcileReplicaRoot(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         &.{ 100, 2003 },
@@ -2523,7 +2590,7 @@ test "table provisioner reports local schema progress once all local shards have
     );
 
     const progress = try collectLocalSchemaProgress(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         7,
@@ -2542,7 +2609,7 @@ test "table provisioner reports local schema progress once all local shards have
             .end_key = "doc:z",
         }},
     );
-    defer std.testing.allocator.free(progress);
+    defer alloc.free(progress);
 
     try std.testing.expectEqual(@as(usize, 1), progress.len);
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
@@ -2551,16 +2618,21 @@ test "table provisioner reports local schema progress once all local shards have
 }
 
 test "table provisioner schema progress probes do not take a writer lease" {
-    const path = "/tmp/antfly-metadata-table-provisioner-progress-live-writer";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-progress-live-writer", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-    const db_path = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2004);
-    defer std.testing.allocator.free(db_path);
+    const db_path = try groupDbPathFromReplicaRoot(alloc, path, 2004);
+    defer alloc.free(db_path);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path);
-    var db = try db_mod.DB.open(std.testing.allocator, db_path, .{
+    var db = try db_mod.DB.open(alloc, db_path, .{
         .primary_backend = .{ .lsm = .{ .flush_threshold = 1 } },
         .start_index_workers = false,
         .ttl_cleanup = .{ .enabled = false },
@@ -2570,7 +2642,7 @@ test "table provisioner schema progress probes do not take a writer lease" {
     try db.addIndex(.{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" });
 
     const progress = try collectLocalSchemaProgress(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         7,
@@ -2589,36 +2661,41 @@ test "table provisioner schema progress probes do not take a writer lease" {
             .end_key = "doc:z",
         }},
     );
-    defer std.testing.allocator.free(progress);
+    defer alloc.free(progress);
 
     try std.testing.expectEqual(@as(usize, 1), progress.len);
     try std.testing.expectEqual(@as(u64, 9), progress[0].table_id);
 }
 
 test "table provisioner withholds schema progress when any local shard is missing the target full-text index" {
-    const path = "/tmp/antfly-metadata-table-provisioner-progress-incomplete";
-    var io_impl = std.Io.Threaded.init(std.testing.allocator, .{});
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/metadata-table-provisioner-progress-incomplete", .{tmp.sub_path});
+    defer alloc.free(path);
+    var io_impl = std.Io.Threaded.init(alloc, .{});
     defer io_impl.deinit();
     std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
     defer std.Io.Dir.cwd().deleteTree(io_impl.io(), path) catch {};
 
-    const db_path_a = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2004);
-    defer std.testing.allocator.free(db_path_a);
+    const db_path_a = try groupDbPathFromReplicaRoot(alloc, path, 2004);
+    defer alloc.free(db_path_a);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path_a);
-    var db_a = try db_mod.DB.open(std.testing.allocator, db_path_a, .{});
+    var db_a = try db_mod.DB.open(alloc, db_path_a, .{});
     defer db_a.close();
     try db_a.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
     try db_a.addIndex(.{ .name = "full_text_index_v1", .kind = .full_text, .config_json = "{}" });
 
-    const db_path_b = try groupDbPathFromReplicaRoot(std.testing.allocator, path, 2005);
-    defer std.testing.allocator.free(db_path_b);
+    const db_path_b = try groupDbPathFromReplicaRoot(alloc, path, 2005);
+    defer alloc.free(db_path_b);
     try fs_paths.createDirPathPortable(io_impl.io(), db_path_b);
-    var db_b = try db_mod.DB.open(std.testing.allocator, db_path_b, .{});
+    var db_b = try db_mod.DB.open(alloc, db_path_b, .{});
     defer db_b.close();
     try db_b.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
 
     const progress = try collectLocalSchemaProgress(
-        std.testing.allocator,
+        alloc,
         path,
         100,
         7,
@@ -2645,7 +2722,7 @@ test "table provisioner withholds schema progress when any local shard is missin
             },
         },
     );
-    defer std.testing.allocator.free(progress);
+    defer alloc.free(progress);
 
     try std.testing.expectEqual(@as(usize, 0), progress.len);
 }

@@ -16,9 +16,11 @@ const std = @import("std");
 
 const ddl_plan = @import("ddl_plan.zig");
 const expr_type = @import("expr/type.zig");
+const expr_projection = @import("expr/projection.zig");
 const generated_parser = @import("generated_parser.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
+const expr_row_parse = @import("expr/row_parse.zig");
 const plan = @import("plan.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -37,7 +39,7 @@ pub const ParserState = struct {
     schema: runtime_schema.TableSchema = .{},
     joined_source_schema: ?runtime_schema.TableSchema = null,
     params: []const value_mod.SqlValue = &.{},
-    function_bindings: lower_expr.SqlFunctionBindings = .{},
+    function_bindings: expr_row_parse.SqlFunctionBindings = .{},
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
     default_context: relational_rows.DefaultValueContext = .{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
@@ -361,14 +363,14 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn rowExpressionParserHooks(ptr: *ParserType) lower_expr.RowExpressionParserHooks {
+        pub fn rowExpressionParserHooks(ptr: *ParserType) expr_row_parse.RowExpressionParserHooks {
             return .{
                 .ptr = ptr,
                 .parse_operand = Accessors.parseRowExpressionOperandHook,
             };
         }
 
-        pub fn variadicRowExpressionParserHooks(ptr: *ParserType) lower_expr.VariadicRowExpressionParserHooks {
+        pub fn variadicRowExpressionParserHooks(ptr: *ParserType) expr_row_parse.VariadicRowExpressionParserHooks {
             return .{
                 .ptr = ptr,
                 .parse_expression = Accessors.parseFixedUnaryRowExpressionOperandHook,
@@ -376,7 +378,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn arithmeticExpressionParserHooks(ptr: *ParserType) lower_expr.ArithmeticExpressionParserHooks {
+        pub fn arithmeticExpressionParserHooks(ptr: *ParserType) expr_row_parse.ArithmeticExpressionParserHooks {
             return .{
                 .ptr = ptr,
                 .parse_operand = Accessors.parseRowExpressionOperandHook,
@@ -384,22 +386,14 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn booleanExpressionParserHooks(ptr: *ParserType) lower_expr.BooleanExpressionParserHooks {
+        pub fn booleanExpressionParserHooks(ptr: *ParserType) expr_row_parse.BooleanExpressionParserHooks {
             return .{
                 .ptr = ptr,
                 .parse_operand = Accessors.parseRowExpressionOperandHook,
             };
         }
 
-        pub fn booleanRowExpressionParserHooks(ptr: *ParserType) lower_expr.BooleanRowExpressionParserHooks {
-            return .{
-                .ptr = ptr,
-                .parse_expression = Accessors.parseFixedUnaryRowExpressionOperandHook,
-                .parse_operand = Accessors.parseRowExpressionOperandHook,
-            };
-        }
-
-        pub fn caseExpressionParserHooks(ptr: *ParserType) lower_expr.CaseExpressionParserHooks {
+        pub fn booleanRowExpressionParserHooks(ptr: *ParserType) expr_row_parse.BooleanRowExpressionParserHooks {
             return .{
                 .ptr = ptr,
                 .parse_expression = Accessors.parseFixedUnaryRowExpressionOperandHook,
@@ -407,7 +401,15 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn extensionFunctionRowExpressionParserOptions(ptr: *ParserType) lower_expr.ExtensionFunctionRowExpressionParserOptions {
+        pub fn caseExpressionParserHooks(ptr: *ParserType) expr_row_parse.CaseExpressionParserHooks {
+            return .{
+                .ptr = ptr,
+                .parse_expression = Accessors.parseFixedUnaryRowExpressionOperandHook,
+                .parse_operand = Accessors.parseRowExpressionOperandHook,
+            };
+        }
+
+        pub fn extensionFunctionRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.ExtensionFunctionRowExpressionParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -416,21 +418,21 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn routineExpressionRowExpressionParserOptions(ptr: *ParserType) lower_expr.RoutineExpressionRowExpressionParserOptions {
+        pub fn routineExpressionRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.RoutineExpressionRowExpressionParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .boolean_hooks = Accessors.booleanRowExpressionParserHooks(ptr),
             };
         }
 
-        pub fn parenthesizedRowExpressionParserOptions(ptr: *ParserType) lower_expr.ParenthesizedRowExpressionParserOptions {
+        pub fn parenthesizedRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.ParenthesizedRowExpressionParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .boolean_hooks = Accessors.booleanRowExpressionParserHooks(ptr),
             };
         }
 
-        pub fn castRowExpressionParserOptions(ptr: *ParserType) lower_expr.CastRowExpressionParserOptions {
+        pub fn castRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.CastRowExpressionParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -439,7 +441,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn coalesceRowExpressionParserOptions(ptr: *ParserType) lower_expr.CoalesceRowExpressionParserOptions {
+        pub fn coalesceRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.CoalesceRowExpressionParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -448,7 +450,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn expressionProjectionParserOptions(ptr: *ParserType) lower_expr.ExpressionProjectionParserOptions {
+        pub fn expressionProjectionParserOptions(ptr: *ParserType) expr_projection.ExpressionProjectionParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -458,7 +460,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn fixedUnaryRowExpressionParserOptions(ptr: *ParserType) lower_expr.FixedUnaryRowExpressionParserOptions {
+        pub fn fixedUnaryRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.FixedUnaryRowExpressionParserOptions {
             return .{
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -466,7 +468,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn fixedBinaryRowExpressionParserOptions(ptr: *ParserType) lower_expr.FixedBinaryRowExpressionParserOptions {
+        pub fn fixedBinaryRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.FixedBinaryRowExpressionParserOptions {
             return .{
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -474,7 +476,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn caseFoldRowExpressionParserOptions(ptr: *ParserType) lower_expr.CaseFoldRowExpressionParserOptions {
+        pub fn caseFoldRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.CaseFoldRowExpressionParserOptions {
             return .{
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -482,7 +484,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn jsonBuildObjectRowExpressionParserOptions(ptr: *ParserType) lower_expr.JsonBuildObjectRowExpressionParserOptions {
+        pub fn jsonBuildObjectRowExpressionParserOptions(ptr: *ParserType) expr_row_parse.JsonBuildObjectRowExpressionParserOptions {
             return .{
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -631,7 +633,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn jsonValueExpressionProjectionParserOptions(ptr: *ParserType) lower_expr.JsonValueExpressionProjectionParserOptions {
+        pub fn jsonValueExpressionProjectionParserOptions(ptr: *ParserType) expr_projection.JsonValueExpressionProjectionParserOptions {
             return .{
                 .params = ptr.params,
             };
@@ -1503,7 +1505,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             lowered: plan.LoweredSelect,
         ) anyerror![]runtime_schema.RelationalColumn {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try lower_expr.loweredSelectOutputColumnsAlloc(self.alloc, Accessors.rowExpressionTypeContext(self), lowered);
+            return try expr_projection.loweredSelectOutputColumnsAlloc(self.alloc, Accessors.rowExpressionTypeContext(self), lowered);
         }
 
         pub fn parseRecursiveCteMemberHook(
