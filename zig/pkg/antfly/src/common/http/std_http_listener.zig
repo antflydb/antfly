@@ -323,7 +323,7 @@ pub const StdHttpListener = struct {
                 metadata_leader_forwarded = metadata_leader_forwarded or blk: {
                     const token = self.cfg.internal_request_metadata_token orelse break :blk false;
                     const value = std.mem.trim(u8, header.value, " \t\r\n");
-                    break :blk token.len > 0 and std.mem.eql(u8, value, token);
+                    break :blk token.len > 0 and timingSafeEql(token, value);
                 };
                 continue;
             }
@@ -611,6 +611,15 @@ test "std http listener and executor round-trip raft batch route" {
         .content_type = frame.media_type,
     });
     try std.testing.expectEqual(@as(usize, 1), handler.seen);
+}
+
+fn timingSafeEql(expected: []const u8, provided: []const u8) bool {
+    if (expected.len != provided.len) return false;
+    var diff: u8 = 0;
+    for (expected, provided) |expected_byte, provided_byte| {
+        diff |= expected_byte ^ provided_byte;
+    }
+    return diff == 0;
 }
 
 test "std http executor enforces request timeout while waiting for response" {

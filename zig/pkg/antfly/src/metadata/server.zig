@@ -76,10 +76,15 @@ pub const MetadataServer = struct {
         cfg: MetadataServerConfig,
         deps: MetadataServerDeps,
     ) !MetadataServer {
-        const internal_metadata_forward_token = try generateInternalMetadataForwardToken(alloc);
-        defer alloc.free(internal_metadata_forward_token);
         var service_cfg = cfg.service;
-        service_cfg.internal_metadata_forward_token = internal_metadata_forward_token;
+        var generated_internal_metadata_forward_token: ?[]u8 = null;
+        defer if (generated_internal_metadata_forward_token) |token| alloc.free(token);
+        if (service_cfg.internal_metadata_forward_token == null or
+            std.mem.trim(u8, service_cfg.internal_metadata_forward_token.?, " \t\r\n").len == 0)
+        {
+            generated_internal_metadata_forward_token = try generateInternalMetadataForwardToken(alloc);
+            service_cfg.internal_metadata_forward_token = generated_internal_metadata_forward_token.?;
+        }
 
         const svc = try alloc.create(service.MetadataHttpService);
         errdefer alloc.destroy(svc);
@@ -830,6 +835,9 @@ test "metadata server wires hosted shard adapters by default" {
                 },
             },
         },
+        .service = .{
+            .internal_metadata_forward_token = "configured-forward-token",
+        },
     }, .{
         .http = .{
             .http = .{
@@ -847,6 +855,7 @@ test "metadata server wires hosted shard adapters by default" {
     try std.testing.expect(server.owned_hosted_shard_db != null);
     try std.testing.expect(server.svc.routed_shard_db_adapter != null);
     try std.testing.expect(server.svc.raft.transition_svc != null);
+    try std.testing.expectEqualStrings("configured-forward-token", server.svc.internal_metadata_forward_token.?);
 }
 
 test "metadata server can expose admin listener endpoints" {

@@ -2917,6 +2917,110 @@ test "metadata http server maps already-forwarded not leader to retryable respon
     try std.testing.expect(has_retry_after);
 }
 
+test "metadata http server honors shared forwarded marker over std http" {
+    const std_http_executor = @import("../raft/transport/std_http_executor.zig");
+    const std_http_listener = @import("../raft/transport/std_http_listener.zig");
+    const shared_token = "shared-metadata-forward-token";
+
+    const FakeSource = struct {
+        forward_count: usize = 0,
+        reallocate_count: usize = 0,
+
+        fn iface(self: *@This()) AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                    .forward_metadata_request = forwardMetadataRequest,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_api.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn triggerReallocate(ptr: *anyopaque) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.reallocate_count += 1;
+            return error.NotLeader;
+        }
+
+        fn forwardMetadataRequest(ptr: *anyopaque, alloc: std.mem.Allocator, _: http_common.HttpRequest) !?http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.forward_count += 1;
+            return try textResponse(alloc, 202, "forwarded");
+        }
+    };
+
+    var source = FakeSource{};
+    var server = MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{
+        .internal_request_metadata_token = shared_token,
+    }, server.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+    const uri = try std.fmt.allocPrint(std.testing.allocator, "{s}{s}", .{ base_uri, routes.Routes.internal_reallocate });
+    defer std.testing.allocator.free(uri);
+
+    var executor: std_http_executor.StdHttpExecutor = undefined;
+    executor.initInPlace(std.testing.allocator, .{});
+    defer executor.deinit();
+
+    const mismatched_headers = [_]http_common.RequestHeader{.{
+        .name = http_common.metadata_leader_forwarded_header,
+        .value = "wrong-token",
+    }};
+    var mismatched = try executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = uri,
+        .headers = mismatched_headers[0..],
+    });
+    defer mismatched.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 202), mismatched.status);
+    try std.testing.expectEqual(@as(usize, 1), source.forward_count);
+    try std.testing.expectEqual(@as(usize, 0), source.reallocate_count);
+
+    const shared_headers = [_]http_common.RequestHeader{.{
+        .name = http_common.metadata_leader_forwarded_header,
+        .value = shared_token,
+    }};
+    var shared = try executor.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = uri,
+        .headers = shared_headers[0..],
+    });
+    defer shared.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), shared.status);
+    try std.testing.expectEqual(@as(usize, 1), source.forward_count);
+    try std.testing.expectEqual(@as(usize, 1), source.reallocate_count);
+    try std.testing.expect(std.mem.indexOf(u8, shared.body, "metadata leader unavailable") != null);
+}
+
 test "metadata http server serves status and filtered admin routes" {
     const FakeSource = struct {
         fn iface(_: *@This()) AdminSource {

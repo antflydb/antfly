@@ -60,12 +60,14 @@ pub const Config = struct {
 
         orchestration_urls: []NodeUrl = &.{},
         raft_urls: []NodeUrl = &.{},
+        forwarding_token: ?[]u8 = null,
 
         fn deinit(self: *MetadataConfig, alloc: std.mem.Allocator) void {
             for (self.orchestration_urls) |entry| alloc.free(entry.url);
             if (self.orchestration_urls.len > 0) alloc.free(self.orchestration_urls);
             for (self.raft_urls) |entry| alloc.free(entry.url);
             if (self.raft_urls.len > 0) alloc.free(self.raft_urls);
+            if (self.forwarding_token) |value| alloc.free(value);
             self.* = undefined;
         }
     };
@@ -536,6 +538,7 @@ fn parseMetadataConfig(
     return .{
         .orchestration_urls = orchestration_urls,
         .raft_urls = raft_urls,
+        .forwarding_token = try optionalObjectStringFieldDup(alloc, root, "metadata", "forwarding_token"),
     };
 }
 
@@ -1130,7 +1133,8 @@ test "common config parses provider maps" {
         \\  "metadata": {
         \\    "orchestration_urls": {
         \\      "1": "http://127.0.0.1:7001"
-        \\    }
+        \\    },
+        \\    "forwarding_token": "shared-forwarding-token"
         \\  },
         \\  "enable_auth": true,
         \\  "storage": {
@@ -1171,6 +1175,7 @@ test "common config parses provider maps" {
     try std.testing.expectEqual(@as(usize, 1), cfg.metadata.orchestration_urls.len);
     try std.testing.expectEqual(@as(u64, 1), cfg.metadata.orchestration_urls[0].node_id);
     try std.testing.expectEqualStrings("http://127.0.0.1:7001", cfg.metadata.orchestration_urls[0].url);
+    try std.testing.expectEqualStrings("shared-forwarding-token", cfg.metadata.forwarding_token.?);
     try std.testing.expect(cfg.auth_enabled);
     try std.testing.expectEqualStrings("antflydb", cfg.storage.local_base_dir.?);
     try std.testing.expectEqualStrings("primary", cfg.registry.defaultGeneratorName().?);
