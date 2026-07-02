@@ -16,8 +16,8 @@ const std = @import("std");
 
 const expr_json_path = @import("expr/json_path.zig");
 const expr_operator = @import("expr/operator.zig");
+const expr_parse = @import("expr/parse.zig");
 const expr_token = @import("expr/token.zig");
-const lower_expr = @import("lower_expr.zig");
 const parser = @import("parser.zig");
 const platform_time = @import("../platform/time.zig");
 const relational_rows = @import("relational_rows.zig");
@@ -27,6 +27,16 @@ const token_mod = @import("token.zig");
 pub const Token = token_mod.Token;
 pub const TokenKind = token_mod.TokenKind;
 const ns_per_day: u64 = 86_400 * std.time.ns_per_s;
+
+pub const PeriodRangeValuePair = struct {
+    start_json: []const u8,
+    end_json: []const u8,
+};
+
+pub fn freePeriodRangeValuePair(alloc: std.mem.Allocator, value: PeriodRangeValuePair) void {
+    alloc.free(value.start_json);
+    alloc.free(value.end_json);
+}
 
 pub const SqlValue = union(enum) {
     null,
@@ -305,7 +315,7 @@ pub fn parseSqlColumnValueAlloc(
         const now_ns = try checkedRealtimeNsU64(realtime_ns);
         return try parseSqlCurrentDateValueJsonAlloc(alloc, tokens, pos, sqlCurrentUtcDateStartNs(now_ns));
     }
-    if (column.field_type == .datetime and lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos.*)) {
+    if (column.field_type == .datetime and expr_parse.peekSqlTypedDatetimeLiteral(tokens, pos.*)) {
         return try parseSqlTypedDatetimeLiteralValueJsonAlloc(alloc, tokens, pos);
     }
     if (expr_token.peekFunctionCallTokenIf(tokens, pos.*, expr_token.sqlTokenIsUuidV4Function)) {
@@ -323,6 +333,9 @@ pub fn parseSqlColumnValueAlloc(
     if (peekToJsonbFunctionCall(tokens, pos.*)) {
         if (column.field_type != .json) return error.InvalidSqlCatalog;
         return try parseToJsonbValueJsonAlloc(alloc, tokens, pos, params);
+    }
+    if (column.field_type == .array and parser.peekKeywordTag(tokens, pos.*, .array)) {
+        return try parseSqlArrayConstructorJsonAlloc(alloc, tokens, pos, params);
     }
     if (parser.matchToken(tokens, pos, .placeholder)) |token| {
         const value = try boundSqlValue(token, params);
@@ -875,7 +888,7 @@ pub fn parseSqlCanonicalRangeLiteralValuePairAlloc(
     literal: []const u8,
     field_type: runtime_schema.AntflyType,
     range_type: ?runtime_schema.RelationalPeriodRangeType,
-) !lower_expr.PeriodRangeValuePair {
+) !PeriodRangeValuePair {
     if (literal.len < 3) return error.UnsupportedSqlShape;
     const upper_bound = literal[literal.len - 1];
     const lower_bound = literal[0];
@@ -1403,7 +1416,7 @@ test "sql adapter value parses timestamp literals" {
     try std.testing.expectEqualStrings("86400000000000", canonical);
 
     const pair = try parseSqlCanonicalRangeLiteralValuePairAlloc(alloc, "(1970-01-01,1970-01-02]", .datetime, .daterange);
-    defer lower_expr.freePeriodRangeValuePair(alloc, pair);
+    defer freePeriodRangeValuePair(alloc, pair);
     try std.testing.expectEqualStrings("86400000000000", pair.start_json);
     try std.testing.expectEqualStrings("172800000000000", pair.end_json);
 }

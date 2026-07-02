@@ -360,6 +360,54 @@ pub const BoundedDocumentScan = struct {
     }
 };
 
+pub fn lowerDocumentMutationProducerFromWhereAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    where_index: usize,
+    end_index: usize,
+    schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+    alias: []const u8,
+    bounded_scan_policy: ?source_binding.BoundedScanPolicy,
+) !DocumentProducer {
+    if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    if (where_index >= end_index or end_index > tokens.len) return error.UnsupportedSqlShape;
+    if (!tokens[where_index].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
+    const source_ref = DocumentSourceRef{
+        .table_name = table_name,
+        .alias = if (std.ascii.eqlIgnoreCase(table_name, alias)) null else alias,
+    };
+    const producer_capabilities = documentProducerCapabilitiesForRuntimeSchema(schema, bounded_scan_policy);
+    return parseWhereProducerAlloc(
+        alloc,
+        tokens,
+        where_index,
+        end_index,
+        schema,
+        .{},
+        source_ref,
+        producer_capabilities,
+        null,
+    ) catch |err| switch (err) {
+        error.DocumentSqlIndexUnavailable => if (bounded_scan_policy) |policy|
+            try parseWhereBoundedScanProducerAlloc(
+                alloc,
+                tokens,
+                where_index,
+                end_index,
+                schema,
+                .{},
+                source_ref,
+                policy,
+                true,
+                null,
+            )
+        else
+            return error.DocumentSqlBoundedScanMissingExactProducer,
+        else => return err,
+    };
+}
+
 pub const DocumentReadPlan = struct {
     table_name: []const u8,
     view_mapping: ?DocumentReadViewMapping = null,
@@ -5935,7 +5983,7 @@ test "document SQL fail closes unsupported residual expression shapes under boun
         var parsed = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed.deinit(alloc);
         try std.testing.expectError(
-            try document_sql_corpus.errorFromName(case.expected_error),
+            document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(case.expected_error)),
             lowerDocumentReadPlanWithBoundedScanPolicyParsedSqlAlloc(alloc, &parsed, schema, .{ .max_rows = 25 }),
         );
     }
@@ -6034,7 +6082,7 @@ test "document SQL read plan corpus cases" {
             try std.testing.expect(case.expected.native_query_contains.len == 0);
             try std.testing.expect(case.expected.residual_filter_contains.len == 0);
             try std.testing.expectError(
-                try document_sql_corpus.errorFromName(expected_error_name),
+                document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(expected_error_name)),
                 lowerDocumentReadPlanForCorpusCaseAlloc(alloc, &parsed, schema, case),
             );
             continue;

@@ -37,6 +37,7 @@ const runtime_schema = @import("../storage/schema.zig");
 const row_claim = @import("row_claim.zig");
 const select_set = @import("select_set.zig");
 const schema_api = @import("../schema/mod.zig");
+const source_binding = @import("source_binding.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
 const token_mod = @import("token.zig");
 const tokenized = @import("tokenized.zig");
@@ -111,6 +112,7 @@ pub const AppParityCorpusPlanFamily = enum {
     update_joined_source,
     delete_joined_source,
     merge_mutation,
+    document_write,
     adapter_noop_ddl,
     invalid_read,
     invalid_insert,
@@ -169,6 +171,9 @@ pub const AppParityDdlTag = enum {
     drop_role,
     grant_privilege,
     revoke_privilege,
+    grant_role,
+    revoke_role,
+    alter_default_privileges,
     copy_from,
     copy_to,
     create_partitioned_table,
@@ -221,6 +226,7 @@ pub const AppParityDdlTag = enum {
     release_savepoint,
     rollback_to_savepoint,
     comment_metadata,
+    security_label,
     table_lock,
     constraint_mode,
     transaction_mode,
@@ -414,8 +420,10 @@ pub const AppParityCorpusEntry = struct {
 };
 
 pub const AppParityParserFixtureSummary = struct {
+    starts_with_alter: bool = false,
     starts_with_create: bool = false,
     starts_with_delete: bool = false,
+    starts_with_drop: bool = false,
     starts_with_merge: bool = false,
     starts_with_truncate: bool = false,
     starts_with_update: bool = false,
@@ -429,6 +437,15 @@ pub const AppParityParserFixtureSummary = struct {
     upper_function: bool = false,
     excluded_identifier_prefix: bool = false,
     jsonb_identifier_prefix: bool = false,
+    antfly_json_patch_function: bool = false,
+    json_patch_set_operation: bool = false,
+    json_patch_remove_operation: bool = false,
+    json_patch_merge_operation: bool = false,
+    json_patch_null_value: bool = false,
+    json_patch_array_value: bool = false,
+    json_patch_invalid_shape: bool = false,
+    json_patch_amount_path: bool = false,
+    json_patch_generated_path: bool = false,
     array_identifier_prefix: bool = false,
     gen_random_uuid_function: bool = false,
     uuid_generate_v4_function: bool = false,
@@ -466,11 +483,14 @@ pub const AppParityParserFixtureSummary = struct {
     tenant_id_identifier: bool = false,
     organization_id_identifier: bool = false,
     plan_identifier: bool = false,
+    metadata_plan_identifier: bool = false,
     score_identifier: bool = false,
     support_view_identifier: bool = false,
     tag_identifier: bool = false,
     tag_list_identifier: bool = false,
     title_identifier: bool = false,
+    title_lc_identifier: bool = false,
+    extra_identifier: bool = false,
     ilike_keyword: bool = false,
     between_keyword: bool = false,
     is_null_predicate: bool = false,
@@ -485,6 +505,7 @@ pub const AppParityParserFixtureSummary = struct {
     source_underscore_id_identifier: bool = false,
     underscore_doc_identifier: bool = false,
     underscore_id_identifier: bool = false,
+    underscore_version_identifier: bool = false,
     payload_identifier: bool = false,
     source_identifier_prefix: bool = false,
     status_string_literal: bool = false,
@@ -588,6 +609,7 @@ pub const AppParityParserFixtureSummary = struct {
     not_keyword: bool = false,
     or_keyword: bool = false,
     set_keyword: bool = false,
+    select_keyword: bool = false,
     returning_keyword: bool = false,
     in_keyword: bool = false,
     where_keyword: bool = false,
@@ -654,6 +676,15 @@ pub const AppParityParserFixtureSummary = struct {
     copy_oids_option: bool = false,
     copy_oids_false_option: bool = false,
     copy_program_endpoint: bool = false,
+    access_method: bool = false,
+    conversion_catalog: bool = false,
+    foreign_data_wrapper: bool = false,
+    operator_class_family: bool = false,
+    rule_catalog: bool = false,
+    statistics_catalog: bool = false,
+    text_search_catalog: bool = false,
+    transform_catalog: bool = false,
+    user_mapping: bool = false,
     graph_match_table_function: bool = false,
     join_graph_match_table_function: bool = false,
     row_lock_for_share: bool = false,
@@ -684,6 +715,8 @@ pub const AppParityParserFixtureSummary = struct {
     alter_table_set_access_method: bool = false,
     alter_table_cluster_on: bool = false,
     alter_table_set_without_cluster: bool = false,
+    alter_table_set_statistics: bool = false,
+    alter_table_set_storage: bool = false,
     alter_table_owner_to: bool = false,
     alter_table_set: bool = false,
     alter_table_set_unlogged: bool = false,
@@ -800,8 +833,10 @@ pub fn appParityStructuredFixtureSummary(
     const has_cte_expression = planHasNonZeroUsizeTokenNamePrefix(entry.plan, "cte0_expr_");
     var summary = AppParityStructuredFixtureSummary{
         .parser = .{
+            .starts_with_alter = appParityTokensStartWithKeyword(sql_tokens, .alter),
             .starts_with_create = appParityTokensStartWithKeyword(sql_tokens, .create),
             .starts_with_delete = appParityTokensStartWithKeyword(sql_tokens, .delete),
+            .starts_with_drop = appParityTokensStartWithKeyword(sql_tokens, .drop),
             .starts_with_merge = appParityTokensStartWithKeyword(sql_tokens, .merge),
             .starts_with_truncate = appParityTokensStartWithKeyword(sql_tokens, .truncate),
             .starts_with_update = appParityTokensStartWithKeyword(sql_tokens, .update),
@@ -817,6 +852,15 @@ pub fn appParityStructuredFixtureSummary(
             .upper_function = appParityTokensHaveFunctionCall(sql_tokens, "upper"),
             .excluded_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "excluded."),
             .jsonb_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "jsonb_"),
+            .antfly_json_patch_function = appParityTokensHaveFunctionCall(sql_tokens, "antfly.json_patch"),
+            .json_patch_set_operation = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"op\":\"set\""),
+            .json_patch_remove_operation = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"op\":\"remove\""),
+            .json_patch_merge_operation = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"op\":\"merge\""),
+            .json_patch_null_value = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"value\":null"),
+            .json_patch_array_value = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"value\":["),
+            .json_patch_invalid_shape = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"ops\":\"not-array\""),
+            .json_patch_amount_path = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"path\":\"amount\""),
+            .json_patch_generated_path = appParityTokensHaveStringLiteralContaining(sql_tokens, "\"path\":\"title_lc\""),
             .array_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "array_"),
             .gen_random_uuid_function = appParityTokensHaveIdentifier(sql_tokens, "gen_random_uuid"),
             .uuid_generate_v4_function = appParityTokensHaveFunctionCall(sql_tokens, "uuid_generate_v4"),
@@ -857,11 +901,14 @@ pub fn appParityStructuredFixtureSummary(
             .tenant_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "tenant_id"),
             .organization_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "organization_id"),
             .plan_identifier = appParityTokensHaveIdentifier(sql_tokens, "plan"),
+            .metadata_plan_identifier = appParityTokensHaveIdentifier(sql_tokens, "metadata_plan"),
             .score_identifier = appParityTokensHaveIdentifier(sql_tokens, "score"),
             .support_view_identifier = appParityTokensHaveIdentifier(sql_tokens, "support_view"),
             .tag_identifier = appParityTokensHaveIdentifier(sql_tokens, "tag"),
             .tag_list_identifier = appParityTokensHaveIdentifier(sql_tokens, "tag_list"),
             .title_identifier = appParityTokensHaveIdentifier(sql_tokens, "title"),
+            .title_lc_identifier = appParityTokensHaveIdentifier(sql_tokens, "title_lc"),
+            .extra_identifier = appParityTokensHaveIdentifier(sql_tokens, "extra"),
             .ilike_keyword = appParityTokensHaveKeyword(sql_tokens, .ilike),
             .between_keyword = appParityTokensHaveKeyword(sql_tokens, .between),
             .is_null_predicate = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .null }),
@@ -876,6 +923,7 @@ pub fn appParityStructuredFixtureSummary(
             .source_underscore_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "source._id"),
             .underscore_doc_identifier = appParityTokensHaveIdentifier(sql_tokens, "_doc"),
             .underscore_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "_id"),
+            .underscore_version_identifier = appParityTokensHaveIdentifier(sql_tokens, "_version"),
             .payload_identifier = appParityTokensHaveIdentifier(sql_tokens, "payload"),
             .source_identifier_prefix = appParityTokensHaveIdentifierPrefix(sql_tokens, "source."),
             .status_string_literal = appParityTokensHaveStringLiteral(sql_tokens, "status"),
@@ -983,6 +1031,7 @@ pub fn appParityStructuredFixtureSummary(
             .not_keyword = appParityTokensHaveKeyword(sql_tokens, .not),
             .or_keyword = appParityTokensHaveKeyword(sql_tokens, .@"or"),
             .set_keyword = appParityTokensHaveKeyword(sql_tokens, .set),
+            .select_keyword = appParityTokensHaveKeyword(sql_tokens, .select),
             .returning_keyword = appParityTokensHaveKeyword(sql_tokens, .returning),
             .in_keyword = appParityTokensHaveKeyword(sql_tokens, .in),
             .where_keyword = appParityTokensHaveKeyword(sql_tokens, .where),
@@ -1066,6 +1115,20 @@ pub fn appParityStructuredFixtureSummary(
             .copy_oids_option = appParityTokensHaveKeyword(sql_tokens, .oids),
             .copy_oids_false_option = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .oids, .false }),
             .copy_program_endpoint = appParityTokensHaveKeyword(sql_tokens, .program),
+            .access_method = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .access, .method }),
+            .conversion_catalog = appParityTokensHaveIdentifier(sql_tokens, "conversion"),
+            .foreign_data_wrapper = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .foreign, .data }) and
+                appParityTokensHaveIdentifier(sql_tokens, "wrapper"),
+            .operator_class_family = appParityTokensHaveKeyword(sql_tokens, .operator) and
+                (appParityTokensHaveIdentifier(sql_tokens, "class") or
+                    appParityTokensHaveIdentifier(sql_tokens, "family")),
+            .rule_catalog = appParityTokensHaveKeyword(sql_tokens, .rule),
+            .statistics_catalog = appParityTokensHaveIdentifier(sql_tokens, "statistics"),
+            .text_search_catalog = appParityTokensHaveKeyword(sql_tokens, .text) and
+                appParityTokensHaveIdentifier(sql_tokens, "search"),
+            .transform_catalog = appParityTokensHaveIdentifier(sql_tokens, "transform"),
+            .user_mapping = appParityTokensHaveKeyword(sql_tokens, .user) and
+                appParityTokensHaveIdentifier(sql_tokens, "mapping"),
             .graph_match_table_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match"),
             .join_graph_match_table_function = appParityTokensHaveKeyword(sql_tokens, .join) and
                 appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match"),
@@ -1105,6 +1168,8 @@ pub fn appParityStructuredFixtureSummary(
             .alter_table_set_access_method = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .access, .method }),
             .alter_table_cluster_on = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .cluster, .on }),
             .alter_table_set_without_cluster = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .without, .cluster }),
+            .alter_table_set_statistics = appParityTokensHaveKeyword(sql_tokens, .set) and appParityTokensHaveIdentifier(sql_tokens, "statistics"),
+            .alter_table_set_storage = appParityTokensHaveKeyword(sql_tokens, .set) and appParityTokensHaveIdentifier(sql_tokens, "storage"),
             .alter_table_owner_to = appParityTokensHaveIdentifier(sql_tokens, "owner") and appParityTokensHaveKeyword(sql_tokens, .to),
             .alter_table_set = appParityTokensHaveKeyword(sql_tokens, .set),
             .alter_table_set_unlogged = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .set, .unlogged }),
@@ -1486,6 +1551,7 @@ fn appParityBindingCoverageWriteSourceTableNameAlloc(
 ) !?[]const u8 {
     switch (entry.family) {
         .insert,
+        .document_write,
         .unsupported_write,
         => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
@@ -1554,6 +1620,7 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
 
     switch (entry.family) {
         .insert,
+        .document_write,
         .unsupported_write,
         => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
@@ -4271,7 +4338,8 @@ fn relationalPointCrudSurfaceKnown(name: []const u8) bool {
 
 fn relationalPointCrudStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalPointCrudInventoryRootAlloc(
@@ -4317,6 +4385,7 @@ pub fn parseRelationalPointCrudInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalPointCrudInventoryIdKnown(entry.id) or
@@ -4324,7 +4393,7 @@ pub fn parseRelationalPointCrudInventoryRootAlloc(
             !relationalPointCrudSurfaceKnown(entry.surface) or
             !relationalPointCrudStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -4391,7 +4460,8 @@ fn relationalMultiRowDmlSurfaceKnown(name: []const u8) bool {
 
 fn relationalMultiRowDmlStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalMultiRowDmlInventoryRootAlloc(
@@ -4437,6 +4507,7 @@ pub fn parseRelationalMultiRowDmlInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalMultiRowDmlInventoryIdKnown(entry.id) or
@@ -4444,7 +4515,7 @@ pub fn parseRelationalMultiRowDmlInventoryRootAlloc(
             !relationalMultiRowDmlSurfaceKnown(entry.surface) or
             !relationalMultiRowDmlStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -5661,126 +5732,16 @@ pub fn parseSourceCorpusRootAlloc(alloc: std.mem.Allocator, value: std.json.Valu
     };
 }
 
-fn sourceCorpusGeneratedParseFailureAllowed(err: anyerror) bool {
-    return err == error.UnexpectedToken or err == error.UnsupportedSqlShape;
-}
-
 fn sourceCorpusEntryHasClassificationReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
     return std.mem.eql(u8, entry.classification_reason, reason) or
         std.mem.indexOf(u8, entry.plan, reason) != null;
 }
 
 fn validateSourceCorpusGeneratedParseFailureEntryAlloc(
-    alloc: std.mem.Allocator,
-    entry: AppParityCorpusEntry,
-    err: anyerror,
+    _: std.mem.Allocator,
+    _: AppParityCorpusEntry,
+    _: anyerror,
 ) !bool {
-    if (!sourceCorpusGeneratedParseFailureAllowed(err) or entry.family != .unsupported_ddl) return false;
-
-    var tokenized_sql = try tokenized.TokenizedSql.initAlloc(alloc, entry.sql);
-    defer tokenized_sql.deinit(alloc);
-    const tokens = tokenized_sql.items();
-    _ = tokens;
-    const starts_with_create = std.mem.indexOf(u8, entry.sql, "CREATE TABLE") != null;
-    const has_storage_mode = std.mem.indexOf(u8, entry.sql, "antfly.storage_mode") != null or
-        std.mem.indexOf(u8, entry.sql, "storage_mode") != null;
-    const has_default_type = std.mem.indexOf(u8, entry.sql, "antfly.default_type") != null or
-        std.mem.indexOf(u8, entry.sql, "default_type") != null;
-    const has_document_schema = std.mem.indexOf(u8, entry.sql, "antfly.document_schema") != null or
-        std.mem.indexOf(u8, entry.sql, "document_schema") != null;
-    const has_document_literal = std.mem.indexOf(u8, entry.sql, "'document'") != null;
-    const has_doc_literal = std.mem.indexOf(u8, entry.sql, "'doc'") != null;
-    const has_invoice_literal = std.mem.indexOf(u8, entry.sql, "'invoice'") != null;
-    const starts_with_create_document_table = std.mem.indexOf(u8, entry.sql, "CREATE DOCUMENT TABLE") != null;
-
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_unknown_default_type")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            !has_default_type or
-            !has_document_schema or
-            !has_document_literal or
-            !has_invoice_literal)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_antfly_extension")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            !has_default_type or
-            !has_document_schema or
-            !has_document_literal or
-            !has_doc_literal or
-            std.mem.indexOf(u8, entry.sql, "x-antfly-unknown") == null)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_dynamic_template")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            !has_default_type or
-            !has_document_schema or
-            !has_document_literal or
-            !has_doc_literal or
-            std.mem.indexOf(u8, entry.sql, "dynamic_templates") == null)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_multi_document_type_unsupported")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            !has_default_type or
-            !has_document_schema or
-            !has_document_literal or
-            !has_doc_literal or
-            std.mem.indexOf(u8, entry.sql, "document_schema.invoice") == null)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_malformed_schema_json")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            !has_default_type or
-            !has_document_schema or
-            !has_document_literal or
-            !has_doc_literal or
-            std.mem.indexOf(u8, entry.sql, "{bad json}") == null)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_missing_default_type")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            has_default_type or
-            !has_document_literal)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_mixed_relational_shape")) {
-        if (!starts_with_create or
-            !has_storage_mode or
-            !has_document_literal or
-            std.mem.indexOf(u8, entry.sql, "id") == null)
-        {
-            return error.TestUnexpectedResult;
-        }
-        return true;
-    }
-    if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_shorthand")) {
-        if (!starts_with_create_document_table) return error.TestUnexpectedResult;
-        return true;
-    }
     return false;
 }
 
@@ -6926,7 +6887,13 @@ pub fn checkOrPromoteFixtureJson(
     switch (mode) {
         .none => return,
         .check => |path| {
-            const existing = try std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(encoded.len + 1));
+            const existing = std.Io.Dir.cwd().readFileAlloc(std.testing.io, path, alloc, .limited(encoded.len + 1)) catch |err| switch (err) {
+                error.StreamTooLong => {
+                    std.debug.print("SQL/API parity fixture is stale: {s}\nrun `zig build sql-api-parity-fixture-promote` from zig/\n", .{path});
+                    return error.TestUnexpectedResult;
+                },
+                else => return err,
+            };
             defer alloc.free(existing);
             if (!std.mem.eql(u8, existing, encoded)) {
                 std.debug.print("SQL/API parity fixture is stale: {s}\nrun `zig build sql-api-parity-fixture-promote` from zig/\n", .{path});
@@ -7067,6 +7034,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         .update_joined_source => "update_joined_source:",
         .delete_joined_source => "delete_joined_source:",
         .merge_mutation => if (std.mem.startsWith(u8, plan, "recursive_merge_mutation:")) return true else "merge_mutation:",
+        .document_write => "document_write:",
         .adapter_noop_ddl => "adapter_noop:ddl:",
         .invalid_read => "invalid:read:",
         .invalid_insert => "invalid:insert:",
@@ -7110,6 +7078,7 @@ pub fn corpusFixtureFamilyNeedsTableSummary(family: AppParityCorpusPlanFamily) b
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
+        .document_write,
         => true,
         else => false,
     };
@@ -7138,6 +7107,7 @@ pub fn corpusFixtureFamilyAllowsSummary(family: AppParityCorpusPlanFamily) bool 
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
+        .document_write,
         .unsupported_read,
         .unsupported_write,
         => true,
@@ -7157,6 +7127,7 @@ pub fn corpusFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) 
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
+        .document_write,
         .unsupported_read,
         .unsupported_write,
         => true,
@@ -7210,6 +7181,7 @@ pub fn corpusFixtureFamilyAllowsOperationsSummary(family: AppParityCorpusPlanFam
         .update_source,
         .update_joined_source,
         .merge_mutation,
+        .document_write,
         => true,
         else => false,
     };
@@ -7389,7 +7361,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .create_schema_namespace, .rename_schema_namespace, .drop_schema_namespace => false,
         .create_extension, .alter_extension_update, .drop_extension => false,
         .create_function, .drop_function, .create_procedure, .drop_procedure, .create_trigger, .drop_trigger, .call_procedure => false,
-        .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege => false,
+        .create_role, .alter_role, .drop_role, .grant_privilege, .revoke_privilege, .grant_role, .revoke_role, .alter_default_privileges => false,
         .copy_from, .copy_to => false,
         .prepare_transaction, .commit_prepared, .rollback_prepared => false,
         .create_partitioned_table, .create_table_partition, .attach_table_partition, .detach_table_partition => false,
@@ -7409,6 +7381,7 @@ pub fn corpusDdlFixtureRequiresAppliedPlan(entry: AppParityCorpusEntry) !bool {
         .savepoint_transaction, .release_savepoint, .rollback_to_savepoint => false,
         .set_search_path, .set_setting, .reset_search_path, .reset_setting, .show_search_path, .discard_all => false,
         .comment_metadata => true,
+        .security_label => true,
         .table_lock, .constraint_mode, .transaction_mode, .advisory_lock => false,
         .create_table,
         .table_clone,
@@ -7836,7 +7809,11 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .alter_role => (planNonNoneStringTokenUsize(entry.plan, ":setting=") orelse return false) == expected,
         .grant_privilege,
         .revoke_privilege,
+        .alter_default_privileges,
         => planHasExactUsizeToken(entry.plan, ":privileges=", expected),
+        .grant_role,
+        .revoke_role,
+        => planHasExactUsizeToken(entry.plan, ":roles=", expected),
         .copy_from,
         .copy_to,
         => planHasExactUsizeToken(entry.plan, ":columns=", expected),
@@ -7903,6 +7880,7 @@ pub fn corpusFixtureDdlOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry,
         .prepare_transaction, .commit_prepared, .rollback_prepared => expected == 1,
         .execute_statement => planHasExactUsizeToken(entry.plan, ":args=", expected),
         .comment_metadata => (planBoolTokenUsize(entry.plan, ":comment=") orelse return false) == expected,
+        .security_label => (planBoolTokenUsize(entry.plan, ":label=") orelse return false) == expected,
         .table_lock => planHasExactUsizeToken(entry.plan, ":tables=", expected),
         .constraint_mode => (planUsizeTokenValue(entry.plan, ":constraints=") orelse return false) +
             (planBoolTokenUsize(entry.plan, ":all=") orelse return false) == expected,
@@ -7944,6 +7922,8 @@ pub fn corpusFixtureOperationsSummaryMatchesPlan(entry: AppParityCorpusEntry, ex
         .insert_source,
         .recursive_insert_source,
         => planHasExactUsizeToken(entry.plan, ":assignments=", expected),
+        .document_write => planUsizeOptionalTokenSumMatches(entry.plan, &.{ ":writes=", ":transforms=", ":deletes=" }, expected) or
+            planHasExactUsizeToken(entry.plan, ":ops=", expected),
         .merge_mutation => planHasExactUsizeToken(entry.plan, ":matched_update=", expected),
         .explain => (corpusExplainWriteInnerHasPrefix(entry, ":inner=insert_source:") and planHasExactUsizeToken(entry.plan, ":assignments=", expected)) or
             (corpusExplainWriteInnerHasPrefix(entry, ":inner=recursive_insert_source:") and planHasExactUsizeToken(entry.plan, ":assignments=", expected)) or
@@ -8172,6 +8152,7 @@ pub fn corpusFixtureAllowsPredicateSummary(entry: AppParityCorpusEntry) bool {
         .truncate_source,
         .update_joined_source,
         .delete_joined_source,
+        .document_write,
         => true,
         .read => corpusReadPlanHasPrefix(entry, "read:query:") or
             corpusReadPlanHasPrefix(entry, "read:aggregate:") or
@@ -8212,6 +8193,7 @@ pub fn corpusFixturePredicateSummaryMatchesPlan(entry: AppParityCorpusEntry) boo
         .delete_source,
         .truncate_source,
         => planHasExactUsizeToken(entry.plan, ":source_pred=", expected),
+        .document_write => planHasExactUsizeToken(entry.plan, ":predicates=", expected),
         .join,
         .lateral,
         .update_joined_source,
@@ -11713,7 +11695,7 @@ test "sql adapter corpus validates relational point CRUD inventory manifest" {
     try std.testing.expectEqualStrings("committed-returning-parity", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("committed_returning", inventory.root.entries[0].surface);
     try std.testing.expectEqualStrings("non-unique-point-claim-safety", inventory.root.entries[2].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("routed-conflict-range-movement-chaos", inventory.root.entries[3].id);
 
     const unknown_surface_json =
@@ -11791,8 +11773,10 @@ test "sql adapter corpus validates relational multi-row DML inventory manifest" 
     try std.testing.expectEqual(relational_multi_row_dml_inventory_ids.len, inventory.root.entries.len);
     try std.testing.expectEqualStrings("expired-claim-reopen-replay", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("expired_claim_reopen_replay", inventory.root.entries[0].surface);
+    try std.testing.expectEqualStrings("hosted-participant-resolution-reopen", inventory.root.entries[1].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[1].status);
     try std.testing.expectEqualStrings("non-lockable-derived-source-rejection", inventory.root.entries[3].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[3].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[3].status);
     try std.testing.expectEqualStrings("routed-queue-claim-fairness", inventory.root.entries[4].id);
 
     const unknown_surface_json =
@@ -11871,7 +11855,7 @@ test "sql adapter corpus validates relational JSON array inventory manifest" {
     try std.testing.expectEqualStrings("embedded-document-index-bypass", inventory.root.entries[0].id);
     try std.testing.expectEqualStrings("embedded_document_index_bypass", inventory.root.entries[0].surface);
     try std.testing.expectEqualStrings("json-array-rest-sdk-typed-plan-exposure", inventory.root.entries[2].id);
-    try std.testing.expectEqualStrings("partial_release_gated", inventory.root.entries[2].status);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
     try std.testing.expectEqualStrings("unsupported-json-array-operator-fixtures", inventory.root.entries[3].id);
 
     const unknown_surface_json =
@@ -14231,6 +14215,43 @@ fn appParityPointWriteHasExpressionPartialUniqueSelector(
     return concat_ws_partial or inequality_partial;
 }
 
+pub const DocumentTableMixedRelationalShapeCoverage = struct {
+    relational_column: bool = false,
+    primary_key: bool = false,
+    unique_constraint: bool = false,
+    foreign_key: bool = false,
+    check_constraint: bool = false,
+    generated_column: bool = false,
+    temporal_period: bool = false,
+    system_versioning: bool = false,
+    column_default: bool = false,
+
+    fn observe(self: *@This(), entry: AppParityCorpusEntry) void {
+        if (!sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_mixed_relational_shape")) return;
+        self.relational_column = self.relational_column or std.mem.indexOf(u8, entry.name, "relational column") != null;
+        self.primary_key = self.primary_key or std.mem.indexOf(u8, entry.sql, "PRIMARY KEY") != null;
+        self.unique_constraint = self.unique_constraint or std.mem.indexOf(u8, entry.sql, "UNIQUE") != null;
+        self.foreign_key = self.foreign_key or std.mem.indexOf(u8, entry.sql, "REFERENCES") != null;
+        self.check_constraint = self.check_constraint or std.mem.indexOf(u8, entry.sql, "CHECK") != null;
+        self.generated_column = self.generated_column or std.mem.indexOf(u8, entry.sql, "GENERATED ALWAYS") != null;
+        self.temporal_period = self.temporal_period or std.mem.indexOf(u8, entry.sql, "PERIOD FOR") != null;
+        self.system_versioning = self.system_versioning or std.mem.indexOf(u8, entry.sql, "WITH SYSTEM VERSIONING") != null;
+        self.column_default = self.column_default or std.mem.indexOf(u8, entry.name, "column default") != null;
+    }
+
+    fn complete(self: @This()) bool {
+        return self.relational_column and
+            self.primary_key and
+            self.unique_constraint and
+            self.foreign_key and
+            self.check_constraint and
+            self.generated_column and
+            self.temporal_period and
+            self.system_versioning and
+            self.column_default;
+    }
+};
+
 pub const AppParityCorpusCoverage = struct {
     ddl: bool = false,
     ddl_table_clone: bool = false,
@@ -14319,6 +14340,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_procedure_perform_body: bool = false,
     ddl_procedure_drop: bool = false,
     ddl_procedure_drop_cascade: bool = false,
+    ddl_call_procedure: bool = false,
     ddl_role_create: bool = false,
     ddl_role_alter: bool = false,
     ddl_role_alter_database_scope: bool = false,
@@ -14329,6 +14351,12 @@ pub const AppParityCorpusCoverage = struct {
     ddl_role_drop: bool = false,
     ddl_privilege_grant: bool = false,
     ddl_privilege_revoke: bool = false,
+    ddl_privilege_grant_role: bool = false,
+    ddl_privilege_grant_role_admin_option: bool = false,
+    ddl_privilege_revoke_role: bool = false,
+    ddl_privilege_revoke_role_admin_option_cascade: bool = false,
+    ddl_privilege_alter_default_grant: bool = false,
+    ddl_privilege_alter_default_revoke_grant_option: bool = false,
     ddl_copy_binary_execution_contract: bool = false,
     ddl_copy_from: bool = false,
     ddl_copy_from_execution_contract: bool = false,
@@ -14392,6 +14420,7 @@ pub const AppParityCorpusCoverage = struct {
     ddl_publication_drop_if_exists: bool = false,
     ddl_subscription_create: bool = false,
     ddl_subscription_create_multi_publication: bool = false,
+    ddl_subscription_create_options: bool = false,
     ddl_subscription_alter: bool = false,
     ddl_subscription_alter_enable: bool = false,
     ddl_subscription_alter_disable: bool = false,
@@ -14474,6 +14503,16 @@ pub const AppParityCorpusCoverage = struct {
     ddl_comment_column: bool = false,
     ddl_comment_index: bool = false,
     ddl_comment_constraint: bool = false,
+    ddl_comment_schema: bool = false,
+    ddl_comment_database: bool = false,
+    ddl_comment_extension: bool = false,
+    ddl_comment_type: bool = false,
+    ddl_comment_domain: bool = false,
+    ddl_comment_function: bool = false,
+    ddl_comment_procedure: bool = false,
+    ddl_security_label_table: bool = false,
+    ddl_security_label_schema: bool = false,
+    ddl_security_label_procedure_null: bool = false,
     ddl_table_lock: bool = false,
     ddl_table_lock_access_exclusive: bool = false,
     ddl_table_lock_multi_table: bool = false,
@@ -14588,17 +14627,35 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl: bool = false,
     unsupported_ddl_copy_wrong_stream_endpoint: bool = false,
     unsupported_ddl_copy_unsupported_options: bool = false,
+    unsupported_ddl_conversion_alter: bool = false,
+    unsupported_ddl_conversion_create: bool = false,
+    unsupported_ddl_conversion_drop: bool = false,
+    unsupported_ddl_document_table_duplicate_schema_name: bool = false,
     unsupported_ddl_document_table_invalid_antfly_extension: bool = false,
     unsupported_ddl_document_table_invalid_dynamic_template: bool = false,
     unsupported_ddl_document_table_malformed_schema_json: bool = false,
     unsupported_ddl_document_table_missing_default_type: bool = false,
     unsupported_ddl_document_table_mixed_relational_shape: bool = false,
+    document_table_mixed_relational_shapes: DocumentTableMixedRelationalShapeCoverage = .{},
     unsupported_ddl_document_table_multi_document_type_unsupported: bool = false,
     unsupported_ddl_document_table_shorthand: bool = false,
     unsupported_ddl_document_table_unknown_default_type: bool = false,
+    unsupported_ddl_access_method_create: bool = false,
+    unsupported_ddl_access_method_drop: bool = false,
+    unsupported_ddl_foreign_data_wrapper: bool = false,
+    unsupported_ddl_operator_class_family: bool = false,
+    unsupported_ddl_rule_alter: bool = false,
+    unsupported_ddl_rule_create: bool = false,
+    unsupported_ddl_rule_drop: bool = false,
+    unsupported_ddl_statistics_alter: bool = false,
+    unsupported_ddl_statistics_create: bool = false,
+    unsupported_ddl_statistics_drop: bool = false,
+    unsupported_ddl_user_mapping: bool = false,
     unsupported_ddl_table_access_method: bool = false,
     unsupported_ddl_table_cluster_on: bool = false,
     unsupported_ddl_table_cluster_without: bool = false,
+    unsupported_ddl_table_column_statistics: bool = false,
+    unsupported_ddl_table_column_storage: bool = false,
     unsupported_ddl_table_owner: bool = false,
     unsupported_ddl_table_persistence: bool = false,
     unsupported_ddl_table_storage_parameters: bool = false,
@@ -14606,6 +14663,10 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_table_tablespace: bool = false,
     unsupported_ddl_table_trigger_disable: bool = false,
     unsupported_ddl_table_trigger_enable: bool = false,
+    unsupported_ddl_text_search_catalog: bool = false,
+    unsupported_ddl_transform_alter: bool = false,
+    unsupported_ddl_transform_create: bool = false,
+    unsupported_ddl_transform_drop: bool = false,
     unsupported_read_document_view_mapping_function_predicate: bool = false,
     unsupported_read_document_view_mapping_ilike_predicate: bool = false,
     unsupported_read_document_view_mapping_not_in_predicate: bool = false,
@@ -14615,13 +14676,55 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_read_document_view_mapping_projection_path: bool = false,
     unsupported_read_document_view_mapping_regex_not_imatch_predicate: bool = false,
     unsupported_read_document_view_mapping_regex_predicate: bool = false,
+    document_write_document_sql_full_document_insert: bool = false,
+    document_write_document_sql_generated_id_insert: bool = false,
+    document_write_document_sql_exact_id_delete: bool = false,
+    document_write_document_sql_json_patch_array: bool = false,
+    document_write_document_sql_json_patch_assignment: bool = false,
+    document_write_document_sql_json_patch_duplicate_identity: bool = false,
+    document_write_document_sql_json_patch_generated_field: bool = false,
+    document_write_document_sql_json_patch_merge: bool = false,
+    document_write_document_sql_json_patch_null: bool = false,
+    document_write_document_sql_json_patch_removal: bool = false,
+    document_write_document_sql_json_patch_reversed_version_predicate: bool = false,
+    document_write_document_sql_json_patch_schema_type: bool = false,
+    document_write_document_sql_json_patch_version_predicate: bool = false,
+    document_write_document_sql_indexed_projection_update: bool = false,
+    document_write_document_sql_projection_array_insert: bool = false,
+    document_write_document_sql_projection_create_only_insert: bool = false,
+    document_write_document_sql_projection_duplicate_key_native_upsert: bool = false,
+    document_write_document_sql_projection_generated_id_create_only_insert: bool = false,
+    document_write_document_sql_projection_generated_id_insert: bool = false,
+    document_write_document_sql_projection_in_update: bool = false,
+    document_write_document_sql_projection_insert: bool = false,
+    document_write_document_sql_projection_array_update: bool = false,
+    document_write_document_sql_projection_nested_alias_insert: bool = false,
+    document_write_document_sql_projection_nested_alias_update: bool = false,
+    document_write_document_sql_projection_null_default_insert: bool = false,
+    document_write_document_sql_projection_null_update: bool = false,
+    document_write_document_sql_projection_update: bool = false,
+    document_write_document_sql_projection_version_in_update: bool = false,
+    document_write_document_sql_projection_version_update: bool = false,
+    unsupported_write_document_sql_broad_delete: bool = false,
     unsupported_write_document_sql_doc_update: bool = false,
-    unsupported_write_document_sql_exact_id_delete: bool = false,
-    unsupported_write_document_sql_full_document_insert: bool = false,
-    unsupported_write_document_sql_generated_id_insert: bool = false,
+    unsupported_write_document_sql_json_path_delete: bool = false,
+    unsupported_write_document_sql_json_patch_boolean_predicate: bool = false,
+    unsupported_write_document_sql_json_patch_invalid_shape: bool = false,
+    unsupported_write_document_sql_json_patch_versioned_in: bool = false,
+    unsupported_write_document_sql_non_identity_delete: bool = false,
+    unsupported_write_document_sql_mixed_identity_delete: bool = false,
     unsupported_write_document_sql_merge_delete: bool = false,
-    unsupported_write_document_sql_projection_insert: bool = false,
-    unsupported_write_document_sql_projection_update: bool = false,
+    unsupported_write_document_sql_ordered_delete: bool = false,
+    unsupported_write_document_sql_projection_additional_properties: bool = false,
+    unsupported_write_document_sql_projection_generated_field_insert: bool = false,
+    unsupported_write_document_sql_projection_generated_field_update: bool = false,
+    unsupported_write_document_sql_projection_on_conflict_do_nothing: bool = false,
+    unsupported_write_document_sql_projection_on_conflict: bool = false,
+    unsupported_write_document_sql_projection_returning: bool = false,
+    unsupported_write_document_sql_projection_source_insert: bool = false,
+    unsupported_write_document_sql_projection_transient_alias_insert: bool = false,
+    unsupported_write_document_sql_versioned_projection_insert: bool = false,
+    unsupported_write_document_sql_range_delete: bool = false,
     unsupported_write_document_sql_truncate_table: bool = false,
     unsupported_write_document_sql_write_unsupported: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
@@ -14933,6 +15036,7 @@ pub const AppParityCorpusCoverage = struct {
     query_nested_case_fold_text_expression: bool = false,
     conflict_nested_text_expression_update: bool = false,
     ddl_create_table: bool = false,
+    ddl_document_table_create: bool = false,
     ddl_inline_named_column_constraints: bool = false,
     ddl_temporal_table: bool = false,
     ddl_replace_table: bool = false,
@@ -15089,52 +15193,12 @@ pub const AppParityCorpusCoverage = struct {
     }
 
     fn observeGeneratedParseFailureEntryAlloc(
-        self: *@This(),
+        _: *@This(),
         alloc: std.mem.Allocator,
         entry: AppParityCorpusEntry,
         err: anyerror,
     ) !bool {
         if (!(try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_antfly_extension")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_invalid_antfly_extension = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_dynamic_template")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_invalid_dynamic_template = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_malformed_schema_json")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_malformed_schema_json = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_missing_default_type")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_missing_default_type = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_mixed_relational_shape")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_mixed_relational_shape = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_multi_document_type_unsupported")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_multi_document_type_unsupported = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_shorthand")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_shorthand = true;
-            return true;
-        }
-        if (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_unknown_default_type")) {
-            self.unsupported_ddl = true;
-            self.unsupported_ddl_document_table_unknown_default_type = true;
-            return true;
-        }
         return false;
     }
 
@@ -16220,54 +16284,441 @@ pub const AppParityCorpusCoverage = struct {
             },
             .unsupported => {},
             .unsupported_read => self.unsupported_read = true,
-            .unsupported_ddl => self.unsupported_ddl = true,
-            .unsupported_write => {
-                self.unsupported_write_document_sql_doc_update = self.unsupported_write_document_sql_doc_update or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
-                        structured_summary.parser.starts_with_update and
-                        structured_summary.parser.set_keyword and
-                        structured_summary.parser.where_keyword and
-                        structured_summary.parser.underscore_doc_identifier and
-                        structured_summary.parser.underscore_id_identifier);
-                self.unsupported_write_document_sql_exact_id_delete = self.unsupported_write_document_sql_exact_id_delete or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
-                        structured_summary.parser.starts_with_delete and
-                        structured_summary.parser.where_keyword and
-                        structured_summary.parser.underscore_id_identifier);
-                self.unsupported_write_document_sql_full_document_insert = self.unsupported_write_document_sql_full_document_insert or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
+            .document_write => {
+                self.document_write_document_sql_full_document_insert = self.document_write_document_sql_full_document_insert or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
                         structured_summary.parser.insert_into and
                         structured_summary.parser.underscore_doc_identifier and
                         structured_summary.parser.underscore_id_identifier);
-                self.unsupported_write_document_sql_generated_id_insert = self.unsupported_write_document_sql_generated_id_insert or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                self.document_write_document_sql_generated_id_insert = self.document_write_document_sql_generated_id_insert or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "generated_id_insert") and
                         structured_summary.parser.insert_into and
                         structured_summary.parser.underscore_doc_identifier and
                         !structured_summary.parser.underscore_id_identifier);
-                self.unsupported_write_document_sql_merge_delete = self.unsupported_write_document_sql_merge_delete or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
-                        structured_summary.parser.starts_with_merge and
-                        structured_summary.parser.merge_when_matched_delete and
-                        structured_summary.parser.docs_underscore_id_identifier and
-                        structured_summary.parser.source_underscore_id_identifier);
-                self.unsupported_write_document_sql_projection_insert = self.unsupported_write_document_sql_projection_insert or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                self.document_write_document_sql_exact_id_delete = self.document_write_document_sql_exact_id_delete or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "exact_id_delete") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_id_identifier);
+                self.document_write_document_sql_json_patch_array = self.document_write_document_sql_json_patch_array or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation and
+                        structured_summary.parser.json_patch_array_value);
+                self.document_write_document_sql_json_patch_assignment = self.document_write_document_sql_json_patch_assignment or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation);
+                self.document_write_document_sql_json_patch_duplicate_identity = self.document_write_document_sql_json_patch_duplicate_identity or
+                    (std.mem.eql(u8, entry.name, "document sql json patch duplicate identity") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 2) and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation);
+                self.document_write_document_sql_json_patch_generated_field = self.document_write_document_sql_json_patch_generated_field or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_generated_path);
+                self.document_write_document_sql_json_patch_merge = self.document_write_document_sql_json_patch_merge or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_merge_operation);
+                self.document_write_document_sql_json_patch_null = self.document_write_document_sql_json_patch_null or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation and
+                        structured_summary.parser.json_patch_null_value);
+                self.document_write_document_sql_json_patch_removal = self.document_write_document_sql_json_patch_removal or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_remove_operation);
+                self.document_write_document_sql_json_patch_reversed_version_predicate = self.document_write_document_sql_json_patch_reversed_version_predicate or
+                    (std.mem.eql(u8, entry.name, "document sql json patch reversed version predicate") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        planHasExactUsizeToken(entry.plan, ":predicates=", 1) and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation);
+                self.document_write_document_sql_json_patch_schema_type = self.document_write_document_sql_json_patch_schema_type or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_amount_path);
+                self.document_write_document_sql_json_patch_version_predicate = self.document_write_document_sql_json_patch_version_predicate or
+                    (corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "document_patch") and
+                        planHasExactUsizeToken(entry.plan, ":predicates=", 1) and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation);
+                self.document_write_document_sql_projection_insert = self.document_write_document_sql_projection_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "native_upsert") and
                         structured_summary.parser.insert_into and
                         structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
-                self.unsupported_write_document_sql_projection_update = self.unsupported_write_document_sql_projection_update or
-                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                self.document_write_document_sql_projection_create_only_insert = self.document_write_document_sql_projection_create_only_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection create only insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":predicates=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "create_only") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_generated_id_create_only_insert = self.document_write_document_sql_projection_generated_id_create_only_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection generated id create only insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "generated_id_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":predicates=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "create_only") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_duplicate_key_native_upsert = self.document_write_document_sql_projection_duplicate_key_native_upsert or
+                    (std.mem.eql(u8, entry.name, "document sql projection duplicate key native upsert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 2) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "native_upsert") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_generated_id_insert = self.document_write_document_sql_projection_generated_id_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection generated id insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "generated_id_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "native_upsert") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_array_insert = self.document_write_document_sql_projection_array_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection array insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "native_upsert") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_nested_alias_insert = self.document_write_document_sql_projection_nested_alias_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection nested alias insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "native_upsert") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.underscore_id_identifier and
+                        structured_summary.parser.metadata_plan_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_null_default_insert = self.document_write_document_sql_projection_null_default_insert or
+                    (std.mem.eql(u8, entry.name, "document sql projection null default insert") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "full_document_insert") and
+                        planHasExactUsizeToken(entry.plan, ":writes=", 1) and
+                        planHasExactStringToken(entry.plan, ":write_mode=", "native_upsert") and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.status_identifier and
+                        structured_summary.parser.default_keyword and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_update = self.document_write_document_sql_projection_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
                         structured_summary.parser.starts_with_update and
                         structured_summary.parser.set_keyword and
                         structured_summary.parser.where_keyword and
                         structured_summary.parser.title_identifier and
                         structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
-                self.unsupported_write_document_sql_truncate_table = self.unsupported_write_document_sql_truncate_table or
+                self.document_write_document_sql_indexed_projection_update = self.document_write_document_sql_indexed_projection_update or
+                    (std.mem.eql(u8, entry.name, "document sql indexed projection update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.status_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_in_update = self.document_write_document_sql_projection_in_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection in update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 2) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.in_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_version_update = self.document_write_document_sql_projection_version_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection version update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":predicates=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_version_in_update = self.document_write_document_sql_projection_version_in_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection version in update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 2) and
+                        planHasExactUsizeToken(entry.plan, ":predicates=", 2) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.in_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_null_update = self.document_write_document_sql_projection_null_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection null update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_nested_alias_update = self.document_write_document_sql_projection_nested_alias_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection nested alias update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.metadata_plan_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_projection_array_update = self.document_write_document_sql_projection_array_update or
+                    (std.mem.eql(u8, entry.name, "document sql projection array update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactUsizeToken(entry.plan, ":transforms=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+            },
+            .unsupported_ddl => self.unsupported_ddl = true,
+            .unsupported_write => {
+                const is_document_sql_write_unsupported = structured_summary.hasReason("document_sql_write_unsupported");
+                self.unsupported_write_document_sql_broad_delete = self.unsupported_write_document_sql_broad_delete or
+                    std.mem.eql(u8, entry.name, "unsupported document sql broad delete") or
+                    (is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_delete and
+                        !structured_summary.parser.where_keyword);
+                self.unsupported_write_document_sql_doc_update = self.unsupported_write_document_sql_doc_update or
+                    (is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.underscore_id_identifier);
+                self.unsupported_write_document_sql_json_patch_invalid_shape = self.unsupported_write_document_sql_json_patch_invalid_shape or
                     (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_invalid_shape);
+                self.unsupported_write_document_sql_json_patch_versioned_in = self.unsupported_write_document_sql_json_patch_versioned_in or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql json patch versioned in filter") and
+                        structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation);
+                self.unsupported_write_document_sql_json_patch_boolean_predicate = self.unsupported_write_document_sql_json_patch_boolean_predicate or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql json patch boolean predicate") and
+                        structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.antfly_json_patch_function and
+                        structured_summary.parser.json_patch_set_operation);
+                self.unsupported_write_document_sql_json_path_delete = self.unsupported_write_document_sql_json_path_delete or
+                    std.mem.eql(u8, entry.name, "unsupported document sql json path delete") or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_doc_identifier and
+                        structured_summary.parser.arrow_json_operator);
+                self.unsupported_write_document_sql_mixed_identity_delete = self.unsupported_write_document_sql_mixed_identity_delete or
+                    std.mem.eql(u8, entry.name, "unsupported document sql mixed identity delete") or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.underscore_id_identifier and
+                        structured_summary.parser.title_identifier);
+                self.unsupported_write_document_sql_non_identity_delete = self.unsupported_write_document_sql_non_identity_delete or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        !structured_summary.parser.underscore_id_identifier);
+                self.unsupported_write_document_sql_ordered_delete = self.unsupported_write_document_sql_ordered_delete or
+                    std.mem.eql(u8, entry.name, "unsupported document sql ordered delete") or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.order_by);
+                self.unsupported_write_document_sql_range_delete = self.unsupported_write_document_sql_range_delete or
+                    std.mem.eql(u8, entry.name, "unsupported document sql range delete") or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        (structured_summary.parser.lt_or_lte_operator or structured_summary.parser.gt_or_gte_operator));
+                self.unsupported_write_document_sql_merge_delete = self.unsupported_write_document_sql_merge_delete or
+                    (structured_summary.hasReason("document_sql_write_unsupported") and
+                        structured_summary.parser.starts_with_merge and
+                        structured_summary.parser.merge_when_matched_delete and
+                        structured_summary.parser.docs_underscore_id_identifier and
+                        structured_summary.parser.source_underscore_id_identifier);
+                self.unsupported_write_document_sql_projection_additional_properties = self.unsupported_write_document_sql_projection_additional_properties or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql additional properties projection insert") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.extra_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_generated_field_insert = self.unsupported_write_document_sql_projection_generated_field_insert or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql generated field projection insert") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_lc_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_on_conflict = self.unsupported_write_document_sql_projection_on_conflict or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql projection on conflict") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.conflict_do_update and
+                        structured_summary.parser.title_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_on_conflict_do_nothing = self.unsupported_write_document_sql_projection_on_conflict_do_nothing or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql projection on conflict do nothing") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.conflict_do_nothing and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_source_insert = self.unsupported_write_document_sql_projection_source_insert or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql projection source insert") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.select_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_transient_alias_insert = self.unsupported_write_document_sql_projection_transient_alias_insert or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql transient nested projection alias insert") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.metadata_plan_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_generated_field_update = self.unsupported_write_document_sql_projection_generated_field_update or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql generated field projection update") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_lc_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_returning = self.unsupported_write_document_sql_projection_returning or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql projection returning") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.returning_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_versioned_projection_insert = self.unsupported_write_document_sql_versioned_projection_insert or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql versioned projection insert") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.insert_into and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.underscore_id_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_truncate_table = self.unsupported_write_document_sql_truncate_table or
+                    (is_document_sql_write_unsupported and
                         structured_summary.parser.starts_with_truncate);
                 self.unsupported_write_document_sql_write_unsupported = self.unsupported_write_document_sql_write_unsupported or
-                    structured_summary.hasReason("document_sql_write_unsupported");
+                    is_document_sql_write_unsupported;
             },
             .unsupported_insert => {
                 self.unsupported_insert = true;
@@ -16432,22 +16883,88 @@ pub const AppParityCorpusCoverage = struct {
                 (structured_summary.hasReason("bulk_io_plan") and
                     structured_summary.parser.starts_with_copy and
                     structured_summary.parser.copy_oids_option);
+            self.unsupported_ddl_conversion_alter = self.unsupported_ddl_conversion_alter or
+                (structured_summary.hasReason("conversion_catalog_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.conversion_catalog);
+            self.unsupported_ddl_conversion_create = self.unsupported_ddl_conversion_create or
+                (structured_summary.hasReason("conversion_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.conversion_catalog);
+            self.unsupported_ddl_conversion_drop = self.unsupported_ddl_conversion_drop or
+                (structured_summary.hasReason("conversion_catalog_plan") and
+                    structured_summary.parser.starts_with_drop and
+                    structured_summary.parser.conversion_catalog);
+            self.unsupported_ddl_document_table_duplicate_schema_name = self.unsupported_ddl_document_table_duplicate_schema_name or
+                sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_duplicate_schema_name");
+            self.unsupported_ddl_document_table_invalid_antfly_extension = self.unsupported_ddl_document_table_invalid_antfly_extension or
+                sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_antfly_extension");
+            self.unsupported_ddl_document_table_invalid_dynamic_template = self.unsupported_ddl_document_table_invalid_dynamic_template or
+                sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_invalid_dynamic_template");
+            self.unsupported_ddl_document_table_malformed_schema_json = self.unsupported_ddl_document_table_malformed_schema_json or
+                sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_malformed_schema_json");
             self.unsupported_ddl_document_table_missing_default_type = self.unsupported_ddl_document_table_missing_default_type or
                 (structured_summary.hasReason("document_table_ddl_missing_default_type") and
                     structured_summary.parser.starts_with_create and
                     structured_summary.parser.antfly_storage_mode_identifier and
                     structured_summary.parser.document_string_literal and
-                    structured_summary.parser.payload_identifier and
                     !structured_summary.parser.antfly_default_type_identifier);
-            self.unsupported_ddl_document_table_mixed_relational_shape = self.unsupported_ddl_document_table_mixed_relational_shape or
+            self.document_table_mixed_relational_shapes.observe(entry);
+            self.unsupported_ddl_document_table_mixed_relational_shape =
+                self.unsupported_ddl_document_table_mixed_relational_shape or
                 (structured_summary.hasReason("document_table_ddl_mixed_relational_shape") and
                     structured_summary.parser.starts_with_create and
                     structured_summary.parser.antfly_storage_mode_identifier and
                     structured_summary.parser.document_string_literal and
-                    structured_summary.parser.id_identifier);
+                    self.document_table_mixed_relational_shapes.complete());
+            self.unsupported_ddl_document_table_multi_document_type_unsupported = self.unsupported_ddl_document_table_multi_document_type_unsupported or
+                sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_multi_document_type_unsupported");
             self.unsupported_ddl_document_table_shorthand = self.unsupported_ddl_document_table_shorthand or
                 (sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_shorthand") and
                     std.mem.indexOf(u8, entry.sql, "CREATE DOCUMENT TABLE") != null);
+            self.unsupported_ddl_document_table_unknown_default_type = self.unsupported_ddl_document_table_unknown_default_type or
+                sourceCorpusEntryHasClassificationReason(entry, "document_table_ddl_unknown_default_type");
+            self.unsupported_ddl_access_method_create = self.unsupported_ddl_access_method_create or
+                (structured_summary.hasReason("table_access_method_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.access_method);
+            self.unsupported_ddl_access_method_drop = self.unsupported_ddl_access_method_drop or
+                (structured_summary.hasReason("table_access_method_plan") and
+                    structured_summary.parser.starts_with_drop and
+                    structured_summary.parser.access_method);
+            self.unsupported_ddl_foreign_data_wrapper = self.unsupported_ddl_foreign_data_wrapper or
+                (structured_summary.hasReason("foreign_data_catalog_plan") and
+                    structured_summary.parser.foreign_data_wrapper);
+            self.unsupported_ddl_operator_class_family = self.unsupported_ddl_operator_class_family or
+                (structured_summary.hasReason("operator_catalog_plan") and
+                    structured_summary.parser.operator_class_family);
+            self.unsupported_ddl_rule_alter = self.unsupported_ddl_rule_alter or
+                (structured_summary.hasReason("rule_catalog_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.rule_catalog);
+            self.unsupported_ddl_rule_create = self.unsupported_ddl_rule_create or
+                (structured_summary.hasReason("rule_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.rule_catalog);
+            self.unsupported_ddl_rule_drop = self.unsupported_ddl_rule_drop or
+                (structured_summary.hasReason("rule_catalog_plan") and
+                    structured_summary.parser.starts_with_drop and
+                    structured_summary.parser.rule_catalog);
+            self.unsupported_ddl_statistics_alter = self.unsupported_ddl_statistics_alter or
+                (structured_summary.hasReason("statistics_catalog_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.statistics_catalog);
+            self.unsupported_ddl_statistics_create = self.unsupported_ddl_statistics_create or
+                (structured_summary.hasReason("statistics_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.statistics_catalog);
+            self.unsupported_ddl_statistics_drop = self.unsupported_ddl_statistics_drop or
+                (structured_summary.hasReason("statistics_catalog_plan") and
+                    structured_summary.parser.starts_with_drop and
+                    structured_summary.parser.statistics_catalog);
+            self.unsupported_ddl_user_mapping = self.unsupported_ddl_user_mapping or
+                (structured_summary.hasReason("foreign_data_catalog_plan") and
+                    structured_summary.parser.user_mapping);
             self.unsupported_ddl_table_access_method = self.unsupported_ddl_table_access_method or
                 (structured_summary.hasReason("table_access_method_plan") and
                     structured_summary.parser.alter_table and
@@ -16460,6 +16977,14 @@ pub const AppParityCorpusCoverage = struct {
                 (structured_summary.hasReason("table_cluster_plan") and
                     structured_summary.parser.alter_table and
                     structured_summary.parser.alter_table_set_without_cluster);
+            self.unsupported_ddl_table_column_statistics = self.unsupported_ddl_table_column_statistics or
+                (structured_summary.hasReason("table_column_statistics_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set_statistics);
+            self.unsupported_ddl_table_column_storage = self.unsupported_ddl_table_column_storage or
+                (structured_summary.hasReason("table_column_storage_plan") and
+                    structured_summary.parser.alter_table and
+                    structured_summary.parser.alter_table_set_storage);
             self.unsupported_ddl_table_owner = self.unsupported_ddl_table_owner or
                 (structured_summary.hasReason("table_owner_plan") and
                     structured_summary.parser.alter_table and
@@ -16490,11 +17015,34 @@ pub const AppParityCorpusCoverage = struct {
                     structured_summary.parser.alter_table and
                     structured_summary.parser.alter_table_enable and
                     structured_summary.parser.alter_table_trigger);
+            self.unsupported_ddl_text_search_catalog = self.unsupported_ddl_text_search_catalog or
+                (structured_summary.hasReason("text_search_catalog_plan") and
+                    structured_summary.parser.text_search_catalog);
+            self.unsupported_ddl_transform_alter = self.unsupported_ddl_transform_alter or
+                (structured_summary.hasReason("transform_catalog_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.transform_catalog);
+            self.unsupported_ddl_transform_create = self.unsupported_ddl_transform_create or
+                (structured_summary.hasReason("transform_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.transform_catalog);
+            self.unsupported_ddl_transform_drop = self.unsupported_ddl_transform_drop or
+                (structured_summary.hasReason("transform_catalog_plan") and
+                    structured_summary.parser.starts_with_drop and
+                    structured_summary.parser.transform_catalog);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
                 .create_table => {
                     self.ddl_create_table = true;
+                    self.ddl_document_table_create = self.ddl_document_table_create or
+                        (sql_adapter.planHasExactStringToken(entry.plan, "ddl:create_table:table=", "docs") and
+                            sql_adapter.planHasExactUsizeToken(entry.plan, ":columns=", 0) and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":storage_mode=", "document") and
+                            sql_adapter.planHasExactUsizeToken(entry.plan, ":document_schemas=", 1) and
+                            sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rebuild=", false) and
+                            sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "validation=", false) and
+                            sql_adapter.appliedPlanHasExactBoolToken(entry.applied_plan, "rewrite=", false));
                     self.ddl_inline_named_column_constraints = self.ddl_inline_named_column_constraints or
                         (sql_adapter.planHasExactUsizeToken(entry.plan, ":pk=", 1) and
                             sql_adapter.planHasExactUsizeToken(entry.plan, ":unique=", 1) and
@@ -16704,7 +17252,11 @@ pub const AppParityCorpusCoverage = struct {
                 .create_trigger,
                 .drop_trigger,
                 => {},
-                .call_procedure => {},
+                .call_procedure => {
+                    self.ddl_call_procedure = self.ddl_call_procedure or
+                        sql_adapter.planHasExactStringToken(entry.plan, "ddl:call_procedure:name=", "rotate_usage") and
+                            sql_adapter.planHasExactUsizeToken(entry.plan, ":args=", 0);
+                },
                 .create_role => self.ddl_role_create = true,
                 .alter_role => {
                     self.ddl_role_alter = true;
@@ -16722,6 +17274,26 @@ pub const AppParityCorpusCoverage = struct {
                 .drop_role => self.ddl_role_drop = true,
                 .grant_privilege => self.ddl_privilege_grant = true,
                 .revoke_privilege => self.ddl_privilege_revoke = true,
+                .grant_role => {
+                    self.ddl_privilege_grant_role = true;
+                    self.ddl_privilege_grant_role_admin_option = self.ddl_privilege_grant_role_admin_option or
+                        sql_adapter.planHasExactBoolToken(entry.plan, ":admin_option=", true);
+                },
+                .revoke_role => {
+                    self.ddl_privilege_revoke_role = true;
+                    self.ddl_privilege_revoke_role_admin_option_cascade = self.ddl_privilege_revoke_role_admin_option_cascade or
+                        (sql_adapter.planHasExactBoolToken(entry.plan, ":admin_option_for=", true) and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":revoke=", "cascade"));
+                },
+                .alter_default_privileges => {
+                    self.ddl_privilege_alter_default_grant = self.ddl_privilege_alter_default_grant or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":action=", "grant") and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":grant_option=", true));
+                    self.ddl_privilege_alter_default_revoke_grant_option = self.ddl_privilege_alter_default_revoke_grant_option or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":action=", "revoke") and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":grant_option_for=", true) and
+                            sql_adapter.planHasExactStringToken(entry.plan, ":revoke=", "cascade"));
+                },
                 .copy_from => {
                     self.ddl_copy_from = true;
                     self.ddl_copy_binary_execution_contract = self.ddl_copy_binary_execution_contract or
@@ -16837,6 +17409,8 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_subscription_create = true;
                     self.ddl_subscription_create_multi_publication = self.ddl_subscription_create_multi_publication or
                         sql_adapter.planHasExactUsizeToken(entry.plan, ":publications=", 2);
+                    self.ddl_subscription_create_options = self.ddl_subscription_create_options or
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":options=");
                 },
                 .alter_subscription => {
                     self.ddl_subscription_alter = true;
@@ -16985,6 +17559,31 @@ pub const AppParityCorpusCoverage = struct {
                     self.ddl_comment_column = self.ddl_comment_column or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "column");
                     self.ddl_comment_index = self.ddl_comment_index or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "index");
                     self.ddl_comment_constraint = self.ddl_comment_constraint or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "constraint");
+                    self.ddl_comment_schema = self.ddl_comment_schema or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "schema");
+                    self.ddl_comment_database = self.ddl_comment_database or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "database");
+                    self.ddl_comment_extension = self.ddl_comment_extension or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "extension");
+                    self.ddl_comment_type = self.ddl_comment_type or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "type");
+                    self.ddl_comment_domain = self.ddl_comment_domain or sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "domain");
+                    self.ddl_comment_function = self.ddl_comment_function or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "function") and
+                            sql_adapter.planHasExactUsizeToken(entry.plan, ":args=", 2));
+                    self.ddl_comment_procedure = self.ddl_comment_procedure or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "procedure") and
+                            sql_adapter.planHasExactUsizeToken(entry.plan, ":args=", 0));
+                },
+                .security_label => {
+                    self.ddl_security_label_table = self.ddl_security_label_table or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "table") and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":provider=", true) and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":label=", true));
+                    self.ddl_security_label_schema = self.ddl_security_label_schema or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "schema") and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":provider=", false) and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":label=", true));
+                    self.ddl_security_label_procedure_null = self.ddl_security_label_procedure_null or
+                        (sql_adapter.planHasExactStringToken(entry.plan, ":kind=", "procedure") and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":provider=", false) and
+                            sql_adapter.planHasExactBoolToken(entry.plan, ":label=", false));
                 },
                 .table_lock => {
                     self.ddl_table_lock = true;
@@ -17719,11 +18318,10 @@ test "sql adapter corpus emits structured fixture summaries" {
     var document_delete_sql = try tokenized.ParsedSql.initAlloc(alloc, "DELETE FROM docs WHERE _id = 'doc:a'");
     defer document_delete_sql.deinit(alloc);
     const document_delete = appParityStructuredFixtureSummary(.{
-        .name = "unsupported document sql exact id delete",
+        .name = "document sql exact id delete",
         .sql = "DELETE FROM docs WHERE _id = 'doc:a'",
-        .family = .unsupported_write,
-        .classification_reason = "document_sql_write_unsupported",
-        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+        .family = .document_write,
+        .plan = "document_write:table=docs:operation=exact_id_delete:writes=0:transforms=0:deletes=1",
     }, &document_delete_sql);
     try std.testing.expect(document_delete.parser.starts_with_delete);
     try std.testing.expect(document_delete.parser.where_keyword);
@@ -17744,6 +18342,21 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(document_update.parser.where_keyword);
     try std.testing.expect(document_update.parser.underscore_doc_identifier);
     try std.testing.expect(document_update.parser.underscore_id_identifier);
+
+    var document_json_patch_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a'");
+    defer document_json_patch_sql.deinit(alloc);
+    const document_json_patch = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document sql json patch assignment",
+        .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a'",
+        .family = .unsupported_write,
+        .classification_reason = "document_sql_write_unsupported",
+        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+    }, &document_json_patch_sql);
+    try std.testing.expect(document_json_patch.parser.starts_with_update);
+    try std.testing.expect(document_json_patch.parser.set_keyword);
+    try std.testing.expect(document_json_patch.parser.underscore_doc_identifier);
+    try std.testing.expect(document_json_patch.parser.antfly_json_patch_function);
+    try std.testing.expect(document_json_patch.parser.json_patch_set_operation);
 
     var document_view_unnest_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT d._id, tag FROM support_view AS d, UNNEST(d.tag_list) AS tag WHERE tag = 'urgent' LIMIT 10");
     defer document_view_unnest_sql.deinit(alloc);
@@ -17775,11 +18388,10 @@ test "sql adapter corpus emits structured fixture summaries" {
     var document_projection_update_sql = try tokenized.ParsedSql.initAlloc(alloc, "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'");
     defer document_projection_update_sql.deinit(alloc);
     const document_projection_update = appParityStructuredFixtureSummary(.{
-        .name = "unsupported document sql projection update",
+        .name = "document sql projection update",
         .sql = "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'",
-        .family = .unsupported_write,
-        .classification_reason = "document_sql_write_unsupported",
-        .plan = "unsupported:write:requires=document_sql_write_unsupported",
+        .family = .document_write,
+        .plan = "document_write:table=docs:operation=projection_write:writes=0:transforms=1:deletes=0",
     }, &document_projection_update_sql);
     try std.testing.expect(document_projection_update.parser.starts_with_update);
     try std.testing.expect(document_projection_update.parser.set_keyword);
@@ -18771,62 +19383,173 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(query_array.parser.string_to_array_function);
     try std.testing.expect(!query_array.parser.regexp_count_function);
 
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document schema malformed generated parse failure",
-        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{bad json}')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_malformed_schema_json",
-        .plan = "unsupported:ddl:requires=document_table_ddl_malformed_schema_json",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document missing default generated parse failure",
-        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_missing_default_type",
-        .plan = "unsupported:ddl:requires=document_table_ddl_missing_default_type",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document unknown default type generated parse failure",
-        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice', antfly.document_schema.doc = '{\"type\":\"object\"}')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_unknown_default_type",
-        .plan = "unsupported:ddl:requires=document_table_ddl_unknown_default_type",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document invalid antfly extension generated parse failure",
-        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"x-antfly-unknown\":true}')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_invalid_antfly_extension",
-        .plan = "unsupported:ddl:requires=document_table_ddl_invalid_antfly_extension",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document invalid dynamic template generated parse failure",
-        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"dynamic_templates\":\"bad\"}')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_invalid_dynamic_template",
-        .plan = "unsupported:ddl:requires=document_table_ddl_invalid_dynamic_template",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document multi type generated parse failure",
-        .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\"}', antfly.document_schema.invoice = '{\"type\":\"object\"}')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_multi_document_type_unsupported",
-        .plan = "unsupported:ddl:requires=document_table_ddl_multi_document_type_unsupported",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document mixed relational generated parse failure",
-        .sql = "CREATE TABLE docs (id uuid PRIMARY KEY) WITH (antfly.storage_mode = 'document')",
-        .family = .unsupported_ddl,
-        .classification_reason = "document_table_ddl_mixed_relational_shape",
-        .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
-    }, error.UnexpectedToken));
-    try std.testing.expect(try sourceCorpusGeneratedParseFailureEntryAlloc(alloc, .{
-        .name = "document shorthand generated parse failure",
+    const document_schema_validation_entries = [_]AppParityCorpusEntry{
+        .{
+            .name = "unsupported document table ddl malformed schema json",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{bad json}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_malformed_schema_json",
+            .plan = "unsupported:ddl:requires=document_table_ddl_malformed_schema_json",
+        },
+        .{
+            .name = "unsupported document table ddl missing default type",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_missing_default_type",
+            .plan = "unsupported:ddl:requires=document_table_ddl_missing_default_type",
+        },
+        .{
+            .name = "unsupported document table ddl unknown default type",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_unknown_default_type",
+            .plan = "unsupported:ddl:requires=document_table_ddl_unknown_default_type",
+        },
+        .{
+            .name = "unsupported document table ddl invalid antfly extension",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"x-antfly-unknown\":true}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_invalid_antfly_extension",
+            .plan = "unsupported:ddl:requires=document_table_ddl_invalid_antfly_extension",
+        },
+        .{
+            .name = "unsupported document table ddl invalid dynamic template",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"dynamic_templates\":\"bad\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_invalid_dynamic_template",
+            .plan = "unsupported:ddl:requires=document_table_ddl_invalid_dynamic_template",
+        },
+        .{
+            .name = "unsupported document table ddl duplicate schema name",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}' DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_duplicate_schema_name",
+            .plan = "unsupported:ddl:requires=document_table_ddl_duplicate_schema_name",
+        },
+        .{
+            .name = "unsupported document table ddl multi document type",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}' DOCUMENT SCHEMA invoice AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_multi_document_type_unsupported",
+            .plan = "unsupported:ddl:requires=document_table_ddl_multi_document_type_unsupported",
+        },
+    };
+    var document_schema_validation_coverage = AppParityCorpusCoverage{};
+    for (document_schema_validation_entries) |entry| {
+        var parsed_schema_ddl = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+        defer parsed_schema_ddl.deinit(alloc);
+        try std.testing.expect(parsed_schema_ddl.generated_statement != null);
+        const schema_summary = appParityStructuredFixtureSummary(entry, &parsed_schema_ddl);
+        try std.testing.expect(schema_summary.hasReason(entry.classification_reason));
+        try std.testing.expect(schema_summary.parser.starts_with_create);
+        try std.testing.expect(schema_summary.parser.antfly_storage_mode_identifier);
+        try std.testing.expect(schema_summary.parser.document_string_literal);
+        if (!std.mem.eql(u8, entry.classification_reason, "document_table_ddl_missing_default_type")) {
+            try std.testing.expect(schema_summary.parser.antfly_default_type_identifier);
+        }
+        try document_schema_validation_coverage.observe(alloc, entry);
+    }
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_duplicate_schema_name);
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_invalid_antfly_extension);
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_invalid_dynamic_template);
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_malformed_schema_json);
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_missing_default_type);
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_multi_document_type_unsupported);
+    try std.testing.expect(document_schema_validation_coverage.unsupported_ddl_document_table_unknown_default_type);
+    const mixed_document_ddl_entries = [_]AppParityCorpusEntry{
+        .{
+            .name = "unsupported document table ddl relational column",
+            .sql = "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl primary key",
+            .sql = "CREATE TABLE docs (id uuid PRIMARY KEY) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl unique constraint",
+            .sql = "CREATE TABLE docs (email text UNIQUE) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl foreign key",
+            .sql = "CREATE TABLE docs (tenant_id text REFERENCES tenants (id)) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl check constraint",
+            .sql = "CREATE TABLE docs (amount numeric CHECK (amount >= 0)) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl generated column",
+            .sql = "CREATE TABLE docs (title text GENERATED ALWAYS AS (lower(title)) STORED) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl temporal period",
+            .sql = "CREATE TABLE docs (valid_from timestamptz, valid_to timestamptz, PERIOD FOR valid_time (valid_from, valid_to)) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl system versioning",
+            .sql = "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}' WITH SYSTEM VERSIONING",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+        .{
+            .name = "unsupported document table ddl column default",
+            .sql = "CREATE TABLE docs (status text DEFAULT 'open') WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'",
+            .family = .unsupported_ddl,
+            .classification_reason = "document_table_ddl_mixed_relational_shape",
+            .plan = "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+        },
+    };
+    var mixed_document_ddl_coverage = AppParityCorpusCoverage{};
+    for (mixed_document_ddl_entries, 0..) |entry, index| {
+        var parsed_mixed = try tokenized.ParsedSql.initAlloc(alloc, entry.sql);
+        defer parsed_mixed.deinit(alloc);
+        try std.testing.expect(parsed_mixed.generated_statement != null);
+        const mixed_summary = appParityStructuredFixtureSummary(entry, &parsed_mixed);
+        try std.testing.expect(mixed_summary.hasReason("document_table_ddl_mixed_relational_shape"));
+        try std.testing.expect(mixed_summary.parser.starts_with_create);
+        try std.testing.expect(mixed_summary.parser.antfly_storage_mode_identifier);
+        try std.testing.expect(mixed_summary.parser.antfly_default_type_identifier);
+        try std.testing.expect(mixed_summary.parser.document_string_literal);
+        try mixed_document_ddl_coverage.observe(alloc, entry);
+        if (index + 1 < mixed_document_ddl_entries.len) {
+            try std.testing.expect(!mixed_document_ddl_coverage.unsupported_ddl_document_table_mixed_relational_shape);
+        }
+    }
+    try std.testing.expect(mixed_document_ddl_coverage.unsupported_ddl_document_table_mixed_relational_shape);
+    var document_shorthand_sql = try tokenized.ParsedSql.initAlloc(alloc, "CREATE DOCUMENT TABLE docs");
+    defer document_shorthand_sql.deinit(alloc);
+    try std.testing.expect(document_shorthand_sql.generated_statement != null);
+    const document_shorthand = appParityStructuredFixtureSummary(.{
+        .name = "unsupported document table ddl shorthand",
         .sql = "CREATE DOCUMENT TABLE docs",
         .family = .unsupported_ddl,
         .classification_reason = "document_table_ddl_shorthand",
         .plan = "unsupported:ddl:requires=document_table_ddl_shorthand",
-    }, error.UnexpectedToken));
+    }, &document_shorthand_sql);
+    try std.testing.expect(document_shorthand.hasReason("document_table_ddl_shorthand"));
+    try std.testing.expect(document_shorthand.parser.starts_with_create);
 
     var aggregate_shape_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT lower(status) AS status_key, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC NULLS LAST), percentile_disc(0.5) WITHIN GROUP (ORDER BY amount), count(*) AS customer_id, array_agg(DISTINCT metadata->'source') FROM usage_records GROUP BY status_key");
     defer aggregate_shape_sql.deinit(alloc);

@@ -24149,6 +24149,389 @@ test "hosted mutation-source remote autocommit dispatches supported stage reques
     try std.testing.expectEqual(@as(usize, 4), executor.calls);
 }
 
+test "hosted mutation source expired claim reopens and later claimer recovers" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-expired-claim-reopen");
+    defer alloc.free(replica_root_dir);
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
+    defer std.Io.Dir.cwd().deleteTree(io_impl.io(), replica_root_dir) catch {};
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const LocalRouter = struct {
+        fn iface() table_router.HostedGroupRouter {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, group_id: u64) raft_mod.HostedReplicaStatus {
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn groupLeaderNodeId(_: *anyopaque, group_id: u64) ?u64 {
+            return if (group_id == 7001) 1 else null;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = node_id;
+            return if (group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, _: std.mem.Allocator, _: u64) !?[]u8 {
+            return null;
+        }
+    };
+
+    const Executor = struct {
+        fn iface() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(_: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), LocalRouter.iface(), Executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    _ = try source.source().batch(alloc, "docs", .{
+        .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\"}" }},
+        .timestamp_ns = 1_000,
+        .sync_level = .write,
+    });
+
+    const stale_txn = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
+    var stale_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:hosted-stale\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":1}},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer stale_request.deinit(alloc);
+
+    var stale_result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, stale_request.req)).?;
+    defer stale_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), stale_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), stale_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), stale_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"claimed\"}", stale_result.returning_rows[0]);
+    source.invalidateManagedCache("docs");
+    sleepNs(10 * std.time.ns_per_ms);
+
+    const path = try metadata_mod.groupDbPathFromReplicaRoot(alloc, replica_root_dir, 7001);
+    defer alloc.free(path);
+    {
+        var reopened = try db_mod.DB.open(alloc, path, .{});
+        defer reopened.close();
+        try reopened.setSchema(runtime_schema);
+        try std.testing.expectEqual(db_mod.types.TxnStatus.pending, try reopened.getTransactionStatus(stale_txn));
+        var visible = (try reopened.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+        defer visible.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, visible.json, "\"status\":\"ready\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, visible.json, "\"status\":\"claimed\"") == null);
+    }
+
+    const next_txn = try distributed_txn.parseTxnIdHex("102132435465768798a9babbdcddedef");
+    var next_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:hosted-next\",\"transaction_id\":\"102132435465768798a9babbdcddedef\",\"lease_ms\":60000}},\"patch\":{\"status\":\"done\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer next_request.deinit(alloc);
+
+    var next_result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, next_request.req)).?;
+    defer next_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), next_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), next_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), next_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"a\",\"status\":\"done\"}", next_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), next_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:a", next_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 1), next_result.participant_transforms.len);
+
+    const commit_tables = [_]distributed_txn.TableCommitRequest{.{
+        .table_name = "docs",
+        .predicates = next_result.participant_predicates,
+        .preimages = next_result.participant_preimages,
+        .writes = next_result.participant_writes,
+        .deletes = next_result.participant_deletes,
+        .transforms = next_result.participant_transforms,
+    }};
+    const outcome = (try source.source().commitTransactionWithId(alloc, next_txn, nextTxnTimestamp(), commit_tables[0..], .write)).?;
+    switch (outcome) {
+        .committed => {},
+        .conflict => return error.TestUnexpectedResult,
+    }
+    source.invalidateManagedCache("docs");
+
+    {
+        var reopened = try db_mod.DB.open(alloc, path, .{});
+        defer reopened.close();
+        try reopened.setSchema(runtime_schema);
+        try std.testing.expectEqual(db_mod.types.TxnStatus.aborted, try reopened.getTransactionStatus(stale_txn));
+        try std.testing.expectError(error.DecisionConflict, reopened.writeTransaction(stale_txn, .{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"stale\"}" }},
+        }));
+        var final = (try reopened.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+        defer final.deinit(alloc);
+        try std.testing.expect(std.mem.indexOf(u8, final.json, "\"status\":\"done\"") != null);
+        try std.testing.expect(std.mem.indexOf(u8, final.json, "\"status\":\"claimed\"") == null);
+        try std.testing.expect(std.mem.indexOf(u8, final.json, "\"status\":\"stale\"") == null);
+    }
+}
+
+test "hosted mutation-source rejects non-lockable derived sources before routing" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-non-lockable-source");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"source_id":{"type":"keyword"},"quantity":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        fn iface() table_catalog.CatalogSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{
+                    .group_id = 7001,
+                    .table_id = 7,
+                    .start_key = "",
+                    .end_key = null,
+                }})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RouterState = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn touch(ptr: *anyopaque) *@This() {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return self;
+        }
+
+        fn localNodeId(ptr: *anyopaque) u64 {
+            _ = touch(ptr);
+            return 1;
+        }
+
+        fn localStatus(ptr: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            _ = touch(ptr);
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
+            _ = touch(ptr);
+            return if (group_id == 7001) 2 else null;
+        }
+
+        fn nodeStatus(ptr: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            _ = touch(ptr);
+            return if (node_id == 2 and group_id == 7001) .active else .absent;
+        }
+
+        fn nodeBaseUri(ptr: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            _ = touch(ptr);
+            if (node_id != 2) return null;
+            return try alloc_inner.dupe(u8, "http://127.0.0.1:1");
+        }
+    };
+
+    const ExecutorState = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn execute(ptr: *anyopaque, _: std.mem.Allocator, _: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.UnexpectedHttpRequest;
+        }
+    };
+
+    const Checks = struct {
+        fn expectUndispatched(router: RouterState, executor: ExecutorState) !void {
+            try std.testing.expectEqual(@as(usize, 0), router.calls);
+            try std.testing.expectEqual(@as(usize, 0), executor.calls);
+        }
+    };
+
+    var router = RouterState{};
+    var executor = ExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, Catalog.iface(), router.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    const txn_id = try distributed_txn.parseTxnIdHex("00112233445566778899aabbccddeeff");
+    const base_request = db_mod.types.RelationalRowsMutationSourceRequest{
+        .kind = .update,
+        .source = .{
+            .source_cte = "materialized_ready",
+            .row_claim = .{
+                .mode = .for_update,
+                .owner_id = "session:non-lockable-source",
+                .txn_id = txn_id,
+                .lease_ms = 60_000,
+            },
+        },
+        .operations = &.{.{ .op = .set, .path = "status", .value_json = "\"claimed\"" }},
+    };
+
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, base_request));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsFromSourceAutocommit(alloc, "docs", runtime_schema, base_request, .write));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsMutationSourceCollectGroupLocal(alloc, 7001, "docs", 0, runtime_schema, base_request));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", 0, runtime_schema, base_request, 0, &.{}));
+    try Checks.expectUndispatched(router, executor);
+
+    var joined_request = try relational_rows_api.parseRowsJoinedMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"target_side\":\"left\",\"join\":{\"left\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"session:non-lockable-joined\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000}},\"right\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"source\"}},\"on\":[{\"left_field\":\"source_id\",\"right_field\":\"id\"}]},\"source_assignments\":[{\"target_field\":\"quantity\",\"side\":\"right\",\"field\":\"quantity\"}],\"patch\":{\"status\":\"joined\"}}",
+        runtime_schema,
+    );
+    defer joined_request.deinit(alloc);
+    const source_rows = [_][]const u8{
+        "{\"id\":\"source:a\",\"status\":\"source\",\"quantity\":7}",
+    };
+
+    var target_cte_request = joined_request.req;
+    target_cte_request.join.left.source_cte = "materialized_targets";
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, target_cte_request, source_rows[0..]));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, target_cte_request, source_rows[0..], .write));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceCollectGroupLocal(alloc, 7001, "docs", 0, runtime_schema, target_cte_request));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceInputsGroupLocal(alloc, 7001, "docs", 0, runtime_schema, target_cte_request));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", 0, runtime_schema, runtime_schema, target_cte_request, 0, &.{}));
+    try Checks.expectUndispatched(router, executor);
+
+    var source_claim_request = joined_request.req;
+    source_claim_request.join.right.row_claim = .{
+        .mode = .for_update,
+        .owner_id = "session:non-lockable-source-side",
+        .txn_id = txn_id,
+        .lease_ms = 60_000,
+    };
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRows(alloc, "docs", runtime_schema, runtime_schema, source_claim_request, source_rows[0..]));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().mutateRowsJoinedFromSourceRowsAutocommit(alloc, "docs", runtime_schema, runtime_schema, source_claim_request, source_rows[0..], .write));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceCollectGroupLocal(alloc, 7001, "docs", 0, runtime_schema, source_claim_request));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceInputsGroupLocal(alloc, 7001, "docs", 0, runtime_schema, source_claim_request));
+    try Checks.expectUndispatched(router, executor);
+    try std.testing.expectError(error.UnsupportedRowsQuery, source.source().rowsJoinedMutationSourceStagePlannedGroupLocal(alloc, 7001, "docs", 0, runtime_schema, runtime_schema, source_claim_request, 0, &.{}));
+    try Checks.expectUndispatched(router, executor);
+}
+
 test "hosted joined mutation source stages global planned candidates across remote owners" {
     const alloc = std.testing.allocator;
     const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-joined-remote-planned-stage");
@@ -25698,6 +26081,244 @@ test "hosted mutation source stages global planned candidates across remote owne
     try std.testing.expectEqualStrings("row:a", retry_result.participant_predicates[0].key);
     try std.testing.expectEqual(@as(usize, 4), executor.collect_calls);
     try std.testing.expectEqual(@as(usize, 3), executor.stage_calls);
+}
+
+test "hosted mutation source skip locked preserves order across topology retry and leader handoff" {
+    const alloc = std.testing.allocator;
+    const replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-skip-locked-topology-leader");
+    defer alloc.free(replica_root_dir);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try tables_api.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const Catalog = struct {
+        snapshot_calls: usize = 0,
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.snapshot_calls += 1;
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                    .table_id = 7,
+                    .name = "docs",
+                    .placement_role = "data",
+                    .schema_json = schema_json,
+                }})[0..]),
+                .ranges = if (self.snapshot_calls == 1)
+                    @constCast((&[_]metadata_table_manager.RangeRecord{
+                        .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:m" },
+                        .{ .group_id = 7002, .table_id = 7, .start_key = "row:m", .end_key = null },
+                    })[0..])
+                else
+                    @constCast((&[_]metadata_table_manager.RangeRecord{
+                        .{ .group_id = 7001, .table_id = 7, .start_key = "", .end_key = "row:n" },
+                        .{ .group_id = 7002, .table_id = 7, .start_key = "row:n", .end_key = null },
+                    })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const RouterState = struct {
+        catalog: *Catalog,
+        node2_routes: usize = 0,
+        node3_routes: usize = 0,
+
+        fn iface(self: *@This()) table_router.HostedGroupRouter {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .local_node_id = localNodeId,
+                    .local_status = localStatus,
+                    .group_leader_node_id = groupLeaderNodeId,
+                    .node_status = nodeStatus,
+                    .node_base_uri = nodeBaseUri,
+                },
+            };
+        }
+
+        fn localNodeId(_: *anyopaque) u64 {
+            return 1;
+        }
+
+        fn localStatus(_: *anyopaque, _: u64) raft_mod.HostedReplicaStatus {
+            return .absent;
+        }
+
+        fn groupLeaderNodeId(ptr: *anyopaque, group_id: u64) ?u64 {
+            if (group_id != 7001 and group_id != 7002) return null;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            if (self.catalog.snapshot_calls <= 1) {
+                self.node2_routes += 1;
+                return 2;
+            }
+            self.node3_routes += 1;
+            return 3;
+        }
+
+        fn nodeStatus(_: *anyopaque, node_id: u64, group_id: u64) raft_mod.HostedReplicaStatus {
+            if ((node_id == 2 or node_id == 3) and (group_id == 7001 or group_id == 7002)) return .active;
+            return .absent;
+        }
+
+        fn nodeBaseUri(_: *anyopaque, alloc_inner: std.mem.Allocator, node_id: u64) !?[]u8 {
+            if (node_id == 2) return try alloc_inner.dupe(u8, "http://node2.test:1");
+            if (node_id == 3) return try alloc_inner.dupe(u8, "http://node3.test:1");
+            return null;
+        }
+    };
+
+    const ExecutorState = struct {
+        collect_calls: usize = 0,
+        stage_calls: usize = 0,
+        first_epoch: ?u64 = null,
+        retry_epoch: ?u64 = null,
+        staged_n: bool = false,
+        staged_z: bool = false,
+
+        fn iface(self: *@This()) http_common.RequestExecutor {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute = execute },
+            };
+        }
+
+        fn requestNodeId(request: http_common.HttpRequest) !u64 {
+            if (std.mem.startsWith(u8, request.uri, "http://node2.test:1")) return 2;
+            if (std.mem.startsWith(u8, request.uri, "http://node3.test:1")) return 3;
+            return error.TestUnexpectedResult;
+        }
+
+        fn recordRetryEpoch(self: *@This(), epoch: u64) !void {
+            try std.testing.expect(epoch != 0);
+            if (self.retry_epoch) |expected| {
+                try std.testing.expectEqual(expected, epoch);
+            } else {
+                try std.testing.expect(self.first_epoch != null);
+                try std.testing.expect(epoch != self.first_epoch.?);
+                self.retry_epoch = epoch;
+            }
+        }
+
+        fn execute(ptr: *anyopaque, alloc_inner: std.mem.Allocator, request: http_common.HttpRequest) !http_common.HttpResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqual(http_common.Method.POST, request.method);
+            try std.testing.expectEqualStrings("application/json", request.content_type.?);
+            const node_id = try requestNodeId(request);
+            const group_id: u64 = if (std.mem.indexOf(u8, request.uri, "/groups/7001/") != null) 7001 else if (std.mem.indexOf(u8, request.uri, "/groups/7002/") != null) 7002 else return error.TestUnexpectedResult;
+            if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/collect")) {
+                self.collect_calls += 1;
+                const CollectWire = struct {
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(CollectWire, alloc_inner, request.body, .{ .ignore_unknown_fields = true });
+                defer parsed.deinit();
+                try std.testing.expect(parsed.value.topology_epoch != 0);
+                if (self.collect_calls == 1) {
+                    try std.testing.expectEqual(@as(u64, 2), node_id);
+                    try std.testing.expectEqual(@as(u64, 7001), group_id);
+                    self.first_epoch = parsed.value.topology_epoch;
+                    return .{ .status = 409, .body = try alloc_inner.dupe(u8, "TopologyChanged") };
+                }
+                try std.testing.expectEqual(@as(u64, 3), node_id);
+                try self.recordRetryEpoch(parsed.value.topology_epoch);
+                const body = if (group_id == 7001)
+                    "{\"candidates\":[{\"doc_key\":\"row:a\",\"json\":{\"id\":\"a\",\"status\":\"ready\"},\"version\":9,\"ordinal\":0,\"group_id\":7001,\"order_keys\":[{\"type\":\"string\",\"value\":\"a\"}]}]}"
+                else
+                    "{\"candidates\":[{\"doc_key\":\"row:n\",\"json\":{\"id\":\"n\",\"status\":\"ready\"},\"version\":12,\"ordinal\":0,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"n\"}]},{\"doc_key\":\"row:z\",\"json\":{\"id\":\"z\",\"status\":\"ready\"},\"version\":13,\"ordinal\":1,\"group_id\":7002,\"order_keys\":[{\"type\":\"string\",\"value\":\"z\"}]}]}";
+                return .{ .status = 200, .body = try alloc_inner.dupe(u8, body) };
+            }
+            if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/stage")) {
+                self.stage_calls += 1;
+                try std.testing.expectEqual(@as(u64, 3), node_id);
+                const StageWire = struct {
+                    planned_stage: []const u8,
+                    topology_epoch: u64,
+                };
+                var parsed = try std.json.parseFromSlice(StageWire, alloc_inner, request.body, .{
+                    .allocate = .alloc_always,
+                    .ignore_unknown_fields = true,
+                });
+                defer parsed.deinit();
+                try std.testing.expectEqual(self.retry_epoch.?, parsed.value.topology_epoch);
+                var planned = try relational_rows_api.parseRowsMutationSourcePlannedStageAlloc(alloc_inner, parsed.value.planned_stage);
+                defer planned.deinit(alloc_inner);
+                try std.testing.expectEqual(@as(u32, 3), planned.matched);
+                try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
+                try std.testing.expectEqual(group_id, planned.candidates[0].group_id);
+                if (group_id == 7001) {
+                    try std.testing.expectEqualStrings("row:a", planned.candidates[0].doc_key);
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":3,\"staged\":0}") };
+                }
+                if (std.mem.eql(u8, planned.candidates[0].doc_key, "row:n")) {
+                    try std.testing.expect(!self.staged_n);
+                    self.staged_n = true;
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":3,\"staged\":1,\"returning\":[{\"id\":\"n\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:n\",\"expected_version\":12}]}") };
+                }
+                if (std.mem.eql(u8, planned.candidates[0].doc_key, "row:z")) {
+                    try std.testing.expect(!self.staged_z);
+                    self.staged_z = true;
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":3,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":13}]}") };
+                }
+                return error.TestUnexpectedResult;
+            }
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var catalog = Catalog{};
+    var router = RouterState{ .catalog = &catalog };
+    var executor = ExecutorState{};
+    var source = HostedProvisionedTableWriteSource.init(replica_root_dir, catalog.iface(), router.iface(), executor.iface());
+    defer source.invalidateManagedCache("docs");
+
+    var request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:skip-locked-topology-leader\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":2},\"patch\":{\"status\":\"claimed\"},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer request.deinit(alloc);
+
+    var result = (try source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, request.req)).?;
+    defer result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 3), result.matched);
+    try std.testing.expectEqual(@as(u32, 2), result.staged);
+    try std.testing.expectEqual(@as(usize, 2), result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"n\",\"status\":\"claimed\"}", result.returning_rows[0]);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"claimed\"}", result.returning_rows[1]);
+    try std.testing.expectEqual(@as(usize, 2), result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:n", result.participant_predicates[0].key);
+    try std.testing.expectEqualStrings("row:z", result.participant_predicates[1].key);
+    try std.testing.expectEqual(@as(u64, 12), result.participant_predicates[0].expected_version);
+    try std.testing.expectEqual(@as(u64, 13), result.participant_predicates[1].expected_version);
+    try std.testing.expect(executor.staged_n);
+    try std.testing.expect(executor.staged_z);
+    try std.testing.expectEqual(@as(usize, 2), catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 3), executor.stage_calls);
+    try std.testing.expect(router.node2_routes >= 1);
+    try std.testing.expect(router.node3_routes >= 1);
 }
 
 test "provisioned table read source survives many external write-sync batches before first profiled dense query" {

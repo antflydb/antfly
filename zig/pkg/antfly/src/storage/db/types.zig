@@ -88,6 +88,11 @@ pub const BatchWrite = struct {
     value: []const u8,
 };
 
+pub const BatchWriteMode = enum {
+    upsert,
+    create_only,
+};
+
 pub const TransformOpType = enum {
     set,
     set_on_insert,
@@ -126,6 +131,7 @@ pub const BatchRequest = struct {
     predicates: []const TransactionVersionPredicate = &.{},
     timestamp_ns: u64 = 0,
     sync_level: SyncLevel = .write,
+    write_mode: BatchWriteMode = .upsert,
 };
 
 pub const GraphEdgeWrite = struct {

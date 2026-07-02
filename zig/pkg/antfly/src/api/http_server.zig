@@ -32364,6 +32364,181 @@ test "api http server executes SQL reads through typed row plan ingress" {
     try expectPublicSqlDiagnosticMissingNativeModel(alloc, cte_claim_resp.body, "lockable base-row source for materialized CTE row claim");
 }
 
+test "api http server executes domain SQL fixtures through typed row plan parity" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant_id":{"type":"keyword"},"subject_id":{"type":"keyword"},"access_role":{"type":"keyword"},"resource_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"migrated":{"type":"boolean"},"updated_at":{"type":"numeric"}},"required":["id","kind"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/domain-sql-typed-parity", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    var read_source = table_reads.BoundTableReadSource.init("domain_records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
+    var write_source = table_writes.BoundTableWriteSource.init("domain_records", &db);
+
+    const FakeSource = struct {
+        tables: [1]metadata_table_manager.TableRecord,
+
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = try status(ptr),
+                .tables = self.tables[0..],
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    var source = FakeSource{ .tables = .{.{
+        .table_id = 1,
+        .name = "domain_records",
+        .schema_json = schema_json,
+        .desired_replica_count = 1,
+    }} };
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
+    defer server.deinit();
+
+    var insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/domain_records/rows/batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"kind\":\"usage\",\"tenant_id\":\"t1\",\"status\":\"active\",\"amount\":10,\"created_at\":10}},{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"kind\":\"usage\",\"tenant_id\":\"t1\",\"status\":\"active\",\"amount\":25,\"created_at\":20}},{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"kind\":\"usage\",\"tenant_id\":\"t1\",\"status\":\"archived\",\"amount\":5,\"created_at\":30}},{\"op\":\"insert\",\"row\":{\"id\":\"u4\",\"kind\":\"usage\",\"tenant_id\":\"t2\",\"status\":\"active\",\"amount\":7,\"created_at\":40}},{\"op\":\"insert\",\"row\":{\"id\":\"m1\",\"kind\":\"membership\",\"tenant_id\":\"t1\",\"subject_id\":\"user:1\",\"access_role\":\"admin\",\"resource_id\":\"project:1\",\"status\":\"active\",\"migrated\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"m2\",\"kind\":\"membership\",\"tenant_id\":\"t1\",\"subject_id\":\"user:1\",\"access_role\":\"viewer\",\"resource_id\":\"project:2\",\"status\":\"active\",\"migrated\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"m3\",\"kind\":\"membership\",\"tenant_id\":\"t2\",\"subject_id\":\"user:1\",\"access_role\":\"admin\",\"resource_id\":\"project:9\",\"status\":\"active\",\"migrated\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"w1\",\"kind\":\"wake_job\",\"tenant_id\":\"t1\",\"status\":\"queued\",\"priority\":5,\"created_at\":100}},{\"op\":\"insert\",\"row\":{\"id\":\"w2\",\"kind\":\"wake_job\",\"tenant_id\":\"t1\",\"status\":\"queued\",\"priority\":10,\"created_at\":90}},{\"op\":\"insert\",\"row\":{\"id\":\"w3\",\"kind\":\"wake_job\",\"tenant_id\":\"t1\",\"status\":\"running\",\"priority\":100,\"created_at\":80}},{\"op\":\"insert\",\"row\":{\"id\":\"b1\",\"kind\":\"backfill\",\"tenant_id\":\"t1\",\"status\":\"validated\",\"migrated\":true,\"updated_at\":1000}},{\"op\":\"insert\",\"row\":{\"id\":\"b2\",\"kind\":\"backfill\",\"tenant_id\":\"t1\",\"status\":\"pending\",\"migrated\":false,\"updated_at\":1001}}]}",
+    });
+    defer insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
+
+    var sql_usage_resp = try server.handlePublicSql("{\"sql\":\"SELECT tenant_id, status, SUM(amount) AS amount_sum, COUNT(*) AS row_count FROM domain_records WHERE kind = 'usage' GROUP BY tenant_id, status ORDER BY tenant_id ASC, status ASC;\"}", null);
+    defer sql_usage_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_usage_resp.status);
+    var parsed_sql_usage = try std.json.parseFromSlice(std.json.Value, alloc, sql_usage_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_usage.deinit();
+    const sql_usage_rows = parsed_sql_usage.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), sql_usage_rows.len);
+    try std.testing.expectEqualStrings("t1", sql_usage_rows[0].object.get("tenant_id").?.string);
+    try std.testing.expectEqualStrings("active", sql_usage_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 35), sql_usage_rows[0].object.get("amount_sum").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), sql_usage_rows[0].object.get("row_count").?.integer);
+
+    var typed_usage_resp = try server.handlePublicTableRowsAggregate("domain_records", "{\"aggregate\":{\"source\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"usage\"}},\"group_by\":[\"tenant_id\",\"status\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"row_count\",\"op\":\"count\"}],\"order_by\":[{\"field\":\"tenant_id\"},{\"field\":\"status\"}]}}", null);
+    defer typed_usage_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_usage_resp.status);
+    var parsed_typed_usage = try std.json.parseFromSlice(std.json.Value, alloc, typed_usage_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_usage.deinit();
+    const typed_usage_rows = parsed_typed_usage.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), typed_usage_rows.len);
+    try std.testing.expectEqualStrings("t1", typed_usage_rows[0].object.get("tenant_id").?.string);
+    try std.testing.expectEqualStrings("active", typed_usage_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 35), typed_usage_rows[0].object.get("amount_sum").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), typed_usage_rows[0].object.get("row_count").?.integer);
+
+    var sql_rbac_resp = try server.handlePublicSql("{\"sql\":\"SELECT resource_id, access_role FROM domain_records WHERE kind = 'membership' AND tenant_id = 't1' AND subject_id = 'user:1' AND status = 'active' ORDER BY resource_id ASC;\"}", null);
+    defer sql_rbac_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_rbac_resp.status);
+    var parsed_sql_rbac = try std.json.parseFromSlice(std.json.Value, alloc, sql_rbac_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_rbac.deinit();
+    const sql_rbac_rows = parsed_sql_rbac.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), sql_rbac_rows.len);
+    try std.testing.expectEqualStrings("project:1", sql_rbac_rows[0].object.get("resource_id").?.string);
+    try std.testing.expectEqualStrings("admin", sql_rbac_rows[0].object.get("access_role").?.string);
+
+    var typed_rbac_resp = try server.handlePublicTableRowsQuery("domain_records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"membership\"},{\"field\":\"tenant_id\",\"op\":\"eq\",\"value\":\"t1\"},{\"field\":\"subject_id\",\"op\":\"eq\",\"value\":\"user:1\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]},\"select\":[\"resource_id\",\"access_role\"],\"order_by\":[{\"field\":\"resource_id\"}]}}", null);
+    defer typed_rbac_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_rbac_resp.status);
+    var parsed_typed_rbac = try std.json.parseFromSlice(std.json.Value, alloc, typed_rbac_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_rbac.deinit();
+    const typed_rbac_rows = parsed_typed_rbac.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), typed_rbac_rows.len);
+    try std.testing.expectEqualStrings("project:1", typed_rbac_rows[0].object.get("resource_id").?.string);
+    try std.testing.expectEqualStrings("admin", typed_rbac_rows[0].object.get("access_role").?.string);
+
+    var sql_wake_resp = try server.handlePublicSql("{\"sql\":\"SELECT id, priority FROM domain_records WHERE kind = 'wake_job' AND status = 'queued' ORDER BY priority DESC, created_at ASC LIMIT 1;\"}", null);
+    defer sql_wake_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_wake_resp.status);
+    var parsed_sql_wake = try std.json.parseFromSlice(std.json.Value, alloc, sql_wake_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_wake.deinit();
+    const sql_wake_rows = parsed_sql_wake.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), sql_wake_rows.len);
+    try std.testing.expectEqualStrings("w2", sql_wake_rows[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), sql_wake_rows[0].object.get("priority").?.integer);
+
+    var typed_wake_resp = try server.handlePublicTableRowsQuery("domain_records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"wake_job\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"queued\"}]},\"select\":[\"id\",\"priority\"],\"order_by\":[{\"field\":\"priority\",\"direction\":\"desc\"},{\"field\":\"created_at\",\"direction\":\"asc\"}],\"limit\":1}}", null);
+    defer typed_wake_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_wake_resp.status);
+    var parsed_typed_wake = try std.json.parseFromSlice(std.json.Value, alloc, typed_wake_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_wake.deinit();
+    const typed_wake_rows = parsed_typed_wake.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), typed_wake_rows.len);
+    try std.testing.expectEqualStrings("w2", typed_wake_rows[0].object.get("id").?.string);
+    try std.testing.expectEqual(@as(i64, 10), typed_wake_rows[0].object.get("priority").?.integer);
+
+    var sql_dashboard_resp = try server.handlePublicSql("{\"sql\":\"SELECT status, COUNT(*) AS row_count, SUM(amount) AS amount_sum FROM domain_records WHERE kind = 'usage' AND tenant_id = 't1' GROUP BY status ORDER BY status ASC;\"}", null);
+    defer sql_dashboard_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_dashboard_resp.status);
+    var parsed_sql_dashboard = try std.json.parseFromSlice(std.json.Value, alloc, sql_dashboard_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_dashboard.deinit();
+    const sql_dashboard_rows = parsed_sql_dashboard.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), sql_dashboard_rows.len);
+    try std.testing.expectEqualStrings("active", sql_dashboard_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 2), sql_dashboard_rows[0].object.get("row_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 35), sql_dashboard_rows[0].object.get("amount_sum").?.integer);
+
+    var typed_dashboard_resp = try server.handlePublicTableRowsAggregate("domain_records", "{\"aggregate\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"usage\"},{\"field\":\"tenant_id\",\"op\":\"eq\",\"value\":\"t1\"}]}},\"group_by\":[\"status\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}],\"order_by\":[{\"field\":\"status\"}]}}", null);
+    defer typed_dashboard_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_dashboard_resp.status);
+    var parsed_typed_dashboard = try std.json.parseFromSlice(std.json.Value, alloc, typed_dashboard_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_dashboard.deinit();
+    const typed_dashboard_rows = parsed_typed_dashboard.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 2), typed_dashboard_rows.len);
+    try std.testing.expectEqualStrings("active", typed_dashboard_rows[0].object.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 2), typed_dashboard_rows[0].object.get("row_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 35), typed_dashboard_rows[0].object.get("amount_sum").?.integer);
+
+    var sql_backfill_resp = try server.handlePublicSql("{\"sql\":\"SELECT COUNT(*) AS missing_count FROM domain_records WHERE kind = 'backfill' AND migrated = false;\"}", null);
+    defer sql_backfill_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_backfill_resp.status);
+    var parsed_sql_backfill = try std.json.parseFromSlice(std.json.Value, alloc, sql_backfill_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_backfill.deinit();
+    const sql_backfill_rows = parsed_sql_backfill.value.object.get("result").?.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), sql_backfill_rows.len);
+    try std.testing.expectEqual(@as(i64, 1), sql_backfill_rows[0].object.get("missing_count").?.integer);
+
+    var typed_backfill_resp = try server.handlePublicTableRowsAggregate("domain_records", "{\"aggregate\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"backfill\"},{\"field\":\"migrated\",\"op\":\"eq\",\"value\":false}]}},\"aggregations\":[{\"name\":\"missing_count\",\"op\":\"count\"}]}}", null);
+    defer typed_backfill_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_backfill_resp.status);
+    var parsed_typed_backfill = try std.json.parseFromSlice(std.json.Value, alloc, typed_backfill_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_backfill.deinit();
+    const typed_backfill_rows = parsed_typed_backfill.value.object.get("rows").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), typed_backfill_rows.len);
+    try std.testing.expectEqual(@as(i64, 1), typed_backfill_rows[0].object.get("missing_count").?.integer);
+}
+
 test "api http server executes document SQL reads through typed document plan ingress" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -33260,6 +33435,177 @@ test "api http server executes SQL point writes through typed row batch ingress"
     const delete_row = delete_result.get("returning").?.array.items[0].object;
     try std.testing.expectEqualStrings("u1", delete_row.get("id").?.string);
     try std.testing.expectEqualStrings("closed", delete_row.get("status").?.string);
+
+    var sql_returning_insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-insert', 'ready', 21) RETURNING id, status, amount;\"}",
+    });
+    defer sql_returning_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_returning_insert_resp.status);
+    var parsed_sql_returning_insert = try std.json.parseFromSlice(std.json.Value, alloc, sql_returning_insert_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_returning_insert.deinit();
+    const sql_returning_insert_row = parsed_sql_returning_insert.value.object.get("result").?.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("sql-returning-insert", sql_returning_insert_row.get("id").?.string);
+    try std.testing.expectEqualStrings("ready", sql_returning_insert_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 21), sql_returning_insert_row.get("amount").?.integer);
+
+    var typed_returning_insert_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/usage_records/rows/batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"typed-returning-insert\",\"status\":\"ready\",\"amount\":21},\"returning\":[\"id\",\"status\",\"amount\"]}]}",
+    });
+    defer typed_returning_insert_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), typed_returning_insert_resp.status);
+    var parsed_typed_returning_insert = try std.json.parseFromSlice(std.json.Value, alloc, typed_returning_insert_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_returning_insert.deinit();
+    const typed_returning_insert_row = parsed_typed_returning_insert.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("typed-returning-insert", typed_returning_insert_row.get("id").?.string);
+    try std.testing.expectEqualStrings(sql_returning_insert_row.get("status").?.string, typed_returning_insert_row.get("status").?.string);
+    try std.testing.expectEqual(sql_returning_insert_row.get("amount").?.integer, typed_returning_insert_row.get("amount").?.integer);
+
+    var sql_conflict_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-conflict', 'old', 1), ('typed-returning-conflict', 'old', 1), ('sql-returning-noop', 'old', 2), ('typed-returning-noop', 'old', 2);\"}",
+    });
+    defer sql_conflict_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_conflict_seed_resp.status);
+
+    var sql_conflict_update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-conflict', 'new', 5) ON CONFLICT (id) DO UPDATE SET status = excluded.status, amount = excluded.amount RETURNING id, status, amount;\"}",
+    });
+    defer sql_conflict_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_conflict_update_resp.status);
+    var parsed_sql_conflict_update = try std.json.parseFromSlice(std.json.Value, alloc, sql_conflict_update_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_conflict_update.deinit();
+    const sql_conflict_update_row = parsed_sql_conflict_update.value.object.get("result").?.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("sql-returning-conflict", sql_conflict_update_row.get("id").?.string);
+    try std.testing.expectEqualStrings("new", sql_conflict_update_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 5), sql_conflict_update_row.get("amount").?.integer);
+
+    var typed_conflict_update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/usage_records/rows/batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"typed-returning-conflict\",\"status\":\"new\",\"amount\":5},\"on_conflict\":{\"target\":{\"primary\":true},\"action\":\"update\",\"patch\":{\"status\":\"new\",\"amount\":5}},\"returning\":[\"id\",\"status\",\"amount\"]}]}",
+    });
+    defer typed_conflict_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), typed_conflict_update_resp.status);
+    var parsed_typed_conflict_update = try std.json.parseFromSlice(std.json.Value, alloc, typed_conflict_update_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_conflict_update.deinit();
+    const typed_conflict_update_row = parsed_typed_conflict_update.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("typed-returning-conflict", typed_conflict_update_row.get("id").?.string);
+    try std.testing.expectEqualStrings(sql_conflict_update_row.get("status").?.string, typed_conflict_update_row.get("status").?.string);
+    try std.testing.expectEqual(sql_conflict_update_row.get("amount").?.integer, typed_conflict_update_row.get("amount").?.integer);
+
+    var sql_conflict_noop_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-noop', 'ignored', 9) ON CONFLICT (id) DO NOTHING RETURNING id, status, amount;\"}",
+    });
+    defer sql_conflict_noop_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_conflict_noop_resp.status);
+    var parsed_sql_conflict_noop = try std.json.parseFromSlice(std.json.Value, alloc, sql_conflict_noop_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_conflict_noop.deinit();
+    const sql_conflict_noop_result = parsed_sql_conflict_noop.value.object.get("result").?.object;
+    try std.testing.expect(sql_conflict_noop_result.get("returning") == null or sql_conflict_noop_result.get("returning").?.array.items.len == 0);
+
+    var typed_conflict_noop_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/usage_records/rows/batch",
+        .content_type = "application/json",
+        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"typed-returning-noop\",\"status\":\"ignored\",\"amount\":9},\"on_conflict\":{\"target\":{\"primary\":true},\"action\":\"nothing\"},\"returning\":[\"id\",\"status\",\"amount\"]}]}",
+    });
+    defer typed_conflict_noop_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 201), typed_conflict_noop_resp.status);
+    var parsed_typed_conflict_noop = try std.json.parseFromSlice(std.json.Value, alloc, typed_conflict_noop_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_conflict_noop.deinit();
+    try std.testing.expect(parsed_typed_conflict_noop.value.object.get("returning") == null or parsed_typed_conflict_noop.value.object.get("returning").?.array.items.len == 0);
+
+    var sql_claim_seed_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-claim', 'queued', 3), ('typed-returning-claim', 'queued', 3), ('sql-returning-delete', 'done', 4), ('typed-returning-delete', 'done', 4);\"}",
+    });
+    defer sql_claim_seed_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_claim_seed_resp.status);
+
+    var sql_claim_update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"UPDATE usage_records SET status = 'claimed', amount = amount + 1 WHERE id = 'sql-returning-claim' FOR UPDATE RETURNING id, status, amount;\"}",
+    });
+    defer sql_claim_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_claim_update_resp.status);
+    var parsed_sql_claim_update = try std.json.parseFromSlice(std.json.Value, alloc, sql_claim_update_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_claim_update.deinit();
+    const sql_claim_update_row = parsed_sql_claim_update.value.object.get("result").?.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("sql-returning-claim", sql_claim_update_row.get("id").?.string);
+    try std.testing.expectEqualStrings("claimed", sql_claim_update_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 4), sql_claim_update_row.get("amount").?.integer);
+
+    const typed_claim_update_txn_hex = "11112233445566778899aabbccddeeff";
+    const typed_claim_update_txn_id = try distributed_txn.parseTxnIdHex(typed_claim_update_txn_hex);
+    _ = try db.beginTransactionWithId(typed_claim_update_txn_id, 1_100);
+    var typed_claim_update_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/usage_records/rows/mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"typed-returning-claim\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"typed:returning-update\",\"transaction_id\":\"11112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"},\"increment\":{\"amount\":1},\"returning\":[\"id\",\"status\",\"amount\"]}",
+    });
+    defer typed_claim_update_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_claim_update_resp.status);
+    var parsed_typed_claim_update = try std.json.parseFromSlice(std.json.Value, alloc, typed_claim_update_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_claim_update.deinit();
+    const typed_claim_update_row = parsed_typed_claim_update.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("typed-returning-claim", typed_claim_update_row.get("id").?.string);
+    try std.testing.expectEqualStrings(sql_claim_update_row.get("status").?.string, typed_claim_update_row.get("status").?.string);
+    try std.testing.expectEqual(sql_claim_update_row.get("amount").?.integer, typed_claim_update_row.get("amount").?.integer);
+    try db.commitTransaction(typed_claim_update_txn_id, 1_101);
+
+    var sql_claim_delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/db/v1/sql",
+        .content_type = "application/json",
+        .body = "{\"sql\":\"DELETE FROM usage_records WHERE id = 'sql-returning-delete' FOR UPDATE RETURNING id, status, amount;\"}",
+    });
+    defer sql_claim_delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), sql_claim_delete_resp.status);
+    var parsed_sql_claim_delete = try std.json.parseFromSlice(std.json.Value, alloc, sql_claim_delete_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_sql_claim_delete.deinit();
+    const sql_claim_delete_row = parsed_sql_claim_delete.value.object.get("result").?.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("sql-returning-delete", sql_claim_delete_row.get("id").?.string);
+    try std.testing.expectEqualStrings("done", sql_claim_delete_row.get("status").?.string);
+    try std.testing.expectEqual(@as(i64, 4), sql_claim_delete_row.get("amount").?.integer);
+
+    const typed_claim_delete_txn_hex = "22112233445566778899aabbccddeeff";
+    const typed_claim_delete_txn_id = try distributed_txn.parseTxnIdHex(typed_claim_delete_txn_hex);
+    _ = try db.beginTransactionWithId(typed_claim_delete_txn_id, 1_200);
+    var typed_claim_delete_resp = try server.handle(.{
+        .method = .POST,
+        .uri = "/tables/usage_records/rows/mutation-source",
+        .content_type = "application/json",
+        .body = "{\"op\":\"delete\",\"source\":{\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"typed-returning-delete\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"typed:returning-delete\",\"transaction_id\":\"22112233445566778899aabbccddeeff\"}},\"returning\":[\"id\",\"status\",\"amount\"]}",
+    });
+    defer typed_claim_delete_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 200), typed_claim_delete_resp.status);
+    var parsed_typed_claim_delete = try std.json.parseFromSlice(std.json.Value, alloc, typed_claim_delete_resp.body, .{ .allocate = .alloc_always });
+    defer parsed_typed_claim_delete.deinit();
+    const typed_claim_delete_row = parsed_typed_claim_delete.value.object.get("returning").?.array.items[0].object;
+    try std.testing.expectEqualStrings("typed-returning-delete", typed_claim_delete_row.get("id").?.string);
+    try std.testing.expectEqualStrings(sql_claim_delete_row.get("status").?.string, typed_claim_delete_row.get("status").?.string);
+    try std.testing.expectEqual(sql_claim_delete_row.get("amount").?.integer, typed_claim_delete_row.get("amount").?.integer);
+    try db.commitTransaction(typed_claim_delete_txn_id, 1_201);
 
     var query_resp = try server.handle(.{
         .method = .POST,

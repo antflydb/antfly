@@ -12782,6 +12782,141 @@ test "db transaction recovery runtime resolves table-group participants through 
     try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, db.getTransactionStatus(txn_id));
 }
 
+test "db transaction recovery resolves committed mutation-source participant after reopen" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/distributed-mutation-source-participant-reopen", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    var parsed_schema = try schema_mod.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    const runtime_schema = try schema_mod.deriveRuntimeTableSchema(alloc, parsed_schema);
+    defer storage_schema.freeSchema(alloc, runtime_schema);
+
+    const participant = try participantIdForGroup(alloc, "docs", 77);
+    defer alloc.free(participant);
+    const txn_id = blk: {
+        var db = try db_mod.DB.open(alloc, path, .{});
+        defer db.close();
+        try db.setSchema(runtime_schema);
+
+        try db.batch(.{
+            .writes = &.{.{ .key = "row:a", .value = "{\"id\":\"a\",\"status\":\"ready\"}" }},
+            .timestamp_ns = 1_000,
+        });
+
+        const staged_txn = try db.beginTransactionWithParticipants(2_000, &.{participant});
+        const predicates = [_]storage_schema.RelationalCheck{.{
+            .name = "",
+            .field = "status",
+            .op = .eq,
+            .value_json = "\"ready\"",
+        }};
+        const operations = [_]db_mod.types.TransformOp{.{
+            .op = .set,
+            .path = "status",
+            .value_json = "\"done\"",
+        }};
+        var staged = try db.mutateRelationalRowsFromSource(alloc, runtime_schema, .{
+            .kind = .update,
+            .source = .{
+                .predicates = predicates[0..],
+                .row_claim = .{
+                    .mode = .for_update,
+                    .owner_id = "session:reopen-participant",
+                    .lease_ms = 60_000,
+                    .txn_id = staged_txn,
+                },
+            },
+            .operations = operations[0..],
+        });
+        defer staged.deinit(alloc);
+        try std.testing.expectEqual(@as(u32, 1), staged.matched);
+        try std.testing.expectEqual(@as(u32, 1), staged.staged);
+
+        try db.resolveTransactionIntents(staged_txn, .committed, 2_100);
+        break :blk staged_txn;
+    };
+
+    const Recorder = struct {
+        calls: usize = 0,
+        last_group_id: u64 = 0,
+        last_status: ?db_mod.types.TxnStatus = null,
+        last_commit_version: u64 = 0,
+
+        fn worker(self: *@This()) ParticipantWorker {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .begin_group = begin,
+                    .prepare_group = prepare,
+                    .resolve_group = resolve,
+                    .status_group = status,
+                },
+            };
+        }
+
+        fn begin(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnBeginRequest) !void {}
+        fn prepare(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: TxnPrepareRequest) !void {}
+        fn status(_: *anyopaque, _: std.mem.Allocator, _: u64, _: []const u8, _: db_mod.types.TxnId) !db_mod.types.TxnStatus {
+            return .pending;
+        }
+
+        fn resolve(ptr: *anyopaque, _: std.mem.Allocator, group_id: u64, table_name: []const u8, req: TxnResolveRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expectEqualStrings("docs", table_name);
+            try std.testing.expectEqual(db_mod.types.TxnStatus.committed, req.status);
+            self.calls += 1;
+            self.last_group_id = group_id;
+            self.last_status = req.status;
+            self.last_commit_version = req.commit_version;
+        }
+    };
+
+    var recorder = Recorder{};
+    var resolver = RecoveryResolver{
+        .alloc = alloc,
+        .worker = recorder.worker(),
+        .lease_owned = true,
+    };
+    var reopened = try db_mod.DB.open(alloc, path, .{});
+    defer reopened.close();
+    try reopened.setSchema(runtime_schema);
+
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, try reopened.getTransactionStatus(txn_id));
+    const unresolved_before = try reopened.getUnresolvedTransactionParticipants(alloc, txn_id);
+    defer transactions_mod.freeParticipantList(alloc, unresolved_before);
+    try std.testing.expectEqual(@as(usize, 1), unresolved_before.len);
+    try std.testing.expectEqualStrings(participant, unresolved_before[0]);
+
+    var visible_before = (try reopened.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+    defer visible_before.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, visible_before.json, "\"status\":\"done\"") != null);
+
+    const stats = try reopened.runTransactionRecoveryOnce(resolver.config());
+    try std.testing.expect(stats.notification_attempts > 0);
+    try std.testing.expect(stats.notification_successes > 0);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+    try std.testing.expectEqual(@as(u64, 77), recorder.last_group_id);
+    try std.testing.expectEqual(db_mod.types.TxnStatus.committed, recorder.last_status.?);
+    try std.testing.expectEqual(@as(u64, 2_100), recorder.last_commit_version);
+    try std.testing.expectError(transactions_mod.TxnError.TxnNotFound, reopened.getTransactionStatus(txn_id));
+
+    var final_row = (try reopened.lookup(alloc, "row:a", .{})) orelse return error.TestUnexpectedResult;
+    defer final_row.deinit(alloc);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"done\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, final_row.json, "\"status\":\"lost\"") == null);
+
+    const again = try reopened.runTransactionRecoveryOnce(resolver.config());
+    try std.testing.expectEqual(@as(u64, 0), again.notification_attempts);
+    try std.testing.expectEqual(@as(usize, 1), recorder.calls);
+}
+
 fn sleepNs(duration_ns: u64) void {
     var req = std.posix.timespec{
         .sec = @intCast(duration_ns / std.time.ns_per_s),

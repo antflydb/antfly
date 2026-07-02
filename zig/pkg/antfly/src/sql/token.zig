@@ -263,6 +263,7 @@ pub const TokenKeyword = enum {
     @"or",
     order,
     outer,
+    owner,
     owned,
     overriding,
     overlaps,
@@ -559,6 +560,7 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.now, keywordFromIdentifier("NOW").?);
     try std.testing.expectEqual(TokenKeyword.next, keywordFromIdentifier("NEXT").?);
     try std.testing.expectEqual(TokenKeyword.notify, keywordFromIdentifier("NOTIFY").?);
+    try std.testing.expectEqual(TokenKeyword.owner, keywordFromIdentifier("OWNER").?);
     try std.testing.expectEqual(TokenKeyword.owned, keywordFromIdentifier("OWNED").?);
     try std.testing.expectEqual(TokenKeyword.overriding, keywordFromIdentifier("OVERRIDING").?);
     try std.testing.expectEqual(TokenKeyword.following, keywordFromIdentifier("FOLLOWING").?);

@@ -78,63 +78,17 @@
     {
       "reason": "document_sql_write_unsupported",
       "coverage": [
+        "unsupported_write_document_sql_broad_delete",
         "unsupported_write_document_sql_doc_update",
-        "unsupported_write_document_sql_exact_id_delete",
-        "unsupported_write_document_sql_full_document_insert",
-        "unsupported_write_document_sql_generated_id_insert",
+        "unsupported_write_document_sql_json_patch_invalid_shape",
+        "unsupported_write_document_sql_json_path_delete",
         "unsupported_write_document_sql_merge_delete",
-        "unsupported_write_document_sql_projection_insert",
-        "unsupported_write_document_sql_projection_update",
+        "unsupported_write_document_sql_mixed_identity_delete",
+        "unsupported_write_document_sql_non_identity_delete",
+        "unsupported_write_document_sql_ordered_delete",
+        "unsupported_write_document_sql_range_delete",
         "unsupported_write_document_sql_truncate_table",
         "unsupported_write_document_sql_write_unsupported"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_invalid_antfly_extension",
-      "coverage": [
-        "unsupported_ddl_document_table_invalid_antfly_extension"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_invalid_dynamic_template",
-      "coverage": [
-        "unsupported_ddl_document_table_invalid_dynamic_template"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_malformed_schema_json",
-      "coverage": [
-        "unsupported_ddl_document_table_malformed_schema_json"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_missing_default_type",
-      "coverage": [
-        "unsupported_ddl_document_table_missing_default_type"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_mixed_relational_shape",
-      "coverage": [
-        "unsupported_ddl_document_table_mixed_relational_shape"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_multi_document_type_unsupported",
-      "coverage": [
-        "unsupported_ddl_document_table_multi_document_type_unsupported"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_shorthand",
-      "coverage": [
-        "unsupported_ddl_document_table_shorthand"
-      ]
-    },
-    {
-      "reason": "document_table_ddl_unknown_default_type",
-      "coverage": [
-        "unsupported_ddl_document_table_unknown_default_type"
       ]
     },
     {
@@ -163,6 +117,13 @@
         "schema_mixed_expression_unique_conflict_target",
         "schema_partial_unique_conflict_target",
         "schema_unique_conflict_target"
+      ]
+    },
+    {
+      "reason": "foreign_data_catalog_plan",
+      "coverage": [
+        "unsupported_ddl_foreign_data_wrapper",
+        "unsupported_ddl_user_mapping"
       ]
     },
     {
@@ -200,6 +161,12 @@
       "coverage": [
         "truncate_cascade_generation_barrier",
         "truncate_multi_table_generation_barrier"
+      ]
+    },
+    {
+      "reason": "operator_catalog_plan",
+      "coverage": [
+        "unsupported_ddl_operator_class_family"
       ]
     },
     {
@@ -306,6 +273,18 @@
       ]
     },
     {
+      "reason": "table_column_statistics_plan",
+      "coverage": [
+        "unsupported_ddl_table_column_statistics"
+      ]
+    },
+    {
+      "reason": "table_column_storage_plan",
+      "coverage": [
+        "unsupported_ddl_table_column_storage"
+      ]
+    },
+    {
       "reason": "table_owner_plan",
       "coverage": [
         "unsupported_ddl_table_owner"
@@ -344,6 +323,12 @@
         "ddl_temporal_fk_delete_set_null_action",
         "ddl_temporal_fk_update_cascade_action",
         "schema_temporal_fk_ddl"
+      ]
+    },
+    {
+      "reason": "text_search_catalog_plan",
+      "coverage": [
+        "unsupported_ddl_text_search_catalog"
       ]
     }
   ]

@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10427
+%expect 10444
 
 %start statement
 
@@ -230,6 +230,7 @@ create_table_statement:
 
 create_table_body:
     LPAREN column_definition_list RPAREN
+  | LPAREN RPAREN
   | PARTITION OF qualified_name table_partition_bound
   | AS read_statement create_table_as_data_opt
   ;
@@ -263,6 +264,17 @@ create_table_option_list:
 
 create_table_option:
     WITH SYSTEM IDENT
+  | WITH LPAREN create_table_storage_parameter_list RPAREN
+  | IDENT SCHEMA identifier_name AS IDENT STRING
+  ;
+
+create_table_storage_parameter_list:
+    create_table_storage_parameter
+  | create_table_storage_parameter_list COMMA create_table_storage_parameter
+  ;
+
+create_table_storage_parameter:
+    qualified_name EQ STRING
   ;
 
 create_view_statement:
@@ -1076,7 +1088,7 @@ identity_options_opt:
 
 insert_columns_opt:
     /* empty */
-  | LPAREN identifier_list RPAREN
+  | LPAREN qualified_name_list RPAREN
   ;
 
 value_tuple_list:

@@ -282,6 +282,15 @@ fn enumTokenSeparator(ch: u8) bool {
     return std.ascii.isWhitespace(ch) or ch == '_' or ch == '-';
 }
 
+fn isSqlColumnAliasIdentifier(value: []const u8) bool {
+    if (value.len == 0) return false;
+    if (!std.ascii.isAlphabetic(value[0]) and value[0] != '_') return false;
+    for (value[1..]) |ch| {
+        if (!std.ascii.isAlphanumeric(ch) and ch != '_') return false;
+    }
+    return true;
+}
+
 pub const ForeignKeyReference = struct {
     table: []const u8,
     columns: [][]const u8 = &.{},
@@ -570,6 +579,7 @@ pub const DocumentProperty = struct {
     root_ref: bool = false,
     field_type: ?[]const u8 = null,
     antfly_types: [][]const u8 = &.{},
+    sql_column_name: ?[]const u8 = null,
     analyzer: ?[]const u8 = null,
     collation: ?[]const u8 = null,
     antfly_index: ?bool = null,
@@ -636,6 +646,7 @@ pub const DocumentProperty = struct {
         if (self.field_type) |field_type| alloc.free(field_type);
         for (self.antfly_types) |antfly_type| alloc.free(antfly_type);
         if (self.antfly_types.len > 0) alloc.free(self.antfly_types);
+        if (self.sql_column_name) |column_name| alloc.free(column_name);
         if (self.analyzer) |analyzer| alloc.free(analyzer);
         if (self.collation) |collation| alloc.free(collation);
         if (self.index_name) |index_name| alloc.free(index_name);
@@ -1016,6 +1027,7 @@ pub fn validateDocumentJson(
 
         if (document_schema) |resolved_document_schema| {
             if (findDocumentProperty(resolved_document_schema.properties, field_name)) |property| {
+                if (schema.storage_mode == .document and property.generated != null) return error.InvalidBatchRequest;
                 try validateDocumentFieldValueWithContext(&validation_context, property, entry.value_ptr, schema.enforce_types);
                 continue;
             }
@@ -1802,6 +1814,10 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     }
     if (object.get("x-antfly-types")) |antfly_types| {
         if (antfly_types != .null) try validateAntflyTypesDefinition(antfly_types);
+    }
+    if (object.get("x-antfly-column-name")) |column_name| {
+        if (column_name != .null and column_name != .string) return error.InvalidSchemaUpdateRequest;
+        if (column_name == .string and !isSqlColumnAliasIdentifier(column_name.string)) return error.InvalidSchemaUpdateRequest;
     }
     if (object.get("x-antfly-analyzer")) |analyzer| {
         if (analyzer != .null and analyzer != .string) return error.InvalidSchemaUpdateRequest;
@@ -3714,6 +3730,15 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         for (antfly_types) |type_name| alloc.free(type_name);
         if (antfly_types.len > 0) alloc.free(antfly_types);
     }
+    const sql_column_name = if (object.get("x-antfly-column-name")) |column_name_value|
+        switch (column_name_value) {
+            .string => |name| if (isSqlColumnAliasIdentifier(name)) try alloc.dupe(u8, name) else return error.InvalidSchemaUpdateRequest,
+            .null => null,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        null;
+    errdefer if (sql_column_name) |owned| alloc.free(owned);
     const analyzer = if (object.get("x-antfly-analyzer")) |analyzer_value|
         switch (analyzer_value) {
             .string => |name| try alloc.dupe(u8, name),
@@ -4081,6 +4106,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .root_ref = false,
         .field_type = field_type,
         .antfly_types = antfly_types,
+        .sql_column_name = sql_column_name,
         .analyzer = analyzer,
         .collation = collation,
         .antfly_index = antfly_index,

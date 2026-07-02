@@ -39,6 +39,8 @@ pub const RowSecurityAlterSyntax = struct {
 pub const CreateRowSecurityPolicySyntax = struct {
     policy_name: []const u8,
     table_name: []const u8,
+    mode: ?ddl_plan.RowSecurityPolicyMode = null,
+    command: ?ddl_plan.RowSecurityPolicyCommand = null,
     role_targets: []const []const u8 = &.{},
     predicate: ddl_plan.RowSecurityPolicyPredicate,
     check_predicate: ?ddl_plan.RowSecurityPolicyPredicate = null,
@@ -579,12 +581,28 @@ pub const CommentMetadataSyntax = struct {
     target: ddl_plan.CommentMetadataTarget,
     object_name: []const u8,
     parent_table_name: ?[]const u8 = null,
+    argument_count: ?usize = null,
     comment_json: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.object_name));
         if (self.parent_table_name) |parent| alloc.free(@constCast(parent));
         if (self.comment_json) |comment| alloc.free(@constCast(comment));
+        self.* = undefined;
+    }
+};
+
+pub const SecurityLabelSyntax = struct {
+    target: ddl_plan.CommentMetadataTarget,
+    object_name: []const u8,
+    provider_name: ?[]const u8 = null,
+    argument_count: ?usize = null,
+    label_json: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.object_name));
+        if (self.provider_name) |provider| alloc.free(@constCast(provider));
+        if (self.label_json) |label| alloc.free(@constCast(label));
         self.* = undefined;
     }
 };
@@ -1021,12 +1039,56 @@ pub const PrivilegeChangeSyntax = struct {
     object_kind: []const u8,
     object_name: []const u8,
     principal_name: []const u8,
+    principal_names: []const []const u8 = &.{},
+    with_grant_option: bool = false,
+    revoke_grant_option_for: bool = false,
+    revoke_cascade: ?bool = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         freeStringSlice(alloc, self.privileges);
         alloc.free(@constCast(self.object_kind));
         alloc.free(@constCast(self.object_name));
         alloc.free(@constCast(self.principal_name));
+        freeStringSlice(alloc, self.principal_names);
+        self.* = undefined;
+    }
+};
+
+pub const RolePrivilegeChangeSyntax = struct {
+    role_names: []const []const u8 = &.{},
+    principal_name: []const u8,
+    principal_names: []const []const u8 = &.{},
+    with_admin_option: bool = false,
+    revoke_admin_option_for: bool = false,
+    revoke_cascade: ?bool = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.role_names);
+        alloc.free(@constCast(self.principal_name));
+        freeStringSlice(alloc, self.principal_names);
+        self.* = undefined;
+    }
+};
+
+pub const DefaultPrivilegeChangeSyntax = struct {
+    action: PrivilegeChangeActionSyntax,
+    target_roles: []const []const u8 = &.{},
+    schema_names: []const []const u8 = &.{},
+    privileges: []const []const u8 = &.{},
+    object_kind: []const u8,
+    principal_name: []const u8,
+    principal_names: []const []const u8 = &.{},
+    with_grant_option: bool = false,
+    revoke_grant_option_for: bool = false,
+    revoke_cascade: ?bool = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeStringSlice(alloc, self.target_roles);
+        freeStringSlice(alloc, self.schema_names);
+        freeStringSlice(alloc, self.privileges);
+        alloc.free(@constCast(self.object_kind));
+        alloc.free(@constCast(self.principal_name));
+        freeStringSlice(alloc, self.principal_names);
         self.* = undefined;
     }
 };
@@ -1122,23 +1184,56 @@ pub const TruncateMutationSourceSyntax = struct {
 
 pub const CreatePublicationSyntax = struct {
     publication_name: []const u8,
-    table_names: []const []const u8 = &.{},
+    tables: []const PublicationTableSyntax = &.{},
     all_tables: bool = false,
+    publish_json: ?[]const u8 = null,
+    publish_via_partition_root: ?bool = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.publication_name));
-        freeStringSlice(alloc, self.table_names);
+        freePublicationTableSyntaxSlice(alloc, self.tables);
+        if (self.publish_json) |publish_json| alloc.free(@constCast(publish_json));
         self.* = undefined;
     }
 };
 
 pub const AlterPublicationSyntax = struct {
     publication_name: []const u8,
-    table_names: []const []const u8 = &.{},
+    operation: AlterPublicationOperationSyntax,
+    tables: []const PublicationTableSyntax = &.{},
+    rename_to: ?[]const u8 = null,
+    owner_to: ?[]const u8 = null,
+    publish_json: ?[]const u8 = null,
+    publish_via_partition_root: ?bool = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.publication_name));
-        freeStringSlice(alloc, self.table_names);
+        freePublicationTableSyntaxSlice(alloc, self.tables);
+        if (self.rename_to) |rename_to| alloc.free(@constCast(rename_to));
+        if (self.owner_to) |owner_to| alloc.free(@constCast(owner_to));
+        if (self.publish_json) |publish_json| alloc.free(@constCast(publish_json));
+        self.* = undefined;
+    }
+};
+
+pub const AlterPublicationOperationSyntax = enum {
+    add_tables,
+    drop_tables,
+    set_tables,
+    set_options,
+    rename,
+    owner,
+};
+
+pub const PublicationTableSyntax = struct {
+    table_name: []const u8,
+    column_names: []const []const u8 = &.{},
+    where_predicate_sql: ?[]const u8 = null,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.table_name));
+        freeStringSlice(alloc, self.column_names);
+        if (self.where_predicate_sql) |where_predicate_sql| alloc.free(@constCast(where_predicate_sql));
         self.* = undefined;
     }
 };
@@ -1157,23 +1252,77 @@ pub const CreateSubscriptionSyntax = struct {
     subscription_name: []const u8,
     connection_json: []const u8,
     publication_names: []const []const u8 = &.{},
+    copy_data: ?bool = null,
+    connect: ?bool = null,
+    binary: ?bool = null,
+    create_slot: ?bool = null,
+    enabled: ?bool = null,
+    two_phase: ?bool = null,
+    disable_on_error: ?bool = null,
+    synchronous_commit_json: ?[]const u8 = null,
+    streaming_json: ?[]const u8 = null,
+    password_required: ?bool = null,
+    run_as_owner: ?bool = null,
+    failover: ?bool = null,
+    origin_json: ?[]const u8 = null,
+    slot_name_json: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.subscription_name));
         alloc.free(@constCast(self.connection_json));
         freeStringSlice(alloc, self.publication_names);
+        if (self.synchronous_commit_json) |synchronous_commit_json| alloc.free(@constCast(synchronous_commit_json));
+        if (self.streaming_json) |streaming_json| alloc.free(@constCast(streaming_json));
+        if (self.origin_json) |origin_json| alloc.free(@constCast(origin_json));
+        if (self.slot_name_json) |slot_name_json| alloc.free(@constCast(slot_name_json));
         self.* = undefined;
     }
 };
 
 pub const AlterSubscriptionSyntax = struct {
     subscription_name: []const u8,
-    enabled: bool,
+    enabled: ?bool = null,
+    connection_json: ?[]const u8 = null,
+    rename_to: ?[]const u8 = null,
+    owner_to: ?[]const u8 = null,
+    skip_lsn_json: ?[]const u8 = null,
+    refresh_publication: bool = false,
+    publication_action: ?AlterSubscriptionPublicationActionSyntax = null,
+    publication_names: []const []const u8 = &.{},
+    copy_data: ?bool = null,
+    connect: ?bool = null,
+    binary: ?bool = null,
+    create_slot: ?bool = null,
+    enabled_option: ?bool = null,
+    two_phase: ?bool = null,
+    disable_on_error: ?bool = null,
+    synchronous_commit_json: ?[]const u8 = null,
+    streaming_json: ?[]const u8 = null,
+    password_required: ?bool = null,
+    run_as_owner: ?bool = null,
+    failover: ?bool = null,
+    origin_json: ?[]const u8 = null,
+    slot_name_json: ?[]const u8 = null,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.subscription_name));
+        if (self.connection_json) |connection_json| alloc.free(@constCast(connection_json));
+        if (self.rename_to) |rename_to| alloc.free(@constCast(rename_to));
+        if (self.owner_to) |owner_to| alloc.free(@constCast(owner_to));
+        if (self.skip_lsn_json) |skip_lsn_json| alloc.free(@constCast(skip_lsn_json));
+        freeStringSlice(alloc, self.publication_names);
+        if (self.synchronous_commit_json) |synchronous_commit_json| alloc.free(@constCast(synchronous_commit_json));
+        if (self.streaming_json) |streaming_json| alloc.free(@constCast(streaming_json));
+        if (self.origin_json) |origin_json| alloc.free(@constCast(origin_json));
+        if (self.slot_name_json) |slot_name_json| alloc.free(@constCast(slot_name_json));
         self.* = undefined;
     }
+};
+
+pub const AlterSubscriptionPublicationActionSyntax = enum {
+    set,
+    add,
+    drop,
 };
 
 pub const DropSubscriptionSyntax = struct {
@@ -1426,6 +1575,8 @@ pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
     const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
     var table_transferred = false;
     errdefer if (!table_transferred) alloc.free(table_name);
+    const mode = try parseOptionalRowSecurityPolicyMode(tokens, pos);
+    const command = try parseOptionalRowSecurityPolicyCommand(tokens, pos);
     const role_targets = try parseOptionalRowSecurityPolicyRoleTargetsAlloc(alloc, tokens, pos);
     var role_targets_transferred = false;
     errdefer if (!role_targets_transferred) freeStringSlice(alloc, role_targets);
@@ -1451,6 +1602,8 @@ pub fn parseCreateRowSecurityPolicyCatalogTailAlloc(
     return .{
         .policy_name = policy_name,
         .table_name = table_name,
+        .mode = mode,
+        .command = command,
         .role_targets = role_targets,
         .predicate = predicate,
         .check_predicate = check_predicate,
@@ -1520,6 +1673,31 @@ pub fn parseOptionalRowSecurityPolicyRoleTargetsAlloc(
     const cursor = parser.Cursor.init(tokens, pos);
     if (!cursor.matchKeyword("to")) return &.{};
     return try parseRowSecurityPolicyRoleTargetsAfterToAlloc(alloc, tokens, pos);
+}
+
+pub fn parseOptionalRowSecurityPolicyMode(
+    tokens: []const Token,
+    pos: *usize,
+) !?ddl_plan.RowSecurityPolicyMode {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("as")) return null;
+    if (cursor.matchKeyword("permissive")) return .permissive;
+    if (cursor.matchKeyword("restrictive")) return .restrictive;
+    return error.UnsupportedSqlShape;
+}
+
+pub fn parseOptionalRowSecurityPolicyCommand(
+    tokens: []const Token,
+    pos: *usize,
+) !?ddl_plan.RowSecurityPolicyCommand {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("for")) return null;
+    if (cursor.matchKeyword("all")) return .all;
+    if (cursor.matchKeyword("select")) return .select;
+    if (cursor.matchKeyword("insert")) return .insert;
+    if (cursor.matchKeyword("update")) return .update;
+    if (cursor.matchKeyword("delete")) return .delete;
+    return error.UnsupportedSqlShape;
 }
 
 pub fn parseRowSecurityPolicyRoleTargetsAfterToAlloc(
@@ -3769,23 +3947,16 @@ pub fn parseCommentMetadataCatalogTailAlloc(
 ) !CommentMetadataSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
     try cursor.expectKeyword("on");
-    const target: ddl_plan.CommentMetadataTarget = if (cursor.matchKeyword("table"))
-        .table
-    else if (cursor.matchKeyword("column"))
-        .column
-    else if (cursor.matchKeyword("index"))
-        .index
-    else if (cursor.matchKeyword("constraint"))
-        .constraint
-    else
-        return error.UnsupportedSqlShape;
+    const target = try parseMetadataObjectTarget(cursor);
 
-    const object_name = switch (target) {
-        .table, .index => try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos),
-        .column, .constraint => try parseIdentifierOwnedAlloc(alloc, tokens, pos),
-    };
+    const object_name = try parseMetadataObjectNameAlloc(alloc, tokens, pos, target);
     var object_transferred = false;
     errdefer if (!object_transferred) alloc.free(object_name);
+
+    const argument_count: ?usize = switch (target) {
+        .function, .procedure => try parseRoutineSignatureArgumentCount(cursor),
+        else => null,
+    };
 
     var parent_table_name: ?[]const u8 = null;
     var parent_transferred = false;
@@ -3811,7 +3982,96 @@ pub fn parseCommentMetadataCatalogTailAlloc(
         .target = target,
         .object_name = object_name,
         .parent_table_name = parent_table_name,
+        .argument_count = argument_count,
         .comment_json = comment_json,
+    };
+}
+
+pub fn parseSecurityLabelCatalogTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !SecurityLabelSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("label");
+
+    var provider_name: ?[]const u8 = null;
+    var provider_transferred = false;
+    errdefer if (!provider_transferred) if (provider_name) |provider| alloc.free(@constCast(provider));
+    if (cursor.matchKeyword("for")) {
+        provider_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    }
+
+    try cursor.expectKeyword("on");
+    const target = try parseMetadataObjectTarget(cursor);
+    if (target == .constraint) return error.UnsupportedSqlShape;
+
+    const object_name = try parseMetadataObjectNameAlloc(alloc, tokens, pos, target);
+    var object_transferred = false;
+    errdefer if (!object_transferred) alloc.free(object_name);
+
+    const argument_count: ?usize = switch (target) {
+        .function, .procedure => try parseRoutineSignatureArgumentCount(cursor),
+        else => null,
+    };
+
+    try cursor.expectKeyword("is");
+    var label_json: ?[]const u8 = null;
+    var label_transferred = false;
+    errdefer if (!label_transferred) if (label_json) |label| alloc.free(@constCast(label));
+    if (!cursor.matchKeyword("null")) {
+        label_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    }
+    try adapterNoopStatementEnd(cursor);
+
+    provider_transferred = true;
+    object_transferred = true;
+    label_transferred = true;
+    return .{
+        .target = target,
+        .object_name = object_name,
+        .provider_name = provider_name,
+        .argument_count = argument_count,
+        .label_json = label_json,
+    };
+}
+
+fn parseMetadataObjectTarget(cursor: parser.Cursor) !ddl_plan.CommentMetadataTarget {
+    return if (cursor.matchKeyword("table"))
+        .table
+    else if (cursor.matchKeyword("column"))
+        .column
+    else if (cursor.matchKeyword("index"))
+        .index
+    else if (cursor.matchKeyword("constraint"))
+        .constraint
+    else if (cursor.matchKeyword("database"))
+        .database
+    else if (cursor.matchKeyword("schema"))
+        .schema
+    else if (cursor.matchKeyword("extension"))
+        .extension
+    else if (cursor.matchKeyword("type"))
+        .type
+    else if (cursor.matchKeyword("domain"))
+        .domain
+    else if (cursor.matchKeyword("function"))
+        .function
+    else if (cursor.matchKeyword("procedure"))
+        .procedure
+    else
+        return error.UnsupportedSqlShape;
+}
+
+fn parseMetadataObjectNameAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target: ddl_plan.CommentMetadataTarget,
+) ![]const u8 {
+    return switch (target) {
+        .table, .index, .database, .schema, .extension, .type, .domain, .function, .procedure => try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos),
+        .column, .constraint => try parseIdentifierOwnedAlloc(alloc, tokens, pos),
     };
 }
 
@@ -5956,6 +6216,12 @@ pub fn parsePrivilegeChangeTailAlloc(
     action: PrivilegeChangeActionSyntax,
 ) !PrivilegeChangeSyntax {
     const cursor = parser.Cursor.init(tokens, pos);
+    var revoke_grant_option_for = false;
+    if (action == .revoke and cursor.matchKeyword("grant")) {
+        try cursor.expectKeyword("option");
+        try cursor.expectKeyword("for");
+        revoke_grant_option_for = true;
+    }
     const privileges = try parsePrivilegeListAlloc(alloc, cursor, tokens, pos);
     var privileges_transferred = false;
     errdefer if (!privileges_transferred) freeStringSlice(alloc, privileges);
@@ -5983,20 +6249,195 @@ pub fn parsePrivilegeChangeTailAlloc(
         .grant => try cursor.expectKeyword("to"),
         .revoke => try cursor.expectKeyword("from"),
     }
-    const principal_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    const principal_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+    var principal_names_transferred = false;
+    errdefer if (!principal_names_transferred) freeStringSlice(alloc, principal_names);
+    if (principal_names.len == 0) return error.UnsupportedSqlShape;
+    const principal_name = try alloc.dupe(u8, principal_names[0]);
     var principal_transferred = false;
     errdefer if (!principal_transferred) alloc.free(principal_name);
+    var with_grant_option = false;
+    if (action == .grant and cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("grant");
+        try cursor.expectKeyword("option");
+        with_grant_option = true;
+    }
+    var revoke_cascade: ?bool = null;
+    if (action == .revoke) {
+        if (cursor.matchKeyword("cascade")) {
+            revoke_cascade = true;
+        } else if (cursor.matchKeyword("restrict")) {
+            revoke_cascade = false;
+        }
+    }
 
     try adapterNoopStatementEnd(cursor);
     privileges_transferred = true;
     object_kind_transferred = true;
     object_name_transferred = true;
+    principal_names_transferred = true;
     principal_transferred = true;
     return .{
         .privileges = privileges,
         .object_kind = object_kind.?,
         .object_name = object_name.?,
         .principal_name = principal_name,
+        .principal_names = principal_names,
+        .with_grant_option = with_grant_option,
+        .revoke_grant_option_for = revoke_grant_option_for,
+        .revoke_cascade = revoke_cascade,
+    };
+}
+
+pub fn parseRolePrivilegeChangeTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    action: PrivilegeChangeActionSyntax,
+) !RolePrivilegeChangeSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var revoke_admin_option_for = false;
+    if (action == .revoke and cursor.matchKeyword("admin")) {
+        try cursor.expectKeyword("option");
+        try cursor.expectKeyword("for");
+        revoke_admin_option_for = true;
+    }
+    const role_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+    var role_names_transferred = false;
+    errdefer if (!role_names_transferred) freeStringSlice(alloc, role_names);
+    if (role_names.len == 0) return error.UnsupportedSqlShape;
+
+    switch (action) {
+        .grant => try cursor.expectKeyword("to"),
+        .revoke => try cursor.expectKeyword("from"),
+    }
+    const principal_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+    var principal_names_transferred = false;
+    errdefer if (!principal_names_transferred) freeStringSlice(alloc, principal_names);
+    if (principal_names.len == 0) return error.UnsupportedSqlShape;
+    const principal_name = try alloc.dupe(u8, principal_names[0]);
+    var principal_transferred = false;
+    errdefer if (!principal_transferred) alloc.free(principal_name);
+
+    var with_admin_option = false;
+    if (action == .grant and cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("admin");
+        try cursor.expectKeyword("option");
+        with_admin_option = true;
+    }
+    var revoke_cascade: ?bool = null;
+    if (action == .revoke) {
+        if (cursor.matchKeyword("cascade")) {
+            revoke_cascade = true;
+        } else if (cursor.matchKeyword("restrict")) {
+            revoke_cascade = false;
+        }
+    }
+
+    try adapterNoopStatementEnd(cursor);
+    role_names_transferred = true;
+    principal_names_transferred = true;
+    principal_transferred = true;
+    return .{
+        .role_names = role_names,
+        .principal_name = principal_name,
+        .principal_names = principal_names,
+        .with_admin_option = with_admin_option,
+        .revoke_admin_option_for = revoke_admin_option_for,
+        .revoke_cascade = revoke_cascade,
+    };
+}
+
+pub fn parseDefaultPrivilegeChangeTailAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !DefaultPrivilegeChangeSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectKeyword("default");
+    try cursor.expectKeyword("privileges");
+
+    var target_roles: []const []const u8 = &.{};
+    var target_roles_transferred = true;
+    errdefer if (!target_roles_transferred) freeStringSlice(alloc, target_roles);
+    if (cursor.matchKeyword("for")) {
+        try expectRoleAliasKeyword(cursor);
+        target_roles = try parseIdentifierListAlloc(alloc, tokens, pos);
+        target_roles_transferred = false;
+        if (target_roles.len == 0) return error.UnsupportedSqlShape;
+    }
+
+    var schema_names: []const []const u8 = &.{};
+    var schema_names_transferred = true;
+    errdefer if (!schema_names_transferred) freeStringSlice(alloc, schema_names);
+    if (cursor.matchKeyword("in")) {
+        try cursor.expectKeyword("schema");
+        schema_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
+        schema_names_transferred = false;
+        if (schema_names.len == 0) return error.UnsupportedSqlShape;
+    }
+
+    const action: PrivilegeChangeActionSyntax = if (cursor.matchKeyword("grant")) .grant else if (cursor.matchKeyword("revoke")) .revoke else return error.UnsupportedSqlShape;
+    var revoke_grant_option_for = false;
+    if (action == .revoke and cursor.matchKeyword("grant")) {
+        try cursor.expectKeyword("option");
+        try cursor.expectKeyword("for");
+        revoke_grant_option_for = true;
+    }
+
+    const privileges = try parsePrivilegeListAlloc(alloc, cursor, tokens, pos);
+    var privileges_transferred = false;
+    errdefer if (!privileges_transferred) freeStringSlice(alloc, privileges);
+    try cursor.expectKeyword("on");
+    const object_kind = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    var object_kind_transferred = false;
+    errdefer if (!object_kind_transferred) alloc.free(@constCast(object_kind));
+
+    switch (action) {
+        .grant => try cursor.expectKeyword("to"),
+        .revoke => try cursor.expectKeyword("from"),
+    }
+    const principal_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+    var principal_names_transferred = false;
+    errdefer if (!principal_names_transferred) freeStringSlice(alloc, principal_names);
+    if (principal_names.len == 0) return error.UnsupportedSqlShape;
+    const principal_name = try alloc.dupe(u8, principal_names[0]);
+    var principal_transferred = false;
+    errdefer if (!principal_transferred) alloc.free(principal_name);
+
+    var with_grant_option = false;
+    if (action == .grant and cursor.matchKeyword("with")) {
+        try cursor.expectKeyword("grant");
+        try cursor.expectKeyword("option");
+        with_grant_option = true;
+    }
+    var revoke_cascade: ?bool = null;
+    if (action == .revoke) {
+        if (cursor.matchKeyword("cascade")) {
+            revoke_cascade = true;
+        } else if (cursor.matchKeyword("restrict")) {
+            revoke_cascade = false;
+        }
+    }
+
+    try adapterNoopStatementEnd(cursor);
+    target_roles_transferred = true;
+    schema_names_transferred = true;
+    privileges_transferred = true;
+    object_kind_transferred = true;
+    principal_names_transferred = true;
+    principal_transferred = true;
+    return .{
+        .action = action,
+        .target_roles = target_roles,
+        .schema_names = schema_names,
+        .privileges = privileges,
+        .object_kind = object_kind,
+        .principal_name = principal_name,
+        .principal_names = principal_names,
+        .with_grant_option = with_grant_option,
+        .revoke_grant_option_for = revoke_grant_option_for,
+        .revoke_cascade = revoke_cascade,
     };
 }
 
@@ -6361,25 +6802,78 @@ pub fn parseCreatePublicationCatalogTailAlloc(
     errdefer if (!publication_transferred) alloc.free(publication_name);
     try cursor.expectKeyword("for");
     var all_tables = false;
-    var table_names: []const []const u8 = &.{};
-    errdefer freeStringSlice(alloc, table_names);
+    var tables: []const PublicationTableSyntax = &.{};
+    errdefer freePublicationTableSyntaxSlice(alloc, tables);
     if (cursor.matchKeyword("all")) {
         try cursor.expectKeyword("tables");
         all_tables = true;
     } else {
         try cursor.expectKeyword("table");
-        table_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
+        tables = try parsePublicationTableListAlloc(alloc, tokens, pos);
     }
-    if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
+    var options = try parseOptionalPublicationOptionsAlloc(alloc, tokens, pos);
+    var options_transferred = false;
+    errdefer if (!options_transferred) deinitPublicationOptionsSyntax(alloc, &options);
     try adapterNoopStatementEnd(cursor);
     publication_transferred = true;
+    options_transferred = true;
     const out = CreatePublicationSyntax{
         .publication_name = publication_name,
-        .table_names = table_names,
+        .tables = tables,
         .all_tables = all_tables,
+        .publish_json = options.publish_json,
+        .publish_via_partition_root = options.publish_via_partition_root,
     };
-    table_names = &.{};
+    options.publish_json = null;
+    tables = &.{};
     return out;
+}
+
+const PublicationOptionsSyntax = struct {
+    publish_json: ?[]const u8 = null,
+    publish_via_partition_root: ?bool = null,
+};
+
+fn deinitPublicationOptionsSyntax(alloc: std.mem.Allocator, options: *PublicationOptionsSyntax) void {
+    if (options.publish_json) |publish_json| alloc.free(@constCast(publish_json));
+    options.* = undefined;
+}
+
+pub fn parseOptionalPublicationOptionsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !PublicationOptionsSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("with")) return .{};
+    return try parsePublicationOptionsListAlloc(alloc, tokens, pos);
+}
+
+fn parsePublicationOptionsListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !PublicationOptionsSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var options = PublicationOptionsSyntax{};
+    errdefer deinitPublicationOptionsSyntax(alloc, &options);
+    try cursor.expectToken(.lparen);
+    while (true) {
+        if (cursor.matchKeyword("publish")) {
+            if (options.publish_json != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.publish_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+        } else if (cursor.matchKeyword("publish_via_partition_root")) {
+            if (options.publish_via_partition_root != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.publish_via_partition_root = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    return options;
 }
 
 pub fn parseAlterPublicationCatalogTailAlloc(
@@ -6392,17 +6886,113 @@ pub fn parseAlterPublicationCatalogTailAlloc(
     const publication_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var publication_transferred = false;
     errdefer if (!publication_transferred) alloc.free(publication_name);
-    try cursor.expectKeyword("add");
-    try cursor.expectKeyword("table");
-    var table_names = try parseSqlObjectIdentifierListAlloc(alloc, tokens, pos);
-    errdefer freeStringSlice(alloc, table_names);
+    var operation: AlterPublicationOperationSyntax = undefined;
+    var tables: []const PublicationTableSyntax = &.{};
+    var rename_to: ?[]const u8 = null;
+    var owner_to: ?[]const u8 = null;
+    var options = PublicationOptionsSyntax{};
+    errdefer {
+        freePublicationTableSyntaxSlice(alloc, tables);
+        if (rename_to) |value| alloc.free(@constCast(value));
+        if (owner_to) |value| alloc.free(@constCast(value));
+        deinitPublicationOptionsSyntax(alloc, &options);
+    }
+    if (cursor.matchKeyword("add")) {
+        operation = .add_tables;
+        try cursor.expectKeyword("table");
+        tables = try parsePublicationTableListAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("drop")) {
+        operation = .drop_tables;
+        try cursor.expectKeyword("table");
+        tables = try parsePublicationTableListAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("set")) {
+        if (cursor.matchKeyword("table")) {
+            operation = .set_tables;
+            tables = try parsePublicationTableListAlloc(alloc, tokens, pos);
+        } else {
+            operation = .set_options;
+            options = try parsePublicationOptionsListAlloc(alloc, tokens, pos);
+        }
+    } else if (cursor.matchKeyword("rename")) {
+        operation = .rename;
+        try cursor.expectKeyword("to");
+        rename_to = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("owner")) {
+        operation = .owner;
+        try cursor.expectKeyword("to");
+        owner_to = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    } else return error.UnsupportedSqlShape;
     try adapterNoopStatementEnd(cursor);
     publication_transferred = true;
     const out = AlterPublicationSyntax{
         .publication_name = publication_name,
-        .table_names = table_names,
+        .operation = operation,
+        .tables = tables,
+        .rename_to = rename_to,
+        .owner_to = owner_to,
+        .publish_json = options.publish_json,
+        .publish_via_partition_root = options.publish_via_partition_root,
     };
-    table_names = &.{};
+    tables = &.{};
+    rename_to = null;
+    owner_to = null;
+    options.publish_json = null;
+    return out;
+}
+
+pub fn parsePublicationTableListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const PublicationTableSyntax {
+    var out = std.ArrayListUnmanaged(PublicationTableSyntax).empty;
+    errdefer {
+        for (out.items) |*item| item.deinit(alloc);
+        out.deinit(alloc);
+    }
+    while (true) {
+        try out.append(alloc, try parsePublicationTableAlloc(alloc, tokens, pos));
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn parsePublicationTableAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !PublicationTableSyntax {
+    const table_name = try parseSqlObjectIdentifierOwnedAlloc(alloc, tokens, pos);
+    var table_transferred = false;
+    errdefer if (!table_transferred) alloc.free(@constCast(table_name));
+
+    var column_names: []const []const u8 = &.{};
+    errdefer freeStringSlice(alloc, column_names);
+    if (parser.matchToken(tokens, pos, .lparen) != null) {
+        column_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+        try validateSqlIdentifierListUnique(column_names);
+        try parser.expectToken(tokens, pos, .rparen);
+    }
+
+    var where_predicate_sql: ?[]const u8 = null;
+    errdefer if (where_predicate_sql) |where_sql| alloc.free(@constCast(where_sql));
+    if (parser.matchKeyword(tokens, pos, "where")) {
+        const open_index = pos.*;
+        try parser.expectToken(tokens, pos, .lparen);
+        const close_index = findMatchingParen(tokens, open_index, tokens.len) orelse return error.UnsupportedSqlShape;
+        if (open_index + 1 >= close_index) return error.UnsupportedSqlShape;
+        where_predicate_sql = try tokenRangeSqlTextAlloc(alloc, tokens, open_index + 1, close_index);
+        pos.* = close_index + 1;
+    }
+
+    table_transferred = true;
+    const out = PublicationTableSyntax{
+        .table_name = table_name,
+        .column_names = column_names,
+        .where_predicate_sql = where_predicate_sql,
+    };
+    column_names = &.{};
+    where_predicate_sql = null;
     return out;
 }
 
@@ -6443,7 +7033,8 @@ pub fn parseCreateSubscriptionCatalogTailAlloc(
     try cursor.expectKeyword("publication");
     var publication_names = try parseIdentifierListAlloc(alloc, tokens, pos);
     errdefer freeStringSlice(alloc, publication_names);
-    if (cursor.peekKeyword("with")) return error.UnsupportedSqlShape;
+    var options = try parseOptionalSubscriptionOptions(alloc, tokens, pos);
+    defer deinitSubscriptionOptionsSyntax(alloc, &options);
     try adapterNoopStatementEnd(cursor);
     subscription_transferred = true;
     connection_transferred = true;
@@ -6451,9 +7042,158 @@ pub fn parseCreateSubscriptionCatalogTailAlloc(
         .subscription_name = subscription_name,
         .connection_json = connection_json,
         .publication_names = publication_names,
+        .copy_data = options.copy_data,
+        .connect = options.connect,
+        .binary = options.binary,
+        .create_slot = options.create_slot,
+        .enabled = options.enabled,
+        .two_phase = options.two_phase,
+        .disable_on_error = options.disable_on_error,
+        .synchronous_commit_json = options.synchronous_commit_json,
+        .streaming_json = options.streaming_json,
+        .password_required = options.password_required,
+        .run_as_owner = options.run_as_owner,
+        .failover = options.failover,
+        .origin_json = options.origin_json,
+        .slot_name_json = options.slot_name_json,
     };
+    options.synchronous_commit_json = null;
+    options.streaming_json = null;
+    options.origin_json = null;
+    options.slot_name_json = null;
     publication_names = &.{};
     return out;
+}
+
+const SubscriptionOptionsSyntax = struct {
+    copy_data: ?bool = null,
+    connect: ?bool = null,
+    binary: ?bool = null,
+    create_slot: ?bool = null,
+    enabled: ?bool = null,
+    two_phase: ?bool = null,
+    disable_on_error: ?bool = null,
+    synchronous_commit_json: ?[]const u8 = null,
+    streaming_json: ?[]const u8 = null,
+    password_required: ?bool = null,
+    run_as_owner: ?bool = null,
+    failover: ?bool = null,
+    origin_json: ?[]const u8 = null,
+    slot_name_json: ?[]const u8 = null,
+};
+
+fn deinitSubscriptionOptionsSyntax(alloc: std.mem.Allocator, options: *SubscriptionOptionsSyntax) void {
+    if (options.synchronous_commit_json) |synchronous_commit_json| alloc.free(@constCast(synchronous_commit_json));
+    if (options.streaming_json) |streaming_json| alloc.free(@constCast(streaming_json));
+    if (options.origin_json) |origin_json| alloc.free(@constCast(origin_json));
+    if (options.slot_name_json) |slot_name_json| alloc.free(@constCast(slot_name_json));
+    options.* = undefined;
+}
+
+fn parseOptionalSubscriptionOptions(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !SubscriptionOptionsSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (!cursor.matchKeyword("with")) return .{};
+    return try parseSubscriptionOptionsListAlloc(alloc, tokens, pos);
+}
+
+fn parseSubscriptionOptionsListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) !SubscriptionOptionsSyntax {
+    const cursor = parser.Cursor.init(tokens, pos);
+    var options = SubscriptionOptionsSyntax{};
+    errdefer deinitSubscriptionOptionsSyntax(alloc, &options);
+    try cursor.expectToken(.lparen);
+    while (true) {
+        if (cursor.matchKeyword("copy_data")) {
+            if (options.copy_data != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.copy_data = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("connect")) {
+            if (options.connect != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.connect = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("binary")) {
+            if (options.binary != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.binary = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("create_slot")) {
+            if (options.create_slot != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.create_slot = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("enabled")) {
+            if (options.enabled != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.enabled = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("two_phase")) {
+            if (options.two_phase != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.two_phase = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("disable_on_error")) {
+            if (options.disable_on_error != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.disable_on_error = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("synchronous_commit")) {
+            if (options.synchronous_commit_json != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.synchronous_commit_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+        } else if (cursor.matchKeyword("streaming")) {
+            if (options.streaming_json != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.streaming_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+        } else if (cursor.matchKeyword("password_required")) {
+            if (options.password_required != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.password_required = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("run_as_owner")) {
+            if (options.run_as_owner != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.run_as_owner = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("failover")) {
+            if (options.failover != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.failover = try parseSubscriptionBooleanOptionValue(tokens, pos);
+        } else if (cursor.matchKeyword("origin")) {
+            if (options.origin_json != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.origin_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+        } else if (cursor.matchKeyword("slot_name")) {
+            if (options.slot_name_json != null) return error.UnsupportedSqlShape;
+            try cursor.expectToken(.eq);
+            options.slot_name_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+        } else {
+            return error.UnsupportedSqlShape;
+        }
+        if (cursor.matchToken(.comma) == null) break;
+    }
+    try cursor.expectToken(.rparen);
+    return options;
+}
+
+fn parseSubscriptionBooleanOptionValue(tokens: []const Token, pos: *usize) !bool {
+    if (parser.matchKeywordTag(tokens, pos, .true)) return true;
+    if (parser.matchKeywordTag(tokens, pos, .false)) return false;
+    return error.UnsupportedSqlShape;
+}
+
+fn parseSubscriptionSkipLsnJsonAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![]const u8 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    try cursor.expectToken(.lparen);
+    try cursor.expectKeyword("lsn");
+    try cursor.expectToken(.eq);
+    const lsn_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    errdefer alloc.free(lsn_json);
+    try cursor.expectToken(.rparen);
+    return lsn_json;
 }
 
 pub fn parseAlterSubscriptionCatalogTailAlloc(
@@ -6466,15 +7206,71 @@ pub fn parseAlterSubscriptionCatalogTailAlloc(
     const subscription_name = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
     var subscription_transferred = false;
     errdefer if (!subscription_transferred) alloc.free(subscription_name);
-    const enabled = if (cursor.matchKeyword("enable"))
-        true
-    else if (cursor.matchKeyword("disable"))
-        false
-    else
-        return error.UnsupportedSqlShape;
-    try adapterNoopStatementEnd(cursor);
+    var out = AlterSubscriptionSyntax{ .subscription_name = subscription_name };
     subscription_transferred = true;
-    return .{ .subscription_name = subscription_name, .enabled = enabled };
+    errdefer out.deinit(alloc);
+    var options = SubscriptionOptionsSyntax{};
+    defer deinitSubscriptionOptionsSyntax(alloc, &options);
+    if (cursor.matchKeyword("enable")) {
+        out.enabled = true;
+    } else if (cursor.matchKeyword("disable")) {
+        out.enabled = false;
+    } else if (cursor.matchKeyword("connection")) {
+        out.connection_json = try sql_value.parseSqlUntypedValueJsonAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("rename")) {
+        try cursor.expectKeyword("to");
+        out.rename_to = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("owner")) {
+        try cursor.expectKeyword("to");
+        out.owner_to = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("skip")) {
+        out.skip_lsn_json = try parseSubscriptionSkipLsnJsonAlloc(alloc, tokens, pos);
+    } else if (cursor.matchKeyword("refresh")) {
+        try cursor.expectKeyword("publication");
+        out.refresh_publication = true;
+        options = try parseOptionalSubscriptionOptions(alloc, tokens, pos);
+        out.copy_data = options.copy_data;
+    } else if (cursor.matchKeyword("set")) {
+        if (cursor.matchKeyword("publication")) {
+            out.publication_action = .set;
+            out.publication_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+            options = try parseOptionalSubscriptionOptions(alloc, tokens, pos);
+        } else {
+            options = try parseSubscriptionOptionsListAlloc(alloc, tokens, pos);
+        }
+        out.copy_data = options.copy_data;
+        out.connect = options.connect;
+        out.binary = options.binary;
+        out.create_slot = options.create_slot;
+        out.enabled_option = options.enabled;
+        out.two_phase = options.two_phase;
+        out.disable_on_error = options.disable_on_error;
+        out.synchronous_commit_json = options.synchronous_commit_json;
+        out.streaming_json = options.streaming_json;
+        out.password_required = options.password_required;
+        out.run_as_owner = options.run_as_owner;
+        out.failover = options.failover;
+        out.origin_json = options.origin_json;
+        out.slot_name_json = options.slot_name_json;
+        options.synchronous_commit_json = null;
+        options.streaming_json = null;
+        options.origin_json = null;
+        options.slot_name_json = null;
+    } else if (cursor.matchKeyword("add")) {
+        try cursor.expectKeyword("publication");
+        out.publication_action = .add;
+        out.publication_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+        options = try parseOptionalSubscriptionOptions(alloc, tokens, pos);
+        out.copy_data = options.copy_data;
+    } else if (cursor.matchKeyword("drop")) {
+        try cursor.expectKeyword("publication");
+        out.publication_action = .drop;
+        out.publication_names = try parseIdentifierListAlloc(alloc, tokens, pos);
+        options = try parseOptionalSubscriptionOptions(alloc, tokens, pos);
+        out.copy_data = options.copy_data;
+    } else return error.UnsupportedSqlShape;
+    try adapterNoopStatementEnd(cursor);
+    return out;
 }
 
 pub fn parseDropSubscriptionCatalogTailAlloc(
@@ -7731,6 +8527,47 @@ fn freeStringSlice(alloc: std.mem.Allocator, values: []const []const u8) void {
     if (values.len > 0) alloc.free(values);
 }
 
+fn freePublicationTableSyntaxSlice(alloc: std.mem.Allocator, values: []const PublicationTableSyntax) void {
+    for (values) |value| {
+        var table = value;
+        table.deinit(alloc);
+    }
+    if (values.len > 0) alloc.free(values);
+}
+
+fn findMatchingParen(tokens: []const Token, open_index: usize, end: usize) ?usize {
+    if (open_index >= end or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 1;
+    var index = open_index + 1;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
+}
+
+pub fn tokenRangeSqlTextAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+) ![]const u8 {
+    if (start >= end or end > tokens.len) return error.UnsupportedSqlShape;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    for (tokens[start..end], 0..) |token, index| {
+        if (index != 0) try out.append(alloc, ' ');
+        try out.appendSlice(alloc, token.text);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn freeRoutineSettingList(alloc: std.mem.Allocator, list: *std.ArrayListUnmanaged(ddl_plan.RoutineSetting)) void {
     for (list.items) |setting_value| {
         var setting = setting_value;
@@ -8007,6 +8844,17 @@ test "sql adapter grammar parses row security catalog tails" {
     try std.testing.expectEqual(@as(usize, 2), targeted.role_targets.len);
     try std.testing.expectEqualStrings("app_reader", targeted.role_targets[0]);
     try std.testing.expectEqualStrings("app_writer", targeted.role_targets[1]);
+
+    var command_tokens = try lexer.tokenizeAlloc(alloc, "POLICY tenant_policy ON usage_records AS PERMISSIVE FOR SELECT TO app_reader USING (tenant_id = current_setting('app.tenant_id'));");
+    defer lexer.freeTokens(alloc, &command_tokens);
+    var command_pos: usize = 0;
+    var command = try parseCreateRowSecurityPolicyCatalogTailAlloc(alloc, command_tokens.items, &command_pos);
+    defer command.deinit(alloc);
+    try std.testing.expectEqual(command_tokens.items.len, command_pos);
+    try std.testing.expectEqual(ddl_plan.RowSecurityPolicyMode.permissive, command.mode.?);
+    try std.testing.expectEqual(ddl_plan.RowSecurityPolicyCommand.select, command.command.?);
+    try std.testing.expectEqual(@as(usize, 1), command.role_targets.len);
+    try std.testing.expectEqualStrings("app_reader", command.role_targets[0]);
 
     var role_tokens = try lexer.tokenizeAlloc(alloc, "TO app_reader, app_writer USING");
     defer lexer.freeTokens(alloc, &role_tokens);
@@ -9285,10 +10133,73 @@ test "sql adapter grammar parses comment metadata catalog tails" {
     try std.testing.expectEqualStrings("usage_records", constraint.parent_table_name.?);
     try std.testing.expectEqualStrings("\"valid update clock\"", constraint.comment_json.?);
 
+    var schema_tokens = try lexer.tokenizeAlloc(alloc, "ON SCHEMA public IS 'public schema';");
+    defer lexer.freeTokens(alloc, &schema_tokens);
+    var schema_pos: usize = 0;
+    var schema = try parseCommentMetadataCatalogTailAlloc(alloc, schema_tokens.items, &schema_pos);
+    defer schema.deinit(alloc);
+    try std.testing.expectEqual(schema_tokens.items.len, schema_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.schema, schema.target);
+    try std.testing.expectEqualStrings("public", schema.object_name);
+    try std.testing.expectEqualStrings("\"public schema\"", schema.comment_json.?);
+
+    var domain_tokens = try lexer.tokenizeAlloc(alloc, "ON DOMAIN usage_status IS 'status domain';");
+    defer lexer.freeTokens(alloc, &domain_tokens);
+    var domain_pos: usize = 0;
+    var domain = try parseCommentMetadataCatalogTailAlloc(alloc, domain_tokens.items, &domain_pos);
+    defer domain.deinit(alloc);
+    try std.testing.expectEqual(domain_tokens.items.len, domain_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.domain, domain.target);
+    try std.testing.expectEqualStrings("usage_status", domain.object_name);
+    try std.testing.expectEqualStrings("\"status domain\"", domain.comment_json.?);
+
+    var function_tokens = try lexer.tokenizeAlloc(alloc, "ON FUNCTION normalize_status(text, integer) IS 'normalizes status';");
+    defer lexer.freeTokens(alloc, &function_tokens);
+    var function_pos: usize = 0;
+    var function = try parseCommentMetadataCatalogTailAlloc(alloc, function_tokens.items, &function_pos);
+    defer function.deinit(alloc);
+    try std.testing.expectEqual(function_tokens.items.len, function_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.function, function.target);
+    try std.testing.expectEqualStrings("normalize_status", function.object_name);
+    try std.testing.expectEqual(@as(?usize, 2), function.argument_count);
+    try std.testing.expectEqualStrings("\"normalizes status\"", function.comment_json.?);
+
     var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "ON SEQUENCE usage_records_id_seq IS 'unsupported';");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCommentMetadataCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
+}
+
+test "sql adapter grammar parses security label catalog tails" {
+    const alloc = std.testing.allocator;
+
+    var table_tokens = try lexer.tokenizeAlloc(alloc, "LABEL FOR selinux ON TABLE usage_records IS 'internal';");
+    defer lexer.freeTokens(alloc, &table_tokens);
+    var table_pos: usize = 0;
+    var table = try parseSecurityLabelCatalogTailAlloc(alloc, table_tokens.items, &table_pos);
+    defer table.deinit(alloc);
+    try std.testing.expectEqual(table_tokens.items.len, table_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.table, table.target);
+    try std.testing.expectEqualStrings("usage_records", table.object_name);
+    try std.testing.expectEqualStrings("selinux", table.provider_name.?);
+    try std.testing.expectEqualStrings("\"internal\"", table.label_json.?);
+
+    var procedure_tokens = try lexer.tokenizeAlloc(alloc, "LABEL ON PROCEDURE rotate_usage() IS NULL;");
+    defer lexer.freeTokens(alloc, &procedure_tokens);
+    var procedure_pos: usize = 0;
+    var procedure = try parseSecurityLabelCatalogTailAlloc(alloc, procedure_tokens.items, &procedure_pos);
+    defer procedure.deinit(alloc);
+    try std.testing.expectEqual(procedure_tokens.items.len, procedure_pos);
+    try std.testing.expectEqual(ddl_plan.CommentMetadataTarget.procedure, procedure.target);
+    try std.testing.expectEqualStrings("rotate_usage", procedure.object_name);
+    try std.testing.expect(procedure.provider_name == null);
+    try std.testing.expectEqual(@as(?usize, 0), procedure.argument_count);
+    try std.testing.expect(procedure.label_json == null);
+
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "LABEL ON SEQUENCE usage_records_id_seq IS 'unsupported';");
+    defer lexer.freeTokens(alloc, &unsupported_tokens);
+    var unsupported_pos: usize = 0;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseSecurityLabelCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));
 }
 
 test "sql adapter grammar parses drop table and index catalog tails" {
@@ -10909,7 +11820,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("app_readers", drop_group.role_name);
     try std.testing.expect(drop_group.if_exists);
 
-    var grant_tokens = try lexer.tokenizeAlloc(alloc, "SELECT, INSERT ON TABLE usage_records TO app_writer;");
+    var grant_tokens = try lexer.tokenizeAlloc(alloc, "SELECT, INSERT ON TABLE usage_records TO app_reader, app_writer WITH GRANT OPTION;");
     defer lexer.freeTokens(alloc, &grant_tokens);
     var grant_pos: usize = 0;
     var grant = try parsePrivilegeChangeTailAlloc(alloc, grant_tokens.items, &grant_pos, .grant);
@@ -10920,7 +11831,26 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("INSERT", grant.privileges[1]);
     try std.testing.expectEqualStrings("TABLE", grant.object_kind);
     try std.testing.expectEqualStrings("usage_records", grant.object_name);
-    try std.testing.expectEqualStrings("app_writer", grant.principal_name);
+    try std.testing.expectEqualStrings("app_reader", grant.principal_name);
+    try std.testing.expectEqual(@as(usize, 2), grant.principal_names.len);
+    try std.testing.expectEqualStrings("app_reader", grant.principal_names[0]);
+    try std.testing.expectEqualStrings("app_writer", grant.principal_names[1]);
+    try std.testing.expect(grant.with_grant_option);
+
+    var role_grant_tokens = try lexer.tokenizeAlloc(alloc, "readonly, reporting TO app_reader, app_writer WITH ADMIN OPTION;");
+    defer lexer.freeTokens(alloc, &role_grant_tokens);
+    var role_grant_pos: usize = 0;
+    var role_grant = try parseRolePrivilegeChangeTailAlloc(alloc, role_grant_tokens.items, &role_grant_pos, .grant);
+    defer role_grant.deinit(alloc);
+    try std.testing.expectEqual(role_grant_tokens.items.len, role_grant_pos);
+    try std.testing.expectEqual(@as(usize, 2), role_grant.role_names.len);
+    try std.testing.expectEqualStrings("readonly", role_grant.role_names[0]);
+    try std.testing.expectEqualStrings("reporting", role_grant.role_names[1]);
+    try std.testing.expectEqualStrings("app_reader", role_grant.principal_name);
+    try std.testing.expectEqual(@as(usize, 2), role_grant.principal_names.len);
+    try std.testing.expectEqualStrings("app_reader", role_grant.principal_names[0]);
+    try std.testing.expectEqualStrings("app_writer", role_grant.principal_names[1]);
+    try std.testing.expect(role_grant.with_admin_option);
 
     var grant_all_tokens = try lexer.tokenizeAlloc(alloc, "ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO app_writer;");
     defer lexer.freeTokens(alloc, &grant_all_tokens);
@@ -10933,7 +11863,7 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqualStrings("ALL_TABLES_IN_SCHEMA", grant_all.object_kind);
     try std.testing.expectEqualStrings("public", grant_all.object_name);
 
-    var revoke_tokens = try lexer.tokenizeAlloc(alloc, "INSERT ON TABLE public.usage_records FROM app_writer;");
+    var revoke_tokens = try lexer.tokenizeAlloc(alloc, "GRANT OPTION FOR INSERT ON TABLE public.usage_records FROM app_writer CASCADE;");
     defer lexer.freeTokens(alloc, &revoke_tokens);
     var revoke_pos: usize = 0;
     var revoke = try parsePrivilegeChangeTailAlloc(alloc, revoke_tokens.items, &revoke_pos, .revoke);
@@ -10941,12 +11871,72 @@ test "sql adapter grammar parses authorization catalog tails" {
     try std.testing.expectEqual(revoke_tokens.items.len, revoke_pos);
     try std.testing.expectEqualStrings("usage_records", revoke.object_name);
     try std.testing.expectEqualStrings("app_writer", revoke.principal_name);
+    try std.testing.expectEqual(@as(usize, 1), revoke.principal_names.len);
+    try std.testing.expectEqualStrings("app_writer", revoke.principal_names[0]);
+    try std.testing.expect(revoke.revoke_grant_option_for);
+    try std.testing.expectEqual(true, revoke.revoke_cascade.?);
+
+    var role_revoke_tokens = try lexer.tokenizeAlloc(alloc, "ADMIN OPTION FOR readonly, reporting FROM app_writer RESTRICT;");
+    defer lexer.freeTokens(alloc, &role_revoke_tokens);
+    var role_revoke_pos: usize = 0;
+    var role_revoke = try parseRolePrivilegeChangeTailAlloc(alloc, role_revoke_tokens.items, &role_revoke_pos, .revoke);
+    defer role_revoke.deinit(alloc);
+    try std.testing.expectEqual(role_revoke_tokens.items.len, role_revoke_pos);
+    try std.testing.expectEqual(@as(usize, 2), role_revoke.role_names.len);
+    try std.testing.expectEqualStrings("readonly", role_revoke.role_names[0]);
+    try std.testing.expectEqualStrings("reporting", role_revoke.role_names[1]);
+    try std.testing.expectEqualStrings("app_writer", role_revoke.principal_name);
+    try std.testing.expectEqual(@as(usize, 1), role_revoke.principal_names.len);
+    try std.testing.expectEqualStrings("app_writer", role_revoke.principal_names[0]);
+    try std.testing.expect(role_revoke.revoke_admin_option_for);
+    try std.testing.expectEqual(false, role_revoke.revoke_cascade.?);
+
+    var default_grant_tokens = try lexer.tokenizeAlloc(alloc, "DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO readonly, app_writer WITH GRANT OPTION;");
+    defer lexer.freeTokens(alloc, &default_grant_tokens);
+    var default_grant_pos: usize = 0;
+    var default_grant = try parseDefaultPrivilegeChangeTailAlloc(alloc, default_grant_tokens.items, &default_grant_pos);
+    defer default_grant.deinit(alloc);
+    try std.testing.expectEqual(default_grant_tokens.items.len, default_grant_pos);
+    try std.testing.expectEqual(PrivilegeChangeActionSyntax.grant, default_grant.action);
+    try std.testing.expectEqual(@as(usize, 1), default_grant.target_roles.len);
+    try std.testing.expectEqualStrings("app_owner", default_grant.target_roles[0]);
+    try std.testing.expectEqual(@as(usize, 1), default_grant.schema_names.len);
+    try std.testing.expectEqualStrings("public", default_grant.schema_names[0]);
+    try std.testing.expectEqual(@as(usize, 2), default_grant.privileges.len);
+    try std.testing.expectEqualStrings("SELECT", default_grant.privileges[0]);
+    try std.testing.expectEqualStrings("INSERT", default_grant.privileges[1]);
+    try std.testing.expectEqualStrings("TABLES", default_grant.object_kind);
+    try std.testing.expectEqualStrings("readonly", default_grant.principal_name);
+    try std.testing.expectEqual(@as(usize, 2), default_grant.principal_names.len);
+    try std.testing.expectEqualStrings("readonly", default_grant.principal_names[0]);
+    try std.testing.expectEqualStrings("app_writer", default_grant.principal_names[1]);
+    try std.testing.expect(default_grant.with_grant_option);
+
+    var default_revoke_tokens = try lexer.tokenizeAlloc(alloc, "DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public REVOKE GRANT OPTION FOR INSERT ON TABLES FROM readonly CASCADE;");
+    defer lexer.freeTokens(alloc, &default_revoke_tokens);
+    var default_revoke_pos: usize = 0;
+    var default_revoke = try parseDefaultPrivilegeChangeTailAlloc(alloc, default_revoke_tokens.items, &default_revoke_pos);
+    defer default_revoke.deinit(alloc);
+    try std.testing.expectEqual(default_revoke_tokens.items.len, default_revoke_pos);
+    try std.testing.expectEqual(PrivilegeChangeActionSyntax.revoke, default_revoke.action);
+    try std.testing.expectEqual(@as(usize, 1), default_revoke.target_roles.len);
+    try std.testing.expectEqualStrings("app_owner", default_revoke.target_roles[0]);
+    try std.testing.expectEqual(@as(usize, 1), default_revoke.schema_names.len);
+    try std.testing.expectEqualStrings("public", default_revoke.schema_names[0]);
+    try std.testing.expectEqual(@as(usize, 1), default_revoke.privileges.len);
+    try std.testing.expectEqualStrings("INSERT", default_revoke.privileges[0]);
+    try std.testing.expectEqualStrings("TABLES", default_revoke.object_kind);
+    try std.testing.expectEqualStrings("readonly", default_revoke.principal_name);
+    try std.testing.expectEqual(@as(usize, 1), default_revoke.principal_names.len);
+    try std.testing.expectEqualStrings("readonly", default_revoke.principal_names[0]);
+    try std.testing.expect(default_revoke.revoke_grant_option_for);
+    try std.testing.expectEqual(true, default_revoke.revoke_cascade.?);
 }
 
 test "sql adapter grammar parses logical replication catalog tails" {
     const alloc = std.testing.allocator;
 
-    var create_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage FOR TABLE public.usage_records, audit_records;");
+    var create_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage FOR TABLE public.usage_records (id, status) WHERE (status = 'open'), audit_records;");
     defer lexer.freeTokens(alloc, &create_publication_tokens);
     var create_publication_pos: usize = 0;
     var create_publication = try parseCreatePublicationCatalogTailAlloc(alloc, create_publication_tokens.items, &create_publication_pos);
@@ -10954,27 +11944,89 @@ test "sql adapter grammar parses logical replication catalog tails" {
     try std.testing.expectEqual(create_publication_tokens.items.len, create_publication_pos);
     try std.testing.expectEqualStrings("pub_usage", create_publication.publication_name);
     try std.testing.expect(!create_publication.all_tables);
-    try std.testing.expectEqual(@as(usize, 2), create_publication.table_names.len);
-    try std.testing.expectEqualStrings("usage_records", create_publication.table_names[0]);
-    try std.testing.expectEqualStrings("audit_records", create_publication.table_names[1]);
+    try std.testing.expectEqual(@as(usize, 2), create_publication.tables.len);
+    try std.testing.expectEqualStrings("usage_records", create_publication.tables[0].table_name);
+    try std.testing.expectEqual(@as(usize, 2), create_publication.tables[0].column_names.len);
+    try std.testing.expectEqualStrings("id", create_publication.tables[0].column_names[0]);
+    try std.testing.expectEqualStrings("status", create_publication.tables[0].column_names[1]);
+    try std.testing.expectEqualStrings("status = 'open'", create_publication.tables[0].where_predicate_sql.?);
+    try std.testing.expectEqualStrings("audit_records", create_publication.tables[1].table_name);
 
-    var create_all_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_all FOR ALL TABLES;");
+    var create_all_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_all FOR ALL TABLES WITH (publish = 'insert, update', publish_via_partition_root = true);");
     defer lexer.freeTokens(alloc, &create_all_tokens);
     var create_all_pos: usize = 0;
     var create_all = try parseCreatePublicationCatalogTailAlloc(alloc, create_all_tokens.items, &create_all_pos);
     defer create_all.deinit(alloc);
     try std.testing.expectEqual(create_all_tokens.items.len, create_all_pos);
     try std.testing.expect(create_all.all_tables);
-    try std.testing.expectEqual(@as(usize, 0), create_all.table_names.len);
+    try std.testing.expectEqual(@as(usize, 0), create_all.tables.len);
+    try std.testing.expectEqualStrings("\"insert, update\"", create_all.publish_json.?);
+    try std.testing.expectEqual(true, create_all.publish_via_partition_root.?);
 
-    var alter_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage ADD TABLE public.usage_records;");
+    var alter_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage ADD TABLE public.usage_records (id) WHERE (status = 'open');");
     defer lexer.freeTokens(alloc, &alter_publication_tokens);
     var alter_publication_pos: usize = 0;
     var alter_publication = try parseAlterPublicationCatalogTailAlloc(alloc, alter_publication_tokens.items, &alter_publication_pos);
     defer alter_publication.deinit(alloc);
     try std.testing.expectEqual(alter_publication_tokens.items.len, alter_publication_pos);
     try std.testing.expectEqualStrings("pub_usage", alter_publication.publication_name);
-    try std.testing.expectEqualStrings("usage_records", alter_publication.table_names[0]);
+    try std.testing.expectEqual(AlterPublicationOperationSyntax.add_tables, alter_publication.operation);
+    try std.testing.expectEqualStrings("usage_records", alter_publication.tables[0].table_name);
+    try std.testing.expectEqualStrings("id", alter_publication.tables[0].column_names[0]);
+    try std.testing.expectEqualStrings("status = 'open'", alter_publication.tables[0].where_predicate_sql.?);
+
+    var drop_publication_table_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage DROP TABLE usage_events;");
+    defer lexer.freeTokens(alloc, &drop_publication_table_tokens);
+    var drop_publication_table_pos: usize = 0;
+    var drop_publication_table = try parseAlterPublicationCatalogTailAlloc(alloc, drop_publication_table_tokens.items, &drop_publication_table_pos);
+    defer drop_publication_table.deinit(alloc);
+    try std.testing.expectEqual(drop_publication_table_tokens.items.len, drop_publication_table_pos);
+    try std.testing.expectEqualStrings("pub_usage", drop_publication_table.publication_name);
+    try std.testing.expectEqual(AlterPublicationOperationSyntax.drop_tables, drop_publication_table.operation);
+    try std.testing.expectEqual(@as(usize, 1), drop_publication_table.tables.len);
+    try std.testing.expectEqualStrings("usage_events", drop_publication_table.tables[0].table_name);
+
+    var set_publication_table_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage SET TABLE usage_events, usage_audit;");
+    defer lexer.freeTokens(alloc, &set_publication_table_tokens);
+    var set_publication_table_pos: usize = 0;
+    var set_publication_table = try parseAlterPublicationCatalogTailAlloc(alloc, set_publication_table_tokens.items, &set_publication_table_pos);
+    defer set_publication_table.deinit(alloc);
+    try std.testing.expectEqual(set_publication_table_tokens.items.len, set_publication_table_pos);
+    try std.testing.expectEqualStrings("pub_usage", set_publication_table.publication_name);
+    try std.testing.expectEqual(AlterPublicationOperationSyntax.set_tables, set_publication_table.operation);
+    try std.testing.expectEqual(@as(usize, 2), set_publication_table.tables.len);
+    try std.testing.expectEqualStrings("usage_audit", set_publication_table.tables[1].table_name);
+
+    var set_publication_options_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage SET (publish = 'insert, update, delete', publish_via_partition_root = false);");
+    defer lexer.freeTokens(alloc, &set_publication_options_tokens);
+    var set_publication_options_pos: usize = 0;
+    var set_publication_options = try parseAlterPublicationCatalogTailAlloc(alloc, set_publication_options_tokens.items, &set_publication_options_pos);
+    defer set_publication_options.deinit(alloc);
+    try std.testing.expectEqual(set_publication_options_tokens.items.len, set_publication_options_pos);
+    try std.testing.expectEqualStrings("pub_usage", set_publication_options.publication_name);
+    try std.testing.expectEqual(AlterPublicationOperationSyntax.set_options, set_publication_options.operation);
+    try std.testing.expectEqualStrings("\"insert, update, delete\"", set_publication_options.publish_json.?);
+    try std.testing.expectEqual(false, set_publication_options.publish_via_partition_root.?);
+
+    var rename_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage RENAME TO pub_usage_archive;");
+    defer lexer.freeTokens(alloc, &rename_publication_tokens);
+    var rename_publication_pos: usize = 0;
+    var rename_publication = try parseAlterPublicationCatalogTailAlloc(alloc, rename_publication_tokens.items, &rename_publication_pos);
+    defer rename_publication.deinit(alloc);
+    try std.testing.expectEqual(rename_publication_tokens.items.len, rename_publication_pos);
+    try std.testing.expectEqualStrings("pub_usage", rename_publication.publication_name);
+    try std.testing.expectEqual(AlterPublicationOperationSyntax.rename, rename_publication.operation);
+    try std.testing.expectEqualStrings("pub_usage_archive", rename_publication.rename_to.?);
+
+    var owner_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage OWNER TO app_role;");
+    defer lexer.freeTokens(alloc, &owner_publication_tokens);
+    var owner_publication_pos: usize = 0;
+    var owner_publication = try parseAlterPublicationCatalogTailAlloc(alloc, owner_publication_tokens.items, &owner_publication_pos);
+    defer owner_publication.deinit(alloc);
+    try std.testing.expectEqual(owner_publication_tokens.items.len, owner_publication_pos);
+    try std.testing.expectEqualStrings("pub_usage", owner_publication.publication_name);
+    try std.testing.expectEqual(AlterPublicationOperationSyntax.owner, owner_publication.operation);
+    try std.testing.expectEqualStrings("app_role", owner_publication.owner_to.?);
 
     var drop_publication_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION IF EXISTS pub_usage;");
     defer lexer.freeTokens(alloc, &drop_publication_tokens);
@@ -10985,7 +12037,7 @@ test "sql adapter grammar parses logical replication catalog tails" {
     try std.testing.expectEqualStrings("pub_usage", drop_publication.publication_name);
     try std.testing.expect(drop_publication.if_exists);
 
-    var create_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage CONNECTION 'host=db' PUBLICATION pub_usage, pub_audit;");
+    var create_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage CONNECTION 'host=db' PUBLICATION pub_usage, pub_audit WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot');");
     defer lexer.freeTokens(alloc, &create_subscription_tokens);
     var create_subscription_pos: usize = 0;
     var create_subscription = try parseCreateSubscriptionCatalogTailAlloc(alloc, create_subscription_tokens.items, &create_subscription_pos);
@@ -10996,6 +12048,20 @@ test "sql adapter grammar parses logical replication catalog tails" {
     try std.testing.expectEqual(@as(usize, 2), create_subscription.publication_names.len);
     try std.testing.expectEqualStrings("pub_usage", create_subscription.publication_names[0]);
     try std.testing.expectEqualStrings("pub_audit", create_subscription.publication_names[1]);
+    try std.testing.expectEqual(false, create_subscription.copy_data.?);
+    try std.testing.expectEqual(false, create_subscription.connect.?);
+    try std.testing.expectEqual(true, create_subscription.binary.?);
+    try std.testing.expectEqual(false, create_subscription.create_slot.?);
+    try std.testing.expectEqual(false, create_subscription.enabled.?);
+    try std.testing.expectEqual(false, create_subscription.two_phase.?);
+    try std.testing.expectEqual(false, create_subscription.disable_on_error.?);
+    try std.testing.expectEqualStrings("\"remote_write\"", create_subscription.synchronous_commit_json.?);
+    try std.testing.expectEqualStrings("\"parallel\"", create_subscription.streaming_json.?);
+    try std.testing.expectEqual(false, create_subscription.password_required.?);
+    try std.testing.expectEqual(true, create_subscription.run_as_owner.?);
+    try std.testing.expectEqual(true, create_subscription.failover.?);
+    try std.testing.expectEqualStrings("\"none\"", create_subscription.origin_json.?);
+    try std.testing.expectEqualStrings("\"usage_slot\"", create_subscription.slot_name_json.?);
 
     var alter_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage DISABLE;");
     defer lexer.freeTokens(alloc, &alter_subscription_tokens);
@@ -11004,7 +12070,103 @@ test "sql adapter grammar parses logical replication catalog tails" {
     defer alter_subscription.deinit(alloc);
     try std.testing.expectEqual(alter_subscription_tokens.items.len, alter_subscription_pos);
     try std.testing.expectEqualStrings("sub_usage", alter_subscription.subscription_name);
-    try std.testing.expect(!alter_subscription.enabled);
+    try std.testing.expectEqual(false, alter_subscription.enabled.?);
+
+    var alter_subscription_connection_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage CONNECTION 'host=replica';");
+    defer lexer.freeTokens(alloc, &alter_subscription_connection_tokens);
+    var alter_subscription_connection_pos: usize = 0;
+    var alter_subscription_connection = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_connection_tokens.items, &alter_subscription_connection_pos);
+    defer alter_subscription_connection.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_connection_tokens.items.len, alter_subscription_connection_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_connection.subscription_name);
+    try std.testing.expect(alter_subscription_connection.enabled == null);
+    try std.testing.expectEqualStrings("\"host=replica\"", alter_subscription_connection.connection_json.?);
+
+    var alter_subscription_rename_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage RENAME TO sub_usage_archive;");
+    defer lexer.freeTokens(alloc, &alter_subscription_rename_tokens);
+    var alter_subscription_rename_pos: usize = 0;
+    var alter_subscription_rename = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_rename_tokens.items, &alter_subscription_rename_pos);
+    defer alter_subscription_rename.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_rename_tokens.items.len, alter_subscription_rename_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_rename.subscription_name);
+    try std.testing.expect(alter_subscription_rename.enabled == null);
+    try std.testing.expectEqualStrings("sub_usage_archive", alter_subscription_rename.rename_to.?);
+
+    var alter_subscription_owner_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage OWNER TO app_role;");
+    defer lexer.freeTokens(alloc, &alter_subscription_owner_tokens);
+    var alter_subscription_owner_pos: usize = 0;
+    var alter_subscription_owner = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_owner_tokens.items, &alter_subscription_owner_pos);
+    defer alter_subscription_owner.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_owner_tokens.items.len, alter_subscription_owner_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_owner.subscription_name);
+    try std.testing.expect(alter_subscription_owner.enabled == null);
+    try std.testing.expectEqualStrings("app_role", alter_subscription_owner.owner_to.?);
+
+    var alter_subscription_skip_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage SKIP (lsn = '0/14C0378');");
+    defer lexer.freeTokens(alloc, &alter_subscription_skip_tokens);
+    var alter_subscription_skip_pos: usize = 0;
+    var alter_subscription_skip = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_skip_tokens.items, &alter_subscription_skip_pos);
+    defer alter_subscription_skip.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_skip_tokens.items.len, alter_subscription_skip_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_skip.subscription_name);
+    try std.testing.expect(alter_subscription_skip.enabled == null);
+    try std.testing.expectEqualStrings("\"0/14C0378\"", alter_subscription_skip.skip_lsn_json.?);
+
+    var alter_subscription_refresh_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage REFRESH PUBLICATION WITH (copy_data = false);");
+    defer lexer.freeTokens(alloc, &alter_subscription_refresh_tokens);
+    var alter_subscription_refresh_pos: usize = 0;
+    var alter_subscription_refresh = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_refresh_tokens.items, &alter_subscription_refresh_pos);
+    defer alter_subscription_refresh.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_refresh_tokens.items.len, alter_subscription_refresh_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_refresh.subscription_name);
+    try std.testing.expect(alter_subscription_refresh.refresh_publication);
+    try std.testing.expectEqual(false, alter_subscription_refresh.copy_data.?);
+
+    var alter_subscription_set_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage SET (slot_name = 'usage_slot', copy_data = false);");
+    defer lexer.freeTokens(alloc, &alter_subscription_set_tokens);
+    var alter_subscription_set_pos: usize = 0;
+    var alter_subscription_set = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_set_tokens.items, &alter_subscription_set_pos);
+    defer alter_subscription_set.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_set_tokens.items.len, alter_subscription_set_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_set.subscription_name);
+    try std.testing.expect(alter_subscription_set.enabled == null);
+    try std.testing.expectEqualStrings("\"usage_slot\"", alter_subscription_set.slot_name_json.?);
+    try std.testing.expectEqual(false, alter_subscription_set.copy_data.?);
+
+    var alter_subscription_publication_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage SET PUBLICATION pub_usage, pub_audit WITH (copy_data = true);");
+    defer lexer.freeTokens(alloc, &alter_subscription_publication_tokens);
+    var alter_subscription_publication_pos: usize = 0;
+    var alter_subscription_publication = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_publication_tokens.items, &alter_subscription_publication_pos);
+    defer alter_subscription_publication.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_publication_tokens.items.len, alter_subscription_publication_pos);
+    try std.testing.expectEqualStrings("sub_usage", alter_subscription_publication.subscription_name);
+    try std.testing.expect(alter_subscription_publication.enabled == null);
+    try std.testing.expectEqual(@as(usize, 2), alter_subscription_publication.publication_names.len);
+    try std.testing.expectEqualStrings("pub_usage", alter_subscription_publication.publication_names[0]);
+    try std.testing.expectEqualStrings("pub_audit", alter_subscription_publication.publication_names[1]);
+    try std.testing.expectEqual(true, alter_subscription_publication.copy_data.?);
+
+    var alter_subscription_add_publication_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage ADD PUBLICATION pub_new WITH (copy_data = false);");
+    defer lexer.freeTokens(alloc, &alter_subscription_add_publication_tokens);
+    var alter_subscription_add_publication_pos: usize = 0;
+    var alter_subscription_add_publication = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_add_publication_tokens.items, &alter_subscription_add_publication_pos);
+    defer alter_subscription_add_publication.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_add_publication_tokens.items.len, alter_subscription_add_publication_pos);
+    try std.testing.expectEqual(AlterSubscriptionPublicationActionSyntax.add, alter_subscription_add_publication.publication_action.?);
+    try std.testing.expectEqual(@as(usize, 1), alter_subscription_add_publication.publication_names.len);
+    try std.testing.expectEqualStrings("pub_new", alter_subscription_add_publication.publication_names[0]);
+    try std.testing.expectEqual(false, alter_subscription_add_publication.copy_data.?);
+
+    var alter_subscription_drop_publication_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION sub_usage DROP PUBLICATION pub_old WITH (copy_data = true);");
+    defer lexer.freeTokens(alloc, &alter_subscription_drop_publication_tokens);
+    var alter_subscription_drop_publication_pos: usize = 0;
+    var alter_subscription_drop_publication = try parseAlterSubscriptionCatalogTailAlloc(alloc, alter_subscription_drop_publication_tokens.items, &alter_subscription_drop_publication_pos);
+    defer alter_subscription_drop_publication.deinit(alloc);
+    try std.testing.expectEqual(alter_subscription_drop_publication_tokens.items.len, alter_subscription_drop_publication_pos);
+    try std.testing.expectEqual(AlterSubscriptionPublicationActionSyntax.drop, alter_subscription_drop_publication.publication_action.?);
+    try std.testing.expectEqual(@as(usize, 1), alter_subscription_drop_publication.publication_names.len);
+    try std.testing.expectEqualStrings("pub_old", alter_subscription_drop_publication.publication_names[0]);
+    try std.testing.expectEqual(true, alter_subscription_drop_publication.copy_data.?);
 
     var drop_subscription_tokens = try lexer.tokenizeAlloc(alloc, "SUBSCRIPTION IF EXISTS sub_usage;");
     defer lexer.freeTokens(alloc, &drop_subscription_tokens);
@@ -11015,7 +12177,7 @@ test "sql adapter grammar parses logical replication catalog tails" {
     try std.testing.expectEqualStrings("sub_usage", drop_subscription.subscription_name);
     try std.testing.expect(drop_subscription.if_exists);
 
-    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage FOR ALL TABLES WITH (publish = 'insert');");
+    var unsupported_tokens = try lexer.tokenizeAlloc(alloc, "PUBLICATION pub_usage FOR ALL TABLES WITH (slot_name = 'usage_slot');");
     defer lexer.freeTokens(alloc, &unsupported_tokens);
     var unsupported_pos: usize = 0;
     try std.testing.expectError(error.UnsupportedSqlShape, parseCreatePublicationCatalogTailAlloc(alloc, unsupported_tokens.items, &unsupported_pos));

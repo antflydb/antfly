@@ -334,6 +334,10 @@ pub fn executeRelationalSqlAuthPlanOnUserManagerWithCatalog(
             .drop_role => |drop| return try executeDropRole(manager, alloc, drop),
             .grant_privilege => |grant| return try executePrivilegeChange(manager, alloc, grant, .grant, catalog),
             .revoke_privilege => |revoke| return try executePrivilegeChange(manager, alloc, revoke, .revoke, catalog),
+            .grant_role,
+            .revoke_role,
+            .alter_default_privileges,
+            => null,
         },
         .row_security_catalog => |row_security_plan| switch (row_security_plan) {
             .alter_table => |alter| return try executeAlterRowSecurity(manager, alloc, alter, catalog),

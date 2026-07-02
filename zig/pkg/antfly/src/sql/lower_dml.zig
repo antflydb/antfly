@@ -20,19 +20,25 @@ const sql_statement_kind = @import("statement_kind.zig");
 const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
+const document_plan = @import("document_plan.zig");
+const document_write = @import("document_write.zig");
 const expr_build = @import("expr/build.zig");
 const expr_condition = @import("expr/condition.zig");
 const expr_equal = @import("expr/equal.zig");
 const expr_generated = @import("expr/generated.zig");
 const expr_generated_validate = @import("expr/generated_validate.zig");
 const expr_operator = @import("expr/operator.zig");
+const expr_order = @import("expr/order.zig");
+const expr_parse = @import("expr/parse.zig");
 const expr_predicate = @import("expr/predicate.zig");
 const expr_projection = @import("expr/projection.zig");
 const expr_selector = @import("expr/selector.zig");
 const expr_text = @import("expr/text.zig");
 const expr_token = @import("expr/token.zig");
 const expr_type = @import("expr/type.zig");
+const expr_where_condition = @import("expr/where_condition.zig");
 const generated_parser = @import("generated_parser.zig");
+const generated_read_validate = @import("generated_read_validate.zig");
 const grammar = @import("grammar.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
@@ -43,6 +49,7 @@ const query_function = @import("query_function.zig");
 const relational_rows = @import("relational_rows.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const row_claim_mod = @import("row_claim.zig");
+const source_binding = @import("source_binding.zig");
 const strings = @import("strings.zig");
 const test_support = @import("test_support.zig");
 const table_catalog = @import("../metadata/catalog/source.zig");
@@ -70,7 +77,7 @@ pub const InsertSourceParserHooks = struct {
     generated_insert_column_items: ?*const generated_parser.GeneratedSqlListAst = null,
     conflict_condition_options: ConflictAssignmentExpressionParserOptions,
     conflict_dispatch_options: ConflictExpressionDispatchOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     parse_select: *const fn (
         *anyopaque,
         []const Token,
@@ -128,11 +135,11 @@ pub const MergeMutationParserOptions = struct {
     mutation_context_hooks: MutationSourceParserContextHooks,
     mutation_assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
-    order_expression_hooks: lower_expr.OrderExpressionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
 
@@ -371,7 +378,7 @@ pub fn conflictExpressionStartAt(tokens: []const Token, pos: usize) ?ConflictExp
     if (expr_token.peekFunctionCallTokenIf(tokens, pos, expr_token.sqlTokenIsUuidV4Function)) return .uuid_v4;
     if (expr_token.peekSqlNowExpressionSyntax(tokens, pos)) return .now;
     if (expr_token.peekSqlCurrentDateExpressionSyntax(tokens, pos)) return .current_date;
-    if (lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
+    if (expr_parse.peekSqlTypedDatetimeLiteral(tokens, pos)) return .typed_datetime_literal;
     if (expr_token.peekSqlIntervalExpressionSyntax(tokens, pos)) return .interval;
     return null;
 }
@@ -420,7 +427,7 @@ pub const ConflictCaseFoldExpressionParserOptions = struct {
 pub const JoinedMutationJsonSetSqlValueParserOptions = struct {
     params: []const sql_value.SqlValue,
     pending_joined_source_alias: ?[]const u8,
-    row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
+    row_expression_options: expr_row_parse.JoinedRowExpressionParserOptions,
 };
 
 pub const JoinedMutationAssignmentValueParserOptions = struct {
@@ -431,8 +438,8 @@ pub const JoinedMutationAssignmentValueParserOptions = struct {
 pub const JoinedMutationAssignmentExpressionParserOptions = struct {
     pending_joined_source_alias: ?[]const u8,
     type_context: expr_type.RowExpressionTypeContext,
-    row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
-    boolean_expression_options: lower_expr.JoinedBooleanRowExpressionParserOptions,
+    row_expression_options: expr_row_parse.JoinedRowExpressionParserOptions,
+    boolean_expression_options: expr_row_parse.JoinedBooleanRowExpressionParserOptions,
 };
 
 pub const JoinedMutationWherePredicateTargets = struct {
@@ -475,7 +482,7 @@ pub const JoinedMutationTailParserOptions = struct {
     returning_qualifiers: []const []const u8,
     string_to_array_predicate_is_containment: bool,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
-    returning_hooks: lower_expr.JoinedMutationReturningProjectionParserOptions,
+    returning_hooks: expr_projection.JoinedMutationReturningProjectionParserOptions,
     realtime_ns: u64,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
 };
@@ -509,9 +516,9 @@ pub const SemiJoinSourceQueryParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
     realtime_ns: u64,
     generated_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
@@ -527,11 +534,11 @@ pub const ExistsSemiJoinMutationTailParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
     generated_where_expression: ?*const generated_parser.GeneratedSqlExpressionAst = null,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
@@ -558,11 +565,11 @@ pub const SemiJoinMutationSourceParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
 };
@@ -582,11 +589,11 @@ pub const ExistsJoinedMutationSourceParserOptions = struct {
     defer_row_expression_field_validation: bool = false,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
 };
@@ -602,13 +609,13 @@ pub const DeleteJoinedMutationSourceParserOptions = struct {
     context_hooks: JoinedMutationSourceParserContextHooks,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
-    joined_returning_hooks: lower_expr.JoinedMutationReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
+    joined_returning_hooks: expr_projection.JoinedMutationReturningProjectionParserOptions,
     realtime_ns: u64,
     field_expression_qualifiers: []const []const u8 = &.{},
     returning_expression_qualifiers: []const []const u8 = &.{},
@@ -629,12 +636,12 @@ pub const UpdateJoinedMutationSourceParserOptions = struct {
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
     source_query_context_hooks: SemiJoinSourceQueryParserContextHooks,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     expression_where_options: lower_expr.JoinedMutationExpressionWhereConditionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
-    joined_returning_hooks: lower_expr.JoinedMutationReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
+    joined_returning_hooks: expr_projection.JoinedMutationReturningProjectionParserOptions,
     realtime_ns: u64,
     field_expression_qualifiers: []const []const u8 = &.{},
     returning_expression_qualifiers: []const []const u8 = &.{},
@@ -653,13 +660,13 @@ pub const MergeAssignmentParserOptions = struct {
 pub const MergeAssignmentExpressionParserOptions = struct {
     default_context: relational_rows.DefaultValueContext = .{},
     type_context: expr_type.RowExpressionTypeContext,
-    row_expression_options: lower_expr.JoinedRowExpressionParserOptions,
+    row_expression_options: expr_row_parse.JoinedRowExpressionParserOptions,
 };
 
 pub const MergeArmExpressionPredicatesParserOptions = struct {
-    not_where_options: lower_expr.JoinedExpressionNotWhereParserOptions,
-    or_where_options: lower_expr.JoinedExpressionOrWhereParserOptions,
-    where_condition_options: lower_expr.JoinedExpressionWhereConditionsParserOptions,
+    not_where_options: expr_where_condition.JoinedExpressionNotWhereParserOptions,
+    or_where_options: expr_where_condition.JoinedExpressionOrWhereParserOptions,
+    where_condition_options: expr_where_condition.JoinedExpressionWhereConditionsParserOptions,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
 };
 
@@ -693,7 +700,7 @@ pub const InsertParserOptions = struct {
     generated_conflict_action_kind: ?generated_parser.GeneratedSqlConflictActionKind = null,
     condition_options: ConflictAssignmentExpressionParserOptions,
     dispatch_options: ConflictExpressionDispatchOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
 
@@ -704,7 +711,7 @@ pub const UpdateParserOptions = struct {
     default_context: relational_rows.DefaultValueContext = .{},
     conflict_existing_qualifiers: []const []const u8 = &.{},
     assignment_value_hooks: ConflictUpdateAssignmentValueParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
 
@@ -713,7 +720,7 @@ pub const DeleteParserOptions = struct {
     schema: runtime_schema.TableSchema,
     unique_resolver: ?relational_rows.UniqueSelectorResolver = null,
     default_context: relational_rows.DefaultValueContext = .{},
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     realtime_ns: u64,
 };
 
@@ -747,11 +754,11 @@ pub const MutationSourceParserOptions = struct {
     generated_assignment_items: ?*const generated_parser.GeneratedSqlListAst = null,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst = null,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
-    order_expression_hooks: lower_expr.OrderExpressionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
 };
 
 const LoweredMergeMutationPlan = plan_mod.LoweredMergeMutationPlan;
@@ -972,7 +979,7 @@ pub fn parseInsertSourceWithCtesAlloc(
             hooks.generated_dml_ast,
             hooks.returning_hooks.generated_returning_items,
         );
-        returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, hooks.schema, &returning_qualifiers, hooks.returning_hooks);
+        returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, hooks.schema, &returning_qualifiers, hooks.returning_hooks);
         if (generated_returning_range) |range| {
             if (pos.* != range.end) return error.UnsupportedSqlShape;
         }
@@ -1060,7 +1067,7 @@ fn parseGeneratedInsertSourceColumnsAlloc(
         if (pos.* != item.end) return error.UnsupportedSqlShape;
         if (parser.peekKind(tokens, pos.*, .lparen)) return error.UnsupportedSqlShape;
         if (binder.relationalColumnForField(schema, column, null) == null) return error.InvalidSqlCatalog;
-        try columns.append(alloc, column);
+        try columns.append(alloc, @constCast(column));
         column_transferred = true;
     }
 }
@@ -2216,7 +2223,7 @@ fn validateGeneratedDmlBoundaryMirrorWhereExpression(
             const local_tokens = tokens[body_start..body_end];
             try validateGeneratedDmlWhereExpressionMetadata(local_tokens, local_tokens.len, body_dml);
         },
-        else => try lower_expr.validateGeneratedOptionalExpression(tokens, null, body_dml.where_expression),
+        else => try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, body_dml.where_expression),
     }
 }
 
@@ -2234,7 +2241,7 @@ fn validateGeneratedDmlBoundaryMirrorReturningItems(
         returning_tokens.end <= tokens.len and
         tokens[returning_tokens.start - 1].matchesKeywordTag(.returning))
     {
-        try lower_expr.validateGeneratedProjectionListForClause(tokens, returning_tokens, body_dml.returning_items);
+        try generated_read_validate.validateGeneratedProjectionListForClause(tokens, returning_tokens, body_dml.returning_items);
         return;
     }
 
@@ -2244,7 +2251,7 @@ fn validateGeneratedDmlBoundaryMirrorReturningItems(
     if (returning_tokens.start == 0 or returning_tokens.start >= returning_tokens.end or returning_tokens.end > body_len) return error.UnsupportedSqlShape;
     const local_tokens = tokens[body_start..body_end];
     if (!local_tokens[returning_tokens.start - 1].matchesKeywordTag(.returning)) return error.UnsupportedSqlShape;
-    try lower_expr.validateGeneratedProjectionListForClause(local_tokens, returning_tokens, body_dml.returning_items);
+    try generated_read_validate.validateGeneratedProjectionListForClause(local_tokens, returning_tokens, body_dml.returning_items);
 }
 
 fn validateGeneratedDmlBoundaryMirrorListItemsRange(
@@ -2409,7 +2416,7 @@ fn generatedDmlCteColumnAliasesAlloc(
         {
             return error.UnsupportedSqlShape;
         }
-        try lower_expr.validateGeneratedOptionalExpression(tokens, item, cte.column_names.expressions[index]);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, item, cte.column_names.expressions[index]);
         try aliases.append(alloc, try alloc.dupe(u8, tokens[item.start].text));
         expected_start = item.end;
         if (index + 1 < cte.column_names.items.len) {
@@ -3616,7 +3623,7 @@ pub fn parseJoinedMutationJsonSetSqlValueAlloc(
 
     const target_qualifiers = [_][]const u8{target_alias};
     const source_qualifiers = [_][]const u8{options.pending_joined_source_alias orelse return error.UnsupportedSqlShape};
-    const expression = try lower_expr.parseJoinedRowExpressionWithQualifiersAlloc(
+    const expression = try expr_row_parse.parseJoinedRowExpressionWithQualifiersAlloc(
         alloc,
         tokens,
         pos,
@@ -4119,7 +4126,7 @@ fn generatedDmlSemijoinSubqueryExpression(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !?*const generated_parser.GeneratedSqlExpressionAst {
     const expression = generated_expression_ast orelse return null;
-    try lower_expr.validateGeneratedOptionalExpression(tokens, expression.tokens, expression.*);
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, expression.tokens, expression.*);
     return switch (expression.kind) {
         .exists_subquery => blk: {
             if (expression.right_expression_kind != .subquery) return error.UnsupportedSqlShape;
@@ -4910,7 +4917,7 @@ pub fn parseConflictUpdateAssignmentValueAlloc(
         return;
     }
 
-    if (lower_expr.peekConflictExistingFieldIncrement(tokens, pos.*, field, column)) {
+    if (expr_operator.peekConflictExistingFieldIncrement(tokens, pos.*, field, column)) {
         try parseConflictIncrementAssignmentAlloc(alloc, tokens, pos, field, column, increment, increment_expr, .{
             .schema = hooks.schema,
             .params = hooks.params,
@@ -5063,7 +5070,7 @@ pub fn parseJoinedMutationAssignmentValueAlloc(
         return;
     }
 
-    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and lower_expr.identifierContainsQualifier(tokens[pos.*].text)) {
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and expr_parse.identifierContainsQualifier(tokens[pos.*].text)) {
         const rhs_start = pos.*;
         const source = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
         defer plan_mod.freeQualifiedField(alloc, source);
@@ -5436,7 +5443,7 @@ pub fn parseMergeMutationClausesAlloc(
     condition_options: MergeArmConditionParserOptions,
     assignment_options: MergeAssignmentParserOptions,
     generated_merge_arms: ?*const generated_parser.GeneratedSqlMergeArmListAst,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
 ) !ParsedMergeMutationClauses {
     if (generated_merge_arms) |arms| try validateGeneratedMergeArmListForHook(arms.*);
     const match_fields = try parseMergeMatchFieldsAlloc(alloc, tokens, pos, schema, joined_source_schema, target_table, source_table);
@@ -5515,7 +5522,7 @@ pub fn parseMergeMutationClausesAlloc(
     if (parser.matchKeywordTag(tokens, pos, .returning)) {
         if ((generated_merge_arms == null) != (returning_hooks.generated_returning_items == null)) return error.UnsupportedSqlShape;
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-        clauses.returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, schema, &returning_qualifiers, returning_hooks);
+        clauses.returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, schema, &returning_qualifiers, returning_hooks);
     }
     if (ctes_len == 0) {
         if (parser.matchToken(tokens, pos, .semicolon) != null and pos.* != tokens.len) return error.UnsupportedSqlShape;
@@ -5540,7 +5547,7 @@ fn validateGeneratedMergeArmListForHook(arms: generated_parser.GeneratedSqlMerge
             if (predicate.start <= arm.tokens.start or predicate.start >= predicate.end or predicate.end >= arm.action_tokens.start) return error.UnsupportedSqlShape;
             if (!generatedDmlTokenRangeEql(arm.predicate_expression.tokens orelse return error.UnsupportedSqlShape, predicate)) return error.UnsupportedSqlShape;
         } else {
-            try lower_expr.validateGeneratedOptionalExpression(&.{}, null, arm.predicate_expression);
+            try generated_read_validate.validateGeneratedOptionalExpression(&.{}, null, arm.predicate_expression);
         }
         if (arm.assignments_tokens) |assignments| {
             if (assignments.start < arm.action_tokens.start or assignments.start >= assignments.end or assignments.end > arm.action_tokens.end) return error.UnsupportedSqlShape;
@@ -5727,7 +5734,7 @@ pub fn parseMergeAssignmentExpressionAlloc(
         };
     }
 
-    const expression = try lower_expr.parseJoinedRowExpressionWithTableQualifiersAlloc(
+    const expression = try expr_row_parse.parseJoinedRowExpressionWithTableQualifiersAlloc(
         alloc,
         tokens,
         pos,
@@ -5753,7 +5760,7 @@ pub fn parseJoinedMutationAssignmentExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     const target_qualifiers = [_][]const u8{target_alias};
     const source_qualifiers = [_][]const u8{options.pending_joined_source_alias orelse return error.UnsupportedSqlShape};
-    const expression = try lower_expr.parseJoinedRowExpressionWithQualifiersAlloc(
+    const expression = try expr_row_parse.parseJoinedRowExpressionWithQualifiersAlloc(
         alloc,
         tokens,
         pos,
@@ -5778,7 +5785,7 @@ pub fn parseJoinedMutationBooleanAssignmentExpressionAlloc(
 ) !db_mod.types.RelationalRowsExpression {
     const target_qualifiers = [_][]const u8{target_alias};
     const source_qualifiers = [_][]const u8{options.pending_joined_source_alias orelse return error.UnsupportedSqlShape};
-    const expression = try lower_expr.parseJoinedBooleanRowExpressionWithQualifiersAlloc(
+    const expression = try expr_row_parse.parseJoinedBooleanRowExpressionWithQualifiersAlloc(
         alloc,
         tokens,
         pos,
@@ -8736,12 +8743,12 @@ pub fn parseMergeArmExpressionPredicatesAlloc(
     where_condition_options.generated_expression_ast = options.generated_expression_ast;
     where_condition_options.condition_hooks.require_exact_generated_expression = options.generated_expression_ast != null;
     if (mergeCanParseExpressionNotWhere(tokens, pos.*)) {
-        not_where_options.generated_expression_ast = try lower_expr.generatedPredicateExpressionAtStart(tokens, pos.*, options.generated_expression_ast);
-        try lower_expr.parseExpressionNotWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &not_groups, not_where_options);
+        not_where_options.generated_expression_ast = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, options.generated_expression_ast);
+        try expr_where_condition.parseExpressionNotWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &not_groups, not_where_options);
     } else if (parser.hasTopLevelOrBeforeTailToken(tokens, pos.*, expr_token.sqlWhereTailClauseKeywordToken) or mergeParenthesizedExpressionOrWhereCanStart(tokens, pos.*)) {
-        try lower_expr.parseExpressionOrWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &or_groups, or_where_options);
+        try expr_where_condition.parseExpressionOrWhereWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &or_groups, or_where_options);
     } else {
-        try lower_expr.parseExpressionWhereConditionsWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &conditions, &or_groups, &not_groups, where_condition_options);
+        try expr_where_condition.parseExpressionWhereConditionsWithTableQualifiersAlloc(alloc, tokens, pos, target_table, source_table, &conditions, &or_groups, &not_groups, where_condition_options);
     }
     if (conditions.items.len == 0 and or_groups.items.len == 0 and not_groups.items.len == 0) return error.UnsupportedSqlShape;
     if (!allow_target) {
@@ -8765,7 +8772,7 @@ pub fn parseMergeArmExpressionPredicatesAlloc(
 pub fn mergeParenthesizedExpressionOrWhereCanStart(tokens: []const Token, pos: usize) bool {
     if (!parser.peekKind(tokens, pos, .lparen)) return false;
     const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos);
-    if (!lower_expr.expressionPredicateCanStartAt(tokens, inner)) return false;
+    if (!expr_predicate.expressionPredicateCanStartAt(tokens, inner)) return false;
 
     var depth: usize = 0;
     var i = pos;
@@ -8789,7 +8796,7 @@ pub fn mergeParenthesizedExpressionOrWhereCanStart(tokens: []const Token, pos: u
 pub fn mergeCanParseExpressionNotWhere(tokens: []const Token, pos: usize) bool {
     if (!parser.peekKeywordTag(tokens, pos, .not) or pos + 2 >= tokens.len or tokens[pos + 1].kind != .lparen) return false;
     const inner = parser.predicateStartIndexAfterOpenParens(tokens, pos + 1);
-    return lower_expr.expressionPredicateCanStartAt(tokens, inner);
+    return expr_predicate.expressionPredicateCanStartAt(tokens, inner);
 }
 
 pub fn parseMergeUpdateAssignmentAlloc(
@@ -8967,7 +8974,7 @@ pub fn parseJoinedMutationTargetFieldAlloc(
     pos: *usize,
     target_alias: []const u8,
 ) ![]const u8 {
-    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and lower_expr.identifierContainsQualifier(tokens[pos.*].text)) {
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and expr_parse.identifierContainsQualifier(tokens[pos.*].text)) {
         const source = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
         defer plan_mod.freeQualifiedField(alloc, source);
         if (!std.mem.eql(u8, source.qualifier, target_alias)) return error.UnsupportedSqlShape;
@@ -9151,9 +9158,9 @@ pub fn parseJoinedMutationWhereAlloc(
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
     while (true) {
-        const generated_atom_expression = try lower_expr.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
+        const generated_atom_expression = try expr_generated_validate.generatedPredicateExpressionAtStart(tokens, pos.*, generated_expression_ast);
 
-        if (try lower_expr.joinedMutationExpressionSideAt(tokens, pos.*, target_alias, source_alias, string_to_array_predicate_is_containment)) |expression_side| {
+        if (try expr_predicate.joinedMutationExpressionSideAt(tokens, pos.*, target_alias, source_alias, string_to_array_predicate_is_containment)) |expression_side| {
             var expression_targets = lower_expr.JoinWherePredicateTargets{
                 .left_predicates = targets.left_predicates,
                 .right_predicates = targets.right_predicates,
@@ -9349,7 +9356,7 @@ pub fn parseJoinedMutationWhereAlloc(
             try parser.expectToken(tokens, pos, .rparen);
             try appendJoinedMutationInPredicate(alloc, lhs_in_predicates, lhs.field, lhs_column, values_json, true);
             values_transferred = true;
-        } else if (parser.peekKind(tokens, pos.*, .identifier) and lower_expr.identifierContainsQualifier(tokens[pos.*].text)) {
+        } else if (parser.peekKind(tokens, pos.*, .identifier) and expr_parse.identifierContainsQualifier(tokens[pos.*].text)) {
             if (op != .eq) return error.UnsupportedSqlShape;
             try expr_generated_validate.validateGeneratedRelationalPredicateIdentity(generated_atom_expression, tokens, op_token_index, op);
             const rhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
@@ -9569,7 +9576,7 @@ pub fn parseConflictTargetAlloc(
                 try validateGeneratedConflictTargetWhereJsonPredicateIdentity(scoped_tokens, where_tokens, generated_where_expression);
             }
         } else {
-            where_expressions = try lower_expr.parseUniquePredicateWhereExpressionConditionsAlloc(alloc, scoped_tokens, pos, .{
+            where_expressions = try expr_where_condition.parseUniquePredicateWhereExpressionConditionsAlloc(alloc, scoped_tokens, pos, .{
                 .type_context = options.type_context,
                 .defer_row_expression_field_validation = options.defer_row_expression_field_validation,
                 .case_expression_hooks = options.case_expression_hooks,
@@ -9743,7 +9750,7 @@ fn validateGeneratedConflictTargetWhereJsonPredicateIdentity(
     where_tokens: generated_parser.GeneratedSqlTokenRange,
     expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try lower_expr.validateGeneratedOptionalExpression(tokens, where_tokens, expression.*);
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, where_tokens, expression.*);
     try validateGeneratedConflictTargetWhereJsonPredicateAtomIdentity(tokens, where_tokens, expression);
 }
 
@@ -9753,7 +9760,7 @@ fn validateGeneratedConflictTargetUniqueExpressionIdentity(
     expression: runtime_schema.UniqueExpression,
     generated_expression: *const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
-    try lower_expr.validateGeneratedOptionalExpression(tokens, item, generated_expression.*);
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, item, generated_expression.*);
     const generated_tokens = generated_expression.tokens orelse return error.UnsupportedSqlShape;
     if (generated_tokens.start != item.start or generated_tokens.end != item.end) return error.UnsupportedSqlShape;
     const generated_inner = generatedConflictTargetInnerExpression(generated_expression);
@@ -10086,7 +10093,7 @@ pub fn parseExistsSemiJoinMutationTailAlloc(
                 options.generated_dml_ast,
                 options.returning_hooks.generated_returning_items,
             );
-            returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &target_qualifiers, options.returning_hooks);
+            returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &target_qualifiers, options.returning_hooks);
             if (generated_returning_range) |range| {
                 if (pos.* != range.end) return error.UnsupportedSqlShape;
             }
@@ -10226,7 +10233,7 @@ pub fn parseSemiJoinMutationSourceAlloc(
                 options.generated_dml_ast,
                 options.returning_hooks.generated_returning_items,
             );
-            returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &target_qualifiers, options.returning_hooks);
+            returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &target_qualifiers, options.returning_hooks);
             if (generated_returning_range) |range| {
                 if (pos.* != range.end) return error.UnsupportedSqlShape;
             }
@@ -11191,7 +11198,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
             options.generated_where_expression,
         );
         const target_qualifiers = [_][]const u8{ options.target_table.name, options.target_table.alias };
-        if (lower_expr.tailMentionsAnyQualifierBeforeClose(tokens, pos.*, target_qualifiers[0..])) {
+        if (expr_parse.tailMentionsAnyQualifierBeforeClose(tokens, pos.*, target_qualifiers[0..])) {
             options.context_hooks.set_context(options.context_hooks.ptr, .{
                 .schema = options.target_schema,
                 .field_expression_qualifiers = source_qualifiers[0..],
@@ -11225,7 +11232,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
                 &match_expression_array_contains,
                 options.target_table.alias,
                 options.source_alias,
-                lower_expr.stringToArrayPredicateIsContainment(tokens, pos.*),
+                expr_predicate.stringToArrayPredicateIsContainment(tokens, pos.*),
                 options.expression_where_options,
                 options.realtime_ns,
                 generated_source_where_expression,
@@ -11566,7 +11573,7 @@ pub fn parseJoinedMutationTailAlloc(
         } else if (parser.matchKeywordTag(tokens, pos, .order)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             try parser.expectKeywordTag(tokens, pos, .by);
-            try lower_expr.parseTargetOrderByAlloc(alloc, tokens, pos, options.schema, &order_by, options.target_alias);
+            try expr_order.parseTargetByAlloc(alloc, tokens, pos, options.schema, &order_by, options.target_alias);
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (saw_returning) return error.UnsupportedSqlShape;
             limit = try sql_value.parseLimitValue(tokens, pos, options.params);
@@ -11595,13 +11602,13 @@ pub fn parseJoinedMutationTailAlloc(
                 options.generated_dml_ast,
                 options.returning_hooks.generated_returning_items,
             );
-            returning = try lower_expr.parseJoinedMutationReturningProjectionAlloc(alloc, tokens, pos, options.schema, options.joined_source_schema, options.source_alias, options.returning_qualifiers, options.returning_hooks);
+            returning = try expr_projection.parseJoinedMutationReturningProjectionAlloc(alloc, tokens, pos, options.schema, options.joined_source_schema, options.source_alias, options.returning_qualifiers, options.returning_hooks);
             if (generated_returning_range) |range| {
                 if (pos.* != range.end) return error.UnsupportedSqlShape;
             }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
-        } else if (lower_expr.nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
+        } else if (expr_parse.nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
             return error.UnsupportedSqlShape;
         } else {
             return error.UnsupportedSqlShape;
@@ -11726,7 +11733,7 @@ fn generatedDmlOrderReadAstForClause(
     if (keyword_index + 1 >= tokens.len or !tokens[keyword_index].matchesKeywordTag(.order) or !tokens[keyword_index + 1].matchesKeywordTag(.by)) return null;
     const range = ast.mutation_order_tokens orelse return error.UnsupportedSqlShape;
     if (range.start != pos or range.end > tokens.len) return error.UnsupportedSqlShape;
-    try lower_expr.validateGeneratedOrderListForClause(tokens, range, ast.mutation_order_items);
+    try generated_read_validate.validateGeneratedOrderListForClause(tokens, range, ast.mutation_order_items);
     return generated_parser.GeneratedSqlReadAst{
         .kind = .query,
         .statement_span = ast.statement_span,
@@ -11783,7 +11790,7 @@ fn parseGeneratedDmlLimitValueForClause(
     if (range.start != pos.* or range.end > tokens.len) return error.UnsupportedSqlShape;
     if (ast.mutation_limit_all) {
         try validateGeneratedDmlLimitAllRangeLayout(tokens, range);
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_limit_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_limit_expression);
         pos.* = range.end;
         return @as(?u32, null);
     }
@@ -11832,7 +11839,7 @@ fn parseGeneratedDmlFetchLimitValueForClause(
         const generated_limit = try parseGeneratedDmlPaginationNullableU32Expression(tokens, ast.mutation_fetch_count_expression, expression_range, params);
         break :blk generated_limit;
     } else blk: {
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_fetch_count_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_fetch_count_expression);
         break :blk @as(?u32, 1);
     };
     pos.* = range.end;
@@ -11880,11 +11887,11 @@ pub fn parseMutationSourceQueryTailAlloc(
     row_claim: db_mod.types.RowClaimRequest,
     realtime_ns: u64,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
-    bare_boolean_hooks: lower_expr.BareBooleanWhereExpressionParserOptions,
-    expression_alternatives_hooks: lower_expr.ExpressionWhereConditionAlternativesParserOptions,
-    expression_condition_hooks: lower_expr.ExpressionWhereConditionsParserOptions,
-    order_expression_hooks: lower_expr.OrderExpressionParserOptions,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    order_expression_hooks: expr_order.OrderExpressionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
     generated_dml_ast: ?*const generated_parser.GeneratedSqlDmlAst,
 ) !ParsedMutationSourceQuery {
     var owned_row_claim = row_claim;
@@ -12040,7 +12047,7 @@ pub fn parseMutationSourceQueryTailAlloc(
             if (saw_returning) return error.UnsupportedSqlShape;
             const order_keyword_index = pos.* - 1;
             try parser.expectKeywordTag(tokens, pos, .by);
-            var order_by_options = lower_expr.OrderByParserOptions{
+            var order_by_options = expr_order.ByParserOptions{
                 .schema = schema,
                 .function_bindings = function_bindings,
                 .field_expression_qualifiers = field_expression_qualifiers,
@@ -12055,10 +12062,10 @@ pub fn parseMutationSourceQueryTailAlloc(
             };
             if (try generatedDmlOrderReadAstForClause(tokens, order_keyword_index, pos.*, generated_dml_ast)) |generated_order_read| {
                 order_by_options.generated_read_ast = &generated_order_read;
-                try lower_expr.parseOrderByAlloc(alloc, tokens, pos, &order_by, order_by_options);
+                try expr_order.parseByAlloc(alloc, tokens, pos, &order_by, order_by_options);
                 if (pos.* != generated_order_read.order_tokens.?.end) return error.UnsupportedSqlShape;
             } else {
-                try lower_expr.parseOrderByAlloc(alloc, tokens, pos, &order_by, order_by_options);
+                try expr_order.parseByAlloc(alloc, tokens, pos, &order_by, order_by_options);
             }
         } else if (parser.matchKeywordTag(tokens, pos, .limit)) {
             if (saw_returning) return error.UnsupportedSqlShape;
@@ -12103,13 +12110,13 @@ pub fn parseMutationSourceQueryTailAlloc(
                 generated_dml_ast,
                 returning_hooks.generated_returning_items,
             );
-            returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
+            returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, schema, returning_qualifiers, returning_hooks);
             if (generated_returning_range) |range| {
                 if (pos.* != range.end) return error.UnsupportedSqlShape;
             }
         } else if (parser.matchToken(tokens, pos, .semicolon) != null) {
             if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
-        } else if (lower_expr.nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
+        } else if (expr_parse.nextIsUnsupportedQueryKeyword(tokens, pos.*)) {
             return error.UnsupportedSqlShape;
         } else {
             return error.UnsupportedSqlShape;
@@ -12197,10 +12204,10 @@ pub fn parseOptionalTemporalPortionAlloc(
     const end_column = binder.relationalColumnForField(schema, period_catalog.end_column, null) orelse return error.InvalidSqlCatalog;
     if (start_column.field_type != end_column.field_type or !binder.relationalPeriodColumnType(start_column.field_type)) return error.InvalidSqlCatalog;
     try parser.expectKeywordTag(tokens, pos, .from);
-    const from_json = try lower_expr.parseSqlRangeConstructorEndpointJsonAlloc(alloc, tokens, pos, params, start_column.field_type, realtime_ns);
+    const from_json = try expr_predicate.parseSqlRangeConstructorEndpointJsonAlloc(alloc, tokens, pos, params, start_column.field_type, realtime_ns);
     errdefer alloc.free(from_json);
     try parser.expectKeywordTag(tokens, pos, .to);
-    const to_json = try lower_expr.parseSqlRangeConstructorEndpointJsonAlloc(alloc, tokens, pos, params, end_column.field_type, realtime_ns);
+    const to_json = try expr_predicate.parseSqlRangeConstructorEndpointJsonAlloc(alloc, tokens, pos, params, end_column.field_type, realtime_ns);
     errdefer alloc.free(to_json);
     return .{
         .period = period,
@@ -12208,10 +12215,6 @@ pub fn parseOptionalTemporalPortionAlloc(
         .to_json = to_json,
     };
 }
-
-pub const JoinedMutationExpressionSide = lower_expr.JoinedMutationExpressionSide;
-pub const joinedMutationExpressionSideAt = lower_expr.joinedMutationExpressionSideAt;
-pub const joinedMutationExpressionCanStartAt = lower_expr.joinedMutationExpressionCanStartAt;
 
 pub fn sqlCanonicalMutationFieldPath(
     schema: runtime_schema.TableSchema,
@@ -12676,7 +12679,7 @@ pub fn parseInsertAlloc(
                         value_transferred = true;
                     },
                     .period => |period| {
-                        const pair = try lower_expr.parseSqlPeriodRangeValuePairAlloc(
+                        const pair = try expr_predicate.parseSqlPeriodRangeValuePairAlloc(
                             alloc,
                             tokens,
                             pos,
@@ -12745,7 +12748,7 @@ pub fn parseInsertAlloc(
     errdefer returning.deinit(alloc);
     if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-        returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
+        returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
     }
 
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -13168,7 +13171,7 @@ pub fn parseUpdateAlloc(
     errdefer returning.deinit(alloc);
     if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-        returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
+        returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
     }
 
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -13240,7 +13243,7 @@ pub fn parseDeleteAlloc(
     errdefer returning.deinit(alloc);
     if (parser.matchKeywordTag(tokens, pos, .returning)) {
         const returning_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
-        returning = try lower_expr.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
+        returning = try expr_projection.parseReturningProjectionAlloc(alloc, tokens, pos, options.schema, &returning_qualifiers, options.returning_hooks);
     }
 
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
@@ -13854,7 +13857,7 @@ pub fn canParseJoinedAssignmentExpression(
         if (pos + 1 >= tokens.len) return false;
         return tokens[pos + 1].kind != .number;
     }
-    if (lower_expr.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
+    if (expr_parse.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
     if (assignmentExpressionKeywordCanStartAt(tokens, pos, false)) return true;
     if (tokens[pos].kind == .lparen) return true;
     if (tokens[pos].kind != .identifier or
@@ -13871,7 +13874,7 @@ pub fn canParseJoinedAssignmentExpression(
         else => false,
     };
     if (!next_is_expression_operator) return false;
-    if (lower_expr.identifierContainsQualifier(token.text)) {
+    if (expr_parse.identifierContainsQualifier(token.text)) {
         const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
         const qualifier = token.text[0..dot];
         const field = token.text[dot + 1 ..];
@@ -13906,7 +13909,7 @@ pub fn canParseConflictAssignmentExpression(
         if (pos + 1 >= tokens.len) return false;
         return tokens[pos + 1].kind != .number;
     }
-    if (lower_expr.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
+    if (expr_parse.rowExpressionHasTopLevelPipeConcat(tokens, pos)) return true;
     if (assignmentExpressionKeywordCanStartAt(tokens, pos, true)) return true;
     if (tokens[pos].kind == .lparen) return true;
     if (tokens[pos].kind != .identifier or
@@ -13971,7 +13974,7 @@ fn singleJoinedBooleanExpressionCanStartAt(
     const token = tokens[index];
     if (token.kind != .identifier) return false;
     if (booleanKeywordCanStart(token)) return true;
-    if (lower_expr.identifierContainsQualifier(token.text)) {
+    if (expr_parse.identifierContainsQualifier(token.text)) {
         const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return false;
         const qualifier = token.text[0..dot];
         const field = token.text[dot + 1 ..];
@@ -14088,7 +14091,7 @@ fn assignmentExpressionKeywordCanStartAt(tokens: []const Token, pos: usize, incl
         keywordTagAt(tokens, pos, .now) or
         keywordTagAt(tokens, pos, .current_timestamp) or
         keywordTagAt(tokens, pos, .current_date) or
-        lower_expr.peekSqlTypedDatetimeLiteral(tokens, pos) or
+        expr_parse.peekSqlTypedDatetimeLiteral(tokens, pos) or
         keywordAt(tokens, pos, "interval");
 }
 
@@ -15820,6 +15823,9 @@ fn lowerWritePlanParsedSqlWithFunctionBindingsForDmlTestAlloc(
     options: plan_mod.LowerWritePlanOptions,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
+    if (schema.storage_mode == .document) {
+        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, options);
+    }
     var context = lowering_context.WritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -17113,7 +17119,7 @@ fn validateGeneratedDmlListItemsRange(
         {
             return error.UnsupportedSqlShape;
         }
-        try lower_expr.validateGeneratedOptionalExpression(tokens, item, list.expressions[index]);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, item, list.expressions[index]);
         expected_start = item.end;
         if (index + 1 < list.count) {
             if (expected_start >= range.end or tokens[expected_start].kind != .comma) return error.UnsupportedSqlShape;
@@ -17153,7 +17159,7 @@ fn validateGeneratedDmlCommaPrefixedIdentifierListItemsRange(
         {
             return error.UnsupportedSqlShape;
         }
-        try lower_expr.validateGeneratedOptionalExpression(tokens, item, list.expressions[index]);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, item, list.expressions[index]);
         expected_comma = item.end;
     }
     if (expected_comma != range.end) return error.UnsupportedSqlShape;
@@ -17191,7 +17197,7 @@ fn validateGeneratedDmlReturningItemsRange(
         {
             return error.UnsupportedSqlShape;
         }
-        try lower_expr.validateGeneratedProjectionListForClause(tokens, range, returning_items.*);
+        try generated_read_validate.validateGeneratedProjectionListForClause(tokens, range, returning_items.*);
     } else {
         try validateGeneratedDmlEmptyList(returning_items);
     }
@@ -17226,8 +17232,8 @@ fn validateGeneratedDmlNoConflictMetadata(ast: generated_parser.GeneratedSqlDmlA
     {
         return error.UnsupportedSqlShape;
     }
-    try lower_expr.validateGeneratedOptionalExpression(&.{}, null, ast.conflict_target_where_expression);
-    try lower_expr.validateGeneratedOptionalExpression(&.{}, null, ast.conflict_action_where_expression);
+    try generated_read_validate.validateGeneratedOptionalExpression(&.{}, null, ast.conflict_target_where_expression);
+    try generated_read_validate.validateGeneratedOptionalExpression(&.{}, null, ast.conflict_action_where_expression);
     try validateGeneratedDmlEmptyList(&ast.conflict_target_items);
     try validateGeneratedDmlEmptyList(&ast.conflict_assignment_items);
 }
@@ -17325,12 +17331,12 @@ fn validateGeneratedInsertConflictMetadata(
         if (where.start != cursor + 1 or where.start >= where.end or where.end > conflict_range.end) return error.UnsupportedSqlShape;
         if (!tokens[cursor].matchesKeywordTag(.where)) return error.UnsupportedSqlShape;
         if (!generatedDmlTokenRangeEql(ast.conflict_target_where_expression.tokens orelse return error.UnsupportedSqlShape, where)) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, where, ast.conflict_target_where_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, where, ast.conflict_target_where_expression);
         const do_index = parser.findTopLevelKeywordTagFromIndex(tokens[0..conflict_range.end], where.end, .do) orelse return error.UnsupportedSqlShape;
         if (do_index != where.end) return error.UnsupportedSqlShape;
         cursor = do_index;
     } else {
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.conflict_target_where_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.conflict_target_where_expression);
     }
 
     if (cursor >= conflict_range.end or !tokens[cursor].matchesKeywordTag(.do)) return error.UnsupportedSqlShape;
@@ -17342,7 +17348,7 @@ fn validateGeneratedInsertConflictMetadata(
             if (!tokens[action.start].matchesKeywordTag(.nothing)) return error.UnsupportedSqlShape;
             if (action.end != action.start + 1 or ast.conflict_assignments_tokens != null or ast.conflict_action_where_tokens != null) return error.UnsupportedSqlShape;
             try validateGeneratedDmlEmptyList(&ast.conflict_assignment_items);
-            try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.conflict_action_where_expression);
+            try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.conflict_action_where_expression);
             return;
         },
         .update => {
@@ -17359,10 +17365,10 @@ fn validateGeneratedInsertConflictMetadata(
         const where = ast.conflict_action_where_tokens orelse return error.UnsupportedSqlShape;
         if (where.start != where_index + 1 or where.start >= where.end or where.end != action.end) return error.UnsupportedSqlShape;
         if (!generatedDmlTokenRangeEql(ast.conflict_action_where_expression.tokens orelse return error.UnsupportedSqlShape, where)) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, where, ast.conflict_action_where_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, where, ast.conflict_action_where_expression);
     } else {
         if (assignments.end != action.end or ast.conflict_action_where_tokens != null) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.conflict_action_where_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.conflict_action_where_expression);
     }
 }
 
@@ -18003,7 +18009,7 @@ fn generatedDmlWhereExpressionRange(
     ast: generated_parser.GeneratedSqlDmlAst,
 ) !?generated_parser.GeneratedSqlTokenRange {
     const where_range = ast.where_tokens orelse {
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.where_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.where_expression);
         return null;
     };
     if (where_range.start == 0 or where_range.start >= where_range.end or where_range.end > end) return error.UnsupportedSqlShape;
@@ -18031,9 +18037,9 @@ fn validateGeneratedDmlWhereExpressionMetadata(
     switch (ast.kind) {
         .update, .delete => {
             const expression_range = try generatedDmlWhereExpressionRange(tokens, end, ast);
-            try lower_expr.validateGeneratedOptionalExpression(tokens, expression_range, ast.where_expression);
+            try generated_read_validate.validateGeneratedOptionalExpression(tokens, expression_range, ast.where_expression);
         },
-        else => try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.where_expression),
+        else => try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.where_expression),
     }
 }
 
@@ -18056,7 +18062,7 @@ fn validateGeneratedDmlPaginationExpressionMetadata(
     expected_range: generated_parser.GeneratedSqlTokenRange,
 ) !void {
     if (!generatedDmlTokenRangeEql(expression.tokens orelse return error.UnsupportedSqlShape, expected_range)) return error.UnsupportedSqlShape;
-    try lower_expr.validateGeneratedOptionalExpression(tokens, expected_range, expression);
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, expected_range, expression);
     switch (expression.kind) {
         .token_range => {},
         .unary_positive => {
@@ -18259,7 +18265,7 @@ fn validateGeneratedDmlMutationTailMetadata(
         const range = ast.mutation_order_tokens orelse return error.UnsupportedSqlShape;
         const expected_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index, fetch_index, row_lock_index }) orelse tail_end;
         if (range.start != idx + 2 or range.end != expected_end or range.start >= range.end) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOrderListForClause(tokens, range, ast.mutation_order_items);
+        try generated_read_validate.validateGeneratedOrderListForClause(tokens, range, ast.mutation_order_items);
     } else {
         if (ast.mutation_order_tokens != null) return error.UnsupportedSqlShape;
         try validateGeneratedDmlEmptyOrderMetadata(ast.mutation_order_items);
@@ -18271,13 +18277,13 @@ fn validateGeneratedDmlMutationTailMetadata(
         if (range.start != idx + 1 or range.end != expected_end or range.start >= range.end) return error.UnsupportedSqlShape;
         if (ast.mutation_limit_all) {
             try validateGeneratedDmlLimitAllRangeLayout(tokens, range);
-            try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_limit_expression);
+            try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_limit_expression);
         } else {
             try validateGeneratedDmlPaginationExpressionMetadata(tokens, ast.mutation_limit_expression, range);
         }
     } else {
         if (ast.mutation_limit_tokens != null or ast.mutation_limit_all) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_limit_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_limit_expression);
     }
 
     if (offset_index) |idx| {
@@ -18293,7 +18299,7 @@ fn validateGeneratedDmlMutationTailMetadata(
         try validateGeneratedDmlPaginationExpressionMetadata(tokens, ast.mutation_offset_expression, expression_range);
     } else {
         if (ast.mutation_offset_tokens != null) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_offset_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_offset_expression);
     }
 
     if (fetch_index) |idx| {
@@ -18304,11 +18310,11 @@ fn validateGeneratedDmlMutationTailMetadata(
         if (ast.mutation_fetch_count_tokens) |count_range| {
             try validateGeneratedDmlPaginationExpressionMetadata(tokens, ast.mutation_fetch_count_expression, count_range);
         } else {
-            try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_fetch_count_expression);
+            try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_fetch_count_expression);
         }
     } else {
         if (ast.mutation_fetch_tokens != null or ast.mutation_fetch_count_tokens != null) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, ast.mutation_fetch_count_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, ast.mutation_fetch_count_expression);
     }
 
     if (row_lock_index) |idx| {
@@ -18666,9 +18672,9 @@ fn validateGeneratedMergeArmMetadata(
         if (predicate.start != cursor + 1 or predicate.end != then_index or predicate.start >= predicate.end) return error.UnsupportedSqlShape;
         if (!tokens[cursor].matchesKeywordTag(.@"and")) return error.UnsupportedSqlShape;
         if (!generatedDmlTokenRangeEql(arm.predicate_expression.tokens orelse return error.UnsupportedSqlShape, predicate)) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, predicate, arm.predicate_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, predicate, arm.predicate_expression);
     } else {
-        try lower_expr.validateGeneratedOptionalExpression(tokens, null, arm.predicate_expression);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, null, arm.predicate_expression);
         if (cursor != then_index) return error.UnsupportedSqlShape;
     }
     if (arm.action_tokens.start != then_index + 1 or arm.action_tokens.start >= arm.action_tokens.end or arm.action_tokens.end != arm.tokens.end) return error.UnsupportedSqlShape;
@@ -18744,7 +18750,7 @@ fn validateGeneratedDmlAssignmentExpressionMetadata(
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) !bool {
     if (!generatedDmlTokenRangeEql(expression.tokens orelse return error.UnsupportedSqlShape, assignment_item)) return error.UnsupportedSqlShape;
-    try lower_expr.validateGeneratedOptionalExpression(tokens, assignment_item, expression);
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, assignment_item, expression);
     if (expression.kind != .comparison) {
         const operator_index = generatedDmlTopLevelAssignmentEqToken(tokens, assignment_item) orelse return error.UnsupportedSqlShape;
         if (operator_index == assignment_item.start or operator_index + 1 >= assignment_item.end) return error.UnsupportedSqlShape;
@@ -18768,7 +18774,7 @@ fn validateGeneratedDmlAssignmentExpressionMetadata(
     }
     if (expression.right_expression) |right_expression| {
         if (!generatedDmlTokenRangeEql(right_expression.tokens orelse return error.UnsupportedSqlShape, right_tokens)) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, right_tokens, right_expression.*);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, right_tokens, right_expression.*);
     }
     return true;
 }
@@ -18783,17 +18789,17 @@ fn validateGeneratedDmlAssignmentRhsMetadata(
     const rhs_tokens: generated_parser.GeneratedSqlTokenRange = .{ .start = rhs_start, .end = rhs_end };
     if (expression.kind != .comparison) {
         if (!generatedDmlTokenRangeEql(expression.tokens orelse return error.UnsupportedSqlShape, rhs_tokens)) return error.UnsupportedSqlShape;
-        try lower_expr.validateGeneratedOptionalExpression(tokens, rhs_tokens, expression.*);
+        try generated_read_validate.validateGeneratedOptionalExpression(tokens, rhs_tokens, expression.*);
         return;
     }
     const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
     const right_expression = expression.right_expression orelse return error.UnsupportedSqlShape;
     if (right_tokens.start != rhs_start or right_tokens.end != rhs_end) {
-        if (try lower_expr.validateGeneratedOptionalExpressionForExactRange(tokens, rhs_tokens, right_expression)) return;
+        if (try generated_read_validate.validateGeneratedOptionalExpressionForExactRange(tokens, rhs_tokens, right_expression)) return;
         return error.UnsupportedSqlShape;
     }
     if (!generatedDmlTokenRangeEql(right_expression.tokens orelse return error.UnsupportedSqlShape, right_tokens)) return error.UnsupportedSqlShape;
-    try lower_expr.validateGeneratedOptionalExpression(tokens, right_tokens, right_expression.*);
+    try generated_read_validate.validateGeneratedOptionalExpression(tokens, right_tokens, right_expression.*);
 }
 
 fn updatePointFromGeneratedDmlAstAlloc(
@@ -19056,14 +19062,14 @@ fn generatedReturningProjectionAlloc(
     returning_qualifiers: []const []const u8,
     pos: *usize,
     generated_returning_items: *const generated_parser.GeneratedSqlListAst,
-    returning_hooks: lower_expr.ReturningProjectionParserOptions,
+    returning_hooks: expr_projection.ReturningProjectionParserOptions,
 ) !plan_mod.ReturningProjection {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     const scoped_tokens = tokens[0..range.end];
     pos.* = range.start;
     var generated_returning_hooks = returning_hooks;
     generated_returning_hooks.generated_returning_items = generated_returning_items;
-    var returning = try lower_expr.parseReturningProjectionAlloc(alloc, scoped_tokens, pos, schema, returning_qualifiers, generated_returning_hooks);
+    var returning = try expr_projection.parseReturningProjectionAlloc(alloc, scoped_tokens, pos, schema, returning_qualifiers, generated_returning_hooks);
     errdefer returning.deinit(alloc);
     if (pos.* != range.end) return error.UnsupportedSqlShape;
     return returning;
@@ -19167,7 +19173,7 @@ fn generatedInsertValueRowsAlloc(
                     value_transferred = true;
                 },
                 .period => |period| {
-                    const pair = try lower_expr.parseSqlPeriodRangeValuePairAlloc(
+                    const pair = try expr_predicate.parseSqlPeriodRangeValuePairAlloc(
                         alloc,
                         tokens,
                         &index,
@@ -19447,7 +19453,9 @@ fn lowerWritePlanWithCatalogSessionParsedSqlForDmlTestAlloc(
     catalog: table_catalog.CatalogSource,
     session: catalog_resources.SqlCatalogSession,
 ) !plan_mod.LoweredWritePlan {
-    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
+    if (schema.storage_mode == .document) {
+        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, options);
+    }
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -19469,7 +19477,9 @@ pub fn lowerWritePlanWithCatalogSessionAndFunctionBindingsParsedSqlAlloc(
     session: catalog_resources.SqlCatalogSession,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
-    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
+    if (schema.storage_mode == .document) {
+        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, options);
+    }
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -19490,7 +19500,9 @@ pub fn lowerWritePlanWithBoundStatementAndFunctionBindingsAlloc(
     params: []const sql_value.SqlValue,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
-    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
+    if (schema.storage_mode == .document) {
+        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{});
+    }
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -19511,7 +19523,9 @@ pub fn lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
     params: []const sql_value.SqlValue,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan_mod.LoweredWritePlan {
-    if (schema.storage_mode == .document) return error.DocumentSqlWriteUnsupported;
+    if (schema.storage_mode == .document) {
+        return try lowerDocumentWritePlanParsedSqlAlloc(alloc, parsed_sql, schema, params, .{});
+    }
     var context = lowering_context.CatalogWritePlanLoweringContext{
         .alloc = alloc,
         .schema = schema,
@@ -19522,6 +19536,1179 @@ pub fn lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(
         },
     };
     return try context.lowerLogicalParsed(parsed_sql, logical);
+}
+
+fn lowerDocumentWritePlanParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const tokenized.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    options: plan_mod.LowerWritePlanOptions,
+) !plan_mod.LoweredWritePlan {
+    if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    const operation = documentWriteOperationForParsedSql(parsed_sql);
+    switch (operation) {
+        .full_document_insert, .generated_id_insert, .exact_id_delete, .document_patch, .projection_write => {},
+        else => {
+            try document_write.rejectUnadmittedSqlDocumentWrite(operation);
+            unreachable;
+        },
+    }
+    var preflight = options.document_preflight orelse document_write.DocumentWritePreflight{
+        .surface = .sql_adapter,
+        .operation = operation,
+        .operation_admitted = true,
+    };
+    preflight.surface = .sql_adapter;
+    preflight.operation = operation;
+    try document_write.enforceSqlDocumentWritePreflight(preflight);
+    return switch (operation) {
+        .full_document_insert, .generated_id_insert => .{ .document_write = try parseDocumentInsertAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level) },
+        .exact_id_delete => .{ .document_write = try parseExactKeyDocumentDeleteAlloc(alloc, parsed_sql.items(), params, options.sync_level) },
+        .document_patch => .{ .document_write = try parseDocumentPatchUpdateAlloc(alloc, parsed_sql.items(), params, options.sync_level) },
+        .projection_write => try parseDocumentProjectionUpdateAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level),
+        else => unreachable,
+    };
+}
+
+const DocumentInsertColumnMode = enum {
+    explicit_id_doc,
+    explicit_doc_id,
+    generated_doc,
+    projection_explicit_id,
+    projection_generated_id,
+    projection_explicit_id_create_only,
+    projection_generated_id_create_only,
+};
+
+fn documentInsertColumnModeGeneratesId(mode: DocumentInsertColumnMode) bool {
+    return switch (mode) {
+        .generated_doc, .projection_generated_id, .projection_generated_id_create_only => true,
+        .explicit_id_doc, .explicit_doc_id, .projection_explicit_id, .projection_explicit_id_create_only => false,
+    };
+}
+
+fn documentInsertColumnModeCreateOnly(mode: DocumentInsertColumnMode) bool {
+    return switch (mode) {
+        .projection_explicit_id_create_only, .projection_generated_id_create_only => true,
+        else => false,
+    };
+}
+
+fn freeDocumentInsertColumnNames(alloc: std.mem.Allocator, columns: [][]const u8) void {
+    for (columns) |column| alloc.free(@constCast(column));
+    if (columns.len > 0) alloc.free(columns);
+}
+
+fn parseDocumentInsertColumnsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+) ![][]const u8 {
+    var columns = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (columns.items) |column| alloc.free(@constCast(column));
+        columns.deinit(alloc);
+    }
+
+    try parser.expectToken(tokens, pos, .lparen);
+    while (true) {
+        const column = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        errdefer alloc.free(column);
+        for (columns.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing, column)) return error.DocumentSqlWriteUnsupported;
+        }
+        try columns.append(alloc, column);
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    try parser.expectToken(tokens, pos, .rparen);
+    if (columns.items.len == 0) return error.DocumentSqlWriteUnsupported;
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn documentProjectionUnqualifiedField(
+    field: []const u8,
+    target_table: plan_mod.TableAlias,
+) ?[]const u8 {
+    if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
+        const first = field[0..dot];
+        if (std.ascii.eqlIgnoreCase(first, target_table.name) or
+            std.ascii.eqlIgnoreCase(first, target_table.alias))
+        {
+            const unqualified = field[dot + 1 ..];
+            if (unqualified.len == 0) return null;
+            return unqualified;
+        }
+    }
+    return field;
+}
+
+fn documentProjectionColumnForPath(
+    schema: runtime_schema.TableSchema,
+    path: []const u8,
+) !runtime_schema.RelationalColumn {
+    if (path.len == 0) return error.DocumentSqlWriteUnsupported;
+    if (binder.relationalColumnForField(schema, path, null)) |column| {
+        if (column.generated != null) return error.DocumentSqlWriteUnsupported;
+        if (column.path.len == 0) return error.DocumentSqlWriteUnsupported;
+        return column;
+    }
+    const dot = std.mem.indexOfScalar(u8, path, '.') orelse return error.DocumentSqlWriteUnsupported;
+    if (dot == 0 or dot + 1 >= path.len) return error.DocumentSqlWriteUnsupported;
+    const root_name = path[0..dot];
+    const root = binder.relationalColumnForField(schema, root_name, null) orelse return error.DocumentSqlWriteUnsupported;
+    if (root.generated != null) return error.DocumentSqlWriteUnsupported;
+    if (root.field_type != .json) return error.DocumentSqlWriteUnsupported;
+    _ = try documentProjectionPathSegmentCount(path);
+    return .{
+        .name = root.name,
+        .path = path,
+        .field_type = .json,
+        .nullable = root.nullable,
+        .indexed = root.indexed,
+    };
+}
+
+fn documentProjectionColumnForField(
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    field: []const u8,
+) !runtime_schema.RelationalColumn {
+    if (documentDocFieldMatches(field, target_table) or
+        documentVersionFieldMatches(field, target_table) or
+        documentIdentityFieldMatches(field, target_table))
+    {
+        return error.DocumentSqlWriteUnsupported;
+    }
+    const unqualified = documentProjectionUnqualifiedField(field, target_table) orelse return error.DocumentSqlWriteUnsupported;
+    return try documentProjectionColumnForPath(schema, unqualified);
+}
+
+fn documentInsertColumnMode(
+    columns: []const []const u8,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+) !DocumentInsertColumnMode {
+    if (columns.len == 1 and std.ascii.eqlIgnoreCase(columns[0], "_doc")) return .generated_doc;
+    if (columns.len == 2) {
+        if (std.ascii.eqlIgnoreCase(columns[0], "_id") and std.ascii.eqlIgnoreCase(columns[1], "_doc")) return .explicit_id_doc;
+        if (std.ascii.eqlIgnoreCase(columns[0], "_doc") and std.ascii.eqlIgnoreCase(columns[1], "_id")) return .explicit_doc_id;
+    }
+
+    var has_id = false;
+    var has_version = false;
+    var projection_count: usize = 0;
+    for (columns) |column| {
+        if (documentDocFieldMatches(column, target_table)) return error.DocumentSqlWriteUnsupported;
+        if (documentVersionFieldMatches(column, target_table)) {
+            if (has_version) return error.DocumentSqlWriteUnsupported;
+            has_version = true;
+            continue;
+        }
+        if (documentIdentityFieldMatches(column, target_table)) {
+            if (has_id) return error.DocumentSqlWriteUnsupported;
+            has_id = true;
+            continue;
+        }
+        _ = try documentProjectionColumnForField(schema, target_table, column);
+        projection_count += 1;
+    }
+    if (projection_count == 0) return error.DocumentSqlWriteUnsupported;
+    if (has_version) {
+        return if (has_id) .projection_explicit_id_create_only else .projection_generated_id_create_only;
+    }
+    return if (has_id) .projection_explicit_id else .projection_generated_id;
+}
+
+fn documentProjectionPathSeparator(path: []const u8) u8 {
+    return if (path.len > 0 and path[0] == '/') '/' else '.';
+}
+
+fn documentProjectionPathSegmentCount(path: []const u8) !usize {
+    if (path.len == 0) return error.DocumentSqlWriteUnsupported;
+    const separator = documentProjectionPathSeparator(path);
+    var count: usize = 0;
+    var pos: usize = if (separator == '/') 1 else 0;
+    while (pos <= path.len) {
+        const next = std.mem.indexOfScalarPos(u8, path, pos, separator) orelse path.len;
+        if (next == pos) return error.DocumentSqlWriteUnsupported;
+        count += 1;
+        if (next == path.len) break;
+        pos = next + 1;
+    }
+    return count;
+}
+
+fn documentProjectionPathSegment(path: []const u8, depth: usize) ![]const u8 {
+    const separator = documentProjectionPathSeparator(path);
+    var pos: usize = if (separator == '/') 1 else 0;
+    var current: usize = 0;
+    while (pos <= path.len) {
+        const next = std.mem.indexOfScalarPos(u8, path, pos, separator) orelse path.len;
+        if (next == pos) return error.DocumentSqlWriteUnsupported;
+        if (current == depth) return path[pos..next];
+        if (next == path.len) break;
+        pos = next + 1;
+        current += 1;
+    }
+    return error.DocumentSqlWriteUnsupported;
+}
+
+const DocumentProjectionInsertValue = struct {
+    path: []const u8,
+    value_json: []const u8,
+};
+
+fn documentProjectionPathSameAtDepth(a: []const u8, b: []const u8, depth: usize) !bool {
+    return std.mem.eql(u8, try documentProjectionPathSegment(a, depth), try documentProjectionPathSegment(b, depth));
+}
+
+fn documentProjectionPathInGroup(path: []const u8, group_path: ?[]const u8, group_depth: usize) !bool {
+    if (group_path) |wanted| return try documentProjectionPathSameAtDepth(path, wanted, group_depth);
+    return true;
+}
+
+fn writeDocumentProjectionJsonObject(
+    writer: *std.Io.Writer,
+    values: []const DocumentProjectionInsertValue,
+    depth: usize,
+    group_path: ?[]const u8,
+    group_depth: usize,
+) !void {
+    try writer.writeByte('{');
+    var first = true;
+    for (values, 0..) |value, i| {
+        if (!try documentProjectionPathInGroup(value.path, group_path, group_depth)) continue;
+        var seen = false;
+        for (values[0..i]) |previous| {
+            if (!try documentProjectionPathInGroup(previous.path, group_path, group_depth)) continue;
+            if (try documentProjectionPathSameAtDepth(previous.path, value.path, depth)) {
+                seen = true;
+                break;
+            }
+        }
+        if (seen) continue;
+
+        if (!first) try writer.writeByte(',');
+        try writer.print("{f}:", .{std.json.fmt(try documentProjectionPathSegment(value.path, depth), .{})});
+        first = false;
+
+        var leaf_index: ?usize = null;
+        var child_count: usize = 0;
+        for (values, 0..) |candidate, candidate_index| {
+            if (!try documentProjectionPathInGroup(candidate.path, group_path, group_depth)) continue;
+            if (!try documentProjectionPathSameAtDepth(candidate.path, value.path, depth)) continue;
+            const candidate_segment_count = try documentProjectionPathSegmentCount(candidate.path);
+            if (candidate_segment_count == depth + 1) {
+                if (leaf_index != null) return error.DocumentSqlWriteUnsupported;
+                leaf_index = candidate_index;
+            } else if (candidate_segment_count > depth + 1) {
+                child_count += 1;
+            } else {
+                return error.DocumentSqlWriteUnsupported;
+            }
+        }
+        if (leaf_index != null and child_count != 0) return error.DocumentSqlWriteUnsupported;
+        if (leaf_index) |idx| {
+            try writer.writeAll(values[idx].value_json);
+        } else {
+            try writeDocumentProjectionJsonObject(writer, values, depth + 1, value.path, depth);
+        }
+    }
+    try writer.writeByte('}');
+}
+
+fn documentProjectionJsonAlloc(
+    alloc: std.mem.Allocator,
+    values: []const DocumentProjectionInsertValue,
+) ![]u8 {
+    if (values.len == 0) return error.DocumentSqlWriteUnsupported;
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try writeDocumentProjectionJsonObject(&out.writer, values, 0, null, 0);
+    return try out.toOwnedSlice();
+}
+
+fn parseDocumentInsertAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredDocumentWrite {
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .insert);
+    try parser.expectKeywordTag(tokens, &pos, .into);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+    if (!std.mem.eql(u8, target_table.name, target_table.alias)) return error.UnsupportedSqlShape;
+
+    const columns = try parseDocumentInsertColumnsAlloc(alloc, tokens, &pos);
+    defer freeDocumentInsertColumnNames(alloc, columns);
+    const column_mode = try documentInsertColumnMode(columns, schema, target_table);
+
+    if (!parser.matchKeywordTag(tokens, &pos, .values)) {
+        if (parser.peekKeywordTag(tokens, pos, .select)) return error.DocumentSqlWriteUnsupported;
+        return error.UnsupportedSqlShape;
+    }
+
+    var writes = std.ArrayListUnmanaged(db_mod.types.BatchWrite).empty;
+    errdefer {
+        for (writes.items) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        writes.deinit(alloc);
+    }
+    var predicates = std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate).empty;
+    errdefer {
+        for (predicates.items) |predicate| alloc.free(@constCast(predicate.key));
+        predicates.deinit(alloc);
+    }
+    const create_only_insert = documentInsertColumnModeCreateOnly(column_mode);
+
+    while (true) {
+        try parser.expectToken(tokens, &pos, .lparen);
+        switch (column_mode) {
+            .explicit_id_doc, .explicit_doc_id => {
+                const id_first = column_mode == .explicit_id_doc;
+                const first_value = if (id_first)
+                    try sql_value.parseSqlStringValueAlloc(alloc, tokens, &pos, params)
+                else
+                    try sql_value.parseRequiredJsonDocumentValueAlloc(alloc, tokens, &pos, params);
+                var first_value_transferred = false;
+                errdefer if (!first_value_transferred) alloc.free(first_value);
+                try parser.expectToken(tokens, &pos, .comma);
+                const second_value = if (id_first)
+                    try sql_value.parseRequiredJsonDocumentValueAlloc(alloc, tokens, &pos, params)
+                else
+                    try sql_value.parseSqlStringValueAlloc(alloc, tokens, &pos, params);
+                var second_value_transferred = false;
+                errdefer if (!second_value_transferred) alloc.free(second_value);
+                try parser.expectToken(tokens, &pos, .rparen);
+
+                try writes.append(alloc, .{
+                    .key = if (id_first) first_value else second_value,
+                    .value = if (id_first) second_value else first_value,
+                });
+                first_value_transferred = true;
+                second_value_transferred = true;
+            },
+            .generated_doc => {
+                const key = try document_write.generatedDocumentIdAlloc(alloc);
+                var key_transferred = false;
+                errdefer if (!key_transferred) alloc.free(key);
+                const value = try sql_value.parseRequiredJsonDocumentValueAlloc(alloc, tokens, &pos, params);
+                var value_transferred = false;
+                errdefer if (!value_transferred) alloc.free(value);
+                try parser.expectToken(tokens, &pos, .rparen);
+
+                try writes.append(alloc, .{
+                    .key = key,
+                    .value = value,
+                });
+                key_transferred = true;
+                value_transferred = true;
+            },
+            .projection_explicit_id, .projection_generated_id, .projection_explicit_id_create_only, .projection_generated_id_create_only => {
+                var key: []const u8 = undefined;
+                var generated_key_transferred = true;
+                if (documentInsertColumnModeGeneratesId(column_mode)) {
+                    key = try document_write.generatedDocumentIdAlloc(alloc);
+                    generated_key_transferred = false;
+                }
+                errdefer if (!generated_key_transferred) alloc.free(@constCast(key));
+                var expected_version: ?u64 = null;
+
+                var projection_values = std.ArrayListUnmanaged(DocumentProjectionInsertValue).empty;
+                errdefer {
+                    for (projection_values.items) |item| alloc.free(@constCast(item.value_json));
+                    projection_values.deinit(alloc);
+                }
+
+                for (columns, 0..) |column_name, i| {
+                    if (i > 0) try parser.expectToken(tokens, &pos, .comma);
+                    if (documentIdentityFieldMatches(column_name, target_table)) {
+                        if (documentInsertColumnModeGeneratesId(column_mode)) return error.DocumentSqlWriteUnsupported;
+                        key = try sql_value.parseSqlStringValueAlloc(alloc, tokens, &pos, params);
+                        generated_key_transferred = false;
+                        continue;
+                    }
+                    if (documentVersionFieldMatches(column_name, target_table)) {
+                        const version = try parseDocumentVersionPredicateValue(tokens, &pos, params);
+                        if (!create_only_insert or version != 0) return error.DocumentSqlWriteUnsupported;
+                        expected_version = version;
+                        continue;
+                    }
+
+                    const column = try documentProjectionColumnForField(schema, target_table, column_name);
+                    const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, &pos, params, column, sql_value.currentRealtimeNs());
+                    errdefer alloc.free(value_json);
+                    for (projection_values.items) |existing| {
+                        if (std.mem.eql(u8, existing.path, column.path)) return error.DocumentSqlWriteUnsupported;
+                    }
+                    try projection_values.append(alloc, .{
+                        .path = column.path,
+                        .value_json = value_json,
+                    });
+                }
+                try parser.expectToken(tokens, &pos, .rparen);
+
+                const value = try documentProjectionJsonAlloc(alloc, projection_values.items);
+                var value_transferred = false;
+                errdefer if (!value_transferred) alloc.free(value);
+                for (projection_values.items) |item| alloc.free(@constCast(item.value_json));
+                projection_values.deinit(alloc);
+                projection_values = .empty;
+                if (create_only_insert) {
+                    try appendDocumentVersionPredicateAlloc(alloc, &predicates, key, expected_version orelse return error.DocumentSqlWriteUnsupported);
+                }
+
+                try writes.append(alloc, .{
+                    .key = key,
+                    .value = value,
+                });
+                generated_key_transferred = true;
+                value_transferred = true;
+            },
+        }
+
+        if (parser.matchToken(tokens, &pos, .comma) == null) break;
+        if (!parser.peekKind(tokens, pos, .lparen)) return error.UnsupportedSqlShape;
+    }
+
+    if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos)) {
+        if (parser.peekKeywordTag(tokens, pos, .on) or parser.peekKeywordTag(tokens, pos, .returning)) return error.DocumentSqlWriteUnsupported;
+        return error.UnsupportedSqlShape;
+    }
+
+    const writes_slice = try writes.toOwnedSlice(alloc);
+    var writes_transferred = false;
+    errdefer if (!writes_transferred) {
+        for (writes_slice) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (writes_slice.len > 0) alloc.free(writes_slice);
+    };
+    writes = .empty;
+    const predicates_slice = try predicates.toOwnedSlice(alloc);
+    var predicates_transferred = false;
+    errdefer if (!predicates_transferred) {
+        for (predicates_slice) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates_slice.len > 0) alloc.free(predicates_slice);
+    };
+    predicates = .empty;
+
+    alloc.free(target_table.alias);
+    const table_name = target_table.name;
+    writes_transferred = true;
+    predicates_transferred = true;
+    return .{
+        .table_name = table_name,
+        .batch = .{
+            .writes = writes_slice,
+            .predicates = predicates_slice,
+            .req = .{
+                .writes = writes_slice,
+                .predicates = predicates_slice,
+                .sync_level = sync_level,
+                .write_mode = if (create_only_insert) .create_only else .upsert,
+            },
+            .inserted = @intCast(writes_slice.len),
+        },
+        .operation = switch (column_mode) {
+            .explicit_id_doc, .explicit_doc_id, .projection_explicit_id, .projection_explicit_id_create_only => .full_document_insert,
+            .generated_doc, .projection_generated_id, .projection_generated_id_create_only => .generated_id_insert,
+        },
+        .sync_level = sync_level,
+    };
+}
+
+fn documentVirtualFieldMatches(field: []const u8, target_table: plan_mod.TableAlias, virtual_field: []const u8) bool {
+    const dot = std.mem.lastIndexOfScalar(u8, field, '.');
+    const unqualified = if (dot) |idx| field[idx + 1 ..] else field;
+    if (!std.ascii.eqlIgnoreCase(unqualified, virtual_field)) return false;
+    if (dot) |idx| {
+        const qualifier = field[0..idx];
+        return std.ascii.eqlIgnoreCase(qualifier, target_table.name) or
+            std.ascii.eqlIgnoreCase(qualifier, target_table.alias);
+    }
+    return true;
+}
+
+fn documentIdentityFieldMatches(field: []const u8, target_table: plan_mod.TableAlias) bool {
+    return documentVirtualFieldMatches(field, target_table, "_id");
+}
+
+fn documentDocFieldMatches(field: []const u8, target_table: plan_mod.TableAlias) bool {
+    return documentVirtualFieldMatches(field, target_table, "_doc");
+}
+
+fn documentVersionFieldMatches(field: []const u8, target_table: plan_mod.TableAlias) bool {
+    return documentVirtualFieldMatches(field, target_table, "_version");
+}
+
+const DocumentIdentityFilter = struct {
+    keys: [][]const u8,
+    expected_version: ?u64 = null,
+
+    fn deinit(self: @This(), alloc: std.mem.Allocator) void {
+        for (self.keys) |key| alloc.free(key);
+        if (self.keys.len > 0) alloc.free(self.keys);
+    }
+};
+
+fn parseDocumentDeleteIdentityFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: plan_mod.TableAlias,
+) !void {
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(field);
+    if (!documentIdentityFieldMatches(field, target_table)) return error.DocumentSqlWriteUnsupported;
+}
+
+fn appendDocumentDeleteKeyAlloc(
+    alloc: std.mem.Allocator,
+    deletes: *std.ArrayListUnmanaged([]const u8),
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+) !void {
+    const key = try sql_value.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+    errdefer alloc.free(key);
+    try deletes.append(alloc, key);
+}
+
+fn parseDocumentVersionPredicateValue(tokens: []const Token, pos: *usize, params: []const sql_value.SqlValue) !u64 {
+    const cursor = parser.Cursor.init(tokens, pos);
+    if (cursor.matchToken(.number)) |token| {
+        if (std.mem.indexOfAny(u8, token.text, ".eE") != null) return error.DocumentSqlWriteUnsupported;
+        return std.fmt.parseInt(u64, token.text, 10) catch return error.DocumentSqlWriteUnsupported;
+    }
+    if (cursor.matchToken(.placeholder)) |token| {
+        const value = try sql_value.boundSqlValue(token, params);
+        return switch (value) {
+            .integer => |integer| if (integer >= 0) @intCast(integer) else error.DocumentSqlWriteUnsupported,
+            else => error.DocumentSqlWriteUnsupported,
+        };
+    }
+    return error.DocumentSqlWriteUnsupported;
+}
+
+fn parseOptionalDocumentVersionPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) !?u64 {
+    if (!parser.matchKeywordTag(tokens, pos, .@"and")) return null;
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(field);
+    if (!documentVersionFieldMatches(field, target_table)) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, pos, .eq);
+    return try parseDocumentVersionPredicateValue(tokens, pos, params);
+}
+
+fn parseDocumentIdentityKeysAfterFieldAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const sql_value.SqlValue,
+) ![][]const u8 {
+    var keys = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (keys.items) |key| alloc.free(key);
+        keys.deinit(alloc);
+    }
+
+    if (parser.matchToken(tokens, pos, .eq) != null) {
+        try appendDocumentDeleteKeyAlloc(alloc, &keys, tokens, pos, params);
+    } else if (parser.matchKeywordTag(tokens, pos, .in)) {
+        try parser.expectToken(tokens, pos, .lparen);
+        while (true) {
+            try appendDocumentDeleteKeyAlloc(alloc, &keys, tokens, pos, params);
+            if (parser.matchToken(tokens, pos, .comma) == null) break;
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+    } else {
+        return error.DocumentSqlWriteUnsupported;
+    }
+
+    if (keys.items.len == 0) return error.UnsupportedSqlShape;
+    return try keys.toOwnedSlice(alloc);
+}
+
+fn parseDocumentIdentityFilterAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) !DocumentIdentityFilter {
+    try parser.expectKeywordTag(tokens, pos, .where);
+    const first_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(first_field);
+
+    if (documentIdentityFieldMatches(first_field, target_table)) {
+        const keys_slice = try parseDocumentIdentityKeysAfterFieldAlloc(alloc, tokens, pos, params);
+        errdefer {
+            for (keys_slice) |key| alloc.free(key);
+            if (keys_slice.len > 0) alloc.free(keys_slice);
+        }
+        return .{
+            .keys = keys_slice,
+            .expected_version = try parseOptionalDocumentVersionPredicateAlloc(alloc, tokens, pos, target_table, params),
+        };
+    }
+
+    if (!documentVersionFieldMatches(first_field, target_table)) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, pos, .eq);
+    const expected_version = try parseDocumentVersionPredicateValue(tokens, pos, params);
+    if (!parser.matchKeywordTag(tokens, pos, .@"and")) return error.DocumentSqlWriteUnsupported;
+    try parseDocumentDeleteIdentityFieldAlloc(alloc, tokens, pos, target_table);
+    const keys_slice = try parseDocumentIdentityKeysAfterFieldAlloc(alloc, tokens, pos, params);
+    errdefer {
+        for (keys_slice) |key| alloc.free(key);
+        if (keys_slice.len > 0) alloc.free(keys_slice);
+    }
+    return .{
+        .keys = keys_slice,
+        .expected_version = expected_version,
+    };
+}
+
+fn parseDocumentIdentityFilterKeysAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) ![][]const u8 {
+    const filter = try parseDocumentIdentityFilterAlloc(alloc, tokens, pos, target_table, params);
+    if (filter.expected_version != null) {
+        filter.deinit(alloc);
+        return error.DocumentSqlWriteUnsupported;
+    }
+    return filter.keys;
+}
+
+fn documentVersionPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    expected_version: u64,
+) ![]db_mod.types.TransactionVersionPredicate {
+    const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, 1);
+    errdefer alloc.free(predicates);
+    predicates[0] = try documentVersionPredicateAlloc(alloc, key, expected_version);
+    return predicates;
+}
+
+fn documentVersionPredicatesForKeysAlloc(
+    alloc: std.mem.Allocator,
+    keys: []const []const u8,
+    expected_version: u64,
+) ![]db_mod.types.TransactionVersionPredicate {
+    if (keys.len == 0) return error.DocumentSqlWriteUnsupported;
+    const predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (predicates[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+    for (keys) |key| {
+        predicates[initialized] = try documentVersionPredicateAlloc(alloc, key, expected_version);
+        initialized += 1;
+    }
+    return predicates;
+}
+
+fn documentVersionPredicateAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+    expected_version: u64,
+) !db_mod.types.TransactionVersionPredicate {
+    const predicate_key = try alloc.dupe(u8, key);
+    errdefer alloc.free(predicate_key);
+    return .{
+        .key = predicate_key,
+        .expected_version = expected_version,
+    };
+}
+
+fn appendDocumentVersionPredicateAlloc(
+    alloc: std.mem.Allocator,
+    predicates: *std.ArrayListUnmanaged(db_mod.types.TransactionVersionPredicate),
+    key: []const u8,
+    expected_version: u64,
+) !void {
+    const predicate = try documentVersionPredicateAlloc(alloc, key, expected_version);
+    errdefer alloc.free(@constCast(predicate.key));
+    try predicates.append(alloc, predicate);
+}
+
+fn parseExactKeyDocumentDeleteAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredDocumentWrite {
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .delete);
+    try parser.expectKeywordTag(tokens, &pos, .from);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+    if (!std.mem.eql(u8, target_table.name, target_table.alias)) return error.UnsupportedSqlShape;
+
+    const deletes_slice = try parseDocumentIdentityFilterKeysAlloc(alloc, tokens, &pos, target_table, params);
+    var deletes_transferred = false;
+    errdefer if (!deletes_transferred) {
+        for (deletes_slice) |key| alloc.free(key);
+        if (deletes_slice.len > 0) alloc.free(deletes_slice);
+    };
+
+    if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos)) {
+        if (parser.peekKeywordTag(tokens, pos, .returning)) return error.DocumentSqlWriteUnsupported;
+        return error.DocumentSqlWriteUnsupported;
+    }
+
+    alloc.free(target_table.alias);
+    const table_name = target_table.name;
+    deletes_transferred = true;
+    return .{
+        .table_name = table_name,
+        .batch = .{
+            .deletes = deletes_slice,
+            .req = .{
+                .deletes = deletes_slice,
+                .sync_level = sync_level,
+            },
+            .deleted = @intCast(deletes_slice.len),
+        },
+        .operation = .exact_id_delete,
+        .sync_level = sync_level,
+    };
+}
+
+fn freeDocumentTransformOps(alloc: std.mem.Allocator, operations: []const db_mod.types.TransformOp) void {
+    for (operations) |op| {
+        alloc.free(@constCast(op.path));
+        if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+    }
+    if (operations.len > 0) alloc.free(@constCast(operations));
+}
+
+fn freeDocumentTransformOpPayloads(alloc: std.mem.Allocator, operations: []const db_mod.types.TransformOp) void {
+    for (operations) |op| {
+        alloc.free(@constCast(op.path));
+        if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+    }
+}
+
+fn freeDocumentTransforms(alloc: std.mem.Allocator, transforms: []const db_mod.types.DocumentTransform) void {
+    for (transforms) |transform| {
+        alloc.free(@constCast(transform.key));
+        freeDocumentTransformOps(alloc, transform.operations);
+    }
+    if (transforms.len > 0) alloc.free(@constCast(transforms));
+}
+
+fn cloneDocumentTransformOpsAlloc(
+    alloc: std.mem.Allocator,
+    operations: []const db_mod.types.TransformOp,
+) ![]db_mod.types.TransformOp {
+    var out = try alloc.alloc(db_mod.types.TransformOp, operations.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (operations) |op| {
+        const path = try alloc.dupe(u8, op.path);
+        errdefer alloc.free(path);
+        const value_json = if (op.value_json) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (value_json) |value| alloc.free(value);
+        out[initialized] = .{
+            .op = op.op,
+            .path = path,
+            .value_json = value_json,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn appendDocumentPatchSetOpAlloc(
+    alloc: std.mem.Allocator,
+    operations: *std.ArrayListUnmanaged(db_mod.types.TransformOp),
+    path: []const u8,
+    value: std.json.Value,
+) !void {
+    if (path.len == 0) return error.DocumentSqlWriteUnsupported;
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    const value_json = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    errdefer alloc.free(value_json);
+    try operations.append(alloc, .{
+        .op = .set,
+        .path = owned_path,
+        .value_json = value_json,
+    });
+}
+
+fn appendDocumentProjectionSetOpAlloc(
+    alloc: std.mem.Allocator,
+    operations: *std.ArrayListUnmanaged(db_mod.types.TransformOp),
+    path: []const u8,
+    value_json: []const u8,
+) !void {
+    if (path.len == 0) return error.DocumentSqlWriteUnsupported;
+    for (operations.items) |existing| {
+        if (std.mem.eql(u8, existing.path, path)) return error.DocumentSqlWriteUnsupported;
+    }
+    const owned_path = try alloc.dupe(u8, path);
+    errdefer alloc.free(owned_path);
+    const owned_value = try alloc.dupe(u8, value_json);
+    errdefer alloc.free(owned_value);
+    try operations.append(alloc, .{
+        .op = .set,
+        .path = owned_path,
+        .value_json = owned_value,
+    });
+}
+
+fn parseDocumentPatchOpsAlloc(
+    alloc: std.mem.Allocator,
+    patch_json: []const u8,
+) ![]db_mod.types.TransformOp {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, patch_json, .{}) catch return error.DocumentSqlWriteUnsupported;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.DocumentSqlWriteUnsupported;
+
+    const ops_value = parsed.value.object.get("ops") orelse return error.DocumentSqlWriteUnsupported;
+    if (ops_value != .array) return error.DocumentSqlWriteUnsupported;
+
+    var operations = std.ArrayListUnmanaged(db_mod.types.TransformOp).empty;
+    errdefer {
+        freeDocumentTransformOpPayloads(alloc, operations.items);
+        operations.deinit(alloc);
+    }
+
+    for (ops_value.array.items) |item| {
+        if (item != .object) return error.DocumentSqlWriteUnsupported;
+        const op_value = item.object.get("op") orelse return error.DocumentSqlWriteUnsupported;
+        if (op_value != .string) return error.DocumentSqlWriteUnsupported;
+        if (std.mem.eql(u8, op_value.string, "set")) {
+            const path_value = item.object.get("path") orelse return error.DocumentSqlWriteUnsupported;
+            if (path_value != .string) return error.DocumentSqlWriteUnsupported;
+            const value = item.object.get("value") orelse return error.DocumentSqlWriteUnsupported;
+            try appendDocumentPatchSetOpAlloc(alloc, &operations, path_value.string, value);
+        } else if (std.mem.eql(u8, op_value.string, "remove")) {
+            const path_value = item.object.get("path") orelse return error.DocumentSqlWriteUnsupported;
+            if (path_value != .string or path_value.string.len == 0) return error.DocumentSqlWriteUnsupported;
+            const owned_path = try alloc.dupe(u8, path_value.string);
+            errdefer alloc.free(owned_path);
+            try operations.append(alloc, .{
+                .op = .unset,
+                .path = owned_path,
+            });
+        } else if (std.mem.eql(u8, op_value.string, "merge")) {
+            const value = item.object.get("value") orelse return error.DocumentSqlWriteUnsupported;
+            if (value != .object) return error.DocumentSqlWriteUnsupported;
+            var it = value.object.iterator();
+            while (it.next()) |entry| {
+                try appendDocumentPatchSetOpAlloc(alloc, &operations, entry.key_ptr.*, entry.value_ptr.*);
+            }
+        } else {
+            return error.DocumentSqlWriteUnsupported;
+        }
+    }
+    if (operations.items.len == 0) return error.DocumentSqlWriteUnsupported;
+    return try operations.toOwnedSlice(alloc);
+}
+
+fn parseDocumentPatchUpdateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredDocumentWrite {
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .update);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+    if (!std.mem.eql(u8, target_table.name, target_table.alias)) return error.DocumentSqlWriteUnsupported;
+
+    try parser.expectKeywordTag(tokens, &pos, .set);
+    const target_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, &pos);
+    defer alloc.free(target_field);
+    if (!documentDocFieldMatches(target_field, target_table)) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, &pos, .eq);
+
+    const function_token = parser.matchToken(tokens, &pos, .identifier) orelse return error.DocumentSqlWriteUnsupported;
+    if (!std.ascii.eqlIgnoreCase(function_token.text, "antfly.json_patch")) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, &pos, .lparen);
+    const source_field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, &pos);
+    defer alloc.free(source_field);
+    if (!documentDocFieldMatches(source_field, target_table)) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, &pos, .comma);
+    const patch_json = try sql_value.parseSqlStringValueAlloc(alloc, tokens, &pos, params);
+    defer alloc.free(patch_json);
+    try parser.expectToken(tokens, &pos, .rparen);
+
+    const operations_template = try parseDocumentPatchOpsAlloc(alloc, patch_json);
+    defer freeDocumentTransformOps(alloc, operations_template);
+
+    const filter = try parseDocumentIdentityFilterAlloc(alloc, tokens, &pos, target_table, params);
+    var filter_transferred = false;
+    errdefer if (!filter_transferred) filter.deinit(alloc);
+    if (filter.expected_version != null and filter.keys.len != 1) return error.DocumentSqlWriteUnsupported;
+
+    if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos)) return error.DocumentSqlWriteUnsupported;
+
+    var transforms = try alloc.alloc(db_mod.types.DocumentTransform, filter.keys.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (transforms[0..initialized]) |transform| {
+            alloc.free(@constCast(transform.key));
+            freeDocumentTransformOps(alloc, transform.operations);
+        }
+        if (transforms.len > 0) alloc.free(transforms);
+    }
+    for (filter.keys) |key| {
+        const transform_key = try alloc.dupe(u8, key);
+        errdefer alloc.free(transform_key);
+        const operations = try cloneDocumentTransformOpsAlloc(alloc, operations_template);
+        errdefer freeDocumentTransformOps(alloc, operations);
+        transforms[initialized] = .{
+            .key = transform_key,
+            .operations = operations,
+        };
+        initialized += 1;
+    }
+    const predicates: []db_mod.types.TransactionVersionPredicate = if (filter.expected_version) |expected_version|
+        try documentVersionPredicatesAlloc(alloc, filter.keys[0], expected_version)
+    else
+        try alloc.alloc(db_mod.types.TransactionVersionPredicate, 0);
+    errdefer {
+        for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+
+    filter.deinit(alloc);
+    filter_transferred = true;
+    alloc.free(target_table.alias);
+    const table_name = target_table.name;
+    return .{
+        .table_name = table_name,
+        .batch = .{
+            .transforms = transforms,
+            .predicates = predicates,
+            .req = .{
+                .transforms = transforms,
+                .predicates = predicates,
+                .sync_level = sync_level,
+            },
+            .transformed = @intCast(transforms.len),
+        },
+        .operation = .document_patch,
+        .sync_level = sync_level,
+    };
+}
+
+fn parseDocumentProjectionUpdateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredWritePlan {
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .update);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+    if (!std.mem.eql(u8, target_table.name, target_table.alias)) return error.DocumentSqlWriteUnsupported;
+
+    try parser.expectKeywordTag(tokens, &pos, .set);
+    var operations = std.ArrayListUnmanaged(db_mod.types.TransformOp).empty;
+    errdefer {
+        freeDocumentTransformOpPayloads(alloc, operations.items);
+        operations.deinit(alloc);
+    }
+
+    while (true) {
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, &pos);
+        defer alloc.free(field);
+        const column = try documentProjectionColumnForField(schema, target_table, field);
+        try parser.expectToken(tokens, &pos, .eq);
+        const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, &pos, params, column, sql_value.currentRealtimeNs());
+        defer alloc.free(value_json);
+        try appendDocumentProjectionSetOpAlloc(alloc, &operations, column.path, value_json);
+        if (parser.matchToken(tokens, &pos, .comma) == null) break;
+    }
+    if (operations.items.len == 0) return error.DocumentSqlWriteUnsupported;
+
+    const operations_template = try operations.toOwnedSlice(alloc);
+    var operations_template_transferred = false;
+    errdefer if (!operations_template_transferred) freeDocumentTransformOps(alloc, operations_template);
+    operations = .empty;
+
+    const filter_start = pos;
+    var identity_filter_pos = filter_start;
+    const identity_filter = parseDocumentIdentityFilterAlloc(alloc, tokens, &identity_filter_pos, target_table, params) catch |err| switch (err) {
+        error.DocumentSqlWriteUnsupported, error.UnsupportedSqlShape => null,
+        else => return err,
+    };
+    if (identity_filter) |filter| {
+        var mutable_filter = filter;
+        var filter_transferred = false;
+        defer if (!filter_transferred) mutable_filter.deinit(alloc);
+
+        var tail_pos = identity_filter_pos;
+        if (parser.matchToken(tokens, &tail_pos, .semicolon) != null and !parser.atEnd(tokens, tail_pos)) return error.UnsupportedSqlShape;
+        if (parser.atEnd(tokens, tail_pos)) {
+            const predicates: []db_mod.types.TransactionVersionPredicate = if (mutable_filter.expected_version) |expected_version|
+                try documentVersionPredicatesForKeysAlloc(alloc, mutable_filter.keys, expected_version)
+            else
+                try alloc.alloc(db_mod.types.TransactionVersionPredicate, 0);
+            errdefer {
+                for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+                if (predicates.len > 0) alloc.free(predicates);
+            }
+
+            var transforms = try alloc.alloc(db_mod.types.DocumentTransform, mutable_filter.keys.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (transforms[0..initialized]) |transform| {
+                    alloc.free(@constCast(transform.key));
+                    freeDocumentTransformOps(alloc, transform.operations);
+                }
+                if (transforms.len > 0) alloc.free(transforms);
+            }
+            for (mutable_filter.keys) |key| {
+                const transform_key = try alloc.dupe(u8, key);
+                var key_transferred = false;
+                errdefer if (!key_transferred) alloc.free(transform_key);
+                const transform_operations = try cloneDocumentTransformOpsAlloc(alloc, operations_template);
+                var operations_transferred = false;
+                errdefer if (!operations_transferred) freeDocumentTransformOps(alloc, transform_operations);
+                transforms[initialized] = .{
+                    .key = transform_key,
+                    .operations = transform_operations,
+                };
+                key_transferred = true;
+                operations_transferred = true;
+                initialized += 1;
+            }
+
+            freeDocumentTransformOps(alloc, operations_template);
+            operations_template_transferred = true;
+            mutable_filter.deinit(alloc);
+            filter_transferred = true;
+            alloc.free(target_table.alias);
+            const table_name = target_table.name;
+            return .{ .document_write = .{
+                .table_name = table_name,
+                .batch = .{
+                    .transforms = transforms,
+                    .predicates = predicates,
+                    .req = .{
+                        .transforms = transforms,
+                        .predicates = predicates,
+                        .sync_level = sync_level,
+                    },
+                    .transformed = @intCast(transforms.len),
+                },
+                .operation = .projection_write,
+                .sync_level = sync_level,
+            } };
+        }
+    }
+
+    const producer_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
+    var producer = document_plan.lowerDocumentMutationProducerFromWhereAlloc(
+        alloc,
+        tokens,
+        filter_start,
+        producer_end,
+        schema,
+        target_table.name,
+        target_table.alias,
+        .{ .max_rows = source_binding.default_document_sql_bounded_scan_rows },
+    ) catch |err| switch (err) {
+        error.DocumentSqlBoundedScanMissingExactProducer,
+        error.DocumentSqlBoundedScanPolicyRequired,
+        error.DocumentSqlBoundedScanUnsupportedResidual,
+        error.DocumentSqlIndexUnavailable,
+        => return error.DocumentSqlWriteUnsupported,
+        else => return err,
+    };
+    switch (producer) {
+        .id_lookup => {},
+        .indexed_query => |*query| {
+            if (query.max_candidate_rows == null) {
+                query.max_candidate_rows = source_binding.default_document_sql_bounded_scan_rows;
+            }
+        },
+        .bounded_scan => {
+            producer.deinit(alloc);
+            return error.DocumentSqlWriteUnsupported;
+        },
+    }
+    var producer_transferred = false;
+    errdefer if (!producer_transferred) {
+        var mutable_producer = producer;
+        mutable_producer.deinit(alloc);
+    };
+
+    alloc.free(target_table.alias);
+    const table_name = target_table.name;
+    operations_template_transferred = true;
+    producer_transferred = true;
+    return .{ .document_producer_mutation = .{
+        .table_name = table_name,
+        .producer = producer,
+        .operation = .projection_write,
+        .template = .{ .transform = operations_template },
+        .sync_level = sync_level,
+    } };
+}
+
+fn parsedSqlContainsIdentifier(parsed_sql: *const tokenized.ParsedSql, identifier: []const u8) bool {
+    for (parsed_sql.tokenized_sql.items()) |token| {
+        if (token.kind != .identifier) continue;
+        if (std.ascii.eqlIgnoreCase(token.text, identifier)) return true;
+        if (std.mem.lastIndexOfScalar(u8, token.text, '.')) |dot| {
+            if (std.ascii.eqlIgnoreCase(token.text[dot + 1 ..], identifier)) return true;
+        }
+    }
+    return false;
+}
+
+fn documentWriteOperationForParsedSql(parsed_sql: *const tokenized.ParsedSql) document_write.DocumentWriteOperation {
+    const has_doc = parsedSqlContainsIdentifier(parsed_sql, "_doc");
+    const has_id = parsedSqlContainsIdentifier(parsed_sql, "_id");
+    return switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse parsed_sql.writeStatementKind() orelse .update) {
+        .insert, .insert_source => if (has_id) .full_document_insert else .generated_id_insert,
+        .update, .update_source, .update_joined_source => if (has_doc) .document_patch else .projection_write,
+        .delete, .delete_source, .delete_joined_source => if (has_id) .exact_id_delete else .non_identity_delete,
+        .truncate => .truncate_table,
+        .merge => .merge,
+    };
 }
 
 pub fn lowerInsertWithResolverParsedSqlAlloc(
@@ -28356,20 +29543,317 @@ test "sql adapter lower dml routes write sql through typed plan families" {
 test "sql adapter lower dml rejects catalog writes to document tables" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"}},"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","default":"draft"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
     var catalog = corpus.AppParitySourceSchemaCatalog.init("docs", schema_json);
 
-    const cases = [_][]const u8{
+    var admitted_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
         "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')",
-        "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer admitted_insert.deinit(alloc);
+    switch (admitted_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("docs", document_insert.table_name);
+            try std.testing.expectEqualStrings("doc:a", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_id_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_doc) VALUES ('{}')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer generated_id_insert.deinit(alloc);
+    switch (generated_id_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.generated_id_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("docs", document_insert.table_name);
+            try std.testing.expectEqual(document_write.generated_document_id_len, document_insert.batch.req.writes[0].key.len);
+            try std.testing.expect(std.mem.startsWith(u8, document_insert.batch.req.writes[0].key, document_write.generated_document_id_prefix));
+            try std.testing.expectEqualStrings("{}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title) VALUES ('doc:projection', 'Launch')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_insert.deinit(alloc);
+    switch (projection_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.upsert, document_insert.batch.req.write_mode);
+            try std.testing.expectEqualStrings("doc:projection", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Launch\"}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_create_only_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _version, title) VALUES ('doc:projection-create', 0, 'Launch')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_create_only_insert.deinit(alloc);
+    switch (projection_create_only_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.predicates.len);
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_insert.batch.req.write_mode);
+            try std.testing.expectEqualStrings("doc:projection-create", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Launch\"}", document_insert.batch.req.writes[0].value);
+            try std.testing.expectEqualStrings("doc:projection-create", document_insert.batch.req.predicates[0].key);
+            try std.testing.expectEqual(@as(u64, 0), document_insert.batch.req.predicates[0].expected_version);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_duplicate_id_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title) VALUES ('doc:projection-dupe', 'First'), ('doc:projection-dupe', 'Second')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_duplicate_id_insert.deinit(alloc);
+    switch (projection_duplicate_id_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 2), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection-dupe", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"First\"}", document_insert.batch.req.writes[0].value);
+            try std.testing.expectEqualStrings("doc:projection-dupe", document_insert.batch.req.writes[1].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Second\"}", document_insert.batch.req.writes[1].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_generated_id_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (title) VALUES ('Generated')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_generated_id_insert.deinit(alloc);
+    switch (projection_generated_id_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.generated_id_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqual(document_write.generated_document_id_len, document_insert.batch.req.writes[0].key.len);
+            try std.testing.expect(std.mem.startsWith(u8, document_insert.batch.req.writes[0].key, document_write.generated_document_id_prefix));
+            try std.testing.expectEqualStrings("{\"title\":\"Generated\"}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_generated_create_only_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_version, title) VALUES (0, 'Generated Create Only')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_generated_create_only_insert.deinit(alloc);
+    switch (projection_generated_create_only_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.generated_id_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.predicates.len);
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_insert.batch.req.write_mode);
+            try std.testing.expectEqual(document_write.generated_document_id_len, document_insert.batch.req.writes[0].key.len);
+            try std.testing.expect(std.mem.startsWith(u8, document_insert.batch.req.writes[0].key, document_write.generated_document_id_prefix));
+            try std.testing.expectEqualStrings(document_insert.batch.req.writes[0].key, document_insert.batch.req.predicates[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Generated Create Only\"}", document_insert.batch.req.writes[0].value);
+            try std.testing.expectEqual(@as(u64, 0), document_insert.batch.req.predicates[0].expected_version);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_default_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, status) VALUES ('doc:default', NULL, DEFAULT)",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_default_insert.deinit(alloc);
+    switch (projection_default_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:default", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":null,\"status\":\"draft\"}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_array_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, tags) VALUES ('doc:array', 'Tagged', ARRAY['new','hot'])",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_array_insert.deinit(alloc);
+    switch (projection_array_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:array", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Tagged\",\"tags\":[\"new\",\"hot\"]}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_array_param_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, tags) VALUES ('doc:array-param', 'Tagged Param', $1)",
+        schema,
+        &.{.{ .json = "[\"param\",\"bound\"]" }},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_array_param_insert.deinit(alloc);
+    switch (projection_array_param_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:array-param", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Tagged Param\",\"tags\":[\"param\",\"bound\"]}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_nested_path_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, metadata_plan) VALUES ('doc:nested', 'Nested', 'pro')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_nested_path_insert.deinit(alloc);
+    switch (projection_nested_path_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:nested", document_insert.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Nested\",\"metadata\":{\"plan\":\"pro\"}}", document_insert.batch.req.writes[0].value);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, metadata, metadata_plan) VALUES ('doc:nested-conflict', 'Nested Conflict', '{\"tier\":\"gold\"}', 'pro')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _version, title) VALUES ('doc:projection-version', 42, 'Launch')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_version, title) VALUES (42, 'Generated Versioned')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+
+    var admitted_delete = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
         "DELETE FROM docs WHERE _id = 'doc:a'",
-        "TRUNCATE docs",
-        "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer admitted_delete.deinit(alloc);
+    switch (admitted_delete) {
+        .document_write => |document_delete| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.exact_id_delete, document_delete.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_delete.batch.req.deletes.len);
+            try std.testing.expectEqualStrings("docs", document_delete.table_name);
+            try std.testing.expectEqualStrings("doc:a", document_delete.batch.req.deletes[0]);
+            try std.testing.expectEqual(@as(u32, 1), document_delete.batch.deleted);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var admitted_in_delete = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs WHERE _id IN ('doc:a', 'doc:b', 'doc:b')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer admitted_in_delete.deinit(alloc);
+    switch (admitted_in_delete) {
+        .document_write => |document_delete| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.exact_id_delete, document_delete.operation);
+            try std.testing.expectEqual(@as(usize, 3), document_delete.batch.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:a", document_delete.batch.req.deletes[0]);
+            try std.testing.expectEqualStrings("doc:b", document_delete.batch.req.deletes[1]);
+            try std.testing.expectEqualStrings("doc:b", document_delete.batch.req.deletes[2]);
+            try std.testing.expectEqual(@as(u32, 3), document_delete.batch.deleted);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const unsupported_insert_tails = [_][]const u8{
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') RETURNING _id",
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO NOTHING",
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO UPDATE SET _doc = excluded._doc",
+        "INSERT INTO docs (_doc) VALUES ('{}') RETURNING _id",
     };
-    for (cases) |sql| {
+    for (unsupported_insert_tails) |sql| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, sql);
+        defer parsed_sql.deinit(alloc);
+        const expected_operation: document_write.DocumentWriteOperation = if (parsedSqlContainsIdentifier(&parsed_sql, "_id"))
+            .full_document_insert
+        else
+            .generated_id_insert;
+        try std.testing.expectEqual(expected_operation, documentWriteOperationForParsedSql(&parsed_sql));
         try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             sql,
@@ -28378,6 +29862,534 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
             .{},
             catalog.iface(),
         ));
+    }
+
+    const unsupported_delete_predicates = [_][]const u8{
+        "DELETE FROM docs WHERE _id <> 'doc:a'",
+        "DELETE FROM docs WHERE _id = 'doc:a' RETURNING _id",
+        "DELETE FROM docs WHERE title = 'Launch'",
+        "DELETE FROM docs WHERE _id = 'doc:a' AND title = 'Launch'",
+        "DELETE FROM docs WHERE _doc->'status' = '\"draft\"'",
+        "DELETE FROM docs WHERE title > 'Launch'",
+        "DELETE FROM docs WHERE title = 'Launch' ORDER BY title",
+        "DELETE FROM docs",
+    };
+    for (unsupported_delete_predicates) |sql| {
+        try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        ));
+    }
+
+    const valid_patch_cases = [_]struct {
+        sql: []const u8,
+        expected_op: db_mod.types.TransformOpType,
+        expected_path: []const u8,
+        expected_value_json: ?[]const u8 = null,
+    }{
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a'",
+            .expected_op = .set,
+            .expected_path = "title",
+            .expected_value_json = "\"Launch\"",
+        },
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"remove\",\"path\":\"obsolete\"}]}') WHERE _id = 'doc:a'",
+            .expected_op = .unset,
+            .expected_path = "obsolete",
+        },
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"merge\",\"value\":{\"metadata\":{\"status\":\"ready\"}}}]}') WHERE _id = 'doc:a'",
+            .expected_op = .set,
+            .expected_path = "metadata",
+            .expected_value_json = "{\"status\":\"ready\"}",
+        },
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"metadata.archived_at\",\"value\":null}]}') WHERE _id = 'doc:a'",
+            .expected_op = .set,
+            .expected_path = "metadata.archived_at",
+            .expected_value_json = "null",
+        },
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"tags\",\"value\":[\"new\",\"hot\"]}]}') WHERE _id = 'doc:a'",
+            .expected_op = .set,
+            .expected_path = "tags",
+            .expected_value_json = "[\"new\",\"hot\"]",
+        },
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"amount\",\"value\":\"not numeric\"}]}') WHERE _id = 'doc:a'",
+            .expected_op = .set,
+            .expected_path = "amount",
+            .expected_value_json = "\"not numeric\"",
+        },
+        .{
+            .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title_lc\",\"value\":\"launch\"}]}') WHERE _id = 'doc:a'",
+            .expected_op = .set,
+            .expected_path = "title_lc",
+            .expected_value_json = "\"launch\"",
+        },
+    };
+    for (valid_patch_cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, documentWriteOperationForParsedSql(&parsed_sql));
+        var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        );
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .document_write => |document_patch| {
+                try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, document_patch.operation);
+                try std.testing.expectEqual(@as(usize, 1), document_patch.batch.req.transforms.len);
+                try std.testing.expectEqual(@as(u32, 1), document_patch.batch.transformed);
+                try std.testing.expectEqualStrings("doc:a", document_patch.batch.req.transforms[0].key);
+                try std.testing.expectEqual(@as(usize, 1), document_patch.batch.req.transforms[0].operations.len);
+                const op = document_patch.batch.req.transforms[0].operations[0];
+                try std.testing.expectEqual(case.expected_op, op.op);
+                try std.testing.expectEqualStrings(case.expected_path, op.path);
+                if (case.expected_value_json) |expected_value_json| {
+                    try std.testing.expectEqualStrings(expected_value_json, op.value_json.?);
+                } else {
+                    try std.testing.expect(op.value_json == null);
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var patch_in_filter = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id IN ('doc:a', 'doc:b')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer patch_in_filter.deinit(alloc);
+    switch (patch_in_filter) {
+        .document_write => |document_patch| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, document_patch.operation);
+            try std.testing.expectEqual(@as(usize, 2), document_patch.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 0), document_patch.batch.req.predicates.len);
+            try std.testing.expectEqual(@as(u32, 2), document_patch.batch.transformed);
+            try std.testing.expectEqualStrings("doc:a", document_patch.batch.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:b", document_patch.batch.req.transforms[1].key);
+            for (document_patch.batch.req.transforms) |transform| {
+                try std.testing.expectEqual(@as(usize, 1), transform.operations.len);
+                try std.testing.expectEqual(db_mod.types.TransformOpType.set, transform.operations[0].op);
+                try std.testing.expectEqualStrings("title", transform.operations[0].path);
+                try std.testing.expectEqualStrings("\"Launch\"", transform.operations[0].value_json.?);
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var patch_duplicate_identity_filter = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id IN ('doc:a', 'doc:a')",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer patch_duplicate_identity_filter.deinit(alloc);
+    switch (patch_duplicate_identity_filter) {
+        .document_write => |document_patch| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, document_patch.operation);
+            try std.testing.expectEqual(@as(usize, 2), document_patch.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 0), document_patch.batch.req.predicates.len);
+            try std.testing.expectEqual(@as(u32, 2), document_patch.batch.transformed);
+            try std.testing.expectEqualStrings("doc:a", document_patch.batch.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:a", document_patch.batch.req.transforms[1].key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var versioned_patch = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a' AND _version = 42",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer versioned_patch.deinit(alloc);
+    switch (versioned_patch) {
+        .document_write => |document_patch| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, document_patch.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_patch.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 1), document_patch.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:a", document_patch.batch.req.predicates[0].key);
+            try std.testing.expectEqual(@as(u64, 42), document_patch.batch.req.predicates[0].expected_version);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var reversed_versioned_patch = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _version = 42 AND _id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer reversed_versioned_patch.deinit(alloc);
+    switch (reversed_versioned_patch) {
+        .document_write => |document_patch| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.document_patch, document_patch.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_patch.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 1), document_patch.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:a", document_patch.batch.req.predicates[0].key);
+            try std.testing.expectEqual(@as(u64, 42), document_patch.batch.req.predicates[0].expected_version);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const valid_projection_update_cases = [_]struct {
+        sql: []const u8,
+        expected_key: []const u8 = "doc:a",
+        expected_ops: []const struct {
+            path: []const u8,
+            value_json: []const u8,
+        },
+        expected_predicates: usize = 0,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'",
+            .expected_ops = &.{.{ .path = "title", .value_json = "\"Launch\"" }},
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' AND _version = 42",
+            .expected_ops = &.{.{ .path = "title", .value_json = "\"Launch\"" }},
+            .expected_predicates = 1,
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _version = 42 AND _id = 'doc:a'",
+            .expected_ops = &.{.{ .path = "title", .value_json = "\"Launch\"" }},
+            .expected_predicates = 1,
+        },
+        .{
+            .sql = "UPDATE docs SET title = NULL WHERE _id = 'doc:a'",
+            .expected_ops = &.{.{ .path = "title", .value_json = "null" }},
+        },
+        .{
+            .sql = "UPDATE docs SET metadata_plan = 'pro' WHERE _id = 'doc:a'",
+            .expected_ops = &.{.{ .path = "metadata.plan", .value_json = "\"pro\"" }},
+        },
+        .{
+            .sql = "UPDATE docs SET tags = ARRAY['new','hot'] WHERE _id = 'doc:a'",
+            .expected_ops = &.{.{ .path = "tags", .value_json = "[\"new\",\"hot\"]" }},
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch', status = 'ready' WHERE _id = 'doc:a'",
+            .expected_ops = &.{
+                .{ .path = "title", .value_json = "\"Launch\"" },
+                .{ .path = "status", .value_json = "\"ready\"" },
+            },
+        },
+    };
+    for (valid_projection_update_cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, documentWriteOperationForParsedSql(&parsed_sql));
+        var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        );
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .document_write => |projection_write| {
+                try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, projection_write.operation);
+                try std.testing.expectEqual(@as(usize, 1), projection_write.batch.req.transforms.len);
+                try std.testing.expectEqual(@as(u32, 1), projection_write.batch.transformed);
+                try std.testing.expectEqualStrings(case.expected_key, projection_write.batch.req.transforms[0].key);
+                try std.testing.expectEqual(case.expected_ops.len, projection_write.batch.req.transforms[0].operations.len);
+                try std.testing.expectEqual(case.expected_predicates, projection_write.batch.req.predicates.len);
+                if (case.expected_predicates == 1) {
+                    try std.testing.expectEqualStrings(case.expected_key, projection_write.batch.req.predicates[0].key);
+                    try std.testing.expectEqual(@as(u64, 42), projection_write.batch.req.predicates[0].expected_version);
+                }
+                for (case.expected_ops, projection_write.batch.req.transforms[0].operations) |expected, actual| {
+                    try std.testing.expectEqual(db_mod.types.TransformOpType.set, actual.op);
+                    try std.testing.expectEqualStrings(expected.path, actual.path);
+                    try std.testing.expectEqualStrings(expected.value_json, actual.value_json.?);
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var residual_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' AND status = 'draft'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer residual_projection_update.deinit(alloc);
+    switch (residual_projection_update) {
+        .document_producer_mutation => |projection_write| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, projection_write.operation);
+            try std.testing.expectEqualStrings("docs", projection_write.table_name);
+            try std.testing.expect(projection_write.producer == .id_lookup);
+            try std.testing.expectEqual(@as(usize, 1), projection_write.producer.id_lookup.ids.len);
+            try std.testing.expectEqualStrings("doc:a", projection_write.producer.id_lookup.ids[0]);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+                projection_write.producer.id_lookup.residual_filter_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expect(projection_write.template == .transform);
+            try std.testing.expectEqual(@as(usize, 1), projection_write.template.transform.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set, projection_write.template.transform[0].op);
+            try std.testing.expectEqualStrings("title", projection_write.template.transform[0].path);
+            try std.testing.expectEqualStrings("\"Launch\"", projection_write.template.transform[0].value_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var indexed_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE status = 'draft'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer indexed_projection_update.deinit(alloc);
+    switch (indexed_projection_update) {
+        .document_producer_mutation => |projection_write| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, projection_write.operation);
+            try std.testing.expectEqualStrings("docs", projection_write.table_name);
+            try std.testing.expect(projection_write.producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+                projection_write.producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expect(projection_write.producer.indexed_query.residual_filter_json == null);
+            try std.testing.expectEqual(
+                @as(?u32, source_binding.default_document_sql_bounded_scan_rows),
+                projection_write.producer.indexed_query.max_candidate_rows,
+            );
+            try std.testing.expect(projection_write.template == .transform);
+            try std.testing.expectEqual(@as(usize, 1), projection_write.template.transform.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set, projection_write.template.transform[0].op);
+            try std.testing.expectEqualStrings("title", projection_write.template.transform[0].path);
+            try std.testing.expectEqualStrings("\"Launch\"", projection_write.template.transform[0].value_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const projection_in_update_cases = [_]struct {
+        sql: []const u8,
+        expected_keys: []const []const u8,
+        expected_predicates: usize = 0,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _id IN ('doc:a', 'doc:b')",
+            .expected_keys = &.{ "doc:a", "doc:b" },
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _id IN ('doc:a', 'doc:a')",
+            .expected_keys = &.{ "doc:a", "doc:a" },
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _id IN ('doc:a', 'doc:b') AND _version = 42",
+            .expected_keys = &.{ "doc:a", "doc:b" },
+            .expected_predicates = 2,
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE _version = 42 AND _id IN ('doc:a', 'doc:b')",
+            .expected_keys = &.{ "doc:a", "doc:b" },
+            .expected_predicates = 2,
+        },
+    };
+    for (projection_in_update_cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, documentWriteOperationForParsedSql(&parsed_sql));
+        var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        );
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .document_write => |projection_write| {
+                try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, projection_write.operation);
+                try std.testing.expectEqual(case.expected_keys.len, projection_write.batch.req.transforms.len);
+                try std.testing.expectEqual(@as(u32, @intCast(case.expected_keys.len)), projection_write.batch.transformed);
+                try std.testing.expectEqual(case.expected_predicates, projection_write.batch.req.predicates.len);
+                for (case.expected_keys, projection_write.batch.req.transforms) |expected_key, transform| {
+                    try std.testing.expectEqualStrings(expected_key, transform.key);
+                    try std.testing.expectEqual(@as(usize, 1), transform.operations.len);
+                    try std.testing.expectEqual(db_mod.types.TransformOpType.set, transform.operations[0].op);
+                    try std.testing.expectEqualStrings("title", transform.operations[0].path);
+                    try std.testing.expectEqualStrings("\"Launch\"", transform.operations[0].value_json.?);
+                }
+                for (projection_write.batch.req.predicates, 0..) |predicate, i| {
+                    try std.testing.expectEqualStrings(case.expected_keys[i], predicate.key);
+                    try std.testing.expectEqual(@as(u64, 42), predicate.expected_version);
+                }
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    const cases = [_]struct {
+        sql: []const u8,
+        operation: document_write.DocumentWriteOperation,
+    }{
+        .{ .sql = "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":\"not-array\"}') WHERE _id = 'doc:a'", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE title = 'Launch'", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id IN ('doc:a', 'doc:b') AND _version = 42", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _version = 42 AND _id IN ('doc:a', 'doc:b')", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _version = 42 AND title = 'Launch'", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a' AND title = 'Launch'", .operation = .document_patch },
+        .{ .sql = "UPDATE docs SET title_lc = 'launch' WHERE _id = 'doc:a'", .operation = .projection_write },
+        .{ .sql = "UPDATE docs SET _id = 'doc:b' WHERE _id = 'doc:a'", .operation = .projection_write },
+        .{ .sql = "UPDATE docs SET _version = 43 WHERE _id = 'doc:a'", .operation = .projection_write },
+        .{ .sql = "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, title", .operation = .projection_write },
+        .{ .sql = "TRUNCATE docs", .operation = .truncate_table },
+        .{ .sql = "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE", .operation = .merge },
+    };
+    for (cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqual(case.operation, documentWriteOperationForParsedSql(&parsed_sql));
+        try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        ));
+    }
+
+    const payload_parse_error_sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, $1) WHERE _id = 'doc:a'";
+    try std.testing.expectError(error.MissingSqlParameter, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        payload_parse_error_sql,
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+
+    const preflight_cases = [_]struct {
+        preflight: db_mod.document_write.DocumentWritePreflight,
+        rejection: db_mod.document_write.DocumentWritePreflightRejection,
+    }{
+        .{
+            .preflight = .{
+                .surface = .sql_adapter,
+                .operation = .full_document_insert,
+                .authorization_allowed = false,
+                .row_filter_allowed = false,
+                .audit_satisfied = false,
+                .conflict_free = false,
+                .match_requirement_satisfied = false,
+                .operation_admitted = true,
+            },
+            .rejection = .authorization,
+        },
+        .{
+            .preflight = .{
+                .surface = .sql_adapter,
+                .operation = .full_document_insert,
+                .row_filter_allowed = false,
+                .audit_satisfied = false,
+                .conflict_free = false,
+                .match_requirement_satisfied = false,
+                .operation_admitted = true,
+            },
+            .rejection = .row_filter,
+        },
+        .{
+            .preflight = .{
+                .surface = .sql_adapter,
+                .operation = .full_document_insert,
+                .audit_satisfied = false,
+                .conflict_free = false,
+                .match_requirement_satisfied = false,
+                .operation_admitted = true,
+            },
+            .rejection = .audit_required,
+        },
+        .{
+            .preflight = .{
+                .surface = .sql_adapter,
+                .operation = .full_document_insert,
+                .conflict_free = false,
+                .match_requirement_satisfied = false,
+                .operation_admitted = true,
+            },
+            .rejection = .conflict,
+        },
+        .{
+            .preflight = .{
+                .surface = .sql_adapter,
+                .operation = .full_document_insert,
+                .match_requirement_satisfied = false,
+                .operation_admitted = true,
+            },
+            .rejection = .no_match,
+        },
+    };
+    const preflight_sql_cases = [_]struct {
+        sql: []const u8,
+        operation: db_mod.document_write.DocumentWriteOperation,
+    }{
+        .{
+            .sql = "INSERT INTO docs (_id, title) VALUES ('doc:preflight-projection', 'Launch')",
+            .operation = .full_document_insert,
+        },
+        .{
+            .sql = "INSERT INTO docs (title) VALUES ('Generated Preflight')",
+            .operation = .generated_id_insert,
+        },
+        .{
+            .sql = payload_parse_error_sql,
+            .operation = .document_patch,
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Projection Preflight' WHERE _id = 'doc:preflight-projection'",
+            .operation = .projection_write,
+        },
+    };
+    for (preflight_cases) |case| {
+        try std.testing.expectEqual(case.rejection, db_mod.document_write.documentWritePreflightRejection(case.preflight).?);
+        for (preflight_sql_cases) |sql_case| {
+            var preflight = case.preflight;
+            preflight.operation = sql_case.operation;
+            try std.testing.expectEqual(case.rejection, db_mod.document_write.documentWritePreflightRejection(preflight).?);
+            try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+                alloc,
+                sql_case.sql,
+                schema,
+                &.{},
+                .{ .document_preflight = preflight },
+                catalog.iface(),
+            ));
+        }
     }
 }
 

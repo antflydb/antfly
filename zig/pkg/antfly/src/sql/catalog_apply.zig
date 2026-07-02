@@ -19,6 +19,7 @@ const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const expr_type = @import("expr/type.zig");
+const fingerprint = @import("fingerprint.zig");
 const lower_expr = @import("lower_expr.zig");
 const mem_backend = @import("../storage/mem_backend.zig");
 const runtime_schema = @import("../storage/schema.zig");
@@ -934,6 +935,7 @@ pub fn applyLogicalDdlPlanToRuntimeSchemaAlloc(
         },
         .catalog_ddl => |catalog_plan| switch (catalog_plan) {
             .comment_metadata => |comment| applyCommentMetadataPlanAlloc(alloc, current, comment),
+            .security_label => |label| applySecurityLabelPlanAlloc(alloc, current, label),
             else => error.UnsupportedSqlShape,
         },
         .other_ddl, .session => if (current.storage_mode == .relational)
@@ -1246,6 +1248,7 @@ pub fn applyLogicalDdlPlanToSchemaJsonAlloc(
         },
         .catalog_ddl => |catalog_plan| switch (catalog_plan) {
             .comment_metadata => |comment| try applyCommentMetadataPlanToSchemaJsonAlloc(alloc, current_schema_json, comment),
+            .security_label => |label| try applySecurityLabelPlanToSchemaJsonAlloc(alloc, current_schema_json, label),
             else => error.UnsupportedSqlShape,
         },
         .other_ddl, .session => .{ .schema_json = try alloc.dupe(u8, current_schema_json) },
@@ -1285,6 +1288,27 @@ fn applyCommentMetadataPlanToSchemaJsonAlloc(
         else => return error.InvalidSqlCatalog,
     };
     try schema_json.applyCommentMetadataPlanToSchemaJsonValue(arena, root, comment);
+    const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
+    errdefer alloc.free(updated_schema_json);
+    try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, updated_schema_json);
+    return .{ .schema_json = updated_schema_json };
+}
+
+fn applySecurityLabelPlanToSchemaJsonAlloc(
+    alloc: std.mem.Allocator,
+    current_schema_json: []const u8,
+    label: ddl_plan.SecurityLabelPlan,
+) !ddl_plan.AppliedDdlSchemaJson {
+    if (current_schema_json.len == 0) return error.InvalidSqlCatalog;
+    var arena_impl = std.heap.ArenaAllocator.init(alloc);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    var parsed = try std.json.parseFromSlice(std.json.Value, arena, current_schema_json, .{});
+    const root = switch (parsed.value) {
+        .object => |*object| object,
+        else => return error.InvalidSqlCatalog,
+    };
+    try schema_json.applySecurityLabelPlanToSchemaJsonValue(arena, root, label);
     const updated_schema_json = try std.json.Stringify.valueAlloc(alloc, parsed.value, .{ .emit_null_optional_fields = false });
     errdefer alloc.free(updated_schema_json);
     try schema_json.validateDdlAppliedSchemaJsonAlloc(alloc, updated_schema_json);
@@ -1723,6 +1747,16 @@ fn applyCommentMetadataPlanAlloc(
     return try ddl_plan.cloneRelationalRuntimeSchemaAlloc(alloc, current);
 }
 
+fn applySecurityLabelPlanAlloc(
+    alloc: std.mem.Allocator,
+    current: runtime_schema.TableSchema,
+    plan: ddl_plan.SecurityLabelPlan,
+) !runtime_schema.TableSchema {
+    _ = plan;
+    if (!binder.tableSchemaCatalogExists(current)) return error.InvalidSqlCatalog;
+    return try ddl_plan.cloneRelationalRuntimeSchemaAlloc(alloc, current);
+}
+
 fn applyDropIndexPlanAlloc(
     alloc: std.mem.Allocator,
     current: runtime_schema.TableSchema,
@@ -1915,6 +1949,11 @@ fn ddlLogicalFingerprintForCatalogApplyTestAlloc(alloc: std.mem.Allocator, plan:
                     "ddl:comment:kind={s}:object={s}:comment={}",
                     .{ @tagName(comment.target), comment.object_name, comment.comment_json != null },
                 ),
+            .security_label => |label| try std.fmt.allocPrint(
+                alloc,
+                "ddl:security_label:kind={s}:object={s}:provider={}:label={}",
+                .{ @tagName(label.target), label.object_name, label.provider_name != null, label.label_json != null },
+            ),
             else => error.TestUnexpectedResult,
         },
         else => error.TestUnexpectedResult,
@@ -2342,8 +2381,84 @@ test "catalog apply creates clones and replaces public schema json" {
     try std.testing.expect(binder.relationalColumnForField(replaced_if_not_exists_runtime, "status", null) != null);
 }
 
+fn expectSqlCreatedDocumentTableNativeCatalogParity(alloc: std.mem.Allocator) !void {
+    const document_sql =
+        \\CREATE TABLE docs ()
+        \\WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc')
+        \\DOCUMENT SCHEMA doc AS JSON '{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}'
+    ;
+    const native_schema_json =
+        \\{"storage_mode":"document","default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+
+    var sql_plan = try logicalDdlPlanForCatalogApplyTestAlloc(alloc, document_sql);
+    defer sql_plan.deinit(alloc);
+    const ddl_fingerprint = try fingerprint.ddlFingerprintAlloc(alloc, sql_plan);
+    defer alloc.free(ddl_fingerprint);
+    try std.testing.expectEqualStrings(
+        "ddl:create_table:table=docs:columns=0:unique=0:fk=0:checks=0:if_not_exists=false:storage_mode=document:document_schemas=1",
+        ddl_fingerprint,
+    );
+
+    const create_table = switch (sql_plan) {
+        .table_ddl => |table_plan| switch (table_plan) {
+            .create_table => |create| create,
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    };
+    const direct_schema_json = try schema_json.schemaJsonFromCreateTablePlanAlloc(alloc, create_table);
+    defer alloc.free(direct_schema_json);
+
+    var sql_applied = try applyLogicalDdlPlanToSchemaJsonAlloc(alloc, "", sql_plan);
+    defer sql_applied.deinit(alloc);
+    try std.testing.expect(!sql_applied.requires_rebuild);
+    try std.testing.expect(!sql_applied.validation_required);
+    try std.testing.expect(!sql_applied.rewrite_required);
+    try std.testing.expectEqualStrings(direct_schema_json, sql_applied.schema_json);
+    try std.testing.expectEqualStrings(native_schema_json, sql_applied.schema_json);
+
+    const applied_fingerprint = try fingerprint.ddlAppliedFingerprintAlloc(alloc, sql_applied);
+    defer alloc.free(applied_fingerprint);
+    try std.testing.expectEqualStrings(
+        "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+        applied_fingerprint,
+    );
+
+    var sql_parsed = try schema_api.parseValidatedTableSchema(alloc, sql_applied.schema_json);
+    defer sql_parsed.deinit(alloc);
+    var native_parsed = try schema_api.parseValidatedTableSchema(alloc, native_schema_json);
+    defer native_parsed.deinit(alloc);
+    try std.testing.expectEqual(native_parsed.storage_mode, sql_parsed.storage_mode);
+    try std.testing.expectEqualStrings(native_parsed.default_type, sql_parsed.default_type);
+    try std.testing.expectEqual(native_parsed.enforce_types, sql_parsed.enforce_types);
+    try std.testing.expectEqual(@as(usize, 1), sql_parsed.document_schemas.len);
+    try std.testing.expectEqual(native_parsed.document_schemas.len, sql_parsed.document_schemas.len);
+    try std.testing.expectEqualStrings(native_parsed.document_schemas[0].name, sql_parsed.document_schemas[0].name);
+    try std.testing.expectEqual(@as(usize, 1), sql_parsed.document_schemas[0].required_fields.len);
+    try std.testing.expectEqualStrings("title", sql_parsed.document_schemas[0].required_fields[0]);
+    try std.testing.expectEqual(@as(?bool, false), sql_parsed.document_schemas[0].additional_properties_allowed);
+    try std.testing.expectEqual(@as(usize, 2), sql_parsed.document_schemas[0].properties.len);
+    try std.testing.expectEqualStrings("title", sql_parsed.document_schemas[0].properties[0].name);
+    try std.testing.expectEqualStrings("text", sql_parsed.document_schemas[0].properties[0].field_type.?);
+    try std.testing.expectEqualStrings("tags", sql_parsed.document_schemas[0].properties[1].name);
+    try std.testing.expectEqualStrings("array", sql_parsed.document_schemas[0].properties[1].field_type.?);
+    try std.testing.expect(sql_parsed.document_schemas[0].properties[1].item != null);
+    try std.testing.expectEqualStrings("keyword", sql_parsed.document_schemas[0].properties[1].item.?.field_type.?);
+
+    const sql_runtime = try applyLogicalDdlPlanToRuntimeSchemaAlloc(alloc, .{}, sql_plan);
+    defer runtime_schema.freeSchema(alloc, sql_runtime);
+    const native_runtime = try schema_api.deriveRuntimeTableSchema(alloc, native_parsed);
+    defer runtime_schema.freeSchema(alloc, native_runtime);
+    try std.testing.expectEqual(native_runtime.storage_mode, sql_runtime.storage_mode);
+    try std.testing.expectEqualStrings(native_runtime.default_type, sql_runtime.default_type);
+    try std.testing.expectEqual(native_runtime.enforce_types, sql_runtime.enforce_types);
+}
+
 test "catalog apply applies incremental ddl plans to public schema json" {
     const alloc = std.testing.allocator;
+    try expectSqlCreatedDocumentTableNativeCatalogParity(alloc);
+
     var create = try logicalDdlPlanForCatalogApplyTestAlloc(
         alloc,
         "CREATE TABLE users (id uuid PRIMARY KEY, tenant_id text NOT NULL, account_id text, email text, status text, deleted_at timestamptz, updated_at_ns bigint);",

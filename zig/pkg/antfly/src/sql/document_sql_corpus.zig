@@ -69,16 +69,40 @@ pub fn parseDocumentSqlCorpusAlloc(alloc: std.mem.Allocator) !std.json.Parsed(Do
     return parsed;
 }
 
-pub fn errorFromName(name: []const u8) !anyerror {
-    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanUnsupportedResidual")) return error.DocumentSqlBoundedScanUnsupportedResidual;
-    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanPolicyRequired")) return error.DocumentSqlBoundedScanPolicyRequired;
-    if (std.mem.eql(u8, name, "DocumentSqlIndexUnavailable")) return error.DocumentSqlIndexUnavailable;
-    if (std.mem.eql(u8, name, "DocumentSqlNativeSearchRequiresTableFunction")) return error.DocumentSqlNativeSearchRequiresTableFunction;
-    if (std.mem.eql(u8, name, "DocumentSqlUnnestRequiresArray")) return error.DocumentSqlUnnestRequiresArray;
-    if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return error.UnsupportedSqlShape;
-    if (std.mem.eql(u8, name, "InvalidRowsRequest")) return error.InvalidRowsRequest;
-    if (std.mem.eql(u8, name, "InvalidSqlCatalog")) return error.InvalidSqlCatalog;
+pub const ExpectedError = enum {
+    DocumentSqlBoundedScanUnsupportedResidual,
+    DocumentSqlBoundedScanPolicyRequired,
+    DocumentSqlIndexUnavailable,
+    DocumentSqlNativeSearchRequiresTableFunction,
+    DocumentSqlUnnestRequiresArray,
+    UnsupportedSqlShape,
+    InvalidRowsRequest,
+    InvalidSqlCatalog,
+};
+
+pub fn errorFromName(name: []const u8) !ExpectedError {
+    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanUnsupportedResidual")) return .DocumentSqlBoundedScanUnsupportedResidual;
+    if (std.mem.eql(u8, name, "DocumentSqlBoundedScanPolicyRequired")) return .DocumentSqlBoundedScanPolicyRequired;
+    if (std.mem.eql(u8, name, "DocumentSqlIndexUnavailable")) return .DocumentSqlIndexUnavailable;
+    if (std.mem.eql(u8, name, "DocumentSqlNativeSearchRequiresTableFunction")) return .DocumentSqlNativeSearchRequiresTableFunction;
+    if (std.mem.eql(u8, name, "DocumentSqlUnnestRequiresArray")) return .DocumentSqlUnnestRequiresArray;
+    if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return .UnsupportedSqlShape;
+    if (std.mem.eql(u8, name, "InvalidRowsRequest")) return .InvalidRowsRequest;
+    if (std.mem.eql(u8, name, "InvalidSqlCatalog")) return .InvalidSqlCatalog;
     return error.InvalidSqlCorpusFixture;
+}
+
+pub fn errorValue(expected: ExpectedError) anyerror {
+    return switch (expected) {
+        .DocumentSqlBoundedScanUnsupportedResidual => error.DocumentSqlBoundedScanUnsupportedResidual,
+        .DocumentSqlBoundedScanPolicyRequired => error.DocumentSqlBoundedScanPolicyRequired,
+        .DocumentSqlIndexUnavailable => error.DocumentSqlIndexUnavailable,
+        .DocumentSqlNativeSearchRequiresTableFunction => error.DocumentSqlNativeSearchRequiresTableFunction,
+        .DocumentSqlUnnestRequiresArray => error.DocumentSqlUnnestRequiresArray,
+        .UnsupportedSqlShape => error.UnsupportedSqlShape,
+        .InvalidRowsRequest => error.InvalidRowsRequest,
+        .InvalidSqlCatalog => error.InvalidSqlCatalog,
+    };
 }
 
 test "document SQL corpus fixture parses" {

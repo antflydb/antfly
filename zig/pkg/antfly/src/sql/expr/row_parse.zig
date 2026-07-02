@@ -18,9 +18,13 @@ const binder = @import("../binder.zig");
 const db_mod = @import("../../storage/db/mod.zig");
 const ddl_plan = @import("../ddl_plan.zig");
 const expr_build = @import("build.zig");
+const expr_generated = @import("generated.zig");
+const expr_generated_validate = @import("generated_validate.zig");
 const expr_operator = @import("operator.zig");
+const expr_parse = @import("parse.zig");
 const expr_token = @import("token.zig");
 const expr_type = @import("type.zig");
+const generated_parser = @import("../generated_parser.zig");
 const parser = @import("../parser.zig");
 const plan_mod = @import("../plan.zig");
 const runtime_schema = @import("../../storage/schema.zig");
@@ -32,6 +36,21 @@ pub const Token = token_mod.Token;
 const freeExpression = plan_mod.freeExpression;
 const freeExpressionCondition = plan_mod.freeExpressionCondition;
 
+fn wrapBooleanNotExpressionAlloc(
+    alloc: std.mem.Allocator,
+    expression: db_mod.types.RelationalRowsExpression,
+) !db_mod.types.RelationalRowsExpression {
+    const operands = try alloc.alloc(db_mod.types.RelationalRowsExpression, 1);
+    var operands_transferred = false;
+    errdefer if (!operands_transferred) alloc.free(operands);
+    operands[0] = expression;
+    operands_transferred = true;
+    return .{
+        .kind = .bool_not,
+        .operands = operands,
+    };
+}
+
 fn parseIdentifierOwnedAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -39,6 +58,61 @@ fn parseIdentifierOwnedAlloc(
 ) ![]const u8 {
     const token = parser.matchToken(tokens, pos, .identifier) orelse return error.UnsupportedSqlShape;
     return try alloc.dupe(u8, token.text);
+}
+
+fn parseRowExpressionArrayFieldOwnedAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+) ![]const u8 {
+    const parsed_field = try parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(parsed_field);
+    const field = try binder.normalizeRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    errdefer alloc.free(field);
+    _ = binder.relationalColumnForField(schema, field, .array) orelse return error.InvalidSqlCatalog;
+    return field;
+}
+
+fn parseArrayLengthRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !db_mod.types.RelationalRowsExpression {
+    const keyword = try expr_token.parseArrayLengthFunctionCallStart(tokens, pos);
+    const field = try parseRowExpressionArrayFieldOwnedAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        defer_row_expression_field_validation,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    try value_mod.parseArrayLengthFunctionTail(tokens, pos, params, keyword);
+
+    const field_expression: db_mod.types.RelationalRowsExpression = .{ .kind = .field, .field = field, .field_source = field_source };
+    const expression = try expr_build.buildUnaryFunctionExpressionAlloc(alloc, .array_length, field_expression);
+    field_transferred = true;
+    return expression;
 }
 
 pub const ExtensionFunctionBinding = struct {
@@ -59,10 +133,240 @@ pub const SqlFunctionBindings = struct {
     routine_expressions: []const RoutineExpressionBinding = &.{},
 };
 
+pub const SelectParserContext = struct {
+    schema: runtime_schema.TableSchema,
+    field_expression_qualifiers: []const []const u8 = &.{},
+    returning_expression_qualifiers: []const []const u8 = &.{},
+    defer_row_expression_field_validation: bool = false,
+};
+
+pub const SelectParserContextHooks = struct {
+    ptr: *anyopaque,
+    get_context: *const fn (*anyopaque) SelectParserContext,
+    set_context: *const fn (*anyopaque, SelectParserContext) void,
+    row_expression_type_context: *const fn (*anyopaque) expr_type.RowExpressionTypeContext,
+};
+
+pub const JoinedExpressionParserContext = struct {
+    joined_target_expression_qualifiers: []const []const u8 = &.{},
+    joined_source_expression_qualifiers: []const []const u8 = &.{},
+    defer_row_expression_field_validation: bool = false,
+};
+
+pub const JoinedExpressionParserContextHooks = struct {
+    ptr: *anyopaque,
+    get_context: *const fn (*anyopaque) JoinedExpressionParserContext,
+    set_context: *const fn (*anyopaque, JoinedExpressionParserContext) void,
+    row_expression_type_context: *const fn (*anyopaque) expr_type.RowExpressionTypeContext,
+};
+
 pub const RowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
 };
+
+pub fn parseRowExpressionFromContextAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    context_hooks: SelectParserContextHooks,
+    row_expression_hooks: RowExpressionParserHooks,
+    arithmetic_hooks: ArithmeticExpressionParserHooks,
+    variadic_hooks: VariadicRowExpressionParserHooks,
+) !db_mod.types.RelationalRowsExpression {
+    return try parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        context_hooks.row_expression_type_context(context_hooks.ptr),
+        row_expression_hooks,
+        arithmetic_hooks,
+        variadic_hooks,
+    );
+}
+
+pub fn setJoinedExpressionContextForTables(
+    context_hooks: JoinedExpressionParserContextHooks,
+    target_qualifiers: []const []const u8,
+    source_qualifiers: []const []const u8,
+) JoinedExpressionParserContext {
+    const previous_context = context_hooks.get_context(context_hooks.ptr);
+    var context = previous_context;
+    context.joined_target_expression_qualifiers = target_qualifiers;
+    context.joined_source_expression_qualifiers = source_qualifiers;
+    context_hooks.set_context(context_hooks.ptr, context);
+    return previous_context;
+}
+
+pub const JoinedRowExpressionParserOptions = struct {
+    context_hooks: JoinedExpressionParserContextHooks,
+    row_expression_hooks: RowExpressionParserHooks,
+    arithmetic_hooks: ArithmeticExpressionParserHooks,
+    variadic_hooks: VariadicRowExpressionParserHooks,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    require_exact_generated_expression: bool = false,
+};
+
+pub fn parseJoinedRowExpressionWithTableQualifiersAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
+    options: JoinedRowExpressionParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    const target_qualifiers = [_][]const u8{ target_table.name, target_table.alias };
+    const source_qualifiers = [_][]const u8{ source_table.name, source_table.alias };
+    const previous_context = setJoinedExpressionContextForTables(options.context_hooks, target_qualifiers[0..], source_qualifiers[0..]);
+    defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
+
+    const start = pos.*;
+    const expression = try parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+        options.row_expression_hooks,
+        options.arithmetic_hooks,
+        options.variadic_hooks,
+    );
+    errdefer freeExpression(alloc, expression);
+    if (options.require_exact_generated_expression) {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    } else {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+    }
+    return expression;
+}
+
+pub fn parseJoinedRowExpressionWithQualifiersAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_qualifiers: []const []const u8,
+    source_qualifiers: []const []const u8,
+    options: JoinedRowExpressionParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    const previous_context = setJoinedExpressionContextForTables(options.context_hooks, target_qualifiers, source_qualifiers);
+    defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
+
+    const start = pos.*;
+    const expression = try parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+        options.row_expression_hooks,
+        options.arithmetic_hooks,
+        options.variadic_hooks,
+    );
+    errdefer freeExpression(alloc, expression);
+    if (options.require_exact_generated_expression) {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    } else {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+    }
+    return expression;
+}
+
+pub const JoinedBooleanRowExpressionParserOptions = struct {
+    context_hooks: JoinedExpressionParserContextHooks,
+    boolean_hooks: BooleanRowExpressionParserHooks,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst = null,
+    require_exact_generated_expression: bool = false,
+};
+
+pub fn parseJoinedBooleanRowExpressionWithQualifiersAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_qualifiers: []const []const u8,
+    source_qualifiers: []const []const u8,
+    options: JoinedBooleanRowExpressionParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    const previous_context = setJoinedExpressionContextForTables(options.context_hooks, target_qualifiers, source_qualifiers);
+    defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
+
+    const start = pos.*;
+    const expression = try parseBooleanRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+        options.boolean_hooks,
+    );
+    errdefer freeExpression(alloc, expression);
+    if (options.require_exact_generated_expression) {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentityStrict(tokens, start, pos.*, expression, options.generated_expression_ast);
+    } else {
+        try expr_generated_validate.validateGeneratedRowExpressionIdentity(tokens, start, pos.*, expression, options.generated_expression_ast);
+    }
+    return expression;
+}
+
+pub fn setDeferredRowExpressionFieldValidation(context_hooks: SelectParserContextHooks) SelectParserContext {
+    const previous_context = context_hooks.get_context(context_hooks.ptr);
+    var context = previous_context;
+    context.defer_row_expression_field_validation = true;
+    context_hooks.set_context(context_hooks.ptr, context);
+    return previous_context;
+}
+
+pub const DeferredRowExpressionParserOptions = struct {
+    function_bindings: SqlFunctionBindings = .{},
+    require_routine_expression_binding: bool = false,
+    context_hooks: SelectParserContextHooks,
+    row_expression_hooks: RowExpressionParserHooks,
+    arithmetic_hooks: ArithmeticExpressionParserHooks,
+    variadic_hooks: VariadicRowExpressionParserHooks,
+};
+
+pub fn parseRowExpressionWithDeferredFieldValidationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    options: DeferredRowExpressionParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    if (options.require_routine_expression_binding and options.function_bindings.routine_expressions.len == 0) return error.UnsupportedSqlShape;
+    const previous_context = setDeferredRowExpressionFieldValidation(options.context_hooks);
+    defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
+
+    return try parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+        options.row_expression_hooks,
+        options.arithmetic_hooks,
+        options.variadic_hooks,
+    );
+}
+
+pub const DeferredBooleanRowExpressionParserOptions = struct {
+    function_bindings: SqlFunctionBindings = .{},
+    require_routine_expression_binding: bool = false,
+    context_hooks: SelectParserContextHooks,
+    boolean_hooks: BooleanRowExpressionParserHooks,
+};
+
+pub fn parseBooleanRowExpressionWithDeferredFieldValidationAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    options: DeferredBooleanRowExpressionParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    if (options.require_routine_expression_binding and options.function_bindings.routine_expressions.len == 0) return error.UnsupportedSqlShape;
+    const previous_context = setDeferredRowExpressionFieldValidation(options.context_hooks);
+    defer options.context_hooks.set_context(options.context_hooks.ptr, previous_context);
+
+    return try parseBooleanRowExpressionAlloc(
+        alloc,
+        tokens,
+        pos,
+        options.context_hooks.row_expression_type_context(options.context_hooks.ptr),
+        options.boolean_hooks,
+    );
+}
 
 pub const ExtensionFunctionRowExpressionParserOptions = struct {
     type_context: expr_type.RowExpressionTypeContext,
@@ -141,6 +445,11 @@ pub const BooleanRowExpressionParserHooks = struct {
     ptr: *anyopaque,
     parse_expression: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
     parse_operand: *const fn (*anyopaque) anyerror!db_mod.types.RelationalRowsExpression,
+};
+
+pub const BooleanNotRowExpressionParserOptions = struct {
+    operand_hooks: RowExpressionParserHooks,
+    parenthesized: ParenthesizedRowExpressionParserOptions,
 };
 
 pub const CaseExpressionParserHooks = struct {
@@ -1389,6 +1698,78 @@ pub fn parseBooleanRowExpressionAlloc(
     return expression;
 }
 
+pub fn parseBooleanNotRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: expr_type.RowExpressionTypeContext,
+    options: BooleanNotRowExpressionParserOptions,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    try expr_token.parseBooleanNotExpressionStart(tokens, pos);
+    const operand = if (expr_token.peekParenthesizedExpressionSyntax(tokens, pos.*))
+        try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, .{
+            .type_context = type_context,
+            .boolean_hooks = options.parenthesized.boolean_hooks,
+        })
+    else
+        try options.operand_hooks.parse_operand(options.operand_hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    try type_context.validateBooleanRowExpression(operand);
+    const expression = try wrapBooleanNotExpressionAlloc(alloc, operand);
+    operand_transferred = true;
+    return expression;
+}
+
+pub fn parseUnaryNegativeRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    hooks: RowExpressionParserHooks,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    _ = parser.matchToken(tokens, pos, .minus) orelse return error.UnsupportedSqlShape;
+    if (parser.matchToken(tokens, pos, .number)) |token| {
+        return .{
+            .kind = .value,
+            .value_json = try std.fmt.allocPrint(alloc, "-{s}", .{token.text}),
+        };
+    }
+
+    const operand = try hooks.parse_operand(hooks.ptr);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    const expression = try expr_build.buildUnaryNegativeExpressionAlloc(alloc, operand);
+    operand_transferred = true;
+    return expression;
+}
+
+pub fn parseNullifRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    type_context: expr_type.RowExpressionTypeContext,
+    hooks: RowExpressionParserHooks,
+) anyerror!db_mod.types.RelationalRowsExpression {
+    try expr_token.parseNullifFunctionCallStart(tokens, pos);
+    const lhs = try hooks.parse_operand(hooks.ptr);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+    try parser.expectToken(tokens, pos, .comma);
+    const rhs = try hooks.parse_operand(hooks.ptr);
+    var rhs_transferred = false;
+    errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+    try parser.expectToken(tokens, pos, .rparen);
+
+    const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .nullif, lhs, rhs);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    lhs_transferred = true;
+    rhs_transferred = true;
+    try type_context.validateExpressionOperandDomains(expression);
+    expression_transferred = true;
+    return expression;
+}
+
 pub fn parseCaseRowExpressionAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1900,6 +2281,378 @@ pub fn testRowParseResolvesFunctionBindings() !void {
     try std.testing.expectError(error.UnsupportedSqlShape, routineExpressionBinding(&duplicate_routine_bindings, "status_label", 1));
     try std.testing.expect(routineArgumentExpressionIsNullLiteral(.{ .kind = .value, .value_json = "null" }));
     try std.testing.expect(!routineArgumentExpressionIsNullLiteral(.{ .kind = .value, .value_json = "\"null\"" }));
+}
+
+pub const RowExpressionOperandParserOptions = struct {
+    extension_function: ExtensionFunctionRowExpressionParserOptions,
+    routine_expression: RoutineExpressionRowExpressionParserOptions,
+    parenthesized: ParenthesizedRowExpressionParserOptions,
+    cast: CastRowExpressionParserOptions,
+    case_expression: CaseExpressionParserHooks,
+    case_fold: CaseFoldRowExpressionParserOptions,
+    coalesce: CoalesceRowExpressionParserOptions,
+    fixed_unary: FixedUnaryRowExpressionParserOptions,
+    fixed_binary: FixedBinaryRowExpressionParserOptions,
+    variadic: VariadicRowExpressionParserHooks,
+    json_build_object: JsonBuildObjectRowExpressionParserOptions,
+};
+
+pub fn rowExpressionOperandStartWithFunctionBindingsAt(tokens: []const Token, pos: usize, bindings: SqlFunctionBindings) ?expr_parse.RowExpressionOperandStart {
+    if (expr_parse.rowExpressionOperandStartAt(tokens, pos)) |start| return start;
+    if (peekExtensionFunctionCall(tokens, pos, bindings.extension_functions)) return .extension_function;
+    if (peekRoutineExpressionCall(tokens, pos, bindings.routine_expressions)) return .routine_expression;
+    return null;
+}
+
+pub fn parseRowExpressionOperandAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    function_bindings: SqlFunctionBindings,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    joined_source_expression_qualifiers: []const []const u8,
+    joined_target_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    type_context: expr_type.RowExpressionTypeContext,
+    hooks: RowExpressionOperandParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    if (rowExpressionOperandStartWithFunctionBindingsAt(tokens, pos.*, function_bindings)) |start| {
+        switch (start) {
+            .parenthesized => return try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, hooks.parenthesized),
+            .unary_negative => {
+                _ = parser.matchToken(tokens, pos, .minus) orelse return error.UnsupportedSqlShape;
+                if (parser.matchToken(tokens, pos, .number)) |token| {
+                    return .{
+                        .kind = .value,
+                        .value_json = try std.fmt.allocPrint(alloc, "-{s}", .{token.text}),
+                    };
+                }
+                const operand = try parseRowExpressionOperandAlloc(
+                    alloc,
+                    tokens,
+                    pos,
+                    params,
+                    schema,
+                    joined_source_schema,
+                    function_bindings,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    joined_source_expression_qualifiers,
+                    joined_target_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                    field_source,
+                    type_context,
+                    hooks,
+                );
+                var operand_transferred = false;
+                errdefer if (!operand_transferred) freeExpression(alloc, operand);
+                const expression = try expr_build.buildUnaryNegativeExpressionAlloc(alloc, operand);
+                operand_transferred = true;
+                return expression;
+            },
+            .boolean_not => {
+                try expr_token.parseBooleanNotExpressionStart(tokens, pos);
+                const operand = if (expr_token.peekParenthesizedExpressionSyntax(tokens, pos.*))
+                    try parseParenthesizedRowExpressionAlloc(alloc, tokens, pos, .{
+                        .type_context = type_context,
+                        .boolean_hooks = hooks.parenthesized.boolean_hooks,
+                    })
+                else
+                    try parseRowExpressionOperandAlloc(
+                        alloc,
+                        tokens,
+                        pos,
+                        params,
+                        schema,
+                        joined_source_schema,
+                        function_bindings,
+                        field_expression_qualifiers,
+                        returning_expression_qualifiers,
+                        joined_source_expression_qualifiers,
+                        joined_target_expression_qualifiers,
+                        defer_row_expression_field_validation,
+                        field_source,
+                        type_context,
+                        hooks,
+                    );
+                var operand_transferred = false;
+                errdefer if (!operand_transferred) freeExpression(alloc, operand);
+                try type_context.validateBooleanRowExpression(operand);
+                const expression = try wrapBooleanNotExpressionAlloc(alloc, operand);
+                operand_transferred = true;
+                return expression;
+            },
+            .extension_function => return (try parseExtensionFunctionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.extension_functions, hooks.extension_function)) orelse unreachable,
+            .routine_expression => return (try parseRoutineExpressionRowExpressionOrNullAlloc(alloc, tokens, pos, function_bindings.routine_expressions, hooks.routine_expression)) orelse unreachable,
+            .cast => return try parseCastRowExpressionAlloc(alloc, tokens, pos, hooks.cast),
+            .case => return try parseCaseRowExpressionAlloc(alloc, tokens, pos, type_context, defer_row_expression_field_validation, hooks.case_expression),
+            .now => return try expr_build.parseSqlNowRowExpressionAlloc(alloc, tokens, pos),
+            .current_date => return try expr_build.parseSqlCurrentDateRowExpressionAlloc(alloc, tokens, pos),
+            .typed_datetime_literal => return try expr_build.parseSqlTypedDatetimeLiteralRowExpressionAlloc(alloc, tokens, pos),
+            .uuid_v4 => return try expr_build.parseSqlUuidV4RowExpression(tokens, pos),
+            .interval => return try expr_build.parseSqlIntervalRowExpressionAlloc(alloc, tokens, pos),
+            .case_fold => return try parseCaseFoldRowExpressionAlloc(alloc, tokens, pos, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source, type_context, hooks.case_fold),
+            .replace => return try parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .replace, type_context, hooks.variadic),
+            .regexp_replace => return try parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_replace, type_context, hooks.variadic),
+            .regexp_substr => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_substr, type_context, hooks.fixed_binary),
+            .regexp_match => return try parseRegexpListRowExpressionAlloc(alloc, tokens, pos, .regexp_match, type_context, hooks.variadic),
+            .regexp_count => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_count, type_context, hooks.fixed_binary),
+            .regexp_instr => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .regexp_instr, type_context, hooks.fixed_binary),
+            .translate => return try parseTextTernaryRowExpressionAlloc(alloc, tokens, pos, .translate, type_context, hooks.variadic),
+            .concat => return try parseConcatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .coalesce => return try parseCoalesceRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.coalesce),
+            .nullif => {
+                try expr_token.parseNullifFunctionCallStart(tokens, pos);
+                const lhs = try parseRowExpressionOperandAlloc(
+                    alloc,
+                    tokens,
+                    pos,
+                    params,
+                    schema,
+                    joined_source_schema,
+                    function_bindings,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    joined_source_expression_qualifiers,
+                    joined_target_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                    field_source,
+                    type_context,
+                    hooks,
+                );
+                var lhs_transferred = false;
+                errdefer if (!lhs_transferred) freeExpression(alloc, lhs);
+                try parser.expectToken(tokens, pos, .comma);
+                const rhs = try parseRowExpressionOperandAlloc(
+                    alloc,
+                    tokens,
+                    pos,
+                    params,
+                    schema,
+                    joined_source_schema,
+                    function_bindings,
+                    field_expression_qualifiers,
+                    returning_expression_qualifiers,
+                    joined_source_expression_qualifiers,
+                    joined_target_expression_qualifiers,
+                    defer_row_expression_field_validation,
+                    field_source,
+                    type_context,
+                    hooks,
+                );
+                var rhs_transferred = false;
+                errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+                try parser.expectToken(tokens, pos, .rparen);
+                const expression = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, .nullif, lhs, rhs);
+                var expression_transferred = false;
+                errdefer if (!expression_transferred) freeExpression(alloc, expression);
+                lhs_transferred = true;
+                rhs_transferred = true;
+                try type_context.validateExpressionOperandDomains(expression);
+                expression_transferred = true;
+                return expression;
+            },
+            .text_length => return try parseTextLengthRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_unary),
+            .ascii => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ascii, type_context, .text, hooks.fixed_unary),
+            .chr => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .chr, type_context, .numeric, hooks.fixed_unary),
+            .substring => return try parseSubstringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .overlay => return try parseOverlayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .split_part => return try parseSplitPartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .strpos => return try parseStrposRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .left_right => return try parseLeftRightRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .pad => return try parsePadRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .repeat => return try parseRepeatRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .reverse => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .reverse, type_context, .text, hooks.fixed_unary),
+            .md5 => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .md5, type_context, .text, hooks.fixed_unary),
+            .starts_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .starts_with, type_context, hooks.fixed_binary),
+            .ends_with => return try parseTextBinaryRowExpressionAlloc(alloc, tokens, pos, .ends_with, type_context, hooks.fixed_binary),
+            .date_trunc => return try parseDateTruncRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .date_bin => return try parseDateBinRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .date_part => return try parseDatePartRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .abs => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .abs, type_context, .numeric, hooks.fixed_unary),
+            .round => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .round, type_context, .numeric, hooks.fixed_unary),
+            .trunc => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .trunc, type_context, .numeric, hooks.fixed_unary),
+            .floor => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .floor, type_context, .numeric, hooks.fixed_unary),
+            .ceil => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .ceil, type_context, .numeric, hooks.fixed_unary),
+            .sqrt => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sqrt, type_context, .numeric, hooks.fixed_unary),
+            .sign => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .sign, type_context, .numeric, hooks.fixed_unary),
+            .mod => return try parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .mod, type_context, hooks.fixed_binary),
+            .power => return try parseFixedNumericBinaryRowExpressionAlloc(alloc, tokens, pos, .power, type_context, hooks.fixed_binary),
+            .greatest_least => return try parseGreatestLeastRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .json_extract_path => return try parseJsonExtractPathRowExpressionAlloc(alloc, tokens, pos, params, type_context, hooks.fixed_unary),
+            .json_typeof => return try parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_typeof, type_context, hooks.fixed_unary),
+            .json_array_length => return try parseJsonUnaryRowExpressionAlloc(alloc, tokens, pos, .json_array_length, type_context, hooks.fixed_unary),
+            .json_build_object => return try parseJsonBuildObjectRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.json_build_object),
+            .to_jsonb => return try parseFixedUnaryRowExpressionAlloc(alloc, tokens, pos, .to_jsonb, type_context, .any, hooks.fixed_unary),
+            .convert_from => {
+                const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
+                errdefer alloc.free(value_json);
+                return .{ .kind = .value, .value_json = value_json };
+            },
+            .array_length => return try parseArrayLengthRowExpressionAlloc(alloc, tokens, pos, params, schema, field_expression_qualifiers, returning_expression_qualifiers, defer_row_expression_field_validation, field_source),
+            .array_position => return try parseArrayPositionRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+            .array_element_transform => return try parseArrayElementTransformRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .array_to_string => return try parseArrayToStringRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.variadic),
+            .string_to_array => return try parseStringToArrayRowExpressionAlloc(alloc, tokens, pos, type_context, hooks.fixed_binary),
+        }
+    }
+    if (try parseRowExpressionFieldOperandOrNullAlloc(
+        alloc,
+        tokens,
+        pos,
+        schema,
+        joined_source_schema,
+        params,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        joined_source_expression_qualifiers,
+        joined_target_expression_qualifiers,
+        defer_row_expression_field_validation,
+        field_source,
+    )) |expression| return expression;
+
+    const value_json = try value_mod.parseJsonValueAlloc(alloc, tokens, pos, params);
+    errdefer alloc.free(value_json);
+    return .{ .kind = .value, .value_json = value_json };
+}
+
+pub fn parseRowExpressionOperandFromContextAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    function_bindings: SqlFunctionBindings,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+    select_context_hooks: SelectParserContextHooks,
+    joined_context_hooks: JoinedExpressionParserContextHooks,
+    options: RowExpressionOperandParserOptions,
+) !db_mod.types.RelationalRowsExpression {
+    const select_context = select_context_hooks.get_context(select_context_hooks.ptr);
+    const joined_context = joined_context_hooks.get_context(joined_context_hooks.ptr);
+    const defer_field_validation =
+        select_context.defer_row_expression_field_validation or
+        joined_context.defer_row_expression_field_validation or
+        joined_context.joined_source_expression_qualifiers.len != 0 or
+        joined_context.joined_target_expression_qualifiers.len != 0;
+    var type_context = select_context_hooks.row_expression_type_context(select_context_hooks.ptr);
+    type_context.defer_row_expression_field_validation = defer_field_validation;
+    return try parseRowExpressionOperandAlloc(
+        alloc,
+        tokens,
+        pos,
+        params,
+        select_context.schema,
+        joined_source_schema,
+        function_bindings,
+        select_context.field_expression_qualifiers,
+        select_context.returning_expression_qualifiers,
+        joined_context.joined_source_expression_qualifiers,
+        joined_context.joined_target_expression_qualifiers,
+        defer_field_validation,
+        field_source,
+        type_context,
+        options,
+    );
+}
+
+pub fn parseRowExpressionFieldOperandOrNullAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema,
+    params: []const value_mod.SqlValue,
+    field_expression_qualifiers: []const []const u8,
+    returning_expression_qualifiers: []const []const u8,
+    joined_source_expression_qualifiers: []const []const u8,
+    joined_target_expression_qualifiers: []const []const u8,
+    defer_row_expression_field_validation: bool,
+    field_source: db_mod.types.RelationalRowsExpressionFieldSource,
+) !?db_mod.types.RelationalRowsExpression {
+    if (!parser.peekKind(tokens, pos.*, .identifier) or
+        parser.peekKeywordTag(tokens, pos.*, .null) or
+        parser.peekKeywordTag(tokens, pos.*, .true) or
+        parser.peekKeywordTag(tokens, pos.*, .false))
+    {
+        return null;
+    }
+    if (pos.* + 1 < tokens.len and tokens[pos.* + 1].kind == .lparen) return error.UnsupportedSqlShape;
+    const parsed_field = if (joined_source_expression_qualifiers.len != 0 or joined_target_expression_qualifiers.len != 0)
+        try parseIdentifierOwnedAlloc(alloc, tokens, pos)
+    else
+        try expr_generated.parseRowExpressionFieldOwnedAlloc(
+            alloc,
+            tokens,
+            pos,
+            schema,
+            field_expression_qualifiers,
+            returning_expression_qualifiers,
+            defer_row_expression_field_validation,
+        );
+    defer alloc.free(parsed_field);
+    const resolved = try binder.resolveRowExpressionFieldAlloc(
+        alloc,
+        schema,
+        joined_source_schema,
+        parsed_field,
+        field_expression_qualifiers,
+        returning_expression_qualifiers,
+        joined_source_expression_qualifiers,
+        joined_target_expression_qualifiers,
+        defer_row_expression_field_validation,
+        field_source,
+    );
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(resolved.field);
+    if (expr_operator.matchJsonExtractOperator(tokens, pos)) |operator| {
+        const as_text = expr_operator.tokenKindIsJsonExtractTextOperator(operator);
+        if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
+        const path = try value_mod.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        const expression = try expr_build.buildJsonExtractExpressionAlloc(
+            alloc,
+            .{ .kind = .field, .field = resolved.field, .field_source = resolved.source },
+            path,
+            as_text,
+        );
+        field_transferred = true;
+        path_transferred = true;
+        return expression;
+    }
+    if (parser.matchToken(tokens, pos, .question) != null) {
+        if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
+        const path = try value_mod.parseJsonPathOwnedAlloc(alloc, tokens, pos, params);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        const expression = try expr_build.buildJsonPathExistsExpressionAlloc(
+            alloc,
+            .{ .kind = .field, .field = resolved.field, .field_source = resolved.source },
+            path,
+        );
+        field_transferred = true;
+        path_transferred = true;
+        return expression;
+    }
+    if (parser.matchToken(tokens, pos, .question_any) != null or parser.matchToken(tokens, pos, .question_all) != null) {
+        const match_all = tokens[pos.* - 1].kind == .question_all;
+        if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, .json) == null) return error.InvalidSqlCatalog;
+        const values_json = try value_mod.parseJsonArrayValueAlloc(alloc, tokens, pos, params);
+        defer alloc.free(values_json);
+        const expression = try expr_build.buildJsonKeySetExistsExpressionAlloc(alloc, resolved.field, resolved.source, match_all, values_json);
+        field_transferred = true;
+        alloc.free(resolved.field);
+        return expression;
+    }
+    if (!defer_row_expression_field_validation and binder.relationalColumnForField(resolved.schema, resolved.field, null) == null) return error.InvalidSqlCatalog;
+    field_transferred = true;
+    return .{ .kind = .field, .field = resolved.field, .field_source = resolved.source };
 }
 
 test "sql expr row parse resolves function bindings" {

@@ -27,11 +27,11 @@
       "id": "domain-rollup-execution-fixtures",
       "relational_slices_section": "Advanced aggregates, windows, and rollups",
       "surface": "domain_execution_fixtures",
-      "status": "gap_tracked",
-      "current_evidence": "Representative aggregate, window, CTE, and typed read parity fixtures exist, but they are not domain-shaped workload fixtures.",
-      "missing_evidence": "Add SQL versus REST/SDK typed-plan execution fixtures for usage rollups, RBAC membership queries, wake-one queries, dashboards, and migration/backfill validation queries.",
-      "evidence_file": "zig/RELATIONAL.md",
-      "evidence_symbol": "Add execution fixtures for usage rollups, RBAC membership queries, wake-one queries, dashboards, and migration/backfill validation queries",
+      "status": "release_evidence",
+      "current_evidence": "Public SQL and REST/SDK-style typed row-plan endpoints now share release-gated domain execution fixtures for usage rollups, RBAC membership queries, wake-one queue selection, dashboard aggregates, and migration/backfill validation aggregates.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/api/http_server.zig",
+      "evidence_symbol": "api http server executes domain SQL fixtures through typed row plan parity",
       "release_gate": "relational-release-gate"
     },
     {

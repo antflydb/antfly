@@ -27,11 +27,11 @@
       "id": "json-array-rest-sdk-typed-plan-exposure",
       "relational_slices_section": "JSONB, arrays, and embedded document fields",
       "surface": "rest_sdk_typed_plan_exposure",
-      "status": "partial_release_gated",
-      "current_evidence": "REST/SDK-style relational row requests parse typed JSON filters and typed array expression projections while SQL lowering emits the same promoted JSON/array expression kinds for covered read and DML shapes.",
-      "missing_evidence": "All SQL-supported JSON/array selectors and transforms still need direct REST/SDK typed-plan exposure using the same typed nodes, with parity against SQL lowering.",
+      "status": "release_evidence",
+      "current_evidence": "REST/SDK-style relational row requests parse typed JSON filters plus the public expression operator surface test, which fails if any promoted RelationalRowsExpressionKind lacks a native request parser case. That surface includes JSON extract/path/type/array-length/build/to_jsonb nodes and array length/cardinality/position/positions/append/prepend/cat/remove/replace/to_string/string_to_array nodes; SQL/API required coverage pins the matching SQL lowering fixtures for those promoted JSON/array shapes.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
-      "evidence_symbol": "relational rows api query contract parses typed json filters",
+      "evidence_symbol": "relational rows query contract parses public expression operator surface",
       "release_gate": "relational-release-gate"
     },
     {

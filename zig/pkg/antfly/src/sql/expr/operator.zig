@@ -64,6 +64,20 @@ pub fn peekArithmeticRhsKeyword(tokens: []const Token, pos: usize, keyword: []co
     return rhs.kind == .identifier and std.ascii.eqlIgnoreCase(rhs.text, keyword);
 }
 
+pub fn peekConflictExistingFieldIncrement(
+    tokens: []const Token,
+    pos: usize,
+    field: []const u8,
+    column: runtime_schema.RelationalColumn,
+) bool {
+    if (column.field_type != .numeric) return false;
+    if (pos + 1 >= tokens.len or tokens[pos].kind != .identifier) return false;
+    if (!std.mem.eql(u8, tokens[pos].text, field)) return false;
+    const op = tokens[pos + 1].kind;
+    if (op != .plus and op != .minus) return false;
+    return !peekArithmeticRhsKeyword(tokens, pos, "interval");
+}
+
 pub fn peekBooleanOperator(tokens: []const Token, pos: usize) ?BooleanOperator {
     if (parser.peekKeyword(tokens, pos, "or")) return .{ .keyword = "or", .kind = .bool_or, .precedence = 1 };
     if (parser.peekKeyword(tokens, pos, "and")) return .{ .keyword = "and", .kind = .bool_and, .precedence = 2 };
@@ -269,6 +283,14 @@ test "sql expr_operator handles expression operator helpers" {
     try std.testing.expectEqual(TokenKind.plus, peekArithmeticOperator(&arithmetic_tokens, 1).?.token);
     try std.testing.expect(peekArithmeticRhsKeyword(&arithmetic_tokens, 0, "interval"));
     try std.testing.expect(!peekArithmeticRhsKeyword(&arithmetic_tokens, 1, "interval"));
+
+    const increment_tokens = [_]Token{
+        .{ .kind = .identifier, .text = "amount" },
+        .{ .kind = .plus, .text = "+" },
+        .{ .kind = .number, .text = "1" },
+    };
+    const numeric_column = runtime_schema.RelationalColumn{ .name = "amount", .path = "amount", .field_type = .numeric };
+    try std.testing.expect(peekConflictExistingFieldIncrement(&increment_tokens, 0, "amount", numeric_column));
 
     var comparison_pos: usize = 0;
     const comparison_tokens = [_]Token{.{ .kind = .gte, .text = ">=" }};

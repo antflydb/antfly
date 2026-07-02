@@ -489,6 +489,14 @@ pub fn validateCommentMetadataPlanForRuntimeSchemaAlloc(
             const parent_table = plan.parent_table_name orelse return error.InvalidSqlCatalog;
             if (!relationalConstraintNameExists(schema, parent_table, plan.object_name)) return error.InvalidSqlCatalog;
         },
+        .database,
+        .schema,
+        .extension,
+        .type,
+        .domain,
+        .function,
+        .procedure,
+        => {},
     }
 }
 
@@ -1701,6 +1709,7 @@ pub const CatalogDdlLogicalPlan = union(enum) {
     logical_replication: ddl_plan.LogicalReplicationPlan,
     type_system_catalog: ddl_plan.TypeSystemCatalogPlan,
     comment_metadata: ddl_plan.CommentMetadataPlan,
+    security_label: ddl_plan.SecurityLabelPlan,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
@@ -1715,6 +1724,7 @@ pub const CatalogDdlLogicalPlan = union(enum) {
             .logical_replication => |*plan| plan.deinit(alloc),
             .type_system_catalog => |*plan| plan.deinit(alloc),
             .comment_metadata => |*plan| plan.deinit(alloc),
+            .security_label => |*plan| plan.deinit(alloc),
         }
         self.* = undefined;
     }

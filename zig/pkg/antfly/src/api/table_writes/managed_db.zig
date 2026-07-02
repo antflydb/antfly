@@ -453,6 +453,7 @@ pub fn validateTableWritesAgainstLocalSchema(
 
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
+    try enforceNativeDocumentWritesPreflightForSchema(parsed_schema, writes);
     try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, writes);
 }
 
@@ -662,12 +663,18 @@ pub fn validateTableBatchAgainstLocalSchema(
     defer alloc.free(schema_json);
     if (schema_json.len == 0) return;
 
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed_schema.deinit(alloc);
+    try enforceNativeDocumentBatchPreflightForSchema(parsed_schema, .{
+        .writes = writes,
+        .deletes = deletes,
+        .transforms = transforms,
+    });
+
     const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
-    defer parsed_schema.deinit(alloc);
     try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, effective_writes);
 }
 
@@ -696,6 +703,7 @@ pub fn validateTableWritesAgainstCatalogSchema(
 
     var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed_schema.deinit(alloc);
+    try enforceNativeDocumentWritesPreflightForSchema(parsed_schema, writes);
     try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, writes);
 }
 
@@ -726,13 +734,88 @@ pub fn validateTableBatchAgainstSchemaJson(
     const raw_schema_json = schema_json orelse return;
     if (raw_schema_json.len == 0) return;
 
+    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, raw_schema_json);
+    defer parsed_schema.deinit(alloc);
+    try enforceNativeDocumentBatchPreflightForSchema(parsed_schema, .{
+        .writes = writes,
+        .deletes = deletes,
+        .transforms = transforms,
+    });
+
     const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 
-    var parsed_schema = try tables_api.parseValidatedTableSchema(alloc, raw_schema_json);
-    defer parsed_schema.deinit(alloc);
     try tables_api.validateWritesAgainstTableSchema(alloc, parsed_schema, effective_writes);
+}
+
+fn enforceNativeDocumentWritesPreflightForSchema(schema: anytype, writes: anytype) !void {
+    const empty_deletes = [_][]const u8{};
+    const empty_transforms = [_]db_mod.types.DocumentTransform{};
+    try enforceNativeDocumentBatchPreflightForSchema(schema, .{
+        .writes = writes,
+        .deletes = empty_deletes[0..],
+        .transforms = empty_transforms[0..],
+    });
+}
+
+fn enforceNativeDocumentBatchPreflightForSchema(schema: anytype, req: anytype) !void {
+    if (schema.storage_mode != .document) return;
+    try db_mod.document_write.enforceNativeDocumentBatchPreflight(req);
+}
+
+test "managed table batch validation preflights native document writes before schema validation" {
+    const alloc = std.testing.allocator;
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/managed-document-write-preflight", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+
+    const Hook = struct {
+        operations: [3]db_mod.document_write.DocumentWriteOperation = undefined,
+        len: usize = 0,
+
+        fn run(ptr: *anyopaque, req: db_mod.document_write.DocumentWritePreflight) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.operations[self.len] = req.operation;
+            self.len += 1;
+        }
+    };
+
+    var hook = Hook{};
+    db_mod.document_write.test_preflight_hook = .{ .ptr = &hook, .run = Hook.run };
+    defer db_mod.document_write.test_preflight_hook = null;
+
+    const schema_json =
+        \\{"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"}}}}}}
+    ;
+    const writes = [_]db_mod.types.BatchWrite{.{
+        .key = "doc:a",
+        .value = "{\"title\":\"alpha\"}",
+    }};
+    const deletes = [_][]const u8{"doc:b"};
+    const transform_ops = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "status",
+        .value_json = "\"updated\"",
+    }};
+    const transforms = [_]db_mod.types.DocumentTransform{.{
+        .key = "doc:a",
+        .operations = transform_ops[0..],
+        .upsert = true,
+    }};
+
+    try validateTableBatchAgainstSchemaJson(alloc, &db, schema_json, writes[0..], deletes[0..], transforms[0..]);
+
+    try std.testing.expectEqual(@as(usize, 3), hook.len);
+    try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[0]);
+    try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.exact_id_delete, hook.operations[1]);
+    try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[2]);
 }
 
 pub fn validateTransactionAgainstCatalogSchema(

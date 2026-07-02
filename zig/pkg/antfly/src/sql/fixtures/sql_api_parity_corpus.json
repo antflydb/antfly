@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "3ec97b2875391f36db78540bc0eb1fdc2f5d7a40e11b47633f6ff3d4a83d1ec8",
-  "source_entry_count": 1095,
-  "entry_count": 1095,
+  "source_sha256": "d999ef3e2a53bb2f67661eae692f552ee477d466978f711f75a6ce9803ae77a8",
+  "source_entry_count": 1212,
+  "entry_count": 1212,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -1132,7 +1132,7 @@
         "table_name": "usage_pub",
         "operations": 1
       },
-      "plan": "ddl:create_publication:publication=usage_pub:tables=1:all=false",
+      "plan": "ddl:create_publication:publication=usage_pub:tables=1:all=false:options=0",
       "sql": "CREATE PUBLICATION usage_pub FOR TABLE usage_records"
     },
     {
@@ -1143,7 +1143,7 @@
         "table_name": "usage_pub_all",
         "operations": 0
       },
-      "plan": "ddl:create_publication:publication=usage_pub_all:tables=0:all=true",
+      "plan": "ddl:create_publication:publication=usage_pub_all:tables=0:all=true:options=0",
       "sql": "CREATE PUBLICATION usage_pub_all FOR ALL TABLES"
     },
     {
@@ -1185,8 +1185,19 @@
         "table_name": "usage_sub",
         "operations": 1
       },
-      "plan": "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1",
+      "plan": "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1:options=0",
       "sql": "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub"
+    },
+    {
+      "name": "create subscription options catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_subscription",
+        "table_name": "usage_sub_options",
+        "operations": 1
+      },
+      "plan": "ddl:create_subscription:subscription=usage_sub_options:connection=true:publications=1:options=14",
+      "sql": "CREATE SUBSCRIPTION usage_sub_options CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub WITH (copy_data = false, connect = false, binary = true, create_slot = false, enabled = false, two_phase = false, disable_on_error = false, synchronous_commit = 'remote_write', streaming = 'parallel', password_required = false, run_as_owner = true, failover = true, origin = 'none', slot_name = 'usage_slot')"
     },
     {
       "name": "create subscription multi-publication catalog ddl",
@@ -1196,7 +1207,7 @@
         "table_name": "usage_sub_multi",
         "operations": 2
       },
-      "plan": "ddl:create_subscription:subscription=usage_sub_multi:connection=true:publications=2",
+      "plan": "ddl:create_subscription:subscription=usage_sub_multi:connection=true:publications=2:options=0",
       "sql": "CREATE SUBSCRIPTION usage_sub_multi CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub, usage_audit_pub"
     },
     {
@@ -1459,6 +1470,126 @@
       "apply_setup_sql": ["CREATE TABLE usage_records (id uuid PRIMARY KEY, status text, CONSTRAINT usage_records_status_check CHECK (status != 'deleted'));"],
       "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none:comments=1",
       "sql": "COMMENT ON CONSTRAINT usage_records_status_check ON usage_records IS 'valid status';"
+    },
+    {
+      "name": "schema comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "public",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=schema:object=public:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON SCHEMA public IS 'public schema';"
+    },
+    {
+      "name": "database comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "appdb",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=database:object=appdb:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON DATABASE appdb IS 'application database';"
+    },
+    {
+      "name": "extension comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "vector",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=extension:object=vector:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON EXTENSION vector IS 'vector search extension';"
+    },
+    {
+      "name": "type comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "usage_status_enum",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=type:object=usage_status_enum:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON TYPE usage_status_enum IS 'usage status enum';"
+    },
+    {
+      "name": "domain comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "usage_status",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=domain:object=usage_status:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON DOMAIN usage_status IS 'status domain';"
+    },
+    {
+      "name": "function signature comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "normalize_status",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=function:object=normalize_status:args=2:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON FUNCTION normalize_status(text, integer) IS 'normalizes status';"
+    },
+    {
+      "name": "procedure signature comment metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "comment_metadata",
+        "table_name": "rotate_usage",
+        "operations": 1
+      },
+      "plan": "ddl:comment:kind=procedure:object=rotate_usage:args=0:comment=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "COMMENT ON PROCEDURE rotate_usage() IS 'rotates usage partitions';"
+    },
+    {
+      "name": "table security label metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "security_label",
+        "table_name": "usage_records",
+        "operations": 1
+      },
+      "plan": "ddl:security_label:kind=table:object=usage_records:provider=true:label=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "SECURITY LABEL FOR selinux ON TABLE usage_records IS 'internal';"
+    },
+    {
+      "name": "schema security label metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "security_label",
+        "table_name": "public",
+        "operations": 1
+      },
+      "plan": "ddl:security_label:kind=schema:object=public:provider=false:label=true",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "SECURITY LABEL ON SCHEMA public IS 'internal';"
+    },
+    {
+      "name": "procedure security label null metadata ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "security_label",
+        "table_name": "rotate_usage",
+        "operations": 0
+      },
+      "plan": "ddl:security_label:kind=procedure:object=rotate_usage:args=0:provider=false:label=false",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "SECURITY LABEL ON PROCEDURE rotate_usage() IS NULL;"
     },
     {
       "name": "replace updated-at function catalog ddl",
@@ -3723,7 +3854,7 @@
         "table_name": "usage_records",
         "operations": 2
       },
-      "plan": "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=2",
+      "plan": "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:principals=1:privileges=2:grant_option=false",
       "sql": "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer"
     },
     {
@@ -3734,8 +3865,68 @@
         "table_name": "usage_records",
         "operations": 1
       },
-      "plan": "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
+      "plan": "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:principals=1:privileges=1:grant_option_for=false:revoke=default",
       "sql": "REVOKE INSERT ON TABLE usage_records FROM app_writer"
+    },
+    {
+      "name": "grant role catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "grant_role",
+        "operations": 2
+      },
+      "plan": "ddl:grant_role:principal=app_reader:principals=2:roles=2:admin_option=false",
+      "sql": "GRANT readonly, reporting TO app_reader, app_writer"
+    },
+    {
+      "name": "grant role admin option catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "grant_role",
+        "operations": 2
+      },
+      "plan": "ddl:grant_role:principal=app_reader:principals=2:roles=2:admin_option=true",
+      "sql": "GRANT readonly, reporting TO app_reader, app_writer WITH ADMIN OPTION"
+    },
+    {
+      "name": "revoke role catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "revoke_role",
+        "operations": 1
+      },
+      "plan": "ddl:revoke_role:principal=app_writer:principals=1:roles=1:admin_option_for=false:revoke=default",
+      "sql": "REVOKE readonly FROM app_writer"
+    },
+    {
+      "name": "revoke role admin option cascade catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "revoke_role",
+        "operations": 1
+      },
+      "plan": "ddl:revoke_role:principal=app_writer:principals=1:roles=1:admin_option_for=true:revoke=cascade",
+      "sql": "REVOKE ADMIN OPTION FOR readonly FROM app_writer CASCADE"
+    },
+    {
+      "name": "alter default privileges grant catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_default_privileges",
+        "operations": 2
+      },
+      "plan": "ddl:alter_default_privileges:action=grant:roles=1:schemas=1:object=TABLES:principal=readonly:principals=2:privileges=2:grant_option=true:grant_option_for=false:revoke=default",
+      "sql": "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO readonly, app_writer WITH GRANT OPTION"
+    },
+    {
+      "name": "alter default privileges revoke grant option catalog ddl",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "alter_default_privileges",
+        "operations": 1
+      },
+      "plan": "ddl:alter_default_privileges:action=revoke:roles=1:schemas=1:object=TABLES:principal=readonly:principals=1:privileges=1:grant_option=false:grant_option_for=true:revoke=cascade",
+      "sql": "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public REVOKE GRANT OPTION FOR INSERT ON TABLES FROM readonly CASCADE"
     },
     {
       "name": "grant public schema tables privilege catalog ddl",
@@ -3745,7 +3936,7 @@
         "table_name": "public",
         "operations": 1
       },
-      "plan": "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+      "plan": "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:principals=1:privileges=1:grant_option=false",
       "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer"
     },
@@ -3757,7 +3948,7 @@
         "table_name": "public",
         "operations": 1
       },
-      "plan": "ddl:revoke_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+      "plan": "ddl:revoke_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:principals=1:privileges=1:grant_option_for=false:revoke=default",
       "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
       "sql": "REVOKE SELECT ON ALL TABLES IN SCHEMA public FROM app_writer"
     },
@@ -7426,6 +7617,19 @@
       "sql": "CREATE TABLE IF NOT EXISTS usage_records (\n  id uuid DEFAULT gen_random_uuid() PRIMARY KEY,\n  tenant_id text COLLATE \"C\" NOT NULL,\n  quantity numeric(18, 2) DEFAULT 0::numeric CHECK (quantity >= 0::numeric),\n  metadata jsonb,\n  tags text[],\n  created_at timestamptz DEFAULT now(),\n  tenant_key text GENERATED ALWAYS AS (lower(tenant_id)) STORED,\n  CONSTRAINT usage_records_tenant_key UNIQUE (tenant_id),\n  CONSTRAINT usage_records_tenant_fkey FOREIGN KEY (tenant_id) REFERENCES tenants (id) ON DELETE CASCADE\n);"
     },
     {
+      "name": "document table ddl canonical",
+      "family": "ddl",
+      "summary": {
+        "ddl_tag": "create_table",
+        "table_name": "docs",
+        "select": 0,
+        "operations": 0
+      },
+      "plan": "ddl:create_table:table=docs:columns=0:unique=0:fk=0:checks=0:if_not_exists=false:storage_mode=document:document_schemas=1",
+      "applied_plan": "applied:rebuild=false:validation=false:rewrite=false:building_indexes=0:unvalidated_unique=0:unvalidated_fk=0:unvalidated_check=0:update_policy=0:work_items=0:work=none",
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}'"
+    },
+    {
       "name": "schema generated expression columns",
       "family": "ddl",
       "summary": {
@@ -8580,49 +8784,112 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_malformed_schema_json",
       "classification_reason": "document_table_ddl_malformed_schema_json",
-      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{bad json}')"
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{bad json}'"
     },
     {
       "name": "unsupported document table ddl missing default type",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_missing_default_type",
       "classification_reason": "document_table_ddl_missing_default_type",
-      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document')"
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
     },
     {
       "name": "unsupported document table ddl unknown default type",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_unknown_default_type",
       "classification_reason": "document_table_ddl_unknown_default_type",
-      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice', antfly.document_schema.doc = '{\"type\":\"object\"}')"
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'invoice') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
     },
     {
       "name": "unsupported document table ddl invalid antfly extension",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_invalid_antfly_extension",
       "classification_reason": "document_table_ddl_invalid_antfly_extension",
-      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"x-antfly-unknown\":true}')"
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"x-antfly-unknown\":true}'"
     },
     {
       "name": "unsupported document table ddl invalid dynamic template",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_invalid_dynamic_template",
       "classification_reason": "document_table_ddl_invalid_dynamic_template",
-      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\",\"dynamic_templates\":\"bad\"}')"
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"dynamic_templates\":\"bad\"}'"
+    },
+    {
+      "name": "unsupported document table ddl duplicate schema name",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_duplicate_schema_name",
+      "classification_reason": "document_table_ddl_duplicate_schema_name",
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}' DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}}}'"
     },
     {
       "name": "unsupported document table ddl multi document type",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_multi_document_type_unsupported",
       "classification_reason": "document_table_ddl_multi_document_type_unsupported",
-      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc', antfly.document_schema.doc = '{\"type\":\"object\"}', antfly.document_schema.invoice = '{\"type\":\"object\"}')"
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}' DOCUMENT SCHEMA invoice AS JSON '{\"type\":\"object\"}'"
     },
     {
-      "name": "unsupported document table ddl mixed relational syntax",
+      "name": "unsupported document table ddl relational column",
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
       "classification_reason": "document_table_ddl_mixed_relational_shape",
-      "sql": "CREATE TABLE docs (id uuid PRIMARY KEY) WITH (antfly.storage_mode = 'document')"
+      "sql": "CREATE TABLE docs (payload text) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl primary key",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (id uuid PRIMARY KEY) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl unique constraint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (email text UNIQUE) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl foreign key",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (tenant_id text REFERENCES tenants (id)) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl check constraint",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (amount numeric CHECK (amount >= 0)) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl generated column",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (title text GENERATED ALWAYS AS (lower(title)) STORED) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl temporal period",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (valid_from timestamptz, valid_to timestamptz, PERIOD FOR valid_time (valid_from, valid_to)) WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
+    },
+    {
+      "name": "unsupported document table ddl system versioning",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs () WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}' WITH SYSTEM VERSIONING"
+    },
+    {
+      "name": "unsupported document table ddl column default",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=document_table_ddl_mixed_relational_shape",
+      "classification_reason": "document_table_ddl_mixed_relational_shape",
+      "sql": "CREATE TABLE docs (status text DEFAULT 'open') WITH (antfly.storage_mode = 'document', antfly.default_type = 'doc') DOCUMENT SCHEMA doc AS JSON '{\"type\":\"object\"}'"
     },
     {
       "name": "unsupported document table ddl shorthand",
@@ -9010,29 +9277,73 @@
       "sql": "SELECT _id, plan FROM support_view WHERE length(plan) = 3 LIMIT 10"
     },
     {
-      "name": "unsupported document sql full document insert",
-      "family": "unsupported_write",
+      "name": "document sql full document insert",
+      "family": "document_write",
       "summary": {
-        "table_name": "docs"
+        "table_name": "docs",
+        "operations": 1
       },
-      "plan": "unsupported:write:requires=document_sql_write_unsupported",
-      "classification_reason": "document_sql_write_unsupported",
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}')"
     },
     {
-      "name": "unsupported document sql generated id insert",
+      "name": "unsupported document sql full document insert returning",
       "family": "unsupported_write",
       "summary": {
         "table_name": "docs"
       },
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') RETURNING _id"
+    },
+    {
+      "name": "unsupported document sql full document insert on conflict",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{}') ON CONFLICT (_id) DO NOTHING"
+    },
+    {
+      "name": "document sql generated id insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=generated_id_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "INSERT INTO docs (_doc) VALUES ('{}')"
     },
     {
-      "name": "unsupported document sql exact id delete",
+      "name": "document sql exact id delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=exact_id_delete:writes=0:transforms=0:deletes=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql exact id in delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 3
+      },
+      "plan": "document_write:table=docs:operation=exact_id_delete:writes=0:transforms=0:deletes=3",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE _id IN ('doc:a', 'doc:b', 'doc:b')"
+    },
+    {
+      "name": "unsupported document sql non identity delete",
       "family": "unsupported_write",
       "summary": {
         "table_name": "docs"
@@ -9040,7 +9351,62 @@
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "DELETE FROM docs WHERE _id = 'doc:a'"
+      "sql": "DELETE FROM docs WHERE title = 'Launch'"
+    },
+    {
+      "name": "unsupported document sql json path delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE _doc->'status' = '\"draft\"'"
+    },
+    {
+      "name": "unsupported document sql mixed identity delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE _id = 'doc:a' AND title = 'Launch'"
+    },
+    {
+      "name": "unsupported document sql range delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE title > 'Launch'"
+    },
+    {
+      "name": "unsupported document sql ordered delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE title = 'Launch' ORDER BY title"
+    },
+    {
+      "name": "unsupported document sql broad delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs"
     },
     {
       "name": "unsupported document sql doc update",
@@ -9054,18 +9420,275 @@
       "sql": "UPDATE docs SET _doc = '{}' WHERE _id = 'doc:a'"
     },
     {
-      "name": "unsupported document sql projection insert",
+      "name": "document sql json patch assignment",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql json patch version predicate",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "predicates": 1,
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0:predicates=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a' AND _version = 42"
+    },
+    {
+      "name": "document sql json patch reversed version predicate",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "predicates": 1,
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0:predicates=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _version = 42 AND _id = 'doc:a'"
+    },
+    {
+      "name": "document sql json patch in filter",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 2
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=2:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id IN ('doc:a', 'doc:b')"
+    },
+    {
+      "name": "document sql json patch duplicate identity",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 2
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=2:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id IN ('doc:a', 'doc:a')"
+    },
+    {
+      "name": "document sql json patch removal",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"obsolete\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"remove\",\"path\":\"obsolete\"}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql json patch merge",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"merge\",\"value\":{\"metadata\":{\"status\":\"ready\"}}}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql json patch null",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"metadata.archived_at\",\"value\":null}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql json patch array",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"tags\",\"value\":[\"new\",\"hot\"]}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql json patch invalid shape",
       "family": "unsupported_write",
       "summary": {
         "table_name": "docs"
       },
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":\"not-array\"}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql json patch versioned in filter",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id IN ('doc:a', 'doc:b') AND _version = 42"
+    },
+    {
+      "name": "unsupported document sql json patch boolean predicate",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a' OR _version = 42"
+    },
+    {
+      "name": "document sql json patch schema type",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"amount\",\"value\":\"not numeric\"}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql json patch generated field",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=document_patch:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"title\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title_lc\",\"value\":\"launch\"}]}') WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql projection insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch')"
     },
     {
-      "name": "unsupported document sql projection update",
+      "name": "document sql projection create only insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "predicates": 1,
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=create_only:predicates=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _version, title) VALUES ('doc:a', 0, 'Launch')"
+    },
+    {
+      "name": "document sql projection duplicate key native upsert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 2
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=2:transforms=0:deletes=0:write_mode=native_upsert",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'First'), ('doc:a', 'Second')"
+    },
+    {
+      "name": "document sql projection generated id insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=generated_id_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (title) VALUES ('Launch')"
+    },
+    {
+      "name": "document sql projection generated id create only insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "predicates": 1,
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=generated_id_insert:writes=1:transforms=0:deletes=0:write_mode=create_only:predicates=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_version, title) VALUES (0, 'Launch')"
+    },
+    {
+      "name": "document sql projection array insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title, tags) VALUES ('doc:a', 'Launch', ARRAY['new','hot'])"
+    },
+    {
+      "name": "document sql projection nested alias insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"object\",\"properties\":{\"plan\":{\"type\":\"keyword\",\"x-antfly-column-name\":\"metadata_plan\"}},\"additionalProperties\":false}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, metadata_plan) VALUES ('doc:a', 'pro')"
+    },
+    {
+      "name": "unsupported document sql transient nested projection alias insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"object\",\"properties\":{\"plan\":{\"type\":\"keyword\"}},\"additionalProperties\":false}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, metadata_plan) VALUES ('doc:a', 'pro')"
+    },
+    {
+      "name": "document sql projection null default insert",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=full_document_insert:writes=1:transforms=0:deletes=0:write_mode=native_upsert",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"default\":\"draft\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title, status) VALUES ('doc:a', NULL, DEFAULT)"
+    },
+    {
+      "name": "unsupported document sql generated field projection insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"title\"}}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title_lc) VALUES ('doc:a', 'launch')"
+    },
+    {
+      "name": "unsupported document sql versioned projection insert",
       "family": "unsupported_write",
       "summary": {
         "table_name": "docs"
@@ -9073,7 +9696,174 @@
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, _version, title) VALUES ('doc:a', 42, 'Launch')"
+    },
+    {
+      "name": "unsupported document sql additional properties projection insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":false}}}}",
+      "sql": "INSERT INTO docs (_id, extra) VALUES ('doc:a', 'blocked')"
+    },
+    {
+      "name": "unsupported document sql projection on conflict",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO UPDATE SET title = EXCLUDED.title"
+    },
+    {
+      "name": "unsupported document sql projection on conflict do nothing",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) VALUES ('doc:a', 'Launch') ON CONFLICT (_id) DO NOTHING"
+    },
+    {
+      "name": "unsupported document sql projection source insert",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "INSERT INTO docs (_id, title) SELECT _id, title FROM docs"
+    },
+    {
+      "name": "document sql projection update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql projection residual id update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=id_lookup:producer_ids=1:producer_residual=1:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' AND status = 'draft'"
+    },
+    {
+      "name": "document sql projection in update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 2
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=2:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id IN ('doc:a', 'doc:b')"
+    },
+    {
+      "name": "document sql projection version in update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "predicates": 2,
+        "operations": 2
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=2:deletes=0:predicates=2",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id IN ('doc:a', 'doc:b') AND _version = 42"
+    },
+    {
+      "name": "unsupported document sql generated field projection update",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"title_lc\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"title\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title_lc = 'launch' WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql projection version update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "predicates": 1,
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=1:deletes=0:predicates=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' AND _version = 42"
+    },
+    {
+      "name": "document sql projection null update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"archived_at\":{\"type\":\"numeric\",\"nullable\":true}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET archived_at = NULL WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql projection nested alias update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"metadata\":{\"type\":\"object\",\"properties\":{\"plan\":{\"type\":\"keyword\",\"x-antfly-column-name\":\"metadata_plan\"}},\"additionalProperties\":false}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET metadata_plan = 'pro' WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql projection array update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:writes=0:transforms=1:deletes=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET tags = ARRAY['new','hot'] WHERE _id = 'doc:a'"
+    },
+    {
+      "name": "document sql indexed projection update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft'"
+    },
+    {
+      "name": "unsupported document sql projection returning",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, title"
     },
     {
       "name": "unsupported document sql truncate table",
@@ -9096,6 +9886,293 @@
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE"
+    },
+    {
+      "name": "unsupported create event trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=event_trigger_catalog_plan",
+      "classification_reason": "event_trigger_catalog_plan",
+      "sql": "CREATE EVENT TRIGGER usage_ddl_start ON ddl_command_start EXECUTE FUNCTION audit_ddl()"
+    },
+    {
+      "name": "unsupported alter event trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=event_trigger_catalog_plan",
+      "classification_reason": "event_trigger_catalog_plan",
+      "sql": "ALTER EVENT TRIGGER usage_ddl_start DISABLE"
+    },
+    {
+      "name": "unsupported drop event trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=event_trigger_catalog_plan",
+      "classification_reason": "event_trigger_catalog_plan",
+      "sql": "DROP EVENT TRIGGER IF EXISTS usage_ddl_start"
+    },
+    {
+      "name": "unsupported create rule",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=rule_catalog_plan",
+      "classification_reason": "rule_catalog_plan",
+      "sql": "CREATE RULE usage_insert AS ON INSERT TO usage_records DO ALSO NOTIFY usage_events"
+    },
+    {
+      "name": "unsupported alter rule",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=rule_catalog_plan",
+      "classification_reason": "rule_catalog_plan",
+      "sql": "ALTER RULE usage_insert ON usage_records RENAME TO usage_insert_v2"
+    },
+    {
+      "name": "unsupported drop rule",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=rule_catalog_plan",
+      "classification_reason": "rule_catalog_plan",
+      "sql": "DROP RULE IF EXISTS usage_insert_v2 ON usage_records"
+    },
+    {
+      "name": "unsupported create transform",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=transform_catalog_plan",
+      "classification_reason": "transform_catalog_plan",
+      "sql": "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)"
+    },
+    {
+      "name": "unsupported alter transform",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=transform_catalog_plan",
+      "classification_reason": "transform_catalog_plan",
+      "sql": "ALTER TRANSFORM FOR jsonb LANGUAGE plpgsql OWNER TO app_role"
+    },
+    {
+      "name": "unsupported drop transform",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=transform_catalog_plan",
+      "classification_reason": "transform_catalog_plan",
+      "sql": "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql"
+    },
+    {
+      "name": "unsupported create foreign data wrapper",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=foreign_data_catalog_plan",
+      "classification_reason": "foreign_data_catalog_plan",
+      "sql": "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler"
+    },
+    {
+      "name": "unsupported alter foreign data wrapper",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=foreign_data_catalog_plan",
+      "classification_reason": "foreign_data_catalog_plan",
+      "sql": "ALTER FOREIGN DATA WRAPPER usage_fdw OPTIONS (ADD host 'localhost')"
+    },
+    {
+      "name": "unsupported drop foreign data wrapper",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=foreign_data_catalog_plan",
+      "classification_reason": "foreign_data_catalog_plan",
+      "sql": "DROP FOREIGN DATA WRAPPER IF EXISTS usage_fdw CASCADE"
+    },
+    {
+      "name": "unsupported create user mapping",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=foreign_data_catalog_plan",
+      "classification_reason": "foreign_data_catalog_plan",
+      "sql": "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')"
+    },
+    {
+      "name": "unsupported alter user mapping",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=foreign_data_catalog_plan",
+      "classification_reason": "foreign_data_catalog_plan",
+      "sql": "ALTER USER MAPPING FOR usage_user SERVER usage_server OPTIONS (SET user 'remote')"
+    },
+    {
+      "name": "unsupported drop user mapping",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=foreign_data_catalog_plan",
+      "classification_reason": "foreign_data_catalog_plan",
+      "sql": "DROP USER MAPPING IF EXISTS FOR usage_user SERVER usage_server"
+    },
+    {
+      "name": "unsupported create operator class",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=operator_catalog_plan",
+      "classification_reason": "operator_catalog_plan",
+      "sql": "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)"
+    },
+    {
+      "name": "unsupported alter operator class",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=operator_catalog_plan",
+      "classification_reason": "operator_catalog_plan",
+      "sql": "ALTER OPERATOR CLASS usage_ops USING btree RENAME TO usage_ops_v2"
+    },
+    {
+      "name": "unsupported drop operator class",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=operator_catalog_plan",
+      "classification_reason": "operator_catalog_plan",
+      "sql": "DROP OPERATOR CLASS IF EXISTS usage_ops USING btree"
+    },
+    {
+      "name": "unsupported create operator family",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=operator_catalog_plan",
+      "classification_reason": "operator_catalog_plan",
+      "sql": "CREATE OPERATOR FAMILY usage_family USING btree"
+    },
+    {
+      "name": "unsupported alter operator family",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=operator_catalog_plan",
+      "classification_reason": "operator_catalog_plan",
+      "sql": "ALTER OPERATOR FAMILY usage_family USING btree RENAME TO usage_family_v2"
+    },
+    {
+      "name": "unsupported drop operator family",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=operator_catalog_plan",
+      "classification_reason": "operator_catalog_plan",
+      "sql": "DROP OPERATOR FAMILY IF EXISTS usage_family USING btree"
+    },
+    {
+      "name": "unsupported create text search configuration",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)"
+    },
+    {
+      "name": "unsupported alter text search configuration",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "ALTER TEXT SEARCH CONFIGURATION usage_search RENAME TO usage_search_v2"
+    },
+    {
+      "name": "unsupported drop text search configuration",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "DROP TEXT SEARCH CONFIGURATION IF EXISTS usage_search"
+    },
+    {
+      "name": "unsupported create text search dictionary",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "CREATE TEXT SEARCH DICTIONARY usage_dict (TEMPLATE = simple)"
+    },
+    {
+      "name": "unsupported alter text search dictionary",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "ALTER TEXT SEARCH DICTIONARY usage_dict OWNER TO app_role"
+    },
+    {
+      "name": "unsupported drop text search dictionary",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "DROP TEXT SEARCH DICTIONARY IF EXISTS usage_dict"
+    },
+    {
+      "name": "unsupported create text search parser",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)"
+    },
+    {
+      "name": "unsupported alter text search parser",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "ALTER TEXT SEARCH PARSER usage_parser RENAME TO usage_parser_v2"
+    },
+    {
+      "name": "unsupported drop text search parser",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "DROP TEXT SEARCH PARSER IF EXISTS usage_parser"
+    },
+    {
+      "name": "unsupported create text search template",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)"
+    },
+    {
+      "name": "unsupported alter text search template",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "ALTER TEXT SEARCH TEMPLATE usage_template RENAME TO usage_template_v2"
+    },
+    {
+      "name": "unsupported drop text search template",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=text_search_catalog_plan",
+      "classification_reason": "text_search_catalog_plan",
+      "sql": "DROP TEXT SEARCH TEMPLATE IF EXISTS usage_template"
+    },
+    {
+      "name": "unsupported create access method",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_access_method_plan",
+      "classification_reason": "table_access_method_plan",
+      "sql": "CREATE ACCESS METHOD usage_am TYPE INDEX HANDLER usage_handler"
+    },
+    {
+      "name": "unsupported drop access method",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_access_method_plan",
+      "classification_reason": "table_access_method_plan",
+      "sql": "DROP ACCESS METHOD IF EXISTS usage_am"
+    },
+    {
+      "name": "unsupported create conversion",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=conversion_catalog_plan",
+      "classification_reason": "conversion_catalog_plan",
+      "sql": "CREATE CONVERSION usage_conv FOR 'UTF8' TO 'LATIN1' FROM utf8_to_latin1"
+    },
+    {
+      "name": "unsupported alter conversion",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=conversion_catalog_plan",
+      "classification_reason": "conversion_catalog_plan",
+      "sql": "ALTER CONVERSION usage_conv RENAME TO usage_conv_v2"
+    },
+    {
+      "name": "unsupported drop conversion",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=conversion_catalog_plan",
+      "classification_reason": "conversion_catalog_plan",
+      "sql": "DROP CONVERSION IF EXISTS usage_conv"
+    },
+    {
+      "name": "unsupported create statistics",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=statistics_catalog_plan",
+      "classification_reason": "statistics_catalog_plan",
+      "sql": "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records"
+    },
+    {
+      "name": "unsupported alter statistics",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=statistics_catalog_plan",
+      "classification_reason": "statistics_catalog_plan",
+      "sql": "ALTER STATISTICS usage_stats SET STATISTICS 100"
+    },
+    {
+      "name": "unsupported drop statistics",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=statistics_catalog_plan",
+      "classification_reason": "statistics_catalog_plan",
+      "sql": "DROP STATISTICS IF EXISTS usage_stats"
     },
     {
       "name": "unsupported alter table access method",
@@ -9131,6 +10208,20 @@
       "plan": "unsupported:ddl:requires=table_persistence_plan",
       "classification_reason": "table_persistence_plan",
       "sql": "ALTER TABLE usage_records SET UNLOGGED"
+    },
+    {
+      "name": "unsupported alter table column statistics",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_column_statistics_plan",
+      "classification_reason": "table_column_statistics_plan",
+      "sql": "ALTER TABLE usage_records ALTER COLUMN status SET STATISTICS 100"
+    },
+    {
+      "name": "unsupported alter table column storage",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=table_column_storage_plan",
+      "classification_reason": "table_column_storage_plan",
+      "sql": "ALTER TABLE usage_records ALTER COLUMN metadata SET STORAGE EXTENDED"
     },
     {
       "name": "unsupported alter table storage parameters",

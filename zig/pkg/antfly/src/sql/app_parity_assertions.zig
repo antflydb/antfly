@@ -318,6 +318,23 @@ pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered
             if (summary.returning_all) |expected| try std.testing.expectEqual(expected, insert.returning_all);
             if (summary.conflict_where) |expected| try std.testing.expectEqual(expected, insert.conflict_where);
         },
+        .document_write => |document_write| {
+            try expectOptionalTableName(summary.table_name, document_write.table_name);
+            try expectOptionalUsize(
+                summary.operations,
+                document_write.batch.writes.len + document_write.batch.transforms.len + document_write.batch.deletes.len,
+            );
+            try expectOptionalUsize(summary.predicates, document_write.batch.predicates.len);
+        },
+        .document_producer_mutation => |document_mutation| {
+            try expectOptionalTableName(summary.table_name, document_mutation.table_name);
+            const operation_count: usize = switch (document_mutation.template) {
+                .delete => 0,
+                .transform => |operations| operations.len,
+            };
+            try expectOptionalUsize(summary.operations, operation_count);
+            try expectOptionalUsize(summary.predicates, if (document_mutation.expected_version != null) 1 else 0);
+        },
         .insert_source => |insert_source| {
             try expectOptionalTableName(summary.table_name, insert_source.table_name);
             try expectOptionalUsize(summary.ctes, insert_source.ctes.len);

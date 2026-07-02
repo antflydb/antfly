@@ -246,46 +246,89 @@ fn deriveRuntimeRelationalColumns(alloc: std.mem.Allocator, schema: ParsedTableS
 
     for (schema.document_schemas) |document_schema| {
         for (document_schema.properties) |property| {
-            const field_type = runtimeRelationalColumnType(property) orelse continue;
-            const nullable = !requiredFieldsContain(document_schema.required_fields, property.name);
-            if (property.collation != null and !runtimeRelationalPropertySupportsCollation(property, field_type)) return error.InvalidSchemaUpdateRequest;
-            try validateRuntimeRelationalDefault(alloc, property.default_value, field_type);
-            try validateRuntimeRelationalOnUpdate(property.on_update_value, field_type);
-            const name = try alloc.dupe(u8, property.name);
-            var name_owned = true;
-            errdefer if (name_owned) alloc.free(name);
-            const path = try alloc.dupe(u8, property.name);
-            var path_owned = true;
-            errdefer if (path_owned) alloc.free(path);
-            var column: storage_schema.RelationalColumn = .{
-                .name = name,
-                .path = path,
-                .field_type = field_type,
-                .array_item_type = runtimeRelationalArrayItemType(property),
-                .nullable = nullable,
-                .collation = if (property.collation) |collation| try alloc.dupe(u8, collation) else null,
-                .indexed = if (property.antfly_index) |indexed| indexed else true,
-                .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
-                .index_generation = property.index_generation orelse 0,
-            };
-            name_owned = false;
-            path_owned = false;
-            var column_owned = true;
-            errdefer if (column_owned) freeRuntimeRelationalColumn(alloc, column);
-            column.index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
-            column.index_include_columns = try cloneStringSlice(alloc, property.index_include_columns);
-            column.index_keys = try cloneRelationalIndexKeys(alloc, property.index_keys);
-            column.default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null;
-            column.on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null;
-            column.generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null;
-            column.index_where = try cloneUniquePredicates(alloc, property.index_where);
-            column.index_where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, property.index_where_expressions);
-            try columns.append(alloc, column);
-            column_owned = false;
+            const required = requiredFieldsContain(document_schema.required_fields, property.name);
+            try appendRuntimeRelationalColumnForProperty(alloc, &columns, property, property.name, required, false);
+            try appendRuntimeRelationalColumnAliasesForPropertyChildren(alloc, &columns, property, property.name, required);
         }
     }
 
     return try columns.toOwnedSlice(alloc);
+}
+
+fn appendRuntimeRelationalColumnAliasesForPropertyChildren(
+    alloc: std.mem.Allocator,
+    columns: *std.ArrayListUnmanaged(storage_schema.RelationalColumn),
+    property: anytype,
+    path: []const u8,
+    parent_required: bool,
+) !void {
+    for (property.properties) |child| {
+        const child_path = try appendPath(alloc, path, child.name);
+        defer alloc.free(child_path);
+        const child_required = parent_required and requiredFieldsContain(property.required_fields, child.name);
+        if (child.sql_column_name != null) {
+            try appendRuntimeRelationalColumnForProperty(alloc, columns, child, child_path, child_required, true);
+        }
+        try appendRuntimeRelationalColumnAliasesForPropertyChildren(alloc, columns, child, child_path, child_required);
+    }
+}
+
+fn appendRuntimeRelationalColumnForProperty(
+    alloc: std.mem.Allocator,
+    columns: *std.ArrayListUnmanaged(storage_schema.RelationalColumn),
+    property: anytype,
+    path: []const u8,
+    required: bool,
+    require_column: bool,
+) !void {
+    const field_type = runtimeRelationalColumnType(property) orelse {
+        if (require_column) return error.InvalidSchemaUpdateRequest;
+        return;
+    };
+    const column_name = property.sql_column_name orelse property.name;
+    if (runtimeRelationalColumnNameExists(columns.items, column_name)) return error.InvalidSchemaUpdateRequest;
+    const nullable = !required;
+    if (property.collation != null and !runtimeRelationalPropertySupportsCollation(property, field_type)) return error.InvalidSchemaUpdateRequest;
+    try validateRuntimeRelationalDefault(alloc, property.default_value, field_type);
+    try validateRuntimeRelationalOnUpdate(property.on_update_value, field_type);
+    const name = try alloc.dupe(u8, column_name);
+    var name_owned = true;
+    errdefer if (name_owned) alloc.free(name);
+    const owned_path = try alloc.dupe(u8, path);
+    var path_owned = true;
+    errdefer if (path_owned) alloc.free(owned_path);
+    var column: storage_schema.RelationalColumn = .{
+        .name = name,
+        .path = owned_path,
+        .field_type = field_type,
+        .array_item_type = runtimeRelationalArrayItemType(property),
+        .nullable = nullable,
+        .collation = if (property.collation) |collation| try alloc.dupe(u8, collation) else null,
+        .indexed = if (property.antfly_index) |indexed| indexed else true,
+        .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
+        .index_generation = property.index_generation orelse 0,
+    };
+    name_owned = false;
+    path_owned = false;
+    var column_owned = true;
+    errdefer if (column_owned) freeRuntimeRelationalColumn(alloc, column);
+    column.index_name = if (property.index_name) |index_name| try alloc.dupe(u8, index_name) else null;
+    column.index_include_columns = try cloneStringSlice(alloc, property.index_include_columns);
+    column.index_keys = try cloneRelationalIndexKeys(alloc, property.index_keys);
+    column.default_value = if (property.default_value) |default_value| try cloneRelationalDefaultValue(alloc, default_value) else null;
+    column.on_update_value = if (property.on_update_value) |on_update_value| try cloneRelationalDefaultValue(alloc, on_update_value) else null;
+    column.generated = if (property.generated) |generated| try cloneRelationalGeneratedValue(alloc, generated) else null;
+    column.index_where = try cloneUniquePredicates(alloc, property.index_where);
+    column.index_where_expressions = try cloneRelationalRowsExpressionConditionsAlloc(alloc, property.index_where_expressions);
+    try columns.append(alloc, column);
+    column_owned = false;
+}
+
+fn runtimeRelationalColumnNameExists(columns: []const storage_schema.RelationalColumn, name: []const u8) bool {
+    for (columns) |column| {
+        if (std.mem.eql(u8, column.name, name)) return true;
+    }
+    return false;
 }
 
 fn runtimeRelationalColumnSupportsCollation(field_type: storage_schema.AntflyType) bool {
@@ -1584,6 +1627,42 @@ fn findRuntimeColumn(schema: storage_schema.TableSchema, name: []const u8) ?stor
         if (std.mem.eql(u8, column.name, name)) return column;
     }
     return null;
+}
+
+test "deriveRuntimeTableSchema carries nested document SQL column aliases" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","required":["plan"],"properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"title":{"type":"text"}},"required":["metadata"],"additionalProperties":false}}}}
+    ;
+
+    var parsed = try parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const metadata = findRuntimeColumn(runtime, "metadata") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("metadata", metadata.path);
+    try std.testing.expectEqual(storage_schema.AntflyType.json, metadata.field_type);
+
+    const plan = findRuntimeColumn(runtime, "metadata_plan") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("metadata.plan", plan.path);
+    try std.testing.expectEqual(storage_schema.AntflyType.keyword, plan.field_type);
+    try std.testing.expect(!plan.nullable);
+    try std.testing.expect(findRuntimeColumn(runtime, "plan") == null);
+}
+
+test "deriveRuntimeTableSchema rejects invalid or duplicate document SQL column aliases" {
+    const alloc = std.testing.allocator;
+
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata-plan"}}}}}}}
+    ));
+
+    var duplicate = try parseValidatedTableSchema(alloc,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"title"}}}}}}}
+    );
+    defer duplicate.deinit(alloc);
+    try std.testing.expectError(error.InvalidSchemaUpdateRequest, deriveRuntimeTableSchema(alloc, duplicate));
 }
 
 test "deriveRuntimeTableSchema carries external lake base source binding" {

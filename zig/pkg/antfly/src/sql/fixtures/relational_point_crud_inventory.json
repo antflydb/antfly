@@ -5,11 +5,11 @@
       "id": "committed-returning-parity",
       "relational_slices_section": "Point CRUD and conflict upsert hardening",
       "surface": "committed_returning",
-      "status": "partial_release_gated",
-      "current_evidence": "Local SQL and typed row-plan paths gate committed mutation images for insert, update, delete, conflict update, conflict do-nothing, merge, insert-source, and joined mutation RETURNING shapes.",
-      "missing_evidence": "Committed-row RETURNING still needs one parity fixture comparing SQL, REST/SDK typed plans, local storage execution, and routed execution for inserted, updated, conflict-updated, conflict-noop, and deleted rows.",
-      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
-      "evidence_symbol": "relational rows batch returning projects committed mutation images",
+      "status": "release_evidence",
+      "current_evidence": "Public SQL and REST/SDK-style typed row APIs now share committed-image RETURNING evidence for inserted rows, primary-conflict updated rows, primary-conflict do-nothing rows, claimed mutation-source updates, and claimed mutation-source deletes. The fixture compares SQL endpoint results with direct typed /rows/batch and /rows/mutation-source responses while local storage execution, insert-source, joined mutation, and merge RETURNING paths remain covered by the release gate.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/api/http_server.zig",
+      "evidence_symbol": "api http server executes SQL point writes through typed row batch ingress",
       "release_gate": "relational-release-gate"
     },
     {
@@ -27,11 +27,11 @@
       "id": "non-unique-point-claim-safety",
       "relational_slices_section": "Point CRUD and conflict upsert hardening",
       "surface": "non_unique_point_claim",
-      "status": "partial_release_gated",
-      "current_evidence": "Claimed mutation-source parsing, non-lockable row-lock rejection, invalid row-lock targets, and storage-bound row-claim tests gate the current lockable-source contract.",
-      "missing_evidence": "Every new non-unique point mutation shape must remain on explicit claimed mutation-source plans, with fallback scans rejected before remote routing or owner-local staging.",
-      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
-      "evidence_symbol": "relational rows mutation source contract parses claimed update plans",
+      "status": "release_evidence",
+      "current_evidence": "Claimed mutation-source parsing rejects missing owner metadata, SQL lowering injects explicit row-claim metadata for non-unique update/delete mutation-source plans, invalid row-lock targets fail before planning, storage-bound row-claim tests gate execution, and hosted/provisioned write sources reject non-lockable CTE or source-side claim shapes before remote routing or owner-local staging.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/api/table_writes/sources.zig",
+      "evidence_symbol": "hosted mutation-source rejects non-lockable derived sources before routing",
       "release_gate": "relational-release-gate"
     },
     {

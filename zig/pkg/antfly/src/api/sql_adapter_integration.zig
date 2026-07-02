@@ -17,12 +17,14 @@ const std = @import("std");
 const catalog_resources = @import("catalog_resources.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const relational_rows = @import("relational_rows.zig");
+const raft_mod = @import("../raft/mod.zig");
 const runtime_schema = @import("../storage/schema.zig");
 const schema_api = @import("../schema/mod.zig");
 const sql_adapter = @import("../sql/mod.zig");
 const ddl_plan = @import("../sql/ddl_plan.zig");
 const table_catalog = @import("../metadata/catalog/routing.zig");
 const table_read_relational_rows = @import("table_reads/relational_rows.zig");
+const table_writes_managed_db = @import("table_writes/managed_db.zig");
 const transactions_mod = @import("../storage/transactions.zig");
 const usermgr = @import("../usermgr/mod.zig");
 
@@ -59,6 +61,7 @@ const AppParityDdlSummaryPlan = union(enum) {
     cursor_portal: ddl_plan.CursorPortalPlan,
     savepoint_transaction: ddl_plan.SavepointTransactionPlan,
     comment_metadata: ddl_plan.CommentMetadataPlan,
+    security_label: ddl_plan.SecurityLabelPlan,
     transaction_control: ddl_plan.TransactionControlPlan,
     create_index: ddl_plan.CreateIndexPlan,
     drop_index: ddl_plan.DropIndexPlan,
@@ -311,6 +314,7 @@ fn expectCatalogDdlSummary(summary: AppParityPlanSummary, plan: sql_adapter.Cata
         .logical_replication => |payload| return try expectDdlSummaryPayload(summary, .{ .logical_replication = payload }),
         .type_system_catalog => |payload| return try expectDdlSummaryPayload(summary, .{ .type_system_catalog = payload }),
         .comment_metadata => |payload| return try expectDdlSummaryPayload(summary, .{ .comment_metadata = payload }),
+        .security_label => |payload| return try expectDdlSummaryPayload(summary, .{ .security_label = payload }),
     }
 }
 
@@ -534,6 +538,18 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
                 try expectOptionalTableName(summary.table_name, revoke.object_name);
                 try expectOptionalUsize(summary.operations, revoke.privileges.len);
             },
+            .grant_role => |grant| {
+                try std.testing.expectEqual(AppParityDdlTag.grant_role, expected);
+                try expectOptionalUsize(summary.operations, grant.role_names.len);
+            },
+            .revoke_role => |revoke| {
+                try std.testing.expectEqual(AppParityDdlTag.revoke_role, expected);
+                try expectOptionalUsize(summary.operations, revoke.role_names.len);
+            },
+            .alter_default_privileges => |alter| {
+                try std.testing.expectEqual(AppParityDdlTag.alter_default_privileges, expected);
+                try expectOptionalUsize(summary.operations, alter.privileges.len);
+            },
         },
         .bulk_io => |plan| {
             try std.testing.expectEqual(switch (plan.direction) {
@@ -638,13 +654,17 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
                 .create => |create| {
                     try std.testing.expectEqual(AppParityDdlTag.create_publication, expected);
                     try expectOptionalTableName(summary.table_name, create.publication_name);
-                    try expectOptionalUsize(summary.operations, create.table_names.len);
+                    try expectOptionalUsize(summary.operations, create.tables.len);
                 },
                 .alter => |alter| {
                     try std.testing.expectEqual(AppParityDdlTag.alter_publication, expected);
                     try expectOptionalTableName(summary.table_name, alter.publication_name);
                     switch (alter.operation) {
                         .add_tables => |tables| try expectOptionalUsize(summary.operations, tables.len),
+                        .drop_tables => |tables| try expectOptionalUsize(summary.operations, tables.len),
+                        .set_tables => |tables| try expectOptionalUsize(summary.operations, tables.len),
+                        .set_options => |options| try expectOptionalUsize(summary.operations, (if (options.publish_json != null) @as(usize, 1) else 0) + (if (options.publish_via_partition_root != null) @as(usize, 1) else 0)),
+                        .rename_to, .owner_to => try expectOptionalUsize(summary.operations, 1),
                     }
                 },
                 .drop => |drop| {
@@ -809,6 +829,13 @@ fn expectDdlSummaryPayload(summary: AppParityPlanSummary, payload: AppParityDdlS
             try expectOptionalTableName(summary.table_name, plan.object_name);
             if (summary.operations) |expected_operations| {
                 try std.testing.expectEqual(expected_operations, @intFromBool(plan.comment_json != null));
+            }
+        },
+        .security_label => |plan| {
+            try std.testing.expectEqual(AppParityDdlTag.security_label, expected);
+            try expectOptionalTableName(summary.table_name, plan.object_name);
+            if (summary.operations) |expected_operations| {
+                try std.testing.expectEqual(expected_operations, @as(usize, @intFromBool(plan.label_json != null)));
             }
         },
         .transaction_control => |plan| switch (plan) {
@@ -1114,6 +1141,19 @@ fn expectAppParityWritePlanEntry(
             },
             else => return error.TestUnexpectedResult,
         },
+        .document_write => switch (lowered) {
+            .document_write => {
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
+            .document_producer_mutation => {
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
+            else => return error.TestUnexpectedResult,
+        },
         .insert_source => switch (lowered) {
             .insert_source => |insert_source| {
                 var fingerprint = try insertSourceFingerprintAlloc(alloc, insert_source);
@@ -1228,6 +1268,7 @@ fn expectAppParityWritePlanEntry(
 fn appParityPlanFamilyIsSupportedWrite(family: AppParityCorpusPlanFamily) bool {
     return switch (family) {
         .insert,
+        .document_write,
         .insert_source,
         .recursive_insert_source,
         .update,
@@ -1440,6 +1481,7 @@ fn expectAppParityCorpusEntry(
             try expectAppParityPlan(entry.plan, fingerprint);
         },
         .insert,
+        .document_write,
         .insert_source,
         .recursive_insert_source,
         .update,
@@ -3362,8 +3404,1405 @@ test "postgres sql adapter temporal portion mutation sources execute through rel
     try expectSqlTemporalPriceRow(alloc, sku_b_rows.rows[1], "sku:b", 8, 10, 20);
 }
 
+fn expectDocumentFullDocumentInsertRuntime() !void {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"archived_at":{"type":"numeric","nullable":true},"metadata":{"type":"object","properties":{"status":{"type":"keyword"},"archived_at":{"type":"numeric","nullable":true},"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"obsolete":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}}},"required":["title"],"additionalProperties":false}}}}
+    ;
+    var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/sql-document-write-execution", .{tmp.sub_path});
+    defer alloc.free(path);
+
+    var db = try db_mod.DB.open(alloc, path, .{});
+    defer db.close();
+    try db.applyTableSchemaJson(alloc, schema_json, .{});
+
+    const Hook = struct {
+        operations: [64]db_mod.document_write.DocumentWriteOperation = undefined,
+        len: usize = 0,
+
+        fn run(ptr: *anyopaque, req: db_mod.document_write.DocumentWritePreflight) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.operations[self.len] = req.operation;
+            self.len += 1;
+        }
+    };
+    var hook = Hook{};
+    db_mod.document_write.test_preflight_hook = .{ .ptr = &hook, .run = Hook.run };
+    defer db_mod.document_write.test_preflight_hook = null;
+
+    var insert_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:a', '{\"title\":\"Alpha\",\"status\":\"draft\"}')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer insert_plan.deinit(alloc);
+    switch (insert_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.writes[0].key);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try std.testing.expectEqual(@as(usize, 1), hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[0]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const stored = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(stored);
+    var parsed_stored = try std.json.parseFromSlice(std.json.Value, alloc, stored, .{});
+    defer parsed_stored.deinit();
+    try std.testing.expectEqualStrings("Alpha", parsed_stored.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("draft", parsed_stored.value.object.get("status").?.string);
+
+    var upsert_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_doc, _id) VALUES ('{\"title\":\"Beta\",\"status\":\"ready\"}', 'doc:a')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer upsert_plan.deinit(alloc);
+    switch (upsert_plan) {
+        .document_write => |document_write| {
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try std.testing.expectEqual(@as(usize, 2), hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[1]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const upserted = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(upserted);
+    var parsed_upserted = try std.json.parseFromSlice(std.json.Value, alloc, upserted, .{});
+    defer parsed_upserted.deinit();
+    try std.testing.expectEqualStrings("Beta", parsed_upserted.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("ready", parsed_upserted.value.object.get("status").?.string);
+
+    var patch_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Patched\"},{\"op\":\"merge\",\"value\":{\"metadata\":{\"status\":\"patched\"}}},{\"op\":\"set\",\"path\":\"tags\",\"value\":[\"new\",\"hot\"]},{\"op\":\"set\",\"path\":\"metadata.archived_at\",\"value\":null},{\"op\":\"remove\",\"path\":\"status\"}]}') WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer patch_plan.deinit(alloc);
+    switch (patch_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.document_patch, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.transformed);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.transforms[0].key);
+            try std.testing.expectEqual(@as(usize, 5), document_write.batch.req.transforms[0].operations.len);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const patched = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(patched);
+    var parsed_patched = try std.json.parseFromSlice(std.json.Value, alloc, patched, .{});
+    defer parsed_patched.deinit();
+    try std.testing.expectEqualStrings("Patched", parsed_patched.value.object.get("title").?.string);
+    try std.testing.expect(parsed_patched.value.object.get("status") == null);
+    try std.testing.expectEqualStrings("patched", parsed_patched.value.object.get("metadata").?.object.get("status").?.string);
+    try std.testing.expectEqual(@as(usize, 2), parsed_patched.value.object.get("tags").?.array.items.len);
+    try std.testing.expect(parsed_patched.value.object.get("metadata").?.object.get("archived_at").? == .null);
+
+    const patched_version = try db.getTimestamp(alloc, "doc:a");
+    const versioned_patch_sql = try std.fmt.allocPrint(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{{\"ops\":[{{\"op\":\"set\",\"path\":\"title\",\"value\":\"Versioned\"}}]}}') WHERE _id = 'doc:a' AND _version = {d}",
+        .{patched_version},
+    );
+    defer alloc.free(versioned_patch_sql);
+    var versioned_patch_plan = try lowerWritePlanAlloc(alloc, versioned_patch_sql, schema, &.{}, .{});
+    defer versioned_patch_plan.deinit(alloc);
+    switch (versioned_patch_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.document_patch, document_write.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.predicates[0].key);
+            try std.testing.expectEqual(patched_version, document_write.batch.req.predicates[0].expected_version);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const versioned = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(versioned);
+    var parsed_versioned = try std.json.parseFromSlice(std.json.Value, alloc, versioned, .{});
+    defer parsed_versioned.deinit();
+    try std.testing.expectEqualStrings("Versioned", parsed_versioned.value.object.get("title").?.string);
+
+    const versioned_commit = try db.getTimestamp(alloc, "doc:a");
+    const reversed_versioned_patch_sql = try std.fmt.allocPrint(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{{\"ops\":[{{\"op\":\"set\",\"path\":\"title\",\"value\":\"Reversed\"}}]}}') WHERE _version = {d} AND _id = 'doc:a'",
+        .{versioned_commit},
+    );
+    defer alloc.free(reversed_versioned_patch_sql);
+    var reversed_versioned_patch_plan = try lowerWritePlanAlloc(alloc, reversed_versioned_patch_sql, schema, &.{}, .{});
+    defer reversed_versioned_patch_plan.deinit(alloc);
+    switch (reversed_versioned_patch_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.document_patch, document_write.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.predicates[0].key);
+            try std.testing.expectEqual(versioned_commit, document_write.batch.req.predicates[0].expected_version);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const reversed = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(reversed);
+    var parsed_reversed = try std.json.parseFromSlice(std.json.Value, alloc, reversed, .{});
+    defer parsed_reversed.deinit();
+    try std.testing.expectEqualStrings("Reversed", parsed_reversed.value.object.get("title").?.string);
+
+    const stale_patch_sql = try std.fmt.allocPrint(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{{\"ops\":[{{\"op\":\"set\",\"path\":\"title\",\"value\":\"Stale\"}}]}}') WHERE _id = 'doc:a' AND _version = {d}",
+        .{patched_version},
+    );
+    defer alloc.free(stale_patch_sql);
+    var stale_patch_plan = try lowerWritePlanAlloc(alloc, stale_patch_sql, schema, &.{}, .{});
+    defer stale_patch_plan.deinit(alloc);
+    switch (stale_patch_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(document_write.batch.req));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var missing_patch_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Missing\"}]}') WHERE _id = 'doc:missing'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer missing_patch_plan.deinit(alloc);
+    switch (missing_patch_plan) {
+        .document_write => |document_write| {
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try db.get(alloc, "doc:missing")) == null);
+
+    var duplicate_patch_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Duplicate\"}]}') WHERE _id IN ('doc:a', 'doc:a')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer duplicate_patch_plan.deinit(alloc);
+    switch (duplicate_patch_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.document_patch, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 2), document_write.batch.transformed);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.transforms[1].key);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const duplicate_patched = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(duplicate_patched);
+    var parsed_duplicate_patched = try std.json.parseFromSlice(std.json.Value, alloc, duplicate_patched, .{});
+    defer parsed_duplicate_patched.deinit();
+    try std.testing.expectEqualStrings("Duplicate", parsed_duplicate_patched.value.object.get("title").?.string);
+
+    const invalid_patch_sql = [_][]const u8{
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":\"not-array\"}') WHERE _id = 'doc:a'",
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Broad\"}]}') WHERE title = 'Patched'",
+    };
+    for (invalid_patch_sql) |sql| {
+        try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanAlloc(
+            alloc,
+            sql,
+            schema,
+            &.{},
+            .{},
+        ));
+    }
+
+    const invalid_patch_documents = [_][]const u8{
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"amount\",\"value\":\"not numeric\"}]}') WHERE _id = 'doc:a'",
+        "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title_lc\",\"value\":\"patched\"}]}') WHERE _id = 'doc:a'",
+    };
+    for (invalid_patch_documents) |sql| {
+        var invalid_patch_plan = try lowerWritePlanAlloc(alloc, sql, schema, &.{}, .{});
+        defer invalid_patch_plan.deinit(alloc);
+        switch (invalid_patch_plan) {
+            .document_write => |document_write| {
+                const before_len = hook.len;
+                try std.testing.expectError(error.InvalidBatchRequest, table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                    alloc,
+                    &db,
+                    schema_json,
+                    &.{},
+                    &.{},
+                    document_write.batch.req.transforms,
+                ));
+                try std.testing.expectEqual(before_len + 1, hook.len);
+                try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var generated_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_doc) VALUES ('{\"title\":\"Gamma\",\"status\":\"queued\"}'), ('{\"title\":\"Delta\",\"status\":\"queued\"}')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer generated_plan.deinit(alloc);
+    switch (generated_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.generated_id_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 2), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.writes.len);
+            try std.testing.expect(!std.mem.eql(u8, document_write.batch.req.writes[0].key, document_write.batch.req.writes[1].key));
+            for (document_write.batch.req.writes) |write| {
+                try std.testing.expectEqual(sql_adapter.document_write.generated_document_id_len, write.key.len);
+                try std.testing.expect(std.mem.startsWith(u8, write.key, sql_adapter.document_write.generated_document_id_prefix));
+            }
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            const before_len = hook.len - 1;
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+            const generated_key = document_write.batch.req.writes[0].key;
+            const generated_stored = (try db.get(alloc, generated_key)) orelse return error.TestExpectedEqual;
+            defer alloc.free(generated_stored);
+            var parsed_generated = try std.json.parseFromSlice(std.json.Value, alloc, generated_stored, .{});
+            defer parsed_generated.deinit();
+            try std.testing.expectEqualStrings("Gamma", parsed_generated.value.object.get("title").?.string);
+            try std.testing.expectEqualStrings("queued", parsed_generated.value.object.get("status").?.string);
+            const second_generated_key = document_write.batch.req.writes[1].key;
+            const second_generated_stored = (try db.get(alloc, second_generated_key)) orelse return error.TestExpectedEqual;
+            defer alloc.free(second_generated_stored);
+            var parsed_second_generated = try std.json.parseFromSlice(std.json.Value, alloc, second_generated_stored, .{});
+            defer parsed_second_generated.deinit();
+            try std.testing.expectEqualStrings("Delta", parsed_second_generated.value.object.get("title").?.string);
+            try std.testing.expectEqualStrings("queued", parsed_second_generated.value.object.get("status").?.string);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var delete_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM docs WHERE _id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer delete_plan.deinit(alloc);
+    switch (delete_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.exact_id_delete, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.deleted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:a", document_write.batch.req.deletes[0]);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                document_write.batch.req.deletes,
+                &.{},
+            );
+            const before_len = hook.len - 1;
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.exact_id_delete, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try db.get(alloc, "doc:a")) == null);
+
+    const second_generated_key = switch (generated_plan) {
+        .document_write => |document_write| document_write.batch.req.writes[1].key,
+        else => unreachable,
+    };
+    const multi_delete_sql = try std.fmt.allocPrint(
+        alloc,
+        "DELETE FROM docs WHERE _id IN ('doc:missing', '{s}', '{s}')",
+        .{ second_generated_key, second_generated_key },
+    );
+    defer alloc.free(multi_delete_sql);
+    var multi_delete_plan = try lowerWritePlanAlloc(
+        alloc,
+        multi_delete_sql,
+        schema,
+        &.{},
+        .{},
+    );
+    defer multi_delete_plan.deinit(alloc);
+    switch (multi_delete_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.exact_id_delete, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 3), document_write.batch.deleted);
+            try std.testing.expectEqual(@as(usize, 3), document_write.batch.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:missing", document_write.batch.req.deletes[0]);
+            try std.testing.expectEqualStrings(second_generated_key, document_write.batch.req.deletes[1]);
+            try std.testing.expectEqualStrings(second_generated_key, document_write.batch.req.deletes[2]);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                document_write.batch.req.deletes,
+                &.{},
+            );
+            const before_len = hook.len - 1;
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.exact_id_delete, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try db.get(alloc, second_generated_key)) == null);
+
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:bad', 'not-json')",
+        schema,
+        &.{},
+        .{},
+    ));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_doc) VALUES ('not-json')",
+        schema,
+        &.{},
+        .{},
+    ));
+    var projection_insert_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title) VALUES ('doc:projection', 'Projection')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_insert_plan.deinit(alloc);
+    switch (projection_insert_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Projection\"}", document_write.batch.req.writes[0].value);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_stored = (try db.get(alloc, "doc:projection")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Projection\"}", projection_stored);
+
+    var create_only_projection_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _version, title) VALUES ('doc:create-only', 0, 'Create Only')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer create_only_projection_plan.deinit(alloc);
+    switch (create_only_projection_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_write.batch.req.write_mode);
+            try std.testing.expectEqualStrings("doc:create-only", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Create Only\"}", document_write.batch.req.writes[0].value);
+            try std.testing.expectEqualStrings("doc:create-only", document_write.batch.req.predicates[0].key);
+            try std.testing.expectEqual(@as(u64, 0), document_write.batch.req.predicates[0].expected_version);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const create_only_stored = (try db.get(alloc, "doc:create-only")) orelse return error.TestExpectedEqual;
+    defer alloc.free(create_only_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Create Only\"}", create_only_stored);
+
+    var create_only_existing_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _version, title) VALUES ('doc:create-only', 0, 'Create Only Conflict')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer create_only_existing_plan.deinit(alloc);
+    switch (create_only_existing_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_write.batch.req.write_mode);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(document_write.batch.req));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const create_only_after_stale = (try db.get(alloc, "doc:create-only")) orelse return error.TestExpectedEqual;
+    defer alloc.free(create_only_after_stale);
+    try std.testing.expectEqualStrings("{\"title\":\"Create Only\"}", create_only_after_stale);
+
+    var create_only_duplicate_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _version, title) VALUES ('doc:create-only-dupe', 0, 'First'), ('doc:create-only-dupe', 0, 'Second')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer create_only_duplicate_plan.deinit(alloc);
+    switch (create_only_duplicate_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 2), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.writes.len);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.predicates.len);
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_write.batch.req.write_mode);
+            try std.testing.expectError(error.Conflict, db.batch(document_write.batch.req));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    if (try db.get(alloc, "doc:create-only-dupe")) |value| {
+        defer alloc.free(value);
+        return error.TestExpectedEqual;
+    }
+
+    var native_duplicate_insert_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:native-dupe', '{\"title\":\"Native First\"}'), ('doc:native-dupe', '{\"title\":\"Native Second\"}')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer native_duplicate_insert_plan.deinit(alloc);
+    switch (native_duplicate_insert_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 2), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:native-dupe", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Native First\"}", document_write.batch.req.writes[0].value);
+            try std.testing.expectEqualStrings("doc:native-dupe", document_write.batch.req.writes[1].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Native Second\"}", document_write.batch.req.writes[1].value);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const native_duplicate_stored = (try db.get(alloc, "doc:native-dupe")) orelse return error.TestExpectedEqual;
+    defer alloc.free(native_duplicate_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Native Second\"}", native_duplicate_stored);
+
+    var projection_overwrite_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, status) VALUES ('doc:projection', 'Projection Updated', 'ready')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_overwrite_plan.deinit(alloc);
+    switch (projection_overwrite_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Projection Updated\",\"status\":\"ready\"}", document_write.batch.req.writes[0].value);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_overwritten = (try db.get(alloc, "doc:projection")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_overwritten);
+    try std.testing.expectEqualStrings("{\"title\":\"Projection Updated\",\"status\":\"ready\"}", projection_overwritten);
+
+    var projection_update_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Projection Patched' WHERE _id = 'doc:projection'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_update_plan.deinit(alloc);
+    switch (projection_update_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.transformed);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:projection", document_write.batch.req.transforms[0].key);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.transforms[0].operations.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set, document_write.batch.req.transforms[0].operations[0].op);
+            try std.testing.expectEqualStrings("title", document_write.batch.req.transforms[0].operations[0].path);
+            try std.testing.expectEqualStrings("\"Projection Patched\"", document_write.batch.req.transforms[0].operations[0].value_json.?);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_updated = (try db.get(alloc, "doc:projection")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_updated);
+    var parsed_projection_updated = try std.json.parseFromSlice(std.json.Value, alloc, projection_updated, .{});
+    defer parsed_projection_updated.deinit();
+    try std.testing.expectEqualStrings("Projection Patched", parsed_projection_updated.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("ready", parsed_projection_updated.value.object.get("status").?.string);
+
+    const DocumentDbSource = struct {
+        db: *db_mod.DB,
+
+        fn source(self: *@This()) sql_adapter.document_runtime.Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: sql_adapter.document_runtime.LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?sql_adapter.document_runtime.LookupResponse {
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const json = (try self.db.get(lookup_alloc, key)) orelse return null;
+            errdefer lookup_alloc.free(json);
+            return .{
+                .json = json,
+                .version = try self.db.getTimestamp(lookup_alloc, key),
+            };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: sql_adapter.document_runtime.ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?sql_adapter.document_runtime.ScanResponse {
+            _ = ptr;
+            _ = scan_alloc;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: sql_adapter.document_runtime.QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?sql_adapter.document_runtime.QueryResponse {
+            _ = ptr;
+            _ = consistency;
+            if (!std.mem.eql(u8, table_name, "docs") or
+                std.mem.indexOf(u8, req.body_json, "status") == null or
+                std.mem.indexOf(u8, req.body_json, "draft") == null)
+            {
+                return null;
+            }
+            const response_json =
+                \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:indexed-projection-a"},{"_id":"doc:indexed-projection-b"}]}}]}
+            ;
+            const owned = try query_alloc.dupe(u8, response_json);
+            errdefer query_alloc.free(owned);
+            return .{ .json = owned };
+        }
+    };
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:projection-residual-match", .value = "{\"title\":\"Residual Match\",\"status\":\"draft\"}" },
+        .{ .key = "doc:projection-residual-skip", .value = "{\"title\":\"Residual Skip\",\"status\":\"ready\"}" },
+    } });
+    var projection_residual_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Residual Patched' WHERE _id IN ('doc:projection-residual-match', 'doc:projection-residual-skip') AND status = 'draft'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_residual_plan.deinit(alloc);
+    switch (projection_residual_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 1), executed.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:projection-residual-match", executed.req.transforms[0].key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_residual_match = (try db.get(alloc, "doc:projection-residual-match")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_residual_match);
+    var parsed_projection_residual_match = try std.json.parseFromSlice(std.json.Value, alloc, projection_residual_match, .{});
+    defer parsed_projection_residual_match.deinit();
+    try std.testing.expectEqualStrings("Residual Patched", parsed_projection_residual_match.value.object.get("title").?.string);
+    const projection_residual_skip = (try db.get(alloc, "doc:projection-residual-skip")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_residual_skip);
+    var parsed_projection_residual_skip = try std.json.parseFromSlice(std.json.Value, alloc, projection_residual_skip, .{});
+    defer parsed_projection_residual_skip.deinit();
+    try std.testing.expectEqualStrings("Residual Skip", parsed_projection_residual_skip.value.object.get("title").?.string);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:indexed-projection-a", .value = "{\"title\":\"Indexed A\",\"status\":\"draft\"}" },
+        .{ .key = "doc:indexed-projection-b", .value = "{\"title\":\"Indexed B\",\"status\":\"draft\"}" },
+        .{ .key = "doc:indexed-projection-ready", .value = "{\"title\":\"Indexed Ready\",\"status\":\"ready\"}" },
+    } });
+    var indexed_projection_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Indexed Patched' WHERE status = 'draft'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer indexed_projection_plan.deinit(alloc);
+    switch (indexed_projection_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expect(document_mutation.producer == .indexed_query);
+            try std.testing.expectEqual(
+                @as(?u32, sql_adapter.default_document_sql_bounded_scan_rows),
+                document_mutation.producer.indexed_query.max_candidate_rows,
+            );
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 2), executed.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:indexed-projection-a", executed.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:indexed-projection-b", executed.req.transforms[1].key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const indexed_projection_a = (try db.get(alloc, "doc:indexed-projection-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(indexed_projection_a);
+    var parsed_indexed_projection_a = try std.json.parseFromSlice(std.json.Value, alloc, indexed_projection_a, .{});
+    defer parsed_indexed_projection_a.deinit();
+    try std.testing.expectEqualStrings("Indexed Patched", parsed_indexed_projection_a.value.object.get("title").?.string);
+    const indexed_projection_b = (try db.get(alloc, "doc:indexed-projection-b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(indexed_projection_b);
+    var parsed_indexed_projection_b = try std.json.parseFromSlice(std.json.Value, alloc, indexed_projection_b, .{});
+    defer parsed_indexed_projection_b.deinit();
+    try std.testing.expectEqualStrings("Indexed Patched", parsed_indexed_projection_b.value.object.get("title").?.string);
+    const indexed_projection_ready = (try db.get(alloc, "doc:indexed-projection-ready")) orelse return error.TestExpectedEqual;
+    defer alloc.free(indexed_projection_ready);
+    var parsed_indexed_projection_ready = try std.json.parseFromSlice(std.json.Value, alloc, indexed_projection_ready, .{});
+    defer parsed_indexed_projection_ready.deinit();
+    try std.testing.expectEqualStrings("Indexed Ready", parsed_indexed_projection_ready.value.object.get("title").?.string);
+
+    const projection_version = try db.getTimestamp(alloc, "doc:projection");
+    const projection_versioned_sql = try std.fmt.allocPrint(
+        alloc,
+        "UPDATE docs SET status = 'versioned' WHERE _id = 'doc:projection' AND _version = {d}",
+        .{projection_version},
+    );
+    defer alloc.free(projection_versioned_sql);
+    var projection_versioned_plan = try lowerWritePlanAlloc(alloc, projection_versioned_sql, schema, &.{}, .{});
+    defer projection_versioned_plan.deinit(alloc);
+    switch (projection_versioned_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_write.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:projection", document_write.batch.req.predicates[0].key);
+            try std.testing.expectEqual(projection_version, document_write.batch.req.predicates[0].expected_version);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_versioned = (try db.get(alloc, "doc:projection")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_versioned);
+    var parsed_projection_versioned = try std.json.parseFromSlice(std.json.Value, alloc, projection_versioned, .{});
+    defer parsed_projection_versioned.deinit();
+    try std.testing.expectEqualStrings("versioned", parsed_projection_versioned.value.object.get("status").?.string);
+
+    var projection_stale_plan = try lowerWritePlanAlloc(alloc, projection_versioned_sql, schema, &.{}, .{});
+    defer projection_stale_plan.deinit(alloc);
+    switch (projection_stale_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(document_write.batch.req));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_value_shape_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET archived_at = NULL, metadata_plan = 'pro', tags = ARRAY['fresh','stable'] WHERE _id = 'doc:projection'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_value_shape_plan.deinit(alloc);
+    switch (projection_value_shape_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_write.operation);
+            try std.testing.expectEqual(@as(usize, 3), document_write.batch.req.transforms[0].operations.len);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_value_shape = (try db.get(alloc, "doc:projection")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_value_shape);
+    var parsed_projection_value_shape = try std.json.parseFromSlice(std.json.Value, alloc, projection_value_shape, .{});
+    defer parsed_projection_value_shape.deinit();
+    try std.testing.expect(parsed_projection_value_shape.value.object.get("archived_at").? == .null);
+    try std.testing.expectEqualStrings("pro", parsed_projection_value_shape.value.object.get("metadata").?.object.get("plan").?.string);
+    try std.testing.expectEqual(@as(usize, 2), parsed_projection_value_shape.value.object.get("tags").?.array.items.len);
+    try std.testing.expectEqualStrings("fresh", parsed_projection_value_shape.value.object.get("tags").?.array.items[0].string);
+    try std.testing.expectEqualStrings("stable", parsed_projection_value_shape.value.object.get("tags").?.array.items[1].string);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:projection-in-a", .value = "{\"title\":\"Projection In A\",\"status\":\"draft\"}" },
+        .{ .key = "doc:projection-in-b", .value = "{\"title\":\"Projection In B\",\"status\":\"draft\"}" },
+    } });
+    var projection_in_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Projection In Patched', status = 'batched' WHERE _id IN ('doc:projection-in-a', 'doc:projection-in-b', 'doc:projection-in-missing')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_in_plan.deinit(alloc);
+    switch (projection_in_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 3), document_write.batch.transformed);
+            try std.testing.expectEqual(@as(usize, 3), document_write.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 0), document_write.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:projection-in-a", document_write.batch.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:projection-in-b", document_write.batch.req.transforms[1].key);
+            try std.testing.expectEqualStrings("doc:projection-in-missing", document_write.batch.req.transforms[2].key);
+            for (document_write.batch.req.transforms) |transform| {
+                try std.testing.expectEqual(@as(usize, 2), transform.operations.len);
+                try std.testing.expectEqualStrings("title", transform.operations[0].path);
+                try std.testing.expectEqualStrings("\"Projection In Patched\"", transform.operations[0].value_json.?);
+                try std.testing.expectEqualStrings("status", transform.operations[1].path);
+                try std.testing.expectEqualStrings("\"batched\"", transform.operations[1].value_json.?);
+            }
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.document_patch, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_in_a = (try db.get(alloc, "doc:projection-in-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_in_a);
+    var parsed_projection_in_a = try std.json.parseFromSlice(std.json.Value, alloc, projection_in_a, .{});
+    defer parsed_projection_in_a.deinit();
+    try std.testing.expectEqualStrings("Projection In Patched", parsed_projection_in_a.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("batched", parsed_projection_in_a.value.object.get("status").?.string);
+    const projection_in_b = (try db.get(alloc, "doc:projection-in-b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_in_b);
+    var parsed_projection_in_b = try std.json.parseFromSlice(std.json.Value, alloc, projection_in_b, .{});
+    defer parsed_projection_in_b.deinit();
+    try std.testing.expectEqualStrings("Projection In Patched", parsed_projection_in_b.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("batched", parsed_projection_in_b.value.object.get("status").?.string);
+    try std.testing.expect((try db.get(alloc, "doc:projection-in-missing")) == null);
+
+    const projection_in_version_a = try db.getTimestamp(alloc, "doc:projection-in-a");
+    const projection_in_version_b = try db.getTimestamp(alloc, "doc:projection-in-b");
+    try std.testing.expectEqual(projection_in_version_a, projection_in_version_b);
+    const projection_in_versioned_sql = try std.fmt.allocPrint(
+        alloc,
+        "UPDATE docs SET status = 'versioned-batch' WHERE _id IN ('doc:projection-in-a', 'doc:projection-in-b') AND _version = {d}",
+        .{projection_in_version_a},
+    );
+    defer alloc.free(projection_in_versioned_sql);
+    var projection_in_versioned_plan = try lowerWritePlanAlloc(alloc, projection_in_versioned_sql, schema, &.{}, .{});
+    defer projection_in_versioned_plan.deinit(alloc);
+    switch (projection_in_versioned_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_write.operation);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.transforms.len);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.predicates.len);
+            try std.testing.expectEqualStrings("doc:projection-in-a", document_write.batch.req.predicates[0].key);
+            try std.testing.expectEqualStrings("doc:projection-in-b", document_write.batch.req.predicates[1].key);
+            try std.testing.expectEqual(projection_in_version_a, document_write.batch.req.predicates[0].expected_version);
+            try std.testing.expectEqual(projection_in_version_a, document_write.batch.req.predicates[1].expected_version);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_in_versioned_a = (try db.get(alloc, "doc:projection-in-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_in_versioned_a);
+    var parsed_projection_in_versioned_a = try std.json.parseFromSlice(std.json.Value, alloc, projection_in_versioned_a, .{});
+    defer parsed_projection_in_versioned_a.deinit();
+    try std.testing.expectEqualStrings("versioned-batch", parsed_projection_in_versioned_a.value.object.get("status").?.string);
+    const projection_in_versioned_b = (try db.get(alloc, "doc:projection-in-b")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_in_versioned_b);
+    var parsed_projection_in_versioned_b = try std.json.parseFromSlice(std.json.Value, alloc, projection_in_versioned_b, .{});
+    defer parsed_projection_in_versioned_b.deinit();
+    try std.testing.expectEqualStrings("versioned-batch", parsed_projection_in_versioned_b.value.object.get("status").?.string);
+
+    var projection_in_stale_plan = try lowerWritePlanAlloc(alloc, projection_in_versioned_sql, schema, &.{}, .{});
+    defer projection_in_stale_plan.deinit(alloc);
+    switch (projection_in_stale_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.predicates.len);
+            try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(document_write.batch.req));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_missing_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Missing Projection' WHERE _id = 'doc:projection-missing'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_missing_plan.deinit(alloc);
+    switch (projection_missing_plan) {
+        .document_write => |document_write| {
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect((try db.get(alloc, "doc:projection-missing")) == null);
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title_lc = 'patched' WHERE _id = 'doc:projection'",
+        schema,
+        &.{},
+        .{},
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET extra = 'blocked' WHERE _id = 'doc:projection'",
+        schema,
+        &.{},
+        .{},
+    ));
+
+    var projection_invalid_type_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET amount = 'not numeric' WHERE _id = 'doc:projection'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_invalid_type_plan.deinit(alloc);
+    switch (projection_invalid_type_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_write.operation);
+            try std.testing.expectError(error.InvalidBatchRequest, table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                &.{},
+                &.{},
+                document_write.batch.req.transforms,
+            ));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_duplicate_insert_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title) VALUES ('doc:projection-dupe', 'Projection First'), ('doc:projection-dupe', 'Projection Second')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_duplicate_insert_plan.deinit(alloc);
+    switch (projection_duplicate_insert_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 2), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 2), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection-dupe", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Projection First\"}", document_write.batch.req.writes[0].value);
+            try std.testing.expectEqualStrings("doc:projection-dupe", document_write.batch.req.writes[1].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Projection Second\"}", document_write.batch.req.writes[1].value);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_duplicate_stored = (try db.get(alloc, "doc:projection-dupe")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_duplicate_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Projection Second\"}", projection_duplicate_stored);
+
+    var projection_generated_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (title) VALUES ('Projection Generated')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_generated_plan.deinit(alloc);
+    var projection_generated_key: []const u8 = "";
+    switch (projection_generated_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.generated_id_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqual(db_mod.document_write.generated_document_id_len, document_write.batch.req.writes[0].key.len);
+            try std.testing.expect(std.mem.startsWith(u8, document_write.batch.req.writes[0].key, db_mod.document_write.generated_document_id_prefix));
+            try std.testing.expectEqualStrings("{\"title\":\"Projection Generated\"}", document_write.batch.req.writes[0].value);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+            projection_generated_key = document_write.batch.req.writes[0].key;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_generated_stored = (try db.get(alloc, projection_generated_key)) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_generated_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Projection Generated\"}", projection_generated_stored);
+
+    var projection_generated_create_only_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_version, title) VALUES (0, 'Projection Generated Create Only')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_generated_create_only_plan.deinit(alloc);
+    var projection_generated_create_only_key: []const u8 = "";
+    switch (projection_generated_create_only_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.generated_id_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_write.batch.req.write_mode);
+            try std.testing.expectEqual(db_mod.document_write.generated_document_id_len, document_write.batch.req.writes[0].key.len);
+            try std.testing.expect(std.mem.startsWith(u8, document_write.batch.req.writes[0].key, db_mod.document_write.generated_document_id_prefix));
+            try std.testing.expectEqualStrings(document_write.batch.req.writes[0].key, document_write.batch.req.predicates[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Projection Generated Create Only\"}", document_write.batch.req.writes[0].value);
+            try std.testing.expectEqual(@as(u64, 0), document_write.batch.req.predicates[0].expected_version);
+            const before_len = hook.len;
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try std.testing.expectEqual(before_len + 1, hook.len);
+            try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[before_len]);
+            try db.batch(document_write.batch.req);
+            projection_generated_create_only_key = document_write.batch.req.writes[0].key;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_generated_create_only_stored = (try db.get(alloc, projection_generated_create_only_key)) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_generated_create_only_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Projection Generated Create Only\"}", projection_generated_create_only_stored);
+
+    var projection_generated_create_only_conflict_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_version, title) VALUES (0, 'Projection Generated Create Only Conflict')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_generated_create_only_conflict_plan.deinit(alloc);
+    switch (projection_generated_create_only_conflict_plan) {
+        .document_write => |document_write| {
+            try db.batch(.{ .writes = &.{.{ .key = document_write.batch.req.writes[0].key, .value = "{\"title\":\"Seeded Generated Conflict\"}" }} });
+            try std.testing.expectEqual(db_mod.types.BatchWriteMode.create_only, document_write.batch.req.write_mode);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.predicates.len);
+            try std.testing.expectError(transactions_mod.TxnError.VersionConflict, db.batch(document_write.batch.req));
+            const seeded = (try db.get(alloc, document_write.batch.req.writes[0].key)) orelse return error.TestExpectedEqual;
+            defer alloc.free(seeded);
+            try std.testing.expectEqualStrings("{\"title\":\"Seeded Generated Conflict\"}", seeded);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var projection_array_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, tags) VALUES ('doc:projection-array', 'Tagged', ARRAY['new','hot'])",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_array_plan.deinit(alloc);
+    switch (projection_array_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection-array", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Tagged\",\"tags\":[\"new\",\"hot\"]}", document_write.batch.req.writes[0].value);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_array_stored = (try db.get(alloc, "doc:projection-array")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_array_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Tagged\",\"tags\":[\"new\",\"hot\"]}", projection_array_stored);
+
+    var projection_array_param_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, tags) VALUES ('doc:projection-array-param', 'Tagged Param', $1)",
+        schema,
+        &.{.{ .json = "[\"param\",\"bound\"]" }},
+        .{},
+    );
+    defer projection_array_param_plan.deinit(alloc);
+    switch (projection_array_param_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection-array-param", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Tagged Param\",\"tags\":[\"param\",\"bound\"]}", document_write.batch.req.writes[0].value);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_array_param_stored = (try db.get(alloc, "doc:projection-array-param")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_array_param_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Tagged Param\",\"tags\":[\"param\",\"bound\"]}", projection_array_param_stored);
+
+    var projection_nested_path_plan = try lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, metadata_plan) VALUES ('doc:projection-nested', 'Nested', 'pro')",
+        schema,
+        &.{},
+        .{},
+    );
+    defer projection_nested_path_plan.deinit(alloc);
+    switch (projection_nested_path_plan) {
+        .document_write => |document_write| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.full_document_insert, document_write.operation);
+            try std.testing.expectEqual(@as(u32, 1), document_write.batch.inserted);
+            try std.testing.expectEqual(@as(usize, 1), document_write.batch.req.writes.len);
+            try std.testing.expectEqualStrings("doc:projection-nested", document_write.batch.req.writes[0].key);
+            try std.testing.expectEqualStrings("{\"title\":\"Nested\",\"metadata\":{\"plan\":\"pro\"}}", document_write.batch.req.writes[0].value);
+            try table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                alloc,
+                &db,
+                schema_json,
+                document_write.batch.req.writes,
+                &.{},
+                &.{},
+            );
+            try db.batch(document_write.batch.req);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const projection_nested_path_stored = (try db.get(alloc, "doc:projection-nested")) orelse return error.TestExpectedEqual;
+    defer alloc.free(projection_nested_path_stored);
+    try std.testing.expectEqualStrings("{\"title\":\"Nested\",\"metadata\":{\"plan\":\"pro\"}}", projection_nested_path_stored);
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title_lc) VALUES ('doc:bad-generated-projection', 'projection')",
+        schema,
+        &.{},
+        .{},
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, _version, title_lc) VALUES ('doc:bad-generated-create-only', 0, 'projection')",
+        schema,
+        &.{},
+        .{},
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanAlloc(
+        alloc,
+        "INSERT INTO docs (_id, extra) VALUES ('doc:bad-extra-projection', 'blocked')",
+        schema,
+        &.{},
+        .{},
+    ));
+
+    const invalid_documents = [_][]const u8{
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:missing-title', '{\"status\":\"draft\"}')",
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:extra-field', '{\"title\":\"Extra\",\"status\":\"draft\",\"extra\":\"bad\"}')",
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:bad-type', '{\"title\":42,\"status\":\"draft\"}')",
+        "INSERT INTO docs (_id, _doc) VALUES ('doc:generated-field', '{\"title\":\"Alpha\",\"title_lc\":\"alpha\"}')",
+        "INSERT INTO docs (_doc) VALUES ('{\"status\":\"draft\"}')",
+        "INSERT INTO docs (_doc) VALUES ('{\"title\":\"Extra\",\"status\":\"draft\",\"extra\":\"bad\"}')",
+        "INSERT INTO docs (_doc) VALUES ('{\"title\":42,\"status\":\"draft\"}')",
+        "INSERT INTO docs (_doc) VALUES ('{\"title\":\"Alpha\",\"title_lc\":\"alpha\"}')",
+        "INSERT INTO docs (_id, title) VALUES ('doc:bad-type-projection', 42)",
+        "INSERT INTO docs (_id, _version, title) VALUES ('doc:bad-create-only-type', 0, 42)",
+    };
+    for (invalid_documents) |sql| {
+        var invalid_plan = try lowerWritePlanAlloc(alloc, sql, schema, &.{}, .{});
+        defer invalid_plan.deinit(alloc);
+        switch (invalid_plan) {
+            .document_write => |document_write| {
+                const before_len = hook.len;
+                try std.testing.expectError(error.InvalidBatchRequest, table_writes_managed_db.validateTableBatchAgainstSchemaJson(
+                    alloc,
+                    &db,
+                    schema_json,
+                    document_write.batch.req.writes,
+                    &.{},
+                    &.{},
+                ));
+                try std.testing.expectEqual(before_len + 1, hook.len);
+                try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.full_document_insert, hook.operations[before_len]);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expect((try db.get(alloc, "doc:bad-type-projection")) == null);
+}
+
 test "postgres sql adapter typed write plans execute through relational storage" {
     const alloc = std.testing.allocator;
+    try expectDocumentFullDocumentInsertRuntime();
+
     const schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"organization_id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
     ;

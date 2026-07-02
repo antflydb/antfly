@@ -3079,6 +3079,63 @@ fn chunkCacheTupleKeyAlloc(alloc: Allocator, components: []const []const u8) ![]
     return try out.toOwnedSlice(alloc);
 }
 
+test "db write path create-only batch rejects existing document key" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"first\"}" }},
+        .sync_level = .write,
+    });
+
+    try std.testing.expectError(error.Conflict, db.batch(.{
+        .writes = &.{.{ .key = "doc:a", .value = "{\"name\":\"second\"}" }},
+        .write_mode = .create_only,
+        .sync_level = .write,
+    }));
+
+    const value = (try db.get(alloc, "doc:a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(value);
+    try std.testing.expectEqualStrings("{\"name\":\"first\"}", value);
+}
+
+test "db write path create-only batch rejects duplicate request keys before coalescing" {
+    const DB = @import("mod.zig").DB;
+    const alloc = std.testing.allocator;
+
+    var path_buf: [256]u8 = undefined;
+    const path = TestHelpers.tempPath(&path_buf);
+    defer TestHelpers.cleanupTempDir(path);
+
+    var db = try DB.open(alloc, std.mem.span(path), .{
+        .primary_backend = .{ .mem = .{} },
+    });
+    defer db.close();
+
+    try std.testing.expectError(error.Conflict, db.batch(.{
+        .writes = &.{
+            .{ .key = "doc:a", .value = "{\"name\":\"first\"}" },
+            .{ .key = "doc:a", .value = "{\"name\":\"second\"}" },
+        },
+        .write_mode = .create_only,
+        .sync_level = .write,
+    }));
+
+    if (try db.get(alloc, "doc:a")) |value| {
+        defer alloc.free(value);
+        return error.TestExpectedEqual;
+    }
+}
+
 test "db write path doc identity allocates final document ordinal then rejects new documents" {
     const DB = @import("mod.zig").DB;
     const alloc = std.testing.allocator;
@@ -7684,6 +7741,7 @@ pub fn Impl(comptime DB: type) type {
             }
 
             const resolve_transforms_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
+            try validateCreateOnlyBatchWriteRequest(self.alloc, req);
             var effective_ops = try coalesceKeyValueRequest(self, types.BatchWrite, req.writes, req.deletes, req.transforms);
             defer effective_ops.deinit(self.alloc);
             if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.resolve_transforms_ns, resolve_transforms_start_ns);
@@ -7700,6 +7758,7 @@ pub fn Impl(comptime DB: type) type {
                 .predicates = req.predicates,
                 .timestamp_ns = req.timestamp_ns,
                 .sync_level = req.sync_level,
+                .write_mode = req.write_mode,
             };
             if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.merge_effective_req_ns, merge_effective_req_start_ns);
 
@@ -8024,7 +8083,7 @@ pub fn Impl(comptime DB: type) type {
             if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.identity_capacity_check_ns, identity_capacity_start_ns);
 
             var assume_all_new_identity_upserts = false;
-            if (self.bulk_ingest_identity_all_new and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
+            if (effective_req.write_mode == .upsert and self.bulk_ingest_identity_all_new and effective_req.deletes.len == 0 and identity_upsert_keys.items.len > 0) {
                 assume_all_new_identity_upserts = try rememberBulkIngestAllNewIdentityUpserts(self, identity_upsert_keys.items);
                 if (!assume_all_new_identity_upserts) clearBulkIngestIdentityAllNewLocked(self);
             }
@@ -8047,6 +8106,7 @@ pub fn Impl(comptime DB: type) type {
                 }
                 if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.overwrite_probe_ns, overwrite_probe_start_ns);
             }
+            try enforceCreateOnlyNoOverwrite(effective_req.write_mode, overwritten_flags);
 
             for (effective_req.graph_writes) |graph_write| {
                 try appendGraphEdgeArtifactWrite(self.alloc, &explicit_graph_artifact_writes, graph_write);
@@ -8648,6 +8708,25 @@ pub fn Impl(comptime DB: type) type {
             }
             db_internal.finishExternalDenseBulkSessionTracked(self.async_context);
             db_internal.flushDeferredExternalBulkExecutorNotification(self.async_context, self.executor);
+        }
+
+        fn validateCreateOnlyBatchWriteRequest(alloc: Allocator, req: types.BatchRequest) !void {
+            if (req.write_mode != .create_only) return;
+            if (req.transforms.len != 0 or req.relational_identity_rewrites.len != 0) return error.UnsupportedOperation;
+
+            var seen = std.StringHashMapUnmanaged(void){};
+            defer seen.deinit(alloc);
+            for (req.writes) |write| {
+                const gop = try seen.getOrPut(alloc, write.key);
+                if (gop.found_existing) return error.Conflict;
+            }
+        }
+
+        fn enforceCreateOnlyNoOverwrite(write_mode: types.BatchWriteMode, overwritten_flags: []const bool) !void {
+            if (write_mode != .create_only) return;
+            for (overwritten_flags) |overwritten| {
+                if (overwritten) return error.Conflict;
+            }
         }
 
         pub fn coalesceKeyValueRequest(

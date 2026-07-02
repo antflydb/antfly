@@ -1,8 +1,13 @@
 # Antfly SQL Grammar Remaining Slices
 
-This tracker lists only remaining migration work. Completed read-plan and DML
-cutover slices are intentionally omitted from the active checklist; keep durable
-evidence for completed work in grammar notes, tests, and corpus manifests.
+This is the tracking document for the SQL grammar migration. It lists only
+remaining migration work and should stay checklist-shaped. Keep design
+rationale, architecture decisions, ownership boundaries, and implementation
+invariants in `GRAMMAR.md`. Completed history that is deducible from code,
+tests, fixtures, or git history should stay out of both docs.
+
+Completed read-plan and DML cutover slices are intentionally omitted from the
+active checklist.
 
 Feature work is listed first, followed by parser cutover, diagnostics, and
 evidence/performance hardening. Check a slice only when the implementation,
@@ -35,31 +40,28 @@ diagnostics, and verification evidence are all in place.
   - [ ] Add parity and fail-closed fixtures for graph subjects, graph metrics, graph metric rerank, joined graph sources, CTE graph sources, and corrupted graph semantic payloads.
 
 - [ ] Rich DDL metadata and semantic coverage
-  - [ ] Add native generated AST fields for `GRANT`/`REVOKE`: privilege lists, grant targets, grantees, grant options, revoke grant-option mode, and cascade/restrict behavior.
-  - [ ] Extend generated `COMMENT ON` beyond the current table/column/index/constraint metadata: routine signatures, type/domain/extension/schema/database objects, security labels, and unsupported-object diagnostics with exact subject spans.
-  - [ ] Extend routine metadata beyond signature/language/return type: body/`AS` clauses, volatility, security, strictness, cost/rows, support, transform, parallel, leakproof, and `SET` options.
-  - [ ] Extend row-policy metadata beyond table and role targets: `FOR` command, `USING` predicate, and `WITH CHECK` predicate retained expression ranges/payloads.
-  - [ ] Extend publication/subscription metadata beyond current table/publication/enabled fields: publication publish/options, table filters/column lists, subscription options, refresh/copy/slot state, and owner/connection mutations.
-  - [ ] Extend generated `ALTER TABLE` operation items beyond currently typed add/drop/rename/alter/constraint/row-security paths: partitions, inheritance, ownership/schema/storage/persistence/tablespace, trigger state, replica identity, and statistics/storage parameters.
   - [ ] Route every valid-but-unplanned generated-owned DDL shape to a typed unsupported statement with stable reason, exact subject span, and retained-AST validation before any catalog/DDL fallback can run.
-  - [ ] For every new DDL metadata field, add generated AST shape coverage, parsed-entrypoint corruption tests, logical-DDL corruption tests where applicable, and SQL/API parity or unsupported-reason fixture coverage.
+  - [ ] For every new DDL metadata field, add generated parser span coverage, grammar tail fixtures, parsed-entrypoint corruption tests, logical-DDL corruption tests where applicable, and SQL/API parity or unsupported-reason fixture coverage.
 
 - [ ] Production ingress parser cutover
-  - [ ] Inventory public SQL entrypoints (`tokenized`, SQL adapter, pgwire, HTTP, Lite, binder, document SQL, durable/executor paths) and mark which statement families still call hand-written parser probes.
+  - [ ] Keep `fixtures/sql_parser_migration_table.json` current while inventorying public SQL entrypoints (`tokenized`, SQL adapter, pgwire, HTTP, Lite, binder, document SQL, durable/executor paths) and marking which statement families still call hand-written parser probes.
   - [ ] Replace remaining generated-covered token scans/string probes with generated AST dispatch or generated unsupported diagnostics; leave legacy admission only for shapes outside generated grammar coverage.
   - [ ] Add public-boundary corruption tests for retained AST payload removal/staleness across read, DML, DDL, graph, unsupported, prepared, cursor, session, and transaction families.
   - [ ] Add regression fixtures proving generated-owned malformed statements cannot recover by re-entering legacy DDL/read/write parsing.
 
 - [ ] Broader generated unsupported PostgreSQL diagnostics
-  - [ ] Audit generated unsupported enum/reason coverage against PostgreSQL utility/admin/catalog heads used by dumps and migrations; add missing heads before they can fall through to parser/DDL fallback.
-  - [ ] For each unsupported family, validate kind, reason, command span, subject span, explain options, and family-specific payloads at parsed-statement publication.
-  - [ ] Add corpus rows for PostgreSQL dump/admin compatibility shapes: ownership, privileges, comments, security labels, extensions, foreign-data objects, text search, operator classes/families, maintenance, and bulk I/O.
-  - [ ] Add corruption tests that mutate unsupported kind/reason/subject/option payloads and verify parsed entrypoints fail closed.
+  - [ ] Audit standalone trigger variants not already covered by the trigger-catalog and update-policy planning paths; separate supported `CREATE/DROP TRIGGER` forms from valid PostgreSQL trigger variants that still require generated unsupported diagnostics.
+  - [ ] For each remaining unsupported trigger variant, add a generated unsupported kind/reason pair with exact command and subject spans before it can reach parser/DDL fallback.
+  - [ ] Add parsed-entrypoint corruption tests for each new unsupported trigger family, covering kind, reason, command span, subject span, explain options, and any family-specific retained AST payload.
+  - [ ] Add SQL/API source-corpus rows in `fixtures/sql_api_parity_source_corpus.json`, promote `fixtures/sql_api_parity_corpus.json`, and add/extend the matching required coverage observer in `corpus.zig`.
 
 - [ ] Evidence and performance hardening
   - [ ] Expand accepted PostgreSQL-compatible corpus coverage as each generated family is cut over, with required coverage manifests updated in the same change.
-  - [ ] Expand Antfly-specific corpus coverage for query functions, graph, Lite, table APIs, and routed execution paths; for document SQL, update the dedicated `document_sql_corpus.json`, `sql_document_dependency_guard.json`, `document_sql_bounded_scan_inventory.json`, and `document_sql_read_expansion_gate.json` fixtures alongside SQL/API parity rows.
-  - [ ] Expand deterministic malformed SQL diagnostics for incomplete DDL, DML, read, CTE, unsupported, graph, and expression payload shapes.
-  - [ ] Keep short mutation/fuzz coverage in default tests; keep longer generated parser fuzzing behind `sql-parser-fuzz` with documented seed/replay workflow.
-  - [ ] Track parser throughput, allocation count, parse-table size, compile-time impact, and binary size through parser benchmarks before production cutover.
-  - [ ] Require SQL/API parity evidence, unsupported-reason fixture updates, and fail-closed retained-AST corruption tests before marking any migrated family complete.
+  - [ ] Expand Antfly-specific corpus coverage for query functions, graph, Lite, table APIs, and routed execution paths.
+  - [ ] For document SQL-specific read/write behavior, add the case to `fixtures/document_sql_corpus.json`, update `fixtures/sql_document_dependency_guard.json`, and keep the document plan/runtime corpus tests passing.
+  - [ ] For document SQL bounded-scan compatibility, update `fixtures/document_sql_bounded_scan_inventory.json` only when changing the `mapped-view-residual-bounded-scan` contract and keep its SQL/API parity row in the same patch.
+  - [ ] For document SQL read expansion, update `fixtures/document_sql_read_expansion_gate.json` only when changing the `additional-array-unnest-patterns` gate and keep matching SQL/API parity rows in the same patch.
+  - [ ] Add deterministic malformed SQL diagnostics for the next touched family only: incomplete DDL, DML, read, CTE, unsupported, graph, or expression payload shapes.
+  - [ ] Keep short mutation/fuzz coverage in default tests; when parser fuzzing changes, update the `sql-parser-fuzz` seed/replay workflow in the same patch.
+  - [ ] Before production cutover, record parser throughput, allocation count, parse-table size, compile-time impact, and binary size from parser benchmarks.
+  - [ ] Before marking any migrated family complete, run the relevant SQL/API parity check, unsupported-reason fixture check, and fail-closed retained-AST corruption tests.

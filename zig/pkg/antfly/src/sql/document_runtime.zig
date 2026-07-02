@@ -5,9 +5,11 @@
 
 const std = @import("std");
 
+const db_mod = @import("../storage/db/mod.zig");
 const raft_mod = @import("../raft/mod.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");
 const sql_adapter = @import("document_plan.zig");
+const sql_plan = @import("plan.zig");
 const storage_schema = @import("../storage/schema.zig");
 
 pub const LookupOptions = struct {};
@@ -227,6 +229,33 @@ pub const Source = struct {
     }
 };
 
+pub const BatchSink = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        batch: *const fn (ptr: *anyopaque, req: db_mod.types.BatchRequest) anyerror!void,
+    };
+
+    pub fn batch(self: BatchSink, req: db_mod.types.BatchRequest) !void {
+        return try self.vtable.batch(self.ptr, req);
+    }
+};
+
+pub fn dbBatchSink(db: *db_mod.DB) BatchSink {
+    return .{
+        .ptr = db,
+        .vtable = &.{
+            .batch = dbBatchSinkBatch,
+        },
+    };
+}
+
+fn dbBatchSinkBatch(ptr: *anyopaque, req: db_mod.types.BatchRequest) !void {
+    const db: *db_mod.DB = @ptrCast(@alignCast(ptr));
+    try db.batch(req);
+}
+
 fn appendJsonFieldName(alloc: std.mem.Allocator, out: *std.ArrayListUnmanaged(u8), first: *bool, name: []const u8) !void {
     if (!first.*) try out.append(alloc, ',');
     first.* = false;
@@ -345,6 +374,295 @@ pub fn executeReadPlanAlloc(
         .rows = try rows.toOwnedSlice(alloc),
         .total = total,
     };
+}
+
+fn freeDocumentCandidateIds(alloc: std.mem.Allocator, ids: []const []const u8) void {
+    for (ids) |id| alloc.free(@constCast(id));
+    if (ids.len > 0) alloc.free(ids);
+}
+
+fn appendDocumentCandidateIdAlloc(
+    alloc: std.mem.Allocator,
+    ids: *std.ArrayListUnmanaged([]const u8),
+    id: []const u8,
+) !void {
+    const owned_id = try alloc.dupe(u8, id);
+    errdefer alloc.free(owned_id);
+    try ids.append(alloc, owned_id);
+}
+
+fn appendDocumentCandidateIdsFromQueryResponseAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    response_json: []const u8,
+    residual_filter_json: ?[]const u8,
+    consistency: raft_mod.ReadConsistency,
+    ids: *std.ArrayListUnmanaged([]const u8),
+) !void {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, response_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidRowsRequest;
+    const responses_value = parsed.value.object.get("responses") orelse return error.InvalidRowsRequest;
+    if (responses_value != .array or responses_value.array.items.len == 0) return error.InvalidRowsRequest;
+    const first_response = responses_value.array.items[0];
+    if (first_response != .object) return error.InvalidRowsRequest;
+    const hits_value = first_response.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hits_value != .object) return error.InvalidRowsRequest;
+    const hit_items = hits_value.object.get("hits") orelse return error.InvalidRowsRequest;
+    if (hit_items != .array) return error.InvalidRowsRequest;
+
+    for (hit_items.array.items) |hit_value| {
+        if (hit_value != .object) return error.InvalidRowsRequest;
+        const id_value = hit_value.object.get("_id") orelse return error.InvalidRowsRequest;
+        if (id_value != .string) return error.InvalidRowsRequest;
+        if (residual_filter_json) |filter| {
+            if (hit_value.object.get("_source")) |source_value| {
+                if (source_value == .object) {
+                    const doc_json = try std.json.Stringify.valueAlloc(alloc, source_value, .{});
+                    defer alloc.free(doc_json);
+                    if (!try residualFilterMatchesAlloc(alloc, doc_json, filter)) continue;
+                    try appendDocumentCandidateIdAlloc(alloc, ids, id_value.string);
+                    continue;
+                }
+                if (source_value != .null) return error.InvalidRowsRequest;
+            }
+
+            var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, id_value.string, .{}, consistency)) orelse continue;
+            defer lookup.deinit(alloc);
+            if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+        }
+        try appendDocumentCandidateIdAlloc(alloc, ids, id_value.string);
+    }
+}
+
+fn collectDocumentProducerCandidateIdsAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    native_table_name: []const u8,
+    public_table_name: []const u8,
+    producer: sql_adapter.DocumentProducer,
+    consistency: raft_mod.ReadConsistency,
+) ![][]const u8 {
+    var ids = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (ids.items) |id| alloc.free(@constCast(id));
+        ids.deinit(alloc);
+    }
+
+    switch (producer) {
+        .id_lookup => |lookup_plan| {
+            for (lookup_plan.ids) |id| {
+                if (lookup_plan.residual_filter_json) |filter| {
+                    var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, id, .{}, consistency)) orelse continue;
+                    defer lookup.deinit(alloc);
+                    if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentCandidateIdAlloc(alloc, &ids, id);
+            }
+        },
+        .indexed_query => |query| {
+            const query_limit = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, query.residual_filter_json != null, false, consistency)) orelse return error.UnsupportedOperation;
+            defer query_response.deinit(alloc);
+            const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
+            try documentSqlAdmitBoundedRowCount(total_hits, query_limit);
+            try appendDocumentCandidateIdsFromQueryResponseAlloc(
+                alloc,
+                source,
+                native_table_name,
+                public_table_name,
+                query_response.json,
+                query.residual_filter_json,
+                consistency,
+                &ids,
+            );
+        },
+        .bounded_scan => |scan_plan| {
+            var scan = (try documentSqlScanAlloc(alloc, source, native_table_name, public_table_name, "", "", .{
+                .include_documents = false,
+                .include_all_fields = false,
+                .limit = documentSqlBoundedScanProbeLimit(scan_plan.max_rows),
+            }, consistency)) orelse return error.UnsupportedOperation;
+            defer scan.deinit(alloc);
+            try documentSqlAdmitBoundedScanPayload(scan_plan, scan.ndjson);
+
+            var scanned: u32 = 0;
+            var lines = std.mem.splitScalar(u8, scan.ndjson, '\n');
+            while (lines.next()) |line| {
+                if (line.len == 0) continue;
+                scanned += 1;
+                var parsed = std.json.parseFromSlice(std.json.Value, alloc, line, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+                defer parsed.deinit();
+                if (parsed.value != .object) return error.InvalidRowsRequest;
+                const key_value = parsed.value.object.get("key") orelse return error.InvalidRowsRequest;
+                if (key_value != .string) return error.InvalidRowsRequest;
+
+                if (scan_plan.residual_filter_json) |filter| {
+                    var lookup = (try documentSqlLookupAlloc(alloc, source, native_table_name, public_table_name, key_value.string, .{}, consistency)) orelse continue;
+                    defer lookup.deinit(alloc);
+                    if (!try residualFilterMatchesAlloc(alloc, lookup.json, filter)) continue;
+                }
+                try appendDocumentCandidateIdAlloc(alloc, &ids, key_value.string);
+            }
+            try documentSqlAdmitBoundedRowCount(scanned, scan_plan.max_rows);
+        },
+    }
+
+    return try ids.toOwnedSlice(alloc);
+}
+
+fn cloneDocumentMutationTemplateOpsAlloc(
+    alloc: std.mem.Allocator,
+    operations: []const db_mod.types.TransformOp,
+) ![]db_mod.types.TransformOp {
+    var out = try alloc.alloc(db_mod.types.TransformOp, operations.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        if (out.len > 0) alloc.free(out);
+    }
+
+    for (operations) |op| {
+        const path = try alloc.dupe(u8, op.path);
+        errdefer alloc.free(path);
+        const value_json = if (op.value_json) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (value_json) |value| alloc.free(value);
+        out[initialized] = .{
+            .op = op.op,
+            .path = path,
+            .value_json = value_json,
+        };
+        initialized += 1;
+    }
+    return out;
+}
+
+fn freeDocumentMutationTemplateOps(alloc: std.mem.Allocator, operations: []const db_mod.types.TransformOp) void {
+    for (operations) |op| {
+        alloc.free(@constCast(op.path));
+        if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+    }
+    if (operations.len > 0) alloc.free(@constCast(operations));
+}
+
+fn documentProducerMutationVersionPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    candidate_ids: []const []const u8,
+    expected_version: ?u64,
+) ![]db_mod.types.TransactionVersionPredicate {
+    const version = expected_version orelse return &.{};
+    if (candidate_ids.len == 0) return &.{};
+    var predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, candidate_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (predicates[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+    for (candidate_ids) |id| {
+        predicates[initialized] = .{
+            .key = try alloc.dupe(u8, id),
+            .expected_version = version,
+        };
+        initialized += 1;
+    }
+    return predicates;
+}
+
+pub fn materializeProducerMutationBatchAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    lowered: sql_plan.LoweredDocumentProducerMutation,
+    consistency: raft_mod.ReadConsistency,
+) !sql_plan.OwnedDocumentBatchRequest {
+    const native_table_name = source.native_table_name;
+    const public_table_name = source.public_table_name;
+    const candidate_ids = try collectDocumentProducerCandidateIdsAlloc(alloc, source, native_table_name, public_table_name, lowered.producer, consistency);
+    var candidate_ids_transferred = false;
+    errdefer if (!candidate_ids_transferred) freeDocumentCandidateIds(alloc, candidate_ids);
+
+    const predicates = try documentProducerMutationVersionPredicatesAlloc(alloc, candidate_ids, lowered.expected_version);
+    errdefer {
+        for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+
+    switch (lowered.template) {
+        .delete => {
+            candidate_ids_transferred = true;
+            return .{
+                .deletes = candidate_ids,
+                .predicates = predicates,
+                .req = .{
+                    .deletes = candidate_ids,
+                    .predicates = predicates,
+                    .sync_level = lowered.sync_level,
+                },
+                .deleted = @intCast(candidate_ids.len),
+            };
+        },
+        .transform => |operations_template| {
+            if (candidate_ids.len == 0) {
+                freeDocumentCandidateIds(alloc, candidate_ids);
+                candidate_ids_transferred = true;
+                return .{
+                    .predicates = predicates,
+                    .req = .{
+                        .predicates = predicates,
+                        .sync_level = lowered.sync_level,
+                    },
+                };
+            }
+            var transforms = try alloc.alloc(db_mod.types.DocumentTransform, candidate_ids.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (transforms[0..initialized]) |transform| {
+                    alloc.free(@constCast(transform.key));
+                    freeDocumentMutationTemplateOps(alloc, transform.operations);
+                }
+                if (transforms.len > 0) alloc.free(transforms);
+            }
+            for (candidate_ids) |id| {
+                const transform_key = try alloc.dupe(u8, id);
+                errdefer alloc.free(transform_key);
+                const operations = try cloneDocumentMutationTemplateOpsAlloc(alloc, operations_template);
+                transforms[initialized] = .{
+                    .key = transform_key,
+                    .operations = operations,
+                };
+                initialized += 1;
+            }
+            freeDocumentCandidateIds(alloc, candidate_ids);
+            candidate_ids_transferred = true;
+            return .{
+                .transforms = transforms,
+                .predicates = predicates,
+                .req = .{
+                    .transforms = transforms,
+                    .predicates = predicates,
+                    .sync_level = lowered.sync_level,
+                },
+                .transformed = @intCast(transforms.len),
+            };
+        },
+    }
+}
+
+pub fn executeProducerMutationPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    sink: BatchSink,
+    lowered: sql_plan.LoweredDocumentProducerMutation,
+    consistency: raft_mod.ReadConsistency,
+) !sql_plan.OwnedDocumentBatchRequest {
+    var batch = try materializeProducerMutationBatchAlloc(alloc, source, lowered, consistency);
+    errdefer batch.deinit(alloc);
+    try sink.batch(batch.req);
+    return batch;
 }
 
 fn documentSqlAdmitBoundedScanPayload(
@@ -3161,12 +3479,343 @@ test "document SQL residual filters match corpus cases" {
             if (case.expected.@"error" != null) return error.InvalidSqlCorpusFixture;
             try std.testing.expectEqual(expected, try residualFilterMatchesAlloc(alloc, case.document_json, case.filter_json));
         } else if (case.expected.@"error") |expected_error_name| {
-            const expected_error = try document_sql_corpus.errorFromName(expected_error_name);
+            const expected_error = document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(expected_error_name));
             try std.testing.expectError(expected_error, residualFilterMatchesAlloc(alloc, case.document_json, case.filter_json));
         } else {
             return error.InvalidSqlCorpusFixture;
         }
     }
+}
+
+test "document SQL producer mutation materializes bounded residual transform batch" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        last_scan_limit: u32 = 0,
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            const json = if (std.mem.eql(u8, key, "doc:a"))
+                "{\"status\":\"active\"}"
+            else if (std.mem.eql(u8, key, "doc:b"))
+                "{\"status\":\"inactive\"}"
+            else if (std.mem.eql(u8, key, "doc:c"))
+                "{\"status\":\"active\"}"
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = consistency;
+            self.last_scan_limit = opts.limit;
+            return .{ .ndjson = try scan_alloc.dupe(u8, "{\"key\":\"doc:a\"}\n{\"key\":\"doc:b\"}\n{\"key\":\"doc:c\"}\n") };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    var operations = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "/title",
+        .value_json = "\"Ready\"",
+    }};
+    const residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}";
+    const lowered = sql_plan.LoweredDocumentProducerMutation{
+        .table_name = "docs",
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 3,
+            .residual_filter_json = residual_filter_json,
+        } },
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .expected_version = 7,
+        .sync_level = .enrichments,
+    };
+    var source = MockSource{};
+    var batch = try materializeProducerMutationBatchAlloc(alloc, source.source(), lowered, .stale);
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), source.last_scan_limit);
+    try std.testing.expectEqual(@as(usize, 2), batch.req.transforms.len);
+    try std.testing.expectEqual(@as(usize, 2), batch.req.predicates.len);
+    try std.testing.expectEqual(@as(u32, 2), batch.transformed);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.enrichments, batch.req.sync_level);
+    try std.testing.expectEqualStrings("doc:a", batch.req.transforms[0].key);
+    try std.testing.expectEqualStrings("doc:c", batch.req.transforms[1].key);
+    for (batch.req.transforms) |transform| {
+        try std.testing.expectEqual(@as(usize, 1), transform.operations.len);
+        try std.testing.expectEqual(db_mod.types.TransformOpType.set, transform.operations[0].op);
+        try std.testing.expectEqualStrings("/title", transform.operations[0].path);
+        try std.testing.expectEqualStrings("\"Ready\"", transform.operations[0].value_json.?);
+    }
+    try std.testing.expectEqualStrings("doc:a", batch.req.predicates[0].key);
+    try std.testing.expectEqual(@as(u64, 7), batch.req.predicates[0].expected_version);
+    try std.testing.expectEqualStrings("doc:c", batch.req.predicates[1].key);
+    try std.testing.expectEqual(@as(u64, 7), batch.req.predicates[1].expected_version);
+}
+
+test "document SQL producer mutation applies materialized native batch through sink" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = opts;
+            _ = consistency;
+            const json = if (std.mem.eql(u8, key, "doc:a"))
+                "{\"status\":\"active\"}"
+            else if (std.mem.eql(u8, key, "doc:b"))
+                "{\"status\":\"inactive\"}"
+            else
+                return null;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return .{ .ndjson = try scan_alloc.dupe(u8, "") };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    const MockSink = struct {
+        calls: usize = 0,
+        transform_count: usize = 0,
+        predicate_count: usize = 0,
+        first_key: []const u8 = "",
+        sync_level: db_mod.types.SyncLevel = .write,
+
+        fn sink(self: *@This()) BatchSink {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                },
+            };
+        }
+
+        fn batch(ptr: *anyopaque, req: db_mod.types.BatchRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.transform_count = req.transforms.len;
+            self.predicate_count = req.predicates.len;
+            self.sync_level = req.sync_level;
+            if (req.transforms.len > 0) self.first_key = req.transforms[0].key;
+        }
+    };
+
+    var operations = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "/title",
+        .value_json = "\"Ready\"",
+    }};
+    const ids = [_][]const u8{ "doc:a", "doc:b" };
+    const lowered = sql_plan.LoweredDocumentProducerMutation{
+        .table_name = "docs",
+        .producer = .{ .id_lookup = .{
+            .ids = ids[0..],
+            .residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}",
+        } },
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .expected_version = 9,
+        .sync_level = .enrichments,
+    };
+    var source = MockSource{};
+    var sink = MockSink{};
+    var batch = try executeProducerMutationPlanAlloc(alloc, source.source(), sink.sink(), lowered, .stale);
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), sink.calls);
+    try std.testing.expectEqual(@as(usize, 1), sink.transform_count);
+    try std.testing.expectEqual(@as(usize, 1), sink.predicate_count);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.enrichments, sink.sync_level);
+    try std.testing.expectEqualStrings("doc:a", sink.first_key);
+    try std.testing.expectEqual(@as(usize, 1), batch.req.transforms.len);
+    try std.testing.expectEqualStrings("doc:a", batch.req.transforms[0].key);
+}
+
+test "document SQL producer mutation materializes explicit delete batch" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = lookup_alloc;
+            _ = table_name;
+            _ = key;
+            _ = opts;
+            _ = consistency;
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            _ = ptr;
+            _ = scan_alloc;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return null;
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    const ids = [_][]const u8{ "doc:a", "doc:b" };
+    const lowered = sql_plan.LoweredDocumentProducerMutation{
+        .table_name = "docs",
+        .producer = .{ .id_lookup = .{ .ids = ids[0..] } },
+        .operation = .exact_id_delete,
+        .template = .delete,
+    };
+    var source = MockSource{};
+    var batch = try materializeProducerMutationBatchAlloc(alloc, source.source(), lowered, .stale);
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 2), batch.req.deletes.len);
+    try std.testing.expectEqual(@as(u32, 2), batch.deleted);
+    try std.testing.expectEqualStrings("doc:a", batch.req.deletes[0]);
+    try std.testing.expectEqualStrings("doc:b", batch.req.deletes[1]);
 }
 
 test "document SQL bounded residual scan fails closed only when the scan cap is filled" {

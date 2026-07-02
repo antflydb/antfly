@@ -527,6 +527,87 @@ pub const LoweredInsert = struct {
     }
 };
 
+pub const OwnedDocumentBatchRequest = struct {
+    writes: []db_mod.types.BatchWrite = &.{},
+    deletes: [][]const u8 = &.{},
+    transforms: []db_mod.types.DocumentTransform = &.{},
+    predicates: []db_mod.types.TransactionVersionPredicate = &.{},
+    req: db_mod.types.BatchRequest = .{},
+    inserted: u32 = 0,
+    deleted: u32 = 0,
+    transformed: u32 = 0,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.writes) |write| {
+            alloc.free(@constCast(write.key));
+            alloc.free(@constCast(write.value));
+        }
+        if (self.writes.len > 0) alloc.free(self.writes);
+        for (self.deletes) |key| alloc.free(key);
+        if (self.deletes.len > 0) alloc.free(self.deletes);
+        for (self.transforms) |transform| {
+            alloc.free(@constCast(transform.key));
+            for (transform.operations) |op| {
+                alloc.free(@constCast(op.path));
+                if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+            }
+            if (transform.operations.len > 0) alloc.free(@constCast(transform.operations));
+        }
+        if (self.transforms.len > 0) alloc.free(self.transforms);
+        for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
+        if (self.predicates.len > 0) alloc.free(self.predicates);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentProducerMutationTemplate = union(enum) {
+    delete,
+    transform: []db_mod.types.TransformOp,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .delete => {},
+            .transform => |operations| {
+                for (operations) |op| {
+                    alloc.free(@constCast(op.path));
+                    if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+                }
+                if (operations.len > 0) alloc.free(@constCast(operations));
+            },
+        }
+        self.* = undefined;
+    }
+};
+
+pub const LoweredDocumentWrite = struct {
+    table_name: []const u8,
+    batch: OwnedDocumentBatchRequest,
+    operation: db_mod.document_write.DocumentWriteOperation,
+    sync_level: db_mod.types.SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.batch.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const LoweredDocumentProducerMutation = struct {
+    table_name: []const u8,
+    producer: document_plan.DocumentProducer,
+    operation: db_mod.document_write.DocumentWriteOperation,
+    template: DocumentProducerMutationTemplate,
+    expected_version: ?u64 = null,
+    sync_level: db_mod.types.SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        self.producer.deinit(alloc);
+        self.template.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredInsertSource = struct {
     table_name: []const u8,
     ctes: []const db_mod.types.RelationalRowsCte = &.{},
@@ -622,6 +703,7 @@ pub const LowerWritePlanOptions = struct {
     row_claim: ?db_mod.types.RowClaimRequest = null,
     joined_source_schema: ?runtime_schema.TableSchema = null,
     insert_source_schema: ?runtime_schema.TableSchema = null,
+    document_preflight: ?db_mod.document_write.DocumentWritePreflight = null,
     sync_level: db_mod.types.SyncLevel = .write,
 };
 
@@ -747,6 +829,8 @@ pub const LoweredRecursiveMergeMutation = struct {
 
 pub const LoweredWritePlan = union(enum) {
     insert: LoweredInsert,
+    document_write: LoweredDocumentWrite,
+    document_producer_mutation: LoweredDocumentProducerMutation,
     insert_source: LoweredInsertSource,
     recursive_insert_source: LoweredRecursiveInsertSource,
     update: LoweredMutation,
@@ -764,6 +848,8 @@ pub const LoweredWritePlan = union(enum) {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         switch (self.*) {
             .insert => |*insert| insert.deinit(alloc),
+            .document_write => |*document_write| document_write.deinit(alloc),
+            .document_producer_mutation => |*document_producer_mutation| document_producer_mutation.deinit(alloc),
             .insert_source => |*insert_source| insert_source.deinit(alloc),
             .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.deinit(alloc),
             .update => |*update| update.deinit(alloc),
@@ -791,6 +877,13 @@ fn applyLoweredWritePlanSyncLevel(plan: *LoweredWritePlan, sync_level: db_mod.ty
         .insert => |*insert| {
             insert.sync_level = sync_level;
             applyRowsBatchSyncLevel(&insert.batch, sync_level);
+        },
+        .document_write => |*document_write| {
+            document_write.sync_level = sync_level;
+            document_write.batch.req.sync_level = sync_level;
+        },
+        .document_producer_mutation => |*document_producer_mutation| {
+            document_producer_mutation.sync_level = sync_level;
         },
         .insert_source => |*insert_source| insert_source.sync_level = sync_level,
         .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.insert_source.sync_level = sync_level,
@@ -5395,7 +5488,7 @@ test "sql adapter plan consumes generated CTE prefix metadata before parsing bod
     var materialized = try tokenized.ParsedSql.initAlloc(alloc, "WITH open_orders AS MATERIALIZED (SELECT id FROM orders) SELECT id FROM open_orders");
     defer materialized.deinit(alloc);
     var stale_materialization = switch ((materialized.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
-        .read => |read| read,
+        .read => |read| read.*,
         else => return error.TestUnexpectedResult,
     };
     stale_materialization.cte_items[0].materialization = .not_materialized;
@@ -5416,7 +5509,7 @@ test "sql adapter plan consumes generated CTE prefix metadata before parsing bod
     var column_aliases = try tokenized.ParsedSql.initAlloc(alloc, "WITH open_orders(order_id) AS (SELECT id FROM orders) SELECT order_id FROM open_orders");
     defer column_aliases.deinit(alloc);
     var stale_column_aliases = switch ((column_aliases.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
-        .read => |read| read,
+        .read => |read| read.*,
         else => return error.TestUnexpectedResult,
     };
     stale_column_aliases.cte_items[0].column_names.items[0].end += 1;
@@ -5475,7 +5568,7 @@ test "sql adapter recursive CTE producer consumes generated prefix metadata befo
     );
     defer materialized.deinit(alloc);
     var stale_materialization = switch ((materialized.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
-        .read => |read| read,
+        .read => |read| read.*,
         else => return error.TestUnexpectedResult,
     };
     stale_materialization.cte_items[0].materialization = .not_materialized;
@@ -5499,7 +5592,7 @@ test "sql adapter recursive CTE producer consumes generated prefix metadata befo
     );
     defer column_aliases.deinit(alloc);
     var stale_column_aliases = switch ((column_aliases.generated_statement orelse return error.TestUnexpectedResult).ast.?) {
-        .read => |read| read,
+        .read => |read| read.*,
         else => return error.TestUnexpectedResult,
     };
     stale_column_aliases.cte_items[0].column_names.items[0].end += 1;

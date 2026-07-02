@@ -18,6 +18,7 @@ const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const diagnostics = @import("diagnostics.zig");
 const ddl_fingerprint = @import("fingerprint.zig");
+const document_plan = @import("document_plan.zig");
 const lower_dml = @import("lower_dml.zig");
 const plan_mod = @import("plan.zig");
 const row_claim = @import("row_claim.zig");
@@ -475,6 +476,64 @@ fn relationPopulationTargetLifetimeName(kind: ?RelationLifetimeKind) []const u8 
     return if (kind) |lifetime| relationLifetimeKindName(lifetime) else "durable";
 }
 
+fn documentProducerMutationTemplateName(template: plan_mod.DocumentProducerMutationTemplate) []const u8 {
+    return switch (template) {
+        .delete => "delete",
+        .transform => "transform",
+    };
+}
+
+fn appendNonZeroU64FingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    label: []const u8,
+    value: u64,
+) ![]u8 {
+    if (value == 0) return owned_base;
+    errdefer alloc.free(owned_base);
+    const out = try std.fmt.allocPrint(alloc, "{s}:{s}={d}", .{ owned_base, label, value });
+    alloc.free(owned_base);
+    return out;
+}
+
+fn appendDocumentProducerFingerprintAlloc(
+    alloc: std.mem.Allocator,
+    owned_base: []u8,
+    producer: document_plan.DocumentProducer,
+) ![]u8 {
+    var fingerprint = owned_base;
+    switch (producer) {
+        .id_lookup => |lookup| {
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "producer", "id_lookup");
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "producer_ids", lookup.ids.len);
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_residual", lookup.residual_filter_json != null);
+        },
+        .indexed_query => |query| {
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "producer", "indexed_query");
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_index", query.index_name != null);
+            if (query.index_name) |index_name| {
+                fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "producer_index_name", index_name);
+            }
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_native", query.native_query_json != null);
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_full_text", query.full_text_query != null);
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_filter", query.filter_query_json != null);
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_residual", query.residual_filter_json != null);
+            if (query.max_candidate_rows) |max_candidate_rows| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "producer_candidate_rows", max_candidate_rows);
+            }
+        },
+        .bounded_scan => |scan| {
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "producer", "bounded_scan");
+            fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "producer_scan_rows", scan.max_rows);
+            if (scan.max_bytes) |max_bytes| {
+                fingerprint = try appendNonZeroU64FingerprintAlloc(alloc, fingerprint, "producer_scan_bytes", max_bytes);
+            }
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "producer_residual", scan.residual_filter_json != null);
+        },
+    }
+    return fingerprint;
+}
+
 pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWritePlan) ![]u8 {
     return switch (lowered) {
         .insert => |insert| blk: {
@@ -495,6 +554,56 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
             fingerprint = try appendTransformOpFingerprintAlloc(alloc, fingerprint, insert.batch.transforms);
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "returning_all", insert.returning_all);
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "conflict_where", insert.conflict_where);
+            break :blk fingerprint;
+        },
+        .document_write => |document_write| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "document_write:table={s}:operation={s}:writes={d}:transforms={d}:deletes={d}",
+                .{
+                    document_write.table_name,
+                    @tagName(document_write.operation),
+                    document_write.batch.writes.len,
+                    document_write.batch.transforms.len,
+                    document_write.batch.deletes.len,
+                },
+            );
+            switch (document_write.operation) {
+                .full_document_insert, .generated_id_insert => {
+                    if (document_write.batch.writes.len > 0) {
+                        const write_mode = switch (document_write.batch.req.write_mode) {
+                            .upsert => "native_upsert",
+                            .create_only => "create_only",
+                        };
+                        fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "write_mode", write_mode);
+                    }
+                },
+                else => {},
+            }
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "predicates", document_write.batch.predicates.len);
+            break :blk fingerprint;
+        },
+        .document_producer_mutation => |document_mutation| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "document_write:table={s}:operation={s}",
+                .{
+                    document_mutation.table_name,
+                    @tagName(document_mutation.operation),
+                },
+            );
+            fingerprint = try appendDocumentProducerFingerprintAlloc(alloc, fingerprint, document_mutation.producer);
+            fingerprint = try appendStringFingerprintAlloc(
+                alloc,
+                fingerprint,
+                "template",
+                documentProducerMutationTemplateName(document_mutation.template),
+            );
+            switch (document_mutation.template) {
+                .delete => {},
+                .transform => |operations| fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ops", operations.len),
+            }
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "version_predicate", document_mutation.expected_version != null);
             break :blk fingerprint;
         },
         .insert_source => |insert_source| blk: {
@@ -616,4 +725,31 @@ pub fn invalidPlanFingerprintAlloc(
     reason: diagnostics.SqlAdapterClassificationReason,
 ) ![]u8 {
     return try std.fmt.allocPrint(alloc, "invalid:{s}:reason={s}", .{ family, @tagName(reason) });
+}
+
+test "document producer mutation fingerprint pins producer and template shape" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{ "doc:a", "doc:b" };
+    var operations = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "/title",
+        .value_json = "\"Ready\"",
+    }};
+    const lowered = LoweredWritePlan{ .document_producer_mutation = .{
+        .table_name = "docs",
+        .producer = .{ .id_lookup = .{
+            .ids = ids[0..],
+            .residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+        } },
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .expected_version = 7,
+    } };
+
+    const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+    defer alloc.free(fingerprint);
+    try std.testing.expectEqualStrings(
+        "document_write:table=docs:operation=projection_write:producer=id_lookup:producer_ids=2:producer_residual=1:template=transform:ops=1:version_predicate=1",
+        fingerprint,
+    );
 }

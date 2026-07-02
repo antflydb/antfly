@@ -38,6 +38,7 @@ const BulkIoOnErrorPolicy = ddl_plan.BulkIoOnErrorPolicy;
 const BulkIoPlan = ddl_plan.BulkIoPlan;
 const CreateIndexPlan = ddl_plan.CreateIndexPlan;
 const CreateRoutinePlan = ddl_plan.CreateRoutinePlan;
+const CreateSubscriptionPlan = ddl_plan.CreateSubscriptionPlan;
 const CreateTablePlan = ddl_plan.CreateTablePlan;
 const EnumValuePosition = ddl_plan.EnumValuePosition;
 const IdentityAllocatorKind = ddl_plan.IdentityAllocatorKind;
@@ -367,6 +368,7 @@ const FingerprintDdlPayload = union(enum) {
     cursor_portal: ddl_plan.CursorPortalPlan,
     savepoint_transaction: ddl_plan.SavepointTransactionPlan,
     comment_metadata: ddl_plan.CommentMetadataPlan,
+    security_label: ddl_plan.SecurityLabelPlan,
     transaction_control: ddl_plan.TransactionControlPlan,
     create_index: ddl_plan.CreateIndexPlan,
     drop_index: ddl_plan.DropIndexPlan,
@@ -424,6 +426,7 @@ fn catalogDdlFingerprintAlloc(alloc: std.mem.Allocator, plan: binder.CatalogDdlL
         .logical_replication => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .logical_replication = payload }),
         .type_system_catalog => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .type_system_catalog = payload }),
         .comment_metadata => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .comment_metadata = payload }),
+        .security_label => |payload| try ddlPayloadFingerprintAlloc(alloc, .{ .security_label = payload }),
     };
 }
 
@@ -814,13 +817,28 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             ),
             .grant_privilege => |grant| try std.fmt.allocPrint(
                 alloc,
-                "ddl:grant_privilege:object={s}:{s}:principal={s}:privileges={d}",
-                .{ grant.object_kind, grant.object_name, grant.principal_name, grant.privileges.len },
+                "ddl:grant_privilege:object={s}:{s}:principal={s}:principals={d}:privileges={d}:grant_option={}",
+                .{ grant.object_kind, grant.object_name, grant.principal_name, grant.principal_names.len, grant.privileges.len, grant.with_grant_option },
             ),
             .revoke_privilege => |revoke| try std.fmt.allocPrint(
                 alloc,
-                "ddl:revoke_privilege:object={s}:{s}:principal={s}:privileges={d}",
-                .{ revoke.object_kind, revoke.object_name, revoke.principal_name, revoke.privileges.len },
+                "ddl:revoke_privilege:object={s}:{s}:principal={s}:principals={d}:privileges={d}:grant_option_for={}:revoke={s}",
+                .{ revoke.object_kind, revoke.object_name, revoke.principal_name, revoke.principal_names.len, revoke.privileges.len, revoke.revoke_grant_option_for, revokeCascadeName(revoke.revoke_cascade) },
+            ),
+            .grant_role => |grant| try std.fmt.allocPrint(
+                alloc,
+                "ddl:grant_role:principal={s}:principals={d}:roles={d}:admin_option={}",
+                .{ grant.principal_name, grant.principal_names.len, grant.role_names.len, grant.with_admin_option },
+            ),
+            .revoke_role => |revoke| try std.fmt.allocPrint(
+                alloc,
+                "ddl:revoke_role:principal={s}:principals={d}:roles={d}:admin_option_for={}:revoke={s}",
+                .{ revoke.principal_name, revoke.principal_names.len, revoke.role_names.len, revoke.revoke_admin_option_for, revokeCascadeName(revoke.revoke_cascade) },
+            ),
+            .alter_default_privileges => |change| try std.fmt.allocPrint(
+                alloc,
+                "ddl:alter_default_privileges:action={s}:roles={d}:schemas={d}:object={s}:principal={s}:principals={d}:privileges={d}:grant_option={}:grant_option_for={}:revoke={s}",
+                .{ @tagName(change.action), change.target_roles.len, change.schema_names.len, change.object_kind, change.principal_name, change.principal_names.len, change.privileges.len, change.with_grant_option, change.revoke_grant_option_for, revokeCascadeName(change.revoke_cascade) },
             ),
         },
         .bulk_io => |plan| blk: {
@@ -902,6 +920,7 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                     alloc.free(base);
                     base = with_check;
                 }
+                base = try appendRowSecurityPolicyQualifiersAlloc(alloc, base, create.mode, create.command);
                 break :blk try appendRowSecurityRoleTargetsAlloc(alloc, base, create.role_targets);
             },
             .alter_policy => |alter| blk: {
@@ -1002,14 +1021,39 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             .publication => |publication| switch (publication) {
                 .create => |create| try std.fmt.allocPrint(
                     alloc,
-                    "ddl:create_publication:publication={s}:tables={d}:all={}",
-                    .{ create.publication_name, create.table_names.len, create.all_tables },
+                    "ddl:create_publication:publication={s}:tables={d}:all={}:options={d}",
+                    .{ create.publication_name, create.tables.len, create.all_tables, publicationOptionCount(create.publish_json, create.publish_via_partition_root) },
                 ),
                 .alter => |alter| switch (alter.operation) {
                     .add_tables => |tables| try std.fmt.allocPrint(
                         alloc,
                         "ddl:alter_publication:publication={s}:add_tables={d}",
                         .{ alter.publication_name, tables.len },
+                    ),
+                    .drop_tables => |tables| try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_publication:publication={s}:drop_tables={d}",
+                        .{ alter.publication_name, tables.len },
+                    ),
+                    .set_tables => |tables| try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_publication:publication={s}:set_tables={d}",
+                        .{ alter.publication_name, tables.len },
+                    ),
+                    .set_options => |options| try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_publication:publication={s}:set_options={d}",
+                        .{ alter.publication_name, publicationOptionCount(options.publish_json, options.publish_via_partition_root) },
+                    ),
+                    .rename_to => |rename_to| try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_publication:publication={s}:rename_to={s}",
+                        .{ alter.publication_name, rename_to },
+                    ),
+                    .owner_to => |owner_to| try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_publication:publication={s}:owner_to={s}",
+                        .{ alter.publication_name, owner_to },
                     ),
                 },
                 .drop => |drop| try std.fmt.allocPrint(
@@ -1021,14 +1065,69 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
             .subscription => |subscription| switch (subscription) {
                 .create => |create| try std.fmt.allocPrint(
                     alloc,
-                    "ddl:create_subscription:subscription={s}:connection=true:publications={d}",
-                    .{ create.subscription_name, create.publication_names.len },
+                    "ddl:create_subscription:subscription={s}:connection=true:publications={d}:options={d}",
+                    .{ create.subscription_name, create.publication_names.len, createSubscriptionOptionCount(create) },
                 ),
-                .alter => |alter| try std.fmt.allocPrint(
-                    alloc,
-                    "ddl:alter_subscription:subscription={s}:enabled={}",
-                    .{ alter.subscription_name, alter.enabled },
-                ),
+                .alter => |alter| if (alter.enabled) |enabled|
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:enabled={}",
+                        .{ alter.subscription_name, enabled },
+                    )
+                else if (alter.publication_names.len > 0)
+                    switch (alter.publication_action orelse .set) {
+                        .set => try std.fmt.allocPrint(
+                            alloc,
+                            "ddl:alter_subscription:subscription={s}:publications={d}:options={d}",
+                            .{ alter.subscription_name, alter.publication_names.len, alterSubscriptionOptionCount(alter) },
+                        ),
+                        .add => try std.fmt.allocPrint(
+                            alloc,
+                            "ddl:alter_subscription:subscription={s}:add_publications={d}:options={d}",
+                            .{ alter.subscription_name, alter.publication_names.len, alterSubscriptionOptionCount(alter) },
+                        ),
+                        .drop => try std.fmt.allocPrint(
+                            alloc,
+                            "ddl:alter_subscription:subscription={s}:drop_publications={d}:options={d}",
+                            .{ alter.subscription_name, alter.publication_names.len, alterSubscriptionOptionCount(alter) },
+                        ),
+                    }
+                else if (alter.connection_json != null)
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:connection=true",
+                        .{alter.subscription_name},
+                    )
+                else if (alter.rename_to) |rename_to|
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:rename_to={s}",
+                        .{ alter.subscription_name, rename_to },
+                    )
+                else if (alter.owner_to) |owner_to|
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:owner_to={s}",
+                        .{ alter.subscription_name, owner_to },
+                    )
+                else if (alter.skip_lsn_json != null)
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:skip_lsn=true",
+                        .{alter.subscription_name},
+                    )
+                else if (alter.refresh_publication)
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:refresh_publication=true:options={d}",
+                        .{ alter.subscription_name, alterSubscriptionOptionCount(alter) },
+                    )
+                else
+                    try std.fmt.allocPrint(
+                        alloc,
+                        "ddl:alter_subscription:subscription={s}:options={d}",
+                        .{ alter.subscription_name, alterSubscriptionOptionCount(alter) },
+                    ),
                 .drop => |drop| try std.fmt.allocPrint(
                     alloc,
                     "ddl:drop_subscription:subscription={s}:if_exists={}",
@@ -1208,11 +1307,29 @@ fn ddlPayloadFingerprintAlloc(alloc: std.mem.Allocator, payload: FingerprintDdlP
                 "ddl:comment:kind={s}:object={s}:table={s}:comment={}",
                 .{ @tagName(plan.target), plan.object_name, parent_table, plan.comment_json != null },
             )
+        else if (plan.argument_count) |argument_count|
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:comment:kind={s}:object={s}:args={d}:comment={}",
+                .{ @tagName(plan.target), plan.object_name, argument_count, plan.comment_json != null },
+            )
         else
             try std.fmt.allocPrint(
                 alloc,
                 "ddl:comment:kind={s}:object={s}:comment={}",
                 .{ @tagName(plan.target), plan.object_name, plan.comment_json != null },
+            ),
+        .security_label => |plan| if (plan.argument_count) |argument_count|
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:security_label:kind={s}:object={s}:args={d}:provider={}:label={}",
+                .{ @tagName(plan.target), plan.object_name, argument_count, plan.provider_name != null, plan.label_json != null },
+            )
+        else
+            try std.fmt.allocPrint(
+                alloc,
+                "ddl:security_label:kind={s}:object={s}:provider={}:label={}",
+                .{ @tagName(plan.target), plan.object_name, plan.provider_name != null, plan.label_json != null },
             ),
         .transaction_control => |plan| switch (plan) {
             .table_lock => |lock| try std.fmt.allocPrint(
@@ -1859,6 +1976,53 @@ fn appendRowSecurityRoleTargetsAlloc(
     return out;
 }
 
+fn publicationOptionCount(publish_json: ?[]const u8, publish_via_partition_root: ?bool) usize {
+    return (if (publish_json != null) @as(usize, 1) else 0) +
+        (if (publish_via_partition_root != null) @as(usize, 1) else 0);
+}
+
+fn revokeCascadeName(revoke_cascade: ?bool) []const u8 {
+    const cascade = revoke_cascade orelse return "default";
+    return if (cascade) "cascade" else "restrict";
+}
+
+fn appendRowSecurityPolicyQualifiersAlloc(
+    alloc: std.mem.Allocator,
+    base: []u8,
+    mode: ?ddl_plan.RowSecurityPolicyMode,
+    command: ?ddl_plan.RowSecurityPolicyCommand,
+) ![]u8 {
+    var out = base;
+    if (mode) |value| {
+        const next = try std.fmt.allocPrint(alloc, "{s}:mode={s}", .{ out, rowSecurityPolicyModeName(value) });
+        alloc.free(out);
+        out = next;
+    }
+    if (command) |value| {
+        const next = try std.fmt.allocPrint(alloc, "{s}:command={s}", .{ out, rowSecurityPolicyCommandName(value) });
+        alloc.free(out);
+        out = next;
+    }
+    return out;
+}
+
+fn rowSecurityPolicyModeName(mode: ddl_plan.RowSecurityPolicyMode) []const u8 {
+    return switch (mode) {
+        .permissive => "permissive",
+        .restrictive => "restrictive",
+    };
+}
+
+fn rowSecurityPolicyCommandName(command: ddl_plan.RowSecurityPolicyCommand) []const u8 {
+    return switch (command) {
+        .all => "all",
+        .select => "select",
+        .insert => "insert",
+        .update => "update",
+        .delete => "delete",
+    };
+}
+
 fn bulkIoStringOptionHexAlloc(alloc: std.mem.Allocator, option: ?[]const u8) ![]const u8 {
     const value = option orelse return try alloc.dupe(u8, "default");
     if (value.len == 0) return try alloc.dupe(u8, "empty");
@@ -2010,6 +2174,14 @@ test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
             .fingerprint = "ddl:drop_materialized_view:view=users_mv:if_exists=true:cascade=true",
         },
         .{
+            .sql = "SECURITY LABEL FOR selinux ON TABLE usage_records IS 'internal';",
+            .fingerprint = "ddl:security_label:kind=table:object=usage_records:provider=true:label=true",
+        },
+        .{
+            .sql = "SECURITY LABEL ON PROCEDURE rotate_usage() IS NULL;",
+            .fingerprint = "ddl:security_label:kind=procedure:object=rotate_usage:args=0:provider=false:label=false",
+        },
+        .{
             .sql = "CREATE TEMPORARY TABLE users_session (id uuid PRIMARY KEY, status text);",
             .fingerprint = "ddl:relation_lifetime:kind=temporary:table=users_session:columns=2:unique=0:fk=0:checks=0:if_not_exists=false",
         },
@@ -2122,6 +2294,40 @@ test "sql adapter ddl fingerprint owns catalog-only ddl surfaces" {
         defer alloc.free(fingerprint);
         try std.testing.expectEqualStrings(case.fingerprint, fingerprint);
     }
+}
+
+fn createSubscriptionOptionCount(create: CreateSubscriptionPlan) usize {
+    return (if (create.copy_data != null) @as(usize, 1) else 0) +
+        (if (create.connect != null) @as(usize, 1) else 0) +
+        (if (create.binary != null) @as(usize, 1) else 0) +
+        (if (create.create_slot != null) @as(usize, 1) else 0) +
+        (if (create.enabled != null) @as(usize, 1) else 0) +
+        (if (create.two_phase != null) @as(usize, 1) else 0) +
+        (if (create.disable_on_error != null) @as(usize, 1) else 0) +
+        (if (create.synchronous_commit_json != null) @as(usize, 1) else 0) +
+        (if (create.streaming_json != null) @as(usize, 1) else 0) +
+        (if (create.password_required != null) @as(usize, 1) else 0) +
+        (if (create.run_as_owner != null) @as(usize, 1) else 0) +
+        (if (create.failover != null) @as(usize, 1) else 0) +
+        (if (create.origin_json != null) @as(usize, 1) else 0) +
+        (if (create.slot_name_json != null) @as(usize, 1) else 0);
+}
+
+fn alterSubscriptionOptionCount(alter: ddl_plan.AlterSubscriptionPlan) usize {
+    return (if (alter.copy_data != null) @as(usize, 1) else 0) +
+        (if (alter.connect != null) @as(usize, 1) else 0) +
+        (if (alter.binary != null) @as(usize, 1) else 0) +
+        (if (alter.create_slot != null) @as(usize, 1) else 0) +
+        (if (alter.enabled_option != null) @as(usize, 1) else 0) +
+        (if (alter.two_phase != null) @as(usize, 1) else 0) +
+        (if (alter.disable_on_error != null) @as(usize, 1) else 0) +
+        (if (alter.synchronous_commit_json != null) @as(usize, 1) else 0) +
+        (if (alter.streaming_json != null) @as(usize, 1) else 0) +
+        (if (alter.password_required != null) @as(usize, 1) else 0) +
+        (if (alter.run_as_owner != null) @as(usize, 1) else 0) +
+        (if (alter.failover != null) @as(usize, 1) else 0) +
+        (if (alter.origin_json != null) @as(usize, 1) else 0) +
+        (if (alter.slot_name_json != null) @as(usize, 1) else 0);
 }
 
 test "sql adapter ddl fingerprint owns routine catalog ddl surfaces" {
@@ -2271,20 +2477,40 @@ test "sql adapter ddl fingerprint owns authorization catalog ddl surfaces" {
         fingerprint: []const u8,
     }{
         .{
-            .sql = "GRANT SELECT, INSERT ON TABLE usage_records TO app_writer;",
-            .fingerprint = "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=2",
+            .sql = "GRANT SELECT, INSERT ON TABLE usage_records TO app_reader, app_writer WITH GRANT OPTION;",
+            .fingerprint = "ddl:grant_privilege:object=TABLE:usage_records:principal=app_reader:principals=2:privileges=2:grant_option=true",
         },
         .{
             .sql = "GRANT ALL PRIVILEGES ON TABLE usage_records TO app_writer;",
-            .fingerprint = "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
+            .fingerprint = "ddl:grant_privilege:object=TABLE:usage_records:principal=app_writer:principals=1:privileges=1:grant_option=false",
         },
         .{
             .sql = "GRANT SELECT ON ALL TABLES IN SCHEMA public TO app_writer;",
-            .fingerprint = "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:privileges=1",
+            .fingerprint = "ddl:grant_privilege:object=ALL_TABLES_IN_SCHEMA:public:principal=app_writer:principals=1:privileges=1:grant_option=false",
         },
         .{
-            .sql = "REVOKE INSERT ON TABLE usage_records FROM app_writer;",
-            .fingerprint = "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:privileges=1",
+            .sql = "REVOKE GRANT OPTION FOR INSERT ON TABLE usage_records FROM app_writer CASCADE;",
+            .fingerprint = "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:principals=1:privileges=1:grant_option_for=true:revoke=cascade",
+        },
+        .{
+            .sql = "REVOKE INSERT ON TABLE usage_records FROM app_writer RESTRICT;",
+            .fingerprint = "ddl:revoke_privilege:object=TABLE:usage_records:principal=app_writer:principals=1:privileges=1:grant_option_for=false:revoke=restrict",
+        },
+        .{
+            .sql = "GRANT readonly, reporting TO app_reader, app_writer WITH ADMIN OPTION;",
+            .fingerprint = "ddl:grant_role:principal=app_reader:principals=2:roles=2:admin_option=true",
+        },
+        .{
+            .sql = "REVOKE ADMIN OPTION FOR readonly FROM app_writer CASCADE;",
+            .fingerprint = "ddl:revoke_role:principal=app_writer:principals=1:roles=1:admin_option_for=true:revoke=cascade",
+        },
+        .{
+            .sql = "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public GRANT SELECT, INSERT ON TABLES TO readonly, app_writer WITH GRANT OPTION;",
+            .fingerprint = "ddl:alter_default_privileges:action=grant:roles=1:schemas=1:object=TABLES:principal=readonly:principals=2:privileges=2:grant_option=true:grant_option_for=false:revoke=default",
+        },
+        .{
+            .sql = "ALTER DEFAULT PRIVILEGES FOR ROLE app_owner IN SCHEMA public REVOKE GRANT OPTION FOR INSERT ON TABLES FROM readonly CASCADE;",
+            .fingerprint = "ddl:alter_default_privileges:action=revoke:roles=1:schemas=1:object=TABLES:principal=readonly:principals=1:privileges=1:grant_option=false:grant_option_for=true:revoke=cascade",
         },
         .{
             .sql = "CREATE ROLE app_writer;",
@@ -2374,6 +2600,10 @@ test "sql adapter ddl fingerprint owns partition and row security catalog ddl su
         .{
             .sql = "CREATE POLICY usage_records_targeted_policy ON usage_records TO app_reader, app_writer USING (tenant_id = current_setting('app.tenant_id'));",
             .fingerprint = "ddl:create_row_policy:policy=usage_records_targeted_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:roles=2:role=app_reader:role=app_writer",
+        },
+        .{
+            .sql = "CREATE POLICY usage_records_select_policy ON usage_records AS RESTRICTIVE FOR SELECT TO app_reader USING (tenant_id = current_setting('app.tenant_id'));",
+            .fingerprint = "ddl:create_row_policy:policy=usage_records_select_policy:table=usage_records:kind=current_setting_eq:field=tenant_id:setting=app.tenant_id:mode=restrictive:command=select:roles=1:role=app_reader",
         },
         .{
             .sql = "CREATE POLICY usage_records_active_policy ON usage_records USING (status = 'active');",
@@ -2505,11 +2735,35 @@ test "sql adapter ddl fingerprint owns notification and logical replication ddl 
         },
         .{
             .sql = "CREATE PUBLICATION usage_pub FOR TABLE usage_records;",
-            .fingerprint = "ddl:create_publication:publication=usage_pub:tables=1:all=false",
+            .fingerprint = "ddl:create_publication:publication=usage_pub:tables=1:all=false:options=0",
+        },
+        .{
+            .sql = "CREATE PUBLICATION usage_pub_options FOR TABLE usage_records WITH (publish = 'insert, update', publish_via_partition_root = true);",
+            .fingerprint = "ddl:create_publication:publication=usage_pub_options:tables=1:all=false:options=2",
         },
         .{
             .sql = "ALTER PUBLICATION usage_pub ADD TABLE usage_events;",
             .fingerprint = "ddl:alter_publication:publication=usage_pub:add_tables=1",
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub DROP TABLE usage_events;",
+            .fingerprint = "ddl:alter_publication:publication=usage_pub:drop_tables=1",
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub SET TABLE usage_events, usage_audit;",
+            .fingerprint = "ddl:alter_publication:publication=usage_pub:set_tables=2",
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub SET (publish = 'insert, update', publish_via_partition_root = false);",
+            .fingerprint = "ddl:alter_publication:publication=usage_pub:set_options=2",
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub RENAME TO usage_pub_archive;",
+            .fingerprint = "ddl:alter_publication:publication=usage_pub:rename_to=usage_pub_archive",
+        },
+        .{
+            .sql = "ALTER PUBLICATION usage_pub OWNER TO app_role;",
+            .fingerprint = "ddl:alter_publication:publication=usage_pub:owner_to=app_role",
         },
         .{
             .sql = "DROP PUBLICATION IF EXISTS usage_pub;",
@@ -2517,11 +2771,47 @@ test "sql adapter ddl fingerprint owns notification and logical replication ddl 
         },
         .{
             .sql = "CREATE SUBSCRIPTION usage_sub CONNECTION 'host=localhost dbname=usage' PUBLICATION usage_pub;",
-            .fingerprint = "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1",
+            .fingerprint = "ddl:create_subscription:subscription=usage_sub:connection=true:publications=1:options=0",
         },
         .{
             .sql = "ALTER SUBSCRIPTION usage_sub DISABLE;",
             .fingerprint = "ddl:alter_subscription:subscription=usage_sub:enabled=false",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub CONNECTION 'host=replica';",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:connection=true",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub RENAME TO usage_sub_archive;",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:rename_to=usage_sub_archive",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub OWNER TO app_role;",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:owner_to=app_role",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub SKIP (lsn = '0/14C0378');",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:skip_lsn=true",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub REFRESH PUBLICATION WITH (copy_data = false);",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:refresh_publication=true:options=1",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub SET (slot_name = 'usage_slot', copy_data = false);",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:options=2",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub SET PUBLICATION usage_pub, usage_audit_pub WITH (copy_data = true);",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:publications=2:options=1",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub ADD PUBLICATION usage_new_pub WITH (copy_data = false);",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:add_publications=1:options=1",
+        },
+        .{
+            .sql = "ALTER SUBSCRIPTION usage_sub DROP PUBLICATION usage_old_pub WITH (copy_data = true);",
+            .fingerprint = "ddl:alter_subscription:subscription=usage_sub:drop_publications=1:options=1",
         },
         .{
             .sql = "DROP SUBSCRIPTION IF EXISTS usage_sub;",

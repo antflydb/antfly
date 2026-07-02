@@ -22,6 +22,7 @@ pub const generated_validate = @import("generated_validate.zig");
 pub const json_path = @import("json_path.zig");
 pub const limits = @import("limits.zig");
 pub const operator = @import("operator.zig");
+pub const order = @import("order.zig");
 pub const parse = @import("parse.zig");
 pub const predicate = @import("predicate.zig");
 pub const projection = @import("projection.zig");
@@ -30,19 +31,26 @@ pub const selector = @import("selector.zig");
 pub const text = @import("text.zig");
 pub const token = @import("token.zig");
 pub const typing = @import("type.zig");
+pub const where_condition = @import("where_condition.zig");
 pub const window = @import("window.zig");
 
 test {
     _ = aggregate;
     _ = condition;
     _ = generated_validate;
+    _ = order;
     _ = projection;
     _ = row_parse;
     _ = selector;
     _ = text;
+    _ = where_condition;
     _ = window;
 
     try generated_validate.testGeneratedValidationChecksPredicateAndRowExpressionIdentity();
+    try order.testOrderNullPlacementAndModifiers();
+    try order.testDistinctOnOrderValidation();
     try projection.testProjectionBuildsOwnedDefaultOutputs();
+    try projection.testProjectionParsesFieldHelpers();
+    try projection.testProjectionPeeksSimpleReturningFields();
     try row_parse.testRowParseResolvesFunctionBindings();
 }

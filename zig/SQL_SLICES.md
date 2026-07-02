@@ -1,9 +1,14 @@
-# SQL.md Remaining Work Slices
+# SQL Adapter Remaining Work Slices
 
-This is the current backlog for the remaining large `SQL.md` work. It omits
-completed tracking context and keeps only slices that still need implementation,
-parity proof, or cleanup. Each checkbox should describe a landable artifact:
-code behavior, diagnostics, fixture coverage, runtime parity, or a deletion.
+This is the tracking document for remaining SQL adapter work. It lists only
+slices that still need implementation, parity proof, or cleanup. Keep design
+rationale, architecture decisions, ownership boundaries, and implementation
+invariants in `SQL.md`. Completed history that is deducible from code, tests,
+fixtures, or git history should stay out of both docs.
+
+Each checkbox should describe a landable artifact: code behavior, diagnostics,
+fixture coverage, runtime parity, or a deletion. When a slice lands with those
+artifacts, delete its checkbox rather than leaving completed history here.
 
 Feature and plan-parity coverage belongs in named entries in
 `zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json`, with new
@@ -16,107 +21,91 @@ inventory validators, and diagnostic classifiers.
 
 ## Document SQL
 
-- [ ] **Admit document table DDL through SQL**
-  - [ ] Parse canonical document-table DDL in the generated parser:
-        `CREATE TABLE ... WITH (antfly.storage_mode = 'document',
-        antfly.default_type = ..., ...)` plus one or more
-        `DOCUMENT SCHEMA name AS JSON '...'` clauses.
-  - [ ] Bind the parsed DDL into a typed catalog request summary containing
-        table name, `storage_mode = document`, `default_type`, and normalized
-        `document_schemas`; durable schema metadata must not preserve raw SQL
-        text.
-  - [ ] Add source-corpus success fixtures for the canonical DDL shape and
-        required coverage buckets for document-table DDL admission.
-  - [ ] Decide and fixture the `CREATE DOCUMENT TABLE` shorthand contract:
-        either parsed structural rejection, or sugar for the same typed
-        document-table DDL request.
-  - [ ] Promote generated-failure placeholders for mixed relational/document
-        DDL into parsed diagnostic fixtures once document-table DDL parses:
-        relational columns, relational constraints, generated columns, and
-        other PostgreSQL column-table semantics on a document table.
-  - [ ] Promote generated-failure placeholders for schema validation failures
-        into parsed diagnostic fixtures once document-table DDL parses:
-        malformed schema JSON, missing or unknown `default_type`, invalid
-        Antfly extensions, invalid dynamic templates, and unsupported
-        multi-document-type shape.
-  - [ ] Add SQL/native catalog parity fixtures proving SQL-created document
-        table schemas match equivalent native/API schema mutations.
-  - [ ] Remove or rename the old generated-parse-failure tracking entries after
-        every formerly unparsed DDL shape has a parsed success or parsed
-        diagnostic fixture.
+Document-table DDL design lives in `SQL.md`; this tracker only lists remaining
+document SQL implementation gates.
 
 - [ ] **Admit document writes through SQL**
-  - [ ] Keep unsupported write fixtures in the source corpus for broad insert,
-        update, delete, truncate, and merge shapes until each shape is admitted
-        by a named slice below.
-  - [ ] Add one shared document-write preflight used by native writes and SQL
-        document writes; fixture the rejection order for authorization,
-        row-filter, audit-required, conflict, and no-match behavior before any
-        write form is admitted.
-  - [ ] Admit explicit-key full-document insert/upsert:
-        `INSERT INTO docs (_id, _doc) VALUES (...)` lowers to native document
-        insert/upsert and has corpus parity for document shape, duplicate key,
-        malformed `_doc`, schema validation, generated-field rejection, and
-        audit behavior.
-  - [ ] Admit generated-id full-document insert only after native document id
-        generation policy is shared and fixture the SQL/native `_id` behavior.
-  - [ ] Admit exact-key delete:
-        `DELETE FROM docs WHERE _id = ...` and `_id IN (...)` lower to native
-        document delete and have corpus parity for deleted identity,
-        row-filter/audit behavior, no-match behavior, and rejection behavior.
-  - [ ] Keep non-identity delete predicates rejected until boundedness,
-        row-filter, authorization, audit, and no-match semantics have explicit
-        source-corpus diagnostics.
-  - [ ] Pick one explicit `_doc` patch/update surface, such as
-        `jsonb_set(_doc, ...)` or an Antfly-owned
-        `antfly.json_patch(_doc, patch)` helper, and fixture JSON path
-        assignment, removal, merge, null handling, arrays, type validation,
-        stale-filter behavior, conflict handling, and audit ordering.
-  - [ ] Admit the selected `_doc` patch/update surface by lowering to native
-        document patch/update requests; keep generated-field updates,
-        unsupported JSON patch shapes, and broad projection-field updates as
-        stable diagnostics.
-  - [ ] Admit projection-column writes only after virtual-schema write
-        semantics are proven for field paths, nullability, type validation,
-        defaults, generated-field rejection, and `additionalProperties`; admitted
-        fixtures must construct JSON documents or native document patches, never
-        relational row inserts or mutation-source plans.
-  - [ ] Admit `TRUNCATE docs` only after document table-emptying semantics have
-        bounded deletion, audit, row-filter, and identity-reset behavior pinned.
-  - [ ] Admit `MERGE INTO docs ...` only after document match, insert, update,
-        delete, no-op, conflict, audit, and row-filter ordering semantics are
-        pinned.
+  Admit each document-write shape only after it lowers to the typed native
+  document request model and has SQL/native parity evidence. Keep
+  `ON CONFLICT`, `RETURNING`, source-query projection inserts, broad
+  projection updates, broad insert/update/delete, truncate, and merge rejected
+  until the specific slice below admits that shape with corpus and runtime
+  proof.
+
+  - [ ] Admit indexed-producer document mutations.
+        Lower `UPDATE docs SET ... WHERE mapped_field <op> value` and
+        `DELETE FROM docs WHERE mapped_field <op> value` through
+        `LoweredDocumentProducerMutation` only when the predicate has an exact
+        indexed/native producer. Close this with equality, `IN`, range,
+        boolean/null, nested mapped-path, version-predicate, no-match,
+        stale-version, residual-rejection, corpus-summary, coverage-bucket, and
+        runtime-parity tests.
+  - [ ] Admit bounded-scan document mutations.
+        Lower residual-filtered `UPDATE` and `DELETE` only when the producer
+        carries explicit row and byte caps plus a stable residual predicate.
+        Close this with cap-enforcement, ordering/limit rejection or exact
+        semantics, partial-match, no-match, audit/filter/auth ordering,
+        corpus-summary, coverage-bucket, and runtime-parity tests.
+  - [ ] Admit joined and source-derived document mutations.
+        Lower `UPDATE docs ... FROM ...`, `DELETE FROM docs USING ...`, and
+        source-derived assignments only when the join/source has deterministic
+        cardinality, deterministic ordering, and an exact native candidate
+        producer. Close this with duplicate-source handling, assignment
+        expression binding, version predicates, conflict/no-match behavior,
+        stable rejection of relational mutation-row fallbacks, corpus summaries,
+        required coverage buckets, and runtime parity.
+  - [ ] Admit projection-write `ON CONFLICT`.
+        Lower `DO NOTHING` and `DO UPDATE` only to native document write
+        semantics, with explicit behavior for `_version`, generated fields,
+        nested-path assignments, conflict target validation, conflict/no-op row
+        reporting, corpus plan summaries, required coverage buckets, and runtime
+        parity.
+  - [ ] Admit projection-write `RETURNING`.
+        Return `_id`, `_doc`, virtual fields, projection aliases, generated
+        columns, conflict/no-op rows, and updated version metadata with the same
+        shape as the native/API path. Close this with corpus plan summaries,
+        required coverage buckets, runtime parity, and stable diagnostics for
+        unsupported returning expressions.
+  - [ ] Admit source-query projection writes.
+        Lower `INSERT INTO docs (...) SELECT ...` only when the source has
+        deterministic ordering and bounded cardinality or an explicit native
+        producer contract. Prove source ordering, source limits, duplicate-key
+        handling, conflict behavior, schema validation, corpus plan summaries,
+        required coverage buckets, runtime parity, and stable rejection of
+        relational mutation-source plans.
+  - [ ] Admit `TRUNCATE docs`.
+        Close this with source-corpus fixtures and runtime parity for document
+        table-emptying, bounded deletion, audit-required behavior, row-filter
+        interaction, conflict/no-match reporting, identity-reset behavior, and
+        stable diagnostics for unsupported restart/cascade variants.
+  - [ ] Admit `MERGE INTO docs ...`.
+        Close this with source-corpus fixtures and runtime parity for document
+        match, insert, update, delete, no-op, conflict, audit-required,
+        row-filter, stale-filter, generated-field, schema-validation, and
+        no-match ordering semantics.
 
 - [ ] **Finish document query and view-mapping hardening**
-  The current tracking manifests are
+  Keep the tracking manifests
   `zig/pkg/antfly/src/sql/fixtures/document_sql_bounded_scan_inventory.json` and
   `zig/pkg/antfly/src/sql/fixtures/document_sql_read_expansion_gate.json`. Keep
   those manifests in sync with this section whenever an admitted bounded-scan
   contract is removed or a blocked read-expansion surface is admitted.
-  The current single-array equality-filtered `UNNEST` shape is proven by
-  `api.table_reads.docid document sql view mapping runtime results match native
-  document reads`, which requires
-  `DocumentSqlCapabilities.indexed_array_element_paths` and asserts the native
-  `indexed_query` path.
-  Bounded-scan admission is narrowed to the
-  `mapped-view-residual-bounded-scan` inventory entry; uninventoried mapped-view
-  range, `IN`, ordered, array/`UNNEST`, and other predicate families now require
-  an exact indexed/native producer or fail with
+  Uninventoried mapped-view range, `IN`, ordered, array/`UNNEST`, and other
+  predicate families require an exact indexed/native producer or fail with
   `document_sql_bounded_scan_missing_exact_producer`.
 
-  - [ ] Prove bounded-scan residual behavior is exact before deleting the last
-        fallback. The remaining `mapped-view-residual-bounded-scan` contract
-        needs runtime evidence for row caps, byte caps, residual filtering,
-        limit interaction, ordering rejection, and the stable
+  - [ ] Replace `mapped-view-residual-bounded-scan` with an exact producer.
+        Add runtime evidence for row caps, byte caps, residual filtering, limit
+        interaction, ordering rejection, and the stable
         `document_sql_bounded_scan_missing_exact_producer` diagnostic. Delete
         the inventory entry only in the same patch that replaces it with an
-        exact native/indexed producer and matching runtime parity test.
+        exact native/indexed producer and matching runtime parity tests.
   - [ ] Admit `additional-array-unnest-patterns`: add JSON corpus fixtures for
         multiple arrays, nested arrays, aliasing, non-equality predicates, empty
         arrays, missing arrays, and rejected cartesian-expansion shapes; add
         required coverage buckets and executable runtime parity tests proving
         exact native `array_any`/indexed-array behavior before expanding the
-        current single-array equality-filtered contract.
+        admitted array-unnest contract.
   - [ ] Admit `additional-mapped-fields`: add JSON corpus fixtures for scalar,
         numeric, boolean, text, optional, missing, nested, and multi-field view
         mappings; add required coverage buckets and executable runtime parity

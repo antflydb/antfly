@@ -15,9 +15,15 @@
 const std = @import("std");
 
 const ddl_plan = @import("ddl_plan.zig");
-const expr_type = @import("expr/type.zig");
+const expr_aggregate = @import("expr/aggregate.zig");
+const expr_order = @import("expr/order.zig");
+const expr_predicate = @import("expr/predicate.zig");
 const expr_projection = @import("expr/projection.zig");
+const expr_type = @import("expr/type.zig");
+const expr_where_condition = @import("expr/where_condition.zig");
+const expr_window = @import("expr/window.zig");
 const generated_parser = @import("generated_parser.zig");
+const generated_read_validate = @import("generated_read_validate.zig");
 const lower_dml = @import("lower_dml.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
@@ -80,7 +86,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
     return struct {
         const Accessors = @This();
 
-        pub fn selectParserContextHooks(ptr: *ParserType) lower_expr.SelectParserContextHooks {
+        pub fn selectParserContextHooks(ptr: *ParserType) expr_row_parse.SelectParserContextHooks {
             return .{
                 .ptr = ptr,
                 .get_context = Accessors.getSelectParserContextHook,
@@ -105,7 +111,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn joinedExpressionParserContextHooks(ptr: *ParserType) lower_expr.JoinedExpressionParserContextHooks {
+        pub fn joinedExpressionParserContextHooks(ptr: *ParserType) expr_row_parse.JoinedExpressionParserContextHooks {
             return .{
                 .ptr = ptr,
                 .get_context = Accessors.getJoinedExpressionParserContextHook,
@@ -492,20 +498,20 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn aggregateOutputFieldExpressionConditionParserOptions(ptr: *ParserType) lower_expr.AggregateOutputFieldExpressionConditionParserOptions {
+        pub fn aggregateOutputFieldExpressionConditionParserOptions(ptr: *ParserType) expr_aggregate.OutputFieldExpressionConditionParserOptions {
             return .{
                 .params = ptr.params,
                 .output_field_options = Accessors.aggregateOutputFieldParserOptions(ptr),
             };
         }
 
-        pub fn bareBooleanWhereExpressionParserOptions(ptr: *ParserType) lower_expr.BareBooleanWhereExpressionParserOptions {
+        pub fn bareBooleanWhereExpressionParserOptions(ptr: *ParserType) expr_predicate.BareBooleanWhereExpressionParserOptions {
             return .{
                 .boolean_hooks = Accessors.booleanRowExpressionParserHooks(ptr),
             };
         }
 
-        pub fn outputOrderExpressionParserOptions(ptr: *ParserType) lower_expr.OutputOrderExpressionParserOptions {
+        pub fn outputOrderExpressionParserOptions(ptr: *ParserType) expr_order.OutputExpressionParserOptions {
             return .{
                 .function_bindings = ptr.function_bindings,
                 .context_hooks = Accessors.selectParserContextHooks(ptr),
@@ -513,7 +519,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn returningProjectionParserOptions(ptr: *ParserType) lower_expr.ReturningProjectionParserOptions {
+        pub fn returningProjectionParserOptions(ptr: *ParserType) expr_projection.ReturningProjectionParserOptions {
             return .{
                 .params = ptr.params,
                 .function_bindings = ptr.function_bindings,
@@ -524,7 +530,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn joinedMutationReturningProjectionParserOptions(ptr: *ParserType) lower_expr.JoinedMutationReturningProjectionParserOptions {
+        pub fn joinedMutationReturningProjectionParserOptions(ptr: *ParserType) expr_projection.JoinedMutationReturningProjectionParserOptions {
             return .{
                 .params = ptr.params,
                 .function_bindings = ptr.function_bindings,
@@ -536,7 +542,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn orderByParserOptions(ptr: *ParserType) lower_expr.OrderByParserOptions {
+        pub fn orderByParserOptions(ptr: *ParserType) expr_order.ByParserOptions {
             return .{
                 .schema = ptr.schema,
                 .function_bindings = ptr.function_bindings,
@@ -549,7 +555,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn orderExpressionParserOptions(ptr: *ParserType) lower_expr.OrderExpressionParserOptions {
+        pub fn orderExpressionParserOptions(ptr: *ParserType) expr_order.OrderExpressionParserOptions {
             return .{
                 .field_source = expr_type.rowExpressionFieldSourceOrDefault(ptr.row_expression_field_source_override),
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
@@ -561,7 +567,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn aggregateSpecParserOptions(ptr: *ParserType) lower_expr.AggregateSpecParserOptions {
+        pub fn aggregateSpecParserOptions(ptr: *ParserType) expr_aggregate.SpecParserOptions {
             return .{
                 .function_bindings = ptr.function_bindings,
                 .order_expression_hooks = Accessors.orderExpressionParserOptions(ptr),
@@ -578,7 +584,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn aggregateOutputFieldParserOptions(ptr: *ParserType) lower_expr.AggregateOutputFieldParserOptions {
+        pub fn aggregateOutputFieldParserOptions(ptr: *ParserType) expr_aggregate.OutputFieldParserOptions {
             return .{
                 .params = ptr.params,
                 .context_hooks = Accessors.selectParserContextHooks(ptr),
@@ -599,7 +605,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn expressionWhereConditionsParserHooks(ptr: *ParserType) lower_expr.ExpressionWhereConditionsParserOptions {
+        pub fn expressionWhereConditionsParserHooks(ptr: *ParserType) expr_where_condition.ExpressionWhereConditionsParserOptions {
             return .{
                 .select_context_hooks = Accessors.selectParserContextHooks(ptr),
                 .joined_context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
@@ -609,7 +615,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn expressionWhereConditionAlternativesParserHooks(ptr: *ParserType) lower_expr.ExpressionWhereConditionAlternativesParserOptions {
+        pub fn expressionWhereConditionAlternativesParserHooks(ptr: *ParserType) expr_where_condition.ExpressionWhereConditionAlternativesParserOptions {
             return .{
                 .select_context_hooks = Accessors.selectParserContextHooks(ptr),
                 .joined_context_hooks = Accessors.joinedExpressionParserContextHooks(ptr),
@@ -619,7 +625,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn selectFieldItemParserOptions(ptr: *ParserType) lower_expr.SelectFieldItemParserOptions {
+        pub fn selectFieldItemParserOptions(ptr: *ParserType) expr_projection.SelectFieldItemParserOptions {
             return .{
                 .type_context = Accessors.rowExpressionTypeContext(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -627,7 +633,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn coalesceProjectionParserOptions(ptr: *ParserType) lower_expr.CoalesceProjectionParserOptions {
+        pub fn coalesceProjectionParserOptions(ptr: *ParserType) expr_projection.CoalesceProjectionParserOptions {
             return .{
                 .params = ptr.params,
             };
@@ -639,7 +645,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn selectItemParserOptions(ptr: *ParserType) lower_expr.SelectItemParserOptions {
+        pub fn selectItemParserOptions(ptr: *ParserType) expr_projection.SelectItemParserOptions {
             return .{
                 .expression = Accessors.expressionProjectionParserOptions(ptr),
                 .json_value_expression = Accessors.jsonValueExpressionProjectionParserOptions(ptr),
@@ -649,7 +655,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn windowSpecParserOptions(ptr: *ParserType) lower_expr.WindowSpecParserOptions {
+        pub fn windowSpecParserOptions(ptr: *ParserType) expr_window.WindowSpecParserOptions {
             return .{
                 .row_expression_hooks = Accessors.rowExpressionParserHooks(ptr),
                 .arithmetic_hooks = Accessors.arithmeticExpressionParserHooks(ptr),
@@ -662,7 +668,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn rowExpressionOperandParserOptions(ptr: *ParserType) lower_expr.RowExpressionOperandParserOptions {
+        pub fn rowExpressionOperandParserOptions(ptr: *ParserType) expr_row_parse.RowExpressionOperandParserOptions {
             return .{
                 .extension_function = Accessors.extensionFunctionRowExpressionParserOptions(ptr),
                 .routine_expression = Accessors.routineExpressionRowExpressionParserOptions(ptr),
@@ -750,7 +756,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .context_hooks = Accessors.joinParserContextHooks(ptr),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
                 .output_order_expression_options = Accessors.outputOrderExpressionParserOptions(ptr),
-                .string_to_array_predicate_is_containment = lower_expr.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
+                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
                 .realtime_ns = value_mod.currentRealtimeNs(),
             };
         }
@@ -764,7 +770,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .subquery_hooks = Accessors.lateralSubqueryParserHooks(ptr),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
                 .output_order_expression_options = Accessors.outputOrderExpressionParserOptions(ptr),
-                .string_to_array_predicate_is_containment = lower_expr.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
+                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
                 .realtime_ns = value_mod.currentRealtimeNs(),
             };
         }
@@ -1010,7 +1016,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .row_claim = try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
                 .ctes = ctes,
                 .base_table_name = base_table_name,
-                .string_to_array_predicate_is_containment = lower_expr.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
+                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
                 .context_hooks = Accessors.joinedMutationSourceParserContextHooks(ptr),
                 .assignment_options = Accessors.joinedMutationAssignmentValueParserOptions(ptr),
                 .generated_assignment_items = ptr.generated_assignment_items,
@@ -1042,7 +1048,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .row_claim = try lower_dml.mutationRowClaimAlloc(ptr.alloc, ptr.mutation_claim, false),
                 .ctes = ctes,
                 .base_table_name = base_table_name,
-                .string_to_array_predicate_is_containment = lower_expr.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
+                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(ptr.tokens, ptr.pos),
                 .context_hooks = Accessors.joinedMutationSourceParserContextHooks(ptr),
                 .generated_dml_ast = ptr.generated_dml_ast,
                 .source_query_context_hooks = Accessors.semiJoinSourceQueryParserContextHooks(ptr),
@@ -1318,7 +1324,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn parseRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try lower_expr.parseRowExpressionOperandFromContextAlloc(
+            return try expr_row_parse.parseRowExpressionOperandFromContextAlloc(
                 self.alloc,
                 self.tokens,
                 &self.pos,
@@ -1334,7 +1340,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
 
         pub fn parseFixedUnaryRowExpressionOperandHook(ptr: *anyopaque) anyerror!db_mod.types.RelationalRowsExpression {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try lower_expr.parseRowExpressionFromContextAlloc(
+            return try expr_row_parse.parseRowExpressionFromContextAlloc(
                 self.alloc,
                 self.tokens,
                 &self.pos,
@@ -1360,7 +1366,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 if (ptr.tokens[body.end - 1].source_end != tokens[tokens.len - 1].source_end) continue;
                 var cloned = try generated_parser.cloneCteBodyReadAstAlloc(ptr.alloc, parent.statement_span, cte);
                 errdefer cloned.deinit(ptr.alloc);
-                try lower_expr.validateGeneratedReadAstPayloads(tokens, cloned);
+                try generated_read_validate.validateGeneratedReadAstPayloads(tokens, cloned);
                 return cloned;
             }
             return error.UnsupportedSqlShape;
@@ -1381,7 +1387,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             if (ptr.tokens[body.end - 1].source_end != tokens[tokens.len - 1].source_end) return error.UnsupportedSqlShape;
             var cloned = try generated_parser.cloneCteBodyReadAstAlloc(ptr.alloc, parent.statement_span, cte.*);
             errdefer cloned.deinit(ptr.alloc);
-            try lower_expr.validateGeneratedReadAstPayloads(tokens, cloned);
+            try generated_read_validate.validateGeneratedReadAstPayloads(tokens, cloned);
             return cloned;
         }
 
@@ -1606,7 +1612,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .join_type = join_type,
                 .left_alias = left_alias,
                 .right_alias = right_alias,
-                .string_to_array_predicate_is_containment = lower_expr.stringToArrayPredicateIsContainment(sub.tokens, sub.pos),
+                .string_to_array_predicate_is_containment = expr_predicate.stringToArrayPredicateIsContainment(sub.tokens, sub.pos),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(&sub),
                 .realtime_ns = value_mod.currentRealtimeNs(),
             });
@@ -1633,7 +1639,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             select: plan.SelectList,
         ) anyerror!void {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
-            return try lower_expr.parseSelectOutputOrderByAlloc(
+            return try expr_order.parseSelectOutputByAlloc(
                 self.alloc,
                 self.tokens,
                 &self.pos,
@@ -1701,7 +1707,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             self.pending_joined_source_alias = context.pending_joined_source_alias;
         }
 
-        pub fn getJoinedExpressionParserContextHook(ptr: *anyopaque) lower_expr.JoinedExpressionParserContext {
+        pub fn getJoinedExpressionParserContextHook(ptr: *anyopaque) expr_row_parse.JoinedExpressionParserContext {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             return .{
                 .joined_target_expression_qualifiers = self.joined_target_expression_qualifiers,
@@ -1710,7 +1716,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn setJoinedExpressionParserContextHook(ptr: *anyopaque, context: lower_expr.JoinedExpressionParserContext) void {
+        pub fn setJoinedExpressionParserContextHook(ptr: *anyopaque, context: expr_row_parse.JoinedExpressionParserContext) void {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             self.joined_target_expression_qualifiers = context.joined_target_expression_qualifiers;
             self.joined_source_expression_qualifiers = context.joined_source_expression_qualifiers;
@@ -1745,7 +1751,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             self.field_expression_qualifiers = context.field_expression_qualifiers;
         }
 
-        pub fn getSelectParserContextHook(ptr: *anyopaque) lower_expr.SelectParserContext {
+        pub fn getSelectParserContextHook(ptr: *anyopaque) expr_row_parse.SelectParserContext {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             return .{
                 .schema = self.schema,
@@ -1755,7 +1761,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             };
         }
 
-        pub fn setSelectParserContextHook(ptr: *anyopaque, context: lower_expr.SelectParserContext) void {
+        pub fn setSelectParserContextHook(ptr: *anyopaque, context: expr_row_parse.SelectParserContext) void {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             self.schema = context.schema;
             self.field_expression_qualifiers = context.field_expression_qualifiers;

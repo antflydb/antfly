@@ -2187,7 +2187,10 @@ fn generatedDdlRequiredRangesArePresent(ddl_ast: generated_parser.GeneratedSqlDd
         .create_graph_index,
         .create_graph_metric,
         => true,
-        .comment => ddl_ast.comment_target_tokens != null and (ddl_ast.comment_value_tokens != null or (ddl_ast.comment_value_is_null orelse false)),
+        .comment,
+        .security_label,
+        => ddl_ast.comment_target_tokens != null and (ddl_ast.comment_value_tokens != null or (ddl_ast.comment_value_is_null orelse false)),
+        .alter_default_privileges,
         .grant,
         .revoke,
         => ddl_ast.privilege_items.items.len > 0 and ddl_ast.privilege_principal_tokens != null,
@@ -2433,10 +2436,290 @@ fn generatedUnsupportedShapePayloadIsValid(
 ) bool {
     if (!generatedUnsupportedSubjectRangeMatchesKind(tokens, end, unsupported_ast)) return false;
     return switch (unsupported_ast.kind) {
+        .alter_function, .alter_procedure => generatedAlterRoutineUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
+        .alter_table_access_method,
+        .alter_table_cluster,
+        .alter_table_column_statistics,
+        .alter_table_column_storage,
+        .alter_table_inheritance,
+        .alter_table_owner,
+        .alter_table_persistence,
+        .alter_table_replica_identity,
+        .alter_table_set_schema,
+        .alter_table_storage_parameters,
+        .alter_table_tablespace,
+        .alter_table_trigger_state,
+        => generatedAlterTableUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         .explain => generatedExplainUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         .graph_query => generatedGraphQueryUnsupportedPayloadIsValid(tokens, end, unsupported_ast),
         else => true,
     };
+}
+
+fn generatedAlterRoutineUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    const expected: TokenKeyword = switch (unsupported_ast.kind) {
+        .alter_function => .function,
+        .alter_procedure => .procedure,
+        else => return false,
+    };
+    if (end <= 6 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(expected)) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    if (subject.start != 1 or subject.end != end) return false;
+    const routine_name = unsupported_ast.routine_name_tokens orelse return false;
+    if (routine_name.start != 2 or routine_name.end != 3 or routine_name.end >= end or tokens[routine_name.start].kind != .identifier) return false;
+    if (tokens[routine_name.end].kind != .lparen) return false;
+    const signature_close = generatedMatchingParenIndex(tokens, routine_name.end, end) orelse return false;
+    const operation = unsupported_ast.routine_operation_tokens orelse return false;
+    if (operation.start != signature_close + 1 or operation.end != end or operation.start >= operation.end) return false;
+    const routine_metadata = unsupported_ast.routine_metadata orelse return false;
+    return generatedUnsupportedPlainTokenListMatches(tokens, .{ .start = routine_name.end + 1, .end = signature_close }, &routine_metadata.argument_items);
+}
+
+fn generatedAlterTableUnsupportedPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    unsupported_ast: generated_parser.GeneratedSqlUnsupportedAst,
+) bool {
+    if (end <= 3 or !tokens[0].matchesKeywordTag(.alter) or !tokens[1].matchesKeywordTag(.table)) return false;
+    const subject = unsupported_ast.subject_tokens orelse return false;
+    if (subject.start != 1 or subject.end != end) return false;
+    var index: usize = 2;
+    if (index + 1 < end and tokens[index].matchesKeywordTag(.@"if") and tokens[index + 1].matchesKeywordTag(.exists)) index += 2;
+    if (index < end and tokens[index].matchesKeywordTag(.only)) index += 1;
+    const table = unsupported_ast.alter_table_name_tokens orelse return false;
+    if (table.start != index or table.end != index + 1 or table.end >= end or tokens[table.start].kind != .identifier) return false;
+    index = table.end;
+    const operation = unsupported_ast.alter_table_operation_tokens orelse return false;
+    if (operation.start != index or operation.end != end or operation.start >= operation.end) return false;
+    return generatedAlterTableUnsupportedOperationMatchesKind(tokens, operation, unsupported_ast.kind);
+}
+
+fn generatedAlterTableUnsupportedOperationMatchesKind(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+    kind: generated_parser.GeneratedSqlUnsupportedKind,
+) bool {
+    const start = operation.start;
+    const end = operation.end;
+    if (end > tokens.len or start >= end) return false;
+    return switch (kind) {
+        .alter_table_access_method => end == start + 4 and
+            tokens[start].matchesKeywordTag(.set) and
+            tokens[start + 1].matchesKeywordTag(.access) and
+            tokens[start + 2].matchesKeywordTag(.method) and
+            tokens[start + 3].kind == .identifier,
+        .alter_table_cluster => (end == start + 3 and
+            tokens[start].matchesKeywordTag(.cluster) and
+            tokens[start + 1].matchesKeywordTag(.on) and
+            tokens[start + 2].kind == .identifier) or
+            (end == start + 3 and
+                tokens[start].matchesKeywordTag(.set) and
+                tokens[start + 1].matchesKeywordTag(.without) and
+                tokens[start + 2].matchesKeywordTag(.cluster)),
+        .alter_table_column_statistics => generatedAlterTableUnsupportedColumnStatisticsIsValid(tokens, operation),
+        .alter_table_column_storage => generatedAlterTableUnsupportedColumnStorageIsValid(tokens, operation),
+        .alter_table_inheritance => (end == start + 2 and
+            tokens[start].matchesKeyword("inherit") and
+            tokens[start + 1].kind == .identifier) or
+            (end == start + 3 and
+                tokens[start].matchesKeywordTag(.no) and
+                tokens[start + 1].matchesKeyword("inherit") and
+                tokens[start + 2].kind == .identifier),
+        .alter_table_owner => end == start + 3 and
+            tokens[start].matchesKeyword("owner") and
+            tokens[start + 1].matchesKeywordTag(.to) and
+            tokens[start + 2].kind == .identifier,
+        .alter_table_persistence => end == start + 2 and
+            tokens[start].matchesKeywordTag(.set) and
+            (tokens[start + 1].matchesKeyword("logged") or tokens[start + 1].matchesKeywordTag(.unlogged)),
+        .alter_table_replica_identity => generatedAlterTableUnsupportedReplicaIdentityIsValid(tokens, operation),
+        .alter_table_set_schema => end == start + 3 and
+            tokens[start].matchesKeywordTag(.set) and
+            tokens[start + 1].matchesKeywordTag(.schema) and
+            tokens[start + 2].kind == .identifier,
+        .alter_table_storage_parameters => generatedAlterTableUnsupportedStorageParametersAreValid(tokens, operation),
+        .alter_table_tablespace => end == start + 3 and
+            tokens[start].matchesKeywordTag(.set) and
+            tokens[start + 1].matchesKeywordTag(.tablespace) and
+            tokens[start + 2].kind == .identifier,
+        .alter_table_trigger_state => generatedAlterTableUnsupportedTriggerStateIsValid(tokens, operation),
+        else => false,
+    };
+}
+
+fn generatedAlterTableUnsupportedStorageParametersAreValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (operation.start + 4 > operation.end or operation.end > tokens.len) return false;
+    if (!(tokens[operation.start].matchesKeywordTag(.set) or tokens[operation.start].matchesKeywordTag(.reset))) return false;
+    if (tokens[operation.start + 1].kind != .lparen or tokens[operation.end - 1].kind != .rparen) return false;
+    var depth: usize = 0;
+    var saw_parameter_token = false;
+    var index = operation.start + 1;
+    while (index < operation.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .identifier, .number, .string => {
+                if (depth == 1) saw_parameter_token = true;
+            },
+            else => {},
+        }
+    }
+    return depth == 0 and saw_parameter_token;
+}
+
+fn generatedAlterTableUnsupportedColumnStatisticsIsValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    var index = operation.start;
+    if (operation.end > tokens.len or index >= operation.end) return false;
+    if (!tokens[index].matchesKeywordTag(.alter)) return false;
+    index += 1;
+    if (index < operation.end and tokens[index].matchesKeywordTag(.column)) index += 1;
+    if (index >= operation.end or tokens[index].kind != .identifier) return false;
+    index += 1;
+    return index + 3 == operation.end and
+        tokens[index].matchesKeywordTag(.set) and
+        tokens[index + 1].matchesKeyword("statistics") and
+        tokens[index + 2].kind == .number;
+}
+
+fn generatedAlterTableUnsupportedColumnStorageIsValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    var index = operation.start;
+    if (operation.end > tokens.len or index >= operation.end) return false;
+    if (!tokens[index].matchesKeywordTag(.alter)) return false;
+    index += 1;
+    if (index < operation.end and tokens[index].matchesKeywordTag(.column)) index += 1;
+    if (index >= operation.end or tokens[index].kind != .identifier) return false;
+    index += 1;
+    return index + 3 == operation.end and
+        tokens[index].matchesKeywordTag(.set) and
+        tokens[index + 1].matchesKeyword("storage") and
+        generatedAlterTableUnsupportedColumnStorageModeIsValid(tokens[index + 2]);
+}
+
+fn generatedAlterTableUnsupportedColumnStorageModeIsValid(token: Token) bool {
+    return token.matchesKeywordTag(.default) or
+        token.matchesKeyword("plain") or
+        token.matchesKeyword("external") or
+        token.matchesKeyword("extended") or
+        token.matchesKeyword("main");
+}
+
+fn generatedAlterTableUnsupportedReplicaIdentityIsValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    const start = operation.start;
+    const end = operation.end;
+    if (end > tokens.len or start + 3 > end) return false;
+    if (!tokens[start].matchesKeyword("replica") or !tokens[start + 1].matchesKeyword("identity")) return false;
+    if (end == start + 3) {
+        return tokens[start + 2].matchesKeyword("default") or
+            tokens[start + 2].matchesKeywordTag(.full) or
+            tokens[start + 2].matchesKeyword("nothing");
+    }
+    return end == start + 5 and
+        tokens[start + 2].matchesKeywordTag(.using) and
+        tokens[start + 3].matchesKeywordTag(.index) and
+        tokens[start + 4].kind == .identifier;
+}
+
+fn generatedAlterTableUnsupportedTriggerStateIsValid(
+    tokens: []const Token,
+    operation: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    var index = operation.start;
+    if (operation.end > tokens.len or index >= operation.end) return false;
+    if (!(tokens[index].matchesKeyword("enable") or tokens[index].matchesKeyword("disable"))) return false;
+    index += 1;
+    if (index < operation.end and (tokens[index].matchesKeywordTag(.always) or tokens[index].matchesKeyword("replica"))) index += 1;
+    if (index >= operation.end or !tokens[index].matchesKeywordTag(.trigger)) return false;
+    index += 1;
+    if (index + 1 == operation.end and (tokens[index].matchesKeywordTag(.all) or tokens[index].matchesKeywordTag(.user))) return true;
+    return index + 1 == operation.end and tokens[index].kind == .identifier;
+}
+
+fn generatedUnsupportedPlainTokenListMatches(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    items: *const generated_parser.GeneratedSqlListAst,
+) bool {
+    if (range.end > tokens.len or range.start > range.end) return false;
+    if (range.start == range.end) {
+        return items.count == 0 and
+            items.first_tokens == null and
+            items.last_tokens == null and
+            items.items.len == 0 and
+            items.expression_items.len == 0 and
+            items.alias_items.len == 0 and
+            items.alias_name_items.len == 0 and
+            items.direction_items.len == 0 and
+            items.directions.len == 0 and
+            items.order_using_operator_items.len == 0 and
+            items.nulls_order_items.len == 0 and
+            items.nulls_orders.len == 0 and
+            items.expressions.len == 0;
+    }
+    if (items.count == 0 or items.items.len != items.count) return false;
+    if (items.first_tokens == null or items.last_tokens == null) return false;
+    var item_index: usize = 0;
+    var item_start = range.start;
+    var depth: usize = 0;
+    var index = range.start;
+    while (index < range.end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return false;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) {
+                if (item_index >= items.items.len) return false;
+                if (!std.meta.eql(items.items[item_index], generated_parser.GeneratedSqlTokenRange{ .start = item_start, .end = index })) return false;
+                item_index += 1;
+                item_start = index + 1;
+            },
+            else => {},
+        }
+    }
+    if (depth != 0 or item_index >= items.items.len) return false;
+    if (!std.meta.eql(items.items[item_index], generated_parser.GeneratedSqlTokenRange{ .start = item_start, .end = range.end })) return false;
+    item_index += 1;
+    if (item_index != items.items.len or items.count != item_index) return false;
+    return std.meta.eql(items.first_tokens.?, items.items[0]) and
+        std.meta.eql(items.last_tokens.?, items.items[items.items.len - 1]);
+}
+
+fn generatedMatchingParenIndex(tokens: []const Token, open_index: usize, end: usize) ?usize {
+    if (open_index >= end or tokens[open_index].kind != .lparen) return null;
+    var depth: usize = 0;
+    var index = open_index;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth == 0) return null;
+                depth -= 1;
+                if (depth == 0) return index;
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 fn generatedExplainUnsupportedPayloadIsValid(
@@ -6179,8 +6462,13 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .alter_statistics,
         .alter_table_access_method,
         .alter_table_cluster,
+        .alter_table_column_statistics,
+        .alter_table_column_storage,
+        .alter_table_inheritance,
         .alter_table_owner,
         .alter_table_persistence,
+        .alter_table_replica_identity,
+        .alter_table_set_schema,
         .alter_table_storage_parameters,
         .alter_table_tablespace,
         .alter_table_trigger_state,
@@ -6196,6 +6484,7 @@ fn generatedUnsupportedUsesDdlPlanBoundary(kind: generated_parser.GeneratedSqlUn
         .create_access_method,
         .create_conversion,
         .create_database_options,
+        .create_document_table_shorthand,
         .create_event_trigger,
         .create_foreign_data_wrapper,
         .create_foreign_table,
@@ -7546,6 +7835,31 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .alter_table_cluster_not_planned_by_generated_parser,
         },
         .{
+            .sql = "ALTER TABLE usage_records INHERIT base_usage_records",
+            .kind = .alter_table_inheritance,
+            .reason = .alter_table_inheritance_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records ALTER COLUMN status SET STATISTICS 100",
+            .kind = .alter_table_column_statistics,
+            .reason = .alter_table_column_statistics_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records ALTER COLUMN metadata SET STORAGE EXTENDED",
+            .kind = .alter_table_column_storage,
+            .reason = .alter_table_column_storage_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records SET SCHEMA archive",
+            .kind = .alter_table_set_schema,
+            .reason = .alter_table_set_schema_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "ALTER TABLE usage_records REPLICA IDENTITY FULL",
+            .kind = .alter_table_replica_identity,
+            .reason = .alter_table_replica_identity_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "ALTER TABLE usage_records ENABLE TRIGGER usage_audit",
             .kind = .alter_table_trigger_state,
             .reason = .alter_table_trigger_state_not_planned_by_generated_parser,
@@ -7672,6 +7986,11 @@ test "sql adapter parsed sql owns typed statement variants" {
         },
         .{
             .sql = "CREATE LANGUAGE usage_lang",
+            .kind = .create_language,
+            .reason = .create_language_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "CREATE PROCEDURAL LANGUAGE usage_lang",
             .kind = .create_language,
             .reason = .create_language_not_planned_by_generated_parser,
         },
@@ -7981,7 +8300,7 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .role_session_control_not_planned_by_generated_parser,
         },
         .{
-            .sql = "SECURITY LABEL ON TABLE usage_records IS 'internal'",
+            .sql = "SECURITY LABEL ON SEQUENCE usage_records_id_seq IS 'unsupported'",
             .kind = .security_label,
             .reason = .security_label_not_planned_by_generated_parser,
         },
@@ -9466,6 +9785,258 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(unsupported_copy.raw_statement, malformed_unsupported_subject, &unsupported_copy.tokenized_sql)),
+    );
+
+    var unsupported_foreign_data_wrapper = try ParsedSql.initAlloc(alloc, "CREATE FOREIGN DATA WRAPPER usage_fdw HANDLER usage_fdw_handler");
+    defer unsupported_foreign_data_wrapper.deinit(alloc);
+    var malformed_foreign_data_command_span = unsupported_foreign_data_wrapper.generated_statement.?;
+    if (malformed_foreign_data_command_span.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.command_span.start += 1,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_foreign_data_wrapper.raw_statement, malformed_foreign_data_command_span, &unsupported_foreign_data_wrapper.tokenized_sql)),
+    );
+
+    var mismatched_foreign_data_reason = unsupported_foreign_data_wrapper.generated_statement.?;
+    if (mismatched_foreign_data_reason.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.reason = .create_server_not_planned_by_generated_parser,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_foreign_data_wrapper.raw_statement, mismatched_foreign_data_reason, &unsupported_foreign_data_wrapper.tokenized_sql)),
+    );
+
+    var unsupported_operator_class = try ParsedSql.initAlloc(alloc, "CREATE OPERATOR CLASS usage_ops DEFAULT FOR TYPE text USING btree AS OPERATOR 1 < (text, text)");
+    defer unsupported_operator_class.deinit(alloc);
+    var mismatched_operator_catalog_kind = unsupported_operator_class.generated_statement.?;
+    if (mismatched_operator_catalog_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.kind = .create_operator_family,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_operator_class.raw_statement, mismatched_operator_catalog_kind, &unsupported_operator_class.tokenized_sql)),
+    );
+
+    var malformed_operator_catalog_subject = unsupported_operator_class.generated_statement.?;
+    if (malformed_operator_catalog_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                const subject = unsupported_ast.subject_tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.subject_tokens = .{ .start = subject.start + 1, .end = subject.end };
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_operator_class.raw_statement, malformed_operator_catalog_subject, &unsupported_operator_class.tokenized_sql)),
+    );
+
+    var unsupported_text_search_configuration = try ParsedSql.initAlloc(alloc, "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)");
+    defer unsupported_text_search_configuration.deinit(alloc);
+    var mismatched_text_search_kind = unsupported_text_search_configuration.generated_statement.?;
+    if (mismatched_text_search_kind.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.kind = .create_text_search_dictionary,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_text_search_configuration.raw_statement, mismatched_text_search_kind, &unsupported_text_search_configuration.tokenized_sql)),
+    );
+
+    var malformed_text_search_subject = unsupported_text_search_configuration.generated_statement.?;
+    if (malformed_text_search_subject.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                const subject = unsupported_ast.subject_tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.subject_tokens = .{ .start = subject.start, .end = subject.end - 1 };
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_text_search_configuration.raw_statement, malformed_text_search_subject, &unsupported_text_search_configuration.tokenized_sql)),
+    );
+
+    var unsupported_alter_function = try ParsedSql.initAlloc(alloc, "ALTER FUNCTION normalize_status(text, integer) OWNER TO app_role");
+    defer unsupported_alter_function.deinit(alloc);
+    var missing_alter_function_routine_metadata = unsupported_alter_function.generated_statement.?;
+    if (missing_alter_function_routine_metadata.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.routine_metadata = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_function.raw_statement, missing_alter_function_routine_metadata, &unsupported_alter_function.tokenized_sql)),
+    );
+
+    var unsupported_alter_procedure = try ParsedSql.initAlloc(alloc, "ALTER PROCEDURE refresh_usage_records(text) OWNER TO app_role");
+    defer unsupported_alter_procedure.deinit(alloc);
+    var malformed_alter_procedure_argument = unsupported_alter_procedure.generated_statement.?;
+    if (malformed_alter_procedure_argument.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                const routine_metadata = unsupported_ast.routine_metadata orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(@as(usize, 1), routine_metadata.argument_items.count);
+                routine_metadata.argument_items.items[0].start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_procedure.raw_statement, malformed_alter_procedure_argument, &unsupported_alter_procedure.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_owner = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records OWNER TO app_role");
+    defer unsupported_alter_table_owner.deinit(alloc);
+    var malformed_alter_table_owner_operation = unsupported_alter_table_owner.generated_statement.?;
+    if (malformed_alter_table_owner_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_owner.raw_statement, malformed_alter_table_owner_operation, &unsupported_alter_table_owner.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_storage = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records SET (fillfactor = 70)");
+    defer unsupported_alter_table_storage.deinit(alloc);
+    var malformed_alter_table_storage_operation = unsupported_alter_table_storage.generated_statement.?;
+    if (malformed_alter_table_storage_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 9 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_storage.raw_statement, malformed_alter_table_storage_operation, &unsupported_alter_table_storage.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_inheritance = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records INHERIT base_usage_records");
+    defer unsupported_alter_table_inheritance.deinit(alloc);
+    var malformed_alter_table_inheritance_operation = unsupported_alter_table_inheritance.generated_statement.?;
+    if (malformed_alter_table_inheritance_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 5 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_inheritance.raw_statement, malformed_alter_table_inheritance_operation, &unsupported_alter_table_inheritance.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_column_statistics = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN status SET STATISTICS 100");
+    defer unsupported_alter_table_column_statistics.deinit(alloc);
+    var malformed_alter_table_column_statistics_operation = unsupported_alter_table_column_statistics.generated_statement.?;
+    if (malformed_alter_table_column_statistics_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 9 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_column_statistics.raw_statement, malformed_alter_table_column_statistics_operation, &unsupported_alter_table_column_statistics.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_column_storage = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ALTER COLUMN metadata SET STORAGE EXTENDED");
+    defer unsupported_alter_table_column_storage.deinit(alloc);
+    var malformed_alter_table_column_storage_operation = unsupported_alter_table_column_storage.generated_statement.?;
+    if (malformed_alter_table_column_storage_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 9 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_column_storage.raw_statement, malformed_alter_table_column_storage_operation, &unsupported_alter_table_column_storage.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_set_schema = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records SET SCHEMA archive");
+    defer unsupported_alter_table_set_schema.deinit(alloc);
+    var malformed_alter_table_set_schema_operation = unsupported_alter_table_set_schema.generated_statement.?;
+    if (malformed_alter_table_set_schema_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 6 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_set_schema.raw_statement, malformed_alter_table_set_schema_operation, &unsupported_alter_table_set_schema.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_replica_identity = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records REPLICA IDENTITY USING INDEX usage_records_replica_idx");
+    defer unsupported_alter_table_replica_identity.deinit(alloc);
+    var malformed_alter_table_replica_identity_operation = unsupported_alter_table_replica_identity.generated_statement.?;
+    if (malformed_alter_table_replica_identity_operation.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 3, .end = 8 }, unsupported_ast.alter_table_operation_tokens.?);
+                unsupported_ast.alter_table_operation_tokens.?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_replica_identity.raw_statement, malformed_alter_table_replica_identity_operation, &unsupported_alter_table_replica_identity.tokenized_sql)),
+    );
+
+    var unsupported_alter_table_trigger = try ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ENABLE TRIGGER usage_audit");
+    defer unsupported_alter_table_trigger.deinit(alloc);
+    var missing_alter_table_trigger_name = unsupported_alter_table_trigger.generated_statement.?;
+    if (missing_alter_table_trigger_name.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlTokenRange{ .start = 2, .end = 3 }, unsupported_ast.alter_table_name_tokens.?);
+                unsupported_ast.alter_table_name_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(unsupported_alter_table_trigger.raw_statement, missing_alter_table_trigger_name, &unsupported_alter_table_trigger.tokenized_sql)),
     );
 
     var unsupported_trigger = try ParsedSql.initAlloc(alloc, "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()");

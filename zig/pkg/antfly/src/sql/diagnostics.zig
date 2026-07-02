@@ -243,6 +243,7 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
 pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
     bulk_io_plan,
+    conversion_catalog_plan,
     cte_mutation_source_plan,
     document_sql_bounded_scan_incomplete_topk,
     document_sql_bounded_scan_missing_exact_producer,
@@ -251,6 +252,7 @@ pub const SqlAdapterClassificationReason = enum {
     document_sql_view_mapping_catalog,
     document_sql_view_mapping_unsupported,
     document_sql_write_unsupported,
+    document_table_ddl_duplicate_schema_name,
     document_table_ddl_invalid_antfly_extension,
     document_table_ddl_invalid_dynamic_template,
     document_table_ddl_malformed_schema_json,
@@ -264,16 +266,20 @@ pub const SqlAdapterClassificationReason = enum {
     duplicate_row_batch_target,
     duplicate_update_target,
     enforced_unique_conflict_target,
+    event_trigger_catalog_plan,
     extension,
+    foreign_data_catalog_plan,
     insert_overriding_value_plan,
     invalid_expression_conflict_target,
     invalid_named_conflict_target,
     multi_output_subquery_delete_selector,
     multi_output_subquery_update_selector,
     multi_table_generation_barrier,
+    operator_catalog_plan,
     prepared_transaction_plan,
     recursive_cte_stream_plan,
     role_setting_plan,
+    rule_catalog_plan,
     routine_body_plan,
     routine_option_plan,
     set_operation_output_shape,
@@ -283,16 +289,21 @@ pub const SqlAdapterClassificationReason = enum {
     session_setting,
     set_operation_source_schema,
     set_operation_plan,
+    statistics_catalog_plan,
     system_time_temporal_table,
     table_access_method_plan,
     table_cluster_plan,
+    table_column_statistics_plan,
+    table_column_storage_plan,
     table_owner_plan,
     table_persistence_plan,
     table_storage_parameters_plan,
     table_tablespace_plan,
     table_trigger_state_plan,
     temporal_fk_action,
+    text_search_catalog_plan,
     transaction_control,
+    transform_catalog_plan,
 };
 
 pub fn classificationReasonFromToken(token: []const u8) ?SqlAdapterClassificationReason {
@@ -364,6 +375,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .document_sql_view_mapping_catalog => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .document_sql_view_mapping_unsupported => .{ .category = .stream_materialization },
         .document_sql_write_unsupported => .{ .category = .auth_row_filter, .auth_and_audit = true },
+        .document_table_ddl_duplicate_schema_name,
         .document_table_ddl_invalid_antfly_extension,
         .document_table_ddl_invalid_dynamic_template,
         .document_table_ddl_malformed_schema_json,
@@ -372,6 +384,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .document_table_ddl_multi_document_type_unsupported,
         .document_table_ddl_shorthand,
         .document_table_ddl_unknown_default_type,
+        .conversion_catalog_plan,
         => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .duplicate_conflict_update_target,
         .duplicate_row_batch_target,
@@ -388,15 +401,24 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .set_operation_output_shape,
         => .{ .category = .output_shape_validation },
         .extension,
+        .event_trigger_catalog_plan,
         .schema_namespace,
+        .foreign_data_catalog_plan,
+        .operator_catalog_plan,
+        .rule_catalog_plan,
         .set_operation_source_schema,
+        .statistics_catalog_plan,
         .table_access_method_plan,
         .table_cluster_plan,
+        .table_column_statistics_plan,
+        .table_column_storage_plan,
         .table_owner_plan,
         .table_persistence_plan,
         .table_storage_parameters_plan,
         .table_tablespace_plan,
         .table_trigger_state_plan,
+        .text_search_catalog_plan,
+        .transform_catalog_plan,
         => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .multi_table_generation_barrier => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .prepared_transaction_plan => .{ .category = .prepared_transaction_recovery, .coordinator_recovery = true },
@@ -429,6 +451,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_output_shape"));
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_source_schema"));
     try std.testing.expect(classificationReasonTokenIsKnown("bulk_io_plan"));
+    try std.testing.expectEqual(SqlAdapterClassificationReason.conversion_catalog_plan, classificationReasonFromToken("conversion_catalog_plan").?);
     try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_incomplete_topk, classificationReasonFromToken("document_sql_bounded_scan_incomplete_topk").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_missing_exact_producer, classificationReasonFromToken("document_sql_bounded_scan_missing_exact_producer").?);
@@ -437,6 +460,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_catalog, classificationReasonFromToken("document_sql_view_mapping_catalog").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_unsupported, classificationReasonFromToken("document_sql_view_mapping_unsupported").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_unsupported, classificationReasonFromToken("document_sql_write_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_duplicate_schema_name, classificationReasonFromToken("document_table_ddl_duplicate_schema_name").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_invalid_antfly_extension, classificationReasonFromToken("document_table_ddl_invalid_antfly_extension").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_invalid_dynamic_template, classificationReasonFromToken("document_table_ddl_invalid_dynamic_template").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_malformed_schema_json, classificationReasonFromToken("document_table_ddl_malformed_schema_json").?);
@@ -445,12 +469,19 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_multi_document_type_unsupported, classificationReasonFromToken("document_table_ddl_multi_document_type_unsupported").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_shorthand, classificationReasonFromToken("document_table_ddl_shorthand").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_unknown_default_type, classificationReasonFromToken("document_table_ddl_unknown_default_type").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.event_trigger_catalog_plan, classificationReasonFromToken("event_trigger_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.foreign_data_catalog_plan, classificationReasonFromToken("foreign_data_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.operator_catalog_plan, classificationReasonFromToken("operator_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.prepared_transaction_plan, classificationReasonFromToken("prepared_transaction_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.role_setting_plan, classificationReasonFromToken("role_setting_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.rule_catalog_plan, classificationReasonFromToken("rule_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_body_plan, classificationReasonFromToken("routine_body_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.routine_option_plan, classificationReasonFromToken("routine_option_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_lock_mode_plan, classificationReasonFromToken("row_lock_mode_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_rewrite_expression_plan, classificationReasonFromToken("row_rewrite_expression_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.statistics_catalog_plan, classificationReasonFromToken("statistics_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.text_search_catalog_plan, classificationReasonFromToken("text_search_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.transform_catalog_plan, classificationReasonFromToken("transform_catalog_plan").?);
     try std.testing.expectEqualStrings("multi_table_generation_barrier", classificationReasonToken(.multi_table_generation_barrier));
     try std.testing.expect(classificationReasonIsAdapterNoop(.session_setting));
     try std.testing.expect(!classificationReasonIsAdapterNoop(.set_operation_plan));

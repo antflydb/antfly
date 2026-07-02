@@ -199,6 +199,44 @@ pub fn validateGeneratedOptionalExpressionForExactRange(
     return true;
 }
 
+pub fn generatedPredicateExpressionAtStart(
+    tokens: []const Token,
+    pos: usize,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const expression = generated_expression_ast orelse return null;
+    const expression_tokens = expression.tokens orelse return null;
+    if (expression_tokens.start == pos) {
+        switch (expression.kind) {
+            .logical_or, .logical_and, .grouped => {},
+            else => {
+                try validateGeneratedExpressionPayloads(tokens, expression.*);
+                return expression;
+            },
+        }
+    }
+
+    switch (expression.kind) {
+        .logical_or, .logical_and => {
+            const list = expression.boolean_condition_items;
+            if (list.count == 0 or list.items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+            for (list.items, 0..) |item, index| {
+                if (item.start == pos) {
+                    try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
+                    return &list.expressions[index];
+                }
+                if (item.start <= pos and pos < item.end) {
+                    if (try generatedPredicateExpressionAtStart(tokens, pos, &list.expressions[index])) |child| return child;
+                }
+            }
+            return null;
+        },
+        .grouped => return try generatedPredicateExpressionAtStart(tokens, pos, expression.inner_expression),
+        .logical_not => return try generatedPredicateExpressionAtStart(tokens, pos, expression.right_expression),
+        else => return null,
+    }
+}
+
 fn validateGeneratedChildExpressionPayloads(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
@@ -211,13 +249,76 @@ fn validateGeneratedChildExpressionPayloads(
     try validateGeneratedExpressionPayloads(tokens, child.*);
 }
 
-fn validateGeneratedExpressionPayloads(
+fn validateGeneratedChildExpressionPayloadsAllowUnknownKind(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    kind: ?generated_parser.GeneratedSqlExpressionKind,
+    expression: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !void {
+    const child = expression orelse return error.UnsupportedSqlShape;
+    if (kind) |expected_kind| {
+        if (expected_kind != child.kind) return error.UnsupportedSqlShape;
+    }
+    if (!expr_generated.generatedTokenRangeEqual(child.tokens orelse return error.UnsupportedSqlShape, range)) return error.UnsupportedSqlShape;
+    try validateGeneratedExpressionPayloads(tokens, child.*);
+}
+
+pub fn validateGeneratedExpressionPayloads(
     tokens: []const Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) anyerror!void {
     const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
     if (expression_tokens.start >= expression_tokens.end or expression_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     if (expression.operator_tokens) |operator_tokens| try validateGeneratedExpressionOperatorTokens(tokens, expression.kind, operator_tokens);
+    if (expression.kind == .array_constructor) try validateGeneratedArrayConstructorPayloads(tokens, expression, expression_tokens);
+}
+
+pub const GeneratedExpressionItem = struct {
+    tokens: generated_parser.GeneratedSqlTokenRange,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+};
+
+pub fn generatedOrderItemAtStart(
+    tokens: []const Token,
+    pos: usize,
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+) !?GeneratedExpressionItem {
+    const read = generated_read_ast orelse return null;
+    if (read.order_items.items.len != read.order_items.count or read.order_items.expressions.len != read.order_items.count) return error.UnsupportedSqlShape;
+    for (read.order_items.items, 0..) |item, index| {
+        if (item.start == pos) {
+            try validateGeneratedExpressionPayloads(tokens, read.order_items.expressions[index]);
+            return .{
+                .tokens = item,
+                .expression = &read.order_items.expressions[index],
+            };
+        }
+    }
+    return null;
+}
+
+pub fn generatedExpressionListItemAtStart(
+    tokens: []const Token,
+    pos: usize,
+    list: *const generated_parser.GeneratedSqlListAst,
+) !?GeneratedExpressionItem {
+    if (list.items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    for (list.items, 0..) |item, index| {
+        if (item.start == pos) {
+            try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
+            return .{
+                .tokens = item,
+                .expression = &list.expressions[index],
+            };
+        }
+    }
+    return null;
+}
+
+pub fn validateGeneratedExpressionItemEnd(generated_item: ?GeneratedExpressionItem, pos: usize) !void {
+    if (generated_item) |item| {
+        if (pos != item.tokens.end) return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedExpressionPayloadsIfRetained(
@@ -227,7 +328,51 @@ fn validateGeneratedExpressionPayloadsIfRetained(
     if (expression.tokens != null) try validateGeneratedExpressionPayloads(tokens, expression);
 }
 
-fn generatedExpressionFunctionNameToken(
+fn validateGeneratedArrayConstructorPayloads(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+    expression_tokens: generated_parser.GeneratedSqlTokenRange,
+) anyerror!void {
+    if (expression_tokens.end < expression_tokens.start + 3 or
+        !tokens[expression_tokens.start].matchesKeywordTag(.array) or
+        tokens[expression_tokens.start + 1].kind != .lbracket or
+        tokens[expression_tokens.end - 1].kind != .rbracket)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    if (expression.array_tokens) |array_tokens| {
+        if (array_tokens.start != expression_tokens.start + 2 or
+            array_tokens.end != expression_tokens.end - 1 or
+            array_tokens.start >= array_tokens.end)
+        {
+            return error.UnsupportedSqlShape;
+        }
+    } else if (expression_tokens.end != expression_tokens.start + 3) {
+        return error.UnsupportedSqlShape;
+    }
+
+    const list = expression.array_items;
+    if (list.count == 0) {
+        if (list.items.len != 0 or list.expression_items.len != 0 or list.expressions.len != 0) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (expression.array_tokens == null or
+        list.count != list.items.len or
+        list.count != list.expression_items.len or
+        list.count != list.expressions.len)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    const array_tokens = expression.array_tokens.?;
+    for (list.items, 0..) |item, index| {
+        if (item.start < array_tokens.start or item.end > array_tokens.end or item.start >= item.end) return error.UnsupportedSqlShape;
+        if (!expr_generated.generatedTokenRangeEqual(list.expression_items[index], item)) return error.UnsupportedSqlShape;
+        if (!expr_generated.generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, item)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
+    }
+}
+
+pub fn generatedExpressionFunctionNameToken(
     tokens: []const Token,
     expression: generated_parser.GeneratedSqlExpressionAst,
 ) !Token {
@@ -235,6 +380,51 @@ fn generatedExpressionFunctionNameToken(
     const name_tokens = expression.function_name_tokens orelse return error.UnsupportedSqlShape;
     if (name_tokens.end != name_tokens.start + 1 or name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     return tokens[name_tokens.start];
+}
+
+pub fn validateGeneratedProjectionListForClause(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) !void {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (list.count == 0 or list.items.len != list.count or list.expression_items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != list.count or list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != list.count or list.directions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != list.count or list.nulls_order_items.len != list.count or list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if (list.first_tokens == null or !expr_generated.generatedTokenRangeEqual(list.first_tokens.?, list.items[0])) return error.UnsupportedSqlShape;
+    if (list.last_tokens == null or !expr_generated.generatedTokenRangeEqual(list.last_tokens.?, list.items[list.count - 1])) return error.UnsupportedSqlShape;
+
+    for (list.items, 0..) |item, index| {
+        if (item.start >= item.end or item.start < range.start or item.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (item.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = list.items[index - 1];
+            if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == list.count and item.end != range.end) return error.UnsupportedSqlShape;
+        if (list.direction_items[index] != null or list.directions[index] != null) return error.UnsupportedSqlShape;
+        if (list.order_using_operator_items[index] != null or list.nulls_order_items[index] != null or list.nulls_orders[index] != null) return error.UnsupportedSqlShape;
+
+        const expression_range = list.expression_items[index];
+        if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
+        if (!expr_generated.generatedTokenRangeEqual(list.expressions[index].tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+        try validateGeneratedExpressionPayloads(tokens, list.expressions[index]);
+
+        if (list.alias_items[index]) |alias_range| {
+            const alias_name_range = list.alias_name_items[index] orelse return error.UnsupportedSqlShape;
+            if (alias_range.start != expression_range.end or alias_range.end != item.end) return error.UnsupportedSqlShape;
+            if (alias_name_range.start < alias_range.start or alias_name_range.end != alias_range.end or alias_name_range.start >= alias_name_range.end) return error.UnsupportedSqlShape;
+            if (tokens[alias_range.start].matchesKeywordTag(.as)) {
+                if (alias_name_range.start != alias_range.start + 1) return error.UnsupportedSqlShape;
+            } else if (!expr_generated.generatedTokenRangeEqual(alias_name_range, alias_range)) return error.UnsupportedSqlShape;
+        } else if (list.alias_name_items[index] != null) {
+            return error.UnsupportedSqlShape;
+        } else if (!expr_generated.generatedTokenRangeEqual(expression_range, item)) {
+            return error.UnsupportedSqlShape;
+        }
+    }
 }
 
 pub fn generatedExpressionForExactRange(
@@ -908,6 +1098,7 @@ pub fn validateGeneratedQuantifiedPredicateIdentity(
     }
     const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
     if (operator_tokens.end != quantifier_tokens.start or quantifier_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+    try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, right_tokens, expression.right_expression_kind, expression.right_expression);
 }
 
 pub fn validateGeneratedExistsSubqueryPredicateIdentity(
@@ -962,10 +1153,37 @@ pub fn validateGeneratedPatternPredicateIdentity(
         }
         const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
         if (operator_tokens.end != quantifier_tokens.start or quantifier_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+        try validateGeneratedPatternEscapePayload(tokens, expression, right_tokens);
     } else {
         if (expression.quantifier_tokens != null) return error.UnsupportedSqlShape;
         const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
         if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+        try validateGeneratedPatternEscapePayload(tokens, expression, right_tokens);
+    }
+}
+
+fn validateGeneratedPatternEscapePayload(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    right_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    if (expression.escape_tokens) |escape_tokens| {
+        if (escape_tokens.start != right_tokens.end or
+            escape_tokens.end <= escape_tokens.start or
+            escape_tokens.end > expression_tokens.end or
+            !tokens[escape_tokens.start].matchesKeywordTag(.escape))
+        {
+            return error.UnsupportedSqlShape;
+        }
+        const escape_expression_tokens: generated_parser.GeneratedSqlTokenRange = .{
+            .start = escape_tokens.start + 1,
+            .end = escape_tokens.end,
+        };
+        try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, escape_expression_tokens, expression.escape_expression_kind, expression.escape_expression);
+    } else {
+        if (expression.escape_expression_kind != null or expression.escape_expression != null) return error.UnsupportedSqlShape;
+        if (right_tokens.end < expression_tokens.end and tokens[right_tokens.end].matchesKeywordTag(.escape)) return error.UnsupportedSqlShape;
     }
 }
 
@@ -1122,6 +1340,7 @@ pub fn validateGeneratedSingleOperatorPredicateIdentity(
     const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
     if (right_tokens.start >= right_tokens.end or right_tokens.end > tokens.len) return error.UnsupportedSqlShape;
     if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+    try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, right_tokens, expression.right_expression_kind, expression.right_expression);
 }
 
 pub fn validateGeneratedSetOrBetweenPredicateIdentity(
@@ -1168,6 +1387,7 @@ pub fn validateGeneratedSetOrBetweenPredicateIdentity(
             if (between_modifier_token_index != null or expression.between_modifier_tokens != null or expression.between_modifier != null) return error.UnsupportedSqlShape;
             const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
             if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+            try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, right_tokens, expression.right_expression_kind, expression.right_expression);
         },
         .between, .not_between => {
             const lower_tokens = expression.between_lower_tokens orelse return error.UnsupportedSqlShape;
@@ -1192,6 +1412,8 @@ pub fn validateGeneratedSetOrBetweenPredicateIdentity(
                 break :blk operator_tokens.end;
             };
             if (lower_start != lower_tokens.start or lower_tokens.end >= upper_tokens.start) return error.UnsupportedSqlShape;
+            try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, lower_tokens, expression.between_lower_expression_kind, expression.between_lower_expression);
+            try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, upper_tokens, expression.between_upper_expression_kind, expression.between_upper_expression);
         },
         else => return error.UnsupportedSqlShape,
     }
@@ -1320,6 +1542,7 @@ pub fn validateGeneratedComparisonPredicateExpression(
     }
     const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
     if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+    try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, right_tokens, expression.right_expression_kind, expression.right_expression);
 }
 
 fn validateRebasedGeneratedComparisonPredicateRoot(
@@ -1366,6 +1589,7 @@ fn validateGeneratedDistinctPredicateExpression(
     try validateGeneratedExpressionOperatorTokens(tokens, expected_kind, operator_tokens);
     const right_tokens = expression.right_tokens orelse return error.UnsupportedSqlShape;
     if (operator_tokens.end != right_tokens.start) return error.UnsupportedSqlShape;
+    try validateGeneratedChildExpressionPayloadsAllowUnknownKind(tokens, right_tokens, expression.right_expression_kind, expression.right_expression);
 }
 
 pub fn validateGeneratedRelationalPredicateExpression(
@@ -1459,10 +1683,16 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
         .{ .kind = .string, .text = "active" },
         .{ .kind = .rparen, .text = ")" },
     };
+    var in_right_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 2, .end = 5 },
+    };
     const in_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .in_list,
         .operator_tokens = .{ .start = 1, .end = 2 },
         .right_tokens = .{ .start = 2, .end = 5 },
+        .right_expression_kind = .token_range,
+        .right_expression = &in_right_expression,
     };
     try validateGeneratedSetOrBetweenPredicateIdentity(&in_expression, .in_list, &in_tokens, 1, null, null);
     const not_in_tokens = [_]Token{
@@ -1473,11 +1703,17 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
         .{ .kind = .string, .text = "active" },
         .{ .kind = .rparen, .text = ")" },
     };
+    var not_in_right_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 3, .end = 6 },
+    };
     const not_in_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .not_in_list,
         .negation_tokens = .{ .start = 1, .end = 2 },
         .operator_tokens = .{ .start = 2, .end = 3 },
         .right_tokens = .{ .start = 3, .end = 6 },
+        .right_expression_kind = .token_range,
+        .right_expression = &not_in_right_expression,
     };
     try validateGeneratedSetOrBetweenPredicateIdentity(&not_in_expression, .not_in_list, &not_in_tokens, 2, 1, null);
     try std.testing.expectError(
@@ -1492,13 +1728,25 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
         .{ .kind = .identifier, .text = "and", .keyword = .@"and" },
         .{ .kind = .number, .text = "3" },
     };
+    var between_lower_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 3, .end = 4 },
+    };
+    var between_upper_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 5, .end = 6 },
+    };
     const between_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .between,
         .operator_tokens = .{ .start = 1, .end = 2 },
         .between_modifier_tokens = .{ .start = 2, .end = 3 },
         .between_modifier = .symmetric,
         .between_lower_tokens = .{ .start = 3, .end = 4 },
+        .between_lower_expression_kind = .token_range,
+        .between_lower_expression = &between_lower_expression,
         .between_upper_tokens = .{ .start = 5, .end = 6 },
+        .between_upper_expression_kind = .token_range,
+        .between_upper_expression = &between_upper_expression,
     };
     try validateGeneratedSetOrBetweenPredicateIdentity(&between_expression, .between, &between_tokens, 1, null, 2);
     try std.testing.expectError(
@@ -1511,10 +1759,15 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
         .{ .kind = .at_contains, .text = "@>" },
         .{ .kind = .string, .text = "{\"status\":\"active\"}" },
     };
+    var contains_right_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 2, .end = 3 },
+    };
     const contains_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .contains,
         .operator_tokens = .{ .start = 1, .end = 2 },
         .right_tokens = .{ .start = 2, .end = 3 },
+        .right_expression = &contains_right_expression,
     };
     try validateGeneratedSingleOperatorPredicateIdentity(&contains_expression, .contains, &contains_tokens, 1);
     const stale_contains_tokens = [_]Token{
@@ -1541,10 +1794,16 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
         .{ .kind = .gte, .text = ">=" },
         .{ .kind = .number, .text = "10" },
     };
+    var generated_comparison_right_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 2, .end = 3 },
+    };
     const generated_comparison_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .comparison,
         .operator_tokens = .{ .start = 1, .end = 2 },
         .right_tokens = .{ .start = 2, .end = 3 },
+        .right_expression_kind = .token_range,
+        .right_expression = &generated_comparison_right_expression,
     };
     try validateGeneratedComparisonPredicateExpression(&generated_comparison_expression, &generated_comparison_tokens, 1, .gte);
     try std.testing.expectError(
@@ -1576,10 +1835,16 @@ pub fn testGeneratedValidationChecksPredicateAndRowExpressionIdentity() !void {
             .kind = .distinct_comparison,
         }),
     );
+    var relational_distinct_right_expression = generated_parser.GeneratedSqlExpressionAst{
+        .kind = .token_range,
+        .tokens = .{ .start = 5, .end = 6 },
+    };
     const relational_distinct_expression = generated_parser.GeneratedSqlExpressionAst{
         .kind = .is_not_distinct_from,
         .operator_tokens = .{ .start = 1, .end = 5 },
         .right_tokens = .{ .start = 5, .end = 6 },
+        .right_expression_kind = .token_range,
+        .right_expression = &relational_distinct_right_expression,
     };
     try validateGeneratedRelationalPredicateIdentity(&relational_distinct_expression, &distinct_tokens, 1, .is_not_distinct);
     const stale_relational_distinct_expression = generated_parser.GeneratedSqlExpressionAst{

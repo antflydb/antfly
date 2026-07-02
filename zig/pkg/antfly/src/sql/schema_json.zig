@@ -577,8 +577,72 @@ pub fn applyCommentMetadataPlanToSchemaJsonValue(
             try applyStringCommentValueToObject(alloc, constraints, plan.object_name, plan.comment_json);
             removeEmptyCommentMap(comments, "constraints");
         },
+        .database => {
+            const databases = try rootObjectFieldAlloc(alloc, comments, "databases");
+            try applyStringCommentValueToObject(alloc, databases, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "databases");
+        },
+        .schema => {
+            const schemas = try rootObjectFieldAlloc(alloc, comments, "schemas");
+            try applyStringCommentValueToObject(alloc, schemas, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "schemas");
+        },
+        .extension => {
+            const extensions = try rootObjectFieldAlloc(alloc, comments, "extensions");
+            try applyStringCommentValueToObject(alloc, extensions, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "extensions");
+        },
+        .type => {
+            const types = try rootObjectFieldAlloc(alloc, comments, "types");
+            try applyStringCommentValueToObject(alloc, types, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "types");
+        },
+        .domain => {
+            const domains = try rootObjectFieldAlloc(alloc, comments, "domains");
+            try applyStringCommentValueToObject(alloc, domains, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "domains");
+        },
+        .function => {
+            const functions = try rootObjectFieldAlloc(alloc, comments, "functions");
+            try applyStringCommentValueToObject(alloc, functions, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "functions");
+        },
+        .procedure => {
+            const procedures = try rootObjectFieldAlloc(alloc, comments, "procedures");
+            try applyStringCommentValueToObject(alloc, procedures, plan.object_name, plan.comment_json);
+            removeEmptyCommentMap(comments, "procedures");
+        },
     }
     if (try schemaJsonCommentCountInObject(comments) == 0) _ = root.orderedRemove("comments");
+}
+
+pub fn applySecurityLabelPlanToSchemaJsonValue(
+    alloc: std.mem.Allocator,
+    root: *std.json.ObjectMap,
+    plan: ddl_plan.SecurityLabelPlan,
+) !void {
+    if (plan.object_name.len == 0) return error.InvalidSqlCatalog;
+    const labels = try rootObjectFieldAlloc(alloc, root, "security_labels");
+    const target_map_name = switch (plan.target) {
+        .table => "tables",
+        .column => "columns",
+        .index => "indexes",
+        .constraint => return error.InvalidSqlCatalog,
+        .database => "databases",
+        .schema => "schemas",
+        .extension => "extensions",
+        .type => "types",
+        .domain => "domains",
+        .function => "functions",
+        .procedure => "procedures",
+    };
+    const target_map = try rootObjectFieldAlloc(alloc, labels, target_map_name);
+    const provider_key = plan.provider_name orelse "default";
+    const object_labels = try rootObjectFieldAlloc(alloc, target_map, plan.object_name);
+    try applyStringCommentValueToObject(alloc, object_labels, provider_key, plan.label_json);
+    if (object_labels.count() == 0) removeEmptyCommentMap(target_map, plan.object_name);
+    removeEmptyCommentMap(labels, target_map_name);
+    if (try schemaJsonCommentCountInObject(labels) == 0) _ = root.orderedRemove("security_labels");
 }
 
 fn commentColumnName(object_name: []const u8) []const u8 {

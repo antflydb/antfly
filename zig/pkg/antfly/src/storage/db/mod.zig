@@ -56,6 +56,7 @@ pub const transaction_runtime = @import("maintenance/transaction_runtime.zig");
 pub const graph_metric_runtime = @import("maintenance/graph_metric_runtime.zig");
 pub const document_query = @import("document_query.zig");
 pub const document_mapper = @import("document_mapper.zig");
+pub const document_write = @import("document_write.zig");
 pub const relational_store = @import("relational_store.zig");
 pub const relational_collation = @import("relational_collation.zig");
 pub const DocIdentityNamespace = doc_identity_mod.Namespace;

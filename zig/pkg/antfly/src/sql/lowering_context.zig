@@ -19,6 +19,7 @@ const catalog_resources = @import("catalog_resources.zig");
 const sql_statement_kind = @import("statement_kind.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const generated_parser = @import("generated_parser.zig");
+const generated_read_validate = @import("generated_read_validate.zig");
 const lower_expr = @import("lower_expr.zig");
 const expr_row_parse = @import("expr/row_parse.zig");
 const metadata_api = @import("../metadata/api.zig");
@@ -292,7 +293,7 @@ pub fn validateGeneratedReadAstForStatement(
     read_ast: *const generated_parser.GeneratedSqlReadAst,
 ) !void {
     _ = try generatedReadStatementKind(tokens, read_ast);
-    try lower_expr.validateGeneratedReadAstPayloads(tokens, read_ast.*);
+    try generated_read_validate.validateGeneratedReadAstPayloads(tokens, read_ast.*);
     try validateGeneratedReadAstRanges(tokens, read_ast);
     switch (read_ast.kind) {
         .query => try validateGeneratedSimpleQueryReadAst(tokens, read_ast),
@@ -1142,7 +1143,7 @@ fn validateGeneratedReadJoinLateralPayload(
     } else {
         return error.UnsupportedSqlShape;
     }
-    lower_expr.validateGeneratedReadAstPayloads(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read.*) catch return error.UnsupportedSqlShape;
+    generated_read_validate.validateGeneratedReadAstPayloads(tokens[subquery_tokens.start..subquery_tokens.end], subquery_read.*) catch return error.UnsupportedSqlShape;
 }
 
 fn optionalGeneratedTokenRangeEql(
@@ -5379,7 +5380,7 @@ test "sql adapter lowering context requires generated read publication before ge
     if (parsed_sql.generated_statement) |*generated_statement| {
         if (generated_statement.ast) |*generated_ast| {
             switch (generated_ast.*) {
-                .read => |*read_ast| read_ast.source_alias_tokens = null,
+                .read => |read_ast| read_ast.source_alias_tokens = null,
                 else => return error.TestUnexpectedResult,
             }
         }
@@ -5417,7 +5418,7 @@ test "sql adapter lowering context requires generated read publication before ge
     const stale_read_ast = blk: {
         if (stale_published_read.generated_statement) |*generated_statement| {
             switch (generated_statement.ast.?) {
-                .read => |*read| break :blk read,
+                .read => |read| break :blk read,
                 else => return error.TestUnexpectedResult,
             }
         } else return error.TestUnexpectedResult;
@@ -5593,7 +5594,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     defer system_time_parsed_sql.deinit(alloc);
     const system_time_generated_raw = system_time_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var system_time_read_ast = switch (system_time_generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .read => |ast| ast,
+        .read => |ast| ast.*,
         else => return error.UnsupportedSqlShape,
     };
     try validateGeneratedReadAstForStatement(system_time_parsed_sql.items(), &system_time_read_ast);
@@ -5607,7 +5608,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     );
 
     system_time_read_ast = switch (system_time_generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .read => |ast| ast,
+        .read => |ast| ast.*,
         else => return error.UnsupportedSqlShape,
     };
     system_time_read_ast.source_system_time_tokens = null;
@@ -5655,7 +5656,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     );
     defer stale_projection_leading_gap_parsed_sql.deinit(alloc);
     var stale_projection_leading_gap_read_ast = switch ((stale_projection_leading_gap_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape).ast orelse return error.UnsupportedSqlShape) {
-        .read => |ast| ast,
+        .read => |ast| ast.*,
         else => return error.UnsupportedSqlShape,
     };
     if (stale_projection_leading_gap_read_ast.projection_items.count < 2 or
@@ -7829,7 +7830,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     defer cte_system_time_parsed_sql.deinit(alloc);
     const cte_system_time_generated_raw = cte_system_time_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     var cte_system_time_read_ast = switch (cte_system_time_generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .read => |ast| ast,
+        .read => |ast| ast.*,
         else => return error.UnsupportedSqlShape,
     };
     try validateGeneratedReadAstForStatement(cte_system_time_parsed_sql.items(), &cte_system_time_read_ast);
@@ -7843,7 +7844,7 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     );
 
     cte_system_time_read_ast = switch (cte_system_time_generated_raw.ast orelse return error.UnsupportedSqlShape) {
-        .read => |ast| ast,
+        .read => |ast| ast.*,
         else => return error.UnsupportedSqlShape,
     };
     cte_system_time_read_ast.cte_items[0].body_source_system_time_tokens = null;

@@ -1,4 +1,14 @@
 {
   "requirement_format": 1,
-  "required": []
+  "required": [
+    "document_table_ddl_duplicate_schema_name",
+    "document_table_ddl_invalid_antfly_extension",
+    "document_table_ddl_invalid_dynamic_template",
+    "document_table_ddl_malformed_schema_json",
+    "document_table_ddl_missing_default_type",
+    "document_table_ddl_mixed_relational_shape",
+    "document_table_ddl_multi_document_type_unsupported",
+    "document_table_ddl_shorthand",
+    "document_table_ddl_unknown_default_type"
+  ]
 }
