@@ -28,7 +28,6 @@ const metadata_raft_retained_entries = 1024;
 const metadata_raft_compaction_min_interval_entries = 512;
 const metadata_raft_election_max_ticks = 60;
 const metadata_bootstrap_campaign_retry_min_interval_ns: u64 = 500 * std.time.ns_per_ms;
-const metadata_forwarding_token_key = "antfly.metadata.forwarding.token";
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -313,7 +312,6 @@ pub const ServerConfig = struct {
     local_node_id: u64 = 1,
     metadata_group_id: u64 = group_ids.main_metadata_group_id,
     metadata_cluster_peers: []const MetadataClusterPeer = &.{},
-    metadata_orchestration_urls: []const antfly.metadata_service.MetadataOrchestrationUrl = &.{},
     replica_root_dir: []const u8,
     replica_catalog_path: []const u8,
     snapshot_root_dir: []const u8,
@@ -326,7 +324,6 @@ pub const ServerConfig = struct {
     reconciler_config: antfly.metadata.reconciler.Reconciler.Config = .{},
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     secret_store: ?*antfly.common.secrets.FileStore = null,
-    internal_metadata_forward_token: ?[]const u8 = null,
     api_server_cfg: antfly.public_api.http_server.ApiHttpServerConfig = .{},
 };
 
@@ -426,8 +423,6 @@ pub const Server = struct {
         const service_cfg = antfly.metadata_service.MetadataServiceConfig{
             .observe_local_replica_root = cfg.observe_local_replica_root,
             .backend_runtime = cfg.backend_runtime,
-            .metadata_orchestration_urls = cfg.metadata_orchestration_urls,
-            .internal_metadata_forward_token = cfg.internal_metadata_forward_token,
             .secret_store = cfg.secret_store,
         };
         result.server = try antfly.metadata_server.MetadataServer.init(alloc, .{
@@ -825,15 +820,6 @@ pub fn runFromIterator(
     const metadata_group_id = group_ids.main_metadata_group_id;
     const cluster_peers = try resolveMetadataClusterPeers(alloc, cli.cluster_json, if (loaded_config) |*cfg| cfg else null);
     defer freeMetadataClusterPeers(alloc, cluster_peers);
-    const orchestration_urls = try resolveMetadataOrchestrationUrls(alloc, if (loaded_config) |*cfg| cfg else null);
-    defer freeMetadataOrchestrationUrls(alloc, orchestration_urls);
-    const metadata_forwarding_token = try resolveMetadataForwardingToken(
-        alloc,
-        if (loaded_config) |*cfg| cfg else null,
-        if (secret_store_initialized) &secret_store else null,
-    );
-    defer if (metadata_forwarding_token) |value| alloc.free(value);
-    if (orchestration_urls.len > 0 and metadata_forwarding_token == null) return error.MissingMetadataForwardingToken;
     if (cli.join) return error.UnsupportedMetadataJoin;
     const listener = resolveRaftListener(cli, if (loaded_config) |*cfg| cfg else null);
     const admin_listener = resolveAdminListener(cli, if (loaded_config) |*cfg| cfg else null, local_node_id, listener.bind_host);
@@ -842,7 +828,6 @@ pub fn runFromIterator(
         .local_node_id = local_node_id,
         .metadata_group_id = metadata_group_id,
         .metadata_cluster_peers = cluster_peers,
-        .metadata_orchestration_urls = orchestration_urls,
         .replica_root_dir = resolved.replica_root_dir,
         .replica_catalog_path = resolved.replica_catalog_path,
         .snapshot_root_dir = resolved.snapshot_root_dir,
@@ -852,7 +837,6 @@ pub fn runFromIterator(
         .admin_bind_port = admin_listener.bind_port,
         .reconciler_config = shardAllocationReconcilerConfig(if (loaded_config) |*cfg| cfg else null),
         .secret_store = if (secret_store_initialized) &secret_store else null,
-        .internal_metadata_forward_token = metadata_forwarding_token,
         .api_server_cfg = .{
             .auth_enabled = effective_auth_enabled,
             .trusted_principal_secret = trusted_principal_secret,
@@ -1271,36 +1255,6 @@ pub fn metadataClusterPeerUrl(
     return null;
 }
 
-fn resolveMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    cfg: ?*const antfly.common.config.Config,
-) ![]antfly.metadata_service.MetadataOrchestrationUrl {
-    const loaded = cfg orelse return &.{};
-    if (loaded.metadata.orchestration_urls.len == 0) return &.{};
-    var out = try alloc.alloc(antfly.metadata_service.MetadataOrchestrationUrl, loaded.metadata.orchestration_urls.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |entry| alloc.free(entry.url);
-        alloc.free(out);
-    }
-    for (loaded.metadata.orchestration_urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .url = try alloc.dupe(u8, entry.url),
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    urls: []antfly.metadata_service.MetadataOrchestrationUrl,
-) void {
-    for (urls) |entry| alloc.free(entry.url);
-    if (urls.len > 0) alloc.free(urls);
-}
-
 pub fn metadataOrchestrationPeerUrl(
     cfg: *const antfly.common.config.Config,
     node_id: u64,
@@ -1411,20 +1365,6 @@ fn resolveAuthEnabled(cli: CliConfig, cfg: ?*const antfly.common.config.Config) 
     return false;
 }
 
-fn resolveMetadataForwardingToken(
-    alloc: std.mem.Allocator,
-    cfg: ?*const antfly.common.config.Config,
-    secret_store: ?*antfly.common.secrets.FileStore,
-) !?[]u8 {
-    if (cfg) |loaded| {
-        if (loaded.metadata.forwarding_token) |value| {
-            return try canonicalizeMetadataRuntimeValue(alloc, try alloc.dupe(u8, value));
-        }
-    }
-    const value = try resolveMetadataRuntimeSecretValue(alloc, secret_store, metadata_forwarding_token_key);
-    return if (value) |owned| try canonicalizeMetadataRuntimeValue(alloc, owned) else null;
-}
-
 fn resolveTrustedPrincipalSecret(
     alloc: std.mem.Allocator,
     secret_store: ?*antfly.common.secrets.FileStore,
@@ -1520,42 +1460,6 @@ test "metadata runtime cli accepts auth flag" {
     var cfg = try parseCli(std.testing.allocator, &iter);
     defer cfg.deinit(std.testing.allocator);
     try std.testing.expectEqual(true, cfg.auth_enabled.?);
-}
-
-test "metadata runtime resolves metadata forwarding token from config" {
-    const alloc = std.testing.allocator;
-    var cfg = antfly.common.config.Config{
-        .registry = antfly.common.provider_registry.Registry.init(alloc),
-        .transcribers = antfly.transcribing.Registry.init(alloc),
-        .readers = antfly.readers.Registry.init(alloc),
-        .text_to_speech = antfly.synthesizing.Registry.init(alloc),
-        .metadata = .{
-            .forwarding_token = try alloc.dupe(u8, " configured-forwarding-token \n"),
-        },
-    };
-    defer cfg.deinit();
-
-    const token = try resolveMetadataForwardingToken(alloc, &cfg, null);
-    defer alloc.free(token.?);
-    try std.testing.expectEqualStrings("configured-forwarding-token", token.?);
-}
-
-test "metadata runtime resolves metadata forwarding token from secret store trimmed" {
-    const alloc = std.testing.allocator;
-    const store_path = ".zig-cache/test-metadata-forwarding-token-secrets.json";
-    defer {
-        var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
-        defer io_impl.deinit();
-        std.Io.Dir.cwd().deleteFile(io_impl.io(), store_path) catch {};
-    }
-    var secret_store = try antfly.common.secrets.FileStore.init(alloc, store_path);
-    defer secret_store.deinit();
-    var stored = try secret_store.put(alloc, metadata_forwarding_token_key, "\tstored-forwarding-token\n");
-    stored.deinit(alloc);
-
-    const token = try resolveMetadataForwardingToken(alloc, null, &secret_store);
-    defer alloc.free(token.?);
-    try std.testing.expectEqualStrings("stored-forwarding-token", token.?);
 }
 
 test "metadata runtime preserves trusted principal auth material bytes" {

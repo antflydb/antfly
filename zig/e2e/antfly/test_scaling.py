@@ -448,7 +448,6 @@ class MultiNodeScalingCluster:
                     str(node["id"]): f"http://{self.host}:{node['api_port']}"
                     for node in self.metadata_nodes
                 },
-                "forwarding_token": "metadata-scaling-e2e-forwarding-token",
                 "raft_urls": {
                     str(node["id"]): f"http://{self.host}:{node['raft_port']}"
                     for node in self.metadata_nodes

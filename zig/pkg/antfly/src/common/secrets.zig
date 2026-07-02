@@ -1155,7 +1155,7 @@ test "layered file secret store resolves primary before fallback and writes prim
         \\{"secrets":[{"key":"openai.api_key","value":"primary-openai","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"primary-shared","created_at_ns":1,"updated_at_ns":1}]}
     );
     try writeFileAtomically(fallback_path,
-        \\{"secrets":[{"key":"antfly.metadata.forwarding.token","value":"fallback-token","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"fallback-shared","created_at_ns":1,"updated_at_ns":1}]}
+        \\{"secrets":[{"key":"antfly.runtime.test.token","value":"fallback-token","created_at_ns":1,"updated_at_ns":1},{"key":"shared.key","value":"fallback-shared","created_at_ns":1,"updated_at_ns":1}]}
     );
 
     var store = try FileStore.initLayered(alloc, &.{ primary_path, fallback_path });
@@ -1165,7 +1165,7 @@ test "layered file secret store resolves primary before fallback and writes prim
     defer if (primary) |value| alloc.free(value);
     try std.testing.expectEqualStrings("primary-openai", primary.?);
 
-    const fallback = try store.getOwned(alloc, "antfly.metadata.forwarding.token");
+    const fallback = try store.getOwned(alloc, "antfly.runtime.test.token");
     defer if (fallback) |value| alloc.free(value);
     try std.testing.expectEqualStrings("fallback-token", fallback.?);
 
@@ -1202,21 +1202,21 @@ test "layered file secret store generation changes when fallback changes" {
         \\{"secrets":[]}
     );
     try writeFileAtomically(fallback_path,
-        \\{"secrets":[{"key":"antfly.metadata.forwarding.token","value":"first","created_at_ns":1,"updated_at_ns":1}]}
+        \\{"secrets":[{"key":"antfly.runtime.test.token","value":"first","created_at_ns":1,"updated_at_ns":1}]}
     );
 
     var store = try FileStore.initLayered(alloc, &.{ primary_path, fallback_path });
     defer store.deinit();
 
-    var first = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:antfly.metadata.forwarding.token}");
+    var first = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:antfly.runtime.test.token}");
     defer first.deinit(alloc);
     try std.testing.expectEqualStrings("first", first.value);
 
     try writeFileAtomically(fallback_path,
-        \\{"secrets":[{"key":"antfly.metadata.forwarding.token","value":"second","created_at_ns":1,"updated_at_ns":2}]}
+        \\{"secrets":[{"key":"antfly.runtime.test.token","value":"second","created_at_ns":1,"updated_at_ns":2}]}
     );
 
-    var second = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:antfly.metadata.forwarding.token}");
+    var second = try resolveReferenceWithGenerationOwned(alloc, &store, "${secret:antfly.runtime.test.token}");
     defer second.deinit(alloc);
     try std.testing.expectEqualStrings("second", second.value);
     try std.testing.expect(second.generation > first.generation);

@@ -256,7 +256,6 @@ class MultiMetadataBackupCluster:
             "orchestration_urls": {
                 str(node_id): self.metadata_admin_urls[node_id - 1] for node_id in range(1, 4)
             },
-            "forwarding_token": "metadata-backup-e2e-forwarding-token",
             "raft_urls": {
                 str(node_id): f"http://{self.host}:{self.metadata_raft_ports[node_id - 1]}"
                 for node_id in range(1, 4)

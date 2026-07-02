@@ -43,7 +43,6 @@ pub const StdHttpListenerConfig = struct {
     serve_in_connection_threads: bool = false,
     connection_thread_stack_size: usize = default_request_stack_size,
     max_connection_threads: u32 = 0,
-    internal_request_metadata_token: ?[]const u8 = null,
 };
 
 pub const StdHttpListener = struct {
@@ -309,7 +308,6 @@ pub const StdHttpListener = struct {
         var authorization: ?[]u8 = null;
         defer if (authorization) |value| self.alloc.free(value);
         var headers = std.ArrayListUnmanaged(common.RequestHeader).empty;
-        var metadata_leader_forwarded = false;
         defer {
             for (headers.items) |header| {
                 self.alloc.free(header.name);
@@ -319,14 +317,6 @@ pub const StdHttpListener = struct {
         }
         var header_it = request.iterateHeaders();
         while (header_it.next()) |header| {
-            if (common.isInternalRequestMetadataHeader(header.name)) {
-                metadata_leader_forwarded = metadata_leader_forwarded or blk: {
-                    const token = self.cfg.internal_request_metadata_token orelse break :blk false;
-                    const value = std.mem.trim(u8, header.value, " \t\r\n");
-                    break :blk token.len > 0 and timingSafeEql(token, value);
-                };
-                continue;
-            }
             const name = try self.alloc.dupe(u8, header.name);
             const value = self.alloc.dupe(u8, header.value) catch |err| {
                 self.alloc.free(name);
@@ -354,7 +344,6 @@ pub const StdHttpListener = struct {
             .method = method,
             .uri = uri,
             .headers = headers.items,
-            .metadata_leader_forwarded = metadata_leader_forwarded,
             .authorization = authorization,
             .content_type = content_type,
             .body = body,
@@ -613,15 +602,6 @@ test "std http listener and executor round-trip raft batch route" {
     try std.testing.expectEqual(@as(usize, 1), handler.seen);
 }
 
-fn timingSafeEql(expected: []const u8, provided: []const u8) bool {
-    if (expected.len != provided.len) return false;
-    var diff: u8 = 0;
-    for (expected, provided) |expected_byte, provided_byte| {
-        diff |= expected_byte ^ provided_byte;
-    }
-    return diff == 0;
-}
-
 test "std http executor enforces request timeout while waiting for response" {
     const std_http_executor = @import("std_http_executor.zig");
 
@@ -665,86 +645,6 @@ test "std http executor enforces request timeout while waiting for response" {
         .uri = uri,
         .timeout_ms = 5,
     }));
-}
-
-test "std http transport carries trusted metadata forwarded marker" {
-    const std_http_executor = @import("std_http_executor.zig");
-    const internal_token = "metadata-forward-token";
-
-    const CaptureApp = struct {
-        seen_forwarded: bool = false,
-        seen_test_header: bool = false,
-        seen_internal_header: bool = false,
-
-        fn iface(self: *@This()) common.RequestExecutor {
-            return .{
-                .ptr = self,
-                .vtable = &.{ .execute = execute },
-            };
-        }
-
-        fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: common.HttpRequest) !common.HttpResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            self.seen_forwarded = req.metadata_leader_forwarded;
-            for (req.headers) |header| {
-                if (common.isInternalRequestMetadataHeader(header.name)) self.seen_internal_header = true;
-                if (std.ascii.eqlIgnoreCase(header.name, "X-Test-Header")) self.seen_test_header = true;
-            }
-            return .{
-                .status = 200,
-                .content_type = try alloc.dupe(u8, "text/plain"),
-                .body = try alloc.dupe(u8, "ok"),
-            };
-        }
-    };
-
-    var app = CaptureApp{};
-    var listener = StdHttpListener.init(std.testing.allocator, .{
-        .internal_request_metadata_token = internal_token,
-    }, app.iface());
-    defer listener.deinit();
-    try listener.start();
-
-    const base_uri = try listener.baseUri(std.testing.allocator);
-    defer std.testing.allocator.free(base_uri);
-    const uri = try std.fmt.allocPrint(std.testing.allocator, "{s}/metadata", .{base_uri});
-    defer std.testing.allocator.free(uri);
-    const headers = [_]common.RequestHeader{
-        .{ .name = common.metadata_leader_forwarded_header, .value = "spoofed" },
-        .{ .name = "X-Test-Header", .value = "present" },
-    };
-
-    var executor: std_http_executor.StdHttpExecutor = undefined;
-    executor.initInPlace(std.testing.allocator, .{});
-    defer executor.deinit();
-
-    var spoofed_response = try executor.executor().execute(std.testing.allocator, .{
-        .method = .POST,
-        .uri = uri,
-        .headers = headers[0..],
-    });
-    defer spoofed_response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u16, 200), spoofed_response.status);
-    try std.testing.expect(!app.seen_forwarded);
-    try std.testing.expect(app.seen_test_header);
-    try std.testing.expect(!app.seen_internal_header);
-
-    const valid_headers = [_]common.RequestHeader{
-        .{ .name = common.metadata_leader_forwarded_header, .value = internal_token },
-        .{ .name = "X-Test-Header", .value = "present" },
-    };
-    var trusted_response = try executor.executor().execute(std.testing.allocator, .{
-        .method = .POST,
-        .uri = uri,
-        .headers = valid_headers[0..],
-    });
-    defer trusted_response.deinit(std.testing.allocator);
-
-    try std.testing.expectEqual(@as(u16, 200), trusted_response.status);
-    try std.testing.expect(app.seen_forwarded);
-    try std.testing.expect(app.seen_test_header);
-    try std.testing.expect(!app.seen_internal_header);
 }
 
 test "std http listener and executor round-trip snapshot routes" {

@@ -3537,7 +3537,7 @@ pub fn build(b: *std.Build) void {
         "api http server serves table metadata routes against real metadata service",
         "api http server create table with replication sources returns encoded table detail",
         "api http server lists cluster backups through public route",
-        "api http server forwards cluster backup mutations to metadata leader",
+        "api http server returns retryable not leader through public cluster adapter mutation",
         "api http server backs up and restores a table through public routes",
         "api http server prefers metadata-owned restore over inline write-source restore",
         "public API request body limit matches Go linear merge contract",
@@ -3575,13 +3575,10 @@ pub fn build(b: *std.Build) void {
         .root_module = lib_test_mod,
         .filters = &.{
             "api http server requires auth on public routes when enabled",
-            "api http server forwards public metadata mutations to metadata leader",
-            "api http server does not reforward already-forwarded metadata mutations",
             "api http server returns retryable not leader for local public metadata mutation",
-            "api http server returns retryable not leader when metadata forwarder has no target",
+            "api http server returns retryable not leader when metadata proposal is dropped",
             "api http server returns retryable not leader through public table adapter mutation",
             "api http server returns retryable not leader through public cluster adapter mutation",
-            "api http server keeps public data routes local when metadata forwarder is configured",
             "api http server dispatches HA admin and internal executors",
             "api http server protects HA admin routes while exempting HA internal routes",
             "api http server forbids non-admin secret access when auth is enabled",
@@ -4018,7 +4015,7 @@ pub fn build(b: *std.Build) void {
         },
     });
     const run_lib_metadata_sim_forward_tests = b.addRunArtifact(lib_metadata_sim_forward_tests);
-    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run metadata HTTP forwarding simulation tests only");
+    const lib_metadata_sim_forward_test_step = b.step("lib-metadata-sim-forward-test", "Run public table IO forwarding simulation tests only");
     lib_metadata_sim_forward_test_step.dependOn(&run_lib_metadata_sim_forward_tests.step);
 
     const lib_metadata_service_tests = b.addTest(.{
