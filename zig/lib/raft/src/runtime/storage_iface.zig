@@ -15,6 +15,9 @@
 const core = @import("../core/mod.zig");
 
 pub const ReadyPersistenceDiagnostics = struct {
+    skipped_no_durable_state: bool = false,
+    used_batch: bool = false,
+    used_group_storage: bool = false,
     storage_apply_elapsed_ns: u64 = 0,
     encode_elapsed_ns: u64 = 0,
     wal_append_elapsed_ns: u64 = 0,
