@@ -4,9 +4,7 @@ package controllers
 
 import (
 	"context"
-	"crypto/rand"
 	"crypto/sha256"
-	"encoding/base64"
 	"encoding/json"
 	stderrors "errors"
 	"fmt"
@@ -77,11 +75,6 @@ const (
 	antflySecretStoreDefaultPath = "/run/antfly/secrets/secrets.json" // #nosec G101 -- file path, not a credential
 	antflySecretStoreEnvVar      = "ANTFLY_SECRET_STORE_PATH"         // #nosec G101 -- environment variable name, not a credential
 
-	antflySystemSecretStoreVolumeName = "system-secret-store"
-	antflySystemSecretStoreKey        = "secrets.json"
-	antflySystemSecretStorePath       = "/run/antfly/system-secrets/secrets.json" // #nosec G101 -- file path, not a credential
-	metadataForwardingTokenSecretKey  = "antfly.metadata.forwarding.token"        // #nosec G101 -- Antfly secret-store key name, not a credential
-
 	haPrimaryRouteTargetAnnotation          = "antfly.io/ha-primary-route-target"
 	haPrimaryRouteFenceAuthorityAnnotation  = "antfly.io/ha-primary-route-fence-authority"
 	haPrimaryRouteFenceGenerationAnnotation = "antfly.io/ha-primary-route-fence-generation"
@@ -110,7 +103,6 @@ const (
 //+kubebuilder:rbac:groups=apps,resources=statefulsets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=services,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=configmaps,verbs=get;list;watch;create;update;patch;delete
-//+kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=persistentvolumeclaims,verbs=get;list;watch;create;update;patch;delete
 //+kubebuilder:rbac:groups="",resources=pods,verbs=get;list;watch;delete
 //+kubebuilder:rbac:groups="",resources=pods/log,verbs=get
@@ -180,80 +172,6 @@ func secretStoreArg(store *antflyv1.SecretStoreSpec) string {
 		return ""
 	}
 	return fmt.Sprintf(" \\\n  --secret-store-path %s", shellQuoteArg(secretStorePath(store)))
-}
-
-func metadataSecretStoreArgs(store *antflyv1.SecretStoreSpec) string {
-	return secretStoreArg(store) + fmt.Sprintf(" \\\n  --secret-store-path %s", shellQuoteArg(antflySystemSecretStorePath))
-}
-
-func systemSecretStoreName(cluster *antflyv1.AntflyCluster) string {
-	return cluster.Name + "-system-secrets"
-}
-
-func systemSecretStoreVolumeMounts() []corev1.VolumeMount {
-	return []corev1.VolumeMount{{
-		Name:      antflySystemSecretStoreVolumeName,
-		MountPath: path.Dir(antflySystemSecretStorePath),
-		ReadOnly:  true,
-	}}
-}
-
-func systemSecretStoreVolumes(cluster *antflyv1.AntflyCluster) []corev1.Volume {
-	return []corev1.Volume{{
-		Name: antflySystemSecretStoreVolumeName,
-		VolumeSource: corev1.VolumeSource{
-			Secret: &corev1.SecretVolumeSource{
-				SecretName: systemSecretStoreName(cluster),
-				Items: []corev1.KeyToPath{{
-					Key:  antflySystemSecretStoreKey,
-					Path: path.Base(antflySystemSecretStorePath),
-				}},
-			},
-		},
-	}}
-}
-
-type secretStoreFile struct {
-	Secrets []secretStoreEntry `json:"secrets"`
-}
-
-type secretStoreEntry struct {
-	Key         string `json:"key"`
-	Value       string `json:"value"`
-	CreatedAtNS int64  `json:"created_at_ns"`
-	UpdatedAtNS int64  `json:"updated_at_ns"`
-}
-
-func generateMetadataForwardingToken() (string, error) {
-	var raw [32]byte
-	if _, err := rand.Read(raw[:]); err != nil {
-		return "", fmt.Errorf("generate metadata forwarding token: %w", err)
-	}
-	return base64.RawURLEncoding.EncodeToString(raw[:]), nil
-}
-
-func metadataForwardingTokenFromSecretStore(data []byte) (string, bool) {
-	var store secretStoreFile
-	if err := json.Unmarshal(data, &store); err != nil {
-		return "", false
-	}
-	for _, entry := range store.Secrets {
-		if entry.Key == metadataForwardingTokenSecretKey && strings.TrimSpace(entry.Value) != "" {
-			return entry.Value, true
-		}
-	}
-	return "", false
-}
-
-func encodeSystemSecretStore(token string, nowNS int64) ([]byte, error) {
-	return json.Marshal(secretStoreFile{
-		Secrets: []secretStoreEntry{{
-			Key:         metadataForwardingTokenSecretKey,
-			Value:       token,
-			CreatedAtNS: nowNS,
-			UpdatedAtNS: nowNS,
-		}},
-	})
 }
 
 func swarmHAArgs(ha *antflyv1.HighAvailabilitySpec) string {
@@ -1305,9 +1223,10 @@ func (r *AntflyClusterReconciler) computeEnvFromHash(ctx context.Context, cache 
 	return fmt.Sprintf("%x", h.Sum(nil))[:16]
 }
 
-// markEnvFromSecretsUnchecked records that customer-provided Secret references are
-// intentionally not read by the operator. Kubernetes validates envFrom Secret
-// existence when it creates pods.
+// markEnvFromSecretsUnchecked records that Secret references are intentionally not
+// read by the operator. Kubernetes will validate envFrom Secret existence when it
+// creates pods, and avoiding direct Secret reads keeps the operator ClusterRole from
+// carrying dangerous Secret permissions.
 func (r *AntflyClusterReconciler) markEnvFromSecretsUnchecked(cluster *antflyv1.AntflyCluster) {
 	r.setSecretsReadyCondition(cluster, metav1.ConditionUnknown, antflyv1.ReasonAllSecretsFound, "Secret references are delegated to Kubernetes and are not read by the operator")
 }
@@ -1444,8 +1363,8 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		}
 	}
 
-	// Do not read customer-provided Secrets from the operator. Kubernetes validates
-	// referenced Secrets during pod admission/startup.
+	// Do not read Secrets from the operator. Kubernetes validates referenced Secrets
+	// during pod admission/startup, which avoids granting dangerous Secret RBAC here.
 	r.markEnvFromSecretsUnchecked(workingCluster)
 
 	if err := r.reconcileInferencePool(ctx, workingCluster); err != nil {
@@ -1456,9 +1375,6 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 		// Swarm mode is a single topology and does not support clustered autoscaling.
 		if workingCluster.Spec.DataNodes.AutoScaling != nil && workingCluster.Spec.DataNodes.AutoScaling.Enabled {
 			log.Info("Ignoring data node autoscaling because swarm mode is enabled")
-		}
-		if err := r.deleteMetadataSystemSecretStore(ctx, workingCluster); err != nil {
-			return ctrl.Result{}, err
 		}
 
 		if err := r.reconcileConfigMap(ctx, workingCluster); err != nil {
@@ -1503,10 +1419,6 @@ func (r *AntflyClusterReconciler) Reconcile(ctx context.Context, req ctrl.Reques
 
 	// Create ConfigMap for Antfly configuration
 	if err := r.reconcileConfigMap(ctx, workingCluster); err != nil {
-		return ctrl.Result{}, err
-	}
-
-	if err := r.reconcileMetadataSystemSecretStore(ctx, workingCluster); err != nil {
 		return ctrl.Result{}, err
 	}
 
@@ -2083,63 +1995,6 @@ func (r *AntflyClusterReconciler) reconcileConfigMap(ctx context.Context, cluste
 	})
 
 	return err
-}
-
-func (r *AntflyClusterReconciler) reconcileMetadataSystemSecretStore(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
-	secret := &corev1.Secret{
-		ObjectMeta: metav1.ObjectMeta{
-			Name:      systemSecretStoreName(cluster),
-			Namespace: cluster.Namespace,
-		},
-	}
-
-	_, err := controllerutil.CreateOrUpdate(ctx, r.Client, secret, func() error {
-		if err := controllerutil.SetControllerReference(cluster, secret, r.Scheme); err != nil {
-			return err
-		}
-
-		var encoded []byte
-		if secret.Data != nil {
-			if _, ok := metadataForwardingTokenFromSecretStore(secret.Data[antflySystemSecretStoreKey]); ok {
-				encoded = secret.Data[antflySystemSecretStoreKey]
-			}
-		}
-		if encoded == nil {
-			generated, err := generateMetadataForwardingToken()
-			if err != nil {
-				return err
-			}
-			encodedStore, err := encodeSystemSecretStore(generated, time.Now().UnixNano())
-			if err != nil {
-				return fmt.Errorf("encode metadata system secret store: %w", err)
-			}
-			encoded = encodedStore
-		}
-
-		secret.Type = corev1.SecretTypeOpaque
-		secret.Labels = podLabels(cluster, "metadata")
-		secret.Data = map[string][]byte{
-			antflySystemSecretStoreKey: encoded,
-		}
-		return nil
-	})
-
-	return err
-}
-
-func (r *AntflyClusterReconciler) deleteMetadataSystemSecretStore(ctx context.Context, cluster *antflyv1.AntflyCluster) error {
-	secret := &corev1.Secret{}
-	key := types.NamespacedName{Name: systemSecretStoreName(cluster), Namespace: cluster.Namespace}
-	if err := r.Get(ctx, key, secret); err != nil {
-		if errors.IsNotFound(err) {
-			return nil
-		}
-		return fmt.Errorf("get metadata system secret store: %w", err)
-	}
-	if err := r.Delete(ctx, secret); err != nil && !errors.IsNotFound(err) {
-		return fmt.Errorf("delete metadata system secret store: %w", err)
-	}
-	return nil
 }
 
 // generateCompleteConfig creates a complete Antfly configuration by merging user config with generated metadata network config
@@ -2889,7 +2744,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 								Protocol:      corev1.ProtocolTCP,
 							},
 						},
-						VolumeMounts: append(append([]corev1.VolumeMount{
+						VolumeMounts: append([]corev1.VolumeMount{
 							{
 								Name:      "metadata-storage",
 								MountPath: "/antflydb",
@@ -2898,7 +2753,7 @@ func (r *AntflyClusterReconciler) reconcileMetadataStatefulSet(ctx context.Conte
 								Name:      "config",
 								MountPath: "/config",
 							},
-						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...), systemSecretStoreVolumeMounts()...),
+						}, secretStoreVolumeMounts(cluster.Spec.SecretStore)...),
 						Command: []string{"/bin/sh", "-c"},
 						Args: []string{
 							fmt.Sprintf(`
@@ -2916,7 +2771,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 								cluster.Spec.MetadataNodes.MetadataRaft.Port,
 								cluster.Spec.MetadataNodes.Health.Port,
 								metadataCluster,
-								metadataSecretStoreArgs(cluster.Spec.SecretStore),
+								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
 						Resources:    r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
@@ -2954,7 +2809,7 @@ exec /antfly metadata --id $ID --config /config/config.json \
 							},
 						},
 					},
-				}, append(secretStoreVolumes(cluster.Spec.SecretStore), systemSecretStoreVolumes(cluster)...)...),
+				}, secretStoreVolumes(cluster.Spec.SecretStore)...),
 			},
 		}
 
@@ -8972,7 +8827,6 @@ func (r *AntflyClusterReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Owns(&appsv1.StatefulSet{}).
 		Owns(&corev1.Service{}).
 		Owns(&corev1.ConfigMap{}).
-		Owns(&corev1.Secret{}).
 		Owns(&coordinationv1.Lease{}).
 		Owns(&batchv1.Job{}).
 		Owns(&policyv1.PodDisruptionBudget{}).

@@ -26,30 +26,14 @@ func TestClusterRoleAvoidsOptionalHighRiskPermissions(t *testing.T) {
 	role := ClusterRole()
 	for _, rule := range role.Rules {
 		for _, resource := range rule.Resources {
+			if resource == "secrets" {
+				t.Fatalf("ClusterRole should not grant secrets access, got verbs %v", rule.Verbs)
+			}
 			if resource == "nodes/proxy" {
 				t.Fatalf("ClusterRole should not grant nodes/proxy by default, got verbs %v", rule.Verbs)
 			}
 		}
 	}
-}
-
-func TestClusterRoleGrantsSystemSecretStorePermissions(t *testing.T) {
-	role := ClusterRole()
-	requiredVerbs := []string{"get", "list", "watch", "create", "update", "patch", "delete"}
-
-	for _, rule := range role.Rules {
-		if !containsString(rule.APIGroups, "") || !containsString(rule.Resources, "secrets") {
-			continue
-		}
-		for _, verb := range requiredVerbs {
-			if !containsString(rule.Verbs, verb) {
-				t.Fatalf("ClusterRole secrets rule missing verb %q: %#v", verb, rule.Verbs)
-			}
-		}
-		return
-	}
-
-	t.Fatal("ClusterRole must grant core secrets permissions for operator-owned system secret stores")
 }
 
 func TestClusterRoleGrantsLeasePermissionsForHAFencing(t *testing.T) {
