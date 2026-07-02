@@ -1808,7 +1808,11 @@ func parseSyncLevel(level SyncLevel) (db.Op_SyncLevel, error) {
 		return db.Op_SyncLevelWrite, nil
 	case "full_text":
 		return db.Op_SyncLevelFullText, nil
-	case "embeddings", "aknn":
+	case "enrichments":
+		return db.Op_SyncLevelEnrichments, nil
+	case "full_index":
+		return db.Op_SyncLevelEmbeddings, nil
+	case "embeddings":
 		return db.Op_SyncLevelEmbeddings, nil
 	default:
 		return db.Op_SyncLevelPropose, fmt.Errorf("invalid sync_level: %s", level)

@@ -93,6 +93,8 @@ const (
 	haAdminJobPhaseSucceeded         = "Succeeded"
 	haAdminJobPhaseFailed            = "Failed"
 	haAdminJobPhaseMissingAdminURL   = "MissingAdminURL"
+
+	defaultManagedInferenceAPIPort = 8080
 )
 
 //+kubebuilder:rbac:groups=antfly.io,resources=antflyclusters,verbs=get;list;watch;create;update;patch;delete
@@ -1795,6 +1797,36 @@ func managedInferencePoolName(cluster *antflyv1.AntflyCluster, managed antflyv1.
 	return fmt.Sprintf("%s-inference-%d", cluster.Name, index)
 }
 
+func configuredInferenceAPIURL(cluster *antflyv1.AntflyCluster) string {
+	if cluster.Spec.Inference == nil {
+		return ""
+	}
+	inference := cluster.Spec.Inference
+	switch antflyInferenceMode(inference) {
+	case antflyv1.AntflyInferenceModeManaged:
+		for i, managed := range inference.ManagedPools {
+			name := managedInferencePoolName(cluster, managed, len(inference.ManagedPools), i)
+			if strings.TrimSpace(name) != "" {
+				return fmt.Sprintf("http://%s.%s.svc.cluster.local:%d", name, cluster.Namespace, defaultManagedInferenceAPIPort)
+			}
+		}
+	case antflyv1.AntflyInferenceModeSharedRef:
+		return firstInferencePoolReferenceAPIURL(inference.SharedPools)
+	case antflyv1.AntflyInferenceModePlatformShared:
+		return firstInferencePoolReferenceAPIURL(inference.PlatformPools)
+	}
+	return ""
+}
+
+func firstInferencePoolReferenceAPIURL(refs []antflyv1.InferencePoolReference) string {
+	for _, ref := range refs {
+		if apiURL := strings.TrimRight(strings.TrimSpace(ref.APIURL), "/"); apiURL != "" {
+			return apiURL
+		}
+	}
+	return ""
+}
+
 func (r *AntflyClusterReconciler) reconcileManagedInferencePool(
 	ctx context.Context,
 	cluster *antflyv1.AntflyCluster,
@@ -2034,6 +2066,9 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 		}
 	}
 	completeConfig["storage"] = storageConfig
+	if apiURL := configuredInferenceAPIURL(cluster); apiURL != "" {
+		ensureInferenceAPIURL(completeConfig, apiURL)
+	}
 
 	// Convert back to JSON
 	configBytes, err := json.MarshalIndent(completeConfig, "", "  ")
@@ -2042,6 +2077,18 @@ func (r *AntflyClusterReconciler) generateClusteredConfig(cluster *antflyv1.Antf
 	}
 
 	return string(configBytes), nil
+}
+
+func ensureInferenceAPIURL(config map[string]any, apiURL string) {
+	inferenceConfig, _ := config["inference"].(map[string]any)
+	if inferenceConfig == nil {
+		inferenceConfig = map[string]any{}
+	}
+	if existing, _ := inferenceConfig["api_url"].(string); strings.TrimSpace(existing) != "" {
+		return
+	}
+	inferenceConfig["api_url"] = apiURL
+	config["inference"] = inferenceConfig
 }
 
 func (r *AntflyClusterReconciler) generateSwarmConfig(cluster *antflyv1.AntflyCluster) (string, error) {
@@ -2511,18 +2558,8 @@ exec /antfly swarm --id %d --config /config/config.json \
 								swarmHAArgs(cluster.Spec.HighAvailability),
 							),
 						},
-						Resources: r.buildResourceRequirements(swarm.Resources),
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromInt(int(swarm.Health.Port)),
-								},
-							},
-							InitialDelaySeconds: 30,
-							PeriodSeconds:       10,
-							FailureThreshold:    30,
-						},
+						Resources:    r.buildResourceRequirements(swarm.Resources),
+						StartupProbe: buildHTTPStartupProbe(swarm.Health.Port, swarm.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -2737,18 +2774,8 @@ exec /antfly metadata --id $ID --config /config/config.json \
 								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
-						Resources: r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromInt(int(cluster.Spec.MetadataNodes.Health.Port)),
-								},
-							},
-							InitialDelaySeconds: 30,
-							PeriodSeconds:       10,
-							FailureThreshold:    30,
-						},
+						Resources:    r.buildResourceRequirements(cluster.Spec.MetadataNodes.Resources),
+						StartupProbe: buildHTTPStartupProbe(cluster.Spec.MetadataNodes.Health.Port, cluster.Spec.MetadataNodes.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -2959,18 +2986,8 @@ exec /antfly data --node-id $ID --store-id $ID --config /config/config.json \
 								secretStoreArg(cluster.Spec.SecretStore),
 							),
 						},
-						Resources: r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),
-						StartupProbe: &corev1.Probe{
-							ProbeHandler: corev1.ProbeHandler{
-								HTTPGet: &corev1.HTTPGetAction{
-									Path: "/healthz",
-									Port: intstr.FromInt(int(cluster.Spec.DataNodes.Health.Port)),
-								},
-							},
-							InitialDelaySeconds: 30,
-							PeriodSeconds:       10,
-							FailureThreshold:    30,
-						},
+						Resources:    r.buildResourceRequirements(cluster.Spec.DataNodes.Resources),
+						StartupProbe: buildHTTPStartupProbe(cluster.Spec.DataNodes.Health.Port, cluster.Spec.DataNodes.StartupProbe),
 						LivenessProbe: &corev1.Probe{
 							ProbeHandler: corev1.ProbeHandler{
 								HTTPGet: &corev1.HTTPGetAction{
@@ -3055,6 +3072,35 @@ func (r *AntflyClusterReconciler) buildResourceRequirements(resourceSpec antflyv
 	}
 
 	return requirements
+}
+
+func buildHTTPStartupProbe(port int32, cfg *antflyv1.ProbeConfig) *corev1.Probe {
+	failureThreshold := int32(30)
+	periodSeconds := int32(10)
+	timeoutSeconds := int32(1)
+	if cfg != nil {
+		if cfg.FailureThreshold != nil {
+			failureThreshold = *cfg.FailureThreshold
+		}
+		if cfg.PeriodSeconds != nil {
+			periodSeconds = *cfg.PeriodSeconds
+		}
+		if cfg.TimeoutSeconds != nil {
+			timeoutSeconds = *cfg.TimeoutSeconds
+		}
+	}
+	return &corev1.Probe{
+		ProbeHandler: corev1.ProbeHandler{
+			HTTPGet: &corev1.HTTPGetAction{
+				Path: "/healthz",
+				Port: intstr.FromInt(int(port)),
+			},
+		},
+		InitialDelaySeconds: 30,
+		PeriodSeconds:       periodSeconds,
+		TimeoutSeconds:      timeoutSeconds,
+		FailureThreshold:    failureThreshold,
+	}
 }
 
 func chooseSwarmStorageSize(cluster *antflyv1.AntflyCluster) string {

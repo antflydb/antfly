@@ -173,6 +173,48 @@ pub const HttpHostDeps = struct {
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
 };
 
+const PeerSnapshotTargetResolver = struct {
+    peer_resolver: peer_resolver.PeerResolver,
+
+    fn resolver(self: *PeerSnapshotTargetResolver) transport.http_snapshot.SnapshotTargetResolver {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .resolve_upload_uri = resolveUploadUri,
+            },
+        };
+    }
+
+    fn resolveUploadUri(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        group_id: u64,
+        node_id: u64,
+        snapshot_id: []const u8,
+    ) ![]u8 {
+        const self: *PeerSnapshotTargetResolver = @ptrCast(@alignCast(ptr));
+        const endpoints = try self.peer_resolver.resolveGroupPeer(alloc, group_id, node_id);
+        defer {
+            for (endpoints) |endpoint| {
+                alloc.free(endpoint.address);
+                alloc.free(endpoint.metadata);
+            }
+            alloc.free(endpoints);
+        }
+        for (endpoints) |endpoint| {
+            switch (endpoint.protocol) {
+                .http, .https, .http2, .http3 => {
+                    const upload_path = try transport.Routes.snapshotUploadPath(alloc, snapshot_id);
+                    defer alloc.free(upload_path);
+                    return try transport.Routes.join(alloc, endpoint.address, upload_path);
+                },
+                .quic => {},
+            }
+        }
+        return error.NoHttpSnapshotEndpoint;
+    }
+};
+
 pub const Host = struct {
     const PendingInboundMessage = struct {
         group_id: u64,
@@ -454,8 +496,13 @@ pub const Host = struct {
         max_tick_groups: usize,
         max_ready_groups: usize,
     ) !raft_engine.runtime.multi_raft.HostRound {
+        const inbound_start_ns = platform_time.monotonicNs();
         _ = try self.drainInboundMessages(max_inbound_messages);
-        return try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
+        const inbound_elapsed_ns = platform_time.monotonicNs() -| inbound_start_ns;
+        var round = try self.runtime_host.runRound(max_tick_groups, max_ready_groups);
+        round.inbound_drain_elapsed_ns = inbound_elapsed_ns;
+        round.elapsed_ns += round.inbound_drain_elapsed_ns;
+        return round;
     }
 
     pub fn step(self: *Host, group_id: u64, msg: raft_engine.core.Message) !void {
@@ -556,6 +603,31 @@ pub const Host = struct {
 
     pub fn transferLeader(self: *Host, group_id: u64, transferee: u64) !void {
         try self.runtime_host.transferLeader(group_id, transferee);
+    }
+
+    pub fn handleSnapshotUpload(self: *Host, upload: transport.http_server.SnapshotUpload) !void {
+        var owned = upload;
+        errdefer owned.snapshot.deinit(self.alloc);
+        const grp = self.runtime_host.group(upload.group_id) orelse return error.UnknownGroup;
+        if (upload.to != grp.localNodeId()) return error.SnapshotUploadTargetMismatch;
+        var msg: raft_engine.core.Message = .{
+            .msg_type = .snapshot,
+            .from = upload.from,
+            .to = upload.to,
+            .term = upload.term,
+            .snapshot = owned.snapshot,
+        };
+        owned.snapshot = .{};
+        errdefer msg.deinit(self.alloc);
+
+        self.lockInbound();
+        defer self.inbound_mutex.unlock();
+        try self.pending_inbound.append(self.alloc, .{
+            .group_id = upload.group_id,
+            .message = msg,
+        });
+        self.metrics.inbound_message_enqueues += 1;
+        self.metrics.pending_inbound_messages = self.pending_inbound.items.len;
     }
 
     pub fn forgetLeader(self: *Host, group_id: u64) !void {
@@ -687,6 +759,7 @@ pub const HttpHost = struct {
     executor: ?*transport.StdHttpExecutor,
     request_executor: transport.RequestExecutor,
     transport_stack: *transport.HttpTransportStack,
+    owned_snapshot_resolver: ?*PeerSnapshotTargetResolver,
     owned_snapshot_store: ?*transport.FileSnapshotStore,
     host: *Host,
     batch_handler: *transport.HostBatchHandler,
@@ -714,13 +787,26 @@ pub const HttpHost = struct {
 
         const transport_stack = try alloc.create(transport.HttpTransportStack);
         errdefer alloc.destroy(transport_stack);
+        const owned_snapshot_resolver = if (deps.snapshot_resolver == null) blk: {
+            const peer = deps.host.peer_resolver orelse break :blk null;
+            const resolver = try alloc.create(PeerSnapshotTargetResolver);
+            resolver.* = .{ .peer_resolver = peer };
+            break :blk resolver;
+        } else null;
+        errdefer if (owned_snapshot_resolver) |resolver| alloc.destroy(resolver);
+        const snapshot_resolver = if (deps.snapshot_resolver) |resolver|
+            resolver
+        else if (owned_snapshot_resolver) |resolver|
+            resolver.resolver()
+        else
+            null;
         const transport_io = if (deps.backend_runtime) |runtime| runtime.raftOutboundIo() else null;
         transport_stack.* = try transport.HttpTransportStack.init(
             alloc,
             cfg.transport,
             request_executor,
             transport_io,
-            deps.snapshot_resolver,
+            snapshot_resolver,
         );
         errdefer transport_stack.deinit();
 
@@ -753,6 +839,7 @@ pub const HttpHost = struct {
         server.* = transport_stack.makeServer(
             batch_handler.handler(),
             if (deps.snapshot_store) |snapshot_store| snapshot_store else if (owned_snapshot_store) |snapshot_store| snapshot_store.store() else null,
+            batch_handler.snapshotHandler(),
         );
 
         const listener = try alloc.create(transport.StdHttpListener);
@@ -772,6 +859,7 @@ pub const HttpHost = struct {
             .executor = executor,
             .request_executor = request_executor,
             .transport_stack = transport_stack,
+            .owned_snapshot_resolver = owned_snapshot_resolver,
             .owned_snapshot_store = owned_snapshot_store,
             .host = host,
             .batch_handler = batch_handler,
@@ -789,6 +877,7 @@ pub const HttpHost = struct {
         self.alloc.destroy(self.host);
         self.transport_stack.deinit();
         self.alloc.destroy(self.transport_stack);
+        if (self.owned_snapshot_resolver) |resolver| self.alloc.destroy(resolver);
         if (self.owned_snapshot_store) |snapshot_store| {
             snapshot_store.deinit();
             self.alloc.destroy(snapshot_store);
@@ -991,6 +1080,164 @@ test "host can ensure and remove a replica" {
 
     try host.removeReplica(41);
     try std.testing.expectEqual(.absent, host.status(41));
+}
+
+test "host rejects live snapshot uploads addressed to another node" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) ReplicaDescriptorFactory {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .build_descriptor = buildDescriptor,
+                    .free_descriptor = freeDescriptor,
+                },
+            };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers[0..],
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = .empty,
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+    });
+    defer host.deinit();
+
+    _ = try host.ensureReplica(.{
+        .group_id = 41,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+
+    const voters = try std.testing.allocator.dupe(u64, &[_]u64{1});
+    const data = try std.testing.allocator.dupe(u8, "wrong-target");
+    try std.testing.expectError(error.SnapshotUploadTargetMismatch, host.handleSnapshotUpload(.{
+        .group_id = 41,
+        .from = 2,
+        .to = 3,
+        .term = 7,
+        .snapshot = .{
+            .metadata = .{
+                .index = 1,
+                .term = 1,
+                .conf_state = .{ .voters = voters },
+            },
+            .data = data,
+        },
+    }));
+}
+
+test "host queues live snapshot uploads for runtime round" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) ReplicaDescriptorFactory {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .build_descriptor = buildDescriptor,
+                    .free_descriptor = freeDescriptor,
+                },
+            };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers[0..],
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = .empty,
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+    var host = Host.init(std.testing.allocator, .{ .local_node_id = 1 }, .{
+        .descriptor_factory = factory.iface(),
+    });
+    defer host.deinit();
+
+    _ = try host.ensureReplica(.{
+        .group_id = 41,
+        .replica_id = 1,
+        .local_node_id = 1,
+    });
+
+    const voters = try std.testing.allocator.dupe(u64, &[_]u64{1});
+    const data = try std.testing.allocator.dupe(u8, "queued-snapshot");
+    try host.handleSnapshotUpload(.{
+        .group_id = 41,
+        .from = 2,
+        .to = 1,
+        .term = 7,
+        .snapshot = .{
+            .metadata = .{
+                .index = 1,
+                .term = 1,
+                .conf_state = .{ .voters = voters },
+            },
+            .data = data,
+        },
+    });
+
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_enqueues);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.pending_inbound_messages);
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.inbound_message_drains);
+
+    _ = try host.runRoundBounded(1, 1, 1);
+    try std.testing.expectEqual(@as(usize, 1), host.metrics.inbound_message_drains);
+    try std.testing.expectEqual(@as(usize, 0), host.metrics.pending_inbound_messages);
 }
 
 test "host drops stale inbound peer batch groups without leaking pending storage" {

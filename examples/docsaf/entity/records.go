@@ -40,7 +40,7 @@ func HasEntityRecords(records map[string]any) bool {
 		if !ok {
 			continue
 		}
-		if docType, ok := doc["_type"]; ok && docType == "entity" {
+		if docType, ok := doc["doc_type"]; ok && docType == "entity" {
 			return true
 		}
 	}

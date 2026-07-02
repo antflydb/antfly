@@ -21604,6 +21604,126 @@ test "metal_compute: scaled dot product attention fallback preserves shape and v
     }
 }
 
+test "metal_compute: scaled dot product attention supports seq-major interleaved heads" {
+    if (!build_options.enable_metal) return error.SkipZigTest;
+    if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;
+
+    const allocator = std.testing.allocator;
+
+    var metal_ws = testMetalWeightStoreInit(allocator);
+    defer metal_ws.lazy_weights.deinit(allocator);
+    var metal_compute = try MetalCompute.init(allocator, &metal_ws, null);
+    defer metal_compute.deinit();
+    var metal_cb = metal_compute.computeBackend();
+
+    const batch: usize = 2;
+    const seq_len: usize = 3;
+    const num_heads: usize = 2;
+    const head_dim: usize = 2;
+    const hidden = num_heads * head_dim;
+    const total = batch * seq_len * hidden;
+    const qkv_shape = [_]i32{ @intCast(batch * seq_len), @intCast(hidden) };
+    const bias_shape = [_]i32{ @intCast(num_heads), @intCast(seq_len), @intCast(seq_len) };
+
+    var q_data: [total]f32 = undefined;
+    var k_data: [total]f32 = undefined;
+    var v_data: [total]f32 = undefined;
+    var bias_data: [num_heads * seq_len * seq_len]f32 = undefined;
+    const mask = [_]i64{
+        1, 1, 0,
+        1, 0, 1,
+    };
+
+    for (0..total) |i| {
+        q_data[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 7) % 19)) - 9)) * 0.06;
+        k_data[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 5) % 17)) - 8)) * 0.07;
+        v_data[i] = @as(f32, @floatFromInt(@as(i32, @intCast((i * 3) % 13)) - 6)) * 0.11;
+    }
+    for (0..bias_data.len) |i| {
+        bias_data[i] = @as(f32, @floatFromInt(@as(i32, @intCast(i % 7)) - 3)) * 0.015;
+    }
+
+    const q_host = try metal_cb.fromFloat32Shape(&q_data, &qkv_shape);
+    defer metal_cb.free(q_host);
+    const k_host = try metal_cb.fromFloat32Shape(&k_data, &qkv_shape);
+    defer metal_cb.free(k_host);
+    const v_host = try metal_cb.fromFloat32Shape(&v_data, &qkv_shape);
+    defer metal_cb.free(v_host);
+    const bias = try metal_cb.fromFloat32Shape(&bias_data, &bias_shape);
+    defer metal_cb.free(bias);
+
+    const q_mt = try metal_compute.ownedDeviceMetalTensorFromCt(q_host);
+    const q = try metal_compute.ctFromOwnedMetalTensor(q_mt);
+    defer metal_cb.free(q);
+    const k_mt = try metal_compute.ownedDeviceMetalTensorFromCt(k_host);
+    const k = try metal_compute.ctFromOwnedMetalTensor(k_mt);
+    defer metal_cb.free(k);
+    const v_mt = try metal_compute.ownedDeviceMetalTensorFromCt(v_host);
+    const v = try metal_compute.ctFromOwnedMetalTensor(v_mt);
+    defer metal_cb.free(v);
+
+    const out = try metal_cb.scaledDotProductAttention(q, k, v, &mask, bias, batch, seq_len, num_heads, head_dim);
+    defer metal_cb.free(out);
+    try std.testing.expect(MetalCompute.debugHasDeviceTensor(&metal_cb, out));
+
+    const out_shape = try metal_cb.tensorShape(out, allocator);
+    defer allocator.free(out_shape);
+    try std.testing.expectEqualSlices(i64, &.{ @intCast(batch * seq_len), @intCast(hidden) }, out_shape);
+
+    var expected: [total]f32 = undefined;
+    @memset(&expected, 0.0);
+    var scores: [seq_len]f32 = undefined;
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(head_dim)));
+
+    for (0..batch) |b| {
+        for (0..num_heads) |h| {
+            for (0..seq_len) |qi| {
+                var row_max: f32 = -std.math.inf(f32);
+                for (0..seq_len) |ki| {
+                    if (mask[b * seq_len + ki] == 0) {
+                        scores[ki] = -std.math.inf(f32);
+                        continue;
+                    }
+                    const q_base = (b * seq_len + qi) * hidden + h * head_dim;
+                    const k_base = (b * seq_len + ki) * hidden + h * head_dim;
+                    var dot: f32 = 0.0;
+                    for (0..head_dim) |d| dot += q_data[q_base + d] * k_data[k_base + d];
+                    const bias_idx = (h * seq_len + qi) * seq_len + ki;
+                    scores[ki] = dot * scale + bias_data[bias_idx];
+                    row_max = @max(row_max, scores[ki]);
+                }
+
+                var sum: f32 = 0.0;
+                for (0..seq_len) |ki| {
+                    if (scores[ki] == -std.math.inf(f32)) {
+                        scores[ki] = 0.0;
+                    } else {
+                        scores[ki] = @exp(scores[ki] - row_max);
+                        sum += scores[ki];
+                    }
+                }
+                if (sum > 0.0) {
+                    for (0..seq_len) |ki| scores[ki] /= sum;
+                }
+
+                const out_base = (b * seq_len + qi) * hidden + h * head_dim;
+                for (0..seq_len) |ki| {
+                    const weight = scores[ki];
+                    if (weight == 0.0) continue;
+                    const v_base = (b * seq_len + ki) * hidden + h * head_dim;
+                    for (0..head_dim) |d| expected[out_base + d] += weight * v_data[v_base + d];
+                }
+            }
+        }
+    }
+
+    const out_data = try metal_cb.toFloat32(out, allocator);
+    defer allocator.free(out_data);
+    for (expected, out_data) |expected_value, actual_value| {
+        try std.testing.expectApproxEqAbs(expected_value, actual_value, 1e-4);
+    }
+}
+
 test "metal_compute: linearTriple is owned by metal backend" {
     if (!build_options.enable_metal) return error.SkipZigTest;
     if (!@import("../backends/metal_runtime.zig").metalDeviceAvailable()) return error.SkipZigTest;

@@ -51,19 +51,199 @@ const internal_keys = @import("../storage/internal_keys.zig");
 const foreign_mod = @import("../foreign/mod.zig");
 
 const cdc_replication_round_interval_ms: u64 = 1_000;
+pub const metadata_run_round_slow_threshold_ns: u64 = std.time.ns_per_s;
 const metadata_run_round_slow_phase_threshold_ns: u64 = 500 * std.time.ns_per_ms;
+const metadata_run_round_trace_max_phases: usize = 32;
 const linearizable_metadata_read_prefix = "metadata:linearizable-read:";
 const linearizable_metadata_read_timeout_ns: u64 = 5 * std.time.ns_per_s;
+const linearizable_metadata_read_retry_ns: u64 = 50 * std.time.ns_per_ms;
 
-fn logMetadataRunRoundPhase(name: []const u8, start_ns: u64) void {
-    const elapsed_ns = platform_time.monotonicNs() -| start_ns;
+fn logMetadataRunRoundPhase(name: []const u8, elapsed_ns: u64) void {
     if (elapsed_ns > metadata_run_round_slow_phase_threshold_ns) {
-        std.log.debug("metadata runRound phase slow phase={s} elapsed_ms={d}", .{
+        std.log.warn("metadata runRound phase slow phase={s} elapsed_ms={d}", .{
             name,
             @divTrunc(elapsed_ns, std.time.ns_per_ms),
         });
     }
 }
+
+fn logMetadataRaftRoundDiagnostics(round: raft_engine.runtime.multi_raft.HostRound) void {
+    if (round.elapsed_ns <= metadata_run_round_slow_phase_threshold_ns) return;
+    const ready = round.slowest_ready_group;
+    std.log.warn(
+        "metadata raft round slow elapsed_ms={d} inbound_ms={d} tick_ms={d} drain_ready_ms={d} drain_scan_ms={d} persist_begin_ms={d} persist_finish_ms={d} outbox_drain_ms={d} apply_flush_ms={d} transport_flush_ms={d} transport_advance_ms={d} ticked_groups={d} processed_groups={d} virtual_round={d} virtual_time_ms={d} ready_group_id={d} ready_group_ms={d}",
+        .{
+            @divTrunc(round.elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.tick_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.drain_ready_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.drain_ready_scan_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.persist_batch_begin_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.persist_batch_finish_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.outbox_drain_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.apply_flush_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.transport_flush_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(round.transport_advance_elapsed_ns, std.time.ns_per_ms),
+            round.ticked_groups,
+            round.processed_groups,
+            round.virtual_round,
+            round.virtual_time_ms,
+            ready.group_id,
+            @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+    std.log.warn(
+        "metadata raft ready slow group_id={d} ready_build_ms={d} ready_backpressure_ms={d} ready_capacity_ms={d} ready_snapshot_throttle_ms={d} ready_persist_ms={d} ready_async_ms={d} ready_clone_messages_ms={d} ready_enqueue_apply_ms={d} ready_async_loop_ms={d} ready_outbox_append_ms={d} ready_advance_ms={d} ready_inline_apply_flush_ms={d} ready_inline_outbox_drain_ms={d} ready_inline_transport_flush_ms={d}",
+        .{
+            ready.group_id,
+            @divTrunc(ready.ready_build_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.backpressure_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.capacity_check_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.snapshot_throttle_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.persist_ready_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.async_ready_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.clone_messages_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.enqueue_apply_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.async_message_loop_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.outbox_append_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.raft_advance_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+        },
+    );
+    const persist = ready.persist_ready_detail;
+    std.log.warn(
+        "metadata raft ready persist detail group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+        .{
+            ready.group_id,
+            @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_wait_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_coalesce_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_txn_open_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
+            @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
+            persist.wal_physical_commits,
+            persist.encoded_bytes,
+            persist.delta_records_since_checkpoint,
+            persist.delta_bytes_since_checkpoint,
+        },
+    );
+    std.log.warn(
+        "metadata raft ready pressure group_id={d} ready_messages={d} ready_message_bytes={d} ready_committed_entries={d} ready_committed_bytes={d} ready_unstable_entries={d} ready_unstable_bytes={d} ready_read_states={d} ready_has_snapshot={} ready_snapshot_bytes={d} ready_async_storage={} ready_processed={} ready_denied_backpressure={} ready_denied_transport_capacity={} ready_denied_apply_capacity={} ready_denied_snapshot_throttle={} ready_has_more={}",
+        .{
+            ready.group_id,
+            ready.message_count,
+            ready.message_bytes,
+            ready.committed_entries,
+            ready.committed_entry_bytes,
+            ready.unstable_entries,
+            ready.unstable_entry_bytes,
+            ready.read_states,
+            ready.has_snapshot,
+            ready.snapshot_bytes,
+            ready.async_storage_writes,
+            ready.processed,
+            ready.denied_by_backpressure,
+            ready.denied_by_transport_capacity,
+            ready.denied_by_apply_capacity,
+            ready.denied_by_snapshot_throttle,
+            ready.has_more_ready,
+        },
+    );
+}
+
+const MetadataRaftDiagnosticsSnapshot = struct {
+    pending_updates: usize = 0,
+    node_id: u64 = 0,
+    role: []const u8 = "unknown",
+    has_leader: bool = false,
+    leader_id: u64 = 0,
+    term: u64 = 0,
+    commit_index: u64 = 0,
+    applied_index: u64 = 0,
+    last_index: u64 = 0,
+    election_elapsed: u64 = 0,
+    last_runtime_round: ?raft_engine.runtime.multi_raft.HostRound = null,
+};
+
+const MetadataRunRoundTrace = struct {
+    const Phase = struct {
+        name: []const u8,
+        elapsed_ns: u64,
+    };
+
+    start_ns: u64,
+    phases: [metadata_run_round_trace_max_phases]Phase = undefined,
+    phase_count: usize = 0,
+    dropped_phases: usize = 0,
+
+    fn init() MetadataRunRoundTrace {
+        return .{ .start_ns = platform_time.monotonicNs() };
+    }
+
+    fn recordSince(self: *MetadataRunRoundTrace, name: []const u8, start_ns: u64) void {
+        const elapsed_ns = platform_time.monotonicNs() -| start_ns;
+        if (self.phase_count < self.phases.len) {
+            self.phases[self.phase_count] = .{ .name = name, .elapsed_ns = elapsed_ns };
+            self.phase_count += 1;
+        } else {
+            self.dropped_phases += 1;
+        }
+        logMetadataRunRoundPhase(name, elapsed_ns);
+    }
+
+    fn logIfSlow(self: *const MetadataRunRoundTrace) void {
+        const total_elapsed_ns = platform_time.monotonicNs() -| self.start_ns;
+        if (total_elapsed_ns <= metadata_run_round_slow_threshold_ns) return;
+
+        const top = self.topPhaseIndexes();
+        const top0 = phaseOrEmpty(self, top[0]);
+        const top1 = phaseOrEmpty(self, top[1]);
+        const top2 = phaseOrEmpty(self, top[2]);
+        std.log.warn(
+            "metadata runRound phase summary slow elapsed_ms={d} phases={d} dropped_phases={d} top1_phase={s} top1_ms={d} top2_phase={s} top2_ms={d} top3_phase={s} top3_ms={d}",
+            .{
+                @divTrunc(total_elapsed_ns, std.time.ns_per_ms),
+                self.phase_count,
+                self.dropped_phases,
+                top0.name,
+                @divTrunc(top0.elapsed_ns, std.time.ns_per_ms),
+                top1.name,
+                @divTrunc(top1.elapsed_ns, std.time.ns_per_ms),
+                top2.name,
+                @divTrunc(top2.elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+    }
+
+    fn topPhaseIndexes(self: *const MetadataRunRoundTrace) [3]?usize {
+        var top: [3]?usize = .{ null, null, null };
+        for (self.phases[0..self.phase_count], 0..) |phase, idx| {
+            var insert_at: ?usize = null;
+            for (top, 0..) |existing, top_idx| {
+                if (existing == null or phase.elapsed_ns > self.phases[existing.?].elapsed_ns) {
+                    insert_at = top_idx;
+                    break;
+                }
+            }
+            if (insert_at) |slot| {
+                var move_idx: usize = top.len - 1;
+                while (move_idx > slot) : (move_idx -= 1) {
+                    top[move_idx] = top[move_idx - 1];
+                }
+                top[slot] = idx;
+            }
+        }
+        return top;
+    }
+
+    fn phaseOrEmpty(self: *const MetadataRunRoundTrace, idx: ?usize) Phase {
+        return if (idx) |value| self.phases[value] else .{ .name = "-", .elapsed_ns = 0 };
+    }
+};
 
 const LifecycleSignal = struct {
     alloc: std.mem.Allocator,
@@ -233,40 +413,8 @@ pub const MetadataServiceConfig = struct {
     reconcile_lease: metadata_reconcile_lease.Config = .{},
     observe_local_replica_root: bool = true,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
-    metadata_orchestration_urls: []const MetadataOrchestrationUrl = &.{},
     secret_store: ?*common_secrets.FileStore = null,
 };
-
-pub const MetadataOrchestrationUrl = struct {
-    node_id: u64,
-    url: []const u8,
-};
-
-fn cloneMetadataOrchestrationUrls(
-    alloc: std.mem.Allocator,
-    urls: []const MetadataOrchestrationUrl,
-) ![]MetadataOrchestrationUrl {
-    if (urls.len == 0) return &.{};
-    const out = try alloc.alloc(MetadataOrchestrationUrl, urls.len);
-    var initialized: usize = 0;
-    errdefer {
-        for (out[0..initialized]) |entry| alloc.free(entry.url);
-        alloc.free(out);
-    }
-    for (urls, 0..) |entry, index| {
-        out[index] = .{
-            .node_id = entry.node_id,
-            .url = try alloc.dupe(u8, entry.url),
-        };
-        initialized += 1;
-    }
-    return out;
-}
-
-fn freeMetadataOrchestrationUrls(alloc: std.mem.Allocator, urls: []MetadataOrchestrationUrl) void {
-    for (urls) |entry| alloc.free(entry.url);
-    if (urls.len > 0) alloc.free(urls);
-}
 
 pub const MetadataServiceDeps = struct {
     host: raft_managed_host.ManagedHostDeps = .{},
@@ -2170,7 +2318,6 @@ pub const MetadataHttpService = struct {
     backend_runtime_mutex: std.Io.Mutex = .init,
     backend_runtime: ?*backend_runtime_mod.BackendRuntime = null,
     owned_backend_runtime: ?backend_runtime_mod.BackendRuntimeHandle = null,
-    metadata_orchestration_urls: []MetadataOrchestrationUrl = &.{},
     linearizable_read_tracker: *LinearizableMetadataReadTracker,
     json_response_calls: std.atomic.Value(u64) = .init(0),
     json_response_bytes_total: std.atomic.Value(u64) = .init(0),
@@ -2223,7 +2370,6 @@ pub const MetadataHttpService = struct {
             .backend_runtime = backend_runtime,
             .owned_backend_runtime = owned_backend_runtime,
             .secret_store = cfg.secret_store,
-            .metadata_orchestration_urls = try cloneMetadataOrchestrationUrls(alloc, cfg.metadata_orchestration_urls),
             .linearizable_read_tracker = read_tracker,
             .raft = try raft_service.ManagedHttpHostService.init(alloc, host_cfg, http_deps, cfg.raft, deps.raft),
         };
@@ -2239,7 +2385,6 @@ pub const MetadataHttpService = struct {
         self.store_status_backfill_marker_cache.deinit(self.alloc);
         self.cdc_backfill_registry.deinit(self.alloc);
         self.lifecycle_signal.deinit();
-        freeMetadataOrchestrationUrls(self.alloc, self.metadata_orchestration_urls);
         self.raft.deinit();
         self.linearizable_read_tracker.deinit();
         self.alloc.destroy(self.linearizable_read_tracker);
@@ -2397,54 +2542,6 @@ pub const MetadataHttpService = struct {
         self.lockRuntime();
         defer self.unlockRuntime();
         try self.raft.host.http_host.campaignGroup(self.metadata_group_id);
-    }
-
-    pub fn forwardMetadataLeaderRequest(
-        self: *MetadataHttpService,
-        alloc: std.mem.Allocator,
-        req: http_common.HttpRequest,
-    ) !?http_common.HttpResponse {
-        self.lockRuntime();
-        const local_node_id = self.raft.host.http_host.host.cfg.local_node_id;
-        const leader_id = self.raft.host.http_host.leaderId(self.metadata_group_id);
-        self.unlockRuntime();
-        const target_node_id = leader_id orelse return null;
-        if (target_node_id == local_node_id) return null;
-        const base_uri = self.metadataOrchestrationUrlForNode(target_node_id) orelse return null;
-        const uri = try std.fmt.allocPrint(alloc, "{s}{s}", .{ base_uri, req.uri });
-        defer alloc.free(uri);
-        const headers = try filteredForwardHeaders(alloc, req.headers);
-        defer if (headers.len > 0) alloc.free(headers);
-        return try self.raft.host.http_host.request_executor.execute(alloc, .{
-            .method = req.method,
-            .uri = uri,
-            .headers = headers,
-            .source_node_id = local_node_id,
-            .authorization = req.authorization,
-            .content_type = req.content_type,
-            .body = req.body,
-        });
-    }
-
-    fn filteredForwardHeaders(alloc: std.mem.Allocator, headers: []const http_common.RequestHeader) ![]http_common.RequestHeader {
-        if (headers.len == 0) return &.{};
-        var out = std.ArrayListUnmanaged(http_common.RequestHeader).empty;
-        errdefer out.deinit(alloc);
-        for (headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, "host")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "connection")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "content-length")) continue;
-            if (std.ascii.eqlIgnoreCase(header.name, "content-type")) continue;
-            try out.append(alloc, header);
-        }
-        return try out.toOwnedSlice(alloc);
-    }
-
-    fn metadataOrchestrationUrlForNode(self: *const MetadataHttpService, node_id: u64) ?[]const u8 {
-        for (self.metadata_orchestration_urls) |entry| {
-            if (entry.node_id == node_id) return entry.url;
-        }
-        return null;
     }
 
     pub fn proposeTransitionCommand(self: *MetadataHttpService, command: metadata_storage.TransitionCommand) !void {
@@ -2625,12 +2722,23 @@ pub const MetadataHttpService = struct {
     }
 
     pub fn runRound(self: *MetadataHttpService) !void {
+        var run_round_trace = MetadataRunRoundTrace.init();
+        defer run_round_trace.logIfSlow();
         var phase_start_ns = platform_time.monotonicNs();
         try self.ensureLifecycleListenerRegistered();
-        logMetadataRunRoundPhase("ensure_lifecycle_listener", phase_start_ns);
-        defer self.refreshMetadataStatusCacheIfDue();
-        defer self.lifecycle_signal.notify(null);
+        run_round_trace.recordSince("ensure_lifecycle_listener", phase_start_ns);
+        defer {
+            const status_cache_phase_start_ns = platform_time.monotonicNs();
+            self.refreshMetadataStatusCacheIfDue();
+            run_round_trace.recordSince("refresh_metadata_status_cache", status_cache_phase_start_ns);
+        }
+        defer {
+            const lifecycle_signal_phase_start_ns = platform_time.monotonicNs();
+            self.lifecycle_signal.notify(null);
+            run_round_trace.recordSince("lifecycle_signal_notify", lifecycle_signal_phase_start_ns);
+        }
         phase_start_ns = platform_time.monotonicNs();
+        var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         self.lockRuntime();
         {
             defer self.unlockRuntime();
@@ -2639,24 +2747,30 @@ pub const MetadataHttpService = struct {
             } else {
                 try self.raft.runRaftRoundOnly();
             }
+            raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
         }
         self.refreshProbeReady();
-        logMetadataRunRoundPhase("raft_round", phase_start_ns);
+        run_round_trace.recordSince("raft_round", phase_start_ns);
+        if (raft_diagnostics_snapshot.last_runtime_round) |round| logMetadataRaftRoundDiagnostics(round);
         if (!self.observe_local_replica_root) return;
 
         phase_start_ns = platform_time.monotonicNs();
         const has_reconcile_lease = try self.ensureReconcileLease();
-        logMetadataRunRoundPhase("ensure_reconcile_lease", phase_start_ns);
+        run_round_trace.recordSince("ensure_reconcile_lease", phase_start_ns);
         if (!has_reconcile_lease) return;
 
         phase_start_ns = platform_time.monotonicNs();
         var local_projection_inputs = try captureLocalProjectionInputs(self);
-        defer freeLocalProjectionInputs(self, &local_projection_inputs);
-        logMetadataRunRoundPhase("capture_projection_inputs", phase_start_ns);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalProjectionInputs(self, &local_projection_inputs);
+            run_round_trace.recordSince("free_projection_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_projection_inputs", phase_start_ns);
 
         phase_start_ns = platform_time.monotonicNs();
         const backfill_markers = try self.refreshStoreStatusBackfillMarkersForRound();
-        logMetadataRunRoundPhase("refresh_store_status_backfill_markers", phase_start_ns);
+        run_round_trace.recordSince("refresh_store_status_backfill_markers", phase_start_ns);
         if ((self.store_status_ticks >= 40 or backfill_markers.len > 0) and shouldRefreshLocalStoreStatus(self, backfill_markers)) {
             self.store_status_ticks = 0;
             phase_start_ns = platform_time.monotonicNs();
@@ -2664,46 +2778,54 @@ pub const MetadataHttpService = struct {
                 error.UnknownGroup, error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
                 else => return err,
             };
-            logMetadataRunRoundPhase("refresh_local_store_status", phase_start_ns);
+            run_round_trace.recordSince("refresh_local_store_status", phase_start_ns);
         }
         phase_start_ns = platform_time.monotonicNs();
         self.refreshLocalSchemaProgress(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => {},
             else => return err,
         };
-        logMetadataRunRoundPhase("refresh_local_schema_progress", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_schema_progress", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         var local_placement_inputs = try captureLocalPlacementInputs(self);
-        defer freeLocalPlacementInputs(self, &local_placement_inputs);
-        logMetadataRunRoundPhase("capture_placement_inputs", phase_start_ns);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalPlacementInputs(self, &local_placement_inputs);
+            run_round_trace.recordSince("free_placement_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_placement_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         var local_transition_inputs = try captureLocalTransitionInputs(self);
-        defer freeLocalTransitionInputs(self, &local_transition_inputs);
-        logMetadataRunRoundPhase("capture_transition_inputs", phase_start_ns);
+        defer {
+            const cleanup_phase_start_ns = platform_time.monotonicNs();
+            freeLocalTransitionInputs(self, &local_transition_inputs);
+            run_round_trace.recordSince("free_transition_inputs", cleanup_phase_start_ns);
+        }
+        run_round_trace.recordSince("capture_transition_inputs", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalPlacementIntents(&local_placement_inputs);
-        logMetadataRunRoundPhase("refresh_local_placement_intents", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_placement_intents", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.refreshLocalTransitions(&local_transition_inputs);
-        logMetadataRunRoundPhase("refresh_local_transitions", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_transitions", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = self.refreshLocalTableProvisioning(&local_projection_inputs) catch |err| switch (err) {
             error.FileNotFound, error.WriterLocked, error.LmdbUnexpected, error.Corrupted => .{},
             else => return err,
         };
-        logMetadataRunRoundPhase("refresh_local_table_provisioning", phase_start_ns);
+        run_round_trace.recordSince("refresh_local_table_provisioning", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.completeRestoreIntentsIfReady(&local_projection_inputs, &local_placement_inputs);
-        logMetadataRunRoundPhase("complete_restore_intents", phase_start_ns);
+        run_round_trace.recordSince("complete_restore_intents", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.runReplicationBackfillRound();
-        logMetadataRunRoundPhase("run_replication_backfill", phase_start_ns);
+        run_round_trace.recordSince("run_replication_backfill", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         try self.runLifecycleReconcileHookIfRequested();
-        logMetadataRunRoundPhase("run_lifecycle_reconcile_hook", phase_start_ns);
+        run_round_trace.recordSince("run_lifecycle_reconcile_hook", phase_start_ns);
         phase_start_ns = platform_time.monotonicNs();
         _ = try self.raft.stepTransitions();
-        logMetadataRunRoundPhase("step_transitions", phase_start_ns);
+        run_round_trace.recordSince("step_transitions", phase_start_ns);
     }
 
     pub fn probeReady(self: *const MetadataHttpService) bool {
@@ -2943,15 +3065,35 @@ pub const MetadataHttpService = struct {
             .{ linearizable_metadata_read_prefix, request_id },
         );
 
-        self.lockRuntime();
-        {
-            defer self.unlockRuntime();
-            try self.raft.requestReadableLease(self.metadata_group_id, request_ctx);
-        }
-
         const deadline_ns = platform_time.monotonicNs() + linearizable_metadata_read_timeout_ns;
+        var next_request_ns: u64 = 0;
+        var request_attempts: usize = 0;
+        var not_leader_count: usize = 0;
+        var raft_rounds: usize = 0;
+        var slowest_round: raft_engine.runtime.multi_raft.HostRound = .{};
+        var latest_raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
         while (platform_time.monotonicNs() < deadline_ns) {
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
+            const now_ns = platform_time.monotonicNs();
+            if (now_ns >= next_request_ns) {
+                self.lockRuntime();
+                {
+                    defer self.unlockRuntime();
+                    request_attempts += 1;
+                    self.raft.requestReadableLease(self.metadata_group_id, request_ctx) catch |err| switch (err) {
+                        // A follower may not know the leader yet during elections,
+                        // restarts, or after endpoint-level load balancing. Keep
+                        // driving raft below and retry the same read context until
+                        // the barrier completes or the caller's timeout expires.
+                        error.NotLeader => {
+                            not_leader_count += 1;
+                        },
+                        else => return err,
+                    };
+                }
+                next_request_ns = now_ns + linearizable_metadata_read_retry_ns;
+            }
+            var raft_diagnostics_snapshot: MetadataRaftDiagnosticsSnapshot = .{};
             self.lockRuntime();
             {
                 defer self.unlockRuntime();
@@ -2960,12 +3102,124 @@ pub const MetadataHttpService = struct {
                 } else {
                     try self.raft.runRaftRoundOnly();
                 }
+                raft_diagnostics_snapshot = self.raftDiagnosticsSnapshotLocked();
+                latest_raft_diagnostics_snapshot = raft_diagnostics_snapshot;
+            }
+            raft_rounds += 1;
+            if (raft_diagnostics_snapshot.last_runtime_round) |round| {
+                if (round.elapsed_ns > slowest_round.elapsed_ns) slowest_round = round;
+                logMetadataRaftRoundDiagnostics(round);
             }
             if (self.linearizable_read_tracker.isComplete(request_id)) return;
             platform_clock.Clock.real().sleepMs(1);
         }
         if (self.linearizable_read_tracker.isComplete(request_id)) return;
+        self.logLinearizableReadTimeout(request_id, request_attempts, not_leader_count, raft_rounds, slowest_round, latest_raft_diagnostics_snapshot);
         return error.MetadataLinearizableReadTimeout;
+    }
+
+    fn logLinearizableReadTimeout(
+        self: *MetadataHttpService,
+        request_id: u64,
+        request_attempts: usize,
+        not_leader_count: usize,
+        raft_rounds: usize,
+        slowest_round: raft_engine.runtime.multi_raft.HostRound,
+        snapshot: MetadataRaftDiagnosticsSnapshot,
+    ) void {
+        const ready = slowest_round.slowest_ready_group;
+        std.log.warn(
+            "metadata linearizable read timeout request_id={d} group_id={d} attempts={d} not_leader={d} raft_rounds={d} pending_updates={d} node_id={d} role={s} has_leader={} leader_id={d} term={d} commit_index={d} applied_index={d} last_index={d} election_elapsed={d} slowest_round_ms={d} slowest_inbound_ms={d} slowest_tick_ms={d} slowest_drain_ready_ms={d} slowest_drain_scan_ms={d} slowest_apply_flush_ms={d} slowest_transport_flush_ms={d} slowest_transport_advance_ms={d} slowest_ticked_groups={d} slowest_processed_groups={d} slowest_ready_group_id={d} slowest_ready_group_ms={d}",
+            .{
+                request_id,
+                self.metadata_group_id,
+                request_attempts,
+                not_leader_count,
+                raft_rounds,
+                snapshot.pending_updates,
+                snapshot.node_id,
+                snapshot.role,
+                snapshot.has_leader,
+                snapshot.leader_id,
+                snapshot.term,
+                snapshot.commit_index,
+                snapshot.applied_index,
+                snapshot.last_index,
+                snapshot.election_elapsed,
+                @divTrunc(slowest_round.elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.inbound_drain_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.tick_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.drain_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.drain_ready_scan_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.apply_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.transport_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(slowest_round.transport_advance_elapsed_ns, std.time.ns_per_ms),
+                slowest_round.ticked_groups,
+                slowest_round.processed_groups,
+                ready.group_id,
+                @divTrunc(ready.elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+        std.log.warn(
+            "metadata linearizable read timeout ready timings request_id={d} group_id={d} ready_build_ms={d} ready_backpressure_ms={d} ready_capacity_ms={d} ready_snapshot_throttle_ms={d} ready_persist_ms={d} ready_async_ms={d} ready_clone_messages_ms={d} ready_enqueue_apply_ms={d} ready_async_loop_ms={d} ready_outbox_append_ms={d} ready_advance_ms={d} ready_inline_apply_flush_ms={d} ready_inline_outbox_drain_ms={d} ready_inline_transport_flush_ms={d}",
+            .{
+                request_id,
+                ready.group_id,
+                @divTrunc(ready.ready_build_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.backpressure_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.capacity_check_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.snapshot_throttle_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.persist_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.async_ready_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.clone_messages_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.enqueue_apply_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.async_message_loop_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.outbox_append_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.raft_advance_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.inline_apply_flush_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.inline_outbox_drain_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(ready.inline_transport_flush_elapsed_ns, std.time.ns_per_ms),
+            },
+        );
+        const persist = ready.persist_ready_detail;
+        std.log.warn(
+            "metadata linearizable read timeout persist detail request_id={d} group_id={d} storage_apply_ms={d} encode_ms={d} wal_append_ms={d} wal_wait_ms={d} wal_coalesce_ms={d} wal_txn_open_ms={d} wal_put_ms={d} wal_commit_ms={d} wal_physical_commits={d} encoded_bytes={d} replay_debt_records={d} replay_debt_bytes={d}",
+            .{
+                request_id,
+                ready.group_id,
+                @divTrunc(persist.storage_apply_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.encode_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_append_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_wait_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_coalesce_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_txn_open_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_put_elapsed_ns, std.time.ns_per_ms),
+                @divTrunc(persist.wal_commit_elapsed_ns, std.time.ns_per_ms),
+                persist.wal_physical_commits,
+                persist.encoded_bytes,
+                persist.delta_records_since_checkpoint,
+                persist.delta_bytes_since_checkpoint,
+            },
+        );
+        std.log.warn(
+            "metadata linearizable read timeout ready pressure request_id={d} group_id={d} slowest_ready_messages={d} slowest_ready_committed_entries={d} slowest_ready_unstable_entries={d} slowest_ready_read_states={d} slowest_ready_has_snapshot={} slowest_ready_async_storage={} slowest_ready_processed={} slowest_ready_denied_backpressure={} slowest_ready_denied_transport_capacity={} slowest_ready_denied_apply_capacity={} slowest_ready_denied_snapshot_throttle={} slowest_ready_has_more={}",
+            .{
+                request_id,
+                ready.group_id,
+                ready.message_count,
+                ready.committed_entries,
+                ready.unstable_entries,
+                ready.read_states,
+                ready.has_snapshot,
+                ready.async_storage_writes,
+                ready.processed,
+                ready.denied_by_backpressure,
+                ready.denied_by_transport_capacity,
+                ready.denied_by_apply_capacity,
+                ready.denied_by_snapshot_throttle,
+                ready.has_more_ready,
+            },
+        );
     }
 
     pub fn adminSnapshot(self: *MetadataHttpService) !metadata_api.AdminSnapshot {
@@ -3322,6 +3576,25 @@ pub const MetadataHttpService = struct {
 
     fn unlockRuntime(self: *MetadataHttpService) void {
         self.runtime_mutex.unlock(std.Options.debug_io);
+    }
+
+    fn raftDiagnosticsSnapshotLocked(self: *MetadataHttpService) MetadataRaftDiagnosticsSnapshot {
+        var snapshot = MetadataRaftDiagnosticsSnapshot{
+            .pending_updates = self.raft.pending_updates.items.len,
+            .last_runtime_round = self.raft.lastRuntimeRound(),
+        };
+        if (self.raft.raftStatus(self.metadata_group_id)) |raft_status| {
+            snapshot.node_id = raft_status.id;
+            snapshot.role = @tagName(raft_status.soft.role);
+            snapshot.has_leader = raft_status.soft.leader_id != null;
+            snapshot.leader_id = if (raft_status.soft.leader_id) |leader| leader else 0;
+            snapshot.term = raft_status.hard.current_term;
+            snapshot.commit_index = raft_status.hard.commit_index;
+            snapshot.applied_index = raft_status.applied_index;
+            snapshot.last_index = raft_status.last_index;
+            snapshot.election_elapsed = raft_status.election_elapsed;
+        }
+        return snapshot;
     }
 
     fn refreshLocalPlacementIntents(self: *MetadataHttpService, round_inputs: ?*const LocalPlacementInputs) !void {
@@ -9221,6 +9494,99 @@ test "metadata http service projected tables cache invalidates without prior run
     defer svc.freeProjectedTables(std.testing.allocator, after);
     try std.testing.expectEqual(@as(usize, 0), after.len);
     try std.testing.expectEqual(epoch_after_signal, svc.projected_core_snapshot_cache.projection_epoch);
+}
+
+test "metadata http service linearizable read waits for leader discovery" {
+    const Factory = struct {
+        alloc: std.mem.Allocator,
+        store: *raft_engine.core.MemoryStorage,
+
+        fn iface(self: *@This()) raft_host.ReplicaDescriptorFactory {
+            return .{ .ptr = self, .vtable = &.{ .build_descriptor = buildDescriptor, .free_descriptor = freeDescriptor } };
+        }
+
+        fn buildDescriptor(ptr: *anyopaque, record: raft_host.catalog.ReplicaRecord) !raft_engine.runtime.ReplicaDescriptor {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            const peers = try self.alloc.dupe(raft_engine.core.types.NodeId, &[_]raft_engine.core.types.NodeId{record.local_node_id});
+            return .{
+                .group = .{
+                    .group_id = record.group_id,
+                    .local_node_id = record.local_node_id,
+                    .raft_config = .{
+                        .id = record.local_node_id,
+                        .group_id = record.group_id,
+                        .peers = peers,
+                        .election_tick = 5,
+                        .heartbeat_tick = 1,
+                        .pre_vote = false,
+                        .check_quorum = true,
+                    },
+                    .storage = self.store.storage(),
+                },
+                .bootstrap = switch (record.bootstrap_mode) {
+                    .empty => .empty,
+                    .persisted => .persisted,
+                    .fetch_snapshot => .persisted,
+                },
+            };
+        }
+
+        fn freeDescriptor(ptr: *anyopaque, alloc: std.mem.Allocator, desc: *raft_engine.runtime.ReplicaDescriptor) void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = alloc;
+            self.alloc.free(desc.group.raft_config.peers);
+        }
+    };
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const replica_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-root", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_root);
+    const replica_catalog_path = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-catalog.txt", .{tmp.sub_path});
+    defer std.testing.allocator.free(replica_catalog_path);
+    const snapshot_root = try std.fmt.allocPrint(std.testing.allocator, ".zig-cache/tmp/{s}/metadata-http-service-read-barrier-snapshots", .{tmp.sub_path});
+    defer std.testing.allocator.free(snapshot_root);
+
+    var store = raft_engine.core.MemoryStorage.init(std.testing.allocator);
+    defer store.deinit();
+    var factory = Factory{ .alloc = std.testing.allocator, .store = &store };
+
+    var svc = try MetadataHttpService.init(std.testing.allocator, .{
+        .http = .{
+            .host = .{
+                .local_node_id = 1,
+                .metadata_group_id = 2910,
+                .replica_root_dir = replica_root,
+                .replica_catalog_path = replica_catalog_path,
+            },
+            .transport = .{
+                .snapshot = .{ .root_dir = snapshot_root },
+            },
+        },
+    }, .{
+        .http = .{
+            .http = .{
+                .host = .{
+                    .descriptor_factory = factory.iface(),
+                },
+            },
+        },
+    }, .{
+        .observe_local_replica_root = false,
+    });
+    defer svc.deinit();
+
+    _ = try svc.ensureMetadataReplica(.{
+        .group_id = 2910,
+        .replica_id = 1,
+        .local_node_id = 1,
+        .bootstrap_mode = .empty,
+    });
+
+    try std.testing.expect(!svc.raft.host.http_host.host.isLocalLeader(2910));
+    try svc.ensureLinearizableRead();
+    try std.testing.expect(svc.raft.host.http_host.host.isLocalLeader(2910));
+    try std.testing.expect(svc.metrics().read_lease_requests > 0);
 }
 
 test "metadata http projected clone helpers clean up on allocation failure" {

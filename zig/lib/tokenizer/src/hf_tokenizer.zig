@@ -29,6 +29,7 @@ const ModelType = enum { word_piece, bpe, unigram };
 const PreTokenizerType = enum {
     bert, // BertPreTokenizer: split on whitespace + punctuation
     byte_level, // ByteLevel: byte-to-unicode mapping
+    byte_level_split, // Split(regex) followed by ByteLevel, used by CLIP tokenizers
     metaspace, // Metaspace: replace spaces with ▁
     none, // No pre-tokenization
 };
@@ -49,6 +50,7 @@ pub const HfTokenizer = struct {
     /// next-occurrence lookups. Built lazily after `parseAddedTokens`.
     added_trie: AddedTokenTrie,
     special: SpecialTokens,
+    pad_token_seen: bool,
     do_lowercase: bool,
     replace_space_with: ?[]const u8,
     pre_tokenizer_type: PreTokenizerType,
@@ -237,7 +239,10 @@ pub const HfTokenizer = struct {
     ) void {
         if (bos_id) |id| self.special.cls_id = id;
         if (eos_id) |id| self.special.sep_id = id;
-        if (pad_id) |id| self.special.pad_id = id;
+        if (pad_id) |id| {
+            self.special.pad_id = id;
+            self.pad_token_seen = true;
+        }
         if (unk_id) |id| self.special.unk_id = id;
     }
 
@@ -272,6 +277,7 @@ pub const HfTokenizer = struct {
             .added_tokens = .{},
             .added_trie = try AddedTokenTrie.init(allocator),
             .special = .{},
+            .pad_token_seen = false,
             .do_lowercase = false,
             .replace_space_with = null,
             .pre_tokenizer_type = .bert,
@@ -376,15 +382,20 @@ pub const HfTokenizer = struct {
                         self.pre_tokenizer_type = .none;
                     }
                 } else if (std.mem.eql(u8, t.string, "Sequence")) {
-                    // For Sequence pre-tokenizers, use the first meaningful type
+                    var saw_split = false;
+                    // For Sequence pre-tokenizers, use the first meaningful type.
+                    // CLIP commonly uses Split(regex) followed by ByteLevel; the
+                    // split removes whitespace before byte-level BPE runs.
                     if (obj.get("pretokenizers")) |pts| {
                         if (pts == .array) {
                             for (pts.array.items) |item| {
                                 if (item == .object) {
                                     if (item.object.get("type")) |pt| {
                                         if (pt == .string) {
-                                            if (std.mem.eql(u8, pt.string, "ByteLevel")) {
-                                                self.pre_tokenizer_type = .byte_level;
+                                            if (std.mem.eql(u8, pt.string, "Split")) {
+                                                saw_split = true;
+                                            } else if (std.mem.eql(u8, pt.string, "ByteLevel")) {
+                                                self.pre_tokenizer_type = if (saw_split) .byte_level_split else .byte_level;
                                                 return;
                                             } else if (std.mem.eql(u8, pt.string, "Metaspace")) {
                                                 self.pre_tokenizer_type = .metaspace;
@@ -493,9 +504,14 @@ pub const HfTokenizer = struct {
             if (merges_val == .array) {
                 var rank: u32 = 0;
                 for (merges_val.array.items) |item| {
-                    if (item != .string) continue;
-                    if (std.mem.indexOfScalar(u8, item.string, ' ') == null) continue;
-                    const key = try self.allocator.dupe(u8, item.string);
+                    const raw_key = if (item == .string) blk: {
+                        if (std.mem.indexOfScalar(u8, item.string, ' ') == null) continue;
+                        break :blk item.string;
+                    } else if (item == .array and item.array.items.len >= 2 and item.array.items[0] == .string and item.array.items[1] == .string) blk: {
+                        break :blk try std.fmt.allocPrint(self.allocator, "{s} {s}", .{ item.array.items[0].string, item.array.items[1].string });
+                    } else continue;
+                    defer if (item == .array) self.allocator.free(raw_key);
+                    const key = try self.allocator.dupe(u8, raw_key);
                     try self.arena_strings.append(self.allocator, key);
                     // Earlier merges win ties because getOrPut is no-op on existing.
                     const gop = try self.merge_ranks.getOrPut(self.allocator, key);
@@ -666,7 +682,10 @@ pub const HfTokenizer = struct {
             // Detect common special tokens by content
             if (std.mem.eql(u8, content.string, "[CLS]")) self.special.cls_id = id;
             if (std.mem.eql(u8, content.string, "[SEP]")) self.special.sep_id = id;
-            if (std.mem.eql(u8, content.string, "[PAD]")) self.special.pad_id = id;
+            if (std.mem.eql(u8, content.string, "[PAD]")) {
+                self.special.pad_id = id;
+                self.pad_token_seen = true;
+            }
             if (std.mem.eql(u8, content.string, "[UNK]")) self.special.unk_id = id;
             if (std.mem.eql(u8, content.string, "[MASK]")) self.special.mask_id = id;
             // RoBERTa/GPT-style special tokens
@@ -674,13 +693,21 @@ pub const HfTokenizer = struct {
             if (std.mem.eql(u8, content.string, "<bos>")) self.special.cls_id = id;
             if (std.mem.eql(u8, content.string, "</s>")) self.special.sep_id = id;
             if (std.mem.eql(u8, content.string, "<eos>")) self.special.sep_id = id;
-            if (std.mem.eql(u8, content.string, "<pad>")) self.special.pad_id = id;
+            if (std.mem.eql(u8, content.string, "<pad>")) {
+                self.special.pad_id = id;
+                self.pad_token_seen = true;
+            }
             if (std.mem.eql(u8, content.string, "<unk>")) self.special.unk_id = id;
             if (std.mem.eql(u8, content.string, "<mask>")) self.special.mask_id = id;
         }
     }
 
     fn parsePostProcessor(self: *HfTokenizer, obj: std.json.ObjectMap) void {
+        const processor_type = if (obj.get("type")) |t|
+            if (t == .string) t.string else ""
+        else
+            "";
+
         if (obj.get("cls")) |cls| {
             if (cls == .array and cls.array.items.len >= 2) {
                 if (cls.array.items[1] == .integer) {
@@ -699,11 +726,26 @@ pub const HfTokenizer = struct {
             if (st == .object) {
                 if (st.object.get("[CLS]")) |cls| self.resolveSpecialToken(cls, &self.special.cls_id);
                 if (st.object.get("[SEP]")) |sep| self.resolveSpecialToken(sep, &self.special.sep_id);
-                if (st.object.get("[PAD]")) |pad| self.resolveSpecialToken(pad, &self.special.pad_id);
+                if (st.object.get("[PAD]")) |pad| {
+                    self.resolveSpecialToken(pad, &self.special.pad_id);
+                    self.pad_token_seen = true;
+                }
                 if (st.object.get("<bos>")) |bos| self.resolveSpecialToken(bos, &self.special.cls_id);
                 if (st.object.get("<eos>")) |eos| self.resolveSpecialToken(eos, &self.special.sep_id);
-                if (st.object.get("<pad>")) |pad| self.resolveSpecialToken(pad, &self.special.pad_id);
+                if (st.object.get("<pad>")) |pad| {
+                    self.resolveSpecialToken(pad, &self.special.pad_id);
+                    self.pad_token_seen = true;
+                }
             }
+        }
+
+        if (!self.pad_token_seen and
+            std.mem.eql(u8, processor_type, "RobertaProcessing") and
+            self.special.sep_id >= 0)
+        {
+            // CLIP tokenizers use RobertaProcessing with BOS/EOS specials but
+            // no distinct pad token. HuggingFace pads these models with EOS.
+            self.special.pad_id = self.special.sep_id;
         }
     }
 
@@ -1086,6 +1128,16 @@ pub const HfTokenizer = struct {
                     try self.bpeEncodeWord(allocator, word, ids);
                 }
             },
+            .byte_level_split => {
+                const words = try byteLevelSplitPreTokenize(allocator, text);
+                defer {
+                    for (words) |w| allocator.free(w);
+                    allocator.free(words);
+                }
+                for (words) |word| {
+                    try self.bpeEncodeWord(allocator, word, ids);
+                }
+            },
             .metaspace => {
                 // Metaspace: prepend ▁, split on spaces
                 const prepend_scheme = metaspace_scheme_override orelse self.metaspace_prepend_scheme;
@@ -1180,8 +1232,12 @@ pub const HfTokenizer = struct {
 
         // Some HF BPE tokenizers, including Gemma 3, contain whole-word entries
         // that are not reconstructible from the merge table alone. Prefer an
-        // exact vocab hit before falling back to character-split merges.
-        if (self.vocab.get(word)) |id| {
+        // exact vocab hit before falling back to character-split merges, but
+        // only for models without an end-of-word suffix. CLIP-style BPE has
+        // both raw byte/character entries ("a") and word-final entries
+        // ("a</w>"); taking the raw hit here bypasses suffix-aware merges.
+        if (self.end_of_word_suffix.len == 0 and self.vocab.get(word) != null) {
+            const id = self.vocab.get(word).?;
             try ids.append(allocator, id);
             return;
         }
@@ -2223,6 +2279,60 @@ fn byteLevelPreTokenize(allocator: std.mem.Allocator, text: []const u8) ![][]con
     return try words.toOwnedSlice(allocator);
 }
 
+fn byteLevelSplitPreTokenize(allocator: std.mem.Allocator, text: []const u8) ![][]const u8 {
+    var words = std.ArrayListUnmanaged([]const u8).empty;
+    var i: usize = 0;
+    while (i < text.len) {
+        const c = text[i];
+        if (std.ascii.isWhitespace(c)) {
+            i += 1;
+            continue;
+        }
+
+        const start = i;
+        if (c == '\'') {
+            const contraction_len = clipContractionLen(text[i..]);
+            if (contraction_len > 0) {
+                const encoded = try byteLevelEncode(allocator, text[i .. i + contraction_len]);
+                try words.append(allocator, encoded);
+                i += contraction_len;
+                continue;
+            }
+        }
+
+        if (std.ascii.isAlphabetic(c) or c >= 0x80) {
+            i += utf8CodepointLen(c);
+            while (i < text.len) {
+                const next = text[i];
+                if (!(std.ascii.isAlphabetic(next) or next >= 0x80)) break;
+                i += utf8CodepointLen(next);
+            }
+        } else if (std.ascii.isDigit(c)) {
+            i += 1;
+        } else {
+            i += 1;
+            while (i < text.len) {
+                const next = text[i];
+                if (std.ascii.isWhitespace(next) or std.ascii.isAlphabetic(next) or std.ascii.isDigit(next) or next >= 0x80) break;
+                if (next == '\'' and clipContractionLen(text[i..]) > 0) break;
+                i += 1;
+            }
+        }
+
+        const encoded = try byteLevelEncode(allocator, text[start..i]);
+        try words.append(allocator, encoded);
+    }
+    return try words.toOwnedSlice(allocator);
+}
+
+fn clipContractionLen(text: []const u8) usize {
+    const contractions = [_][]const u8{ "'s", "'t", "'re", "'ve", "'m", "'ll", "'d" };
+    for (contractions) |suffix| {
+        if (text.len >= suffix.len and std.ascii.eqlIgnoreCase(text[0..suffix.len], suffix)) return suffix.len;
+    }
+    return 0;
+}
+
 fn byteLevelEncode(allocator: std.mem.Allocator, text: []const u8) ![]u8 {
     var buf = std.ArrayListUnmanaged(u8).empty;
     for (text) |byte| {
@@ -2654,6 +2764,72 @@ test "infer byte-level bpe when model type is omitted" {
     try std.testing.expectEqualSlices(i32, &.{ 1, 2 }, ids);
 }
 
+test "clip byte-level bpe honors split pretokenizer array merges and end suffix" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "end_of_word_suffix": "</w>",
+        \\    "vocab": {
+        \\      "<|startoftext|>": 49406,
+        \\      "<|endoftext|>": 49407,
+        \\      "a": 64,
+        \\      "a</w>": 320,
+        \\      "c": 66,
+        \\      "u": 84,
+        \\      "p": 79,
+        \\      "k": 74,
+        \\      "e": 68,
+        \\      "cu": 1000,
+        \\      "cup": 1001,
+        \\      "cupc": 1002,
+        \\      "cupca": 1003,
+        \\      "cupcak": 1004,
+        \\      "e</w>": 1005,
+        \\      "cupcake</w>": 17025
+        \\    },
+        \\    "merges": [
+        \\      ["a", "</w>"],
+        \\      ["c", "u"],
+        \\      ["cu", "p"],
+        \\      ["cup", "c"],
+        \\      ["cupc", "a"],
+        \\      ["cupca", "k"],
+        \\      ["e", "</w>"],
+        \\      ["cupcak", "e</w>"]
+        \\    ]
+        \\  },
+        \\  "pre_tokenizer": {
+        \\    "type": "Sequence",
+        \\    "pretokenizers": [
+        \\      {"type": "Split", "pattern": {"Regex": "[\\p{L}]+"}, "behavior": "Removed", "invert": true},
+        \\      {"type": "ByteLevel", "add_prefix_space": false, "trim_offsets": true}
+        \\    ]
+        \\  },
+        \\  "added_tokens": [
+        \\    {"id": 49406, "content": "<|startoftext|>", "special": true},
+        \\    {"id": 49407, "content": "<|endoftext|>", "special": true}
+        \\  ],
+        \\  "post_processor": {
+        \\    "type": "RobertaProcessing",
+        \\    "sep": ["<|endoftext|>", 49407],
+        \\    "cls": ["<|startoftext|>", 49406]
+        \\  }
+        \\}
+    ;
+
+    var hf = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer hf.deinitSelf();
+
+    var encoded = try hf.tokenizer().encodeForModel(allocator, "a cupcake", 6);
+    defer encoded.deinit();
+
+    try std.testing.expectEqualSlices(i32, &.{ 49406, 320, 17025, 49407, 49407, 49407 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 1, 1, 1, 1, 0, 0 }, encoded.attention_mask);
+}
+
 test "sequence normalizer applies lowercase before byte-level bpe" {
     const allocator = std.testing.allocator;
 
@@ -2709,7 +2885,49 @@ test "sequence normalizer applies lowercase before byte-level bpe" {
     const tok = hf.tokenizer();
     var encoded = try tok.encodeForModel(allocator, "WHITE", 4);
     defer encoded.deinit();
-    try std.testing.expectEqualSlices(i32, &.{ 10, 1, 11, 0 }, encoded.ids);
+    try std.testing.expectEqualSlices(i32, &.{ 10, 1, 11, 11 }, encoded.ids);
+}
+
+test "clip roberta processing pads with eos when no pad token is declared" {
+    const allocator = std.testing.allocator;
+
+    const json_str =
+        \\{
+        \\  "model": {
+        \\    "type": "BPE",
+        \\    "vocab": {
+        \\      "<|startoftext|>": 49406,
+        \\      "<|endoftext|>": 49407,
+        \\      "cup": 1
+        \\    },
+        \\    "merges": []
+        \\  },
+        \\  "pre_tokenizer": {"type": "ByteLevel"},
+        \\  "added_tokens": [
+        \\    {"id": 49406, "content": "<|startoftext|>", "special": true},
+        \\    {"id": 49407, "content": "<|endoftext|>", "special": true}
+        \\  ],
+        \\  "post_processor": {
+        \\    "type": "RobertaProcessing",
+        \\    "sep": ["<|endoftext|>", 49407],
+        \\    "cls": ["<|startoftext|>", 49406]
+        \\  }
+        \\}
+    ;
+
+    var hf = try HfTokenizer.loadFromBytes(allocator, json_str);
+    defer hf.deinitSelf();
+
+    const special = hf.getSpecialTokens();
+    try std.testing.expectEqual(@as(i32, 49407), special.pad_id);
+
+    const tok = hf.tokenizer();
+    var encoded = try tok.encodeForModel(allocator, "cup", 6);
+    defer encoded.deinit();
+    try std.testing.expectEqual(@as(i32, 49406), encoded.ids[0]);
+    try std.testing.expectEqual(@as(i32, 49407), encoded.ids[2]);
+    try std.testing.expectEqual(@as(i32, 49407), encoded.ids[3]);
+    try std.testing.expectEqual(@as(i32, 0), encoded.attention_mask[3]);
 }
 
 test "bpe encode basic" {

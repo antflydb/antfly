@@ -3829,8 +3829,30 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
     if (termite_metal_decode_runtime_ready(runtime) == 0) return null;
     if (!request.q.isDevice() or !request.k.isDevice() or !request.v.isDevice()) return null;
     if (request.batch == 0 or request.seq_len == 0 or request.num_heads == 0 or request.head_dim == 0) return null;
-    const total = request.batch * request.num_heads * request.seq_len * request.head_dim;
+    const hidden = std.math.mul(usize, request.num_heads, request.head_dim) catch return null;
+    const token_count = std.math.mul(usize, request.batch, request.seq_len) catch return null;
+    const total = std.math.mul(usize, token_count, hidden) catch return null;
     if (request.q.elemCount() != total or request.k.elemCount() != total or request.v.elemCount() != total) return null;
+    if (token_count > std.math.maxInt(i32) or hidden > std.math.maxInt(i32)) return null;
+    const batch_heads = std.math.mul(usize, request.batch, request.num_heads) catch return null;
+    if (batch_heads > std.math.maxInt(i32) or request.seq_len > std.math.maxInt(i32) or request.head_dim > std.math.maxInt(i32)) return null;
+    const seq_major_shape = [_]i32{ @intCast(token_count), @intCast(hidden) };
+    const head_major_3d_shape = [_]i32{ @intCast(batch_heads), @intCast(request.seq_len), @intCast(request.head_dim) };
+    const head_major_4d_shape = [_]i32{ @intCast(request.batch), @intCast(request.num_heads), @intCast(request.seq_len), @intCast(request.head_dim) };
+    const layout: u32 = if (std.mem.eql(i32, request.q.shape(), &seq_major_shape) and
+        std.mem.eql(i32, request.k.shape(), &seq_major_shape) and
+        std.mem.eql(i32, request.v.shape(), &seq_major_shape))
+        1
+    else if (std.mem.eql(i32, request.q.shape(), &head_major_3d_shape) and
+        std.mem.eql(i32, request.k.shape(), &head_major_3d_shape) and
+        std.mem.eql(i32, request.v.shape(), &head_major_3d_shape))
+        0
+    else if (std.mem.eql(i32, request.q.shape(), &head_major_4d_shape) and
+        std.mem.eql(i32, request.k.shape(), &head_major_4d_shape) and
+        std.mem.eql(i32, request.v.shape(), &head_major_4d_shape))
+        0
+    else
+        return null;
     const bias_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "bias")) request.bias else null;
     const mask_tensor: ?MetalTensor = if (@hasField(@TypeOf(request), "mask")) request.mask else null;
     const bias_mode: u32 = if (@hasField(@TypeOf(request), "bias_mode")) request.bias_mode else 0;
@@ -3862,6 +3884,7 @@ pub fn decoderRuntimeSdpaF32Device(self: anytype, request: anytype) !?MetalTenso
         request.head_dim,
         bias_mode,
         if (mask_tensor != null) 1 else 0,
+        layout,
         output_device.deviceHandle(),
         output_device.deviceByteOffset(),
     );
@@ -8175,6 +8198,7 @@ pub extern fn termite_metal_decode_runtime_sdpa_f32_device(
     head_dim: usize,
     bias_mode: u32,
     has_mask: u32,
+    layout: u32,
     output_handle: ?*anyopaque,
     output_offset: usize,
 ) c_int;

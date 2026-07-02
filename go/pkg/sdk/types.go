@@ -36,6 +36,20 @@ type (
 	IndexStatus        = oapi.IndexStatus
 	IndexType          = oapi.IndexType
 
+	// Artifact types
+	DocumentArtifactChildRange               = oapi.DocumentArtifactChildRange
+	DocumentArtifactManifest                 = oapi.DocumentArtifactManifest
+	DocumentArtifactManifestList             = oapi.DocumentArtifactManifestList
+	DocumentArtifactReprocessFailure         = oapi.DocumentArtifactReprocessFailure
+	DocumentArtifactReprocessJob             = oapi.DocumentArtifactReprocessJob
+	DocumentArtifactReprocessJobPhase        = oapi.DocumentArtifactReprocessJobPhase
+	DocumentArtifactReprocessJobStartRequest = oapi.DocumentArtifactReprocessJobStartRequest
+	DocumentArtifactReprocessResponse        = oapi.DocumentArtifactReprocessResponse
+	DocumentArtifactReprocessShardCursor     = oapi.DocumentArtifactReprocessShardCursor
+	DocumentArtifactTableReprocessRequest    = oapi.DocumentArtifactTableReprocessRequest
+	DocumentArtifactTableReprocessResponse   = oapi.DocumentArtifactTableReprocessResponse
+	TableArtifactEnrichmentList              = oapi.TableArtifactEnrichmentList
+
 	// Index config types
 	EmbeddingsIndexConfig = oapi.EmbeddingsIndexConfig
 	DistanceMetric        = oapi.DistanceMetric
@@ -358,7 +372,6 @@ const (
 	SyncLevelPropose     = oapi.SyncLevelPropose
 	SyncLevelWrite       = oapi.SyncLevelWrite
 	SyncLevelFullText    = oapi.SyncLevelFullText
-	SyncLevelAknn        = oapi.SyncLevelAknn
 	SyncLevelFullIndex   = oapi.SyncLevelFullIndex
 	SyncLevelEnrichments = oapi.SyncLevelEnrichments
 
@@ -517,8 +530,8 @@ const (
 	TransformOpTypeRename      = oapi.TransformOpTypeRename
 	TransformOpTypeCurrentDate = oapi.TransformOpTypeCurrentDate
 
-	// SyncLevel embeddings (renamed from SyncLevelAknn)
-	SyncLevelEmbeddings = oapi.SyncLevelAknn
+	// SyncLevelEmbeddings is a compatibility alias for waiting on all managed index writes.
+	SyncLevelEmbeddings = oapi.SyncLevelFullIndex
 
 	// EdgeDirection values
 	EdgeDirectionBoth = oapi.EdgeDirectionBoth

@@ -942,6 +942,10 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         _ = self;
     }
 
+    pub fn stop(self: *@This()) void {
+        _ = self;
+    }
+
     pub fn setStatusHook(self: *@This(), hook: ?StatusHook) void {
         _ = self;
         _ = hook;
@@ -1162,16 +1166,7 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
     }
 
     pub fn deinit(self: *EnrichmentRuntime) void {
-        if (self.io_impl) |io_impl| {
-            const io = io_impl.io();
-            self.mutex.lockUncancelable(io);
-            self.shutdown = true;
-            self.cond.broadcast(io);
-            self.mutex.unlock(io);
-
-            if (self.future) |*future| _ = future.await(io);
-        }
-        self.future = null;
+        self.stop();
         clearPublishedGeneratedArtifacts(self);
         clearIsolatedFailedIndexes(self);
         self.ownership.deinit(self.alloc);
@@ -1182,7 +1177,23 @@ pub const EnrichmentRuntime = if (builtin.os.tag == .freestanding) struct {
         self.* = undefined;
     }
 
+    pub fn stop(self: *EnrichmentRuntime) void {
+        if (self.io_impl) |io_impl| {
+            const io = io_impl.io();
+            self.mutex.lockUncancelable(io);
+            self.shutdown = true;
+            self.cond.broadcast(io);
+            self.mutex.unlock(io);
+
+            if (self.future) |*future| _ = future.await(io);
+        }
+        self.future = null;
+        self.shutdown = false;
+        self.ownership.release();
+    }
+
     pub fn start(self: *EnrichmentRuntime) !void {
+        if (self.future != null) return;
         const io_impl = self.io_impl orelse return error.MissingBackendRuntimeIo;
         const io = io_impl.io();
         self.future = try io.concurrent(workerMain, .{self});
@@ -1643,6 +1654,12 @@ fn processAsset(
     const key = try internal_keys.artifactNamedPrefixAlloc(runtime.alloc, request.doc_key, "asset", artifact_name);
     defer runtime.alloc.free(key);
 
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
+    defer {
+        for (text_indexes) |name| runtime.alloc.free(name);
+        runtime.alloc.free(text_indexes);
+    }
+
     const source_text = try extractAssetSourceValue(runtime.alloc, runtime.config, raw, request) orelse {
         const state_key = try assetStateKeyAlloc(runtime.alloc, request.doc_key, artifact_name);
         defer runtime.alloc.free(state_key);
@@ -1652,6 +1669,7 @@ fn processAsset(
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
+        try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         return;
     };
@@ -1665,6 +1683,7 @@ fn processAsset(
             try storePutBatchWithRetry(runtime, &.{}, &.{ key, state_key });
             try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
         }
+        try appendFullTextDeleteDocumentToWindow(runtime, window, key, text_indexes);
         try materializeGraphAssetDeleteForRuntime(runtime, request, window);
         return;
     }
@@ -1682,11 +1701,13 @@ fn processAsset(
 
     if (producer_cfg.type == .copy) {
         if (try shouldSkipAssetArtifact(runtime, key, source_text)) {
+            try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
             return;
         }
         try storePutWithRetry(runtime, key, source_text);
         try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+        try appendInlineFullTextDocumentToWindow(runtime, window, key, source_text, text_indexes);
         try materializeGraphAssetForRuntime(runtime, request, source_text, raw, window);
         recordArtifactBytes(runtime, .asset, source_text.len);
         return;
@@ -1703,6 +1724,7 @@ fn processAsset(
         };
         if (existing) |value| {
             defer runtime.alloc.free(value);
+            try appendInlineFullTextDocumentToWindow(runtime, window, key, value, text_indexes);
             try materializeGraphAssetForRuntime(runtime, request, value, raw, window);
             return;
         }
@@ -1724,6 +1746,7 @@ fn processAsset(
     };
     try storePutBatch(runtime, &writes, &.{});
     try appendUniqueDupeKey(runtime.alloc, &window.changed_artifact_keys, key);
+    try appendInlineFullTextDocumentToWindow(runtime, window, key, produced, text_indexes);
     try materializeGraphAssetForRuntime(runtime, request, produced, raw, window);
     recordArtifactBytes(runtime, .asset, produced.len);
 }
@@ -1992,7 +2015,7 @@ fn processDocumentExtractionAsset(
     const in_progress_writes = [_]KVPair{.{ .key = in_progress_key, .value = in_progress_manifest }};
     try storePutBatchWithRetry(runtime, in_progress_writes[0..], &.{});
 
-    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, false);
+    const text_indexes = try runtime.index_manager.textIndexesForChunk(runtime.alloc, artifact_name, request.full_text_index);
     defer {
         for (text_indexes) |name| runtime.alloc.free(name);
         runtime.alloc.free(text_indexes);
@@ -4033,6 +4056,58 @@ fn appendOwnedDocumentsToWindow(
     docs.* = &.{};
 }
 
+fn appendInlineFullTextDocumentToWindow(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    value: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    errdefer {
+        for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+        runtime.alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try runtime.alloc.dupe(u8, index_name),
+        };
+    }
+    try window.documents.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, key),
+        .action = .upsert,
+        .cleaned_value = try runtime.alloc.dupe(u8, value),
+        .targets = targets,
+    });
+}
+
+fn appendFullTextDeleteDocumentToWindow(
+    runtime: *EnrichmentRuntime,
+    window: *GeneratedReplayWindow,
+    key: []const u8,
+    text_indexes: []const []const u8,
+) !void {
+    if (text_indexes.len == 0) return;
+    const targets = try runtime.alloc.alloc(derived_types.DerivedTargetRef, text_indexes.len);
+    errdefer {
+        for (targets) |target| runtime.alloc.free(@constCast(target.index_name));
+        runtime.alloc.free(targets);
+    }
+    for (text_indexes, 0..) |index_name, i| {
+        targets[i] = .{
+            .kind = .full_text,
+            .index_name = try runtime.alloc.dupe(u8, index_name),
+        };
+    }
+    try window.documents.append(runtime.alloc, .{
+        .key = try runtime.alloc.dupe(u8, key),
+        .action = .delete,
+        .targets = targets,
+    });
+}
+
 fn appendOwnedDenseEmbeddingsToWindow(
     runtime: *EnrichmentRuntime,
     window: *GeneratedReplayWindow,
@@ -4286,7 +4361,7 @@ fn processDenseEmbedding(
     defer runtime.alloc.free(raw);
 
     if (request.source_template.len > 0 and dense_embedder.supportsParts()) {
-        const source_parts = renderSourceParts(runtime.alloc, runtime.config, raw, request) catch null;
+        const source_parts = try renderSourceParts(runtime.alloc, runtime.config, raw, request);
         if (source_parts) |parts| {
             defer template.freeContentParts(runtime.alloc, parts);
 
@@ -6359,12 +6434,10 @@ fn extractSourceText(
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
         // Render via Handlebars template
-        const rendered = template_remote.renderJsonToTextWithConfig(
-            alloc,
-            request.source_template,
-            raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content),
-        ) catch return null;
+        const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
@@ -6381,6 +6454,28 @@ fn extractSourceText(
     return try alloc.dupe(u8, source.string);
 }
 
+fn renderSourceTemplateText(
+    alloc: Allocator,
+    config: Config,
+    raw_doc: []const u8,
+    source_template: []const u8,
+) ![]const u8 {
+    if (comptime @hasDecl(template_remote, "renderJsonToValidatedTextWithConfig")) {
+        return try template_remote.renderJsonToValidatedTextWithConfig(
+            alloc,
+            source_template,
+            raw_doc,
+            remoteRenderConfig(config.secret_store, config.remote_content),
+        );
+    }
+    return try template_remote.renderJsonToTextWithConfig(
+        alloc,
+        source_template,
+        raw_doc,
+        remoteRenderConfig(config.secret_store, config.remote_content),
+    );
+}
+
 fn extractAssetSourceValue(
     alloc: Allocator,
     config: Config,
@@ -6388,12 +6483,10 @@ fn extractAssetSourceValue(
     request: enrichment_types.GeneratedEnrichmentRequest,
 ) !?[]const u8 {
     if (request.source_template.len > 0) {
-        const rendered = template_remote.renderJsonToTextWithConfig(
-            alloc,
-            request.source_template,
-            raw_doc,
-            remoteRenderConfig(config.secret_store, config.remote_content),
-        ) catch return null;
+        const rendered = renderSourceTemplateText(alloc, config, raw_doc, request.source_template) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
         if (rendered.len == 0) {
             alloc.free(rendered);
             return null;
@@ -6429,9 +6522,15 @@ fn renderSourceParts(
 ) !?[]template.ContentPart {
     if (request.source_template.len == 0) return null;
     const parts = if (comptime @hasDecl(template_remote, "renderJsonToPartsWithConfig"))
-        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch return null
+        template_remote.renderJsonToPartsWithConfig(alloc, request.source_template, raw_doc, remoteRenderConfig(config.secret_store, config.remote_content)) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        }
     else
-        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch return null;
+        template_remote.renderJsonToParts(alloc, request.source_template, raw_doc) catch |err| switch (err) {
+            error.PermanentPromptFailure, error.TransientPromptFailure => return err,
+            else => return null,
+        };
     if (parts.len == 0) {
         template.freeContentParts(alloc, parts);
         return null;
@@ -6764,6 +6863,19 @@ test "extractSourceText with template and invalid JSON returns null" {
     };
     const result = try extractSourceText(alloc, .{}, "not json", request);
     try std.testing.expect(result == null);
+}
+
+test "enrichment extractSourceText with template error directive fails instead of returning text" {
+    const alloc = std.testing.allocator;
+    const doc = "{\"body\":\"large image description\"}";
+    const request = enrichment_types.GeneratedEnrichmentRequest{
+        .kind = .dense_embedding,
+        .index_name = "idx",
+        .doc_key = "doc:1",
+        .source_field = "body",
+        .source_template = "<<<error:status=413 message=StreamTooLong>>> fallback text",
+    };
+    try std.testing.expectError(error.PermanentPromptFailure, extractSourceText(alloc, .{}, doc, request));
 }
 
 test "extractSourceText with template and scrubHtml helper" {

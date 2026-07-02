@@ -53,7 +53,6 @@ pub const MetadataServer = struct {
     owned_admin_http_server: ?*metadata_http_server.MetadataHttpServer = null,
     owned_public_read_source: ?*api_table_reads.HostedProvisionedTableReadSource = null,
     owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null,
-    owned_public_forwarder: ?*MetadataPublicApiForwarder = null,
     owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null,
     owned_admin_mux: ?*MetadataAdminMux = null,
     owned_admin_listener: ?*raft_transport.StdHttpListener = null,
@@ -107,8 +106,6 @@ pub const MetadataServer = struct {
         errdefer if (owned_public_read_source) |read_source| alloc.destroy(read_source);
         var owned_public_write_source: ?*api_table_writes.HostedProvisionedTableWriteSource = null;
         errdefer if (owned_public_write_source) |write_source| alloc.destroy(write_source);
-        var owned_public_forwarder: ?*MetadataPublicApiForwarder = null;
-        errdefer if (owned_public_forwarder) |forwarder| alloc.destroy(forwarder);
         var owned_public_http_server: ?*public_api_http_server.ApiHttpServer = null;
         errdefer if (owned_public_http_server) |public_http_server| {
             public_http_server.deinit();
@@ -156,14 +153,9 @@ pub const MetadataServer = struct {
             _ = public_write_source.withRemoteContent(cfg.api_server_cfg.remote_content);
             owned_public_write_source = public_write_source;
 
-            const public_forwarder = try alloc.create(MetadataPublicApiForwarder);
-            public_forwarder.* = .{ .svc = svc };
-            owned_public_forwarder = public_forwarder;
-
             var api_server_cfg = cfg.api_server_cfg;
             api_server_cfg.shard_ops = if (owned_hosted_shard_ops) |ops| ops.adapter() else null;
             api_server_cfg.shard_db_adapter = owned_hosted_shard_db.?.adapter();
-            api_server_cfg.metadata_mutation_forwarder = public_forwarder.forwarder();
 
             const public_http_server = try alloc.create(public_api_http_server.ApiHttpServer);
             public_http_server.* = public_api_http_server.ApiHttpServer.init(
@@ -199,7 +191,6 @@ pub const MetadataServer = struct {
             .owned_admin_http_server = owned_admin_http_server,
             .owned_public_read_source = owned_public_read_source,
             .owned_public_write_source = owned_public_write_source,
-            .owned_public_forwarder = owned_public_forwarder,
             .owned_public_http_server = owned_public_http_server,
             .owned_admin_mux = owned_admin_mux,
             .owned_admin_listener = owned_admin_listener,
@@ -220,9 +211,6 @@ pub const MetadataServer = struct {
         }
         if (self.owned_public_write_source) |write_source| {
             self.alloc.destroy(write_source);
-        }
-        if (self.owned_public_forwarder) |forwarder| {
-            self.alloc.destroy(forwarder);
         }
         if (self.owned_public_read_source) |read_source| {
             self.alloc.destroy(read_source);
@@ -332,22 +320,6 @@ pub const MetadataServer = struct {
     }
 };
 
-const MetadataPublicApiForwarder = struct {
-    svc: *service.MetadataHttpService,
-
-    fn forwarder(self: *@This()) public_api_http_server.RequestForwarder {
-        return .{
-            .ptr = self,
-            .vtable = &.{ .forward = forward },
-        };
-    }
-
-    fn forward(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.svc.forwardMetadataLeaderRequest(alloc, req);
-    }
-};
-
 const MetadataAdminMux = struct {
     admin: *metadata_http_server.MetadataHttpServer,
     public_api: *public_api_http_server.ApiHttpServer,
@@ -359,10 +331,10 @@ const MetadataAdminMux = struct {
         };
     }
 
-    fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+    fn execute(ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataAdminMux = @ptrCast(@alignCast(ptr));
         if (isPublicApiRequest(req.uri)) return try self.public_api.handle(req);
-        return try self.admin.handle(req);
+        return try self.admin.executor().execute(alloc, req);
     }
 
     fn isPublicApiRequest(uri: []const u8) bool {
@@ -951,6 +923,62 @@ test "metadata server can expose admin listener endpoints" {
     defer snapshot.deinit();
     try std.testing.expectEqual(@as(usize, 1), snapshot.value.tables.len);
     try std.testing.expectEqualStrings("docs", snapshot.value.tables[0].name);
+}
+
+test "metadata admin mux maps admin not leader through metadata executor" {
+    const FakeSource = struct {
+        fn iface(self: *@This()) metadata_http_server.AdminSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                    .trigger_reallocate = triggerReallocate,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_mod.MetadataStatus {
+            return .{ .metadata_group_id = 77, .metrics = .{} };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_mod.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 77, .metrics = .{} },
+                .tables = &.{},
+                .ranges = &.{},
+                .stores = &.{},
+                .placement_intents = &.{},
+                .split_transitions = &.{},
+                .merge_transitions = &.{},
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, snapshot: *metadata_mod.AdminSnapshot) void {
+            snapshot.* = undefined;
+        }
+
+        fn triggerReallocate(_: *anyopaque) !void {
+            return error.NotLeader;
+        }
+    };
+
+    var source = FakeSource{};
+    var admin = metadata_http_server.MetadataHttpServer.init(std.testing.allocator, .{}, source.iface());
+    var mux = MetadataAdminMux{
+        .admin = &admin,
+        .public_api = undefined,
+    };
+
+    var response = try mux.executor().execute(std.testing.allocator, .{
+        .method = .POST,
+        .uri = "/internal/v1/reallocate",
+    });
+    defer response.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), response.status);
+    try std.testing.expect(std.mem.indexOf(u8, response.body, "metadata leader unavailable") != null);
 }
 
 test "metadata admin mux routes public db v1 requests through public api server" {

@@ -16,6 +16,7 @@ const std = @import("std");
 const raft_engine = @import("raft_engine");
 const common_http = @import("../../common/http/mod.zig");
 const common = @import("http_common.zig");
+const http_snapshot = @import("http_snapshot.zig");
 const routes = @import("routes.zig");
 
 pub const HttpServerConfig = struct {
@@ -53,12 +54,35 @@ pub const SnapshotStore = struct {
     }
 };
 
+pub const SnapshotUpload = struct {
+    group_id: u64,
+    from: u64,
+    to: u64,
+    term: u64,
+    snapshot: raft_engine.core.types.Snapshot,
+};
+
+pub const SnapshotUploadHandler = struct {
+    ptr: *anyopaque,
+    vtable: *const VTable,
+
+    pub const VTable = struct {
+        /// Takes ownership of `upload.snapshot` whether it succeeds or fails.
+        handle_snapshot_upload: *const fn (ptr: *anyopaque, upload: SnapshotUpload) anyerror!void,
+    };
+
+    pub fn handleSnapshotUpload(self: SnapshotUploadHandler, upload: SnapshotUpload) !void {
+        return try self.vtable.handle_snapshot_upload(self.ptr, upload);
+    }
+};
+
 pub const HttpServer = struct {
     alloc: std.mem.Allocator,
     cfg: HttpServerConfig,
     codec: raft_engine.runtime.MessageCodec,
     batch_handler: BatchHandler,
     snapshot_store: ?SnapshotStore = null,
+    snapshot_upload_handler: ?SnapshotUploadHandler = null,
 
     pub fn init(
         alloc: std.mem.Allocator,
@@ -66,6 +90,7 @@ pub const HttpServer = struct {
         codec: raft_engine.runtime.MessageCodec,
         batch_handler: BatchHandler,
         snapshot_store: ?SnapshotStore,
+        snapshot_upload_handler: ?SnapshotUploadHandler,
     ) HttpServer {
         return .{
             .alloc = alloc,
@@ -73,6 +98,7 @@ pub const HttpServer = struct {
             .codec = codec,
             .batch_handler = batch_handler,
             .snapshot_store = snapshot_store,
+            .snapshot_upload_handler = snapshot_upload_handler,
         };
     }
 
@@ -116,8 +142,28 @@ pub const HttpServer = struct {
         }
         if (req.method == .POST) {
             if (routes.Routes.matchSnapshotUpload(req.uri)) |snapshot_id| {
-                const store = self.snapshot_store orelse return error.MissingSnapshotStore;
-                try store.putSnapshot(self.alloc, snapshot_id, req.body);
+                const header_state = snapshotUploadHeaderState(req);
+                if (self.snapshot_upload_handler != null and
+                    (header_state == .partial or (header_state == .absent and self.snapshot_store == null)))
+                {
+                    return error.InvalidSnapshotUploadHeaders;
+                }
+
+                if (self.snapshot_upload_handler) |handler| {
+                    if (header_state == .complete) {
+                        var live_upload = (try parseSnapshotUpload(self.alloc, req)) orelse unreachable;
+                        errdefer live_upload.snapshot.deinit(self.alloc);
+                        const upload = live_upload;
+                        live_upload.snapshot = .{};
+                        try handler.handleSnapshotUpload(upload);
+                    } else if (self.snapshot_store) |store| {
+                        try store.putSnapshot(self.alloc, snapshot_id, req.body);
+                    }
+                } else if (self.snapshot_store) |store| {
+                    try store.putSnapshot(self.alloc, snapshot_id, req.body);
+                } else {
+                    return error.MissingSnapshotStore;
+                }
                 return .{
                     .status = 201,
                     .content_type = try self.alloc.dupe(u8, "text/plain"),
@@ -149,6 +195,41 @@ pub const HttpServer = struct {
     }
 };
 
+const SnapshotUploadHeaderState = enum {
+    absent,
+    partial,
+    complete,
+};
+
+fn snapshotUploadHeaderState(req: common.HttpRequest) SnapshotUploadHeaderState {
+    const group_present = req.header("x-antfly-raft-group-id") != null;
+    const from_present = req.header("x-antfly-raft-from-node-id") != null;
+    const to_present = req.header("x-antfly-raft-to-node-id") != null;
+    const term_present = req.header("x-antfly-raft-term") != null;
+    var present_count: usize = 0;
+    if (group_present) present_count += 1;
+    if (from_present) present_count += 1;
+    if (to_present) present_count += 1;
+    if (term_present) present_count += 1;
+    if (present_count == 0) return .absent;
+    if (present_count == 4) return .complete;
+    return .partial;
+}
+
+fn parseSnapshotUpload(alloc: std.mem.Allocator, req: common.HttpRequest) !?SnapshotUpload {
+    const group_header = req.header("x-antfly-raft-group-id") orelse return null;
+    const from_header = req.header("x-antfly-raft-from-node-id") orelse return null;
+    const to_header = req.header("x-antfly-raft-to-node-id") orelse return null;
+    const term_header = req.header("x-antfly-raft-term") orelse return null;
+    return .{
+        .group_id = try std.fmt.parseInt(u64, group_header, 10),
+        .from = try std.fmt.parseInt(u64, from_header, 10),
+        .to = try std.fmt.parseInt(u64, to_header, 10),
+        .term = try std.fmt.parseInt(u64, term_header, 10),
+        .snapshot = try http_snapshot.HttpSnapshotTransport.decodeSnapshotEnvelope(alloc, req.body),
+    };
+}
+
 test "http server module compiles" {
     _ = HttpServerConfig;
     _ = BatchHandler;
@@ -173,7 +254,7 @@ test "http server exposes request executor" {
     };
 
     var handler = Handler{};
-    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), handler.iface(), null);
+    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), handler.iface(), null, null);
     const executor = server.executor();
     var resp = try executor.execute(std.testing.allocator, .{
         .method = .GET,
@@ -203,7 +284,7 @@ test "http server decodes raft batch requests and dispatches them" {
     };
 
     var handler = Handler{};
-    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), handler.iface(), null);
+    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), handler.iface(), null, null);
 
     const msg = raft_engine.core.Message{
         .msg_type = .heartbeat,
@@ -280,7 +361,7 @@ test "http server stores and fetches snapshot bodies by route" {
     var store = Store{};
     defer if (store.body) |body| std.testing.allocator.free(body);
     var noop = Noop{};
-    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.iface());
+    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.iface(), null);
 
     const upload_path = try routes.Routes.snapshotUploadPath(std.testing.allocator, "snap-7");
     defer std.testing.allocator.free(upload_path);
@@ -301,4 +382,212 @@ test "http server stores and fetches snapshot bodies by route" {
     defer fetch.deinit(std.testing.allocator);
     try std.testing.expectEqual(@as(u16, 200), fetch.status);
     try std.testing.expectEqualStrings("snapshot-body", fetch.body);
+}
+
+test "http server dispatches live snapshot uploads to handler" {
+    const Noop = struct {
+        fn iface(_: *@This()) BatchHandler {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .handle_peer_batch = handlePeerBatch,
+                },
+            };
+        }
+
+        fn handlePeerBatch(_: *anyopaque, batch: raft_engine.runtime.transport_iface.PeerBatch) !void {
+            _ = batch;
+        }
+    };
+
+    const Handler = struct {
+        seen: usize = 0,
+        group_id: u64 = 0,
+        from: u64 = 0,
+        to: u64 = 0,
+        term: u64 = 0,
+        index: u64 = 0,
+        data: ?[]u8 = null,
+
+        fn iface(self: *@This()) SnapshotUploadHandler {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .handle_snapshot_upload = handleSnapshotUpload,
+                },
+            };
+        }
+
+        fn deinit(self: *@This()) void {
+            if (self.data) |data| std.testing.allocator.free(data);
+            self.* = undefined;
+        }
+
+        fn handleSnapshotUpload(ptr: *anyopaque, upload: SnapshotUpload) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var owned = upload;
+            defer owned.snapshot.deinit(std.testing.allocator);
+            self.seen += 1;
+            self.group_id = upload.group_id;
+            self.from = upload.from;
+            self.to = upload.to;
+            self.term = upload.term;
+            self.index = upload.snapshot.metadata.index;
+            if (self.data) |data| std.testing.allocator.free(data);
+            self.data = try std.testing.allocator.dupe(u8, upload.snapshot.data);
+        }
+    };
+
+    const Store = struct {
+        put_calls: usize = 0,
+
+        fn iface(self: *@This()) SnapshotStore {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .put_snapshot = putSnapshot,
+                    .get_snapshot = getSnapshot,
+                },
+            };
+        }
+
+        fn putSnapshot(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.put_calls += 1;
+        }
+
+        fn getSnapshot(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFetch;
+        }
+    };
+
+    var noop = Noop{};
+    var store = Store{};
+    var handler = Handler{};
+    defer handler.deinit();
+    var server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.iface(), handler.iface());
+
+    var voters = [_]u64{ 1, 2, 3 };
+    const snapshot_body = try http_snapshot.HttpSnapshotTransport.encodeSnapshotEnvelope(std.testing.allocator, .{
+        .metadata = .{
+            .index = 42,
+            .term = 7,
+            .conf_state = .{ .voters = voters[0..] },
+        },
+        .data = @constCast("live-snapshot"),
+    });
+    defer std.testing.allocator.free(snapshot_body);
+
+    const upload_path = try routes.Routes.snapshotUploadPath(std.testing.allocator, "snap-live");
+    defer std.testing.allocator.free(upload_path);
+    const headers = [_]common.RequestHeader{
+        .{ .name = "x-antfly-raft-group-id", .value = "91" },
+        .{ .name = "x-antfly-raft-from-node-id", .value = "1" },
+        .{ .name = "x-antfly-raft-to-node-id", .value = "2" },
+        .{ .name = "x-antfly-raft-term", .value = "8" },
+    };
+    var resp = try server.handle(.{
+        .method = .POST,
+        .uri = upload_path,
+        .headers = &headers,
+        .body = snapshot_body,
+    });
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 201), resp.status);
+    try std.testing.expectEqual(@as(usize, 1), handler.seen);
+    try std.testing.expectEqual(@as(u64, 91), handler.group_id);
+    try std.testing.expectEqual(@as(u64, 1), handler.from);
+    try std.testing.expectEqual(@as(u64, 2), handler.to);
+    try std.testing.expectEqual(@as(u64, 8), handler.term);
+    try std.testing.expectEqual(@as(u64, 42), handler.index);
+    try std.testing.expectEqualStrings("live-snapshot", handler.data.?);
+    try std.testing.expectEqual(@as(usize, 0), store.put_calls);
+}
+
+test "http server rejects malformed live snapshot upload metadata" {
+    const Noop = struct {
+        fn iface(_: *@This()) BatchHandler {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .handle_peer_batch = handlePeerBatch,
+                },
+            };
+        }
+
+        fn handlePeerBatch(_: *anyopaque, batch: raft_engine.runtime.transport_iface.PeerBatch) !void {
+            _ = batch;
+        }
+    };
+
+    const Handler = struct {
+        seen: usize = 0,
+
+        fn iface(self: *@This()) SnapshotUploadHandler {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .handle_snapshot_upload = handleSnapshotUpload,
+                },
+            };
+        }
+
+        fn handleSnapshotUpload(ptr: *anyopaque, upload: SnapshotUpload) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            var owned = upload;
+            defer owned.snapshot.deinit(std.testing.allocator);
+            self.seen += 1;
+        }
+    };
+
+    const Store = struct {
+        put_calls: usize = 0,
+
+        fn iface(self: *@This()) SnapshotStore {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .put_snapshot = putSnapshot,
+                    .get_snapshot = getSnapshot,
+                },
+            };
+        }
+
+        fn putSnapshot(ptr: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.put_calls += 1;
+        }
+
+        fn getSnapshot(_: *anyopaque, _: std.mem.Allocator, _: []const u8) ![]u8 {
+            return error.UnexpectedFetch;
+        }
+    };
+
+    var noop = Noop{};
+    var handler = Handler{};
+    const upload_path = try routes.Routes.snapshotUploadPath(std.testing.allocator, "snap-live");
+    defer std.testing.allocator.free(upload_path);
+
+    var handler_only_server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), null, handler.iface());
+    try std.testing.expectError(error.InvalidSnapshotUploadHeaders, handler_only_server.handle(.{
+        .method = .POST,
+        .uri = upload_path,
+        .body = "snapshot-body",
+    }));
+    try std.testing.expectEqual(@as(usize, 0), handler.seen);
+
+    var store = Store{};
+    var store_and_handler_server = HttpServer.init(std.testing.allocator, .{}, raft_engine.runtime.BinaryCodec.codec(), noop.iface(), store.iface(), handler.iface());
+    const partial_headers = [_]common.RequestHeader{
+        .{ .name = "x-antfly-raft-group-id", .value = "91" },
+    };
+    try std.testing.expectError(error.InvalidSnapshotUploadHeaders, store_and_handler_server.handle(.{
+        .method = .POST,
+        .uri = upload_path,
+        .headers = &partial_headers,
+        .body = "snapshot-body",
+    }));
+    try std.testing.expectEqual(@as(usize, 0), store.put_calls);
+    try std.testing.expectEqual(@as(usize, 0), handler.seen);
 }

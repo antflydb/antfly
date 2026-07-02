@@ -22,6 +22,7 @@ pub const SnapshotLocator = struct {
 
 pub const SnapshotSendRequest = struct {
     group_id: core.types.GroupId,
+    from: core.types.NodeId = 0,
     to: core.types.NodeId,
     term: core.types.Term = 0,
     snapshot: core.types.Snapshot,

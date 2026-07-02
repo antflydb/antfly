@@ -380,31 +380,22 @@ fn selfAttn(
     defer cb.free(K);
     defer cb.free(V);
 
-    const Q_heads = try packTokenMajorToHeadMajor(cb, allocator, Q, batch, seq_len, num_heads, head_dim);
-    defer cb.free(Q_heads);
-    const K_heads = try packTokenMajorToHeadMajor(cb, allocator, K, batch, seq_len, num_heads, head_dim);
-    defer cb.free(K_heads);
-    const V_heads = try packTokenMajorToHeadMajor(cb, allocator, V, batch, seq_len, num_heads, head_dim);
-    defer cb.free(V_heads);
-
     const attn_out = if (causal)
-        try cb.causalSelfAttention(Q_heads, K_heads, V_heads, null, batch, seq_len, num_heads, head_dim)
+        try cb.causalSelfAttention(Q, K, V, null, batch, seq_len, num_heads, head_dim)
     else blk: {
         const ones = try allocator.alloc(i64, batch * seq_len);
         defer allocator.free(ones);
         @memset(ones, 1);
-        break :blk try cb.scaledDotProductAttention(Q_heads, K_heads, V_heads, ones, null, batch, seq_len, num_heads, head_dim);
+        break :blk try cb.scaledDotProductAttention(Q, K, V, ones, null, batch, seq_len, num_heads, head_dim);
     };
     defer cb.free(attn_out);
-    const attn_token_major = try unpackHeadMajorToTokenMajor(cb, allocator, attn_out, batch, seq_len, num_heads, head_dim);
-    defer cb.free(attn_token_major);
 
     var o_w_buf: [128]u8 = undefined;
     var o_b_buf: [128]u8 = undefined;
     const o_w = try cb.getWeight(try fmt(&o_w_buf, "{s}.{d}.self_attn.out_proj.weight", .{ prefix, layer }));
     const o_b = try cb.getWeight(try fmt(&o_b_buf, "{s}.{d}.self_attn.out_proj.bias", .{ prefix, layer }));
-    return (try cb.linearAdd(attn_token_major, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
-        const projected = try cb.linear(attn_token_major, o_w, o_b, total, hidden, hidden);
+    return (try cb.linearAdd(attn_out, o_w, o_b, residual, total, hidden, hidden)) orelse blk: {
+        const projected = try cb.linear(attn_out, o_w, o_b, total, hidden, hidden);
         defer cb.free(projected);
         break :blk try cb.add(residual, projected);
     };

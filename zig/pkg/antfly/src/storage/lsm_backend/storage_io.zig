@@ -16,6 +16,7 @@ const std = @import("std");
 const platform_sync = @import("antfly_platform").sync;
 const builtin = @import("builtin");
 const platform = @import("antfly_platform");
+const byte_copy = @import("../../common/byte_copy.zig");
 const fs_paths = @import("../../common/fs_paths.zig");
 
 const Allocator = std.mem.Allocator;
@@ -175,6 +176,144 @@ const CompletedRangeReadFuture = struct {
     }
 };
 
+pub const NativePathLockMode = enum {
+    shared,
+    exclusive,
+};
+
+pub const NativePathLockOptions = struct {
+    nonblocking: bool = false,
+};
+
+pub const NativePathLock = struct {
+    lock_file: NativePathLockFile,
+
+    pub fn release(self: *NativePathLock) void {
+        self.lock_file.close();
+        self.* = undefined;
+    }
+};
+
+pub const NativePathLockFileOptions = struct {
+    create_if_missing: bool = true,
+};
+
+pub const NativePathLockFile = struct {
+    io_impl: std.Io.Threaded,
+    file: std.Io.File,
+    locked: bool = false,
+
+    pub fn lock(self: *NativePathLockFile, mode: NativePathLockMode) !void {
+        std.debug.assert(!self.locked);
+        try self.file.lock(self.io_impl.io(), switch (mode) {
+            .shared => .shared,
+            .exclusive => .exclusive,
+        });
+        self.locked = true;
+    }
+
+    pub fn tryLock(self: *NativePathLockFile, mode: NativePathLockMode) !bool {
+        std.debug.assert(!self.locked);
+        const locked = try self.file.tryLock(self.io_impl.io(), switch (mode) {
+            .shared => .shared,
+            .exclusive => .exclusive,
+        });
+        self.locked = locked;
+        return locked;
+    }
+
+    pub fn unlock(self: *NativePathLockFile) void {
+        if (!self.locked) return;
+        self.file.unlock(self.io_impl.io());
+        self.locked = false;
+    }
+
+    pub fn close(self: *NativePathLockFile) void {
+        self.unlock();
+        self.file.close(self.io_impl.io());
+        self.io_impl.deinit();
+        self.* = undefined;
+    }
+};
+
+pub fn nativeRealPathAlloc(allocator: Allocator, path: []const u8) ![:0]u8 {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.realPathFileAbsoluteAlloc(io_impl.io(), path, allocator);
+    }
+    return try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), path, allocator);
+}
+
+fn nativeRootIdentityAlloc(_: *anyopaque, allocator: Allocator, root_dir: []const u8) ![]u8 {
+    const canonical = nativeRealPathAlloc(allocator, root_dir) catch |err| switch (err) {
+        error.FileNotFound => return try nativeMissingRootIdentityAlloc(allocator, root_dir),
+        else => return err,
+    };
+    defer allocator.free(canonical);
+    return try allocator.dupe(u8, canonical);
+}
+
+fn nativeMissingRootIdentityAlloc(allocator: Allocator, root_dir: []const u8) ![]u8 {
+    if (std.fs.path.isAbsolute(root_dir)) {
+        return try std.fs.path.resolve(allocator, &.{root_dir});
+    }
+
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    defer io_impl.deinit();
+    const cwd = try std.Io.Dir.cwd().realPathFileAlloc(io_impl.io(), ".", allocator);
+    defer allocator.free(cwd);
+    return try std.fs.path.resolve(allocator, &.{ cwd, root_dir });
+}
+
+fn openNativePathFile(io: std.Io, path: []const u8) !std.Io.File {
+    if (std.fs.path.isAbsolute(path)) {
+        return try std.Io.Dir.openFileAbsolute(io, path, .{});
+    }
+    return try std.Io.Dir.cwd().openFile(io, path, .{});
+}
+
+pub fn openNativePathLockFile(
+    allocator: Allocator,
+    path: []const u8,
+    options: NativePathLockFileOptions,
+) !NativePathLockFile {
+    var io_impl = std.Io.Threaded.init(allocator, .{});
+    errdefer io_impl.deinit();
+
+    const file = if (options.create_if_missing)
+        try fs_paths.createFilePortable(io_impl.io(), path, .{ .read = true, .truncate = false })
+    else
+        try openNativePathFile(io_impl.io(), path);
+    errdefer file.close(io_impl.io());
+
+    return .{
+        .io_impl = io_impl,
+        .file = file,
+    };
+}
+
+pub fn acquireNativePathLock(
+    allocator: Allocator,
+    path: []const u8,
+    mode: NativePathLockMode,
+    options: NativePathLockOptions,
+) !NativePathLock {
+    var lock_file = try openNativePathLockFile(allocator, path, .{ .create_if_missing = true });
+    errdefer lock_file.close();
+
+    if (options.nonblocking) {
+        if (!try lock_file.tryLock(mode)) return error.WouldBlock;
+    } else {
+        try lock_file.lock(mode);
+    }
+
+    return .{
+        .lock_file = lock_file,
+    };
+}
+
 pub const Storage = struct {
     ptr: *anyopaque,
     vtable: *const VTable,
@@ -196,6 +335,8 @@ pub const Storage = struct {
         delete_file_absolute: *const fn (*anyopaque, []const u8) anyerror!void,
         delete_tree: *const fn (*anyopaque, []const u8) anyerror!void,
         now_ns: *const fn (*anyopaque) u64,
+        root_identity_alloc: ?*const fn (*anyopaque, Allocator, []const u8) anyerror![]u8 = null,
+        supports_native_path_locks: bool = false,
     };
 
     pub fn createDirPath(self: Storage, path: []const u8) !void {
@@ -309,6 +450,21 @@ pub const Storage = struct {
     pub fn nowNs(self: Storage) u64 {
         return self.vtable.now_ns(self.ptr);
     }
+
+    pub fn rootIdentityAlloc(self: Storage, allocator: Allocator, root_dir: []const u8) ![]u8 {
+        if (self.vtable.root_identity_alloc) |root_identity_alloc| {
+            return try root_identity_alloc(self.ptr, allocator, root_dir);
+        }
+        return try std.fmt.allocPrint(allocator, "storage:{x}:{x}:{s}", .{
+            @intFromPtr(self.ptr),
+            @intFromPtr(self.vtable),
+            root_dir,
+        });
+    }
+
+    pub fn supportsNativePathLocks(self: Storage) bool {
+        return self.vtable.supports_native_path_locks;
+    }
 };
 
 pub fn createDirPathPortable(io: anytype, path: []const u8) !void {
@@ -380,13 +536,13 @@ const BufferedAtomicWriteSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.allocator, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *BufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
@@ -991,6 +1147,8 @@ else blk: {
                 .delete_file_absolute = deleteFileAbsolute,
                 .delete_tree = deleteTree,
                 .now_ns = nowNs,
+                .root_identity_alloc = nativeRootIdentityAlloc,
+                .supports_native_path_locks = true,
             };
 
             pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -1207,6 +1365,8 @@ else blk: {
             .delete_file_absolute = deleteFileAbsolute,
             .delete_tree = deleteTree,
             .now_ns = nowNs,
+            .root_identity_alloc = nativeRootIdentityAlloc,
+            .supports_native_path_locks = true,
         };
 
         pub fn init(allocator: Allocator, kind: RuntimeKind) !NativeStorage {
@@ -1821,13 +1981,13 @@ const NativeBufferedAtomicWriteSink = struct {
 
     fn appendSlice(ptr: *anyopaque, bytes: []const u8) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
-        try self.out.appendSlice(self.allocator, bytes);
+        try byte_copy.appendSlicePossiblyAliased(&self.out, self.allocator, bytes);
     }
 
     fn writeAt(ptr: *anyopaque, offset: usize, bytes: []const u8) !void {
         const self: *NativeBufferedAtomicWriteSink = @ptrCast(@alignCast(ptr));
         if (offset > self.out.items.len or bytes.len > self.out.items.len - offset) return error.InvalidAtomicWriteOffset;
-        @memcpy(self.out.items[offset..][0..bytes.len], bytes);
+        byte_copy.copyPossiblyAliased(self.out.items[offset..][0..bytes.len], bytes);
     }
 
     fn crc32Prefix(ptr: *anyopaque, len_prefix: usize) !u32 {
@@ -2348,6 +2508,30 @@ test "native atomic write sink supports patching and crc before finish" {
     const written = try native.storage().readFileAlloc(std.testing.allocator, path, 64);
     defer std.testing.allocator.free(written);
     try std.testing.expectEqualStrings("hello world", written);
+}
+
+test "buffered atomic write sink supports overlapping writes and appends" {
+    var backing = MemoryStorage.init(std.testing.allocator);
+    defer backing.deinit();
+
+    var writer = try backing.storage().beginAtomicWrite(std.testing.allocator, "/alias-safe.bin");
+    var active = true;
+    defer if (active) writer.abort();
+
+    try writer.appendSlice("abcdef");
+    const impl: *BufferedAtomicWriteSink = @ptrCast(@alignCast(writer.ptr));
+    try writer.writeAt(2, impl.out.items[0..4]);
+    try std.testing.expectEqualStrings("ababcd", impl.out.items);
+
+    try writer.appendSlice(impl.out.items[1..5]);
+    try std.testing.expectEqualStrings("ababcdbabc", impl.out.items);
+
+    active = false;
+    try writer.finish();
+
+    const written = try backing.storage().readFileAlloc(std.testing.allocator, "/alias-safe.bin", 64);
+    defer std.testing.allocator.free(written);
+    try std.testing.expectEqualStrings("ababcdbabc", written);
 }
 
 test "native fd cache evicts to per-store budget" {

@@ -288,7 +288,10 @@ fn primaryStoreMatchingCursorForEachNext(
             cursor.hint_exhausted = true;
             return .{};
         },
-        StopReplayChunk.StopReplayChunk => return callback_ctx.stats,
+        StopReplayChunk.StopReplayChunk => {
+            cursor.next_sequence = @max(cursor.next_sequence, callback_ctx.stats.last_sequence);
+            return callback_ctx.stats;
+        },
         else => return err,
     };
     cursor.next_sequence = @max(cursor.next_sequence, replay_stats.last_sequence);
@@ -1001,6 +1004,65 @@ test "replay source primary store requires hint lane for hinted replay" {
     try std.testing.expectEqual(@as(usize, 0), stats.hint_filter_skips);
     try std.testing.expectEqual(@as(usize, 1), stats.scan_batches);
     try std.testing.expectEqual(@as(u64, 0), stats.last_sequence);
+}
+
+test "replay source primary cursor resumes after stop chunk progress" {
+    const alloc = std.testing.allocator;
+
+    var backend = mem_backend_mod.Backend.init(alloc, .{});
+    defer backend.close();
+    const runtime_store = try backend.runtimeStore(alloc, .{});
+    var store = try docstore_mod.DocStore.openRuntime(alloc, runtime_store);
+    defer store.close();
+
+    const first_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:first"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(first_payload);
+    try store.appendReplayOpaque(alloc, 1, first_payload);
+
+    const second_payload = try change_journal_mod.encodeRecord(alloc, .{
+        .sequence = 2,
+        .changed_doc_keys = &.{"doc:second"},
+        .target_hints = &.{.dense_vector},
+    });
+    defer alloc.free(second_payload);
+    try store.appendReplayOpaque(alloc, 2, second_payload);
+
+    const Context = struct {
+        calls: usize = 0,
+        sequences: [4]u64 = .{ 0, 0, 0, 0 },
+
+        fn stopAfterFirst(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sequences[self.calls] = sequence;
+            self.calls += 1;
+            if (self.calls > 1) return StopReplayChunk.StopReplayChunk;
+        }
+
+        fn consume(ptr: *anyopaque, sequence: u64, _: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.sequences[self.calls] = sequence;
+            self.calls += 1;
+        }
+    };
+
+    var cursor = try Source.fromPrimaryStore(&store, null, null).openMatchingCursor(alloc, 0, .dense_vector);
+    defer cursor.deinit(alloc);
+
+    var context = Context{};
+    const first = try cursor.forEachNext(0, &context, Context.stopAfterFirst);
+    try std.testing.expectEqual(@as(usize, 2), context.calls);
+    try std.testing.expectEqual(@as(u64, 1), context.sequences[0]);
+    try std.testing.expectEqual(@as(u64, 2), context.sequences[1]);
+    try std.testing.expectEqual(@as(u64, 1), first.last_sequence);
+
+    const second = try cursor.forEachNext(0, &context, Context.consume);
+    try std.testing.expectEqual(@as(usize, 3), context.calls);
+    try std.testing.expectEqual(@as(u64, 2), context.sequences[2]);
+    try std.testing.expectEqual(@as(u64, 2), second.last_sequence);
 }
 
 test "replay source primary store collects enrichment groups from hint lane" {

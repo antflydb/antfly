@@ -182,6 +182,105 @@ pub const AntflyClient = struct {
         return resp;
     }
 
+    // --- Artifact operations ---
+
+    pub fn listDocumentArtifactManifests(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        params: openapi.client.ListDocumentArtifactManifestsParams,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactManifestList) {
+        return try self.inner.listDocumentArtifactManifests(table_name, key, params);
+    }
+
+    pub fn getDocumentArtifactManifest(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+        params: openapi.client.GetDocumentArtifactManifestParams,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactManifest) {
+        return try self.inner.getDocumentArtifactManifest(table_name, key, artifact_name, params);
+    }
+
+    pub fn listArtifactEnrichments(
+        self: *AntflyClient,
+        table_name: []const u8,
+    ) !openapi.ApiResponse(openapi.types.TableArtifactEnrichmentList) {
+        return try self.inner.listArtifactEnrichments(table_name);
+    }
+
+    pub fn putArtifactEnrichment(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: openapi.types.EnrichmentConfig,
+    ) !openapi.ApiResponse(std.json.Value) {
+        return try self.inner.putArtifactEnrichment(table_name, artifact_name, body);
+    }
+
+    pub fn deleteArtifactEnrichment(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+    ) !openapi.ApiResponse(std.json.Value) {
+        return try self.inner.deleteArtifactEnrichment(table_name, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifact(
+        self: *AntflyClient,
+        table_name: []const u8,
+        key: []const u8,
+        artifact_name: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessResponse) {
+        return try self.inner.reprocessDocumentArtifact(table_name, key, artifact_name);
+    }
+
+    pub fn reprocessDocumentArtifactRange(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: openapi.types.DocumentArtifactTableReprocessRequest,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactTableReprocessResponse) {
+        return try self.inner.reprocessDocumentArtifactRange(table_name, artifact_name, body);
+    }
+
+    pub fn startDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        body: openapi.types.DocumentArtifactReprocessJobStartRequest,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.startDocumentArtifactReprocessJob(table_name, artifact_name, body);
+    }
+
+    pub fn getDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.getDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+    }
+
+    pub fn advanceDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.advanceDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+    }
+
+    pub fn cancelDocumentArtifactReprocessJob(
+        self: *AntflyClient,
+        table_name: []const u8,
+        artifact_name: []const u8,
+        job_id: []const u8,
+    ) !openapi.ApiResponse(openapi.types.DocumentArtifactReprocessJob) {
+        return try self.inner.cancelDocumentArtifactReprocessJob(table_name, artifact_name, job_id);
+    }
+
     // --- Batch operations ---
 
     pub fn batch(self: *AntflyClient, table_name: []const u8, body: openapi.types.BatchRequest) !openapi.ApiResponse(openapi.types.BatchResponse) {

@@ -12,6 +12,9 @@ const (
 	// TypeBackupClusterReady indicates whether the referenced cluster is ready
 	TypeBackupClusterReady = "ClusterReady"
 
+	// TypeBackupRunHealthy indicates whether the most recent completed backup job succeeded
+	TypeBackupRunHealthy = "BackupRunHealthy"
+
 	// ReasonCronJobCreated indicates the CronJob was created successfully
 	ReasonCronJobCreated = "CronJobCreated"
 
@@ -29,6 +32,12 @@ const (
 
 	// ReasonCronJobFailed indicates the CronJob failed to create or update
 	ReasonCronJobFailed = "CronJobFailed"
+
+	// ReasonBackupJobFailed indicates a scheduled backup job failed.
+	ReasonBackupJobFailed = "BackupJobFailed"
+
+	// ReasonBackupJobSucceeded indicates the latest completed backup job succeeded.
+	ReasonBackupJobSucceeded = "BackupJobSucceeded"
 )
 
 // BackupPhase represents the current state of a backup schedule
@@ -157,6 +166,10 @@ type AntflyBackupStatus struct {
 	// LastSuccessfulBackup records the most recent successful backup
 	// +optional
 	LastSuccessfulBackup *BackupRecord `json:"lastSuccessfulBackup,omitempty"`
+
+	// LastFailedBackup records the most recent failed backup
+	// +optional
+	LastFailedBackup *BackupRecord `json:"lastFailedBackup,omitempty"`
 
 	// RecentBackups stores recent backup records
 	// +optional

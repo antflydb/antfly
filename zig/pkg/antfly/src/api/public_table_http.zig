@@ -58,6 +58,7 @@ pub const TableApi = struct {
         MethodNotAllowed,
         Backpressured,
         Unavailable,
+        WriteUnavailable,
         DocIdentityUnavailable,
         HAReadOnlyStandby,
         HAPromotedStandbyRequiresPrimaryOpen,
@@ -93,6 +94,7 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteRestoreError = error{
+        NotLeader,
         TableAlreadyExists,
         MethodNotAllowed,
         UnsupportedBackupMigrationState,
@@ -112,20 +114,24 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteCreateIndexError = error{
+        NotLeader,
         NotFound,
         MethodNotAllowed,
         InvalidIndexRequest,
         ProbeUnavailable,
+        ModelNotFound,
         InternalFailure,
     };
 
     pub const ExecuteDeleteIndexError = error{
+        NotLeader,
         NotFound,
         MethodNotAllowed,
         InternalFailure,
     };
 
     pub const ExecutePutArtifactEnrichmentError = error{
+        NotLeader,
         NotFound,
         MethodNotAllowed,
         InvalidEnrichmentRequest,
@@ -133,9 +139,15 @@ pub const TableApi = struct {
     };
 
     pub const ExecuteDeleteArtifactEnrichmentError = error{
+        NotLeader,
         NotFound,
         MethodNotAllowed,
         InvalidEnrichmentRequest,
+        InternalFailure,
+    };
+
+    pub const ExecuteListArtifactEnrichmentsError = error{
+        NotFound,
         InternalFailure,
     };
 
@@ -252,6 +264,11 @@ pub const TableApi = struct {
             table_name: []const u8,
             artifact_name: []const u8,
         ) ExecuteDeleteArtifactEnrichmentError!void = null,
+        execute_list_artifact_enrichments: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            table_name: []const u8,
+        ) ExecuteListArtifactEnrichmentsError![]u8 = null,
         execute_document_artifact_manifest: ?*const fn (
             ptr: *anyopaque,
             alloc: std.mem.Allocator,
@@ -389,6 +406,15 @@ pub const TableApi = struct {
         return try fn_ptr(self.ptr, alloc, table_name, artifact_name);
     }
 
+    pub fn executeListArtifactEnrichments(
+        self: TableApi,
+        alloc: std.mem.Allocator,
+        table_name: []const u8,
+    ) ExecuteListArtifactEnrichmentsError![]u8 {
+        const fn_ptr = self.vtable.execute_list_artifact_enrichments orelse return error.NotFound;
+        return try fn_ptr(self.ptr, alloc, table_name);
+    }
+
     pub fn executeDocumentArtifactManifest(
         self: TableApi,
         alloc: std.mem.Allocator,
@@ -470,6 +496,7 @@ pub fn handleTableBatch(
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.Backpressured => return .{ .status = 429, .body = try alloc.dupe(u8, "table backpressured") },
         error.Unavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "maintenance routes unavailable on query-only runtime") },
+        error.WriteUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "write unavailable") },
         error.DocIdentityUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "doc identity unavailable") },
         error.HAReadOnlyStandby => return .{ .status = 409, .body = try alloc.dupe(u8, "standby is read-only") },
         error.HAPromotedStandbyRequiresPrimaryOpen => return .{ .status = 409, .body = try alloc.dupe(u8, "promoted standby requires primary open") },
@@ -645,6 +672,7 @@ pub fn handleTableRestore(
     defer location.deinit(alloc);
 
     api.executeTableRestore(alloc, table_name, parsed_req.value.backup_id, parsed_req.value.location, &location) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.TableAlreadyExists => return .{ .status = 400, .body = try alloc.dupe(u8, "restore target already exists") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.UnsupportedBackupMigrationState => return .{ .status = 400, .body = try alloc.dupe(u8, "restore does not support active schema migration") },
@@ -692,10 +720,12 @@ pub fn handleTableCreateIndex(
     api: TableApi,
 ) !OwnedResponse {
     api.executeTableCreateIndex(alloc, table_name, index_name, body) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidIndexRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported index configuration") },
         error.ProbeUnavailable => return .{ .status = 503, .body = try alloc.dupe(u8, "index validation probe unavailable") },
+        error.ModelNotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "{\"error\":\"MODEL_NOT_FOUND\",\"message\":\"model not found\"}") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index create failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
@@ -708,6 +738,7 @@ pub fn handleTableDeleteIndex(
     api: TableApi,
 ) !OwnedResponse {
     api.executeTableDeleteIndex(alloc, table_name, index_name) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "index delete failed") },
@@ -723,6 +754,7 @@ pub fn handlePutArtifactEnrichment(
     api: TableApi,
 ) !OwnedResponse {
     api.executePutArtifactEnrichment(alloc, table_name, artifact_name, body) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
@@ -738,12 +770,25 @@ pub fn handleDeleteArtifactEnrichment(
     api: TableApi,
 ) !OwnedResponse {
     api.executeDeleteArtifactEnrichment(alloc, table_name, artifact_name) catch |err| switch (err) {
+        error.NotLeader => return err,
         error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
         error.MethodNotAllowed => return .{ .status = 405, .body = try alloc.dupe(u8, "method not allowed") },
         error.InvalidEnrichmentRequest => return .{ .status = 400, .body = try alloc.dupe(u8, "unsupported artifact enrichment configuration") },
         error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment delete failed") },
     };
     return .{ .status = 201, .body = try alloc.dupe(u8, "{}") };
+}
+
+pub fn handleListArtifactEnrichments(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    api: TableApi,
+) !OwnedResponse {
+    const response_body = api.executeListArtifactEnrichments(alloc, table_name) catch |err| switch (err) {
+        error.NotFound => return .{ .status = 404, .body = try alloc.dupe(u8, "not found") },
+        error.InternalFailure => return .{ .status = 500, .body = try alloc.dupe(u8, "artifact enrichment list failed") },
+    };
+    return .{ .status = 200, .body = response_body };
 }
 
 pub fn handleDocumentArtifactManifest(
@@ -1319,6 +1364,44 @@ test "public table batch handler maps unavailable errors" {
 
     try std.testing.expectEqual(@as(u16, 503), resp.status);
     try std.testing.expectEqualStrings("maintenance routes unavailable on query-only runtime", resp.body);
+}
+
+test "public table batch handler maps write unavailable errors" {
+    const Backend = struct {
+        fn iface() TableApi {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_table_batch = executeTableBatch,
+                    .execute_table_query_request = unsupportedQueryRequest,
+                    .execute_table_query_view = unsupportedQueryView,
+                    .execute_table_backup = unsupportedBackup,
+                    .execute_table_restore = unsupportedRestore,
+                    .execute_table_list_indexes = unsupportedListIndexes,
+                    .execute_table_get_index = unsupportedGetIndex,
+                    .execute_table_create_index = unsupportedCreateIndex,
+                    .execute_table_delete_index = unsupportedDeleteIndex,
+                },
+            };
+        }
+
+        fn executeTableBatch(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.BatchRequest,
+        ) TableApi.ExecuteBatchError!void {
+            return error.WriteUnavailable;
+        }
+    };
+
+    var resp = try handleTableBatch(std.testing.allocator, "docs",
+        \\{"inserts":{"doc-a":{"title":"alpha"}}}
+    , Backend.iface());
+    defer resp.deinit(std.testing.allocator);
+
+    try std.testing.expectEqual(@as(u16, 503), resp.status);
+    try std.testing.expectEqualStrings("write unavailable", resp.body);
 }
 
 test "public table batch handler maps doc identity unavailable errors" {

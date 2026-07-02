@@ -544,7 +544,7 @@ type EnrichmentConfig struct {
 	// Field Source field to read from the source document or source artifact payload.
 	Field string `json:"field,omitempty"`
 
-	// FullTextIndex When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
+	// FullTextIndex When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
 	FullTextIndex bool `json:"full_text_index,omitempty"`
 
 	// Kind Managed generated artifact kind.

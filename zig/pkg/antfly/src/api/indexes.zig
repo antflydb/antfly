@@ -231,6 +231,48 @@ pub fn collectArtifactEnrichmentsFromTableIndexesJson(
     return try out.toOwnedSlice(alloc);
 }
 
+pub fn encodeArtifactEnrichmentList(
+    alloc: std.mem.Allocator,
+    table_name: []const u8,
+    indexes_json: []const u8,
+) ![]u8 {
+    var enrichments = try collectArtifactEnrichmentsFromTableIndexesJson(alloc, indexes_json);
+    var unique_len: usize = 0;
+    defer {
+        for (enrichments[0..unique_len]) |*cfg| cfg.deinit(alloc);
+        alloc.free(enrichments);
+    }
+
+    sortArtifactEnrichmentsByDependency(enrichments);
+    for (enrichments, 0..) |*cfg, i| {
+        var duplicate = false;
+        for (enrichments[0..unique_len]) |prior| {
+            if (std.mem.eql(u8, prior.name, cfg.name)) {
+                duplicate = true;
+                break;
+            }
+        }
+        if (duplicate) {
+            cfg.deinit(alloc);
+            continue;
+        }
+        if (unique_len != i) {
+            enrichments[unique_len] = cfg.*;
+            cfg.* = undefined;
+        }
+        unique_len += 1;
+    }
+
+    const response = struct {
+        table_name: []const u8,
+        artifacts: []const db_mod.types.EnrichmentConfig,
+    }{
+        .table_name = table_name,
+        .artifacts = enrichments[0..unique_len],
+    };
+    return try std.json.Stringify.valueAlloc(alloc, response, .{});
+}
+
 pub fn validateArtifactEnrichmentsForTableIndexesJson(
     alloc: std.mem.Allocator,
     indexes_json: []const u8,
@@ -247,7 +289,7 @@ pub fn validateArtifactEnrichmentConfigs(configs: []const db_mod.types.Enrichmen
             if (!std.mem.eql(u8, prior.name, cfg.name)) continue;
             if (!artifactEnrichmentConfigsEqual(prior, cfg)) return error.ConflictingEnrichmentConfig;
         }
-        if (cfg.full_text_index and cfg.kind != .chunk) return error.InvalidEnrichmentConfig;
+        if (cfg.full_text_index and cfg.kind == .embedding) return error.InvalidEnrichmentConfig;
         switch (cfg.kind) {
             .chunk => {
                 if (cfg.source_artifact_name.len > 0 and findArtifactEnrichmentConfig(configs, .asset, cfg.source_artifact_name) == null) {
@@ -1530,6 +1572,12 @@ fn appendSingleIndexRuntimeStatus(
             catch_up_phase = dense_catch_up.phase;
             catch_up_applied_sequence = @max(catch_up_applied_sequence, dense_catch_up.current_sequence);
             catch_up_target_sequence = @max(catch_up_target_sequence, dense_catch_up.current_target_sequence);
+        } else if (embeddings_view) |view| {
+            if (!view.backfill_active) {
+                catch_up_active = false;
+                catch_up_phase = .idle;
+                catch_up_applied_sequence = @max(catch_up_applied_sequence, catch_up_target_sequence);
+            }
         }
     }
     if (catch_up_active or catch_up_target_sequence > catch_up_applied_sequence) {
@@ -1975,6 +2023,8 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.lsm_open_total_ns);
     try out.appendSlice(alloc, ",\"lsm_open_initializing_storage_ns\":");
     try appendIntValue(alloc, out, stats.lsm_open_initializing_storage_ns);
+    try out.appendSlice(alloc, ",\"lsm_open_recovered_temp_cleanup_ns\":");
+    try appendIntValue(alloc, out, stats.lsm_open_recovered_temp_cleanup_ns);
     try out.appendSlice(alloc, ",\"lsm_open_manifest_ns\":");
     try appendIntValue(alloc, out, stats.lsm_open_manifest_ns);
     try out.appendSlice(alloc, ",\"lsm_open_ensuring_dirs_ns\":");
@@ -1991,6 +2041,10 @@ fn appendStartupCatchUpStatus(alloc: std.mem.Allocator, out: *std.ArrayListUnman
     try appendIntValue(alloc, out, stats.lsm_open_mutable_entries_after_replay);
     try out.appendSlice(alloc, ",\"lsm_open_immutable_memtables_after_replay\":");
     try appendIntValue(alloc, out, stats.lsm_open_immutable_memtables_after_replay);
+    try out.appendSlice(alloc, ",\"lsm_open_recovered_temp_files_deleted\":");
+    try appendIntValue(alloc, out, stats.lsm_open_recovered_temp_files_deleted);
+    try out.appendSlice(alloc, ",\"lsm_open_recovered_temp_bytes_deleted\":");
+    try appendIntValue(alloc, out, stats.lsm_open_recovered_temp_bytes_deleted);
     try out.appendSlice(alloc, ",\"wal_replay_records\":");
     try appendIntValue(alloc, out, stats.wal_replay_records);
     try out.appendSlice(alloc, ",\"wal_replay_entries\":");
@@ -2425,8 +2479,11 @@ test "index encoders expose local shard runtime status" {
                     .wal_replay_retained_bytes = 44,
                     .wal_replay_current_segment = 6,
                     .lsm_open_stores = 2,
+                    .lsm_open_recovered_temp_cleanup_ns = 77,
                     .lsm_open_wal_replay_ns = 123,
                     .lsm_open_loaded_runs = 6,
+                    .lsm_open_recovered_temp_files_deleted = 4,
+                    .lsm_open_recovered_temp_bytes_deleted = 2048,
                     .wal_replay_bytes = 456,
                     .wal_replay_truncated_tail_bytes = 7,
                 },
@@ -2488,8 +2545,11 @@ test "index encoders expose local shard runtime status" {
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_retained_bytes\":44") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_current_segment\":6") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_stores\":2") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_recovered_temp_cleanup_ns\":77") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_wal_replay_ns\":123") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_loaded_runs\":6") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_recovered_temp_files_deleted\":4") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"lsm_open_recovered_temp_bytes_deleted\":2048") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_bytes\":456") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"wal_replay_truncated_tail_bytes\":7") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"active\":true") != null);
@@ -3551,7 +3611,7 @@ test "embeddings index status reports dense catch-up phase separately from publi
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"replay\"") != null);
 }
 
-test "embeddings index status keeps replay pending when catch-up progress lags replay target" {
+test "embeddings index status ignores inactive stale catch-up progress once dense coverage is visible" {
     const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
     defer std.testing.allocator.free(indexes);
     indexes[0] = .{
@@ -3600,12 +3660,82 @@ test "embeddings index status keeps replay pending when catch-up progress lags r
 
     const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "dense_idx", &local_status)).?;
     defer std.testing.allocator.free(encoded);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":true") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":77") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"dense_publish_pending\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":325") != null);
     try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":325") != null);
-    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":true") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_applied_sequence\":325") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"idle\"") != null);
+}
+
+test "managed embeddings readiness ignores inactive stale catch-up after rate-limit recovery" {
+    const indexes = try std.testing.allocator.alloc(db_mod.types.DBIndexStats, 1);
+    defer std.testing.allocator.free(indexes);
+    indexes[0] = .{
+        .name = try std.testing.allocator.dupe(u8, "semantic_idx"),
+        .kind = .dense_vector,
+        .doc_count = 3,
+        .node_count = 1,
+        .root_node = 1,
+        .replay_applied_sequence = 4,
+        .replay_target_sequence = 8,
+        .replay_catch_up_required = true,
+        .catch_up_active = false,
+        .catch_up_phase = .idle,
+        .catch_up_applied_sequence = 4,
+        .catch_up_target_sequence = 8,
+        .backfill_active = true,
+        .backfill_progress = 0.5,
+    };
+    defer std.testing.allocator.free(indexes[0].name);
+
+    const local_items = try std.testing.allocator.alloc(runtime_status.LocalTableRuntimeStatus, 1);
+    defer std.testing.allocator.free(local_items);
+    local_items[0] = .{
+        .group_id = 7,
+        .stats = .{
+            .doc_count = 3,
+            .index_count = 1,
+            .indexes = indexes,
+            .enrichment = .{
+                .enabled = true,
+                .target_sequence = 6,
+                .applied_sequence = 6,
+                .retryable_error_count = 10,
+            },
+        },
+    };
+    var local_status = runtime_status.LocalTableRuntimeStatuses{ .items = local_items };
+
+    const snapshot: metadata_api.AdminSnapshot = .{
+        .status = .{ .metadata_group_id = 1, .metrics = .{} },
+        .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+            .table_id = 7,
+            .name = "docs",
+            .indexes_json = "{\"semantic_idx\":{\"type\":\"embeddings\",\"field\":\"body\",\"dimension\":3}}",
+            .placement_role = "data",
+        }})[0..]),
+        .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+        .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+        .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+        .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+        .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+    };
+
+    const encoded = (try encodeSingleIndex(std.testing.allocator, &snapshot, "docs", "semantic_idx", &local_status)).?;
+    defer std.testing.allocator.free(encoded);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"rebuilding\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_progress\":1.000") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"backfill_state\":\"ready\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_applied_sequence\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_target_sequence\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"replay_catch_up_required\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_active\":false") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_applied_sequence\":8") != null);
+    try std.testing.expect(std.mem.indexOf(u8, encoded, "\"catch_up_phase\":\"idle\"") != null);
 }
 
 test "managed embeddings readiness prefers replay completion once docs are indexed" {

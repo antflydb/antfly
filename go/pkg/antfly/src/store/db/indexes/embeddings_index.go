@@ -1126,17 +1126,17 @@ func (i *EmbeddingIndex) enqueueEnrichment(promptKeys [][]byte, sync bool) error
 		return nil
 	}
 	if sync {
-		// SyncLevelAknn should have all enrichments pre-computed in dbWrapper.preEnrichBatch()
+		// SyncLevelFullIndex should have all enrichments pre-computed in dbWrapper.preEnrichBatch()
 		// before the Raft proposal. If we still have promptKeys here with sync=true,
 		// it means enrichments weren't pre-computed for some reason.
 		//
 		// We CANNOT call TrySyncEmbed() here because it causes a deadlock:
-		// 1. Batch() is called with SyncLevelAknn (during Raft apply)
+		// 1. Batch() is called with SyncLevelFullIndex (during Raft apply)
 		// 2. TrySyncEmbed() → TrySyncChunk() → persistChunks() tries to submit a NEW Raft proposal
 		// 3. But we're already inside a Raft apply, so the new proposal deadlocks
 		//
 		// SOLUTION: Log error for visibility, but enqueue to async enricher to handle
-		i.logger.Error("SyncLevelAknn used but enrichments not pre-computed (bug in pre-enrichment logic)",
+		i.logger.Error("SyncLevelFullIndex used but enrichments not pre-computed (bug in pre-enrichment logic)",
 			zap.Int("numKeys", len(promptKeys)),
 			zap.String("index", i.name),
 			zap.ByteStrings("keys", promptKeys),

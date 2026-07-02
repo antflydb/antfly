@@ -837,7 +837,7 @@ fn workerMain(worker: *Worker) void {
             closeWorkerReplayCursor(runtime, worker);
         }
 
-        const target_advance_allowed = if (stats.last_sequence == 0 and target_sequence > from_sequence)
+        const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
             canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
                 close_success = false;
                 runtime.recordError(io, worker.name, "target_advance", err);
@@ -845,13 +845,13 @@ fn workerMain(worker: *Worker) void {
             }
         else
             false;
-        const caught_up_sequence = if (stats.last_sequence > from_sequence)
-            stats.last_sequence
+        const caught_up_sequence = if (stats.appliedSequenceAdvance(from_sequence)) |sequence|
+            sequence
         else if (target_advance_allowed)
             target_sequence
         else
             from_sequence;
-        if (caught_up_sequence == from_sequence and stats.last_sequence == 0 and target_sequence > from_sequence) {
+        if (caught_up_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
             closeWorkerCatchUpState(runtime, worker, false) catch |err| {
                 close_success = false;
                 runtime.recordError(io, worker.name, "coverage_gap_close", err);

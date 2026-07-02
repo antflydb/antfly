@@ -509,7 +509,7 @@ fn workerMain(worker: *Worker) void {
             closeWorkerReplayCursor(runtime, worker);
         }
 
-        const target_advance_allowed = if (stats.last_sequence == 0 and target_sequence > from_sequence)
+        const target_advance_allowed = if (stats.shouldTryTargetAdvance(from_sequence, target_sequence))
             canAdvanceToTarget(runtime, worker, from_sequence, target_sequence) catch |err| {
                 close_success = false;
                 runtime.recordError(err);
@@ -517,13 +517,13 @@ fn workerMain(worker: *Worker) void {
             }
         else
             false;
-        const caught_up_sequence = if (stats.last_sequence > from_sequence)
-            stats.last_sequence
+        const caught_up_sequence = if (stats.appliedSequenceAdvance(from_sequence)) |sequence|
+            sequence
         else if (target_advance_allowed)
             target_sequence
         else
             from_sequence;
-        if (caught_up_sequence == from_sequence and stats.last_sequence == 0 and target_sequence > from_sequence) {
+        if (caught_up_sequence == from_sequence and stats.shouldTryTargetAdvance(from_sequence, target_sequence)) {
             closeWorkerCatchUpState(runtime, worker, false) catch |err| {
                 close_success = false;
                 runtime.recordError(err);
@@ -777,10 +777,12 @@ const TestRuntimeCapture = struct {
     finish_calls: std.atomic.Value(u64) = .init(0),
     publish_failures: std.atomic.Value(u64) = .init(0),
     apply_not_found_failures: std.atomic.Value(u64) = .init(0),
+    target_advance_calls: std.atomic.Value(u64) = .init(0),
     persist_calls: std.atomic.Value(u64) = .init(0),
     persisted_sequence: std.atomic.Value(u64) = .init(0),
     last_applied_batch_sequence: std.atomic.Value(u64) = .init(0),
     defer_next_persist: std.atomic.Value(bool) = .init(false),
+    skip_next_apply: std.atomic.Value(bool) = .init(false),
     fail_next_dense_apply_not_found: std.atomic.Value(bool) = .init(false),
     fail_next_publish: std.atomic.Value(bool) = .init(false),
 };
@@ -793,6 +795,7 @@ fn testRuntimeApply(ctx: *anyopaque, batch: derived_types.DerivedBatch, index_re
         _ = capture.apply_not_found_failures.fetchAdd(1, .monotonic);
         return error.NotFound;
     }
+    if (capture.skip_next_apply.swap(false, .monotonic)) return false;
     return true;
 }
 
@@ -825,6 +828,14 @@ fn testRuntimeFinishCatchUp(ctx: *anyopaque, index_ref: index_manager_mod.Manage
         _ = capture.publish_failures.fetchAdd(1, .monotonic);
         return error.NotFound;
     }
+}
+
+fn testRuntimeCanAdvanceToTarget(ctx: *anyopaque, index_ref: index_manager_mod.ManagedIndexRef, from_sequence: u64, target_sequence: u64) !bool {
+    _ = index_ref;
+    try std.testing.expect(target_sequence > from_sequence);
+    const capture: *TestRuntimeCapture = @ptrCast(@alignCast(ctx));
+    _ = capture.target_advance_calls.fetchAdd(1, .monotonic);
+    return true;
 }
 
 fn appendTestChangeJournalRecord(log: *change_journal_mod.Journal, alloc: Allocator, record: change_journal_mod.Record) !void {
@@ -952,6 +963,52 @@ test "async non-tail replay cursor refreshes before watermark advance" {
     try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 1), capture.last_applied_batch_sequence.load(.monotonic));
     try std.testing.expectEqual(@as(u64, 2), runtime.appliedSequence("dense_idx").?);
+}
+
+test "async dense zero-applied replay window advances only through target coverage guard" {
+    const alloc = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+
+    const journal_path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/async-dense-zero-applied-target-advance-journal", .{tmp.sub_path});
+    defer alloc.free(journal_path);
+    const journal_path_z = try alloc.dupeZ(u8, journal_path);
+    defer alloc.free(journal_path_z);
+
+    var journal = try change_journal_mod.Journal.open(journal_path_z, testInMemoryJournalOpenOptions());
+    defer journal.close();
+
+    try appendTestChangeJournalRecord(&journal, alloc, .{
+        .sequence = 1,
+        .changed_doc_keys = &.{"doc:text-only"},
+        .target_hints = &.{.dense_vector},
+    });
+
+    var capture = TestRuntimeCapture{ .alloc = alloc };
+    capture.skip_next_apply.store(true, .monotonic);
+    var runtime = DerivedRuntime.init(
+        alloc,
+        replay_source_mod.Source.fromJournal(&journal),
+        &capture,
+        testRuntimeApply,
+        testRuntimePersist,
+        testRuntimeTruncate,
+        testRuntimeBeginCatchUp,
+        testRuntimeFinishCatchUp,
+        testRuntimeCanAdvanceToTarget,
+        null,
+    );
+    defer runtime.deinit();
+
+    try runtime.addWorker("dense_idx", .{ .name = "dense_idx", .kind = .dense_vector }, 0);
+    runtime.notifySequence(1);
+    try runtime.waitForAll(1);
+    try runtime.failIfUnhealthy();
+
+    try std.testing.expectEqual(@as(u64, 1), capture.apply_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.target_advance_calls.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), capture.persisted_sequence.load(.monotonic));
+    try std.testing.expectEqual(@as(u64, 1), runtime.appliedSequence("dense_idx").?);
 }
 
 test "async dense publish NotFound retries without failing runtime" {

@@ -12,6 +12,7 @@ if TYPE_CHECKING:
     from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
     from ..models.inference_content_security_config import InferenceContentSecurityConfig
     from ..models.inference_credentials import InferenceCredentials
+    from ..models.inference_model_ref import InferenceModelRef
     from ..models.inferenceschemas_config import InferenceschemasConfig
 
 
@@ -22,7 +23,7 @@ T = TypeVar("T", bound="InferenceConfig")
 class InferenceConfig:
     """
     Attributes:
-        api_url (str): URL of the inference embedding/chunking service Example: http://localhost:8080.
+        api_url (str): URL of the Antfly inference embedding/chunking service Example: http://localhost:8080.
         api_key (str | Unset): API key used when calling an authenticated shared Antfly inference API.
         models_dir (str | Unset): Base directory containing model subdirectories. Antfly inference auto-discovers models
             from:
@@ -34,6 +35,11 @@ class InferenceConfig:
 
             Defaults to ~/.antfly/inference/models (set via viper). If not set, only built-in fixed chunking is available.
              Example: ~/.antfly/inference/models.
+        ml_dir (str | Unset): Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
+            API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
+
+            Defaults to ~/.antfly/inference/ml.
+             Example: ~/.antfly/inference/ml.
         content_security (InferenceContentSecurityConfig | Unset):
         s3_credentials (InferenceCredentials | Unset):
         keep_alive (str | Unset): How long to keep models loaded in memory after last use (Ollama-compatible).
@@ -57,19 +63,6 @@ class InferenceConfig:
             Antfly inference tries entries in order and uses the first available backend+device
             combination that supports the model.
 
-            **Backends** (depend on build flags):
-            - `native` - Native CPU backend
-            - `onnx` - ONNX Runtime backend
-            - `metal` - Apple Metal backend
-            - `cuda` - NVIDIA CUDA backend
-            - `xla` - PJRT/XLA compiled backend
-
-            **Devices**:
-            - `auto` - Auto-detect best available (default)
-            - `cuda` - NVIDIA CUDA GPU
-            - `tpu` - Google TPU (used by XLA)
-            - `cpu` - Force CPU only
-
             **Examples**:
             - `["native", "onnx", "xla"]` - Try backends with auto device detection
             - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
@@ -86,11 +79,13 @@ class InferenceConfig:
             Use Go duration format: "30s", "1m", "0" (no timeout, default).
             Requests exceeding this timeout receive 504 Gateway Timeout.
              Default: '0'. Example: 30s.
-        preload (list[str] | Unset): List of model names to preload at startup (Ollama-compatible).
-            These models are loaded immediately when inference starts, avoiding first-request latency.
-            Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
-            Only effective when keep_alive is non-zero (lazy loading mode).
-             Example: ['BAAI/bge-small-en-v1.5', 'openai/clip-vit-base-patch32'].
+        preload (list[InferenceModelRef] | Unset): Models to preload and warm at startup. Generators run a tiny
+            generation
+            request so native/Metal weights, KV setup, and kernels use the same
+            budgeted path as request-time generation. Other model kinds use the
+            best available warm path for that kind.
+             Example: [{'kind': 'generator', 'name': 'antflydb/gemma-e2b', 'backend': 'metal', 'format': 'gguf',
+            'quantization': 'q4_k'}].
         max_memory_mb (int | Unset): Maximum memory (in MB) to use for loaded models.
             When this limit is approached, least recently used models are unloaded.
             Set to 0 for unlimited (default). This is an advisory limit - actual memory
@@ -104,7 +99,7 @@ class InferenceConfig:
             - If keep_alive="0": eager loading (load at startup, never unload)
 
             When a model has strategy "eager" in this map:
-            - It is loaded at startup (as part of preload)
+            - It is loaded at startup through the same startup warmup path
             - It is never unloaded, even when keep_alive>0 (pinned in memory)
 
             This allows mixing eager and lazy models in the same pool.
@@ -119,6 +114,7 @@ class InferenceConfig:
     api_url: str
     api_key: str | Unset = UNSET
     models_dir: str | Unset = UNSET
+    ml_dir: str | Unset = UNSET
     content_security: InferenceContentSecurityConfig | Unset = UNSET
     s3_credentials: InferenceCredentials | Unset = UNSET
     keep_alive: str | Unset = "5m"
@@ -128,7 +124,7 @@ class InferenceConfig:
     max_concurrent_requests: int | Unset = 0
     max_queue_size: int | Unset = 0
     request_timeout: str | Unset = "0"
-    preload: list[str] | Unset = UNSET
+    preload: list[InferenceModelRef] | Unset = UNSET
     max_memory_mb: int | Unset = 0
     model_strategies: InferenceConfigModelStrategies | Unset = UNSET
     allow_downloads: bool | Unset = True
@@ -141,6 +137,8 @@ class InferenceConfig:
         api_key = self.api_key
 
         models_dir = self.models_dir
+
+        ml_dir = self.ml_dir
 
         content_security: dict[str, Any] | Unset = UNSET
         if not isinstance(self.content_security, Unset):
@@ -166,9 +164,12 @@ class InferenceConfig:
 
         request_timeout = self.request_timeout
 
-        preload: list[str] | Unset = UNSET
+        preload: list[dict[str, Any]] | Unset = UNSET
         if not isinstance(self.preload, Unset):
-            preload = self.preload
+            preload = []
+            for preload_item_data in self.preload:
+                preload_item = preload_item_data.to_dict()
+                preload.append(preload_item)
 
         max_memory_mb = self.max_memory_mb
 
@@ -193,6 +194,8 @@ class InferenceConfig:
             field_dict["api_key"] = api_key
         if models_dir is not UNSET:
             field_dict["models_dir"] = models_dir
+        if ml_dir is not UNSET:
+            field_dict["ml_dir"] = ml_dir
         if content_security is not UNSET:
             field_dict["content_security"] = content_security
         if s3_credentials is not UNSET:
@@ -229,6 +232,7 @@ class InferenceConfig:
         from ..models.inference_config_model_strategies import InferenceConfigModelStrategies
         from ..models.inference_content_security_config import InferenceContentSecurityConfig
         from ..models.inference_credentials import InferenceCredentials
+        from ..models.inference_model_ref import InferenceModelRef
         from ..models.inferenceschemas_config import InferenceschemasConfig
 
         d = dict(src_dict)
@@ -237,6 +241,8 @@ class InferenceConfig:
         api_key = d.pop("api_key", UNSET)
 
         models_dir = d.pop("models_dir", UNSET)
+
+        ml_dir = d.pop("ml_dir", UNSET)
 
         _content_security = d.pop("content_security", UNSET)
         content_security: InferenceContentSecurityConfig | Unset
@@ -266,7 +272,14 @@ class InferenceConfig:
 
         request_timeout = d.pop("request_timeout", UNSET)
 
-        preload = cast(list[str], d.pop("preload", UNSET))
+        _preload = d.pop("preload", UNSET)
+        preload: list[InferenceModelRef] | Unset = UNSET
+        if _preload is not UNSET:
+            preload = []
+            for preload_item_data in _preload:
+                preload_item = InferenceModelRef.from_dict(preload_item_data)
+
+                preload.append(preload_item)
 
         max_memory_mb = d.pop("max_memory_mb", UNSET)
 
@@ -290,6 +303,7 @@ class InferenceConfig:
             api_url=api_url,
             api_key=api_key,
             models_dir=models_dir,
+            ml_dir=ml_dir,
             content_security=content_security,
             s3_credentials=s3_credentials,
             keep_alive=keep_alive,

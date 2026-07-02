@@ -29,7 +29,16 @@ pub const ResidentOutputs = struct {
     allocator: std.mem.Allocator,
 
     pub fn deinit(self: *ResidentOutputs) void {
-        for (self.outputs) |output| self.backend.free(output);
+        for (self.outputs, 0..) |output, idx| {
+            var seen = false;
+            for (self.outputs[0..idx]) |prev| {
+                if (prev == output) {
+                    seen = true;
+                    break;
+                }
+            }
+            if (!seen) self.backend.free(output);
+        }
         self.allocator.free(self.outputs);
         self.outputs = &.{};
     }

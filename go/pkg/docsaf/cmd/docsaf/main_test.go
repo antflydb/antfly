@@ -46,6 +46,91 @@ func parseSourceFlagsForTest(t *testing.T, args ...string) sourceFlags {
 	return flags
 }
 
+func TestDocsafEmbedderConfigDefaultsToAntflyClipclap(t *testing.T) {
+	cfg, err := docsafEmbedderConfig("", defaultDocsafEmbeddingModel, "")
+	if err != nil {
+		t.Fatalf("docsafEmbedderConfig: %v", err)
+	}
+	antflyCfg, err := cfg.AsAntflyEmbedderConfig()
+	if err != nil {
+		t.Fatalf("AsAntflyEmbedderConfig: %v", err)
+	}
+	if antflyCfg.Model != defaultDocsafEmbeddingModel {
+		t.Fatalf("model = %q, want %q", antflyCfg.Model, defaultDocsafEmbeddingModel)
+	}
+}
+
+func TestDocsafEmbedderConfigSupportsOllama(t *testing.T) {
+	cfg, err := docsafEmbedderConfig("ollama", "embeddinggemma", "")
+	if err != nil {
+		t.Fatalf("docsafEmbedderConfig: %v", err)
+	}
+	ollamaCfg, err := cfg.AsOllamaEmbedderConfig()
+	if err != nil {
+		t.Fatalf("AsOllamaEmbedderConfig: %v", err)
+	}
+	if ollamaCfg.Model != "embeddinggemma" {
+		t.Fatalf("model = %q, want embeddinggemma", ollamaCfg.Model)
+	}
+}
+
+func TestDocsafEmbedderConfigSupportsOpenRouter(t *testing.T) {
+	cfg, err := docsafEmbedderConfig("openrouter", "openai/text-embedding-3-small", "")
+	if err != nil {
+		t.Fatalf("docsafEmbedderConfig: %v", err)
+	}
+	openRouterCfg, err := cfg.AsOpenRouterEmbedderConfig()
+	if err != nil {
+		t.Fatalf("AsOpenRouterEmbedderConfig: %v", err)
+	}
+	if openRouterCfg.Model != "openai/text-embedding-3-small" {
+		t.Fatalf("model = %q, want openai/text-embedding-3-small", openRouterCfg.Model)
+	}
+}
+
+func TestDocsafEmbedderConfigPassesThroughFutureProvider(t *testing.T) {
+	cfg, err := docsafEmbedderConfig("future-provider", "future-model", "")
+	if err != nil {
+		t.Fatalf("docsafEmbedderConfig: %v", err)
+	}
+	if string(cfg.Provider) != "future-provider" {
+		t.Fatalf("provider = %q, want future-provider", cfg.Provider)
+	}
+}
+
+func TestDocsafEmbedderConfigAcceptsFullSDKJSON(t *testing.T) {
+	cfg, err := docsafEmbedderConfig("antfly", "ignored", `{"provider":"openai","model":"text-embedding-3-large","dimensions":1024}`)
+	if err != nil {
+		t.Fatalf("docsafEmbedderConfig: %v", err)
+	}
+	openAICfg, err := cfg.AsOpenAIEmbedderConfig()
+	if err != nil {
+		t.Fatalf("AsOpenAIEmbedderConfig: %v", err)
+	}
+	if openAICfg.Model != "text-embedding-3-large" {
+		t.Fatalf("model = %q, want text-embedding-3-large", openAICfg.Model)
+	}
+	if openAICfg.Dimensions != 1024 {
+		t.Fatalf("dimensions = %v, want 1024", openAICfg.Dimensions)
+	}
+}
+
+func TestDocsafEmbedderConfigPassesThroughFutureProviderInJSON(t *testing.T) {
+	cfg, err := docsafEmbedderConfig("", "", `{"provider":"future-provider","model":"future-model","option":true}`)
+	if err != nil {
+		t.Fatalf("docsafEmbedderConfig: %v", err)
+	}
+	if string(cfg.Provider) != "future-provider" {
+		t.Fatalf("provider = %q, want future-provider", cfg.Provider)
+	}
+}
+
+func TestDocsafEmbedderConfigRejectsMissingProviderInJSON(t *testing.T) {
+	if _, err := docsafEmbedderConfig("", "", `{"model":"model"}`); err == nil {
+		t.Fatalf("docsafEmbedderConfig error = nil, want missing provider")
+	}
+}
+
 func TestSourceFlagsFilesystemDefaultRequiresDir(t *testing.T) {
 	flags := parseSourceFlagsForTest(t, "--base-url", "s3://docs")
 	err := flags.validate(context.Background())

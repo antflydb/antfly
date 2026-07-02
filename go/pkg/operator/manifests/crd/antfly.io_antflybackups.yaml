@@ -132,6 +132,29 @@ spec:
                 type: array
               cronJobName:
                 type: string
+              lastFailedBackup:
+                properties:
+                  backupId:
+                    type: string
+                  completionTime:
+                    format: date-time
+                    type: string
+                  error:
+                    type: string
+                  startTime:
+                    format: date-time
+                    type: string
+                  status:
+                    type: string
+                  tables:
+                    items:
+                      type: string
+                    type: array
+                required:
+                - backupId
+                - startTime
+                - status
+                type: object
               lastScheduledTime:
                 format: date-time
                 type: string

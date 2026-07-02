@@ -42,7 +42,6 @@ pub const SyncLevel = enum {
     write,
     full_text,
     enrichments,
-    aknn,
     full_index,
 };
 
@@ -51,7 +50,6 @@ pub fn parsePublicSyncLevelText(text: []const u8) ?SyncLevel {
     if (std.mem.eql(u8, text, "write")) return .write;
     if (std.mem.eql(u8, text, "full_text")) return .full_text;
     if (std.mem.eql(u8, text, "enrichments")) return .enrichments;
-    if (std.mem.eql(u8, text, "aknn")) return .full_index;
     if (std.mem.eql(u8, text, "full_index")) return .full_index;
     return null;
 }
@@ -69,14 +67,13 @@ pub fn publicSyncLevelText(level: SyncLevel) []const u8 {
         .write => "write",
         .full_text => "full_text",
         .enrichments => "enrichments",
-        .aknn, .full_index => "full_index",
+        .full_index => "full_index",
     };
 }
 
-test "public sync level text treats aknn as deprecated alias for full_index" {
-    try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("aknn").?);
+test "public sync level text accepts full_index and rejects removed aknn alias" {
+    try std.testing.expect(parsePublicSyncLevelText("aknn") == null);
     try std.testing.expectEqual(SyncLevel.full_index, parsePublicSyncLevelText("full_index").?);
-    try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.aknn));
     try std.testing.expectEqualStrings("full_index", publicSyncLevelText(.full_index));
 }
 
@@ -1944,6 +1941,7 @@ pub const StartupCatchUpStats = struct {
     lsm_open_failed: u64 = 0,
     lsm_open_total_ns: u64 = 0,
     lsm_open_initializing_storage_ns: u64 = 0,
+    lsm_open_recovered_temp_cleanup_ns: u64 = 0,
     lsm_open_manifest_ns: u64 = 0,
     lsm_open_ensuring_dirs_ns: u64 = 0,
     lsm_open_wal_replay_ns: u64 = 0,
@@ -1952,6 +1950,8 @@ pub const StartupCatchUpStats = struct {
     lsm_open_obsolete_paths: u64 = 0,
     lsm_open_mutable_entries_after_replay: u64 = 0,
     lsm_open_immutable_memtables_after_replay: u64 = 0,
+    lsm_open_recovered_temp_files_deleted: u64 = 0,
+    lsm_open_recovered_temp_bytes_deleted: u64 = 0,
     wal_replay_records: u64 = 0,
     wal_replay_entries: u64 = 0,
     wal_replay_bytes: u64 = 0,
@@ -2065,6 +2065,7 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.lsm_open_failed += src.lsm_open_failed;
     dst.lsm_open_total_ns += src.lsm_open_total_ns;
     dst.lsm_open_initializing_storage_ns += src.lsm_open_initializing_storage_ns;
+    dst.lsm_open_recovered_temp_cleanup_ns += src.lsm_open_recovered_temp_cleanup_ns;
     dst.lsm_open_manifest_ns += src.lsm_open_manifest_ns;
     dst.lsm_open_ensuring_dirs_ns += src.lsm_open_ensuring_dirs_ns;
     dst.lsm_open_wal_replay_ns += src.lsm_open_wal_replay_ns;
@@ -2073,6 +2074,8 @@ pub fn accumulateStartupCatchUpStats(dst: *StartupCatchUpStats, src: StartupCatc
     dst.lsm_open_obsolete_paths += src.lsm_open_obsolete_paths;
     dst.lsm_open_mutable_entries_after_replay += src.lsm_open_mutable_entries_after_replay;
     dst.lsm_open_immutable_memtables_after_replay += src.lsm_open_immutable_memtables_after_replay;
+    dst.lsm_open_recovered_temp_files_deleted += src.lsm_open_recovered_temp_files_deleted;
+    dst.lsm_open_recovered_temp_bytes_deleted += src.lsm_open_recovered_temp_bytes_deleted;
     dst.wal_replay_records += src.wal_replay_records;
     dst.wal_replay_entries += src.wal_replay_entries;
     dst.wal_replay_bytes += src.wal_replay_bytes;

@@ -1015,6 +1015,32 @@ export interface paths {
         patch?: never;
         trace?: never;
     };
+    "/db/v1/tables/{tableName}/artifacts": {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        /**
+         * List table artifact enrichments
+         * @description Returns table-level generated artifact enrichments configured for a
+         *     table, including enrichments declared inline by indexes. This is the
+         *     artifact control-plane view; use the document artifact routes to inspect
+         *     materialized manifests for a specific source document.
+         */
+        get: operations["listArtifactEnrichments"];
+        put?: never;
+        post?: never;
+        delete?: never;
+        options?: never;
+        head?: never;
+        patch?: never;
+        trace?: never;
+    };
     "/db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess": {
         parameters: {
             query?: never;
@@ -1061,8 +1087,8 @@ export interface paths {
         /**
          * Register or replace an artifact enrichment
          * @description Registers a table-level generated artifact definition. Reusing the same
-         *     artifact name replaces the existing mapping. Chunk enrichments may set
-         *     `full_text_index: true` to map generated chunk text into the table's
+         *     artifact name replaces the existing mapping. Chunk or asset enrichments
+         *     may set `full_text_index: true` to map generated text into the table's
          *     default full-text index.
          */
         put: operations["putArtifactEnrichment"];
@@ -2642,6 +2668,12 @@ export interface components {
             document_id: string;
             artifacts: components["schemas"]["DocumentArtifactManifest"][];
         };
+        /** @description Table-level generated artifact enrichments configured for a table. */
+        TableArtifactEnrichmentList: {
+            /** @description Table containing the configured artifact enrichments. */
+            table_name: string;
+            artifacts: components["schemas"]["EnrichmentConfig"][];
+        };
         DocumentArtifactReprocessResponse: {
             /**
              * @description Indicates that reprocessing was accepted.
@@ -2940,12 +2972,11 @@ export interface components {
          *     - "write": Wait for Pebble KV write
          *     - "full_text": Wait for full-text index WAL write
          *     - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-         *     - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+         *     - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
          * @default propose
          * @enum {string}
          */
-        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "aknn" | "full_index";
+        SyncLevel: "propose" | "write" | "full_text" | "enrichments" | "full_index";
         ShardConfig: {
             byte_range: components["schemas"]["ByteRange"];
         };
@@ -6367,6 +6398,40 @@ export interface components {
                 [key: string]: unknown;
             } | null;
         };
+        /**
+         * @description Managed generated artifact kind.
+         * @enum {string}
+         */
+        EnrichmentKind: "chunk" | "asset" | "embedding";
+        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
+        EnrichmentConfig: {
+            /** @description Stable generated artifact name. */
+            name: string;
+            kind: components["schemas"]["EnrichmentKind"];
+            /** @description Source field to read from the source document or source artifact payload. */
+            field?: string;
+            /** @description Optional template for generated text input. */
+            template?: string;
+            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts. */
+            source_artifact_name?: string;
+            /** @description Expected embedding dimension for embedding enrichments. */
+            expected_dims?: number;
+            /** @description Chunk size for chunk enrichments. */
+            chunk_size?: number;
+            /** @description Chunk overlap for chunk enrichments. */
+            chunk_overlap?: number;
+            /** @description Serialized chunker configuration for chunk enrichments. */
+            chunker_json?: string;
+            /**
+             * @description When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
+             * @default false
+             */
+            full_text_index?: boolean;
+            /** @description Produced asset content type for asset enrichments. */
+            content_type?: string;
+            /** @description Serialized asset producer configuration. */
+            producer_json?: string;
+        };
         FullTextIndexConfig: {
             /** @description Whether to use memory-only storage */
             mem_only?: boolean;
@@ -7385,40 +7450,6 @@ export interface components {
          * @enum {string}
          */
         IndexType: "full_text" | "embeddings" | "graph" | "algebraic";
-        /**
-         * @description Managed generated artifact kind.
-         * @enum {string}
-         */
-        EnrichmentKind: "chunk" | "asset" | "embedding";
-        /** @description Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams. */
-        EnrichmentConfig: {
-            /** @description Stable generated artifact name. */
-            name: string;
-            kind: components["schemas"]["EnrichmentKind"];
-            /** @description Source field to read from the source document or source artifact payload. */
-            field?: string;
-            /** @description Optional template for generated text input. */
-            template?: string;
-            /** @description Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts. */
-            source_artifact_name?: string;
-            /** @description Expected embedding dimension for embedding enrichments. */
-            expected_dims?: number;
-            /** @description Chunk size for chunk enrichments. */
-            chunk_size?: number;
-            /** @description Chunk overlap for chunk enrichments. */
-            chunk_overlap?: number;
-            /** @description Serialized chunker configuration for chunk enrichments. */
-            chunker_json?: string;
-            /**
-             * @description When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
-             * @default false
-             */
-            full_text_index?: boolean;
-            /** @description Produced asset content type for asset enrichments. */
-            content_type?: string;
-            /** @description Serialized asset producer configuration. */
-            producer_json?: string;
-        };
         /** @description Configuration for an index */
         IndexConfig: {
             /** @description Name of the index */
@@ -9901,19 +9932,7 @@ export interface components {
              *     0.02 = 50x compression, 0.1 = 10x, 0.5 = 2x. Null/omitted = no compaction.
              */
             cache_compaction_ratio?: number;
-            /**
-             * @description Optional backend override for this request.
-             *     `auto` keeps the node default behavior.
-             *     `onnx` forces ONNX generation when the model/package supports it.
-             *     `native` and `metal` force the native host backend choice.
-             *     `xla` runs native generation with explicit PJRT/XLA compiled graph partitions and
-             *     requires a PJRT plugin path via `ANTFLY_INFERENCE_XLA_PLUGIN`,
-             *     `ANTFLY_INFERENCE_PJRT_PLUGIN`, `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
-             *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
-             *     `mode: "compiled"` to request WebGPU graph partition execution.
-             * @enum {string}
-             */
-            backend?: "auto" | "onnx" | "native" | "metal" | "xla" | "webgpu";
+            backend?: components["schemas"]["InferenceModelBackend"];
             /**
              * @description inference-native graph execution mode. `eager` keeps the direct runtime path when possible.
              *     `compiled` runs inference graph planning, partitioning, and backend executor attachment.
@@ -10037,10 +10056,67 @@ export interface components {
             /** @description Incremental arguments JSON string */
             arguments?: string;
         };
+        /**
+         * @description Model registry kind.
+         * @enum {string}
+         */
+        InferenceModelKind: "generator" | "embedder" | "reranker" | "chunker" | "classifier" | "recognizer" | "rewriter" | "reader" | "transcriber" | "extractor";
+        /**
+         * @description Optional backend preference for model loading or request execution.
+         *     `auto` keeps the node default behavior.
+         *     `xla` selects the PJRT/XLA backend and may require a PJRT plugin path via
+         *     `ANTFLY_INFERENCE_XLA_PLUGIN`, `ANTFLY_INFERENCE_PJRT_PLUGIN`,
+         *     `PJRT_PLUGIN_PATH`, or `PJRT_PLUGIN`.
+         *     `webgpu` selects the Wasm/WebGPU backend in Wasm builds; pair it with
+         *     `mode: "compiled"` on generation requests to request WebGPU graph partition execution.
+         * @enum {string}
+         */
+        InferenceModelBackend: "auto" | "native" | "onnx" | "metal" | "cuda" | "xla" | "webgpu" | "wasm";
+        /**
+         * @description Optional artifact format preference for loading a model.
+         * @enum {string}
+         */
+        InferenceModelFormat: "gguf" | "onnx" | "safetensors" | "hybrid";
+        /**
+         * @description Optional quantization preference for loading a model.
+         * @enum {string}
+         */
+        InferenceModelQuantization: "q4_k" | "q8" | "fp16";
+        /**
+         * @description Backend priority entry for model loading. Use `backend` or `backend:device`,
+         *     where device defaults to `auto`.
+         *
+         *     Backends:
+         *     - `native` - Native CPU backend
+         *     - `onnx` - ONNX Runtime backend
+         *     - `metal` - Apple Metal backend
+         *     - `cuda` - NVIDIA CUDA backend
+         *     - `xla` - PJRT/XLA compiled backend
+         *     - `webgpu` or `wasm` - Wasm/WebGPU backend in Wasm builds
+         *
+         *     Devices:
+         *     - `auto` - Auto-detect best available (default)
+         *     - `cuda` - NVIDIA CUDA GPU
+         *     - `tpu` - Google TPU (used by XLA)
+         *     - `cpu` - Force CPU only
+         */
+        InferenceBackendPriorityEntry: string;
+        /** @description Model reference used by startup preload and model-loading configuration. */
+        InferenceModelRef: {
+            kind: components["schemas"]["InferenceModelKind"];
+            /**
+             * @description Model name to resolve within the registry for the selected kind, usually in `<owner>/<repo>` format.
+             * @example antflydb/gemma-e2b
+             */
+            name: string;
+            backend?: components["schemas"]["InferenceModelBackend"];
+            format?: components["schemas"]["InferenceModelFormat"];
+            quantization?: components["schemas"]["InferenceModelQuantization"];
+        };
         InferenceConfig: {
             /**
              * Format: uri
-             * @description URL of the inference embedding/chunking service
+             * @description URL of the Antfly inference embedding/chunking service
              * @example http://localhost:8080
              */
             api_url: string;
@@ -10058,6 +10134,14 @@ export interface components {
              * @example ~/.antfly/inference/models
              */
             models_dir?: string;
+            /**
+             * @description Base directory containing Traditional ML predictor subdirectories. The `/ml/v1/*`
+             *     API auto-discovers predictors from `{ml_dir}/{name}/tabular_model.json`.
+             *
+             *     Defaults to ~/.antfly/inference/ml.
+             * @example ~/.antfly/inference/ml
+             */
+            ml_dir?: string;
             /** @description Security settings for downloading content from URLs (e.g., images for CLIP models). Controls allowed hosts, private IP blocking, download limits, and timeouts. */
             content_security?: components["schemas"]["InferenceContentSecurityConfig"];
             /** @description S3 credentials for downloading content from S3 URLs. If not set, S3 URLs will fail. */
@@ -10096,19 +10180,6 @@ export interface components {
              *     Antfly inference tries entries in order and uses the first available backend+device
              *     combination that supports the model.
              *
-             *     **Backends** (depend on build flags):
-             *     - `native` - Native CPU backend
-             *     - `onnx` - ONNX Runtime backend
-             *     - `metal` - Apple Metal backend
-             *     - `cuda` - NVIDIA CUDA backend
-             *     - `xla` - PJRT/XLA compiled backend
-             *
-             *     **Devices**:
-             *     - `auto` - Auto-detect best available (default)
-             *     - `cuda` - NVIDIA CUDA GPU
-             *     - `tpu` - Google TPU (used by XLA)
-             *     - `cpu` - Force CPU only
-             *
              *     **Examples**:
              *     - `["native", "onnx", "xla"]` - Try backends with auto device detection
              *     - `["cuda", "onnx:cuda", "xla:tpu", "native"]` - Prefer GPU, fall back to CPU
@@ -10124,7 +10195,7 @@ export interface components {
              *       "native"
              *     ]
              */
-            backend_priority?: string[];
+            backend_priority?: components["schemas"]["InferenceBackendPriorityEntry"][];
             /**
              * @description Maximum number of concurrent inference requests allowed.
              *     Additional requests will be queued up to max_queue_size.
@@ -10150,16 +10221,21 @@ export interface components {
              */
             request_timeout?: string;
             /**
-             * @description List of model names to preload at startup (Ollama-compatible).
-             *     These models are loaded immediately when inference starts, avoiding first-request latency.
-             *     Model names should match those in models_dir/embedders/ (e.g., "BAAI/bge-small-en-v1.5").
-             *     Only effective when keep_alive is non-zero (lazy loading mode).
+             * @description Models to preload and warm at startup. Generators run a tiny generation
+             *     request so native/Metal weights, KV setup, and kernels use the same
+             *     budgeted path as request-time generation. Other model kinds use the
+             *     best available warm path for that kind.
              * @example [
-             *       "BAAI/bge-small-en-v1.5",
-             *       "openai/clip-vit-base-patch32"
+             *       {
+             *         "kind": "generator",
+             *         "name": "antflydb/gemma-e2b",
+             *         "backend": "metal",
+             *         "format": "gguf",
+             *         "quantization": "q4_k"
+             *       }
              *     ]
              */
-            preload?: string[];
+            preload?: components["schemas"]["InferenceModelRef"][];
             /**
              * @description Maximum memory (in MB) to use for loaded models.
              *     When this limit is approached, least recently used models are unloaded.
@@ -10177,7 +10253,7 @@ export interface components {
              *     - If keep_alive="0": eager loading (load at startup, never unload)
              *
              *     When a model has strategy "eager" in this map:
-             *     - It is loaded at startup (as part of preload)
+             *     - It is loaded at startup through the same startup warmup path
              *     - It is never unloaded, even when keep_alive>0 (pinned in memory)
              *
              *     This allows mixing eager and lazy models in the same pool.
@@ -12064,6 +12140,31 @@ export interface operations {
             405: components["responses"]["MethodNotAllowed"];
             500: components["responses"]["InternalServerError"];
             503: components["responses"]["ServiceUnavailable"];
+        };
+    };
+    listArtifactEnrichments: {
+        parameters: {
+            query?: never;
+            header?: never;
+            path: {
+                /** @description Name of the table */
+                tableName: string;
+            };
+            cookie?: never;
+        };
+        requestBody?: never;
+        responses: {
+            /** @description Artifact enrichment list */
+            200: {
+                headers: {
+                    [name: string]: unknown;
+                };
+                content: {
+                    "application/json": components["schemas"]["TableArtifactEnrichmentList"];
+                };
+            };
+            404: components["responses"]["NotFound"];
+            500: components["responses"]["InternalServerError"];
         };
     };
     reprocessDocumentArtifactRange: {

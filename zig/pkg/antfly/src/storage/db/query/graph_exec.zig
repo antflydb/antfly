@@ -721,16 +721,25 @@ pub fn fuseNamedSets(
         else
             null;
         const output_doc_id = if (representative) |entry| entry.representative_doc_id else hit.doc_id;
-        const stored_data = if (req.include_stored)
-            try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
-        else
-            null;
-        hits[i] = .{
-            .id = try alloc.dupe(u8, output_doc_id),
-            .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
-            .score = @floatCast(hit.score),
-            .stored_data = stored_data,
+        const materialized = blk: {
+            const owned_id = try alloc.dupe(u8, output_doc_id);
+            errdefer alloc.free(owned_id);
+            const owned_index_scores = try types.cloneIndexScores(alloc, hit.index_scores);
+            errdefer types.freeIndexScores(alloc, owned_index_scores);
+            const stored_data = if (req.include_stored)
+                try executor.load_projected_document(executor.ctx, alloc, req, output_doc_id)
+            else
+                null;
+            errdefer if (stored_data) |value| alloc.free(value);
+            break :blk types.SearchHit{
+                .id = owned_id,
+                .doc_ordinal = if (representative) |entry| entry.ordinal else if (ordinal_by_id.get(hit.doc_id)) |ordinal| ordinal else null,
+                .score = @floatCast(hit.score),
+                .index_scores = owned_index_scores,
+                .stored_data = stored_data,
+            };
         };
+        hits[i] = materialized;
         initialized += 1;
     }
 
@@ -3405,6 +3414,62 @@ test "fuseNamedSets drops conflicting source hit ordinals" {
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expect(result.hits[0].doc_ordinal == null);
+}
+
+test "fuseNamedSets preserves fused per-index scores" {
+    const alloc = std.testing.allocator;
+
+    const dense_id = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(dense_id);
+    const sparse_id = try alloc.dupe(u8, "doc:a");
+    defer alloc.free(sparse_id);
+    const dense_hits = [_]types.SearchHit{.{
+        .id = dense_id,
+        .doc_ordinal = 11,
+        .score = 1.0,
+    }};
+    const sparse_hits = [_]types.SearchHit{.{
+        .id = sparse_id,
+        .doc_ordinal = 11,
+        .score = 0.9,
+    }};
+    const named_sets = [_]NamedResultSet{
+        .{
+            .name = "dense",
+            .hits = &dense_hits,
+            .total_hits = dense_hits.len,
+        },
+        .{
+            .name = "sparse",
+            .hits = &sparse_hits,
+            .total_hits = sparse_hits.len,
+        },
+    };
+
+    const Harness = struct {
+        fn loadProjectedDocument(
+            _: ?*anyopaque,
+            _: Allocator,
+            _: types.SearchRequest,
+            _: []const u8,
+        ) anyerror!?[]u8 {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    var result = try fuseNamedSets(alloc, .{
+        .limit = 1,
+        .include_stored = false,
+    }, &named_sets, .{
+        .ctx = null,
+        .load_projected_document = Harness.loadProjectedDocument,
+    });
+    defer result.deinit();
+
+    try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
+    try std.testing.expectEqualStrings("dense", result.hits[0].index_scores[0].index_name);
+    try std.testing.expectEqualStrings("sparse", result.hits[0].index_scores[1].index_name);
 }
 
 test "executeGraphQueries projects base hits to resolved doc-set for unbounded selectors" {

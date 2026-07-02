@@ -127,7 +127,6 @@ pub const AdminSource = struct {
         disable_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8) anyerror!extension_domain.InstalledExtension = null,
         configure_extension: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, name: []const u8, req: extension_domain.ConfigureExtensionRequest) anyerror!extension_domain.InstalledExtension = null,
         restore_extensions: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, installed: []const extension_domain.InstalledExtension, members: []const extension_domain.ExtensionMember, dependencies: []const extension_domain.ExtensionDependency) anyerror!void = null,
-        forward_metadata_request: ?*const fn (ptr: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) anyerror!?http_common.HttpResponse = null,
         record_json_response_allocation: ?*const fn (ptr: *anyopaque, bytes: usize) void = null,
     };
 
@@ -288,11 +287,6 @@ pub const AdminSource = struct {
         return try fn_ptr(self.ptr, alloc, installed, members, dependencies);
     }
 
-    pub fn forwardMetadataRequest(self: AdminSource, alloc: std.mem.Allocator, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        const fn_ptr = self.vtable.forward_metadata_request orelse return null;
-        return try fn_ptr(self.ptr, alloc, req);
-    }
-
     pub fn recordJsonResponseAllocation(self: AdminSource, bytes: usize) void {
         const fn_ptr = self.vtable.record_json_response_allocation orelse return;
         fn_ptr(self.ptr, bytes);
@@ -371,7 +365,6 @@ pub const AdminSource = struct {
                 .disable_extension = metadataHttpServiceDisableExtension,
                 .configure_extension = metadataHttpServiceConfigureExtension,
                 .restore_extensions = metadataHttpServiceRestoreExtensions,
-                .forward_metadata_request = metadataHttpServiceForwardMetadataRequest,
                 .record_json_response_allocation = metadataHttpServiceRecordJsonResponseAllocation,
             },
         };
@@ -698,15 +691,6 @@ pub const AdminSource = struct {
         svc.freeAdminSnapshot(snapshot);
     }
 
-    fn metadataHttpServiceForwardMetadataRequest(
-        ptr: *anyopaque,
-        alloc: std.mem.Allocator,
-        req: http_common.HttpRequest,
-    ) !?http_common.HttpResponse {
-        const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
-        return try svc.forwardMetadataLeaderRequest(alloc, req);
-    }
-
     fn metadataHttpServiceCreateTable(ptr: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, req: tables_api.CreateTableRequest) !void {
         const svc: *service.MetadataHttpService = @ptrCast(@alignCast(ptr));
         var workflow = metadata_table_workflow.TableWorkflow.init(alloc);
@@ -1012,7 +996,6 @@ pub const MetadataHttpServer = struct {
 
     pub fn handle(self: *MetadataHttpServer, req: http_common.HttpRequest) !http_common.HttpResponse {
         _ = self.cfg;
-        if (try self.forwardMutationToLeader(req)) |resp| return resp;
         switch (req.method) {
             .GET => {
                 if (routes.Routes.matchInternalNodeShutdown(req.uri)) |node_id| {
@@ -1397,15 +1380,6 @@ pub const MetadataHttpServer = struct {
         return try textResponse(self.alloc, 404, "not found");
     }
 
-    fn forwardMutationToLeader(self: *MetadataHttpServer, req: http_common.HttpRequest) !?http_common.HttpResponse {
-        if (req.source_node_id != null) return null;
-        switch (req.method) {
-            .POST, .PUT, .DELETE => {},
-            .GET => return null,
-        }
-        return try self.source.forwardMetadataRequest(self.alloc, req);
-    }
-
     fn preserveExistingStoreDrainIntent(self: *MetadataHttpServer, record: *metadata_table_manager.StoreRecord) !void {
         if (record.drain_requested) return;
         var snapshot = try self.source.adminSnapshot();
@@ -1596,7 +1570,10 @@ pub const MetadataHttpServer = struct {
 
     fn execute(ptr: *anyopaque, _: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
         const self: *MetadataHttpServer = @ptrCast(@alignCast(ptr));
-        return try self.handle(req);
+        return self.handle(req) catch |err| switch (err) {
+            error.NotLeader, error.ProposalDropped, error.LeaderTransferInProgress => try notLeaderResponse(self.alloc),
+            else => return err,
+        };
     }
 };
 
@@ -2719,6 +2696,44 @@ fn textResponse(alloc: std.mem.Allocator, status: u16, body: []const u8) !http_c
         .status = status,
         .content_type = try alloc.dupe(u8, "text/plain"),
         .body = try alloc.dupe(u8, body),
+    };
+}
+
+fn notLeaderResponse(alloc: std.mem.Allocator) !http_common.HttpResponse {
+    const headers = try alloc.alloc(http_common.Header, 2);
+    var initialized_headers: usize = 0;
+    errdefer {
+        for (headers[0..initialized_headers]) |*header| header.deinit(alloc);
+        alloc.free(headers);
+    }
+
+    var retry_after_name: ?[]u8 = try alloc.dupe(u8, "Retry-After");
+    errdefer if (retry_after_name) |value| alloc.free(value);
+    var retry_after_value: ?[]u8 = try alloc.dupe(u8, "1");
+    errdefer if (retry_after_value) |value| alloc.free(value);
+    headers[0] = .{ .name = retry_after_name.?, .value = retry_after_value.? };
+    retry_after_name = null;
+    retry_after_value = null;
+    initialized_headers += 1;
+
+    var not_leader_name: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_header);
+    errdefer if (not_leader_name) |value| alloc.free(value);
+    var not_leader_value: ?[]u8 = try alloc.dupe(u8, http_common.metadata_not_leader_value);
+    errdefer if (not_leader_value) |value| alloc.free(value);
+    headers[1] = .{ .name = not_leader_name.?, .value = not_leader_value.? };
+    not_leader_name = null;
+    not_leader_value = null;
+    initialized_headers += 1;
+
+    const content_type = try alloc.dupe(u8, "text/plain");
+    errdefer alloc.free(content_type);
+    const body = try alloc.dupe(u8, "metadata leader unavailable");
+    errdefer alloc.free(body);
+    return .{
+        .status = 503,
+        .content_type = content_type,
+        .headers = headers,
+        .body = body,
     };
 }
 

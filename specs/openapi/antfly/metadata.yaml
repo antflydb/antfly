@@ -18,7 +18,7 @@ info:
     - **Multi-Raft Design**: Separate consensus groups for metadata (single cluster) and storage (one per shard)
     - **Horizontal Sharding**: Data automatically partitioned across shards with configurable replication
     - **Distributed Transactions**: Atomic cross-shard writes using coordinator-based 2PC with intent-based locking
-    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, aknn)
+    - **Fine-Grained Durability**: Control write consistency with sync levels (propose, write, full_text, enrichments, full_index)
 
     ### AI-Native Features
     - **RAG**: Streaming retrieval-augmented generation with Server-Sent Events
@@ -2001,6 +2001,20 @@ components:
           type: array
           items:
             $ref: "#/components/schemas/DocumentArtifactManifest"
+    TableArtifactEnrichmentList:
+      type: object
+      description: Table-level generated artifact enrichments configured for a table.
+      required:
+        - table_name
+        - artifacts
+      properties:
+        table_name:
+          type: string
+          description: Table containing the configured artifact enrichments.
+        artifacts:
+          type: array
+          items:
+            $ref: "indexes.yaml#/components/schemas/EnrichmentConfig"
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -2491,7 +2505,6 @@ components:
         - write
         - full_text
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: |
@@ -2500,8 +2513,7 @@ components:
         - "write": Wait for Pebble KV write
         - "full_text": Wait for full-text index WAL write
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable)
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig: # Simplified from common.ShardInfo for brevity
       type: object
       required:
@@ -8308,6 +8320,35 @@ paths:
           $ref: "#/components/responses/ServiceUnavailable"
         "500":
           $ref: "#/components/responses/InternalServerError"
+  /tables/{tableName}/artifacts:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    get:
+      summary: List table artifact enrichments
+      description: |
+        Returns table-level generated artifact enrichments configured for a
+        table, including enrichments declared inline by indexes. This is the
+        artifact control-plane view; use the document artifact routes to inspect
+        materialized manifests for a specific source document.
+      tags:
+        - index_management
+      operationId: listArtifactEnrichments
+      responses:
+        "200":
+          description: Artifact enrichment list
+          content:
+            application/json:
+              schema:
+                $ref: "#/components/schemas/TableArtifactEnrichmentList"
+        "404":
+          $ref: "#/components/responses/NotFound"
+        "500":
+          $ref: "#/components/responses/InternalServerError"
   /tables/{tableName}/artifacts/{artifactName}/reprocess:
     parameters:
       - name: tableName
@@ -8375,8 +8416,8 @@ paths:
       summary: Register or replace an artifact enrichment
       description: |
         Registers a table-level generated artifact definition. Reusing the same
-        artifact name replaces the existing mapping. Chunk enrichments may set
-        `full_text_index: true` to map generated chunk text into the table's
+        artifact name replaces the existing mapping. Chunk or asset enrichments
+        may set `full_text_index: true` to map generated text into the table's
         default full-text index.
       tags:
         - index_management

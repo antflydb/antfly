@@ -3949,6 +3949,42 @@ paths:
         - BasicAuth: []
         - ApiKeyAuth: []
         - BearerAuth: []
+  /db/v1/tables/{tableName}/artifacts:
+    parameters:
+      - name: tableName
+        in: path
+        required: true
+        description: Name of the table
+        schema:
+          type: string
+    get:
+      summary: List table artifact enrichments
+      description: >
+        Returns table-level generated artifact enrichments configured for a
+
+        table, including enrichments declared inline by indexes. This is the
+
+        artifact control-plane view; use the document artifact routes to inspect
+
+        materialized manifests for a specific source document.
+      tags:
+        - index_management
+      operationId: listArtifactEnrichments
+      responses:
+        '200':
+          description: Artifact enrichment list
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TableArtifactEnrichmentList'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+      security:
+        - BasicAuth: []
+        - ApiKeyAuth: []
+        - BearerAuth: []
   /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess:
     parameters:
       - name: tableName
@@ -4026,9 +4062,9 @@ paths:
       description: >
         Registers a table-level generated artifact definition. Reusing the same
 
-        artifact name replaces the existing mapping. Chunk enrichments may set
+        artifact name replaces the existing mapping. Chunk or asset enrichments
 
-        `full_text_index: true` to map generated chunk text into the table's
+        may set `full_text_index: true` to map generated text into the table's
 
         default full-text index.
       tags:
@@ -7173,6 +7209,20 @@ components:
           type: array
           items:
             $ref: '#/components/schemas/DocumentArtifactManifest'
+    TableArtifactEnrichmentList:
+      type: object
+      description: Table-level generated artifact enrichments configured for a table.
+      required:
+        - table_name
+        - artifacts
+      properties:
+        table_name:
+          type: string
+          description: Table containing the configured artifact enrichments.
+        artifacts:
+          type: array
+          items:
+            $ref: '#/components/schemas/EnrichmentConfig'
     DocumentArtifactReprocessResponse:
       type: object
       required:
@@ -7670,7 +7720,6 @@ components:
         - write
         - full_text
         - enrichments
-        - aknn
         - full_index
       default: propose
       description: >
@@ -7684,10 +7733,7 @@ components:
 
         - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation)
 
-        - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async
-        on timeout, slowest, most durable)
-
-        - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+        - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
     ShardConfig:
       type: object
       required:
@@ -12939,6 +12985,72 @@ components:
             are applied as additional narrowing.
       required:
         - name
+    EnrichmentKind:
+      type: string
+      enum:
+        - chunk
+        - asset
+        - embedding
+      description: Managed generated artifact kind.
+    EnrichmentConfig:
+      type: object
+      description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
+        indexing and may target source rows or previously generated artifact streams.
+      required:
+        - name
+        - kind
+      properties:
+        name:
+          type: string
+          description: Stable generated artifact name.
+        kind:
+          $ref: '#/components/schemas/EnrichmentKind'
+        field:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Source field to read from the source document or source artifact payload.
+        template:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Optional template for generated text input.
+        source_artifact_name:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Existing artifact stream this enrichment consumes. Chunk enrichments may consume
+            asset artifacts; embedding enrichments may consume chunk artifacts.
+        expected_dims:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: Expected embedding dimension for embedding enrichments.
+        chunk_size:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: Chunk size for chunk enrichments.
+        chunk_overlap:
+          x-go-type-skip-optional-pointer: true
+          type: integer
+          minimum: 0
+          description: Chunk overlap for chunk enrichments.
+        chunker_json:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Serialized chunker configuration for chunk enrichments.
+        full_text_index:
+          x-go-type-skip-optional-pointer: true
+          type: boolean
+          default: false
+          description: When true on a chunk or asset enrichment, route generated text into the table's
+            default full-text index.
+        content_type:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Produced asset content type for asset enrichments.
+        producer_json:
+          x-go-type-skip-optional-pointer: true
+          type: string
+          description: Serialized asset producer configuration.
     FullTextIndexConfig:
       type: object
       properties:
@@ -14310,72 +14422,6 @@ components:
         - graph
         - algebraic
       description: The type of the index.
-    EnrichmentKind:
-      type: string
-      enum:
-        - chunk
-        - asset
-        - embedding
-      description: Managed generated artifact kind.
-    EnrichmentConfig:
-      type: object
-      description: Inline managed enrichment definition. Enrichments materialize generated artifacts before
-        indexing and may target source rows or previously generated artifact streams.
-      required:
-        - name
-        - kind
-      properties:
-        name:
-          type: string
-          description: Stable generated artifact name.
-        kind:
-          $ref: '#/components/schemas/EnrichmentKind'
-        field:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Source field to read from the source document or source artifact payload.
-        template:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Optional template for generated text input.
-        source_artifact_name:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Existing artifact stream this enrichment consumes. Chunk enrichments may consume
-            asset artifacts; embedding enrichments may consume chunk artifacts.
-        expected_dims:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 0
-          description: Expected embedding dimension for embedding enrichments.
-        chunk_size:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 0
-          description: Chunk size for chunk enrichments.
-        chunk_overlap:
-          x-go-type-skip-optional-pointer: true
-          type: integer
-          minimum: 0
-          description: Chunk overlap for chunk enrichments.
-        chunker_json:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Serialized chunker configuration for chunk enrichments.
-        full_text_index:
-          x-go-type-skip-optional-pointer: true
-          type: boolean
-          default: false
-          description: When true on a chunk enrichment, route generated chunk text into the table's default
-            full-text index.
-        content_type:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Produced asset content type for asset enrichments.
-        producer_json:
-          x-go-type-skip-optional-pointer: true
-          type: string
-          description: Serialized asset producer configuration.
     IndexConfig:
       type: object
       description: Configuration for an index

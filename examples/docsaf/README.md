@@ -16,7 +16,7 @@ derived artifact lifecycle from the source row.
   "mime_type": "text/markdown",
   "sha256": "...",
   "source_path": "guide.md",
-  "_type": "source_document"
+  "doc_type": "source_document"
 }
 ```
 
@@ -175,7 +175,9 @@ Load/sync flags:
   or `ANTFLY_AUTH_TOKEN`.
 - `--chunk-size`: target size for unit-derived chunks.
 - `--chunk-overlap`: overlap for unit-derived chunks.
-- `--embedding-model`: Ollama embedding model for managed vector search.
+- `--embedding-provider`: embedding provider for managed vector search (`antfly` by default; any Antfly SDK embedder provider is supported).
+- `--embedding-model`: embedding model for managed vector search (`antflydb/clipclap:gguf:Q4_K` by default).
+- `--embedding-config-json`: full Antfly SDK `EmbedderConfig` JSON for provider-specific settings; overrides `--embedding-provider` and `--embedding-model`.
 - `--embedding-dims`: expected embedding dimension; `0` lets Antfly probe.
 - `--dry-run`: preview linear merge changes without applying them.
 

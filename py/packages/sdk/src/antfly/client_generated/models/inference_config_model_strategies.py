@@ -21,7 +21,7 @@ class InferenceConfigModelStrategies:
     - If keep_alive="0": eager loading (load at startup, never unload)
 
     When a model has strategy "eager" in this map:
-    - It is loaded at startup (as part of preload)
+    - It is loaded at startup through the same startup warmup path
     - It is never unloaded, even when keep_alive>0 (pinned in memory)
 
     This allows mixing eager and lazy models in the same pool.

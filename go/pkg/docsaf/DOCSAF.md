@@ -13,7 +13,7 @@ The source row is intentionally small:
   "mime_type": "text/markdown",
   "sha256": "...",
   "source_path": "docs/guide.md",
-  "_type": "source_document"
+  "doc_type": "source_document"
 }
 ```
 
@@ -108,8 +108,8 @@ stream rather than asking the embedding index to re-chunk source rows.
 The public SDK helper for that vector index is:
 
 ```go
-embedder, err := antfly.NewEmbedderConfig(antfly.OllamaEmbedderConfig{
-    Model: "embeddinggemma",
+embedder, err := antfly.NewEmbedderConfig(antfly.AntflyEmbedderConfig{
+    Model: "antflydb/clipclap:gguf:Q4_K",
 })
 index, err := antfly.NewArtifactEmbeddingIndexConfig(
     "document_vectors",

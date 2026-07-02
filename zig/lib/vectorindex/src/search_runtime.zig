@@ -203,13 +203,7 @@ pub fn exactDistanceToStoredVector(
     query_measure: f32,
     candidate: []const f32,
 ) f32 {
-    return switch (metric.metric) {
-        .cosine => blk: {
-            if (query_measure == 0) break :blk 1.0;
-            break :blk 1.0 - (vec.dot(query, candidate) / query_measure);
-        },
-        else => vec.distanceToQuery(query, query_measure, candidate, metric.metric),
-    };
+    return vec.distanceToQuery(query, query_measure, candidate, metric.metric);
 }
 
 pub fn exactDistancesToStoredVectors(
@@ -232,9 +226,34 @@ pub fn exactDistancesToStoredVectors(
                 return;
             }
             vec.batchDot(query, candidates, distances);
-            for (distances[0..candidates.len]) |*distance| {
-                distance.* = 1.0 - (distance.* / query_measure);
+            for (distances[0..candidates.len], candidates[0..candidates.len]) |*distance, candidate| {
+                const candidate_norm = vec.norm(candidate);
+                distance.* = if (candidate_norm == 0.0) 1.0 else 1.0 - (distance.* / (query_measure * candidate_norm));
             }
         },
     }
+}
+
+test "exact cosine distance includes candidate norm" {
+    const metric = types.HBCConfig{ .dims = 2, .metric = .cosine };
+    const query = [_]f32{ 1.0, 0.0 };
+    const same_direction_large = [_]f32{ 10.0, 0.0 };
+    const orthogonal = [_]f32{ 0.0, 2.0 };
+    const query_measure = vec.norm(&query);
+
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 0.0),
+        exactDistanceToStoredVector(metric, &query, query_measure, &same_direction_large),
+        1e-6,
+    );
+    try std.testing.expectApproxEqAbs(
+        @as(f32, 1.0),
+        exactDistanceToStoredVector(metric, &query, query_measure, &orthogonal),
+        1e-6,
+    );
+
+    var distances: [2]f32 = undefined;
+    exactDistancesToStoredVectors(metric, &query, query_measure, &.{ &same_direction_large, &orthogonal }, &distances);
+    try std.testing.expectApproxEqAbs(@as(f32, 0.0), distances[0], 1e-6);
+    try std.testing.expectApproxEqAbs(@as(f32, 1.0), distances[1], 1e-6);
 }

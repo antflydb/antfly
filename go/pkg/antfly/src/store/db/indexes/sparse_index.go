@@ -599,7 +599,7 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 
 		if e != nil {
 			if syncIndex {
-				// SyncLevelAknn should have all enrichments pre-computed in
+				// SyncLevelFullIndex should have all enrichments pre-computed in
 				// preEnrichBatch() before the Raft proposal. If we still have
 				// promptKeys here with sync=true, it means enrichments weren't
 				// pre-computed for some reason.
@@ -610,7 +610,7 @@ func (si *SparseIndex) Batch(ctx context.Context, writes [][2][]byte, deletes []
 				// 3. But we're already inside a Raft apply, so the new proposal deadlocks
 				//
 				// Enqueue to async enricher so embeddings eventually get generated
-				si.logger.Error("SyncLevelAknn used but sparse enrichments not pre-computed",
+				si.logger.Error("SyncLevelFullIndex used but sparse enrichments not pre-computed",
 					zap.Int("numKeys", len(promptKeys)),
 					zap.String("index", si.name),
 				)
@@ -1170,7 +1170,7 @@ func (si *SparseIndex) GeneratePrompts(
 }
 
 // ComputeEnrichments generates sparse embeddings synchronously and returns the writes.
-// This is called by preEnrichBatch() before Raft proposal for SyncLevelEnrichments/SyncLevelAknn.
+// This is called by preEnrichBatch() before Raft proposal for SyncLevelEnrichments/SyncLevelFullIndex.
 // Returns sparse embedding writes without persisting (caller includes them in the Raft batch).
 // When a pipeline enricher is configured, delegates to it for full pipeline pre-enrichment.
 func (si *SparseIndex) ComputeEnrichments(

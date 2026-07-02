@@ -428,6 +428,8 @@ pub fn flashAttentionHost(
                     bh_idx * seq_sq
                 else if (bdata.len == bias_shared_len)
                     h * seq_sq
+                else if (bdata.len == seq_sq)
+                    0
                 else
                     null
             else

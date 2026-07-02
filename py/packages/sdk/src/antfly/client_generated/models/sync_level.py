@@ -2,7 +2,6 @@ from enum import Enum
 
 
 class SyncLevel(str, Enum):
-    AKNN = "aknn"
     ENRICHMENTS = "enrichments"
     FULL_INDEX = "full_index"
     FULL_TEXT = "full_text"

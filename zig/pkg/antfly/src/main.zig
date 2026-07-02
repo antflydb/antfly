@@ -64,9 +64,9 @@ pub fn main(init: std.process.Init) !void {
 
     // CLI client subcommands — these talk to a remote Antfly server via HTTP
     const cli_commands = [_][]const u8{
-        "table",  "index",   "query",    "lookup",
-        "load",   "insert",  "delete",   "agents",
-        "backup", "restore", "internal",
+        "table",  "index",  "artifact", "query",
+        "lookup", "load",   "insert",   "delete",
+        "agents", "backup", "restore",  "internal",
     };
     for (cli_commands) |cli_cmd| {
         if (std.mem.eql(u8, subcommand, cli_cmd)) {
@@ -151,6 +151,7 @@ fn runCliCommand(allocator: std.mem.Allocator, subcommand: []const u8, args: *st
     // Dispatch to the specific command
     if (std.mem.eql(u8, subcommand, "table")) return cmd.cli.table.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "index")) return cmd.cli.index.run(allocator, io, &client, args);
+    if (std.mem.eql(u8, subcommand, "artifact")) return cmd.cli.artifact.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "query")) return cmd.cli.query.run(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "lookup")) return cmd.cli.query.lookup(allocator, io, &client, args);
     if (std.mem.eql(u8, subcommand, "load")) return cmd.cli.data.load(allocator, io, &client, args);
@@ -179,6 +180,7 @@ fn printUsage(argv0: []const u8) void {
         \\client subcommands:
         \\  table          Manage tables (create, drop, list, get)
         \\  index          Manage indexes (create, drop, list, get)
+        \\  artifact       Manage generated artifact enrichments and reprocessing
         \\  query          Query data from a table
         \\  lookup         Look up a document by key
         \\  load           Bulk load data from NDJSON file

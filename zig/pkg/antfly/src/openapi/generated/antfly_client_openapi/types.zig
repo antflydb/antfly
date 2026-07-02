@@ -503,13 +503,12 @@ pub const SecretWriteRequest = struct {
 
 pub const ByteRange = []const []const u8;
 
-/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "aknn": Wait for vector index write with best-effort synchronous embedding (falls back to async on timeout, slowest, most durable) - "full_index": Wait for all index writes to complete (full-text + enrichments + aknn)
+/// Synchronization level for batch operations: - "propose": Wait for Raft proposal acceptance (fastest, default) - "write": Wait for Pebble KV write - "full_text": Wait for full-text index WAL write - "enrichments": Pre-compute enrichments before Raft proposal (synchronous enrichment generation) - "full_index": Wait for all index writes to complete (full-text + enrichments + vector indexes)
 pub const SyncLevel = enum {
     propose,
     write,
     full_text,
     enrichments,
-    aknn,
     full_index,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
@@ -518,7 +517,6 @@ pub const SyncLevel = enum {
             .write => "write",
             .full_text => "full_text",
             .enrichments => "enrichments",
-            .aknn => "aknn",
             .full_index => "full_index",
         };
         try jw.write(s);
@@ -534,7 +532,6 @@ pub const SyncLevel = enum {
             .{ "write", .write },
             .{ "full_text", .full_text },
             .{ "enrichments", .enrichments },
-            .{ "aknn", .aknn },
             .{ "full_index", .full_index },
         });
         return map.get(s) orelse error.UnexpectedToken;
@@ -2020,6 +2017,35 @@ pub const RowFilterEntry = struct {
     filter: std.json.ArrayHashMap(std.json.Value),
 };
 
+/// Managed generated artifact kind.
+pub const EnrichmentKind = enum {
+    chunk,
+    asset,
+    embedding,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .chunk => "chunk",
+            .asset => "asset",
+            .embedding => "embedding",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "chunk", .chunk },
+            .{ "asset", .asset },
+            .{ "embedding", .embedding },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
 pub const FullTextIndexConfig = struct {
     /// Whether to use memory-only storage
     mem_only: ?bool = null,
@@ -2518,35 +2544,6 @@ pub const IndexType = enum {
             .{ "embeddings", .embeddings },
             .{ "graph", .graph },
             .{ "algebraic", .algebraic },
-        });
-        return map.get(s) orelse error.UnexpectedToken;
-    }
-};
-
-/// Managed generated artifact kind.
-pub const EnrichmentKind = enum {
-    chunk,
-    asset,
-    embedding,
-
-    pub fn jsonStringify(self: @This(), jw: anytype) !void {
-        const s = switch (self) {
-            .chunk => "chunk",
-            .asset => "asset",
-            .embedding => "embedding",
-        };
-        try jw.write(s);
-    }
-
-    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
-        const s = switch (try source.next()) {
-            .string => |v| v,
-            else => return error.UnexpectedToken,
-        };
-        const map = std.StaticStringMap(@This()).initComptime(.{
-            .{ "chunk", .chunk },
-            .{ "asset", .asset },
-            .{ "embedding", .embedding },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -4802,6 +4799,33 @@ pub const Permission = struct {
     type: PermissionType,
 };
 
+/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
+pub const EnrichmentConfig = struct {
+    /// Stable generated artifact name.
+    name: []const u8,
+    kind: EnrichmentKind,
+    /// Source field to read from the source document or source artifact payload.
+    field: ?[]const u8 = null,
+    /// Optional template for generated text input.
+    template: ?[]const u8 = null,
+    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
+    source_artifact_name: ?[]const u8 = null,
+    /// Expected embedding dimension for embedding enrichments.
+    expected_dims: ?i64 = null,
+    /// Chunk size for chunk enrichments.
+    chunk_size: ?i64 = null,
+    /// Chunk overlap for chunk enrichments.
+    chunk_overlap: ?i64 = null,
+    /// Serialized chunker configuration for chunk enrichments.
+    chunker_json: ?[]const u8 = null,
+    /// When true on a chunk or asset enrichment, route generated text into the table's default full-text index.
+    full_text_index: ?bool = null,
+    /// Produced asset content type for asset enrichments.
+    content_type: ?[]const u8 = null,
+    /// Serialized asset producer configuration.
+    producer_json: ?[]const u8 = null,
+};
+
 /// A unified configuration for an embedding provider. Embedders can be configured with templates to customize how documents are converted to text before embedding. Templates use Handlebars syntax and support various built-in helpers. **Template System:** - **Syntax**: Handlebars templating (https://handlebarsjs.com/guide/) - **Caching**: Templates are automatically cached with configurable TTL (default: 5 minutes) - **Context**: Templates receive the full document as context **Built-in Helpers:** 1. **scrubHtml** - Remove script/style tags and extract clean text from HTML ```handlebars {{scrubHtml html_content}} ``` - Removes `<script>` and `<style>` tags - Adds newlines after block elements (p, div, h1-h6, li, etc.) - Returns plain text with preserved readability 2. **eq** - Equality comparison for conditionals ```handlebars {{#if (eq status "active")}}Active user{{/if}} {{#if (eq @key "special")}}Special field{{/if}} ``` 3. **media** - GenKit dotprompt media directive for multimodal content ```handlebars {{media url=imageDataURI}} {{media url=this.image_url}} {{media url="https://example.com/image.jpg"}} {{media url="s3://endpoint/bucket/image.png"}} {{media url="file:///path/to/image.jpg"}} ``` **Supported URL Schemes:** - `data:` - Base64 encoded data URIs (e.g., `data:image/jpeg;base64,...`) - `http://` / `https://` - Web URLs with automatic content type detection - `file://` - Local filesystem paths - `s3://` - S3-compatible storage (format: `s3://endpoint/bucket/key`) **Automatic Content Processing:** - **Images**: Downloaded, resized (if needed), converted to data URIs - **PDFs**: Text extracted or first page rendered as image - **HTML**: Readable text extracted using Mozilla Readability **Security Controls:** Downloads are protected by content security settings (see Configuration Reference): - Allowed host whitelist - Private IP blocking (prevents SSRF attacks) - Download size limits (default: 100MB) - Download timeouts (default: 30s) - Image dimension limits (default: 2048px, auto-resized) See: https://antfly.io/docs/configuration#security--cors 4. **encodeToon** - Encode data in TOON format (Token-Oriented Object Notation) ```handlebars {{encodeToon this.fields}} {{encodeToon this.fields lengthMarker=false indent=4}} {{encodeToon this.fields delimiter="\t"}} ``` **What is TOON?** TOON is a compact, human-readable format designed for passing structured data to LLMs. It provides **30-60% token reduction** compared to JSON while maintaining high LLM comprehension accuracy. **Key Features:** - Compact syntax using `:` for key-value pairs - Array length markers: `tags[#3]: ai,search,ml` - Tabular format for uniform data structures - Optimized for LLM parsing and understanding - Maintains human readability **Benefits:** - **Lower API costs** - Reduced token usage means lower LLM API costs - **Faster responses** - Less tokens to process - **More context** - Fit more documents within token limits **Options:** - `lengthMarker` (bool): Add # prefix to array counts like `[#3]` (default: true) - `indent` (int): Indentation spacing for nested objects (default: 2) - `delimiter` (string): Field separator for tabular arrays (default: none, use `"\t"` for tabs) **Example output:** ``` title: Introduction to Vector Search author: Jane Doe tags[#3]: ai,search,ml metadata: edition: 2 pages: 450 ``` **Default in RAG:** TOON is the default format for document rendering in RAG queries. **References:** - TOON Specification: https://github.com/toon-format/toon - Go Implementation: https://github.com/alpkeskin/gotoon **Template Examples:** Document with metadata: ```handlebars Title: {{metadata.title}} Date: {{metadata.date}} Tags: {{#each metadata.tags}}{{this}}, {{/each}} {{content}} ``` HTML content extraction: ```handlebars Product: {{name}} Description: {{scrubHtml description_html}} Price: ${{price}} ``` Multimodal with image: ```handlebars Product: {{title}} {{media url=image}} Description: {{description}} ``` Conditional formatting: ```handlebars {{title}} {{#if author}}By: {{author}}{{/if}} {{#if (eq category "premium")}}⭐ Premium Content{{/if}} {{body}} ``` **Environment Variables:** - `GEMINI_API_KEY` - API key for Google AI - `OPENAI_API_KEY` - API key for OpenAI - `OPENAI_BASE_URL` - Base URL for OpenAI-compatible APIs - `OLLAMA_HOST` - Ollama server URL (e.g., http://localhost:11434) **Importing Pre-computed Embeddings:** You can import existing embeddings (from OpenAI, Cohere, or any provider), but only for indexes configured with `external: true`. External indexes accept vectors written directly through the document `_embeddings` field and do not generate prompts from `field` or `template`. **Steps:** 1. Create an embeddings index with `external: true` 2. For dense indexes, set the index `dimension` 3. Write documents with `_embeddings: { "<indexName>": [...<embedding>...] }` **Example:** ```json { "title": "My Document", "content": "Document text...", "_embeddings": { "my_vector_index": [0.1, 0.2, 0.3, ...] } } ``` **Delete Behavior:** - Use `"_embeddings": { "<indexName>": null }` to delete a stored external vector - Omitting `_embeddings[<indexName>]` leaves the existing vector unchanged **Use Cases:** - Migrating from another vector database with existing embeddings - Using embeddings generated by external systems - Importing pre-computed OpenAI, Cohere, or other provider embeddings - Batch processing embeddings offline before ingestion
 pub const EmbedderConfig = struct {
     /// The Google Cloud project ID (optional for Gemini API, required for Vertex AI).
@@ -4882,33 +4906,6 @@ pub const ChunkOptions = struct {
     threshold: ?f32 = null,
     text: ?TextChunkOptions = null,
     audio: ?AudioChunkOptions = null,
-};
-
-/// Inline managed enrichment definition. Enrichments materialize generated artifacts before indexing and may target source rows or previously generated artifact streams.
-pub const EnrichmentConfig = struct {
-    /// Stable generated artifact name.
-    name: []const u8,
-    kind: EnrichmentKind,
-    /// Source field to read from the source document or source artifact payload.
-    field: ?[]const u8 = null,
-    /// Optional template for generated text input.
-    template: ?[]const u8 = null,
-    /// Existing artifact stream this enrichment consumes. Chunk enrichments may consume asset artifacts; embedding enrichments may consume chunk artifacts.
-    source_artifact_name: ?[]const u8 = null,
-    /// Expected embedding dimension for embedding enrichments.
-    expected_dims: ?i64 = null,
-    /// Chunk size for chunk enrichments.
-    chunk_size: ?i64 = null,
-    /// Chunk overlap for chunk enrichments.
-    chunk_overlap: ?i64 = null,
-    /// Serialized chunker configuration for chunk enrichments.
-    chunker_json: ?[]const u8 = null,
-    /// When true on a chunk enrichment, route generated chunk text into the table's default full-text index.
-    full_text_index: ?bool = null,
-    /// Produced asset content type for asset enrichments.
-    content_type: ?[]const u8 = null,
-    /// Serialized asset producer configuration.
-    producer_json: ?[]const u8 = null,
 };
 
 /// Field mapping to apply when a dynamic template matches
@@ -5701,6 +5698,13 @@ pub const CreateApiKeyRequest = struct {
     permissions: ?[]const Permission = null,
     /// Optional per-table row filter. Keys are table names (or '*' for all tables). Values are Antfly query JSON objects. API keys inherit the owner's effective row filters; key-local filters are applied as additional narrowing.
     row_filter: ?std.json.ArrayHashMap(std.json.Value) = null,
+};
+
+/// Table-level generated artifact enrichments configured for a table.
+pub const TableArtifactEnrichmentList = struct {
+    /// Table containing the configured artifact enrichments.
+    table_name: []const u8,
+    artifacts: []const EnrichmentConfig,
 };
 
 pub const QueryBuilderRequest = struct {

@@ -183,7 +183,9 @@ pub const Client = struct {
     /// Store a secret
     /// PUT /db/v1/secrets/{key}
     pub fn putSecret(self: *@This(), key: []const u8, body: types.SecretWriteRequest) !ApiResponse(types.SecretEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/secrets/{s}", .{ self.base_url, key });
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/secrets/{s}", .{ self.base_url, encoded_key });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -194,7 +196,9 @@ pub const Client = struct {
     /// Delete a secret
     /// DELETE /db/v1/secrets/{key}
     pub fn deleteSecret(self: *@This(), key: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/secrets/{s}", .{ self.base_url, key });
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/secrets/{s}", .{ self.base_url, encoded_key });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -268,7 +272,9 @@ pub const Client = struct {
     /// Get transaction session details
     /// GET /db/v1/transactions/{transaction_id}
     pub fn getTransactionSession(self: *@This(), transaction_id: []const u8) !ApiResponse(types.TransactionSessionDetailsResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TransactionSessionDetailsResponse).fromResponse(self.allocator, &resp);
@@ -277,7 +283,9 @@ pub const Client = struct {
     /// Stage a transaction commit request
     /// POST /db/v1/transactions/{transaction_id}/stage
     pub fn stageTransactionSession(self: *@This(), transaction_id: []const u8, body: types.TransactionCommitRequest) !ApiResponse(types.TransactionStatusResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/stage", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/stage", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -288,7 +296,9 @@ pub const Client = struct {
     /// Stage a transaction read version
     /// POST /db/v1/transactions/{transaction_id}/read
     pub fn stageTransactionRead(self: *@This(), transaction_id: []const u8, body: types.TransactionStageReadRequest) !ApiResponse(types.TransactionStageReadResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/read", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/read", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -299,7 +309,9 @@ pub const Client = struct {
     /// Stage a transaction write
     /// POST /db/v1/transactions/{transaction_id}/write
     pub fn stageTransactionWrite(self: *@This(), transaction_id: []const u8, body: types.TransactionStageWriteRequest) !ApiResponse(types.TransactionStatusResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/write", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/write", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -310,7 +322,9 @@ pub const Client = struct {
     /// Stage a transaction delete
     /// POST /db/v1/transactions/{transaction_id}/delete
     pub fn stageTransactionDelete(self: *@This(), transaction_id: []const u8, body: types.TransactionStageDeleteRequest) !ApiResponse(types.TransactionStatusResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/delete", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/delete", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -321,7 +335,9 @@ pub const Client = struct {
     /// Create a transaction savepoint
     /// POST /db/v1/transactions/{transaction_id}/savepoints
     pub fn createTransactionSavepoint(self: *@This(), transaction_id: []const u8) !ApiResponse(types.TransactionSavepointResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/savepoints", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/savepoints", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TransactionSavepointResponse).fromResponse(self.allocator, &resp);
@@ -330,7 +346,11 @@ pub const Client = struct {
     /// Roll back a transaction session to a savepoint
     /// POST /db/v1/transactions/{transaction_id}/savepoints/{savepoint_id}/rollback
     pub fn rollbackTransactionSavepoint(self: *@This(), transaction_id: []const u8, savepoint_id: []const u8) !ApiResponse(types.TransactionSavepointResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/savepoints/{s}/rollback", .{ self.base_url, transaction_id, savepoint_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const encoded_savepoint_id = try httpx.PercentEncoding.encode(self.allocator, savepoint_id);
+        defer self.allocator.free(encoded_savepoint_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/savepoints/{s}/rollback", .{ self.base_url, encoded_transaction_id, encoded_savepoint_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TransactionSavepointResponse).fromResponse(self.allocator, &resp);
@@ -339,7 +359,9 @@ pub const Client = struct {
     /// Commit a transaction session
     /// POST /db/v1/transactions/{transaction_id}/commit
     pub fn commitTransactionSession(self: *@This(), transaction_id: []const u8, body: types.TransactionCommitRequest) !ApiResponse(types.TransactionSessionCommitResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/commit", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/commit", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -350,7 +372,9 @@ pub const Client = struct {
     /// Abort a transaction session
     /// POST /db/v1/transactions/{transaction_id}/abort
     pub fn abortTransactionSession(self: *@This(), transaction_id: []const u8) !ApiResponse(types.TransactionStatusResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/abort", .{ self.base_url, transaction_id });
+        const encoded_transaction_id = try httpx.PercentEncoding.encode(self.allocator, transaction_id);
+        defer self.allocator.free(encoded_transaction_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/transactions/{s}/abort", .{ self.base_url, encoded_transaction_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TransactionStatusResponse).fromResponse(self.allocator, &resp);
@@ -476,7 +500,9 @@ pub const Client = struct {
     /// Get table details
     /// GET /db/v1/tables/{tableName}
     pub fn getTable(self: *@This(), table_name: []const u8) !ApiResponse(types.TableStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.TableStatus).fromResponse(self.allocator, &resp);
@@ -485,7 +511,9 @@ pub const Client = struct {
     /// Create a new table
     /// POST /db/v1/tables/{tableName}
     pub fn createTable(self: *@This(), table_name: []const u8, body: types.CreateTableRequest) !ApiResponse(types.Table) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -496,7 +524,9 @@ pub const Client = struct {
     /// Drop a table
     /// DELETE /db/v1/tables/{tableName}
     pub fn dropTable(self: *@This(), table_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -505,7 +535,9 @@ pub const Client = struct {
     /// Query a specific table
     /// POST /db/v1/tables/{tableName}/query
     pub fn queryTable(self: *@This(), table_name: []const u8, body: types.QueryRequest) !ApiResponse(types.QueryResponses) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/query", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/query", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -516,7 +548,9 @@ pub const Client = struct {
     /// Perform batch inserts and deletes on a table
     /// POST /db/v1/tables/{tableName}/batch
     pub fn batchWrite(self: *@This(), table_name: []const u8, body: types.BatchRequest) !ApiResponse(types.BatchResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/batch", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/batch", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -527,7 +561,9 @@ pub const Client = struct {
     /// Synchronize data from external sources (Shopify, Postgres, S3) using a linear merge
     /// POST /db/v1/tables/{tableName}/merge
     pub fn linearMerge(self: *@This(), table_name: []const u8, body: types.LinearMergeRequest) !ApiResponse(types.LinearMergeResult) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/merge", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/merge", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -538,7 +574,9 @@ pub const Client = struct {
     /// Backup a table
     /// POST /db/v1/tables/{tableName}/backup
     pub fn backupTable(self: *@This(), table_name: []const u8, body: types.BackupRequest) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/backup", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/backup", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -549,7 +587,9 @@ pub const Client = struct {
     /// Restore a table from backup
     /// POST /db/v1/tables/{tableName}/restore
     pub fn restoreTable(self: *@This(), table_name: []const u8, body: types.RestoreRequest) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/restore", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/restore", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -560,7 +600,9 @@ pub const Client = struct {
     /// Update a table's schema
     /// PUT /db/v1/tables/{tableName}/schema
     pub fn updateSchema(self: *@This(), table_name: []const u8, body: types.TableSchema) !ApiResponse(types.Table) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/schema", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -571,7 +613,9 @@ pub const Client = struct {
     /// Scan keys in a table within a key range
     /// POST /db/v1/tables/{tableName}/lookup
     pub fn scanKeys(self: *@This(), table_name: []const u8, body: types.ScanKeysRequest) !RawResponse {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lookup", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/lookup", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -583,7 +627,11 @@ pub const Client = struct {
     /// Retrieve a document by key
     /// GET /db/v1/tables/{tableName}/documents/{key}
     pub fn lookupKey(self: *@This(), table_name: []const u8, key: []const u8, params: LookupKeyParams) !ApiResponse(std.json.Value) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}", .{ self.base_url, table_name, key });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}", .{ self.base_url, encoded_table_name, encoded_key });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -612,7 +660,11 @@ pub const Client = struct {
     /// List derived document artifact manifests
     /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts
     pub fn listDocumentArtifactManifests(self: *@This(), table_name: []const u8, key: []const u8, params: ListDocumentArtifactManifestsParams) !ApiResponse(types.DocumentArtifactManifestList) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts", .{ self.base_url, table_name, key });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts", .{ self.base_url, encoded_table_name, encoded_key });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -632,10 +684,25 @@ pub const Client = struct {
         return ApiResponse(types.DocumentArtifactManifestList).fromResponse(self.allocator, &resp);
     }
 
+    /// List table artifact enrichments
+    /// GET /db/v1/tables/{tableName}/artifacts
+    pub fn listArtifactEnrichments(self: *@This(), table_name: []const u8) !ApiResponse(types.TableArtifactEnrichmentList) {
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts", .{ self.base_url, encoded_table_name });
+        defer self.allocator.free(url);
+        var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
+        return ApiResponse(types.TableArtifactEnrichmentList).fromResponse(self.allocator, &resp);
+    }
+
     /// Reprocess a derived document artifact across a table range
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifactRange(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactTableReprocessRequest) !ApiResponse(types.DocumentArtifactTableReprocessResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess", .{ self.base_url, table_name, artifact_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -646,7 +713,11 @@ pub const Client = struct {
     /// Register or replace an artifact enrichment
     /// PUT /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment
     pub fn putArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.EnrichmentConfig) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/enrichment", .{ self.base_url, table_name, artifact_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/enrichment", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -657,7 +728,11 @@ pub const Client = struct {
     /// Delete an artifact enrichment
     /// DELETE /db/v1/tables/{tableName}/artifacts/{artifactName}/enrichment
     pub fn deleteArtifactEnrichment(self: *@This(), table_name: []const u8, artifact_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/enrichment", .{ self.base_url, table_name, artifact_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/enrichment", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -666,7 +741,11 @@ pub const Client = struct {
     /// Create a derived document artifact reprocess job
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs
     pub fn startDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, body: types.DocumentArtifactReprocessJobStartRequest) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs", .{ self.base_url, table_name, artifact_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs", .{ self.base_url, encoded_table_name, encoded_artifact_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -677,7 +756,13 @@ pub const Client = struct {
     /// Get derived document artifact reprocess job status
     /// GET /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}
     pub fn getDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}", .{ self.base_url, table_name, artifact_name, job_id });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}", .{ self.base_url, encoded_table_name, encoded_artifact_name, encoded_job_id });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
@@ -686,7 +771,13 @@ pub const Client = struct {
     /// Advance a derived document artifact reprocess job
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/advance
     pub fn advanceDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/advance", .{ self.base_url, table_name, artifact_name, job_id });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/advance", .{ self.base_url, encoded_table_name, encoded_artifact_name, encoded_job_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
@@ -695,7 +786,13 @@ pub const Client = struct {
     /// Cancel a derived document artifact reprocess job
     /// POST /db/v1/tables/{tableName}/artifacts/{artifactName}/reprocess-jobs/{jobId}/cancel
     pub fn cancelDocumentArtifactReprocessJob(self: *@This(), table_name: []const u8, artifact_name: []const u8, job_id: []const u8) !ApiResponse(types.DocumentArtifactReprocessJob) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/cancel", .{ self.base_url, table_name, artifact_name, job_id });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const encoded_job_id = try httpx.PercentEncoding.encode(self.allocator, job_id);
+        defer self.allocator.free(encoded_job_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/artifacts/{s}/reprocess-jobs/{s}/cancel", .{ self.base_url, encoded_table_name, encoded_artifact_name, encoded_job_id });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessJob).fromResponse(self.allocator, &resp);
@@ -704,7 +801,13 @@ pub const Client = struct {
     /// Inspect a derived document artifact manifest
     /// GET /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}
     pub fn getDocumentArtifactManifest(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8, params: GetDocumentArtifactManifestParams) !ApiResponse(types.DocumentArtifactManifest) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}", .{ self.base_url, table_name, key, artifact_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}", .{ self.base_url, encoded_table_name, encoded_key, encoded_artifact_name });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -727,7 +830,13 @@ pub const Client = struct {
     /// Reprocess a derived document artifact
     /// POST /db/v1/tables/{tableName}/documents/{key}/artifacts/{artifactName}/reprocess
     pub fn reprocessDocumentArtifact(self: *@This(), table_name: []const u8, key: []const u8, artifact_name: []const u8) !ApiResponse(types.DocumentArtifactReprocessResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}/reprocess", .{ self.base_url, table_name, key, artifact_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_key = try httpx.PercentEncoding.encode(self.allocator, key);
+        defer self.allocator.free(encoded_key);
+        const encoded_artifact_name = try httpx.PercentEncoding.encode(self.allocator, artifact_name);
+        defer self.allocator.free(encoded_artifact_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/documents/{s}/artifacts/{s}/reprocess", .{ self.base_url, encoded_table_name, encoded_key, encoded_artifact_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.DocumentArtifactReprocessResponse).fromResponse(self.allocator, &resp);
@@ -736,7 +845,9 @@ pub const Client = struct {
     /// List all indexes for a table
     /// GET /db/v1/tables/{tableName}/indexes
     pub fn listIndexes(self: *@This(), table_name: []const u8) !ApiResponse([]const types.IndexStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes", .{ self.base_url, table_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes", .{ self.base_url, encoded_table_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.IndexStatus).fromResponse(self.allocator, &resp);
@@ -745,7 +856,11 @@ pub const Client = struct {
     /// Get index details
     /// GET /db/v1/tables/{tableName}/indexes/{indexName}
     pub fn getIndex(self: *@This(), table_name: []const u8, index_name: []const u8) !ApiResponse(types.IndexStatus) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, table_name, index_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.IndexStatus).fromResponse(self.allocator, &resp);
@@ -754,7 +869,11 @@ pub const Client = struct {
     /// Add an index to a table
     /// POST /db/v1/tables/{tableName}/indexes/{indexName}
     pub fn createIndex(self: *@This(), table_name: []const u8, index_name: []const u8, body: types.IndexConfig) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, table_name, index_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -765,7 +884,11 @@ pub const Client = struct {
     /// Drop an index from a table
     /// DELETE /db/v1/tables/{tableName}/indexes/{indexName}
     pub fn dropIndex(self: *@This(), table_name: []const u8, index_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, table_name, index_name });
+        const encoded_table_name = try httpx.PercentEncoding.encode(self.allocator, table_name);
+        defer self.allocator.free(encoded_table_name);
+        const encoded_index_name = try httpx.PercentEncoding.encode(self.allocator, index_name);
+        defer self.allocator.free(encoded_index_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/db/v1/tables/{s}/indexes/{s}", .{ self.base_url, encoded_table_name, encoded_index_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -792,7 +915,9 @@ pub const Client = struct {
     /// Get user details
     /// GET /auth/v1/users/{userName}
     pub fn getUserByName(self: *@This(), user_name: []const u8) !ApiResponse(types.User) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.User).fromResponse(self.allocator, &resp);
@@ -801,7 +926,9 @@ pub const Client = struct {
     /// Create a new user
     /// POST /auth/v1/users/{userName}
     pub fn createUser(self: *@This(), user_name: []const u8, body: types.CreateUserRequest) !ApiResponse(types.User) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -812,7 +939,9 @@ pub const Client = struct {
     /// Delete a user
     /// DELETE /auth/v1/users/{userName}
     pub fn deleteUser(self: *@This(), user_name: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -821,7 +950,9 @@ pub const Client = struct {
     /// Update user password
     /// PUT /auth/v1/users/{userName}/password
     pub fn updateUserPassword(self: *@This(), user_name: []const u8, body: types.UpdatePasswordRequest) !ApiResponse(types.SuccessMessage) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/password", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/password", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -832,7 +963,9 @@ pub const Client = struct {
     /// Get user permissions
     /// GET /auth/v1/users/{userName}/permissions
     pub fn getUserPermissions(self: *@This(), user_name: []const u8) !ApiResponse([]const types.Permission) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.Permission).fromResponse(self.allocator, &resp);
@@ -841,7 +974,9 @@ pub const Client = struct {
     /// Add permission to user
     /// POST /auth/v1/users/{userName}/permissions
     pub fn addPermissionToUser(self: *@This(), user_name: []const u8, body: types.Permission) !ApiResponse(types.SuccessMessage) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -852,7 +987,9 @@ pub const Client = struct {
     /// Remove permission from user
     /// DELETE /auth/v1/users/{userName}/permissions
     pub fn removePermissionFromUser(self: *@This(), user_name: []const u8, params: RemovePermissionFromUserParams) !ApiResponse(std.json.Value) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/permissions", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -877,7 +1014,9 @@ pub const Client = struct {
     /// List row filters for a user
     /// GET /auth/v1/users/{userName}/row-filters
     pub fn listRowFilters(self: *@This(), user_name: []const u8) !ApiResponse([]const types.RowFilterEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.RowFilterEntry).fromResponse(self.allocator, &resp);
@@ -886,7 +1025,9 @@ pub const Client = struct {
     /// List user roles
     /// GET /auth/v1/users/{userName}/roles
     pub fn listUserRoles(self: *@This(), user_name: []const u8) !ApiResponse([]const []const u8) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const []const u8).fromResponse(self.allocator, &resp);
@@ -895,7 +1036,9 @@ pub const Client = struct {
     /// Add role to user
     /// POST /auth/v1/users/{userName}/roles
     pub fn addRoleToUser(self: *@This(), user_name: []const u8, body: types.RoleAssignment) !ApiResponse(types.SuccessMessage) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -906,7 +1049,9 @@ pub const Client = struct {
     /// Remove role from user
     /// DELETE /auth/v1/users/{userName}/roles
     pub fn removeRoleFromUser(self: *@This(), user_name: []const u8, params: RemoveRoleFromUserParams) !ApiResponse(std.json.Value) {
-        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        var url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/roles", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var query_buf = std.ArrayListUnmanaged(u8).empty;
         defer query_buf.deinit(self.allocator);
@@ -936,7 +1081,9 @@ pub const Client = struct {
     /// List row filters for an auth subject
     /// GET /auth/v1/subjects/{subject}/row-filters
     pub fn listSubjectRowFilters(self: *@This(), subject: []const u8) !ApiResponse([]const types.RowFilterEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters", .{ self.base_url, subject });
+        const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
+        defer self.allocator.free(encoded_subject);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters", .{ self.base_url, encoded_subject });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.RowFilterEntry).fromResponse(self.allocator, &resp);
@@ -945,7 +1092,11 @@ pub const Client = struct {
     /// Get row filter for an auth subject on a table
     /// GET /auth/v1/subjects/{subject}/row-filters/{table}
     pub fn getSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8) !ApiResponse(types.RowFilterEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, subject, table });
+        const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
+        defer self.allocator.free(encoded_subject);
+        const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(encoded_table);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.RowFilterEntry).fromResponse(self.allocator, &resp);
@@ -954,7 +1105,11 @@ pub const Client = struct {
     /// Set row filter for an auth subject on a table
     /// PUT /auth/v1/subjects/{subject}/row-filters/{table}
     pub fn setSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8, body: std.json.ArrayHashMap(std.json.Value)) !ApiResponse(types.RowFilterEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, subject, table });
+        const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
+        defer self.allocator.free(encoded_subject);
+        const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(encoded_table);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -965,7 +1120,11 @@ pub const Client = struct {
     /// Remove row filter for an auth subject on a table
     /// DELETE /auth/v1/subjects/{subject}/row-filters/{table}
     pub fn removeSubjectRowFilter(self: *@This(), subject: []const u8, table: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, subject, table });
+        const encoded_subject = try httpx.PercentEncoding.encode(self.allocator, subject);
+        defer self.allocator.free(encoded_subject);
+        const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(encoded_table);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/subjects/{s}/row-filters/{s}", .{ self.base_url, encoded_subject, encoded_table });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -974,7 +1133,11 @@ pub const Client = struct {
     /// Get row filter for a user on a table
     /// GET /auth/v1/users/{userName}/row-filters/{table}
     pub fn getRowFilter(self: *@This(), user_name: []const u8, table: []const u8) !ApiResponse(types.RowFilterEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, user_name, table });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(encoded_table);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.RowFilterEntry).fromResponse(self.allocator, &resp);
@@ -983,7 +1146,11 @@ pub const Client = struct {
     /// Set row filter for a user on a table
     /// PUT /auth/v1/users/{userName}/row-filters/{table}
     pub fn setRowFilter(self: *@This(), user_name: []const u8, table: []const u8, body: std.json.ArrayHashMap(std.json.Value)) !ApiResponse(types.RowFilterEntry) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, user_name, table });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(encoded_table);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -994,7 +1161,11 @@ pub const Client = struct {
     /// Remove row filter for a user on a table
     /// DELETE /auth/v1/users/{userName}/row-filters/{table}
     pub fn removeRowFilter(self: *@This(), user_name: []const u8, table: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, user_name, table });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const encoded_table = try httpx.PercentEncoding.encode(self.allocator, table);
+        defer self.allocator.free(encoded_table);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/row-filters/{s}", .{ self.base_url, encoded_user_name, encoded_table });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -1003,7 +1174,9 @@ pub const Client = struct {
     /// List API keys for a user
     /// GET /auth/v1/users/{userName}/api-keys
     pub fn listApiKeys(self: *@This(), user_name: []const u8) !ApiResponse([]const types.ApiKey) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.ApiKey).fromResponse(self.allocator, &resp);
@@ -1012,7 +1185,9 @@ pub const Client = struct {
     /// Create a new API key
     /// POST /auth/v1/users/{userName}/api-keys
     pub fn createApiKey(self: *@This(), user_name: []const u8, body: types.CreateApiKeyRequest) !ApiResponse(types.ApiKeyWithSecret) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys", .{ self.base_url, user_name });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys", .{ self.base_url, encoded_user_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -1023,7 +1198,11 @@ pub const Client = struct {
     /// Delete an API key
     /// DELETE /auth/v1/users/{userName}/api-keys/{keyId}
     pub fn deleteApiKey(self: *@This(), user_name: []const u8, key_id: []const u8) !ApiResponse(std.json.Value) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys/{s}", .{ self.base_url, user_name, key_id });
+        const encoded_user_name = try httpx.PercentEncoding.encode(self.allocator, user_name);
+        defer self.allocator.free(encoded_user_name);
+        const encoded_key_id = try httpx.PercentEncoding.encode(self.allocator, key_id);
+        defer self.allocator.free(encoded_key_id);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/auth/v1/users/{s}/api-keys/{s}", .{ self.base_url, encoded_user_name, encoded_key_id });
         defer self.allocator.free(url);
         var resp = try self.http.delete(url, .{ .headers = self.authHeaders() });
         return ApiResponse(std.json.Value).fromResponse(self.allocator, &resp);
@@ -1193,7 +1372,9 @@ pub const Client = struct {
     /// Get available package metadata.
     /// GET /extensions/v1/packages/{name}
     pub fn getExtensionPackage(self: *@This(), name: []const u8) !ApiResponse(types.PackageManifest) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.PackageManifest).fromResponse(self.allocator, &resp);
@@ -1202,7 +1383,11 @@ pub const Client = struct {
     /// Get a specific immutable package version.
     /// GET /extensions/v1/packages/{name}/versions/{version}
     pub fn getExtensionPackageVersion(self: *@This(), name: []const u8, version: []const u8) !ApiResponse(types.PackageManifest) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}/versions/{s}", .{ self.base_url, name, version });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const encoded_version = try httpx.PercentEncoding.encode(self.allocator, version);
+        defer self.allocator.free(encoded_version);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/packages/{s}/versions/{s}", .{ self.base_url, encoded_name, encoded_version });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.PackageManifest).fromResponse(self.allocator, &resp);
@@ -1220,7 +1405,9 @@ pub const Client = struct {
     /// Get an installed extension.
     /// GET /extensions/v1/installed/{name}
     pub fn getInstalledExtension(self: *@This(), name: []const u8) !ApiResponse(types.InstalledExtension) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
@@ -1229,7 +1416,9 @@ pub const Client = struct {
     /// Install a package as an extension.
     /// POST /extensions/v1/installed/{name}
     pub fn installExtension(self: *@This(), name: []const u8, body: types.InstallExtensionRequest) !ApiResponse(types.InstalledExtension) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -1240,7 +1429,9 @@ pub const Client = struct {
     /// Update an installed extension.
     /// POST /extensions/v1/installed/{name}/update
     pub fn updateInstalledExtension(self: *@This(), name: []const u8, body: types.UpdateExtensionRequest) !ApiResponse(types.InstalledExtension) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/update", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/update", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -1251,7 +1442,9 @@ pub const Client = struct {
     /// Drop an installed extension.
     /// POST /extensions/v1/installed/{name}/drop
     pub fn dropInstalledExtension(self: *@This(), name: []const u8, body: types.DropExtensionRequest) !ApiResponse(types.DropExtensionResponse) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/drop", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/drop", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);
@@ -1262,7 +1455,9 @@ pub const Client = struct {
     /// List objects owned by an installed extension.
     /// GET /extensions/v1/installed/{name}/objects
     pub fn listInstalledExtensionObjects(self: *@This(), name: []const u8) !ApiResponse([]const types.ExtensionMember) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/objects", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/objects", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         var resp = try self.http.get(url, .{ .headers = self.authHeaders() });
         return ApiResponse([]const types.ExtensionMember).fromResponse(self.allocator, &resp);
@@ -1271,7 +1466,9 @@ pub const Client = struct {
     /// Enable a disabled installed extension.
     /// POST /extensions/v1/installed/{name}/enable
     pub fn enableInstalledExtension(self: *@This(), name: []const u8) !ApiResponse(types.InstalledExtension) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/enable", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/enable", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
@@ -1280,7 +1477,9 @@ pub const Client = struct {
     /// Disable an installed extension without dropping owned state.
     /// POST /extensions/v1/installed/{name}/disable
     pub fn disableInstalledExtension(self: *@This(), name: []const u8) !ApiResponse(types.InstalledExtension) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/disable", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/disable", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         var resp = try self.http.post(url, .{ .headers = self.authHeaders() });
         return ApiResponse(types.InstalledExtension).fromResponse(self.allocator, &resp);
@@ -1289,7 +1488,9 @@ pub const Client = struct {
     /// Replace installed extension configuration.
     /// PUT /extensions/v1/installed/{name}/config
     pub fn configureInstalledExtension(self: *@This(), name: []const u8, body: types.ConfigureExtensionRequest) !ApiResponse(types.InstalledExtension) {
-        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/config", .{ self.base_url, name });
+        const encoded_name = try httpx.PercentEncoding.encode(self.allocator, name);
+        defer self.allocator.free(encoded_name);
+        const url = try std.fmt.allocPrint(self.allocator, "{s}/extensions/v1/installed/{s}/config", .{ self.base_url, encoded_name });
         defer self.allocator.free(url);
         const json_body = try httpx.json.Json.stringify(self.allocator, body);
         defer self.allocator.free(json_body);

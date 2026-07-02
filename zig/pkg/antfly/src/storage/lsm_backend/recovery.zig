@@ -19,9 +19,10 @@ const repository_mod = @import("repository.zig");
 const compaction_mod = @import("compaction.zig");
 const runtime_mod = @import("runtime.zig");
 const storage_io = @import("storage_io.zig");
+const platform = @import("antfly_platform");
 
 fn openDebugLogsEnabled() bool {
-    return std.c.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
+    return platform.env.getenv("ANTFLY_LSM_OPEN_DEBUG") != null;
 }
 
 fn beginOpenPhase(comptime BackendType: type, backend: *BackendType, phase: anytype) u64 {
@@ -39,6 +40,25 @@ fn recordOpenManifestLoaded(comptime BackendType: type, backend: *BackendType, l
 
 fn recordOpenReplayComplete(comptime BackendType: type, backend: *BackendType) void {
     if (@hasDecl(BackendType, "recordOpenReplayComplete")) backend.recordOpenReplayComplete();
+}
+
+fn cleanupRecoveredRunFiles(comptime BackendType: type, backend: *BackendType, stage: []const u8, before_wal_replay: bool) void {
+    if (!@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) return;
+
+    const phase_start = beginOpenPhase(BackendType, backend, .cleaning_recovered_run_temps);
+    defer finishOpenPhase(BackendType, backend, .cleaning_recovered_run_temps, phase_start);
+
+    const stats = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
+        std.log.warn("lsm backend open skipped recovered run cleanup root={?s} stage={s} err={}", .{ backend.root_dir, stage, err });
+        return;
+    };
+    if (@hasDecl(BackendType, "recordRecoveredRunFileCleanup")) backend.recordRecoveredRunFileCleanup(stats, before_wal_replay);
+    if (stats.files_deleted > 0) {
+        std.log.warn(
+            "lsm backend open recovered run cleanup complete root={s} stage={s} files_deleted={d} bytes_deleted={d}",
+            .{ backend.root_dir.?, stage, stats.files_deleted, stats.bytes_deleted },
+        );
+    }
 }
 
 fn finishOpenSuccess(comptime BackendType: type, backend: *BackendType) void {
@@ -91,6 +111,18 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
     }
     errdefer cleanup(BackendType, backend, false);
     errdefer finishOpenFailure(BackendType, backend);
+
+    if (@hasDecl(BackendType, "acquireRootLockState")) {
+        try backend.acquireRootLockState(options.create_if_missing);
+    }
+    if (@hasDecl(BackendType, "acquireRootWriterLock")) {
+        try backend.acquireRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "prepareWalOperationLockFile")) {
+        try backend.prepareWalOperationLockFile();
+    }
+
+    cleanupRecoveredRunFiles(BackendType, backend, "before_manifest", true);
 
     const loaded_manifest = blk: {
         const phase_start = beginOpenPhase(BackendType, backend, .opening_manifest);
@@ -150,11 +182,7 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
         compaction_mod.sortRuns(backend.runs.items);
         if (@hasDecl(BackendType, "registerOpenManifestRunRefs")) try backend.registerOpenManifestRunRefs();
     }
-    if (@hasDecl(BackendType, "cleanupRecoveredRunFilesForManifest")) {
-        _ = backend.cleanupRecoveredRunFilesForManifest() catch |err| {
-            std.log.warn("lsm backend open skipped recovered run cleanup root={?s} err={}", .{ backend.root_dir, err });
-        };
-    }
+    cleanupRecoveredRunFiles(BackendType, backend, "after_mounting_runs", false);
     if (@hasDecl(BackendType, "refreshMaintenanceDebtHint")) {
         backend.refreshMaintenanceDebtHint();
     }
@@ -169,6 +197,10 @@ pub fn openInto(comptime BackendType: type, backend: *BackendType, allocator: Al
 
 pub fn close(comptime BackendType: type, backend: *BackendType) void {
     cleanup(BackendType, backend, true);
+}
+
+pub fn abandon(comptime BackendType: type, backend: *BackendType) void {
+    cleanup(BackendType, backend, false);
 }
 
 fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred: bool) void {
@@ -257,6 +289,15 @@ fn cleanup(comptime BackendType: type, backend: *BackendType, finalize_deferred:
     }
     if (@hasField(BackendType, "manifest_backing")) {
         if (backend.manifest_backing) |raw| backend.allocator.free(raw);
+    }
+    if (@hasDecl(BackendType, "releaseRootWriterLock")) {
+        backend.releaseRootWriterLock();
+    }
+    if (@hasDecl(BackendType, "closeWalOperationLockFile")) {
+        backend.closeWalOperationLockFile();
+    }
+    if (@hasDecl(BackendType, "releaseRootLockState")) {
+        backend.releaseRootLockState();
     }
     if (@hasField(BackendType, "storage_owner")) {
         if (backend.storage_owner) |owned| {

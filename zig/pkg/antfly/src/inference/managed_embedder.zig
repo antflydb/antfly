@@ -147,6 +147,7 @@ pub const InitOptions = struct {
     antfly_provider: ?AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     remote_content: ?*const scraping.RemoteContentConfig = null,
+    inference_api_url: ?[]const u8 = null,
     inference_api_key: ?[]const u8 = null,
 };
 
@@ -161,7 +162,7 @@ pub const QueryTemplateError = error{
 };
 
 const default_pacing_burst: u32 = 1;
-const pacing_safety_margin_ns: u64 = 5 * std.time.ns_per_ms;
+const pacing_safety_margin_ns: u64 = 50 * std.time.ns_per_ms;
 const dimension_probe_text = "antfly embedding dimension probe";
 
 fn monotonicNowNs() u64 {
@@ -222,12 +223,8 @@ const RequestPacer = struct {
 
     fn acquire(self: *RequestPacer) void {
         if (self.capacity <= 1.0) {
-            lockAtomic(&self.mutex);
-            const now_ns = monotonicNowNs();
-            const scheduled_ns = @max(now_ns, self.next_send_ns);
-            self.next_send_ns = (scheduled_ns +| self.interval_ns) +| pacing_safety_margin_ns;
-            self.mutex.unlock();
-            if (scheduled_ns > now_ns) sleepNs(scheduled_ns - now_ns);
+            self.beginSerialRequest();
+            self.endSerialRequest();
             return;
         }
 
@@ -250,6 +247,23 @@ const RequestPacer = struct {
             self.mutex.unlock();
             sleepNs(wait_ns);
         }
+    }
+
+    fn beginSerialRequest(self: *RequestPacer) void {
+        lockAtomic(&self.mutex);
+        while (true) {
+            const now_ns = monotonicNowNs();
+            if (now_ns >= self.next_send_ns) return;
+            const wait_ns = self.next_send_ns - now_ns;
+            self.mutex.unlock();
+            sleepNs(wait_ns);
+            lockAtomic(&self.mutex);
+        }
+    }
+
+    fn endSerialRequest(self: *RequestPacer) void {
+        self.next_send_ns = monotonicNowNs() +| self.interval_ns +| pacing_safety_margin_ns;
+        self.mutex.unlock();
     }
 };
 
@@ -432,6 +446,25 @@ fn attachRequestPacers(
         });
         entry.pacer = pacer;
     }
+}
+
+fn attachRequestPacerToEntry(
+    alloc: std.mem.Allocator,
+    entry: *ManagedEmbeddingEntry,
+) !?[]u8 {
+    if (entry.requests_per_minute == 0) return null;
+    const scope_key = try requestPacerScopeKeyAlloc(alloc, entry);
+    errdefer alloc.free(scope_key);
+    const pacer = try acquireSharedRequestPacer(scope_key, entry.requests_per_minute, entry.burst);
+    errdefer releaseSharedRequestPacer(scope_key);
+    entry.pacer = pacer;
+    return scope_key;
+}
+
+fn releaseEntryRequestPacer(alloc: std.mem.Allocator, maybe_scope_key: ?[]u8) void {
+    const scope_key = maybe_scope_key orelse return;
+    releaseSharedRequestPacer(scope_key);
+    alloc.free(scope_key);
 }
 
 fn requestPacerScopeKeyAlloc(alloc: std.mem.Allocator, entry: *const ManagedEmbeddingEntry) ![]u8 {
@@ -715,6 +748,21 @@ pub const ManagedEmbedder = struct {
 fn waitForEntryPacer(entry: *const ManagedEmbeddingEntry) void {
     const pacer = entry.pacer orelse return;
     pacer.acquire();
+}
+
+fn beginEntryPacedRequest(entry: *const ManagedEmbeddingEntry) ?*RequestPacer {
+    const pacer = entry.pacer orelse return null;
+    if (pacer.capacity <= 1.0) {
+        pacer.beginSerialRequest();
+        return pacer;
+    }
+    pacer.acquire();
+    return null;
+}
+
+fn endEntryPacedRequest(serial_pacer: ?*RequestPacer) void {
+    const pacer = serial_pacer orelse return;
+    pacer.endSerialRequest();
 }
 
 pub fn translateEmbeddingsIndexConfigJson(
@@ -1004,6 +1052,7 @@ fn shouldUseAntflyProvider(embedder: embeddings_types.Config, options: InitOptio
         std.heap.page_allocator.free(value);
         return false;
     }
+    if (configuredDefaultAntflyInferenceURL(options) != null) return false;
     return true;
 }
 
@@ -1041,7 +1090,7 @@ fn buildManagedEmbeddingEntry(
         .antfly => if (antfly_provider != null)
             try alloc.dupe(u8, "")
         else
-            try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg),
+            try resolveAntflyInferenceBaseUrl(alloc, embedder_cfg, options),
     };
     errdefer alloc.free(base_url);
     const input_type = if (embedder_cfg.input_type.len > 0) try alloc.dupe(u8, embedder_cfg.input_type) else @constCast("");
@@ -1143,6 +1192,8 @@ fn resolveEmbeddingDimensionsForManagedConfigWithValidation(
         else => return err,
     };
     defer managed.deinit(alloc);
+    const pacer_scope_key = try attachRequestPacerToEntry(alloc, &managed);
+    defer releaseEntryRequestPacer(alloc, pacer_scope_key);
     return try resolveEmbeddingDimensionsForEntryWithValidation(alloc, &managed, declared, validation);
 }
 
@@ -1159,6 +1210,8 @@ fn validateSparseEmbeddingForManagedConfig(
         else => return err,
     };
     defer managed.deinit(alloc);
+    const pacer_scope_key = try attachRequestPacerToEntry(alloc, &managed);
+    defer releaseEntryRequestPacer(alloc, pacer_scope_key);
     try validateSparseEmbeddingForEntry(alloc, &managed);
 }
 
@@ -1726,15 +1779,24 @@ fn resolveOllamaBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Con
     return try appendPathIfMissing(alloc, raw, "/v1");
 }
 
-fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config) ![]u8 {
-    const raw = try resolveConfigString(
-        alloc,
-        if (embedder.url.len > 0) embedder.url else null,
-        "ANTFLY_INFERENCE_URL",
-        "http://localhost:8082",
-    );
+fn resolveAntflyInferenceBaseUrl(alloc: std.mem.Allocator, embedder: embeddings_types.Config, options: InitOptions) ![]u8 {
+    const raw = if (embedder.url.len > 0)
+        try alloc.dupe(u8, embedder.url)
+    else if (resolveOptionalEnv(alloc, "ANTFLY_INFERENCE_URL")) |value|
+        value
+    else if (configuredDefaultAntflyInferenceURL(options)) |value|
+        try alloc.dupe(u8, value)
+    else
+        try alloc.dupe(u8, "http://localhost:8082");
     defer alloc.free(raw);
     return try normalizeAntflyInferenceBaseUrl(alloc, raw);
+}
+
+fn configuredDefaultAntflyInferenceURL(options: InitOptions) ?[]const u8 {
+    const value = options.inference_api_url orelse return null;
+    const trimmed = std.mem.trim(u8, value, " \t\r\n");
+    if (trimmed.len == 0) return null;
+    return trimmed;
 }
 
 fn normalizeAntflyInferenceBaseUrl(alloc: std.mem.Allocator, raw: []const u8) ![]u8 {
@@ -2004,13 +2066,15 @@ fn embedBatchWithOpenAiCompatible(
         headers_buf[1] = .{ .name = "authorization", .value = value };
     }
 
+    const serial_pacer = beginEntryPacedRequest(entry);
+    defer endEntryPacedRequest(serial_pacer);
+
     var request = std.http.Client.request(&client, .POST, uri, .{
         .extra_headers = headers_buf[0..header_count],
     }) catch |err| return err;
     defer request.deinit();
 
     request.transfer_encoding = .{ .content_length = json_body.len };
-    waitForEntryPacer(entry);
     var body_writer = try request.sendBodyUnflushed(&.{});
     try body_writer.writer.writeAll(json_body);
     try body_writer.end();
@@ -3036,7 +3100,7 @@ test "managed embedder routes antfly with api_url to antfly endpoint" {
 
         fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
             try std.testing.expectEqual(http_common.Method.POST, req.method);
-            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/api/embed"));
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ai/v1/embed"));
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"remote-model\"") != null);
             try std.testing.expect(std.mem.indexOf(u8, req.body, "\"input\":[\"alpha concept\"]") != null);
             return .{
@@ -3071,13 +3135,86 @@ test "managed embedder routes antfly with api_url to antfly endpoint" {
     var managed = try ManagedEmbedder.initFromIndexesJsonWithAntflyProvider(std.testing.allocator, indexes_json, provider);
     defer managed.deinit();
 
-    const expected_base_url = try std.fmt.allocPrint(std.testing.allocator, "{s}/api", .{base_uri});
+    const expected_base_url = try std.fmt.allocPrint(std.testing.allocator, "{s}/ai/v1", .{base_uri});
     defer std.testing.allocator.free(expected_base_url);
     try std.testing.expectEqualStrings(expected_base_url, managed.entries[0].base_url);
 
     const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
     defer std.testing.allocator.free(vector);
     try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+}
+
+pub fn testConfiguredInferenceAPIURLPrecedence() !void {
+    const Local = struct {
+        fn dense(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) ![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn sparse(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const []const u8) ![]db_embedder.SparseEmbedding {
+            return try alloc.alloc(db_embedder.SparseEmbedding, 0);
+        }
+    };
+
+    const FakeApp = struct {
+        fn executor() http_common.RequestExecutor {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute = execute,
+                },
+            };
+        }
+
+        fn execute(_: *anyopaque, alloc: std.mem.Allocator, req: http_common.HttpRequest) !http_common.HttpResponse {
+            try std.testing.expectEqual(http_common.Method.POST, req.method);
+            try std.testing.expect(std.mem.endsWith(u8, req.uri, "/ai/v1/embed"));
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"model\":\"remote-model\"") != null);
+            try std.testing.expect(std.mem.indexOf(u8, req.body, "\"input\":[\"alpha concept\"]") != null);
+            return .{
+                .status = 200,
+                .content_type = try alloc.dupe(u8, "application/json"),
+                .body = try alloc.dupe(u8,
+                    \\{"data":[{"embedding":[0.125,0.25,0.5]}]}
+                ),
+            };
+        }
+    };
+
+    var listener = std_http_listener.StdHttpListener.init(std.testing.allocator, .{}, FakeApp.executor());
+    defer listener.deinit();
+    try listener.start();
+
+    const base_uri = try listener.baseUri(std.testing.allocator);
+    defer std.testing.allocator.free(base_uri);
+
+    var local = Local{};
+    const provider = AntflyProvider{
+        .ptr = &local,
+        .embed_dense_texts = Local.dense,
+        .embed_sparse_texts = Local.sparse,
+    };
+
+    const indexes_json =
+        \\{"semantic_idx":{"type":"embeddings","field":"body","dimension":3,"embedder":{"provider":"antfly","model":"remote-model"}}}
+    ;
+
+    var managed = try ManagedEmbedder.initFromIndexesJsonWithOptions(std.testing.allocator, indexes_json, .{
+        .antfly_provider = provider,
+        .inference_api_url = base_uri,
+    });
+    defer managed.deinit();
+
+    const expected_base_url = try std.fmt.allocPrint(std.testing.allocator, "{s}/ai/v1", .{base_uri});
+    defer std.testing.allocator.free(expected_base_url);
+    try std.testing.expectEqualStrings(expected_base_url, managed.entries[0].base_url);
+
+    const vector = try managed.embedQuery(std.testing.allocator, "semantic_idx", "alpha concept");
+    defer std.testing.allocator.free(vector);
+    try std.testing.expectEqualSlices(f32, &.{ 0.125, 0.25, 0.5 }, vector);
+}
+
+test "managed embedder routes antfly with configured inference api url to antfly endpoint" {
+    try testConfiguredInferenceAPIURLPrecedence();
 }
 
 test "managed embedder sends antfly media parts when local provider is configured" {

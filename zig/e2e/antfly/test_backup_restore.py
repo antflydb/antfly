@@ -404,14 +404,11 @@ class MultiMetadataBackupCluster:
 
         return wait_until(current_leader, timeout_s=timeout_s, interval_s=0.25)
 
-    def metadata_follower_public_url(self) -> str:
+    def metadata_leader_public_url(self) -> str:
         leader_index = self.metadata_leader_index(timeout_s=10.0)
         if leader_index is None:
             raise AssertionError(f"metadata leader unavailable\n{self.debug_logs()}")
-        for index, url in enumerate(self.metadata_public_urls):
-            if index != leader_index:
-                return url
-        raise AssertionError("metadata cluster has no follower")
+        return self.metadata_public_urls[leader_index]
 
     def stop(self) -> None:
         if self.data_proc is not None and self.data_proc.poll() is None:
@@ -552,8 +549,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         == {}
     )
 
-    ready = backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
-    assert ready is not None
+    backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=30.0, interval_s=0.5)
 
     batch = backup_api.batch_write(
         table_name,
@@ -610,10 +606,7 @@ def test_table_backup_restore_round_trip_managed_chunked_semantic(backup_api, op
         assert restored_doc is not None
         assert restored_doc["title"] == "Alpha backup"
 
-        ready_after_restore = backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=180.0, interval_s=1.0)
-        if ready_after_restore is None:
-            after_status = backup_api.get_index(table_name, "semantic_chunked_idx")
-            raise AssertionError(f"semantic restore index did not become query-ready; status={after_status}")
+        backup_api.wait_index_ready(table_name, "semantic_chunked_idx", timeout_s=180.0, interval_s=1.0)
 
         semantic_after = wait_until(
             lambda: _semantic_top_hit(backup_api, table_name, "alpha concept", "semantic_chunked_idx", "doc:a"),
@@ -727,12 +720,12 @@ def test_cluster_backup_restore_round_trip(backup_api):
             assert restored_doc["title"] == expected_title
 
 
-def test_cluster_backup_through_metadata_follower_public_api(
+def test_cluster_backup_through_metadata_leader_public_api(
     multi_metadata_backup_cluster: MultiMetadataBackupCluster,
 ) -> None:
     cluster = multi_metadata_backup_cluster
-    table_name = f"metadata_follower_backup_{time.time_ns()}"
-    backup_id = f"metadata-follower-backup-{time.time_ns()}"
+    table_name = f"metadata_leader_backup_{time.time_ns()}"
+    backup_id = f"metadata-leader-backup-{time.time_ns()}"
     session = requests.Session()
     session.headers["Content-Type"] = "application/json"
     session.headers["Connection"] = "close"
@@ -740,7 +733,7 @@ def test_cluster_backup_through_metadata_follower_public_api(
     created = _check_response(
         session.post(
             f"{cluster.data_api_url}/tables/{table_name}",
-            json={"num_shards": 1, "description": "metadata follower backup docs"},
+            json={"num_shards": 1, "description": "metadata leader backup docs"},
             timeout=30,
         )
     )
@@ -752,8 +745,8 @@ def test_cluster_backup_through_metadata_follower_public_api(
             json={
                 "inserts": {
                     "doc:1": {
-                        "title": "Follower Backup",
-                        "content": "cluster backup requests can arrive at metadata followers",
+                        "title": "Leader Backup",
+                        "content": "cluster backup requests are routed to metadata leaders",
                     }
                 }
             },
@@ -767,11 +760,11 @@ def test_cluster_backup_through_metadata_follower_public_api(
         interval_s=0.5,
     ), cluster.debug_logs()
 
-    follower_public_url = cluster.metadata_follower_public_url()
-    with tempfile.TemporaryDirectory(prefix="antfly-metadata-follower-cluster-backup-") as backup_dir:
+    leader_public_url = cluster.metadata_leader_public_url()
+    with tempfile.TemporaryDirectory(prefix="antfly-metadata-leader-cluster-backup-") as backup_dir:
         backup = _check_response(
             session.post(
-                f"{follower_public_url}/backup",
+                f"{leader_public_url}/backup",
                 json={
                     "backup_id": backup_id,
                     "location": f"file://{backup_dir}",

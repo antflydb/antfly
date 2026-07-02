@@ -14,9 +14,14 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
+	"sigs.k8s.io/controller-runtime/pkg/event"
+	"sigs.k8s.io/controller-runtime/pkg/handler"
 	"sigs.k8s.io/controller-runtime/pkg/log"
+	"sigs.k8s.io/controller-runtime/pkg/predicate"
+	"sigs.k8s.io/controller-runtime/pkg/reconcile"
 
 	antflyv1 "github.com/antflydb/antfly/go/pkg/operator/api/antfly/v1"
 )
@@ -51,10 +56,13 @@ func (r *AntflyBackupReconciler) Reconcile(ctx context.Context, req ctrl.Request
 	}
 
 	// If already Failed and the spec hasn't changed since we last observed it,
-	// skip reconciliation. If the user edits the spec (bumping Generation),
-	// re-run validation to allow recovery without delete/recreate.
+	// skip reconciliation for terminal schedule/spec failures. If the user edits
+	// the spec (bumping Generation), re-run validation to allow recovery without
+	// delete/recreate. Backup job failures are execution history, not terminal
+	// schedule failures, so they must keep reconciling as later jobs complete.
 	if backup.Status.Phase == antflyv1.BackupPhaseFailed &&
-		backup.Status.ObservedGeneration >= backup.Generation {
+		backup.Status.ObservedGeneration >= backup.Generation &&
+		hasTerminalBackupFailureCondition(backup) {
 		return ctrl.Result{}, nil
 	}
 
@@ -311,36 +319,147 @@ func (r *AntflyBackupReconciler) updateBackupHistory(ctx context.Context, backup
 		return err
 	}
 
-	// Find the most recent successful job
+	// Find the most recent successful and failed jobs.
 	var lastSuccessfulJob *batchv1.Job
+	var lastFailedJob *batchv1.Job
 	for i := range jobList.Items {
 		job := &jobList.Items[i]
 		if isJobSuccessful(job) {
-			if lastSuccessfulJob == nil || job.Status.CompletionTime.After(lastSuccessfulJob.Status.CompletionTime.Time) {
+			if lastSuccessfulJob == nil || jobFinishedAt(job).After(jobFinishedAt(lastSuccessfulJob).Time) {
 				lastSuccessfulJob = job
+			}
+			continue
+		}
+		if isJobFailed(job) {
+			if lastFailedJob == nil || jobFinishedAt(job).After(jobFinishedAt(lastFailedJob).Time) {
+				lastFailedJob = job
 			}
 		}
 	}
 
 	// Update last successful backup if found
 	if lastSuccessfulJob != nil {
-		backup.Status.LastSuccessfulBackup = &antflyv1.BackupRecord{
-			BackupID:       lastSuccessfulJob.Name,
-			StartTime:      *lastSuccessfulJob.Status.StartTime,
-			CompletionTime: lastSuccessfulJob.Status.CompletionTime,
-			Status:         "Completed",
-			Tables:         backup.Spec.Tables,
+		backup.Status.LastSuccessfulBackup = backupRecordFromJob(lastSuccessfulJob, "Completed", backup.Spec.Tables)
+	}
+	if lastFailedJob != nil {
+		backup.Status.LastFailedBackup = backupRecordFromJob(lastFailedJob, "Failed", backup.Spec.Tables)
+		backup.Status.LastFailedBackup.Error = jobFailureMessage(lastFailedJob)
+	}
+
+	latestJob := newerJob(lastSuccessfulJob, lastFailedJob)
+	if latestJob != nil {
+		finished := jobFinishedAt(latestJob)
+		backup.Status.LastScheduledTime = &finished
+	}
+
+	if latestJob != nil {
+		if isJobFailed(latestJob) {
+			backup.Status.LastFailedBackup = backupRecordFromJob(latestJob, "Failed", backup.Spec.Tables)
+			backup.Status.LastFailedBackup.Error = jobFailureMessage(latestJob)
+			r.setCondition(backup, metav1.Condition{
+				Type:               antflyv1.TypeBackupRunHealthy,
+				Status:             metav1.ConditionFalse,
+				Reason:             antflyv1.ReasonBackupJobFailed,
+				Message:            fmt.Sprintf("Latest backup job %q failed: %s", latestJob.Name, jobFailureMessage(latestJob)),
+				LastTransitionTime: metav1.Now(),
+			})
+		} else if isJobSuccessful(latestJob) {
+			r.setCondition(backup, metav1.Condition{
+				Type:               antflyv1.TypeBackupRunHealthy,
+				Status:             metav1.ConditionTrue,
+				Reason:             antflyv1.ReasonBackupJobSucceeded,
+				Message:            fmt.Sprintf("Latest backup job %q completed successfully", latestJob.Name),
+				LastTransitionTime: metav1.Now(),
+			})
 		}
-		backup.Status.LastScheduledTime = lastSuccessfulJob.Status.CompletionTime
 	}
 
 	return nil
+}
+
+func newerJob(left, right *batchv1.Job) *batchv1.Job {
+	if left == nil {
+		return right
+	}
+	if right == nil {
+		return left
+	}
+	if jobFinishedAt(right).After(jobFinishedAt(left).Time) {
+		return right
+	}
+	return left
+}
+
+func backupRecordFromJob(job *batchv1.Job, status string, tables []string) *antflyv1.BackupRecord {
+	startTime := job.CreationTimestamp
+	if job.Status.StartTime != nil {
+		startTime = *job.Status.StartTime
+	}
+	completionTime := jobFinishedAt(job)
+	return &antflyv1.BackupRecord{
+		BackupID:       job.Name,
+		StartTime:      startTime,
+		CompletionTime: &completionTime,
+		Status:         status,
+		Tables:         tables,
+	}
+}
+
+func jobFinishedAt(job *batchv1.Job) metav1.Time {
+	if job.Status.CompletionTime != nil {
+		return *job.Status.CompletionTime
+	}
+	for _, condition := range job.Status.Conditions {
+		if (condition.Type == batchv1.JobComplete || condition.Type == batchv1.JobFailed || condition.Type == batchv1.JobFailureTarget) && condition.Status == corev1.ConditionTrue {
+			return condition.LastTransitionTime
+		}
+	}
+	if job.Status.StartTime != nil {
+		return *job.Status.StartTime
+	}
+	return job.CreationTimestamp
 }
 
 // isJobSuccessful checks if a job completed successfully
 func isJobSuccessful(job *batchv1.Job) bool {
 	for _, condition := range job.Status.Conditions {
 		if condition.Type == batchv1.JobComplete && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func isJobFailed(job *batchv1.Job) bool {
+	for _, condition := range job.Status.Conditions {
+		if (condition.Type == batchv1.JobFailed || condition.Type == batchv1.JobFailureTarget) && condition.Status == corev1.ConditionTrue {
+			return true
+		}
+	}
+	return false
+}
+
+func jobFailureMessage(job *batchv1.Job) string {
+	for _, condition := range job.Status.Conditions {
+		if (condition.Type == batchv1.JobFailed || condition.Type == batchv1.JobFailureTarget) && condition.Status == corev1.ConditionTrue {
+			if condition.Message != "" {
+				return condition.Message
+			}
+			if condition.Reason != "" {
+				return condition.Reason
+			}
+		}
+	}
+	return "job failed"
+}
+
+func hasTerminalBackupFailureCondition(backup *antflyv1.AntflyBackup) bool {
+	for _, condition := range backup.Status.Conditions {
+		if condition.Type != antflyv1.TypeBackupScheduleReady || condition.Status != metav1.ConditionFalse {
+			continue
+		}
+		switch condition.Reason {
+		case antflyv1.ReasonBackupValidationFailed, antflyv1.ReasonCronJobFailed:
 			return true
 		}
 	}
@@ -387,5 +506,132 @@ func (r *AntflyBackupReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	return ctrl.NewControllerManagedBy(mgr).
 		For(&antflyv1.AntflyBackup{}).
 		Owns(&batchv1.CronJob{}).
+		Watches(
+			&batchv1.Job{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForBackupJob),
+			builder.WithPredicates(backupJobTerminalPredicate()),
+		).
+		Watches(
+			&antflyv1.AntflyCluster{},
+			handler.EnqueueRequestsFromMapFunc(r.requestsForCluster),
+			builder.WithPredicates(backupClusterDependencyChangedPredicate()),
+		).
 		Complete(r)
+}
+
+func backupJobTerminalPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(e event.CreateEvent) bool {
+			job, ok := e.Object.(*batchv1.Job)
+			return ok && isBackupJob(job) && isJobTerminal(job)
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return false
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldJob, oldOK := e.ObjectOld.(*batchv1.Job)
+			newJob, newOK := e.ObjectNew.(*batchv1.Job)
+			if !oldOK || !newOK || !isBackupJob(newJob) {
+				return false
+			}
+			return !sameTerminalJobState(oldJob, newJob) && isJobTerminal(newJob)
+		},
+		GenericFunc: func(e event.GenericEvent) bool {
+			job, ok := e.Object.(*batchv1.Job)
+			return ok && isBackupJob(job) && isJobTerminal(job)
+		},
+	}
+}
+
+func isBackupJob(job *batchv1.Job) bool {
+	if job == nil {
+		return false
+	}
+	return job.Labels["antfly.io/backup"] != ""
+}
+
+func isJobTerminal(job *batchv1.Job) bool {
+	return isJobSuccessful(job) || isJobFailed(job)
+}
+
+func sameTerminalJobState(left, right *batchv1.Job) bool {
+	leftFinished := jobFinishedAt(left)
+	rightFinished := jobFinishedAt(right)
+	return isJobSuccessful(left) == isJobSuccessful(right) &&
+		isJobFailed(left) == isJobFailed(right) &&
+		leftFinished.Equal(&rightFinished)
+}
+
+func backupClusterDependencyChangedPredicate() predicate.Predicate {
+	return predicate.Funcs{
+		CreateFunc: func(event.CreateEvent) bool {
+			return true
+		},
+		DeleteFunc: func(event.DeleteEvent) bool {
+			return true
+		},
+		UpdateFunc: func(e event.UpdateEvent) bool {
+			oldCluster, oldOK := e.ObjectOld.(*antflyv1.AntflyCluster)
+			newCluster, newOK := e.ObjectNew.(*antflyv1.AntflyCluster)
+			if !oldOK || !newOK {
+				return false
+			}
+			return backupClusterDependencyKey(oldCluster) != backupClusterDependencyKey(newCluster)
+		},
+		GenericFunc: func(event.GenericEvent) bool {
+			return true
+		},
+	}
+}
+
+func backupClusterDependencyKey(cluster *antflyv1.AntflyCluster) string {
+	return cluster.Spec.Image
+}
+
+func (r *AntflyBackupReconciler) requestsForBackupJob(_ context.Context, obj client.Object) []reconcile.Request {
+	backupName := obj.GetLabels()["antfly.io/backup"]
+	if backupName == "" {
+		return nil
+	}
+	return []reconcile.Request{{
+		NamespacedName: types.NamespacedName{
+			Name:      backupName,
+			Namespace: obj.GetNamespace(),
+		},
+	}}
+}
+
+func (r *AntflyBackupReconciler) requestsForCluster(ctx context.Context, obj client.Object) []reconcile.Request {
+	cluster, ok := obj.(*antflyv1.AntflyCluster)
+	if !ok {
+		return nil
+	}
+
+	backupList := &antflyv1.AntflyBackupList{}
+	if err := r.List(ctx, backupList); err != nil {
+		log.FromContext(ctx).Error(err, "Failed to list AntflyBackups for AntflyCluster watch",
+			"cluster", cluster.Name,
+			"namespace", cluster.Namespace,
+		)
+		return nil
+	}
+
+	requests := make([]reconcile.Request, 0, len(backupList.Items))
+	for i := range backupList.Items {
+		backup := &backupList.Items[i]
+		clusterNamespace := backup.Spec.ClusterRef.Namespace
+		if clusterNamespace == "" {
+			clusterNamespace = backup.Namespace
+		}
+		if backup.Spec.ClusterRef.Name != cluster.Name || clusterNamespace != cluster.Namespace {
+			continue
+		}
+		requests = append(requests, reconcile.Request{
+			NamespacedName: types.NamespacedName{
+				Name:      backup.Name,
+				Namespace: backup.Namespace,
+			},
+		})
+	}
+	return requests
 }

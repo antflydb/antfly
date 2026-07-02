@@ -1,11 +1,13 @@
 from enum import Enum
 
 
-class InferenceGenerateRequestBackend(str, Enum):
+class InferenceModelBackend(str, Enum):
     AUTO = "auto"
+    CUDA = "cuda"
     METAL = "metal"
     NATIVE = "native"
     ONNX = "onnx"
+    WASM = "wasm"
     WEBGPU = "webgpu"
     XLA = "xla"
 
