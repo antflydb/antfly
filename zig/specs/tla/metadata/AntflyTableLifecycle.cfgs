@@ -1,0 +1,49 @@
+\* All TLC check configs for AntflyTableLifecycle.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyTableLifecycle.tla.
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyDesiredRangeWithoutTable = FALSE
+    BuggyPlanIntentUndesiredRange = FALSE
+
+INVARIANTS
+    TypeOK
+    DesiredRangesHaveTable
+    NoIntentPlannedForUndesiredRange
+    Safety
+
+PROPERTIES
+    TopologyEventuallyConverges
+
+==== BadIntentUndesiredRange
+\* Expected-failure config: the planner creates a placement intent for a
+\* committed range that the desired topology no longer contains (revives a
+\* dropped table's group). Pinned to the planner-scope invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDesiredRangeWithoutTable = FALSE
+    BuggyPlanIntentUndesiredRange = TRUE
+
+INVARIANTS
+    NoIntentPlannedForUndesiredRange
+
+==== BadRangeWithoutTable
+\* Expected-failure config: a desired range is admitted without its table
+\* (table_manager.zig:350 UnknownTable guard removed). Pinned to the
+\* desired-topology integrity invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDesiredRangeWithoutTable = TRUE
+    BuggyPlanIntentUndesiredRange = FALSE
+
+INVARIANTS
+    DesiredRangesHaveTable

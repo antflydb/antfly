@@ -1,0 +1,88 @@
+\* All TLC check configs for AntflyHATimelineSwitch.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHATimelineSwitch.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwitchBeforeApplied = FALSE
+    BuggyNonMonotonicSwitch = FALSE
+    BuggyAcceptOldTimeline = FALSE
+    BuggyRecoverWrongPrevious = FALSE
+
+INVARIANTS
+    TypeOK
+    ProgressOrder
+    SwitchRecordIsMonotonic
+    SwitchRequiresAppliedProgress
+    SwitchRecordIsContiguous
+    SwitchedIdentityMatchesRecord
+    OldTimelineRejectedAfterSwitch
+    RecoveryUsesRecoveredProgress
+    Safety
+
+==== BadBeforeApplied
+\* Expected-failure config: a timeline switch is accepted before parent
+\* received/applied/safe progress has caught up.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwitchBeforeApplied = TRUE
+    BuggyNonMonotonicSwitch = FALSE
+    BuggyAcceptOldTimeline = FALSE
+    BuggyRecoverWrongPrevious = FALSE
+
+INVARIANTS
+    SwitchRequiresAppliedProgress
+
+==== BadNonMonotonic
+\* Expected-failure config: a timeline switch record can reuse the current
+\* timeline or epoch.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwitchBeforeApplied = FALSE
+    BuggyNonMonotonicSwitch = TRUE
+    BuggyAcceptOldTimeline = FALSE
+    BuggyRecoverWrongPrevious = FALSE
+
+INVARIANTS
+    SwitchRecordIsMonotonic
+
+==== BadOldTimeline
+\* Expected-failure config: after switching, an old-timeline record is accepted.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwitchBeforeApplied = FALSE
+    BuggyNonMonotonicSwitch = FALSE
+    BuggyAcceptOldTimeline = TRUE
+    BuggyRecoverWrongPrevious = FALSE
+
+INVARIANTS
+    OldTimelineRejectedAfterSwitch
+
+==== BadRecoveryPrevious
+\* Expected-failure config: crash recovery applies a durable timeline switch
+\* whose previous_lsn is not contiguous with recovered parent progress.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwitchBeforeApplied = FALSE
+    BuggyNonMonotonicSwitch = FALSE
+    BuggyAcceptOldTimeline = FALSE
+    BuggyRecoverWrongPrevious = TRUE
+
+INVARIANTS
+    RecoveryUsesRecoveredProgress

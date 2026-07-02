@@ -1,0 +1,114 @@
+\* All TLC check configs for AntflyHARejoin.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyUnfencedRewinds = FALSE
+    BuggyExpiredWalRewinds = FALSE
+    BuggyForcedRewinds = FALSE
+    BuggyIdentityMismatchRewinds = FALSE
+    BuggyStaleAssessmentTruncates = FALSE
+    BuggyForkMismatchTruncates = FALSE
+
+INVARIANT Safety
+
+PROPERTIES
+    EventuallyAssessed
+    RejoinEventuallyExecutes
+
+==== BadExpiredWalRewind
+SPECIFICATION Spec
+\* Pinned to the specific semantic invariant this mutant must violate.
+\* AssessmentMatchesPolicy is intentionally coupled (the mutant corrupts the chosen action).
+
+CONSTANTS
+    BuggyUnfencedRewinds = FALSE
+    BuggyExpiredWalRewinds = TRUE
+    BuggyForcedRewinds = FALSE
+    BuggyIdentityMismatchRewinds = FALSE
+    BuggyStaleAssessmentTruncates = FALSE
+    BuggyForkMismatchTruncates = FALSE
+
+INVARIANTS
+    RewindRequiresCompatibleFence
+
+==== BadForcedRewind
+SPECIFICATION Spec
+\* Pinned to the specific semantic invariant this mutant must violate.
+\* AssessmentMatchesPolicy is intentionally coupled (the mutant corrupts the chosen action).
+
+CONSTANTS
+    BuggyUnfencedRewinds = FALSE
+    BuggyExpiredWalRewinds = FALSE
+    BuggyForcedRewinds = TRUE
+    BuggyIdentityMismatchRewinds = FALSE
+    BuggyStaleAssessmentTruncates = FALSE
+    BuggyForkMismatchTruncates = FALSE
+
+INVARIANTS
+    RewindRequiresCompatibleFence
+
+==== BadForkMismatch
+SPECIFICATION Spec
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+CONSTANTS
+    BuggyUnfencedRewinds = FALSE
+    BuggyExpiredWalRewinds = FALSE
+    BuggyForcedRewinds = FALSE
+    BuggyIdentityMismatchRewinds = FALSE
+    BuggyStaleAssessmentTruncates = FALSE
+    BuggyForkMismatchTruncates = TRUE
+
+INVARIANTS
+    RewindExecutionValidatesForkRecord
+
+==== BadIdentityMismatchRewind
+SPECIFICATION Spec
+\* Pinned to the specific semantic invariant this mutant must violate.
+\* AssessmentMatchesPolicy is intentionally coupled (the mutant corrupts the chosen action).
+
+CONSTANTS
+    BuggyUnfencedRewinds = FALSE
+    BuggyExpiredWalRewinds = FALSE
+    BuggyForcedRewinds = FALSE
+    BuggyIdentityMismatchRewinds = TRUE
+    BuggyStaleAssessmentTruncates = FALSE
+    BuggyForkMismatchTruncates = FALSE
+
+INVARIANTS
+    RewindRequiresCompatibleFence
+
+==== BadStaleAssessment
+SPECIFICATION Spec
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+CONSTANTS
+    BuggyUnfencedRewinds = FALSE
+    BuggyExpiredWalRewinds = FALSE
+    BuggyForcedRewinds = FALSE
+    BuggyIdentityMismatchRewinds = FALSE
+    BuggyStaleAssessmentTruncates = TRUE
+    BuggyForkMismatchTruncates = FALSE
+
+INVARIANTS
+    RewindExecutionRequiresFreshAssessment
+
+==== BadUnfencedRewind
+SPECIFICATION Spec
+\* Pinned to the specific semantic invariant this mutant must violate.
+\* AssessmentMatchesPolicy is intentionally coupled (the mutant corrupts the chosen action).
+
+CONSTANTS
+    BuggyUnfencedRewinds = TRUE
+    BuggyExpiredWalRewinds = FALSE
+    BuggyForcedRewinds = FALSE
+    BuggyIdentityMismatchRewinds = FALSE
+    BuggyStaleAssessmentTruncates = FALSE
+    BuggyForkMismatchTruncates = FALSE
+
+INVARIANTS
+    RejectUnfencedDoesNotExecute

@@ -1,0 +1,91 @@
+\* All TLC check configs for AntflyManagedHostLifecycle.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyManagedHostLifecycle.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = FALSE
+    BuggyRemoveKeepsRoute = FALSE
+    BuggyRestartRevivesRemoved = FALSE
+    BuggyRestoreNotCancelled = FALSE
+
+INVARIANTS
+    TypeOK
+    ActiveReplicasAreHosted
+    RoutesOnlyForActiveReplicas
+    NoUndesiredActiveReplica
+    NoUndesiredRoute
+    DurableStoreForHostedReplica
+    CatalogOnlyForDesiredReplica
+    RestoreBootstrapRequiresDesiredGroup
+    RestoreDoesNotActivateBeforeSuccess
+    RestartRestoresOnlyCatalogedDesiredReplicas
+    Safety
+
+==== BadPrematureRestore
+\* Expected-failure config: restore bootstrap makes a replica active/routed
+\* before bootstrap completion and durable apply-store/catalog publication.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = TRUE
+    BuggyRemoveKeepsRoute = FALSE
+    BuggyRestartRevivesRemoved = FALSE
+    BuggyRestoreNotCancelled = FALSE
+
+INVARIANTS
+    RestoreDoesNotActivateBeforeSuccess
+
+==== BadRestoreCancel
+\* Expected-failure config: removing metadata does not cancel pending backup
+\* restore bootstrap state.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = FALSE
+    BuggyRemoveKeepsRoute = FALSE
+    BuggyRestartRevivesRemoved = FALSE
+    BuggyRestoreNotCancelled = TRUE
+
+INVARIANTS
+    RestoreBootstrapRequiresDesiredGroup
+
+==== BadReviveRemoved
+\* Expected-failure config: removed replica catalog state is retained and can be
+\* used to revive a removed group after restart.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = FALSE
+    BuggyRemoveKeepsRoute = FALSE
+    BuggyRestartRevivesRemoved = TRUE
+    BuggyRestoreNotCancelled = FALSE
+
+INVARIANTS
+    CatalogOnlyForDesiredReplica
+
+==== BadStaleRoute
+\* Expected-failure config: metadata removal clears active state but leaves the
+\* live peer route installed.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyActivateBeforeRestoreComplete = FALSE
+    BuggyRemoveKeepsRoute = TRUE
+    BuggyRestartRevivesRemoved = FALSE
+    BuggyRestoreNotCancelled = FALSE
+
+INVARIANTS
+    NoUndesiredRoute

@@ -1,0 +1,61 @@
+\* All TLC check configs for AntflyQueryCompleteness.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+CONSTANTS
+  BuggyRouteBeforeChildReady = FALSE
+  BuggyDoubleServe = FALSE
+  BuggyDropMovedDoc = FALSE
+
+SPECIFICATION Spec
+
+INVARIANTS
+  TypeOK
+  NoMissingDocs
+  NoDuplicateDocs
+  RouteRequiresChildServing
+  Safety
+
+==== BadDoubleServe
+\* Expected-failure config for AntflyQueryCompleteness.tla.
+\* The parent keeps scanning the moved right range after child routing is visible.
+
+CONSTANTS
+  BuggyRouteBeforeChildReady = FALSE
+  BuggyDoubleServe = TRUE
+  BuggyDropMovedDoc = FALSE
+
+SPECIFICATION Spec
+
+INVARIANTS
+  NoDuplicateDocs
+
+==== BadMissingDoc
+\* Expected-failure config for AntflyQueryCompleteness.tla.
+\* The child publishes serving without the moved document, so routing is ready
+\* but the query result misses the moved range's document.
+
+CONSTANTS
+  BuggyRouteBeforeChildReady = FALSE
+  BuggyDoubleServe = FALSE
+  BuggyDropMovedDoc = TRUE
+
+SPECIFICATION Spec
+
+INVARIANTS
+  NoMissingDocs
+
+==== BadRouteBeforeChildReady
+\* Expected-failure config for AntflyQueryCompleteness.tla.
+\* A route to the child can publish before the child has a complete serving view.
+
+CONSTANTS
+  BuggyRouteBeforeChildReady = TRUE
+  BuggyDoubleServe = FALSE
+  BuggyDropMovedDoc = FALSE
+
+SPECIFICATION Spec
+
+INVARIANTS
+  RouteRequiresChildServing

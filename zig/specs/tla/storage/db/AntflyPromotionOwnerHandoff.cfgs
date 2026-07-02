@@ -1,0 +1,64 @@
+\* All TLC check configs for AntflyPromotionOwnerHandoff.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyPromotionOwnerHandoff.tla.
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyAttachBeforeDetach = FALSE
+    BuggyPromoteWithoutOwnership = FALSE
+
+INVARIANTS
+    TypeOK
+    AtMostOneAttachedOwner
+    AttachedImpliesRangeOwner
+    NoUnownedPromotion
+    Safety
+
+PROPERTIES
+    NewSideEventuallyOwns
+
+==== BadAttachBeforeDetach
+\* Expected-failure config: the child/receiver installs its promotion owner
+\* while the parent/donor is still attached. Pinned to single-owner
+\* exclusivity.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyAttachBeforeDetach = TRUE
+    BuggyPromoteWithoutOwnership = FALSE
+
+INVARIANTS
+    AtMostOneAttachedOwner
+
+==== BadAttachBeforeTransfer
+\* Expected-failure config: same premature-attach mutant, pinned to the
+\* range-ownership coupling — the new side attaches after the handoff began
+\* but before the range actually transferred.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyAttachBeforeDetach = TRUE
+    BuggyPromoteWithoutOwnership = FALSE
+
+INVARIANTS
+    AttachedImpliesRangeOwner
+
+==== BadPromoteUnowned
+\* Expected-failure config: the promotion catch-up loop advances without the
+\* isLocalOwner ownership predicate. Pinned to the no-unowned-promotion
+\* invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyAttachBeforeDetach = FALSE
+    BuggyPromoteWithoutOwnership = TRUE
+
+INVARIANTS
+    NoUnownedPromotion

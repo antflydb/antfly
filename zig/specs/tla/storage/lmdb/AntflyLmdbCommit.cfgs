@@ -1,0 +1,54 @@
+\* All TLC check configs for AntflyLmdbCommit.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyLmdbCommit.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxTxn = 3
+    MaxPage = 4
+    BuggyMetaBeforeDataSync = FALSE
+    BuggyReuseReaderVisible = FALSE
+
+INVARIANTS
+    TypeOK
+    PublishedMetaHasData
+    MetaWriteAfterDataSync
+    ReaderSnapshotVisible
+    CommittedPagesMatchActiveMeta
+    RetiredPagesNotInActiveSnapshot
+    CommitPhasesDoNotRaceChild
+    PreparedCommitShape
+    SingleWriter
+    Safety
+
+==== BadMetaBeforeData
+\* Expected-failure config: meta page is written before dirty data pages are durable.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxTxn = 3
+    MaxPage = 4
+    BuggyMetaBeforeDataSync = TRUE
+    BuggyReuseReaderVisible = FALSE
+
+INVARIANTS
+    Safety
+
+==== BadReaderReuse
+\* Expected-failure config: page retired after an old reader snapshot is reused too early.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxTxn = 3
+    MaxPage = 4
+    BuggyMetaBeforeDataSync = FALSE
+    BuggyReuseReaderVisible = TRUE
+
+INVARIANTS
+    Safety

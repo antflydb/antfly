@@ -1,0 +1,55 @@
+\* All TLC check configs for AntflyLsmLifecycle.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyLsmLifecycle.tla
+\*
+\* Run from zig/:
+\*   java -cp /path/to/tla2tools.jar tlc2.TLC \
+\*     -config specs/tla/AntflyLsmLifecycle.cfg \
+\*     specs/tla/AntflyLsmLifecycle.tla -deadlock
+
+CONSTANTS
+    ReadCache = ReadCache
+    WriteCache = WriteCache
+    BuggyIndexFailLeaksTemp = FALSE
+
+SPECIFICATION Spec
+
+INVARIANTS
+    Safety
+    TypeOK
+    CacheActiveLeaseReachable
+    CacheNoRetiredEntryWithoutLease
+    CachePublishedEntryHasRetireCapacity
+    CacheDestroyedHasNoLease
+    SnapshotActiveReaderReachable
+    SnapshotPublishedHasRetireCapacity
+    SnapshotNoRetiredWithoutReader
+    IndexNoTempLeak
+    IndexFailedOpFreedTemps
+
+==== BadIndexTempLeak
+\* Expected-failure LSM lifecycle config: removeSegments leaks its first
+\* temporary array when the second allocation fails.
+
+CONSTANTS
+    ReadCache = ReadCache
+    WriteCache = WriteCache
+    BuggyIndexFailLeaksTemp = TRUE
+
+SPECIFICATION Spec
+
+INVARIANTS
+    Safety
+    TypeOK
+    CacheActiveLeaseReachable
+    CacheNoRetiredEntryWithoutLease
+    CachePublishedEntryHasRetireCapacity
+    CacheDestroyedHasNoLease
+    SnapshotActiveReaderReachable
+    SnapshotPublishedHasRetireCapacity
+    SnapshotNoRetiredWithoutReader
+    IndexNoTempLeak
+    IndexFailedOpFreedTemps

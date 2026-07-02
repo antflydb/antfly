@@ -1,0 +1,39 @@
+\* All TLC check configs for AntflyShardSplitSeq.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyKeySetCutover = FALSE
+
+INVARIANTS
+    TypeOK
+    CutoverPreservesAllFencedWrites
+    SecondWriteCannotBeCollapsedByKey
+    Safety
+
+==== BadFencedWriteDropped
+\* Expected-failure config for AntflyShardSplitSeq.tla.
+\* Reuses the key-set cutover mutant, pinned to the fence-coverage invariant:
+\* cutover completes while a fenced parent write has not been replayed.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyKeySetCutover = TRUE
+
+INVARIANTS
+    CutoverPreservesAllFencedWrites
+
+==== BadKeySetCutover
+\* Expected-failure config for AntflyShardSplitSeq.tla.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyKeySetCutover = TRUE
+
+INVARIANTS
+    SecondWriteCannotBeCollapsedByKey

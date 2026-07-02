@@ -1,0 +1,56 @@
+\* All TLC check configs for AntflyEnrichmentLease.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyEnrichmentLease.tla
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyStalePublish = FALSE
+    BuggyEmptyPendingAdvance = FALSE
+    MaxSeq = 2
+
+INVARIANTS
+    TypeOK
+    TargetsOrdered
+    OwnerMatchesLease
+    CollectedAndGeneratedUnderLease
+    PublishedArtifactsSafe
+    AppliedDoesNotSkipGeneratedWork
+    RetryableFailureDoesNotAdvanceApplied
+    IsolatedFailureRecorded
+    WorkerFailureStatusStable
+    Safety
+
+PROPERTIES
+    EnrichmentEventuallyDrains
+
+==== BadEmptyPending
+\* Expected-failure config for empty pending scans advancing through hidden work.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStalePublish = FALSE
+    BuggyEmptyPendingAdvance = TRUE
+    MaxSeq = 2
+
+INVARIANTS
+    AppliedDoesNotSkipGeneratedWork
+
+==== BadStalePublish
+\* Expected-failure config for stale generated-artifact publication after lease loss.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStalePublish = TRUE
+    BuggyEmptyPendingAdvance = FALSE
+    MaxSeq = 2
+
+INVARIANTS
+    PublishedArtifactsSafe

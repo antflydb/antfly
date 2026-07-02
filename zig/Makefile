@@ -264,8 +264,9 @@ tla-list: ## List available TLA+ verification targets.
 	  '  make tla-audit                    # static hygiene audit (orphans, TTrace, unexercised mutants, Safety pins)'
 
 tla-clean: ## Remove TLA+ model checker runtime artifacts.
-	rm -rf specs/tla/states states
-	find specs/tla -maxdepth 1 \( -name '*_TTrace_*.tla' -o -name '*_TTrace_*.bin' \) -delete
+	rm -rf specs/tla/states specs/tla/.generated states
+	find specs/tla \( -name '*_TTrace_*.tla' -o -name '*_TTrace_*.bin' \) -delete
+	find specs/tla -type d -name states -prune -exec rm -rf {} +
 
 tla-audit: ## Static hygiene audit for the TLA+ suite (fails on orphans/TTrace/unexercised mutants; reports Safety-pin migration debt).
 	@bash ../scripts/tla-audit.sh
@@ -275,11 +276,11 @@ tla-check: tla-check-txn tla-check-split tla-check-snap tla-check-lsm
 tla-check-smoke: tla-tools ## Parse all checked-in TLA+ specs without model checking.
 	@echo "==> Parsing checked-in TLA+ specs..."
 	@source ../scripts/tla-tools.sh && \
-	cd specs/tla && \
-	for spec in *.tla; do \
+	for spec in $$(find specs/tla -name '*.tla' -not -path '*/.generated/*' | sort); do \
 	  case "$$spec" in *'_TTrace_'*) continue ;; esac; \
-	  case "$$spec" in occ-2pc.tla) continue ;; esac; \
-	  "$$TLA_JAVA" -cp "$$TLA2TOOLS" tla2sany.SANY "$$spec" >/dev/null; \
+	  case "$$spec" in */occ-2pc.tla) continue ;; esac; \
+	  (cd "$$(dirname "$$spec")" && \
+	   "$$TLA_JAVA" -cp "$$TLA2TOOLS" tla2sany.SANY "$$(basename "$$spec")" >/dev/null); \
 	done
 
 tla-check-fast: tla-check-new-fast ## Alias for the fast focused lower-level specs.
@@ -313,25 +314,28 @@ endif
 define tla_check_module
 	@echo "==> Model checking $(1)..."
 	source ../scripts/tla-tools.sh && \
+	read -r cfg spec <<<"$$(bash ../scripts/tla-cfg.sh $(2) $(2))" && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/$(2).cfg specs/tla/$(2).tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock
 endef
 
 define tla_check_module_config
 	@echo "==> Model checking $(1)..."
 	source ../scripts/tla-tools.sh && \
+	read -r cfg spec <<<"$$(bash ../scripts/tla-cfg.sh $(2) $(3))" && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/$(2).cfg specs/tla/$(3).tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock
 endef
 
 define tla_check_expected_failure
 	@echo "==> Model checking expected-failure $(1)..."
 	@source ../scripts/tla-tools.sh && \
+	read -r cfg spec <<<"$$(bash ../scripts/tla-cfg.sh $(2) $(3) $(if $(4),$(4),$(3)))" && \
 	status=0; \
 	out=$$("$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/$(2).cfg specs/tla/$(3).tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock 2>&1) || status=$$?; \
 	echo "$$out"; \
 	if [ $$status -eq 0 ]; then \
@@ -356,13 +360,13 @@ tla-check-new-heavy: tla-check-ha-replication tla-check-derived-replay-heavy ## 
 tla-check-negative: tla-check-txn-negative-skip-intent-conflict tla-check-split-negative-premature-child-default tla-check-snap-negative-apply-without-put tla-check-lsm-negative-index-temp-leak tla-check-ha-replication-negative-stale-timeline-ack tla-check-ha-gates-negative-standby-runtime tla-check-ha-sync-wait-negative-move-target tla-check-ha-sync-wait-negative-wrong-timeline-ack tla-check-ha-sync-wait-negative-below-target-ack tla-check-ha-timeline-switch-negative-before-applied tla-check-ha-timeline-switch-negative-non-monotonic tla-check-ha-timeline-switch-negative-old-timeline tla-check-ha-timeline-switch-negative-recovery-previous tla-check-ha-standby-apply-negative-failure-advances tla-check-ha-standby-apply-negative-duplicate-effect tla-check-ha-standby-apply-negative-crash-loses-receive tla-check-ha-standby-apply-negative-client-write tla-check-ha-standby-apply-negative-background-runtime tla-check-ha-rejoin-negative-unfenced-rewind tla-check-ha-rejoin-negative-expired-wal-rewind tla-check-ha-rejoin-negative-forced-rewind tla-check-ha-rejoin-negative-identity-mismatch-rewind tla-check-ha-rejoin-negative-stale-assessment tla-check-ha-rejoin-negative-fork-mismatch tla-check-ha-failover-negative-promote-missing-ack tla-check-ha-failover-negative-old-primary-write tla-check-ha-failover-negative-ack-without-receipt tla-check-ha-partition-fence-negative-promote-before-fence tla-check-ha-partition-fence-negative-old-primary-write-after-promotion tla-check-ha-gate-transitions-negative-stale-allow tla-check-batcher-coalescing-negative-delete-write-inversion tla-check-batcher-coalescing-negative-write-delete-inversion tla-check-batcher-coalescing-negative-partial-visibility tla-check-batcher-coalescing-negative-delete-visible-without-delete tla-check-cdc-cutover-negative-boundary-duplicate tla-check-cdc-cutover-negative-checkpoint-ahead tla-check-cdc-cutover-negative-resume-replay tla-check-cdc-cutover-negative-stream-before-snapshot-complete tla-check-shard-split-seq-negative-keyset-cutover tla-check-shard-split-seq-negative-fenced-write-dropped tla-check-node-drain-negative-finalize-active tla-check-node-drain-negative-registration-clears-drain tla-check-node-drain-negative-safe-ignores-debt tla-check-table-lifecycle-negative-range-without-table tla-check-table-lifecycle-negative-intent-undesired-range tla-check-ha-retention-negative-truncate-unmarked tla-check-ha-retention-negative-backup-ignores-lost-wal tla-check-promotion-handoff-negative-attach-before-detach tla-check-promotion-handoff-negative-attach-before-transfer tla-check-promotion-handoff-negative-promote-unowned tla-check-index-lifecycle-negative-swap-incomplete tla-check-index-lifecycle-negative-recover-trusts-status tla-check-snapshot-content-negative-wrong-content tla-check-snapshot-content-negative-gc-needed-content tla-check-lsm-reserve-cleanup-negative-publish-without-reserve tla-check-lsm-reserve-cleanup-negative-failure-leaks-temp tla-check-query-completeness-negative-route-before-child-ready tla-check-query-completeness-negative-double-serve tla-check-query-completeness-negative-missing-doc tla-check-derived-replay-negative tla-check-enrichment-lease-negative-stale-publish tla-check-enrichment-lease-negative-empty-pending tla-check-lsm-wal-compaction-negative-checkpoint tla-check-lsm-wal-compaction-negative-corrupt-rotate tla-check-lsm-wal-compaction-negative-pinned-retire tla-check-lmdb-commit-negative-meta-before-data tla-check-lmdb-commit-negative-reader-reuse tla-check-transaction-session-negative-rollback tla-check-transaction-session-negative-recovery-decision tla-check-transaction-session-negative-cleanup tla-check-transaction-session-trace-negative-cleanup tla-check-document-identity-negative-reuse-ordinal tla-check-document-identity-negative-stale-filter tla-check-document-identity-negative-namespace-mismatch tla-check-document-identity-range-repair-negative-split-unhealthy tla-check-document-identity-range-repair-negative-split-dest-namespace tla-check-document-identity-range-repair-negative-merge-mismatch tla-check-document-identity-range-repair-negative-merge-active-reassign tla-check-document-identity-range-repair-negative-restore-namespace tla-check-document-identity-range-repair-negative-restore-early-clear tla-check-document-identity-range-repair-trace-negative-restore-mismatch tla-check-document-identity-range-repair-trace-negative-restore-early-clear tla-check-db-split-visibility-negative-parent-write tla-check-db-split-visibility-negative-child-serve tla-check-db-split-visibility-negative-merge-donor tla-check-db-split-visibility-negative-enrichment-owner tla-check-split-refinement-bridge-negative-route-before-db-serving tla-check-split-refinement-bridge-negative-db-serve-before-shard-cutover tla-check-split-refinement-bridge-negative-stale-fence-cutover tla-check-split-refinement-bridge-trace-negative-route-before-db-serving tla-check-managed-host-lifecycle-negative-premature-restore tla-check-managed-host-lifecycle-negative-stale-route tla-check-managed-host-lifecycle-negative-revive-removed tla-check-managed-host-lifecycle-negative-restore-cancel tla-check-lite-publication-negative-manifest-before-artifacts tla-check-lite-publication-negative-failed-head tla-check-lite-publication-negative-pinned-cleanup tla-check-lite-publication-negative-mixed-generation tla-check-ml-graph-passes-negative-dangling-cse tla-check-ml-graph-passes-negative-parameter-dedup tla-check-ml-graph-passes-negative-missing-lower-closure tla-check-ml-graph-passes-negative-fallback-runtime tla-check-ml-graph-passes-negative-partial-publish tla-check-ml-graph-dag-passes-negative-cse-miss-duplicate tla-check-ml-graph-dag-passes-negative-cse-no-consumer-remap tla-check-ml-graph-dag-passes-negative-dce-drop-reachable tla-check-ml-graph-dag-passes-negative-dce-non-topo-map tla-check-ml-compiler-publication-negative-stale-compile tla-check-ml-compiler-publication-negative-missing-input tla-check-ml-compiler-publication-negative-output-selection tla-check-ml-compiler-publication-negative-fallback-publish tla-check-ml-compiler-publication-negative-partial-artifact tla-check-openapi-codegen-negative-stale-package tla-check-openapi-codegen-negative-stale-root tla-check-openapi-codegen-negative-internal-leak tla-check-openapi-codegen-negative-partial-commit ## Run TLA+ expected-failure mutant checks.
 
 tla-check-txn-negative-skip-intent-conflict: tla-tools
-	$(call tla_check_expected_failure,transaction OCC pending-intent conflict mutant,AntflyTransactionBadSkipIntentConflict,MC)
+	$(call tla_check_expected_failure,transaction OCC pending-intent conflict mutant,AntflyTransactionBadSkipIntentConflict,AntflyTransaction,MC)
 
 tla-check-split-negative-premature-child-default: tla-tools
-	$(call tla_check_expected_failure,shard split premature child default mutant,AntflyShardSplitBadPrematureChildDefault,ShardSplitMC)
+	$(call tla_check_expected_failure,shard split premature child default mutant,AntflyShardSplitBadPrematureChildDefault,AntflyShardSplit,ShardSplitMC)
 
 tla-check-snap-negative-apply-without-put: tla-tools
-	$(call tla_check_expected_failure,snapshot apply without local archive mutant,AntflySnapshotTransferBadApplyWithoutPut,SnapshotTransferMC)
+	$(call tla_check_expected_failure,snapshot apply without local archive mutant,AntflySnapshotTransferBadApplyWithoutPut,AntflySnapshotTransfer,SnapshotTransferMC)
 
 tla-check-lsm-negative-index-temp-leak: tla-tools
 	$(call tla_check_expected_failure,LSM lifecycle index temp leak mutant,AntflyLsmLifecycleBadIndexTempLeak,AntflyLsmLifecycle)
@@ -567,9 +571,10 @@ tla-check-transaction-session-negative-cleanup: tla-tools
 
 tla-check-transaction-session-trace-negative-cleanup: tla-tools
 	@echo "==> Validating expected-failure transaction session cleanup trace..."
-	@if bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflyTransactionSession.tla \
-	  -c specs/tla/TraceAntflyTransactionSession.cfg \
+	@cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyTransactionSession TraceAntflyTransactionSession) && read -r cfg spec <<<"$$cfgspec" && \
+	if bash ../scripts/tla-validate-trace.sh -S -p 1 \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  specs/tla/traces/negative/txn_session_bad_cleanup.ndjson; then \
 	  echo "ERROR: expected transaction session cleanup trace to fail, but TLC passed"; \
 	  exit 1; \
@@ -606,9 +611,10 @@ tla-check-document-identity-range-repair-negative-restore-early-clear: tla-tools
 
 tla-check-document-identity-range-repair-trace-negative-restore-mismatch: tla-tools
 	@echo "==> Validating expected-failure document identity restore mismatch trace..."
-	@if bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflyDocumentIdentityRangeRepair.tla \
-	  -c specs/tla/TraceAntflyDocumentIdentityRangeRepair.cfg \
+	@cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyDocumentIdentityRangeRepair TraceAntflyDocumentIdentityRangeRepair) && read -r cfg spec <<<"$$cfgspec" && \
+	if bash ../scripts/tla-validate-trace.sh -S -p 1 \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  specs/tla/traces/negative/doc_identity_restore_accept_mismatch.ndjson; then \
 	  echo "ERROR: expected document identity restore mismatch trace to fail, but TLC passed"; \
 	  exit 1; \
@@ -618,9 +624,10 @@ tla-check-document-identity-range-repair-trace-negative-restore-mismatch: tla-to
 
 tla-check-document-identity-range-repair-trace-negative-restore-early-clear: tla-tools
 	@echo "==> Validating expected-failure document identity restore early-clear trace..."
-	@if bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflyDocumentIdentityRangeRepair.tla \
-	  -c specs/tla/TraceAntflyDocumentIdentityRangeRepair.cfg \
+	@cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyDocumentIdentityRangeRepair TraceAntflyDocumentIdentityRangeRepair) && read -r cfg spec <<<"$$cfgspec" && \
+	if bash ../scripts/tla-validate-trace.sh -S -p 1 \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  specs/tla/traces/negative/doc_identity_restore_early_clear.ndjson; then \
 	  echo "ERROR: expected document identity restore early-clear trace to fail, but TLC passed"; \
 	  exit 1; \
@@ -651,9 +658,10 @@ tla-check-split-refinement-bridge-negative-stale-fence-cutover: tla-tools
 
 tla-check-split-refinement-bridge-trace-negative-route-before-db-serving: tla-tools
 	@echo "==> Validating expected-failure split bridge route-before-serving trace..."
-	@if bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflySplitRefinementBridge.tla \
-	  -c specs/tla/TraceAntflySplitRefinementBridge.cfg \
+	@cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflySplitRefinementBridge TraceAntflySplitRefinementBridge) && read -r cfg spec <<<"$$cfgspec" && \
+	if bash ../scripts/tla-validate-trace.sh -S -p 1 \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  specs/tla/traces/negative/split_bridge_route_before_db_serving.ndjson; then \
 	  echo "ERROR: expected split bridge route-before-serving trace to fail, but TLC passed"; \
 	  exit 1; \
@@ -858,29 +866,33 @@ tla-check-openapi-codegen: tla-tools
 tla-check-txn: tla-tools
 	@echo "==> Model checking transaction spec..."
 	source ../scripts/tla-tools.sh && \
+	cfgspec=$$(bash ../scripts/tla-cfg.sh AntflyTransaction AntflyTransaction MC) && read -r cfg spec <<<"$$cfgspec" && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflyTransaction.cfg specs/tla/MC.tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock
 
 tla-check-split: tla-tools
 	@echo "==> Model checking shard split spec..."
 	source ../scripts/tla-tools.sh && \
+	cfgspec=$$(bash ../scripts/tla-cfg.sh AntflyShardSplit AntflyShardSplit ShardSplitMC) && read -r cfg spec <<<"$$cfgspec" && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflyShardSplit.cfg specs/tla/ShardSplitMC.tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock
 
 tla-check-snap: tla-tools
 	@echo "==> Model checking snapshot transfer spec (safety only, ~90s)..."
 	source ../scripts/tla-tools.sh && \
+	cfgspec=$$(bash ../scripts/tla-cfg.sh AntflySnapshotTransfer-safety AntflySnapshotTransfer SnapshotTransferMC) && read -r cfg spec <<<"$$cfgspec" && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflySnapshotTransfer-safety.cfg specs/tla/SnapshotTransferMC.tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock
 
 tla-check-lsm: tla-tools
 	@echo "==> Model checking LSM lifecycle OOM safety..."
 	source ../scripts/tla-tools.sh && \
+	cfgspec=$$(bash ../scripts/tla-cfg.sh AntflyLsmLifecycle AntflyLsmLifecycle) && read -r cfg spec <<<"$$cfgspec" && \
 	"$$TLA_JAVA" -XX:+UseParallelGC -cp "$$TLA2TOOLS" tlc2.TLC \
-	  -config specs/tla/AntflyLsmLifecycle.cfg specs/tla/AntflyLsmLifecycle.tla \
+	  -config "$$cfg" "$$spec" \
 	  -workers auto -deadlock
 
 tla-trace-raft: tla-tools
@@ -922,9 +934,10 @@ endif
 	    python3 ../scripts/tla-segment-txn-trace.py "$$filtered" "$$segdir"; \
 	    segments=$$(find "$$segdir" -name '*.ndjson' -size +0c | sort); \
 	    if [ -n "$$segments" ]; then \
+	      cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyTransaction TraceAntflyTransaction) && read -r cfg spec <<<"$$cfgspec" && \
 	      bash ../scripts/tla-validate-trace.sh -S \
-	        -s specs/tla/TraceAntflyTransaction.tla \
-	        -c specs/tla/TraceAntflyTransaction.cfg \
+	        -s "$$spec" \
+	        -c "$$cfg" \
 	        $$segments; \
 	      validated=$$((validated + 1)); \
 	    else \
@@ -944,34 +957,38 @@ tla-trace-txn-session: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-txn-session TRACE_FILES="specs/tla/traces/txn_session_*.ndjson")
 endif
+	cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyTransactionSession TraceAntflyTransactionSession) && read -r cfg spec <<<"$$cfgspec" && \
 	bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflyTransactionSession.tla \
-	  -c specs/tla/TraceAntflyTransactionSession.cfg \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  $(TRACE_FILES)
 
 tla-trace-ha: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-ha TRACE_FILES="specs/tla/traces/ha_*.ndjson")
 endif
+	cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyHA TraceAntflyHA) && read -r cfg spec <<<"$$cfgspec" && \
 	bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflyHA.tla \
-	  -c specs/tla/TraceAntflyHA.cfg \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  $(TRACE_FILES)
 
 tla-trace-split-bridge: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-split-bridge TRACE_FILES="specs/tla/traces/split_bridge_*.ndjson")
 endif
+	cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflySplitRefinementBridge TraceAntflySplitRefinementBridge) && read -r cfg spec <<<"$$cfgspec" && \
 	bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflySplitRefinementBridge.tla \
-	  -c specs/tla/TraceAntflySplitRefinementBridge.cfg \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  $(TRACE_FILES)
 
 tla-trace-doc-identity-range-repair: tla-tools
 ifndef TRACE_FILES
 	$(error TRACE_FILES is required. Example: make tla-trace-doc-identity-range-repair TRACE_FILES="specs/tla/traces/doc_identity_restore_*.ndjson")
 endif
+	cfgspec=$$(bash ../scripts/tla-cfg.sh TraceAntflyDocumentIdentityRangeRepair TraceAntflyDocumentIdentityRangeRepair) && read -r cfg spec <<<"$$cfgspec" && \
 	bash ../scripts/tla-validate-trace.sh -S -p 1 \
-	  -s specs/tla/TraceAntflyDocumentIdentityRangeRepair.tla \
-	  -c specs/tla/TraceAntflyDocumentIdentityRangeRepair.cfg \
+	  -s "$$spec" \
+	  -c "$$cfg" \
 	  $(TRACE_FILES)

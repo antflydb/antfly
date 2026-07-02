@@ -1,0 +1,43 @@
+\* All TLC check configs for AntflyHAGates.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHAGates.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStandbyBackgroundRuntime = FALSE
+
+INVARIANTS
+    TypeOK
+    ProgressOrdered
+    FailClosedDoesNotAppendAck
+    StandbyReadNeverBeyondSafeOrMetadata
+    FencedPrimaryCannotWrite
+    OwnerJobsRequireWritablePrimary
+    MutatingBackgroundRequiresWritablePrimary
+    StandbyDoesNotRunMutatingBackground
+    Safety
+
+==== BadStandbyRuntime
+\* Expected-failure config for AntflyHAGates.tla.
+\* Enables a mutant that starts mutating optional/background runtimes on a
+\* standby DB role.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStandbyBackgroundRuntime = TRUE
+
+INVARIANTS
+    TypeOK
+    ProgressOrdered
+    FailClosedDoesNotAppendAck
+    StandbyReadNeverBeyondSafeOrMetadata
+    FencedPrimaryCannotWrite
+    OwnerJobsRequireWritablePrimary
+    MutatingBackgroundRequiresWritablePrimary
+    StandbyDoesNotRunMutatingBackground
+    Safety

@@ -1,0 +1,27 @@
+\* All TLC check configs for AntflyHAGateTransitions.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleAllowAfterTransition = FALSE
+
+INVARIANTS
+    TypeOK
+    AllowedWriteRequiresUnfencedPrimary
+    MutatingRuntimeRequiresUnfencedPrimary
+    Safety
+
+==== BadStaleAllow
+\* Expected-failure config for AntflyHAGateTransitions.tla.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleAllowAfterTransition = TRUE
+
+INVARIANTS
+    AllowedWriteRequiresUnfencedPrimary
+    MutatingRuntimeRequiresUnfencedPrimary
