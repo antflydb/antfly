@@ -13115,6 +13115,7 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     if (responses.len == 0) return error.InvalidQueryRequest;
     const response = responses[0];
     const hits_obj = response.hits orelse return error.InvalidQueryRequest;
+    const total_obj = hits_obj.total orelse return error.InvalidQueryRequest;
     const hits_value = hits_obj.hits orelse return error.InvalidQueryRequest;
 
     const hits = try alloc.alloc(db_mod.types.SearchHit, hits_value.len);
@@ -13141,7 +13142,8 @@ fn parseRemoteSearchResult(alloc: std.mem.Allocator, body: []const u8) !db_mod.t
     return .{
         .alloc = alloc,
         .hits = hits,
-        .total_hits = @intCast(hits_obj.total orelse 0),
+        .total_hits = try query_contract.queryHitsTotalValueToU32(total_obj),
+        .total_hits_relation = try query_contract.parseTotalHitsRelation(total_obj.relation),
         .graph_results = graph_results,
     };
 }
@@ -13189,11 +13191,12 @@ fn parseRemoteIndexScoresAlloc(
 test "parseRemoteSearchResult preserves fused index scores" {
     const alloc = std.testing.allocator;
     var result = try parseRemoteSearchResult(alloc,
-        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
+        \\{"responses":[{"hits":{"total":{"value":1,"relation":"gte"},"hits":[{"_id":"doc:a","_score":0.9,"_index_scores":{"full_text":0.75,"semantic_idx":0.25},"_source":{"title":"alpha"}}],"max_score":0.9},"took":1,"status":200,"table":"docs"}]}
     );
     defer result.deinit();
 
     try std.testing.expectEqual(@as(usize, 1), result.hits.len);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, result.total_hits_relation);
     try std.testing.expectEqualStrings("doc:a", result.hits[0].id);
     try std.testing.expectEqual(@as(usize, 2), result.hits[0].index_scores.len);
     try std.testing.expectEqualStrings("full_text", result.hits[0].index_scores[0].index_name);

@@ -150,6 +150,7 @@ pub const FieldStatistics = types.FieldStatistics;
 pub const AnalysesResult = types.AnalysesResult;
 pub const QueryHit = types.QueryHit;
 pub const QueryHits = types.QueryHits;
+pub const QueryHitsTotal = types.QueryHitsTotal;
 pub const QueryResponses = types.QueryResponses;
 pub const QueryResult = types.QueryResult;
 pub const LinearMergePageStatus = types.LinearMergePageStatus;

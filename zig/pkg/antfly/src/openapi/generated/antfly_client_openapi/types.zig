@@ -1566,6 +1566,14 @@ pub const QueryHit = struct {
     _sort: ?[]const []const u8 = null,
 };
 
+/// Total hit count metadata.
+pub const QueryHitsTotal = struct {
+    /// Hit count value.
+    value: i64,
+    /// Whether value is exact or a lower bound.
+    relation: []const u8,
+};
+
 /// Status of a linear merge page operation: - "success": All records in batch processed successfully - "partial": Processing stopped at shard boundary, client should retry with next_cursor - "error": Fatal error occurred, no records processed successfully
 pub const LinearMergePageStatus = enum {
     success,
@@ -4420,8 +4428,8 @@ pub const TableStatistics = struct {
 
 /// A list of query hits.
 pub const QueryHits = struct {
-    /// Total number of hits available.
-    total: ?i64 = null,
+    /// Total number of hits available and whether it is exact.
+    total: ?QueryHitsTotal = null,
     hits: ?[]const QueryHit = null,
     /// Maximum score of the results.
     max_score: ?f32 = null,

@@ -77,10 +77,12 @@ pub fn mergeSearchResults(
     limit: u32,
 ) !db_mod.types.SearchResult {
     var total_hits: u32 = 0;
+    var total_hits_relation: db_mod.types.TotalHitsRelation = .exact;
     var has_graph_results = false;
     for (results) |result| {
         if (result.graph_results.len > 0) has_graph_results = true;
         total_hits +|= result.total_hits;
+        if (result.total_hits_relation == .gte) total_hits_relation = .gte;
     }
 
     var merged_hits = std.ArrayListUnmanaged(db_mod.types.SearchHit).empty;
@@ -141,6 +143,7 @@ pub fn mergeSearchResults(
         .alloc = alloc,
         .hits = final_hits,
         .total_hits = total_hits,
+        .total_hits_relation = total_hits_relation,
         .identity_read_generation = mergedSearchResultIdentityReadGeneration(req, results),
         .graph_results = graph_results,
     };
@@ -1183,6 +1186,37 @@ test "query merge preserves single-result doc ordinals" {
     try std.testing.expectEqual(@as(usize, 1), merged.hits.len);
     try std.testing.expectEqualStrings("doc:a", merged.hits[0].id);
     try std.testing.expectEqual(@as(?u32, 9), merged.hits[0].doc_ordinal);
+}
+
+test "query merge preserves lower-bound total relation" {
+    const alloc = std.testing.allocator;
+
+    var left_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    left_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:a"),
+        .score = 1.0,
+    };
+    var right_hits = try alloc.alloc(db_mod.types.SearchHit, 1);
+    right_hits[0] = .{
+        .id = try alloc.dupe(u8, "doc:b"),
+        .score = 0.5,
+    };
+
+    var left = db_mod.types.SearchResult{
+        .alloc = alloc,
+        .hits = left_hits,
+        .total_hits = 1,
+        .total_hits_relation = .gte,
+    };
+    defer left.deinit();
+    var right = db_mod.types.SearchResult{ .alloc = alloc, .hits = right_hits, .total_hits = 1 };
+    defer right.deinit();
+
+    var merged = try mergeSearchResults(alloc, .{}, &.{ left, right }, 0, 10);
+    defer merged.deinit();
+
+    try std.testing.expectEqual(@as(u32, 2), merged.total_hits);
+    try std.testing.expectEqual(db_mod.types.TotalHitsRelation.gte, merged.total_hits_relation);
 }
 
 test "query merge preserves common identity read generation" {

@@ -6026,7 +6026,7 @@ test "retrieval agent ignores empty map-valued tool fields for policy and strate
 
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"total":{"value":0,"relation":"exact"},"hits":[]}}]}
                 ),
             };
         }
@@ -7295,7 +7295,7 @@ test "retrieval agent treats aggregations as first-class tool capability" {
             try std.testing.expect(parsed_query.value.filter_query == null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"total":{"value":0,"relation":"exact"},"hits":[]}}]}
                 ),
             };
         }
@@ -7335,7 +7335,7 @@ test "retrieval agent requires filter and aggregate tools for filtered aggregati
             try std.testing.expect(parsed_query.value.filter_query != null);
             return .{
                 .json = try alloc.dupe(u8,
-                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[]}}]}
+                    \\{"responses":[{"status":200,"took":1,"hits":{"total":{"value":0,"relation":"exact"},"hits":[]}}]}
                 ),
             };
         }

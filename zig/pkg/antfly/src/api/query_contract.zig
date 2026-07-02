@@ -56,6 +56,31 @@ pub const testing = if (builtin.is_test) struct {
     }
 } else struct {};
 
+pub fn totalHitsRelationString(relation: db_mod.types.TotalHitsRelation) []const u8 {
+    return switch (relation) {
+        .exact => "exact",
+        .gte => "gte",
+    };
+}
+
+pub fn parseTotalHitsRelation(value: []const u8) !db_mod.types.TotalHitsRelation {
+    if (std.mem.eql(u8, value, "exact")) return .exact;
+    if (std.mem.eql(u8, value, "gte")) return .gte;
+    return error.InvalidQueryRequest;
+}
+
+pub fn queryHitsTotalFromSearchResult(result: db_mod.types.SearchResult) metadata_openapi.QueryHitsTotal {
+    return .{
+        .value = result.total_hits,
+        .relation = totalHitsRelationString(result.total_hits_relation),
+    };
+}
+
+pub fn queryHitsTotalValueToU32(total: metadata_openapi.QueryHitsTotal) !u32 {
+    if (total.value < 0) return error.InvalidQueryRequest;
+    return std.math.cast(u32, total.value) orelse error.InvalidQueryRequest;
+}
+
 pub const QueryResponseMeta = struct {
     pub const RerankerProfile = struct {
         model: []const u8 = "",
@@ -2207,7 +2232,7 @@ pub fn encodeQueryResponses(
     const query_results = try arena.alloc(metadata_openapi.QueryResult, 1);
     query_results[0] = .{
         .hits = .{
-            .total = result.total_hits,
+            .total = queryHitsTotalFromSearchResult(result),
             .hits = hits,
             .max_score = computeMaxScore(emitted_hits),
         },

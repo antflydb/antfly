@@ -25390,7 +25390,7 @@ test "api http server executes direct foreign table query through registry" {
     defer parsed.deinit();
     try std.testing.expectEqual(@as(usize, 1), parsed.value.responses.?.len);
     const response = parsed.value.responses.?[0];
-    try std.testing.expectEqual(@as(?i64, 2), response.hits.?.total);
+    try std.testing.expectEqual(@as(i64, 2), response.hits.?.total.?.value);
     try std.testing.expectEqual(@as(usize, 2), response.hits.?.hits.?.len);
     try std.testing.expectEqualStrings("cust:a", response.hits.?.hits.?[0]._id);
     try std.testing.expectEqualStrings("Alice", testQueryHitSourcePathValue(response.hits.?.hits.?[0], "name").?.string);

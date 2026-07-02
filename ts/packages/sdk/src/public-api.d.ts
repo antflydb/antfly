@@ -5633,17 +5633,27 @@ export interface components {
         };
         /** @description A list of query hits. */
         QueryHits: {
-            /**
-             * Format: uint64
-             * @description Total number of hits available.
-             */
-            total?: number;
+            /** @description Total number of hits available and whether it is exact. */
+            total?: components["schemas"]["QueryHitsTotal"];
             hits?: components["schemas"]["QueryHit"][];
             /**
              * Format: float
              * @description Maximum score of the results.
              */
             max_score?: number;
+        };
+        /** @description Total hit count metadata. */
+        QueryHitsTotal: {
+            /**
+             * Format: uint64
+             * @description Hit count value.
+             */
+            value: number;
+            /**
+             * @description Whether value is exact or a lower bound.
+             * @enum {string}
+             */
+            relation: "exact" | "gte";
         };
         /** @description Responses from multiple query operations. */
         QueryResponses: {

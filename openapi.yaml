@@ -11638,9 +11638,8 @@ components:
       description: A list of query hits.
       properties:
         total:
-          type: integer
-          format: uint64
-          description: Total number of hits available.
+          $ref: '#/components/schemas/QueryHitsTotal'
+          description: Total number of hits available and whether it is exact.
           x-omitzero: false
         hits:
           x-omitempty: false
@@ -11653,6 +11652,26 @@ components:
           format: float
           x-go-type: float64
           description: Maximum score of the results.
+    QueryHitsTotal:
+      x-omitempty: false
+      x-omitzero: false
+      type: object
+      description: Total hit count metadata.
+      required:
+        - value
+        - relation
+      properties:
+        value:
+          type: integer
+          format: uint64
+          description: Hit count value.
+          x-omitzero: false
+        relation:
+          type: string
+          enum:
+            - exact
+            - gte
+          description: Whether value is exact or a lower bound.
     QueryResponses:
       type: object
       description: Responses from multiple query operations.

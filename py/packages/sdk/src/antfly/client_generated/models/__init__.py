@@ -462,6 +462,8 @@ from .query_hit_hierarchy_level import QueryHitHierarchyLevel
 from .query_hit_index_scores import QueryHitIndexScores
 from .query_hit_source import QueryHitSource
 from .query_hits import QueryHits
+from .query_hits_total import QueryHitsTotal
+from .query_hits_total_relation import QueryHitsTotalRelation
 from .query_profile import QueryProfile
 from .query_responses import QueryResponses
 from .query_result import QueryResult
@@ -1048,6 +1050,8 @@ __all__ = (
     "QueryHitIndexScores",
     "QueryHits",
     "QueryHitSource",
+    "QueryHitsTotal",
+    "QueryHitsTotalRelation",
     "QueryProfile",
     "QueryResponses",
     "QueryResult",

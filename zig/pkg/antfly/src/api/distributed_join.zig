@@ -3137,7 +3137,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
             if (query_req.identity_read_generation == null) {
                 query_req.identity_read_generation = search_result.identity_read_generation;
             }
-            if (total_hits == null) total_hits = search_result.total_hits;
+            if (total_hits == null or search_result.total_hits > total_hits.?) total_hits = search_result.total_hits;
             if (search_result.hits.len == 0) break;
 
             _ = try join_model.appendUnmatchedRightJoinSearchHitsAlloc(
@@ -3151,7 +3151,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
             );
 
             scanned_hits += search_result.hits.len;
-            if (scanned_hits >= search_result.total_hits) break;
+            if (search_result.total_hits_relation == .exact and scanned_hits >= search_result.total_hits) break;
             try requireStampedJoinFollowupRequest(query_req);
             query_req.offset = @intCast(scanned_hits);
             continue;
@@ -3162,8 +3162,8 @@ fn appendGroupLocalUnmatchedRightJoinHits(
 
         var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{}) catch return error.InternalFailure;
         defer parsed.deinit();
-        const page_total_hits = try queryTotalHits(parsed.value);
-        if (total_hits == null) total_hits = page_total_hits;
+        const page_total_hits = try queryHitsTotal(parsed.value);
+        if (total_hits == null or page_total_hits.value > total_hits.?) total_hits = page_total_hits.value;
         const hits_ptr = try queryHitsArrayPtr(&parsed.value);
         if (hits_ptr.items.len == 0) break;
 
@@ -3178,7 +3178,7 @@ fn appendGroupLocalUnmatchedRightJoinHits(
         );
 
         scanned_hits += hits_ptr.items.len;
-        if (scanned_hits >= page_total_hits) break;
+        if (page_total_hits.relation == .exact and scanned_hits >= page_total_hits.value) break;
         try requireStampedJoinFollowupRequest(query_req);
         query_req.offset = @intCast(scanned_hits);
     }
@@ -3723,7 +3723,7 @@ fn loadRightJoinQueryAlloc(
 ) !LoadedRightJoinQuery {
     var parsed = try executeRightJoinQueryParsedAlloc(ctx, alloc, source, join, query_value.*, nested_foreign_leaf_join);
     errdefer parsed.deinit();
-    const total_hits = try queryTotalHits(parsed.value);
+    const total_hits = try queryExactTotalHits(parsed.value);
     var hits_ptr = try queryHitsArrayPtr(&parsed.value);
     const explicit_right_limit = join.right_filters != null and join.right_filters.?.limit != null;
 
@@ -4355,7 +4355,18 @@ pub fn queryHitsArrayPtr(root: *std.json.Value) !*std.json.Array {
     return try join_model.queryHitsArrayPtr(root);
 }
 
-fn queryTotalHits(root: std.json.Value) !usize {
+const QueryHitsTotal = struct {
+    value: usize,
+    relation: db_mod.types.TotalHitsRelation,
+};
+
+fn queryExactTotalHits(root: std.json.Value) !usize {
+    const total = try queryHitsTotal(root);
+    if (total.relation != .exact) return error.UnsupportedQueryRequest;
+    return total.value;
+}
+
+fn queryHitsTotal(root: std.json.Value) !QueryHitsTotal {
     if (root != .object) return error.InvalidQueryRequest;
     const responses = root.object.get("responses") orelse return error.InvalidQueryRequest;
     if (responses != .array or responses.array.items.len == 0) return error.InvalidQueryRequest;
@@ -4364,9 +4375,14 @@ fn queryTotalHits(root: std.json.Value) !usize {
     const hits = response.object.get("hits") orelse return error.InvalidQueryRequest;
     if (hits != .object) return error.InvalidQueryRequest;
     const total = hits.object.get("total") orelse return error.InvalidQueryRequest;
-    return switch (total) {
-        .integer => |value| @intCast(value),
-        else => error.InvalidQueryRequest,
+    if (total != .object) return error.InvalidQueryRequest;
+    const value = total.object.get("value") orelse return error.InvalidQueryRequest;
+    const relation = total.object.get("relation") orelse return error.InvalidQueryRequest;
+    if (value != .integer or value.integer < 0) return error.InvalidQueryRequest;
+    if (relation != .string) return error.InvalidQueryRequest;
+    return .{
+        .value = @intCast(value.integer),
+        .relation = try query_contract.parseTotalHitsRelation(relation.string),
     };
 }
 
@@ -5183,6 +5199,7 @@ fn appendGroupLocalJoinHits(
         if (query_req.identity_read_generation == null) {
             query_req.identity_read_generation = search_result.identity_read_generation;
         }
+        if (!explicit_limit and search_result.total_hits_relation != .exact) return error.UnsupportedQueryRequest;
         if (!explicit_limit and search_result.hits.len < search_result.total_hits) {
             try requireStampedJoinFollowupRequest(query_req);
             query_req.limit = search_result.total_hits;
@@ -5199,7 +5216,7 @@ fn appendGroupLocalJoinHits(
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, response.json, .{}) catch return error.InternalFailure;
     defer parsed.deinit();
     var hits_ptr = try queryHitsArrayPtr(&parsed.value);
-    const total_hits = try queryTotalHits(parsed.value);
+    const total_hits = try queryExactTotalHits(parsed.value);
 
     if (!explicit_limit and hits_ptr.items.len < total_hits) {
         try requireStampedJoinFollowupRequest(query_req);
