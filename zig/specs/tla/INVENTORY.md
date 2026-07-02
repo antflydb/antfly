@@ -14,8 +14,9 @@ uses these meanings:
 Every row should eventually have a negative-validation entry showing that the
 listed invariant can fail when the modeled bug is injected.
 
-Critique-specific repairs and remaining known weak spots are tracked in
-`TLA_CRITIQUE_REPAIR.md`.
+Remaining weak spots are tracked inline in this file: the Safety-pin
+migration debt list (audit-reported), the liveness mutant backlog, the
+bounds backlog, and the routed work items below.
 
 ## Coverage Matrix
 
@@ -57,7 +58,6 @@ Critique-specific repairs and remaining known weak spots are tracked in
 | Document identity range repair trace fixtures | `TraceAntflyDocumentIdentityRangeRepair.tla`, `TraceAntflyDocumentIdentityRangeRepair.cfgs`, `specs/tla/traces/doc_identity_restore_*.ndjson`, `specs/tla/traces/negative/doc_identity_restore_*.ndjson` | Trace | same document identity range/restore repair anchors plus DB restore/import ordering anchors in `storage/db/db.zig` | checked-in positive fixtures for namespace rejection and repair ordering; expected-failure fixtures for accepting mismatched strict restore and early intent clear | every event is consumed by a valid model action, strict deferred restore cannot accept a mismatched namespace, runtime repair waits for recovered primary import, restore intent clears only after repair completion | checked fixtures are hand-authored rather than emitted by live Zig tests; exact restore artifact bytes, persisted status row schemas, import stream payloads, and multi-placement quorum progress remain abstract | add live/test-generated fixture emission only if model-fixture evidence is not enough for future restore repair changes |
 | Managed host lifecycle | `AntflyManagedHostLifecycle.tla`, `.cfgs`, `AntflyManagedHostLifecycleBadPrematureRestore`, `AntflyManagedHostLifecycleBadStaleRoute`, `AntflyManagedHostLifecycleBadReviveRemoved`, `AntflyManagedHostLifecycleBadRestoreCancel` | Partial | `pkg/antfly/src/raft/managed_host.zig`, `pkg/antfly/src/raft/host.zig`, `pkg/antfly/src/raft/sim_harness.zig`, `pkg/antfly/src/metadata/reconciler.zig` restore bootstrap projection | managed host restore/restart/route-removal tests, managed host simulation removal/restart tests | active replicas are hosted, routes only target active desired replicas, hosted replicas have durable apply stores, replica catalog only retains desired groups, restore bootstrap status requires desired group, restore preparation cannot activate/route before success, restart activates/routes only cataloged desired groups | still abstracts peer lists, exact catalog records, bootstrap error details, WAL/proposal persistence, leader election, queued metadata update ordering, transition service interactions, and group IDs beyond metadata/data | add trace/refinement from managed host simulation events if instrumentation becomes worthwhile; split WAL proposal persistence into a separate model if needed |
 | Lite publication | `AntflyLitePublication.tla`, `.cfgs`, `AntflyLitePublicationBadManifestBeforeArtifacts`, `AntflyLitePublicationBadFailedHead`, `AntflyLitePublicationBadPinnedCleanup`, `AntflyLitePublicationBadMixedGeneration` | Partial | Lite/serverless publication, manifest, segment, query-runtime pinning, restore-staging, native checkpoint/snapshot, and cleanup code | serverless publication/runtime/object-store/catalog tests; Lite native and CLI restore/snapshot tests | artifact families publish before manifest references, manifest head advances only from complete published refs, crash after manifest/no-head can be retried, visible generation references one generation, reader pins one generation while head advances, failed publication cannot advance head, cleanup cannot delete reader-pinned generation | abstracts exact object-store CAS/write bytes, native page/checkpoint layout, multiple simultaneous readers, manifest schema fields, per-index payload contents, retention horizons beyond two generations, and real concurrent publisher arbitration | add trace/test mapping for serverless publication actions, expand to multi-reader retention, and split native checkpoint/free-page detail into a sibling model if it grows too large |
-| OpenAPI codegen | `AntflyOpenApiCodegen.tla`, `.cfgs`, `AntflyOpenApiCodegenBadStalePackage`, `AntflyOpenApiCodegenBadStaleRoot`, `AntflyOpenApiCodegenBadInternalLeak`, `AntflyOpenApiCodegenBadPartialCommit` | Partial | `openapi.yaml`, modular OpenAPI specs, `zig/build.zig` OpenAPI regen/check wiring, checked-in generated packages, public client/server modules, internal server modules | `openapi-root-check`, standalone `lib/openapi` tests, `antfly-client-test`, HA generated-route and OpenAPI enum tests | root public OpenAPI must match joined/prefixed modular specs before generated-check passes, generated package versions must match their source spec view, public server/extractor package uses joined public spec, public client uses prefixed public spec, generated modes and import mappings must match expected package shape, public packages cannot import internal-only packages, failed partial generation cannot become committed | models representative package families rather than every generated directory, abstracts exact generated source bytes, parser AST shape, full `$ref` resolver graph, generator formatting, OpenAPI 3.0/3.1 nullable details, and `git status` dirtiness mechanics | add a test-to-action table for every `addOpenApiRegenRun`, split generator AST-shape rules into a sibling model if needed, and add trace/hash checks for generated package freshness |
 | ML graph passes/runtime | `AntflyMlGraphPasses.tla`, `.cfgs`, `AntflyMlGraphPassesBadDanglingCse`, `AntflyMlGraphPassesBadParameterDedup`, `AntflyMlGraphPassesBadMissingLowerClosure`, `AntflyMlGraphPassesBadFallbackRuntime`, `AntflyMlGraphPassesBadPartialPublish` | Partial | `lib/ml/src/graph/passes/{pipeline,cse,dce,fuse}.zig`, `lib/ml/src/graph/lower.zig`, `pkg/inference/src/graph/{partition_export,runtime,pjrt_compiler}.zig` | focused `lib/ml` graph root filters, lower test, inference partition-export/runtime filters | pass output ordering, no dangling current/exported graph references, output preservation, CSE cannot collapse parameter/constant identity, fused export preserves primitive lower closure when vjp alternate is present, external cross-partition runtime input is materialized, failed pass output is not visible, runtime publish fails closed on fallback partitions | bounded representative graph, abstracts concrete op/hash/shape equality, fixed-point iteration counts, exact fused pattern catalog, PJRT/native compiler artifact bytes, ONNX import lowering, scheduling/concurrency, and runtime executor lifetimes; current full standalone `lib/ml` test step has an unrelated existing SDPA fuse failure so focused tests are the counted alignment evidence | add a sibling model for pattern-specific fuse/shape rewrites if needed, and keep PJRT compiler output-selection/externalization coverage in the compiler-specific model |
 | ML graph DAG CSE/DCE | `AntflyMlGraphDagPasses.tla`, `.cfgs`, `AntflyMlGraphDagPassesBadCseMissDuplicate`, `AntflyMlGraphDagPassesBadCseNoConsumerRemap`, `AntflyMlGraphDagPassesBadDceDropReachable`, `AntflyMlGraphDagPassesBadDceNonTopoMap` | Partial | `lib/ml/src/graph/passes/{cse,dce,pipeline}.zig` | focused `lib/ml` graph root filters for unary/binary CSE, DCE `id_map`, DCE vjp/fused cases, and cleanup/fixed-point pipeline behavior | duplicate op producers redirect to earlier equal expressions, data nodes are never deduplicated, consumers/outputs/parameters remap through CSE redirects, DCE keeps exactly nodes reachable from remapped outputs, DCE `id_map` is compact and topological, final compacted references are valid | bounded five-node DAG shapes, abstracts concrete op attribute/hash/shape equality and hash collisions, allocator failures, exact vjp-alternate reachability in the arbitrary-DAG model, fuse rewrites, export/runtime publication, and fixed-point pass iteration counts; vjp/fuse/export/runtime are covered by separate models/tests | add op-attribute/hash-collision variants or live graph-pass trace fixtures only if future graph-pass changes need more correspondence |
 | ML compiler publication | `AntflyMlCompilerPublication.tla`, `.cfgs`, `AntflyMlCompilerPublicationBadStaleCompile`, `AntflyMlCompilerPublicationBadMissingInput`, `AntflyMlCompilerPublicationBadOutputSelection`, `AntflyMlCompilerPublicationBadFallbackPublish`, `AntflyMlCompilerPublicationBadPartialArtifact` | Partial | `pkg/inference/src/graph/partition_export.zig`, `pkg/inference/src/graph/pjrt_compiler.zig`, `pkg/inference/src/graph/runtime.zig` | PJRT compiler tests with `-Dpjrt=true`, partition export tests, graph runtime gate/native executor tests | partition export materializes parameters and semantic KV cache inputs, export includes compiler outputs, compiler artifacts are complete exports, runtime publication uses a fresh graph/export version, failed compiler artifacts are not visible, runtime output selection exposes only selected final outputs, fallback partitions fail closed before executor publication | abstracts exact HLO/native artifact bytes, dynamic shape/layout details, full partition planner search, runtime executor lifetime, real cache invalidation keys, compile concurrency, and backend-specific capability matrices | add native/PJRT artifact hash/refinement checks if compiler outputs become traceable; add pattern-specific compiler lowering models for GQA/RoPE only if bugs justify the state space |
@@ -68,16 +68,15 @@ Critique-specific repairs and remaining known weak spots are tracked in
 |---|---|---|---|
 | Replay hint lane visibility | Partial derived replay model plus direct replay-source/DB tests | stale hint metadata or empty hint lane can skip real work; current tests also encode hint-lane-required primary-store behavior | map direct replay-source tests to individual TLA actions and add trace fixtures only if the worker event vocabulary stabilizes |
 | HA failover acknowledged-write preservation and fencing | Focused failover, partition-fence, gate-transition, sync-wait, timeline-switch, standby-apply, and rejoin models with expected-failure mutants | a promoted standby can lose a write that another standby acknowledged, an old primary can accept writes after promotion, or a stale gate decision can outlive demotion/fencing | add trace or generated fixtures from HA promotion/fencing tests after the model contract stabilizes |
-| Product write/query control plane | Batcher coalescing, CDC cutover, split bridge, query completeness, transaction/session, and OpenAPI publication models | stale or partial visibility around write flush, snapshot/stream handoff, split routing, or generated API publication can hide or duplicate user-visible state | keep TLA+ to ordering/visibility/publication; validate top-K, pagination math, analyzers, predicates, and payload bytes with property/golden/fuzz tests |
+| Product write/query control plane | Batcher coalescing, CDC cutover, split bridge, query completeness, and transaction/session models | stale or partial visibility around write flush, snapshot/stream handoff, split routing, or generated API publication can hide or duplicate user-visible state | keep TLA+ to ordering/visibility/publication; validate top-K, pagination math, analyzers, predicates, and payload bytes with property/golden/fuzz tests |
 | Enrichment worker target advancement | Partial enrichment worker model plus focused Zig tests | applied watermark can advance past hidden generated work | map remaining split-fencing and asset-producer tests to model actions |
 | Restore runtime repair | Partial document-identity range/restore repair model, metadata restore-intent tests, and checked restore trace fixtures for strict mismatch and import-before-repair ordering; DB restore tests exist but still lack a clean focused build hook | mixed restored generated artifacts and replay debt, especially when primary import recovery and runtime repair ordering diverge | add implementation-emitted or test-generated restore traces only if checked fixtures need to become live evidence |
 | Vector/search/backup data plane | TLA+ currently covers publication/control-plane boundaries only | byte corruption, HBC/kmeans recall regression, BM25/analyzer math, predicate/hash bugs, and backup content integrity are poorly served by TLA+ state abstraction | add simulation, differential, golden corpus, checksum/restore, and property tests instead of more TLA+ |
-| OpenAPI compatibility | OpenAPI codegen model plus generated checks | stale generated public/internal API mismatch | keep the model-to-codegen target table current when generated package layout or public/internal API boundaries change |
+| OpenAPI compatibility | ROUTED, no model: `zig build openapi-root-check` and `generated-check` verify the real generated artifacts directly, which is stronger evidence than a hand-modeled abstraction (model removed in review) | stale generated public/internal API mismatch | keep the build checks wired to every generated package |
 | ML graph runtime pass ordering | Partial graph pass/export/runtime gate model, bounded DAG CSE/DCE model, compiler publication model, and focused tests | invalid pass output can be published and consumed, especially around fused lower closure, DCE remapping, and fallback runtime gates | add pattern-specific fuse/shape rewrites or graph-pass trace fixtures if bugs justify the extra state space |
 
 The control-plane surfaces found by the July 1 final critique are now all
-either modeled or explicitly routed away from TLA+ (see
-`TLA_CRITIQUE_REPAIR.md` "New Coverage Backlog ... RESOLVED"): node drain
+either modeled or explicitly routed away from TLA+: node drain
 (`AntflyNodeDrainLifecycle`), table create/drop (`AntflyTableLifecycle`),
 WAL retention/reseed + backup slots (`AntflyHARetentionReseed`), entity
 promotion single-owner across split/merge (`AntflyPromotionOwnerHandoff`),
@@ -116,17 +115,17 @@ Not every model carries the same evidentiary weight. Tiers:
 
 | Tier | Models |
 |---|---|
-| Mature | `AntflyBatcherCoalescing` (red->green correspondence test), `AntflyDerivedReplay` (executed co-write tests), `AntflyEnrichmentLease`, `AntflyLmdbCommit`, `AntflyLsmWalCompaction`, `AntflyTransaction`, `AntflyTransactionSession` (+trace fixtures), `AntflyShardSplit`, `AntflySnapshotTransfer`, `AntflyDocumentIdentity`, `AntflyDocumentIdentityRangeRepair` (+trace fixtures), `AntflyHASyncWait`, `AntflyHATimelineSwitch`, `AntflyHAStandbyApply`, `AntflyHARejoin`, `AntflyHAReplication`, `AntflySplitRefinementBridge` (+trace fixtures), `AntflyLitePublication`, `AntflyOpenApiCodegen`, `AntflyMlGraphPasses`, `AntflyMlGraphDagPasses`, `AntflyMlCompilerPublication`, `AntflyManagedHostLifecycle` |
+| Mature | `AntflyBatcherCoalescing` (red->green correspondence test), `AntflyDerivedReplay` (executed co-write tests), `AntflyEnrichmentLease`, `AntflyLmdbCommit`, `AntflyLsmWalCompaction`, `AntflyTransaction`, `AntflyTransactionSession` (+trace fixtures), `AntflyShardSplit`, `AntflySnapshotTransfer`, `AntflyDocumentIdentity`, `AntflyDocumentIdentityRangeRepair` (+trace fixtures), `AntflyHASyncWait`, `AntflyHATimelineSwitch`, `AntflyHAStandbyApply`, `AntflyHARejoin`, `AntflyHAReplication`, `AntflySplitRefinementBridge` (+trace fixtures), `AntflyLitePublication`, `AntflyMlGraphPasses`, `AntflyMlGraphDagPasses`, `AntflyMlCompilerPublication`, `AntflyManagedHostLifecycle` |
 | Useful | `AntflyHAFailoverSafety`, `AntflyHAPartitionFence`, `AntflyHAGateTransitions`, `AntflyHAGates`, `AntflyCdcCutover` (anchor correction pending), `AntflyQueryCompleteness`, `AntflyShardSplitSeq`, `AntflySnapshotContent`, `AntflyLsmReserveCleanup`, `AntflyDbSplitVisibility`, `AntflyLsmLifecycle`, `AntflyNodeDrainLifecycle`, `AntflyTableLifecycle`, `AntflyHARetentionReseed`, `AntflyIndexLifecycle` |
 | Sketch | `AntflyPromotionOwnerHandoff` — a focused authority/ownership guardrail (detach-before-transfer-before-attach), NOT deep implementation correspondence: its state space is tiny and it intentionally collapses raft leadership, group identity, and runtime hook detail into range ownership + an attachment bit. |
-| Routed | Distributed join leases (sim harness), owner-job gate composition (Zig race tests), merge rollback (no abort path exists) — see `TLA_CRITIQUE_REPAIR.md` for the concrete work items. |
+| Routed | Distributed join leases — fault-injection shuffle-join scenarios in `metadata/sim_harness.zig` (kill/stall the finalizer mid-dispatch, force lease expiry, verify takeover produces a duplicate-free result set). Owner-job gate composition — Zig race tests around `data/runtime.zig` `haOwnerJobCanRun` (fence/demote between the cached gate decision and each guarded job kind). Merge prepare->cutover rollback — not modeled; the implementation has no abort path. OpenAPI codegen freshness — verified by the real build checks (`openapi-root-check`, `generated-check`); model removed in review. |
 
 Negative-config pinning status (checked by `bash ../scripts/tla-check.sh audit`): critic-response,
 new-coverage, and the six migrated priority groups (HA sync-wait /
 timeline-switch / standby-apply / rejoin, document identity range repair,
 managed host lifecycle, ML graph/DAG/compiler publication) pin named semantic
-invariants; 25 older configs (DbSplitVisibility, DocumentIdentity, HAGates,
-LitePublication, LmdbCommit, LsmWalCompaction, LsmLifecycle, OpenApiCodegen,
+invariants; 21 older configs (DbSplitVisibility, DocumentIdentity, HAGates,
+LitePublication, LmdbCommit, LsmWalCompaction, LsmLifecycle,
 SplitRefinementBridge) still include the broad `Safety` conjunction and are
 tracked migration debt. Do NOT describe the suite as fully pinned until
 `bash ../scripts/tla-check.sh audit` reports zero Safety-pinned configs.
@@ -253,10 +252,6 @@ model: what a regression looks like and the mutant that would expose it.
 | `AntflyLitePublication` | failed publication advances visible head | `FailedPublicationCannotAdvanceVisibleGeneration` |
 | `AntflyLitePublication` | cleanup deletes data pinned by an open reader | `CleanupCannotDeleteReaderPinnedGeneration` |
 | `AntflyLitePublication` | visible generation mixes document/index segment refs from different generations | `VisibleManifestReferencesPublishedArtifacts` / `ReaderGenerationIsPinnedAndConsistent` |
-| `AntflyOpenApiCodegen` | generated-check passes while a generated package is stale | `GeneratedCheckOnlyPassesForCurrentState` |
-| `AntflyOpenApiCodegen` | generated-check passes while root `openapi.yaml` is stale relative to modular public specs | `GeneratedCheckOnlyPassesForCurrentState` |
-| `AntflyOpenApiCodegen` | public client imports an internal-only generated package | `CommittedPackageShapeValid` |
-| `AntflyOpenApiCodegen` | failed partial generation is committed | `NoCommittedPartialPackages` |
 | `AntflyMlGraphPasses` | CSE removes a duplicate producer without remapping consumers | `CurrentGraphReferencesValid` |
 | `AntflyMlGraphPasses` | CSE collapses parameter/constant identity while leaving a structurally valid graph | `ParameterAndConstantIdentityPreserved` |
 | `AntflyMlGraphPasses` | partition export omits a fused node's primitive lower closure | `ExportedGraphReferencesValid` |
@@ -418,7 +413,6 @@ external `TRACE_FILES`.
 | Fast | `tla-check CHECK=AntflyMlGraphPasses` | ML graph pass ordering | 61 | 36 | 9 | 00s |
 | Fast | `tla-check CHECK=AntflyMlGraphDagPasses` | ML graph DAG CSE/DCE remapping | 9 | 9 | 3 | 00s |
 | Fast | `tla-check CHECK=AntflyMlCompilerPublication` | ML compiler publication | 67 | 36 | 7 | 00s |
-| Fast | `tla-check CHECK=AntflyOpenApiCodegen` | OpenAPI codegen publication | 2,631,870 | 216,814 | 24 | 01s |
 | Heavy | `tla-check CHECK=AntflyHAReplication` | HA replication slot/fence/promotion/rejoin | 1,195,393,777 | 36,781,728 | 25 | 04min 27s |
 | Heavy | `tla-check CHECK=AntflyDerivedReplay-heavy-depth` | derived replay MaxSeq=3 single-index bounds | 3,981 | 1,160 | 19 | 00s |
 | Heavy | `tla-check CHECK=AntflyDerivedReplay-heavy-multi-index` | derived replay MaxSeq=2 two-index bounds | 90,773 | 17,176 | 27 | 00s |
@@ -427,8 +421,8 @@ external `TRACE_FILES`.
 Runtime-budget notes:
 
 - `tla-check-smoke`, `tla-check-fast`, and `tla-check-negative` are suitable
-  developer-facing gates; the fast positive tier is currently dominated by
-  OpenAPI codegen at 216,814 distinct states.
+  developer-facing gates; the largest fast-tier positive is
+  document identity range repair at 95,040 distinct states.
 - `tla-check-snap` and `tla-check CHECK=AntflyHAReplication` are the positive scheduled
   checks above one million distinct states.
 - `tla-check CHECK=AntflyDerivedReplay-heavy` preserves the old combined MaxSeq=3 /
@@ -903,40 +897,6 @@ failed in restore staging while another full Lite native suite was running. The
 same case passed in the serial rerun, so it is not counted as model/product
 evidence. Future focused validation should avoid launching duplicate full Lite
 targets because several build targets ignore `--test-filter`.
-
-Focused validation already run for the deepened OpenAPI/codegen publication
-model:
-
-- `make tla-check CHECK=AntflyOpenApiCodegen`: green, 216,814 distinct states.
-- `make tla-check CHECK=AntflyOpenApiCodegenBadStalePackage`: stale generated
-  package check mutant fails on `GeneratedCheckOnlyPassesForCurrentState`.
-- `make tla-check CHECK=AntflyOpenApiCodegenBadStaleRoot`: stale root
-  `openapi.yaml` check mutant fails on
-  `GeneratedCheckOnlyPassesForCurrentState`.
-- `make tla-check CHECK=AntflyOpenApiCodegenBadInternalLeak`: public client
-  internal import mutant fails on `CommittedPackageShapeValid`.
-- `make tla-check CHECK=AntflyOpenApiCodegenBadPartialCommit`: failed partial
-  generation commit mutant fails on `NoCommittedPartialPackages`.
-- `bash ../scripts/tla-check.sh negative`: green expected-failure harness after adding the
-  OpenAPI mutants.
-- `make tla-check TIER=fast`: green after the OpenAPI model deepening.
-- `zig build openapi-root-check`: green; `../openapi.yaml` is current relative
-  to the modular public specs.
-- `cd lib/openapi && zig build test`: green for generator/parser/naming tests,
-  including required nullable, recursive oneOf, allOf flattening, and
-  oneOf-variant field flattening coverage.
-- `zig build antfly-client-test`: green for the checked-in generated public
-  client package compile surface.
-- `zig build ha-test`: green in a serial run, 274 passed, including generated
-  admin/internal route dispatch, generated route method errors, OpenAPI ALL
-  sync policy decoding, and OpenAPI enum spelling in the HA HTTP client.
-
-Current OpenAPI validation note: attempts to pass exact `--test-filter` values
-to `ha-test` launched broad 274-test HA runs because the target ignores those
-extra filters. Two duplicate broad runs happened to complete green, and two
-overlapping broad runs failed with temp/lock/crash symptoms. Those duplicate
-parallel failures are not counted as product evidence; the serial full
-`ha-test` run is the validation record.
 
 Focused validation already run for the deepened managed host lifecycle model:
 

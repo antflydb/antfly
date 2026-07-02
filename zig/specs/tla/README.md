@@ -1,25 +1,51 @@
 # TLA+ Formal Specifications
 
-## Modeling Maturity Plan
+## Standards
 
-`MODELING_PLAN.md` tracks the work required to turn the current set of specs
-into accurate lower-level models with validation at each step. It defines model
-maturity criteria, coverage inventory requirements, negative-validation
-expectations, and the phased deepening order. Start there before adding new
-models or broadening existing ones.
+`INVENTORY.md` is the live inventory: every model's code anchors, checks,
+invariants, correspondence evidence, quality tier, and open backlog items.
 
-`MODEL_COVERAGE.md` is the live coverage inventory that maps each model to code
-anchors, Zig tests/traces, checked invariants, known gaps, and next validation
-steps.
+A model is mature only when it has: (1) code/test anchors for every state
+variable and action, (2) at least one deliberately-broken check per semantic
+rule, verified to fail on exactly that rule, (3) bounded but
+implementation-shaped state, and (4) a note for every behavior deliberately
+left out. Do not call a model mature merely because TLC exhausts its bounded
+state space.
 
-`TLA_CRITIQUE_REPAIR.md` tracks critique-specific repairs and the remaining
-known weak spots that should block any claim of repository-wide modeling
-maturity.
+`bash ../scripts/tla-check.sh audit` is the static hygiene audit: leftover
+`_TTrace_` artifacts, `Buggy*` constants no check enables, sections no tier
+would ever run (hard failures), and Safety-conjunction-pinned checks
+(reported migration debt). It runs as part of the default `make tla-check`
+gate; run it before any handoff.
 
-`bash ../scripts/tla-check.sh audit` runs the static hygiene audit: orphan negative configs,
-leftover `_TTrace_` artifacts, `Buggy*` constants without an enabling
-expected-failure config (hard failures), and Safety-conjunction-pinned
-negative configs (reported migration debt). Run it before any handoff.
+## What Belongs In TLA+
+
+Model a contract here only when the bug lives in an interleaving, ordering,
+crash window, or partial-visibility window that deterministic tests cannot
+reliably trigger. Wrong values, formulas, byte layouts, and numeric
+thresholds (recall, ranking math, checksums, payload bytes) belong in
+property/simulation/golden/fuzz tests: a model of those abstracts away
+exactly the thing that breaks. And when a deterministic checker of the real
+artifact already exists (e.g. the generated-OpenAPI freshness checks), prefer
+it over a model of the artifact. Routed-away work is tracked in
+`INVENTORY.md` so it is not forgotten.
+
+## Keeping Models Current
+
+Three layers, in decreasing order of automation:
+
+1. **Zig correspondence tests** (in the normal test suite) anchor the
+   models' load-bearing assumptions; they fail on real drift, including
+   after toolchain updates.
+2. **CI** runs the full gate whenever specs or the TLA scripts change, and
+   validates implementation-emitted raft/transaction traces whenever the
+   traced code changes (`zig-tests.yml` `tla-verify`).
+3. **Review discipline**: `INVENTORY.md` maps code files to models. A PR
+   touching an anchored file should re-run that model and its mutants
+   (`make tla-check CHECK=<id>`) and update the model if the contract
+   changed. Useful/Sketch-tier models have no executable tripwire; review
+   is the only guard there.
+
 
 ## Layout
 
@@ -57,7 +83,7 @@ Every new `.tla` model must start with a comment block containing:
 4. **State bounds** — the constants that bound the state space.
 5. **Make targets** — the positive target and each expected-failure target.
 6. **Correspondence tier** — test-backed, trace-backed, or hand-modeled
-   (see the quality tiers in `MODEL_COVERAGE.md`).
+   (see the quality tiers in `INVENTORY.md`).
 
 Negative configs must pin the specific semantic invariant the mutant
 violates; if multiple invariants are intentionally coupled, say so in the
@@ -232,11 +258,6 @@ These specs are intentionally separate bounded models. They cover implementation
 - `AntflyMlCompilerPublicationBadOutputSelection` -- Expected-failure semantic KV side-output leak mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyMlCompilerPublicationBadFallbackPublish` -- Expected-failure fallback partition executor publication mutant used by `bash ../scripts/tla-check.sh negative`.
 - `AntflyMlCompilerPublicationBadPartialArtifact` -- Expected-failure partial compiler artifact visibility mutant used by `bash ../scripts/tla-check.sh negative`.
-- `AntflyOpenApiCodegen.tla` -- OpenAPI checked-generation publication across modular spec versions, joined/prefixed public specs, root `openapi.yaml`, generated package modes, import mappings, public/internal package boundaries, committed state, failed partial generation, and `generated-check` pass/fail state.
-- `AntflyOpenApiCodegenBadStalePackage` -- Expected-failure stale generated package mutant used by `bash ../scripts/tla-check.sh negative`.
-- `AntflyOpenApiCodegenBadStaleRoot` -- Expected-failure stale root `openapi.yaml` mutant used by `bash ../scripts/tla-check.sh negative`.
-- `AntflyOpenApiCodegenBadInternalLeak` -- Expected-failure public client internal import mutant used by `bash ../scripts/tla-check.sh negative`.
-- `AntflyOpenApiCodegenBadPartialCommit` -- Expected-failure failed partial generation commit mutant used by `bash ../scripts/tla-check.sh negative`.
 
 ### Raft Consensus (etcd/raft)
 
