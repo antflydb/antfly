@@ -761,9 +761,9 @@ fn parseOutputFormat(value: []const u8) ?OutputFormat {
 fn configureBackendPreference(session_manager: *backends.SessionManager, choice: BackendChoice) void {
     session_manager.preferred_backends = switch (choice) {
         .auto => if (build_options.enable_metal)
-            &.{ backends.BackendType.onnx, backends.BackendType.metal, backends.BackendType.native }
+            &.{ backends.BackendType.metal, backends.BackendType.native }
         else
-            &.{ backends.BackendType.onnx, backends.BackendType.native },
+            &.{backends.BackendType.native},
         .onnx => &.{backends.BackendType.onnx},
         .native => &.{backends.BackendType.native},
         .metal => if (build_options.enable_metal) &.{backends.BackendType.metal} else &.{backends.BackendType.native},
