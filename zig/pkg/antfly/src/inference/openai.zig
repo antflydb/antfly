@@ -30,6 +30,7 @@ pub const Provider = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    request_timeout_ms: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -70,6 +71,10 @@ pub const Provider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: u64) void {
+        self.request_timeout_ms = timeout_ms;
+    }
+
     pub fn embedder(self: *Provider) inference.Embedder {
         return .{
             .ptr = @ptrCast(self),
@@ -98,7 +103,7 @@ pub const Provider = struct {
             .input = .{ .array = input_array },
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .timeout_ms = self.request_timeout_ms });
         defer resp.deinit();
         if (!resp.ok()) return mapEmbedStatus(resp.status.code);
         const body = resp.body orelse return error.EmptyResponse;
@@ -157,7 +162,7 @@ pub const Provider = struct {
             .max_tokens = self.max_tokens,
         });
         defer self.allocator.free(json_body);
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders() });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = self.authHeaders(), .timeout_ms = self.request_timeout_ms });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;

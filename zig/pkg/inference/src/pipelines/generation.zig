@@ -176,7 +176,33 @@ pub const GenerationConfig = struct {
     /// KV cache compaction ratio after prefill. null = no compaction.
     /// 0.02 = 50x compression, 0.1 = 10x compression.
     cache_compaction_ratio: ?f32 = null,
+    /// Monotonic absolute deadline for local generation. null = no deadline.
+    deadline_ns: ?u64 = null,
 };
+
+fn generationMonotonicNowNs() u64 {
+    var ts: std.posix.timespec = undefined;
+    return switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => 0,
+    };
+}
+
+pub fn generationDeadlineExpired(deadline_ns: u64) bool {
+    const now_ns = generationMonotonicNowNs();
+    return now_ns == 0 or now_ns >= deadline_ns;
+}
+
+fn enforceGenerationDeadline(config: GenerationConfig) !void {
+    if (config.deadline_ns) |deadline_ns| {
+        if (generationDeadlineExpired(deadline_ns)) return error.DeadlineExceeded;
+    }
+}
+
+test "generation deadline detects expired monotonic deadline" {
+    try std.testing.expect(generationDeadlineExpired(0));
+    try std.testing.expect(!generationDeadlineExpired(std.math.maxInt(u64)));
+}
 
 /// Parsed chat template for rendering messages via Jinja2.
 pub const ChatTemplate = struct {
@@ -2017,6 +2043,7 @@ pub const NativeGenerationPipeline = struct {
         on_token_ctx: ?*anyopaque,
     ) !GenerationResult {
         const allocator = self.allocator;
+        try enforceGenerationDeadline(config);
         const started_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         var fallback_decode_state = NativeDecodeState.initContiguous(allocator);
         defer fallback_decode_state.deinit();
@@ -2045,6 +2072,7 @@ pub const NativeGenerationPipeline = struct {
         var encoded = try encodePromptForGeneration(self.tokenizer, allocator, prompt, 2048, self.add_bos_token, self.bos_token);
         const encoded_prompt_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
         defer encoded.deinit();
+        try enforceGenerationDeadline(config);
 
         var actual_prompt_tokens: usize = 0;
         while (actual_prompt_tokens < encoded.attention_mask.len and encoded.attention_mask[actual_prompt_tokens] != 0) : (actual_prompt_tokens += 1) {}
@@ -2269,6 +2297,7 @@ pub const NativeGenerationPipeline = struct {
         const prefill_last_hidden = prefill_output.last_hidden;
         const prefill_last_hidden_rows = prefill_output.last_hidden_rows;
         const finished_prefill_at = if (self.io) |io| std.Io.Timestamp.now(io, .awake) else std.Io.Timestamp.zero;
+        try enforceGenerationDeadline(config);
         defer if (prefill_last_logits) |logits| allocator.free(logits);
         defer if (prefill_last_hidden) |hidden| self.cb.free(hidden);
         debugGenerationStage(
@@ -2284,11 +2313,13 @@ pub const NativeGenerationPipeline = struct {
 
         // Compact KV cache after prefill if configured.
         if (config.cache_compaction_ratio) |ratio| {
+            try enforceGenerationDeadline(config);
             if (NativeDecodeState.requiresDeepSeekV4CompressedCache(self.gpt_config)) {
                 return error.DeepSeekV4CompressedKvCompactionNotSupported;
             }
             var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
             try decode_runtime.compactKvCache(.{ .target_ratio = ratio });
+            try enforceGenerationDeadline(config);
         }
 
         const vocab_size = self.gpt_config.vocab_size;
@@ -2350,6 +2381,7 @@ pub const NativeGenerationPipeline = struct {
 
         var used_prefill_first_token = false;
         if (!use_speculative) {
+            try enforceGenerationDeadline(config);
             if (try self.tryReturnPrefillFirstToken(
                 token_ids,
                 &seq_len,
@@ -2610,6 +2642,7 @@ pub const NativeGenerationPipeline = struct {
                     0;
                 var mtp_acceptance_gate_checked = false;
                 while (tokens_generated < max_tokens) {
+                    try enforceGenerationDeadline(config);
                     const remaining = max_tokens - tokens_generated;
                     const step_k = if (use_gemma4_mtp)
                         mtp_adaptive_k.nextK(remaining)
@@ -2647,6 +2680,7 @@ pub const NativeGenerationPipeline = struct {
                         );
 
                     speculative_stats.rounds += 1;
+                    try enforceGenerationDeadline(config);
                     speculative_stats.drafted_tokens += result.drafted;
                     speculative_stats.matched_draft_tokens += result.matched_drafts;
                     speculative_stats.accepted_tokens += result.accepted;
@@ -2742,6 +2776,7 @@ pub const NativeGenerationPipeline = struct {
                         defer if (fallback_prefill_logits) |logits| allocator.free(logits);
                         var fallback_greedy_token: ?usize = null;
                         const fallback_started_at = mtpProfileTimestamp(speculative_stats.mtp_profile.enabled, self.io);
+                        try enforceGenerationDeadline(config);
                         const fallback = try self.standardDecode(
                             token_ids,
                             &seq_len,
@@ -2775,6 +2810,7 @@ pub const NativeGenerationPipeline = struct {
                         defer if (fallback_prefill_logits) |logits| allocator.free(logits);
                         var fallback_greedy_token: ?usize = null;
                         const fallback_started_at = mtpProfileTimestamp(speculative_stats.mtp_profile.enabled, self.io);
+                        try enforceGenerationDeadline(config);
                         const fallback = try self.standardDecode(
                             token_ids,
                             &seq_len,
@@ -2920,6 +2956,7 @@ pub const NativeGenerationPipeline = struct {
                 use_cuda_prefill_greedy_token,
             },
         );
+        try enforceGenerationDeadline(config);
         var decode_runtime = BorrowedDecodeStateRuntime.init(decode_state);
         if (self.gpt_config.isQwen35() and decode_state.isPaged()) {
             try decode_state.ensureQwen35LinearCache(self.gpt_config);
@@ -2934,6 +2971,7 @@ pub const NativeGenerationPipeline = struct {
 
         if (self.compiled_partition_backend != null and self.compiled_attachment_target == .whole_model and self.graph_cache != null) {
             debugGenerationStage("executePrefill whole-model fast path seq_len={d}", .{seq_len});
+            try enforceGenerationDeadline(config);
             const decode_context = try decode_runtime.preparePrefill(seq_len, seq_len);
             if (allow_resident_greedy_token) {
                 if (try self.forwardGreedyCompiledModelToken(
@@ -2954,6 +2992,7 @@ pub const NativeGenerationPipeline = struct {
                 }
             }
             prefill_last_logits = try self.forwardLastLogits(prompt_ids, 1, seq_len, &decode_context);
+            try enforceGenerationDeadline(config);
             if (self.scheduler) |scheduler| {
                 if (self.scheduler_lease) |lease| {
                     scheduler.notePrefillProgress(lease, seq_len, seq_len);
@@ -2992,6 +3031,7 @@ pub const NativeGenerationPipeline = struct {
             }
             var processed: usize = 0;
             while (processed < seq_len) {
+                try enforceGenerationDeadline(config);
                 const scheduler_chunk = if (self.scheduler_lease) |lease| lease.prefill_chunk_size else current_chunk_size;
                 const chunk_size = @max(@min(current_chunk_size, scheduler_chunk), 1);
                 const chunk_end = @min(seq_len, processed + chunk_size);
@@ -3011,6 +3051,7 @@ pub const NativeGenerationPipeline = struct {
                                     }
                                     return err;
                                 };
+                                try enforceGenerationDeadline(config);
                                 processed = chunk_end;
                                 scheduler.notePrefillProgress(lease, processed, seq_len);
                                 continue;
@@ -3055,6 +3096,7 @@ pub const NativeGenerationPipeline = struct {
                         "executePrefill captured greedy token={d}",
                         .{prefill_greedy_token.?},
                     );
+                    try enforceGenerationDeadline(config);
                 } else {
                     const logits = self.forwardAllLogits(chunk, 1, chunk_end, &decode_context) catch |err| {
                         if (err == error.MemoryBudgetExceeded and chunk_size > 1) {
@@ -3075,6 +3117,7 @@ pub const NativeGenerationPipeline = struct {
                             .{self.gpt_config.vocab_size},
                         );
                     }
+                    try enforceGenerationDeadline(config);
                 }
                 processed = chunk_end;
                 if (self.scheduler) |scheduler| {
@@ -3089,6 +3132,7 @@ pub const NativeGenerationPipeline = struct {
                 if (self.scheduler_lease) |lease| {
                     if (self.io) |io| {
                         prefill_last_logits = try self.runScheduledPrefillBatch(scheduler, lease, io, decode_state, prompt_ids, seq_len, seq_len, true);
+                        try enforceGenerationDeadline(config);
                         scheduler.notePrefillProgress(lease, seq_len, seq_len);
                     } else {
                         _ = try decode_runtime.preparePrefill(seq_len, seq_len);
@@ -3383,6 +3427,7 @@ pub const NativeGenerationPipeline = struct {
         );
 
         while (tokens_generated < max_tokens) {
+            try enforceGenerationDeadline(config);
             var used_decode_microbatch = false;
             var next_device_token_tensor: ?ops.CT = null;
             errdefer if (next_device_token_tensor) |tensor| self.cb.free(tensor);
@@ -3483,6 +3528,7 @@ pub const NativeGenerationPipeline = struct {
                     gbnf_grammar,
                 );
             };
+            try enforceGenerationDeadline(config);
             const next_token = outcome.token;
             debugGenerationStage(
                 "standardDecode iter={d} sampled next_token={d} grammar_complete={}",
@@ -4545,6 +4591,7 @@ pub const NativeGenerationPipeline = struct {
 
         for (0..actual_k) |di| {
             _ = di;
+            try enforceGenerationDeadline(config);
             // Run draft model forward on the last token
             const draft_seq = seq_len.* + draft_count;
             const draft_query_len: usize = if (draft_runtime.kvView() != null and draft_count > 0) 1 else if (draft_runtime.kvView() != null) 1 else draft_seq;
@@ -4568,6 +4615,7 @@ pub const NativeGenerationPipeline = struct {
             // Advance draft KV cache
             _ = try draft_runtime.appendGeneratedToken();
         }
+        try enforceGenerationDeadline(config);
 
         if (draft_count == 0) return .{
             .drafted = 0,
@@ -4607,6 +4655,7 @@ pub const NativeGenerationPipeline = struct {
             return err;
         };
         defer allocator.free(target_logits);
+        try enforceGenerationDeadline(config);
 
         const verify_result = try self.acceptVerifiedDraftTokens(
             token_ids,
@@ -4712,6 +4761,7 @@ pub const NativeGenerationPipeline = struct {
         };
 
         for (0..actual_k) |_| {
+            try enforceGenerationDeadline(config);
             const source_token = token_ids[seq_len.* + draft_count - 1];
             const assistant_total_sequence_len = gemma4MtpAssistantTotalSequenceLen(position_mode, seq_len.*, draft_count);
             const assistant_ctx = gemma4MtpAssistantDecodeContext(decode_state, position_mode, seq_len.*, draft_count);
@@ -4781,6 +4831,7 @@ pub const NativeGenerationPipeline = struct {
             token_ids[seq_len.* + draft_count] = @intCast(draft_step.token);
             draft_count += 1;
         }
+        try enforceGenerationDeadline(config);
         if (enableGemma4MtpDebug()) {
             std.debug.print("gemma4_mtp_debug: seq={d} source={d} position_mode={s} hidden_source={s} concat_order={s} kv_donor_mode={s} topk={d} drafted", .{
                 seq_len.*,
@@ -4869,6 +4920,7 @@ pub const NativeGenerationPipeline = struct {
                     return err;
                 };
                 defer target_hidden.deinit();
+                try enforceGenerationDeadline(config);
 
                 const hidden_size: usize = @intCast(self.gpt_config.hidden_size);
                 const vocab_size_usize: usize = @intCast(self.gpt_config.vocab_size);
@@ -4975,6 +5027,7 @@ pub const NativeGenerationPipeline = struct {
                         .accept_bonus = accept_bonus,
                         .allocator = allocator,
                     })) |runtime_result_owned| {
+                        try enforceGenerationDeadline(config);
                         var runtime_result = runtime_result_owned;
                         defer runtime_result.deinit(allocator);
                         verify_result = try self.acceptGemma4MtpVerifyCommitResultGreedy(
@@ -5110,6 +5163,7 @@ pub const NativeGenerationPipeline = struct {
                     return err;
                 };
                 defer target_result.deinit();
+                try enforceGenerationDeadline(config);
 
                 verify_result = try self.acceptVerifiedDraftTokensGreedyDevice(
                     token_ids,
@@ -5164,6 +5218,7 @@ pub const NativeGenerationPipeline = struct {
                 return err;
             };
             defer target_result.deinit();
+            try enforceGenerationDeadline(config);
 
             const parity_trace: ?MtpParityTrace = if (mtp_top_k > 0)
                 .{
@@ -5216,6 +5271,7 @@ pub const NativeGenerationPipeline = struct {
             }
         }
 
+        try enforceGenerationDeadline(config);
         const matched_drafts = verify_result.matched_drafts;
         const accepted = verify_result.accepted;
         if (mtp_profile.enabled and verify_result.bonus_skipped) {
@@ -5270,6 +5326,7 @@ pub const NativeGenerationPipeline = struct {
                     next_cached_target_choice = materialized.next_target_choice;
                 }
             }
+            try enforceGenerationDeadline(config);
             if (mtp_profile.enabled) {
                 mtp_profile.materializations += 1;
                 if (verify_result.correction_added) {

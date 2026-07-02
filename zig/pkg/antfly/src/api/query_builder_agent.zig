@@ -20,6 +20,7 @@ const generating = @import("antfly_generating");
 const platform_time = @import("../platform/time.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const query_contract = @import("query_contract.zig");
+const recursive_agent = @import("recursive_agent.zig");
 
 const AgentQuestion = metadata_openapi.AgentQuestion;
 const AgentStatus = metadata_openapi.AgentStatus;
@@ -35,6 +36,17 @@ pub const GenerationRunner = struct {
             chain: []const generating.ChainLink,
             messages: []const generating.ChatMessage,
         ) anyerror!generating.GenerateResult,
+        execute_chain_with_timeout_ms: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            chain: []const generating.ChainLink,
+            messages: []const generating.ChatMessage,
+            timeout_ms: u64,
+        ) anyerror!generating.GenerateResult = null,
+        max_concurrent_chain_calls: ?*const fn (
+            ptr: *anyopaque,
+            chain: []const generating.ChainLink,
+        ) usize = null,
     };
 
     pub fn executeChain(
@@ -45,7 +57,46 @@ pub const GenerationRunner = struct {
     ) !generating.GenerateResult {
         return try self.vtable.execute_chain(self.ptr, alloc, chain, messages);
     }
+
+    pub fn executeChainWithTimeoutMs(
+        self: GenerationRunner,
+        alloc: std.mem.Allocator,
+        chain: []const generating.ChainLink,
+        messages: []const generating.ChatMessage,
+        timeout_ms: u64,
+    ) !generating.GenerateResult {
+        const func = self.vtable.execute_chain_with_timeout_ms orelse return error.DeadlineExceeded;
+        return try func(self.ptr, alloc, chain, messages, timeout_ms);
+    }
+
+    pub fn maxConcurrentChainCalls(
+        self: GenerationRunner,
+        chain: []const generating.ChainLink,
+    ) usize {
+        const func = self.vtable.max_concurrent_chain_calls orelse return 1;
+        return @max(@as(usize, 1), func(self.ptr, chain));
+    }
 };
+
+test "query builder generation runner fails closed without timeout support" {
+    const FakeGeneration = struct {
+        fn iface() GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        FakeGeneration.iface().executeChainWithTimeoutMs(std.testing.allocator, &.{}, &.{}, 1),
+    );
+}
 
 pub fn buildQueryBuilderResponse(
     alloc: std.mem.Allocator,
@@ -57,12 +108,15 @@ pub fn buildQueryBuilderResponse(
 
 pub const QueryBuilderTableContext = struct {
     schema_fields: []const []const u8 = &.{},
+    doc_count: ?u64 = null,
     full_text_indexes: []const []const u8 = &.{},
     semantic_indexes: []const []const u8 = &.{},
     graph_indexes: []const []const u8 = &.{},
     full_text_index_metadata: []const QueryBuilderFullTextIndex = &.{},
     embedding_index_metadata: []const QueryBuilderEmbeddingIndex = &.{},
     graph_index_metadata: []const QueryBuilderGraphIndex = &.{},
+    field_metadata: []const QueryBuilderFieldMetadata = &.{},
+    related_tables: []const QueryBuilderRelatedTable = &.{},
     plan_validator: ?QueryBuilderPlanValidator = null,
     runtime_query_request_validator: ?QueryBuilderRuntimeQueryRequestValidator = null,
 };
@@ -98,6 +152,35 @@ pub const QueryBuilderGraphIndex = struct {
 pub const QueryBuilderGraphEdgeType = struct {
     name: []const u8,
     topology: ?[]const u8 = null,
+};
+
+pub const QueryBuilderFieldKind = enum {
+    unknown,
+    text,
+    keyword,
+    numeric,
+    date,
+    boolean,
+    geo,
+};
+
+pub const QueryBuilderFieldMetadata = struct {
+    name: []const u8,
+    aliases: []const []const u8 = &.{},
+    kind: QueryBuilderFieldKind = .unknown,
+    groupable: ?bool = null,
+    metric: ?bool = null,
+    aggregatable: bool = true,
+};
+
+pub const QueryBuilderRelatedTable = struct {
+    name: []const u8,
+    schema_fields: []const []const u8 = &.{},
+    primary_key_fields: []const []const u8 = &.{},
+    doc_count: ?u64 = null,
+    shard_count: ?u32 = null,
+    colocated_with_left: bool = false,
+    key_selectivity_heuristic: ?[]const u8 = null,
 };
 
 pub const QueryBuilderPlanValidator = struct {
@@ -176,6 +259,12 @@ pub const QueryBuilderRuntimeQueryRequestValidator = struct {
             query_request: metadata_openapi.QueryRequest,
             max_work: u32,
         ) anyerror!?db_mod.RuntimePreflightSummary = null,
+        plan_join_query_request: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            query_request: metadata_openapi.QueryRequest,
+            runtime_preflight: db_mod.RuntimePreflightSummary,
+        ) anyerror!?QueryBuilderRuntimeJoinPlannerSummary = null,
     };
 
     pub fn validateQueryRequest(
@@ -195,6 +284,28 @@ pub const QueryBuilderRuntimeQueryRequestValidator = struct {
         const func = self.vtable.preflight_query_request orelse return null;
         return try func(self.ptr, alloc, query_request, max_work);
     }
+
+    pub fn planJoinQueryRequest(
+        self: QueryBuilderRuntimeQueryRequestValidator,
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        runtime_preflight: db_mod.RuntimePreflightSummary,
+    ) !?QueryBuilderRuntimeJoinPlannerSummary {
+        const func = self.vtable.plan_join_query_request orelse return null;
+        return try func(self.ptr, alloc, query_request, runtime_preflight);
+    }
+};
+
+pub const QueryBuilderRuntimeJoinPlannerSummary = struct {
+    strategy: []const u8,
+    estimated_cost: f64 = 0,
+    estimated_rows: u64 = 0,
+    estimated_memory_bytes: u64 = 0,
+    used_stats: bool = false,
+    shuffle_candidate: bool = false,
+    forced_broadcast_fallback: bool = false,
+    left_sample_row_count: u32 = 0,
+    left_sample_source: []const u8 = "synthetic_preflight",
 };
 
 pub const QueryPreflightMode = enum { validate, plan, estimate };
@@ -418,6 +529,7 @@ pub const QueryPreflightResult = struct {
     diagnostics: []const QueryPreflightDiagnostic = &.{},
     plan_summary: ?QueryPreflightPlanSummary = null,
     estimate_summary: ?QueryPreflightEstimateSummary = null,
+    join_planner_summary: ?QueryBuilderRuntimeJoinPlannerSummary = null,
 
     pub fn deinit(self: *const @This(), alloc: std.mem.Allocator) void {
         for (self.diagnostics) |*diagnostic| diagnostic.deinit(alloc);
@@ -432,6 +544,7 @@ const QueryBuilderStepPreflightDetails = struct {
     diagnostics: []const QueryPreflightDiagnostic = &.{},
     plan_summary: ?QueryPreflightPlanSummary = null,
     estimate_summary: ?QueryPreflightEstimateSummary = null,
+    join_planner_summary: ?QueryBuilderRuntimeJoinPlannerSummary = null,
 };
 
 const QueryBuilderStepDetailsJson = struct {
@@ -629,8 +742,6 @@ fn preflightQueryRequestAgainstContext(
 ) !QueryPreflightResult {
     _ = request;
     _ = specialist;
-    _ = opts.require_executable;
-
     var diagnostics = std.ArrayListUnmanaged(QueryPreflightDiagnostic).empty;
     errdefer {
         for (diagnostics.items) |*diagnostic| diagnostic.deinit(alloc);
@@ -638,15 +749,21 @@ fn preflightQueryRequestAgainstContext(
     }
     var runtime_preflight: ?db_mod.RuntimePreflightSummary = null;
     defer if (runtime_preflight) |*summary| summary.deinit(alloc);
-    var contract_preflight = query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
-        const feedback = if (query_request.graph_searches != null)
-            try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
-        else
-            try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
-        defer alloc.free(feedback);
-        try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
-        break :blk null;
-    };
+    var join_planner_summary: ?QueryBuilderRuntimeJoinPlannerSummary = null;
+    const runtime_validator = context.runtime_query_request_validator;
+    const runtime_can_validate_join = query_request.join != null and runtime_validator != null;
+    var contract_preflight = if (runtime_can_validate_join)
+        null
+    else
+        query_contract.preflightQueryRequestAlloc(alloc, query_request) catch |err| blk: {
+            const feedback = if (query_request.graph_searches != null)
+                try std.fmt.allocPrint(alloc, "query_request.graph_searches failed executor preflight: {s}", .{@errorName(err)})
+            else
+                try std.fmt.allocPrint(alloc, "query_request failed contract preflight: {s}", .{@errorName(err)});
+            defer alloc.free(feedback);
+            try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "query_contract_preflight_failed", "query_request", feedback);
+            break :blk null;
+        };
     defer if (contract_preflight) |*summary| summary.deinit(alloc);
 
     if (query_request.full_text_search != null and !metadataContextHasFullTextIndex(context)) {
@@ -730,6 +847,16 @@ fn preflightQueryRequestAgainstContext(
             try appendQueryPreflightDiagnostic(alloc, &diagnostics, .@"error", "invalid_graph_result_ref", "query_request.graph_searches", feedback);
         }
     }
+    if (query_request.join != null and runtime_validator == null) {
+        try appendQueryPreflightDiagnostic(
+            alloc,
+            &diagnostics,
+            .@"error",
+            "unsupported_join",
+            "query_request.join",
+            "query_request.join requires a runtime query validator that supports lower-level join execution",
+        );
+    }
     if (retrieval_query_request) |retrieval_query| {
         if (retrieval_query.tree_search) |tree_search| {
             if (!metadataContextHasGraphIndex(context, tree_search.index)) {
@@ -744,10 +871,13 @@ fn preflightQueryRequestAgainstContext(
             }
         }
     }
-    if (context.runtime_query_request_validator) |validator| {
+    if (runtime_validator) |validator| {
         if (opts.mode == .estimate) {
             runtime_preflight = try validator.preflightQueryRequest(alloc, query_request, opts.max_work);
             if (runtime_preflight) |*summary| db_mod.deriveRuntimePreflightEstimates(summary);
+            if (runtime_preflight != null and query_request.join != null) {
+                join_planner_summary = try validator.planJoinQueryRequest(alloc, query_request, runtime_preflight.?);
+            }
         }
         if (try validator.validateQueryRequest(alloc, query_request)) |feedback| {
             defer alloc.free(feedback);
@@ -770,6 +900,7 @@ fn preflightQueryRequestAgainstContext(
                 null
         else
             null,
+        .join_planner_summary = join_planner_summary,
     };
 }
 
@@ -1541,7 +1672,21 @@ pub fn buildQueryBuilderResponseWithContext(
     generation_runner: ?GenerationRunner,
 ) !metadata_openapi.QueryBuilderResult {
     if (request.intent.len == 0) return error.InvalidQueryBuilderRequest;
+    try recursive_agent.validateQueryBuilderExecutionMode(request);
+    if ((request.execution_mode orelse .pipeline) == .recursive) {
+        return try buildRecursiveQueryBuilderResponseWithContext(alloc, request, table_context, generation_runner);
+    }
 
+    return try buildPipelineQueryBuilderResponseWithContext(alloc, request, table_context, generation_runner, false);
+}
+
+fn buildPipelineQueryBuilderResponseWithContext(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    table_context: QueryBuilderTableContext,
+    generation_runner: ?GenerationRunner,
+    preserve_generation_timeout_errors: bool,
+) !metadata_openapi.QueryBuilderResult {
     const session_id = try ensureQueryBuilderSessionId(alloc, request.session_id);
     const effective_intent = try appendDecisionContext(alloc, request.intent, request.decisions orelse &.{});
     const effective_fields = try resolveQueryBuilderFields(
@@ -1569,6 +1714,7 @@ pub fn buildQueryBuilderResponseWithContext(
         table_context.graph_index_metadata,
         table_context.plan_validator,
         generation_runner,
+        preserve_generation_timeout_errors,
         &warnings,
     ) catch |err| switch (err) {
         error.UnsupportedQueryBuilderGeneration, error.InvalidQueryBuilderGeneration => blk: {
@@ -1580,7 +1726,7 @@ pub fn buildQueryBuilderResponseWithContext(
     const explanation = try buildQueryBuilderExplanation(alloc, effective_fields, built_query);
     const confidence = queryBuilderConfidence(effective_fields, built_query);
     const selectable_fields = try queryBuilderSelectableFields(alloc, request.constraints, effective_fields);
-    const query_request = try buildQueryBuilderQueryRequest(alloc, request, built_query, selectable_fields, graph_indexes);
+    const query_request = try buildQueryBuilderQueryRequest(alloc, request, built_query, selectable_fields, graph_indexes, table_context.field_metadata, table_context.related_tables, &warnings);
     const retrieval_query_request = try buildQueryBuilderRetrievalQueryRequest(alloc, request, query_request, graph_indexes);
     const artifact = if (retrieval_query_request != null) "retrieval_query_request" else "query_request";
     const specialist = pickQueryBuilderSpecialist(request.mode, built_query, query_request, retrieval_query_request != null);
@@ -1614,6 +1760,9 @@ pub fn buildQueryBuilderResponseWithContext(
     if (plan_validation_feedback != null and queryBuilderConstraintBool(request.constraints, "require_executable") and clarification_question == null) {
         return error.InvalidQueryBuilderRequest;
     }
+    if (queryBuilderConstraintBool(request.constraints, "require_executable") and clarification_question == null and queryPreflightHasErrors(&preflight)) {
+        return error.InvalidQueryBuilderRequest;
+    }
     try validateRequiredExecutableQueryBuilderRequest(request, built_query, query_request, retrieval_query_request, clarification_question != null);
     if (plan_validation_feedback) |feedback| {
         try warnings.append(alloc, feedback);
@@ -1636,6 +1785,12 @@ pub fn buildQueryBuilderResponseWithContext(
             try warnings.append(alloc, "Tree mode requires constraints.tree_search or constraints.tree_index, so only the seed query_request was generated.");
         } else if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_searches == null) {
             try warnings.append(alloc, "Graph mode requires constraints.graph_searches, constraints.graph_index, or table graph index metadata, so the deterministic full-text/filter builder was used.");
+        } else if (std.ascii.eqlIgnoreCase(mode, "join") and query_request.join == null) {
+            try warnings.append(alloc, "Join mode requires constraints.join, so only the seed query_request was generated.");
+        } else if (std.ascii.eqlIgnoreCase(mode, "aggregation") and !queryRequestHasAggregations(query_request)) {
+            try warnings.append(alloc, "Aggregation mode requires constraints.aggregations, so only the seed query_request was generated.");
+        } else if (std.ascii.eqlIgnoreCase(mode, "join_aggregation") and (query_request.join == null or !queryRequestHasAggregations(query_request))) {
+            try warnings.append(alloc, "Join aggregation mode requires both constraints.join and constraints.aggregations, so only the seed query_request was generated.");
         }
     }
     if (request.generator != null and generation_runner == null) {
@@ -1681,6 +1836,1786 @@ pub fn buildQueryBuilderResponseWithContext(
         .confidence = confidence,
         .warnings = if (warnings.items.len > 0) try warnings.toOwnedSlice(alloc) else null,
     };
+}
+
+const RecursiveQueryBuilderCandidatePlanJson = struct {
+    id: []const u8,
+    mode: []const u8,
+    status: metadata_openapi.AgentStepStatus,
+    specialist: ?[]const u8 = null,
+    artifact: ?[]const u8 = null,
+    query_request: ?metadata_openapi.QueryRequest = null,
+    retrieval_query_request: ?metadata_openapi.RetrievalQueryRequest = null,
+    plan: ?std.json.Value = null,
+    confidence: ?f64 = null,
+    score: f64 = 0,
+    preflight_error_count: usize = 0,
+    runtime_preflight_estimated: bool = false,
+    join_runtime_validated: bool = false,
+    preflight_latency_heuristic_score: ?u32 = null,
+    preflight_latency_heuristic: ?[]const u8 = null,
+    preflight_selectivity_heuristic: ?[]const u8 = null,
+    aggregation_may_scan_full_results: ?bool = null,
+    aggregation_second_pass_doc_estimate: ?u32 = null,
+    aggregation_second_pass_doc_upper_bound: ?u32 = null,
+    aggregation_cost_heuristic: ?[]const u8 = null,
+    aggregation_group_field: ?[]const u8 = null,
+    aggregation_metric_field: ?[]const u8 = null,
+    aggregation_field_catalog_backed: ?bool = null,
+    aggregation_table_doc_count: ?u64 = null,
+    aggregation_bucket_size: ?u32 = null,
+    aggregation_stat_heuristic: ?[]const u8 = null,
+    join_strategy_hint: ?[]const u8 = null,
+    join_recommended_strategy: ?[]const u8 = null,
+    join_strategy_options: ?[]const RecursiveQueryBuilderJoinStrategyOption = null,
+    join_left_doc_count: ?u64 = null,
+    join_right_doc_count: ?u64 = null,
+    join_right_shard_count: ?u32 = null,
+    join_right_key_selectivity: ?[]const u8 = null,
+    join_right_key_field: ?[]const u8 = null,
+    join_right_key_unique: ?bool = null,
+    join_right_key_estimated_distinct: ?u64 = null,
+    join_right_key_avg_rows_per_key: ?f64 = null,
+    join_right_key_stats_source: ?[]const u8 = null,
+    join_right_key_stats_confidence: ?[]const u8 = null,
+    join_shard_colocation: ?[]const u8 = null,
+    join_left_result_doc_estimate: ?u32 = null,
+    join_left_result_doc_upper_bound: ?u32 = null,
+    join_runtime_shard_count: ?u32 = null,
+    join_runtime_remote_shard_count: ?u32 = null,
+    join_runtime_feasibility: ?[]const u8 = null,
+    join_planner_strategy: ?[]const u8 = null,
+    join_planner_estimated_cost: ?f64 = null,
+    join_planner_estimated_rows: ?u64 = null,
+    join_planner_estimated_memory_bytes: ?u64 = null,
+    join_planner_used_stats: ?bool = null,
+    join_planner_shuffle_candidate: ?bool = null,
+    join_planner_forced_broadcast_fallback: ?bool = null,
+    join_planner_left_sample_row_count: ?u32 = null,
+    join_planner_left_sample_source: ?[]const u8 = null,
+    join_cardinality_heuristic: ?[]const u8 = null,
+    warnings: ?[]const []const u8 = null,
+    @"error": ?[]const u8 = null,
+};
+
+const RecursiveQueryBuilderJoinStrategyOption = struct {
+    strategy: []const u8,
+    estimated_cost_score: u64,
+    recommended: bool = false,
+    feasible: bool = true,
+    feasibility: ?[]const u8 = null,
+};
+
+const RecursiveQueryBuilderPreflightSignal = struct {
+    has_estimate: bool = false,
+    latency_heuristic_score: ?u32 = null,
+    latency_heuristic: ?[]const u8 = null,
+    selectivity_heuristic: ?[]const u8 = null,
+    aggregation_may_scan_full_results: ?bool = null,
+    aggregation_second_pass_doc_estimate: ?u32 = null,
+    aggregation_second_pass_doc_upper_bound: ?u32 = null,
+    aggregation_cost_heuristic: ?[]const u8 = null,
+    result_doc_estimate: ?u32 = null,
+    result_doc_upper_bound: ?u32 = null,
+    shard_count: ?u32 = null,
+    remote_shard_count: ?u32 = null,
+    join_planner_strategy: ?[]const u8 = null,
+    join_planner_estimated_cost: ?f64 = null,
+    join_planner_estimated_rows: ?u64 = null,
+    join_planner_estimated_memory_bytes: ?u64 = null,
+    join_planner_used_stats: ?bool = null,
+    join_planner_shuffle_candidate: ?bool = null,
+    join_planner_forced_broadcast_fallback: ?bool = null,
+    join_planner_left_sample_row_count: ?u32 = null,
+    join_planner_left_sample_source: ?[]const u8 = null,
+};
+
+const RecursiveQueryBuilderJoinSignal = struct {
+    strategy_hint: ?[]const u8 = null,
+    recommended_strategy: ?[]const u8 = null,
+    strategy_options: ?[]const RecursiveQueryBuilderJoinStrategyOption = null,
+    left_doc_count: ?u64 = null,
+    right_doc_count: ?u64 = null,
+    right_shard_count: ?u32 = null,
+    right_key_selectivity: ?[]const u8 = null,
+    right_key_field: ?[]const u8 = null,
+    right_key_unique: ?bool = null,
+    right_key_estimated_distinct: ?u64 = null,
+    right_key_avg_rows_per_key: ?f64 = null,
+    right_key_stats_source: ?[]const u8 = null,
+    right_key_stats_confidence: ?[]const u8 = null,
+    shard_colocation: ?[]const u8 = null,
+    cardinality_heuristic: ?[]const u8 = null,
+};
+
+const RecursiveQueryBuilderRightKeyStats = struct {
+    field: []const u8,
+    unique: bool = false,
+    estimated_distinct: ?u64 = null,
+    avg_rows_per_key: ?f64 = null,
+    source: []const u8 = "unknown",
+    confidence: []const u8 = "low",
+};
+
+const RecursiveQueryBuilderAggregationSignal = struct {
+    group_field: ?[]const u8 = null,
+    metric_field: ?[]const u8 = null,
+    field_catalog_backed: bool = false,
+    table_doc_count: ?u64 = null,
+    bucket_size: ?u32 = null,
+    stat_heuristic: ?[]const u8 = null,
+};
+
+const RecursiveQueryBuilderCandidateStepDetails = struct {
+    candidate_id: []const u8,
+    mode: []const u8,
+    score: f64 = 0,
+    specialist: ?[]const u8 = null,
+    artifact: ?[]const u8 = null,
+    @"error": ?[]const u8 = null,
+};
+
+const RecursiveQueryBuilderDecompositionDetails = struct {
+    root_frame_id: []const u8,
+    split_policy: []const u8,
+    merge_policy: []const u8,
+    max_subcalls: i64,
+    max_concurrency: i64,
+    requested_concurrency: i64,
+    max_wall_time_ms: i64,
+    scheduled_concurrency: usize,
+    actual_concurrency: usize,
+    candidate_mode_count: usize,
+    scheduled_candidate_count: usize,
+    truncated_candidate_count: usize,
+    budget_limited: bool,
+    candidate_modes: []const []const u8,
+};
+
+const RecursiveQueryBuilderMergeDetails = struct {
+    selected_candidate_id: ?[]const u8,
+    candidate_count: usize,
+    selected_specialist: ?[]const u8 = null,
+    selected_artifact: ?[]const u8 = null,
+    incomplete_reason: ?[]const u8 = null,
+    failure_reason: ?[]const u8 = null,
+    wall_time_exhausted: bool = false,
+    elapsed_ms: i64 = 0,
+};
+
+const RecursiveQueryBuilderBudgetSummary = struct {
+    candidate_mode_count: usize,
+    scheduled_candidate_count: usize,
+    scheduled_concurrency: usize,
+    actual_concurrency: usize,
+    truncated_candidate_count: usize,
+    truncated_by_subcalls: bool,
+    wall_time_exhausted: bool,
+    elapsed_ms: i64,
+    incomplete_reason: ?[]const u8 = null,
+};
+
+const RecursiveDeadlineQueryBuilderGenerationRunner = struct {
+    parent: GenerationRunner,
+    timeout_ms: u64,
+
+    fn iface(self: *@This()) GenerationRunner {
+        return .{
+            .ptr = self,
+            .vtable = &.{
+                .execute_chain = executeChain,
+                .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+            },
+        };
+    }
+
+    fn executeChain(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        chain: []const generating.ChainLink,
+        messages: []const generating.ChatMessage,
+    ) !generating.GenerateResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parent.executeChainWithTimeoutMs(alloc, chain, messages, self.timeout_ms);
+    }
+
+    fn executeChainWithTimeoutMs(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        chain: []const generating.ChainLink,
+        messages: []const generating.ChatMessage,
+        timeout_ms: u64,
+    ) !generating.GenerateResult {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.parent.executeChainWithTimeoutMs(alloc, chain, messages, @min(timeout_ms, self.timeout_ms));
+    }
+};
+
+fn buildRecursiveQueryBuilderResponseWithContext(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    table_context: QueryBuilderTableContext,
+    generation_runner: ?GenerationRunner,
+) !metadata_openapi.QueryBuilderResult {
+    const cfg = recursive_agent.normalizeConfig(request.recursive) catch return error.InvalidQueryBuilderRequest;
+    const semantic_indexes = try queryBuilderDenseEmbeddingIndexNames(alloc, table_context.embedding_index_metadata, table_context.semantic_indexes);
+    const graph_indexes = try queryBuilderGraphIndexNames(alloc, table_context.graph_index_metadata, table_context.graph_indexes);
+    const candidate_modes = try recursiveQueryBuilderCandidateModes(alloc, request, semantic_indexes, graph_indexes);
+    if (candidate_modes.len == 0) return error.InvalidQueryBuilderRequest;
+    const budget = recursive_agent.Budget.start(cfg);
+
+    var candidate_plans = std.json.Array.init(alloc);
+    var candidate_steps = std.ArrayListUnmanaged(metadata_openapi.AgentStep).empty;
+    defer candidate_steps.deinit(alloc);
+
+    var selected_result: ?metadata_openapi.QueryBuilderResult = null;
+    var selected_score: f64 = -1;
+    var selected_candidate_id: ?[]const u8 = null;
+    var selected_artifact: ?[]const u8 = null;
+    var candidate_error_count: usize = 0;
+    var scheduled: usize = 0;
+    var truncated_by_subcalls = false;
+    var wall_time_exhausted = false;
+    const max_subcalls: usize = @intCast(cfg.max_subcalls);
+    const execution_concurrency: usize = 1;
+    for (candidate_modes) |mode| {
+        if (scheduled >= max_subcalls) {
+            truncated_by_subcalls = true;
+            break;
+        }
+        const candidate_timeout_ms = budget.remainingMs() orelse {
+            wall_time_exhausted = true;
+            break;
+        };
+        scheduled += 1;
+        const candidate_id = try std.fmt.allocPrint(alloc, "query-builder-candidate-{d}", .{scheduled});
+        var candidate_request = request;
+        candidate_request.mode = mode;
+        candidate_request.execution_mode = .pipeline;
+        candidate_request.recursive = null;
+        var deadline_generation_runner = if (generation_runner) |runner|
+            RecursiveDeadlineQueryBuilderGenerationRunner{ .parent = runner, .timeout_ms = candidate_timeout_ms }
+        else
+            undefined;
+        const candidate_generation_runner: ?GenerationRunner = if (generation_runner != null)
+            deadline_generation_runner.iface()
+        else
+            null;
+
+        const candidate_result = buildPipelineQueryBuilderResponseWithContext(alloc, candidate_request, table_context, candidate_generation_runner, true) catch |err| {
+            const timed_out = recursive_agent.isGenerationTimeoutError(err) or budget.expired();
+            const message = try std.fmt.allocPrint(alloc, "{s}", .{@errorName(err)});
+            candidate_error_count += 1;
+            try candidate_plans.append(try recursiveQueryBuilderCandidatePlanValue(alloc, .{
+                .id = candidate_id,
+                .mode = mode,
+                .status = .@"error",
+                .@"error" = message,
+            }));
+            try candidate_steps.append(alloc, .{
+                .kind = .recursive_subcall,
+                .name = "query_builder_candidate",
+                .action = try std.fmt.allocPrint(alloc, "Rejected recursive query-builder candidate mode '{s}'", .{mode}),
+                .status = .@"error",
+                .details = try jsonValueFromStruct(alloc, RecursiveQueryBuilderCandidateStepDetails{
+                    .candidate_id = candidate_id,
+                    .mode = mode,
+                    .@"error" = message,
+                }),
+            });
+            if (timed_out) {
+                wall_time_exhausted = true;
+                break;
+            }
+            continue;
+        };
+
+        const artifact = queryBuilderResultArtifact(candidate_result);
+        const preflight_error_count = queryBuilderResultPreflightErrorCount(candidate_result);
+        const preflight_signal = queryBuilderResultPreflightSignal(candidate_result);
+        const join_runtime_validated = candidate_result.query_request != null and candidate_result.query_request.?.join != null and preflight_error_count == 0 and table_context.runtime_query_request_validator != null;
+        const join_signal = try recursiveQueryBuilderJoinSignal(alloc, table_context, candidate_result);
+        const aggregation_signal = recursiveQueryBuilderAggregationSignal(table_context, candidate_result);
+        const score = recursiveQueryBuilderCandidateScore(request, candidate_result, preflight_signal, aggregation_signal, join_signal, join_runtime_validated);
+        try candidate_plans.append(try recursiveQueryBuilderCandidatePlanValue(alloc, .{
+            .id = candidate_id,
+            .mode = mode,
+            .status = .success,
+            .specialist = candidate_result.specialist,
+            .artifact = artifact,
+            .query_request = candidate_result.query_request,
+            .retrieval_query_request = candidate_result.retrieval_query_request,
+            .plan = candidate_result.plan,
+            .confidence = candidate_result.confidence,
+            .score = score,
+            .preflight_error_count = preflight_error_count,
+            .runtime_preflight_estimated = preflight_signal.has_estimate,
+            .join_runtime_validated = join_runtime_validated,
+            .preflight_latency_heuristic_score = preflight_signal.latency_heuristic_score,
+            .preflight_latency_heuristic = preflight_signal.latency_heuristic,
+            .preflight_selectivity_heuristic = preflight_signal.selectivity_heuristic,
+            .aggregation_may_scan_full_results = preflight_signal.aggregation_may_scan_full_results,
+            .aggregation_second_pass_doc_estimate = preflight_signal.aggregation_second_pass_doc_estimate,
+            .aggregation_second_pass_doc_upper_bound = preflight_signal.aggregation_second_pass_doc_upper_bound,
+            .aggregation_cost_heuristic = preflight_signal.aggregation_cost_heuristic,
+            .aggregation_group_field = aggregation_signal.group_field,
+            .aggregation_metric_field = aggregation_signal.metric_field,
+            .aggregation_field_catalog_backed = if (aggregation_signal.group_field != null or aggregation_signal.metric_field != null) aggregation_signal.field_catalog_backed else null,
+            .aggregation_table_doc_count = aggregation_signal.table_doc_count,
+            .aggregation_bucket_size = aggregation_signal.bucket_size,
+            .aggregation_stat_heuristic = aggregation_signal.stat_heuristic,
+            .join_strategy_hint = join_signal.strategy_hint,
+            .join_recommended_strategy = join_signal.recommended_strategy,
+            .join_strategy_options = join_signal.strategy_options,
+            .join_left_doc_count = join_signal.left_doc_count,
+            .join_right_doc_count = join_signal.right_doc_count,
+            .join_right_shard_count = join_signal.right_shard_count,
+            .join_right_key_selectivity = join_signal.right_key_selectivity,
+            .join_right_key_field = join_signal.right_key_field,
+            .join_right_key_unique = join_signal.right_key_unique,
+            .join_right_key_estimated_distinct = join_signal.right_key_estimated_distinct,
+            .join_right_key_avg_rows_per_key = join_signal.right_key_avg_rows_per_key,
+            .join_right_key_stats_source = join_signal.right_key_stats_source,
+            .join_right_key_stats_confidence = join_signal.right_key_stats_confidence,
+            .join_shard_colocation = join_signal.shard_colocation,
+            .join_left_result_doc_estimate = if (join_signal.strategy_hint != null) preflight_signal.result_doc_estimate else null,
+            .join_left_result_doc_upper_bound = if (join_signal.strategy_hint != null) preflight_signal.result_doc_upper_bound else null,
+            .join_runtime_shard_count = if (join_signal.strategy_hint != null) preflight_signal.shard_count else null,
+            .join_runtime_remote_shard_count = if (join_signal.strategy_hint != null) preflight_signal.remote_shard_count else null,
+            .join_runtime_feasibility = if (join_signal.strategy_hint != null) recursiveQueryBuilderJoinRuntimeFeasibility(preflight_signal, join_runtime_validated) else null,
+            .join_planner_strategy = preflight_signal.join_planner_strategy,
+            .join_planner_estimated_cost = preflight_signal.join_planner_estimated_cost,
+            .join_planner_estimated_rows = preflight_signal.join_planner_estimated_rows,
+            .join_planner_estimated_memory_bytes = preflight_signal.join_planner_estimated_memory_bytes,
+            .join_planner_used_stats = preflight_signal.join_planner_used_stats,
+            .join_planner_shuffle_candidate = preflight_signal.join_planner_shuffle_candidate,
+            .join_planner_forced_broadcast_fallback = preflight_signal.join_planner_forced_broadcast_fallback,
+            .join_planner_left_sample_row_count = preflight_signal.join_planner_left_sample_row_count,
+            .join_planner_left_sample_source = preflight_signal.join_planner_left_sample_source,
+            .join_cardinality_heuristic = join_signal.cardinality_heuristic,
+            .warnings = candidate_result.warnings,
+        }));
+        try candidate_steps.append(alloc, .{
+            .kind = .recursive_subcall,
+            .name = "query_builder_candidate",
+            .action = try std.fmt.allocPrint(alloc, "Built recursive query-builder candidate mode '{s}'", .{mode}),
+            .status = .success,
+            .details = try jsonValueFromStruct(alloc, RecursiveQueryBuilderCandidateStepDetails{
+                .candidate_id = candidate_id,
+                .mode = mode,
+                .score = score,
+                .specialist = candidate_result.specialist,
+                .artifact = artifact,
+            }),
+        });
+
+        if (score > selected_score) {
+            selected_score = score;
+            selected_result = candidate_result;
+            selected_candidate_id = candidate_id;
+            selected_artifact = artifact;
+        }
+        if (budget.expired() and scheduled < candidate_modes.len and scheduled < max_subcalls) {
+            wall_time_exhausted = true;
+            break;
+        }
+    }
+
+    if (scheduled < candidate_modes.len and scheduled >= max_subcalls) truncated_by_subcalls = true;
+    const incomplete_reason = recursive_agent.incompleteReason(truncated_by_subcalls, 0, wall_time_exhausted);
+    const budget_summary = RecursiveQueryBuilderBudgetSummary{
+        .candidate_mode_count = candidate_modes.len,
+        .scheduled_candidate_count = scheduled,
+        .scheduled_concurrency = @min(execution_concurrency, recursive_agent.scheduledConcurrency(cfg, @min(candidate_modes.len, max_subcalls))),
+        .actual_concurrency = if (scheduled > 0) execution_concurrency else 0,
+        .truncated_candidate_count = candidate_modes.len - scheduled,
+        .truncated_by_subcalls = truncated_by_subcalls,
+        .wall_time_exhausted = wall_time_exhausted,
+        .elapsed_ms = budget.elapsedMs(),
+        .incomplete_reason = incomplete_reason,
+    };
+    var result = selected_result orelse return try buildFailedRecursiveQueryBuilderResponse(
+        alloc,
+        request,
+        cfg,
+        candidate_modes[0..scheduled],
+        candidate_steps.items,
+        .{ .array = candidate_plans },
+        budget_summary,
+        candidate_error_count,
+    );
+    const selected_id = selected_candidate_id orelse return error.InvalidQueryBuilderRequest;
+    result.plan = try buildRecursiveQueryBuilderPlan(alloc, result.plan, cfg, selected_id, .{ .array = candidate_plans }, budget_summary);
+    result.steps = try buildRecursiveQueryBuilderSteps(
+        alloc,
+        cfg,
+        selected_id,
+        candidate_modes[0..scheduled],
+        candidate_steps.items,
+        result.steps orelse &.{},
+        result.specialist,
+        selected_artifact,
+        budget_summary,
+        .success,
+        null,
+    );
+    if (incomplete_reason) |reason| {
+        result.status = .incomplete;
+        result.incomplete_details = .{ .reason = reason };
+    }
+    result.warnings = try appendRecursiveQueryBuilderWarning(
+        alloc,
+        result.warnings,
+        "Recursive query-builder mode evaluated bounded specialist candidates and selected the highest-scoring executable plan.",
+    );
+    result.iteration = 1 + @as(i64, @intCast(scheduled));
+    result.remaining_internal_iterations = @max(@as(i64, 0), (request.max_internal_iterations orelse 0) - result.iteration.?);
+    return result;
+}
+
+fn buildFailedRecursiveQueryBuilderResponse(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    cfg: recursive_agent.RecursiveConfig,
+    scheduled_modes: []const []const u8,
+    candidate_steps: []const metadata_openapi.AgentStep,
+    candidate_plans: std.json.Value,
+    budget: RecursiveQueryBuilderBudgetSummary,
+    candidate_error_count: usize,
+) !metadata_openapi.QueryBuilderResult {
+    const failure_reason: []const u8 = if (budget.incomplete_reason) |reason| reason else "all_candidates_failed";
+    const status: AgentStatus = if (budget.incomplete_reason != null) .incomplete else .failed;
+    const warning = if (budget.incomplete_reason != null)
+        "Recursive query-builder mode exhausted its wall-time budget before producing an executable candidate."
+    else
+        "Recursive query-builder mode did not produce an executable candidate.";
+    return .{
+        .session_id = try ensureQueryBuilderSessionId(alloc, request.session_id),
+        .iteration = 1 + @as(i64, @intCast(budget.scheduled_candidate_count)),
+        .clarification_count = if (request.decisions) |decisions| @intCast(decisions.len) else 0,
+        .status = status,
+        .incomplete_details = if (budget.incomplete_reason) |reason| .{ .reason = reason } else null,
+        .steps = try buildRecursiveQueryBuilderSteps(
+            alloc,
+            cfg,
+            null,
+            scheduled_modes,
+            candidate_steps,
+            &.{},
+            null,
+            null,
+            budget,
+            .@"error",
+            failure_reason,
+        ),
+        .remaining_internal_iterations = @max(@as(i64, 0), (request.max_internal_iterations orelse 0) - (1 + @as(i64, @intCast(budget.scheduled_candidate_count)))),
+        .remaining_user_clarifications = @max(
+            @as(i64, 0),
+            (request.max_user_clarifications orelse 0) - if (request.decisions) |decisions| @as(i64, @intCast(decisions.len)) else 0,
+        ),
+        .query = try buildQueryBuilderMatchNoneQuery(alloc),
+        .specialist = "recursive",
+        .plan = try buildRecursiveQueryBuilderPlan(alloc, null, cfg, null, candidate_plans, budget),
+        .explanation = try std.fmt.allocPrint(alloc, "Recursive query-builder failed after {d} candidate error(s).", .{candidate_error_count}),
+        .confidence = 0,
+        .warnings = try alloc.dupe([]const u8, &[_][]const u8{warning}),
+    };
+}
+
+fn recursiveQueryBuilderCandidateModes(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    semantic_indexes: []const []const u8,
+    graph_indexes: []const []const u8,
+) ![]const []const u8 {
+    var modes = std.ArrayListUnmanaged([]const u8).empty;
+    defer modes.deinit(alloc);
+    if (request.mode) |mode| {
+        if (!std.ascii.eqlIgnoreCase(mode, "auto")) {
+            try appendUniqueQueryBuilderMode(alloc, &modes, mode);
+            return try modes.toOwnedSlice(alloc);
+        }
+    }
+    try appendUniqueQueryBuilderMode(alloc, &modes, "full_text");
+    try appendUniqueQueryBuilderMode(alloc, &modes, "filter");
+    if (semantic_indexes.len > 0 or queryBuilderConstraintHasNonEmptyArray(request.constraints, "prefer_indexes")) {
+        try appendUniqueQueryBuilderMode(alloc, &modes, "semantic");
+        try appendUniqueQueryBuilderMode(alloc, &modes, "hybrid");
+    }
+    const has_join = queryBuilderHasJoinConstraint(request.constraints) or queryBuilderShouldInferJoin(request);
+    const has_aggregation = queryBuilderHasAggregationConstraints(request.constraints) or queryBuilderShouldInferAggregation(request);
+    if (has_join and has_aggregation) {
+        try appendUniqueQueryBuilderMode(alloc, &modes, "join_aggregation");
+    } else if (has_join) {
+        try appendUniqueQueryBuilderMode(alloc, &modes, "join");
+    } else if (has_aggregation) {
+        try appendUniqueQueryBuilderMode(alloc, &modes, "aggregation");
+    }
+    if (graph_indexes.len > 0 or queryBuilderConstraintString(request.constraints, "graph_index") != null or queryBuilderHasConstraintGraphSearches(request.constraints)) {
+        try appendUniqueQueryBuilderMode(alloc, &modes, "graph");
+    }
+    if (graph_indexes.len > 0 or queryBuilderConstraintString(request.constraints, "tree_index") != null or queryBuilderConstraintObject(request.constraints, "tree_search") != null) {
+        try appendUniqueQueryBuilderMode(alloc, &modes, "tree");
+    }
+    return if (modes.items.len == 0) &.{} else try modes.toOwnedSlice(alloc);
+}
+
+fn appendUniqueQueryBuilderMode(
+    alloc: std.mem.Allocator,
+    modes: *std.ArrayListUnmanaged([]const u8),
+    candidate: []const u8,
+) !void {
+    for (modes.items) |existing| {
+        if (std.ascii.eqlIgnoreCase(existing, candidate)) return;
+    }
+    try modes.append(alloc, candidate);
+}
+
+fn queryBuilderConstraintHasNonEmptyArray(constraints: ?std.json.Value, key: []const u8) bool {
+    const value = constraints orelse return false;
+    if (value != .object) return false;
+    const raw = value.object.get(key) orelse return false;
+    return raw == .array and raw.array.items.len > 0;
+}
+
+fn queryBuilderConstraintObject(constraints: ?std.json.Value, key: []const u8) ?std.json.Value {
+    const value = constraints orelse return null;
+    if (value != .object) return null;
+    const raw = value.object.get(key) orelse return null;
+    return if (raw == .object) raw else null;
+}
+
+fn queryBuilderConstraintAggregations(
+    alloc: std.mem.Allocator,
+    constraints: ?std.json.Value,
+) !?std.json.ArrayHashMap(metadata_openapi.AggregationRequest) {
+    const raw = queryBuilderConstraintObject(constraints, "aggregations") orelse return null;
+    const encoded = try std.json.Stringify.valueAlloc(alloc, raw, .{});
+    defer alloc.free(encoded);
+    const parsed = std.json.parseFromSliceLeaky(std.json.ArrayHashMap(metadata_openapi.AggregationRequest), alloc, encoded, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidQueryBuilderRequest;
+    if (parsed.map.count() == 0) return null;
+    return parsed;
+}
+
+fn queryBuilderConstraintJoin(
+    alloc: std.mem.Allocator,
+    constraints: ?std.json.Value,
+) !?metadata_openapi.JoinClause {
+    const raw = queryBuilderConstraintObject(constraints, "join") orelse return null;
+    const encoded = try std.json.Stringify.valueAlloc(alloc, raw, .{});
+    defer alloc.free(encoded);
+    return std.json.parseFromSliceLeaky(metadata_openapi.JoinClause, alloc, encoded, .{
+        .ignore_unknown_fields = true,
+        .allocate = .alloc_always,
+    }) catch return error.InvalidQueryBuilderRequest;
+}
+
+fn queryBuilderInferredJoin(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    fields: []const []const u8,
+    related_tables: []const QueryBuilderRelatedTable,
+    warnings: *std.ArrayListUnmanaged([]const u8),
+) !?metadata_openapi.JoinClause {
+    if (!queryBuilderShouldInferJoin(request)) return null;
+    const right_table = queryBuilderInferredJoinRightTable(alloc, request, related_tables) orelse {
+        try warnings.append(alloc, "Join mode was requested, but no right table could be inferred from intent or constraints.");
+        return null;
+    };
+    const right_table_metadata = queryBuilderRelatedTableForName(related_tables, right_table);
+    const right_field = queryBuilderInferredJoinRightField(request, right_table_metadata);
+    const left_field = queryBuilderInferredJoinLeftField(request, fields, right_table, right_field) orelse {
+        try warnings.append(alloc, "Join mode was requested, but no left join key could be inferred from intent, constraints, or schema fields.");
+        return null;
+    };
+    return .{
+        .right_table = right_table,
+        .join_type = queryBuilderInferredJoinType(request.intent),
+        .on = .{
+            .left_field = left_field,
+            .right_field = right_field,
+            .operator = .eq,
+        },
+        .right_fields = try queryBuilderInferredJoinRightFields(alloc, request, right_table_metadata),
+        .strategy_hint = queryBuilderInferredJoinStrategy(request.intent),
+    };
+}
+
+fn queryBuilderShouldInferJoin(request: metadata_openapi.QueryBuilderRequest) bool {
+    if (queryBuilderHasJoinConstraint(request.constraints)) return false;
+    if (queryBuilderJoinMode(request.mode)) return true;
+    if (request.mode) |mode| {
+        if (!std.ascii.eqlIgnoreCase(mode, "auto")) return false;
+    }
+    return queryBuilderIntentHasJoin(request.intent);
+}
+
+fn queryBuilderJoinMode(mode: ?[]const u8) bool {
+    const value = mode orelse return false;
+    return std.ascii.eqlIgnoreCase(value, "join") or std.ascii.eqlIgnoreCase(value, "join_aggregation");
+}
+
+fn queryBuilderIntentHasJoin(intent: []const u8) bool {
+    return containsWholeWordIgnoreCase(intent, "join") or
+        containsWholeWordIgnoreCase(intent, "joined");
+}
+
+fn queryBuilderInferredJoinRightTable(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    related_tables: []const QueryBuilderRelatedTable,
+) ?[]const u8 {
+    if (queryBuilderConstraintString(request.constraints, "join_right_table")) |value| return value;
+    if (queryBuilderConstraintString(request.constraints, "right_table")) |value| return value;
+    if (queryBuilderConstraintString(request.constraints, "join_table")) |value| return value;
+    for (related_tables) |table| {
+        if (queryBuilderIntentMentionsTable(request.intent, table.name)) return table.name;
+    }
+    for ([_][]const u8{ "join", "with", "including", "from" }) |keyword| {
+        if (queryBuilderWordAfterKeywordAlloc(alloc, request.intent, keyword)) |value| return value;
+    }
+    return null;
+}
+
+fn queryBuilderInferredJoinLeftField(
+    request: metadata_openapi.QueryBuilderRequest,
+    fields: []const []const u8,
+    right_table: []const u8,
+    right_field: []const u8,
+) ?[]const u8 {
+    if (queryBuilderConstraintString(request.constraints, "join_left_field")) |value| {
+        if (queryBuilderFieldInSlice(fields, value) or fields.len == 0) return value;
+    }
+    if (queryBuilderConstraintString(request.constraints, "left_field")) |value| {
+        if (queryBuilderFieldInSlice(fields, value) or fields.len == 0) return value;
+    }
+    for (fields) |field| {
+        if (queryBuilderIntentMentionsField(request.intent, field) and queryBuilderFieldLooksJoinKey(field, right_table, right_field)) return field;
+    }
+    for (fields) |field| {
+        if (queryBuilderFieldLooksJoinKey(field, right_table, right_field)) return field;
+    }
+    return null;
+}
+
+fn queryBuilderInferredJoinRightField(
+    request: metadata_openapi.QueryBuilderRequest,
+    right_table: ?*const QueryBuilderRelatedTable,
+) []const u8 {
+    if (queryBuilderConstraintString(request.constraints, "join_right_field")) |value| return value;
+    if (queryBuilderConstraintString(request.constraints, "right_field")) |value| return value;
+    if (right_table) |table| {
+        if (table.primary_key_fields.len > 0) return table.primary_key_fields[0];
+        for (table.schema_fields) |field| {
+            if (std.ascii.eqlIgnoreCase(field, "id")) return field;
+        }
+    }
+    return "id";
+}
+
+fn queryBuilderFieldLooksJoinKey(field: []const u8, right_table: []const u8, right_field: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(field, "id") and std.ascii.eqlIgnoreCase(right_field, "id")) return true;
+    if (std.ascii.eqlIgnoreCase(field, right_field)) return true;
+    if (std.ascii.endsWithIgnoreCase(field, right_field)) {
+        const prefix = field[0 .. field.len - right_field.len];
+        if (prefix.len > 0 and (prefix[prefix.len - 1] == '_' or prefix[prefix.len - 1] == '.')) {
+            const table_stem = queryBuilderSingularTableName(right_table);
+            if (std.ascii.eqlIgnoreCase(queryBuilderTrimRightSeparators(prefix), table_stem)) return true;
+        }
+    }
+    if (!std.ascii.endsWithIgnoreCase(field, "_id")) return false;
+    const leaf = queryBuilderFieldLeaf(field) orelse field;
+    if (std.ascii.eqlIgnoreCase(leaf, "id")) return true;
+    const stem = leaf[0 .. leaf.len - "_id".len];
+    if (stem.len == 0) return false;
+    if (std.ascii.eqlIgnoreCase(stem, right_table)) return true;
+    if (right_table.len > 1 and right_table[right_table.len - 1] == 's' and std.ascii.eqlIgnoreCase(stem, right_table[0 .. right_table.len - 1])) return true;
+    if (std.ascii.indexOfIgnoreCase(right_table, stem) != null) return true;
+    return false;
+}
+
+fn queryBuilderInferredJoinType(intent: []const u8) ?metadata_openapi.JoinType {
+    if (containsWholeWordIgnoreCase(intent, "left")) return .left;
+    if (containsWholeWordIgnoreCase(intent, "right")) return .right;
+    return .inner;
+}
+
+fn queryBuilderInferredJoinStrategy(intent: []const u8) ?metadata_openapi.JoinStrategy {
+    if (containsWholeWordIgnoreCase(intent, "broadcast")) return .broadcast;
+    if (containsWholeWordIgnoreCase(intent, "shuffle")) return .shuffle;
+    if (containsWholeWordIgnoreCase(intent, "lookup") or containsWholeWordIgnoreCase(intent, "index")) return .index_lookup;
+    return .index_lookup;
+}
+
+fn queryBuilderInferredJoinRightFields(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    right_table: ?*const QueryBuilderRelatedTable,
+) !?[]const []const u8 {
+    const explicit = try queryBuilderConstraintStringSlice(alloc, request.constraints, "join_right_fields");
+    if (explicit.len > 0) return explicit;
+    const fallback = try queryBuilderConstraintStringSlice(alloc, request.constraints, "right_fields");
+    if (fallback.len > 0) return fallback;
+    var out = std.ArrayListUnmanaged([]const u8).empty;
+    defer out.deinit(alloc);
+    if (right_table) |table| {
+        for (table.schema_fields) |field| {
+            if (queryBuilderIntentMentionsField(request.intent, field) and !queryBuilderFieldInSlice(table.primary_key_fields, field)) {
+                try out.append(alloc, field);
+            }
+        }
+        if (out.items.len > 0) return try out.toOwnedSlice(alloc);
+    }
+    for ([_][]const u8{ "name", "tier", "email", "region", "country", "segment", "status", "type" }) |field| {
+        if (containsWholeWordIgnoreCase(request.intent, field)) try out.append(alloc, field);
+    }
+    if (out.items.len == 0) return null;
+    return try out.toOwnedSlice(alloc);
+}
+
+fn queryBuilderRelatedTableForName(
+    related_tables: []const QueryBuilderRelatedTable,
+    name: []const u8,
+) ?*const QueryBuilderRelatedTable {
+    for (related_tables) |*table| {
+        if (queryBuilderTableNameMatches(table.name, name)) return table;
+    }
+    return null;
+}
+
+fn queryBuilderIntentMentionsTable(intent: []const u8, table_name: []const u8) bool {
+    if (containsWholeWordIgnoreCase(intent, table_name)) return true;
+    const singular = queryBuilderSingularTableName(table_name);
+    return !std.mem.eql(u8, singular, table_name) and containsWholeWordIgnoreCase(intent, singular);
+}
+
+fn queryBuilderTableNameMatches(left: []const u8, right: []const u8) bool {
+    if (std.ascii.eqlIgnoreCase(left, right)) return true;
+    const left_singular = queryBuilderSingularTableName(left);
+    const right_singular = queryBuilderSingularTableName(right);
+    return std.ascii.eqlIgnoreCase(left_singular, right_singular);
+}
+
+fn queryBuilderSingularTableName(table_name: []const u8) []const u8 {
+    if (table_name.len > 1 and table_name[table_name.len - 1] == 's') return table_name[0 .. table_name.len - 1];
+    return table_name;
+}
+
+fn queryBuilderTrimRightSeparators(value: []const u8) []const u8 {
+    var end = value.len;
+    while (end > 0 and (value[end - 1] == '_' or value[end - 1] == '.')) : (end -= 1) {}
+    return value[0..end];
+}
+
+fn queryBuilderWordAfterKeywordAlloc(
+    alloc: std.mem.Allocator,
+    text: []const u8,
+    keyword: []const u8,
+) ?[]const u8 {
+    var start: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(text, start, keyword)) |idx| {
+        const after = matchKeywordAt(text, idx, keyword) orelse {
+            start = idx + 1;
+            continue;
+        };
+        var cursor = after;
+        while (cursor < text.len and !isWordByte(text[cursor])) : (cursor += 1) {}
+        const begin = cursor;
+        while (cursor < text.len and (isWordByte(text[cursor]) or text[cursor] == '-' or text[cursor] == '.')) : (cursor += 1) {}
+        if (cursor > begin) {
+            const word = text[begin..cursor];
+            if (!queryBuilderJoinStopWord(word)) return alloc.dupe(u8, word) catch null;
+        }
+        start = idx + 1;
+    }
+    return null;
+}
+
+fn queryBuilderJoinStopWord(word: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(word, "the") or
+        std.ascii.eqlIgnoreCase(word, "a") or
+        std.ascii.eqlIgnoreCase(word, "an") or
+        std.ascii.eqlIgnoreCase(word, "table") or
+        std.ascii.eqlIgnoreCase(word, "data") or
+        std.ascii.eqlIgnoreCase(word, "records") or
+        std.ascii.eqlIgnoreCase(word, "rows");
+}
+
+fn queryBuilderInferredAggregations(
+    alloc: std.mem.Allocator,
+    request: metadata_openapi.QueryBuilderRequest,
+    fields: []const []const u8,
+    field_metadata: []const QueryBuilderFieldMetadata,
+    warnings: *std.ArrayListUnmanaged([]const u8),
+) !?std.json.ArrayHashMap(metadata_openapi.AggregationRequest) {
+    if (!queryBuilderShouldInferAggregation(request)) return null;
+    const kind = queryBuilderIntentAggregationType(request.intent) orelse blk: {
+        if (queryBuilderAggregationMode(request.mode)) break :blk metadata_openapi.AggregationType.terms;
+        return null;
+    };
+    const group_field = queryBuilderIntentGroupField(request.intent, fields, field_metadata);
+    const metric_field = queryBuilderIntentMetricField(request.intent, fields, field_metadata, group_field);
+
+    if (kind == .terms) {
+        const field = group_field orelse {
+            try warnings.append(alloc, "Aggregation mode was requested, but no grouping field could be inferred from intent or schema fields.");
+            return null;
+        };
+        return try queryBuilderSingleAggregationMap(alloc, try std.fmt.allocPrint(alloc, "by_{s}", .{field}), .{
+            .type = .terms,
+            .field = field,
+            .size = queryBuilderConstraintInteger(request.constraints, "aggregation_size") orelse 10,
+        });
+    }
+
+    if (group_field) |field| {
+        var nested = std.json.ArrayHashMap(metadata_openapi.AggregationRequest){};
+        const nested_field = metric_field orelse if (kind == .count) field else null;
+        if (nested_field == null) {
+            try warnings.append(alloc, "Aggregation mode was requested, but no metric field could be inferred for the requested aggregate.");
+            return null;
+        }
+        const nested_name = try queryBuilderAggregationName(alloc, kind, nested_field.?);
+        try nested.map.put(alloc, nested_name, .{
+            .type = kind,
+            .field = nested_field,
+        });
+        return try queryBuilderSingleAggregationMap(alloc, try std.fmt.allocPrint(alloc, "by_{s}", .{field}), .{
+            .type = .terms,
+            .field = field,
+            .size = queryBuilderConstraintInteger(request.constraints, "aggregation_size") orelse 10,
+            .sub_aggregations = nested,
+        });
+    }
+
+    const field = metric_field orelse {
+        try warnings.append(alloc, "Aggregation mode was requested, but no field could be inferred for the requested aggregate.");
+        return null;
+    };
+    return try queryBuilderSingleAggregationMap(alloc, try queryBuilderAggregationName(alloc, kind, field), .{
+        .type = kind,
+        .field = field,
+    });
+}
+
+fn queryBuilderSingleAggregationMap(
+    alloc: std.mem.Allocator,
+    name: []const u8,
+    request: metadata_openapi.AggregationRequest,
+) !std.json.ArrayHashMap(metadata_openapi.AggregationRequest) {
+    var out = std.json.ArrayHashMap(metadata_openapi.AggregationRequest){};
+    try out.map.put(alloc, name, request);
+    return out;
+}
+
+fn queryBuilderAggregationName(
+    alloc: std.mem.Allocator,
+    kind: metadata_openapi.AggregationType,
+    field: []const u8,
+) ![]const u8 {
+    return try std.fmt.allocPrint(alloc, "{s}_{s}", .{ @tagName(kind), field });
+}
+
+fn queryBuilderShouldInferAggregation(request: metadata_openapi.QueryBuilderRequest) bool {
+    if (queryBuilderHasAggregationConstraints(request.constraints)) return false;
+    if (queryBuilderAggregationMode(request.mode)) return true;
+    if (request.mode) |mode| {
+        if (!std.ascii.eqlIgnoreCase(mode, "auto")) return false;
+    }
+    return queryBuilderIntentAggregationType(request.intent) != null or queryBuilderIntentHasGrouping(request.intent);
+}
+
+fn queryBuilderAggregationMode(mode: ?[]const u8) bool {
+    const value = mode orelse return false;
+    return std.ascii.eqlIgnoreCase(value, "aggregation") or std.ascii.eqlIgnoreCase(value, "join_aggregation");
+}
+
+fn queryBuilderIntentAggregationType(intent: []const u8) ?metadata_openapi.AggregationType {
+    if (containsWholeWordIgnoreCase(intent, "average") or containsWholeWordIgnoreCase(intent, "avg") or containsWholeWordIgnoreCase(intent, "mean")) return .avg;
+    if (containsWholeWordIgnoreCase(intent, "sum") or containsWholeWordIgnoreCase(intent, "total")) return .sum;
+    if (containsWholeWordIgnoreCase(intent, "minimum") or containsWholeWordIgnoreCase(intent, "min") or containsWholeWordIgnoreCase(intent, "lowest")) return .min;
+    if (containsWholeWordIgnoreCase(intent, "maximum") or containsWholeWordIgnoreCase(intent, "max") or containsWholeWordIgnoreCase(intent, "highest")) return .max;
+    if (containsWholeWordIgnoreCase(intent, "stats") or containsWholeWordIgnoreCase(intent, "statistics")) return .stats;
+    if (containsWholeWordIgnoreCase(intent, "unique") or containsWholeWordIgnoreCase(intent, "distinct") or containsWholeWordIgnoreCase(intent, "cardinality")) return .cardinality;
+    if (containsWholeWordIgnoreCase(intent, "count") or containsWholeWordIgnoreCase(intent, "counts") or std.ascii.indexOfIgnoreCase(intent, "how many") != null or containsWholeWordIgnoreCase(intent, "number")) return .count;
+    return null;
+}
+
+fn queryBuilderIntentHasGrouping(intent: []const u8) bool {
+    return containsWholeWordIgnoreCase(intent, "by") or containsWholeWordIgnoreCase(intent, "per") or std.ascii.indexOfIgnoreCase(intent, "grouped by") != null;
+}
+
+fn queryBuilderIntentGroupField(
+    intent: []const u8,
+    fields: []const []const u8,
+    field_metadata: []const QueryBuilderFieldMetadata,
+) ?[]const u8 {
+    for (field_metadata) |metadata| {
+        if (!queryBuilderFieldMetadataAllowed(fields, metadata.name)) continue;
+        if (!queryBuilderFieldMetadataGroupable(metadata)) continue;
+        if (queryBuilderIntentMentionsCatalogFieldAfterKeyword(intent, metadata, "by")) return metadata.name;
+        if (queryBuilderIntentMentionsCatalogFieldAfterKeyword(intent, metadata, "per")) return metadata.name;
+    }
+    for (fields) |field| {
+        if (queryBuilderIntentMentionsFieldAfterKeyword(intent, field, "by")) return field;
+        if (queryBuilderIntentMentionsFieldAfterKeyword(intent, field, "per")) return field;
+    }
+    for (field_metadata) |metadata| {
+        if (!queryBuilderFieldMetadataAllowed(fields, metadata.name)) continue;
+        if (!queryBuilderFieldMetadataGroupable(metadata)) continue;
+        if (queryBuilderIntentMentionsCatalogField(intent, metadata)) return metadata.name;
+    }
+    for (fields) |field| {
+        if (queryBuilderFieldLooksCategorical(field) and queryBuilderIntentMentionsField(intent, field)) return field;
+    }
+    for (field_metadata) |metadata| {
+        if (!queryBuilderFieldMetadataAllowed(fields, metadata.name)) continue;
+        if (queryBuilderFieldMetadataGroupable(metadata)) return metadata.name;
+    }
+    for (fields) |field| {
+        if (queryBuilderFieldLooksCategorical(field)) return field;
+    }
+    return null;
+}
+
+fn queryBuilderIntentMetricField(
+    intent: []const u8,
+    fields: []const []const u8,
+    field_metadata: []const QueryBuilderFieldMetadata,
+    group_field: ?[]const u8,
+) ?[]const u8 {
+    for (field_metadata) |metadata| {
+        if (!queryBuilderFieldMetadataAllowed(fields, metadata.name)) continue;
+        if (group_field != null and queryBuilderFieldMatches(group_field.?, metadata.name)) continue;
+        if (!queryBuilderFieldMetadataMetric(metadata)) continue;
+        if (queryBuilderIntentMentionsCatalogField(intent, metadata)) return metadata.name;
+    }
+    for (fields) |field| {
+        if (group_field != null and queryBuilderFieldMatches(group_field.?, field)) continue;
+        if (queryBuilderFieldLooksMetric(field) and queryBuilderIntentMentionsField(intent, field)) return field;
+    }
+    for (field_metadata) |metadata| {
+        if (!queryBuilderFieldMetadataAllowed(fields, metadata.name)) continue;
+        if (group_field != null and queryBuilderFieldMatches(group_field.?, metadata.name)) continue;
+        if (queryBuilderFieldMetadataMetric(metadata)) return metadata.name;
+    }
+    for (fields) |field| {
+        if (group_field != null and queryBuilderFieldMatches(group_field.?, field)) continue;
+        if (queryBuilderFieldLooksMetric(field)) return field;
+    }
+    for (fields) |field| {
+        if (group_field != null and queryBuilderFieldMatches(group_field.?, field)) continue;
+        if (queryBuilderIntentMentionsField(intent, field)) return field;
+    }
+    return null;
+}
+
+fn queryBuilderFieldMetadataAllowed(fields: []const []const u8, field: []const u8) bool {
+    return fields.len == 0 or queryBuilderFieldInSlice(fields, field);
+}
+
+fn queryBuilderFieldMetadataGroupable(metadata: QueryBuilderFieldMetadata) bool {
+    if (!metadata.aggregatable) return false;
+    if (metadata.groupable) |groupable| return groupable;
+    return switch (metadata.kind) {
+        .keyword, .text, .date, .boolean => true,
+        .numeric, .geo => false,
+        .unknown => queryBuilderFieldLooksCategorical(metadata.name),
+    };
+}
+
+fn queryBuilderFieldMetadataMetric(metadata: QueryBuilderFieldMetadata) bool {
+    if (!metadata.aggregatable) return false;
+    if (metadata.metric) |metric| return metric;
+    return switch (metadata.kind) {
+        .numeric => true,
+        .unknown => queryBuilderFieldLooksMetric(metadata.name),
+        else => false,
+    };
+}
+
+fn queryBuilderFieldLooksCategorical(field: []const u8) bool {
+    for ([_][]const u8{ "status", "state", "type", "kind", "category", "tier", "segment", "customer", "customer_id", "user", "user_id", "tenant", "tenant_id", "region", "country" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(field, candidate)) return true;
+        if (std.ascii.endsWithIgnoreCase(field, candidate)) return true;
+    }
+    return false;
+}
+
+fn queryBuilderFieldLooksMetric(field: []const u8) bool {
+    for ([_][]const u8{ "amount", "price", "cost", "total", "duration", "latency", "score", "count", "quantity", "qty", "revenue", "value", "size", "bytes" }) |candidate| {
+        if (std.ascii.eqlIgnoreCase(field, candidate)) return true;
+        if (std.ascii.endsWithIgnoreCase(field, candidate)) return true;
+    }
+    return false;
+}
+
+fn queryBuilderIntentMentionsFieldAfterKeyword(intent: []const u8, field: []const u8, keyword: []const u8) bool {
+    var start: usize = 0;
+    while (std.ascii.indexOfIgnoreCasePos(intent, start, keyword)) |idx| {
+        const after = matchKeywordAt(intent, idx, keyword) orelse {
+            start = idx + 1;
+            continue;
+        };
+        var cursor = after;
+        while (cursor < intent.len and !isWordByte(intent[cursor])) : (cursor += 1) {}
+        const window_end = @min(intent.len, cursor + 48);
+        if (queryBuilderIntentMentionsField(intent[cursor..window_end], field)) return true;
+        start = idx + 1;
+    }
+    return false;
+}
+
+fn queryBuilderIntentMentionsCatalogFieldAfterKeyword(
+    intent: []const u8,
+    metadata: QueryBuilderFieldMetadata,
+    keyword: []const u8,
+) bool {
+    if (queryBuilderIntentMentionsFieldAfterKeyword(intent, metadata.name, keyword)) return true;
+    for (metadata.aliases) |alias| {
+        if (queryBuilderIntentMentionsFieldAfterKeyword(intent, alias, keyword)) return true;
+    }
+    return false;
+}
+
+fn queryBuilderIntentMentionsCatalogField(intent: []const u8, metadata: QueryBuilderFieldMetadata) bool {
+    if (queryBuilderIntentMentionsField(intent, metadata.name)) return true;
+    for (metadata.aliases) |alias| {
+        if (queryBuilderIntentMentionsField(intent, alias)) return true;
+    }
+    return false;
+}
+
+fn queryBuilderIntentMentionsField(intent: []const u8, field: []const u8) bool {
+    if (std.ascii.indexOfIgnoreCase(intent, field) != null) return true;
+    if (queryBuilderFieldLeaf(field)) |leaf| {
+        if (std.ascii.indexOfIgnoreCase(intent, leaf) != null) return true;
+        if (std.ascii.endsWithIgnoreCase(leaf, "_id") and leaf.len > 3) {
+            if (std.ascii.indexOfIgnoreCase(intent, leaf[0 .. leaf.len - 3]) != null) return true;
+        }
+    }
+    return false;
+}
+
+fn queryBuilderFieldLeaf(field: []const u8) ?[]const u8 {
+    if (field.len == 0) return null;
+    if (std.mem.lastIndexOfScalar(u8, field, '.')) |idx| {
+        if (idx + 1 < field.len) return field[idx + 1 ..];
+    }
+    return field;
+}
+
+fn queryBuilderHasJoinConstraint(constraints: ?std.json.Value) bool {
+    return queryBuilderConstraintObject(constraints, "join") != null;
+}
+
+fn queryBuilderHasAggregationConstraints(constraints: ?std.json.Value) bool {
+    return queryBuilderConstraintObject(constraints, "aggregations") != null;
+}
+
+fn recursiveQueryBuilderCandidateScore(
+    request: metadata_openapi.QueryBuilderRequest,
+    result: metadata_openapi.QueryBuilderResult,
+    preflight_signal: RecursiveQueryBuilderPreflightSignal,
+    aggregation_signal: RecursiveQueryBuilderAggregationSignal,
+    join_signal: RecursiveQueryBuilderJoinSignal,
+    join_runtime_validated: bool,
+) f64 {
+    var score = result.confidence orelse 0.5;
+    if (result.status == .completed) score += 0.10;
+    if (result.query_request != null) score += 0.05;
+    if (result.retrieval_query_request != null) score += 0.03;
+    if (join_runtime_validated) score += 0.04;
+    if (request.mode) |mode| {
+        if (result.specialist) |specialist| {
+            if (std.ascii.eqlIgnoreCase(mode, specialist)) score += 0.08;
+        }
+    }
+    const preflight_error_count = queryBuilderResultPreflightErrorCount(result);
+    if (preflight_error_count > 0) score -= @min(@as(f64, 0.40), @as(f64, @floatFromInt(preflight_error_count)) * 0.10);
+    if (preflight_signal.latency_heuristic_score) |latency_score| {
+        score -= @min(@as(f64, 0.12), @as(f64, @floatFromInt(latency_score)) * 0.01);
+    }
+    score += recursiveQueryBuilderAggregationSignalScore(preflight_signal);
+    score += recursiveQueryBuilderAggregationCatalogSignalScore(aggregation_signal);
+    score += recursiveQueryBuilderJoinSignalScore(join_signal, join_runtime_validated);
+    score += recursiveQueryBuilderJoinRuntimeSignalScore(preflight_signal, join_signal, join_runtime_validated);
+    score += recursiveQueryBuilderJoinPlannerSignalScore(preflight_signal, join_signal);
+    if (result.warnings) |warnings| score -= @min(@as(f64, 0.20), @as(f64, @floatFromInt(warnings.len)) * 0.02);
+    return @max(0.0, @min(1.0, score));
+}
+
+fn recursiveQueryBuilderJoinPlannerSignalScore(
+    preflight_signal: RecursiveQueryBuilderPreflightSignal,
+    join_signal: RecursiveQueryBuilderJoinSignal,
+) f64 {
+    const planner_strategy = preflight_signal.join_planner_strategy orelse return 0.0;
+    var score: f64 = 0.0;
+    if (join_signal.strategy_hint) |hint| {
+        score += if (std.mem.eql(u8, hint, planner_strategy)) 0.04 else -0.03;
+    }
+    if (preflight_signal.join_planner_used_stats == true) score += 0.01;
+    if (preflight_signal.join_planner_forced_broadcast_fallback == true) score -= 0.03;
+    if (preflight_signal.join_planner_shuffle_candidate == true and std.mem.eql(u8, planner_strategy, "shuffle")) score += 0.01;
+    return score;
+}
+
+fn recursiveQueryBuilderAggregationSignalScore(signal: RecursiveQueryBuilderPreflightSignal) f64 {
+    var score: f64 = 0.0;
+    if (signal.aggregation_may_scan_full_results == true) score -= 0.04;
+    if (signal.aggregation_second_pass_doc_upper_bound) |upper_bound| {
+        if (upper_bound >= 10_000)
+            score -= 0.04
+        else if (upper_bound >= 1_000)
+            score -= 0.02;
+    }
+    return score;
+}
+
+fn recursiveQueryBuilderAggregationCatalogSignalScore(signal: RecursiveQueryBuilderAggregationSignal) f64 {
+    if (signal.group_field == null and signal.metric_field == null) return 0.0;
+    var score: f64 = 0.0;
+    if (signal.field_catalog_backed) score += 0.02;
+    if (signal.stat_heuristic) |heuristic| {
+        if (std.mem.eql(u8, heuristic, "catalog_small")) score += 0.01;
+        if (std.mem.eql(u8, heuristic, "catalog_large")) score -= 0.02;
+        if (std.mem.eql(u8, heuristic, "catalog_very_large")) score -= 0.04;
+        if (std.mem.eql(u8, heuristic, "unknown_table_stats")) score -= 0.01;
+    }
+    return score;
+}
+
+fn recursiveQueryBuilderAggregationSignal(
+    context: QueryBuilderTableContext,
+    result: metadata_openapi.QueryBuilderResult,
+) RecursiveQueryBuilderAggregationSignal {
+    const query_request = result.query_request orelse return .{};
+    const aggregations = query_request.aggregations orelse return .{};
+
+    var group_field: ?[]const u8 = null;
+    var metric_field: ?[]const u8 = null;
+    var bucket_size: ?u32 = null;
+    var it = aggregations.map.iterator();
+    while (it.next()) |entry| {
+        recursiveQueryBuilderCollectAggregationFields(entry.value_ptr.*, &group_field, &metric_field, &bucket_size);
+        if (group_field != null and metric_field != null) break;
+    }
+
+    const has_aggregation = group_field != null or metric_field != null or aggregations.map.count() > 0;
+    if (!has_aggregation) return .{};
+    return .{
+        .group_field = group_field,
+        .metric_field = metric_field,
+        .field_catalog_backed = recursiveQueryBuilderAggregationFieldsCatalogBacked(context.field_metadata, group_field, metric_field),
+        .table_doc_count = context.doc_count,
+        .bucket_size = bucket_size,
+        .stat_heuristic = recursiveQueryBuilderAggregationStatHeuristic(context.doc_count, bucket_size),
+    };
+}
+
+fn recursiveQueryBuilderCollectAggregationFields(
+    aggregation: metadata_openapi.AggregationRequest,
+    group_field: *?[]const u8,
+    metric_field: *?[]const u8,
+    bucket_size: *?u32,
+) void {
+    switch (aggregation.type) {
+        .terms, .range, .date_range, .histogram, .date_histogram, .geohash_grid, .geo_distance, .significant_terms => {
+            if (group_field.* == null) group_field.* = aggregation.field;
+            if (bucket_size.* == null and aggregation.size != null and aggregation.size.? > 0) {
+                bucket_size.* = std.math.cast(u32, aggregation.size.?) orelse null;
+            }
+        },
+        .sum, .avg, .min, .max, .count, .sumsquares, .stats, .cardinality => {
+            if (metric_field.* == null) metric_field.* = aggregation.field;
+        },
+    }
+    if (aggregation.sub_aggregations) |sub_aggregations| {
+        var it = sub_aggregations.map.iterator();
+        while (it.next()) |entry| {
+            recursiveQueryBuilderCollectAggregationFields(entry.value_ptr.*, group_field, metric_field, bucket_size);
+            if (group_field.* != null and metric_field.* != null and bucket_size.* != null) return;
+        }
+    }
+}
+
+fn recursiveQueryBuilderAggregationFieldsCatalogBacked(
+    field_metadata: []const QueryBuilderFieldMetadata,
+    group_field: ?[]const u8,
+    metric_field: ?[]const u8,
+) bool {
+    if (field_metadata.len == 0) return false;
+    const group_ok = if (group_field) |field|
+        recursiveQueryBuilderFieldCatalogSupportsRole(field_metadata, field, .group)
+    else
+        true;
+    const metric_ok = if (metric_field) |field|
+        recursiveQueryBuilderFieldCatalogSupportsRole(field_metadata, field, .metric)
+    else
+        true;
+    return group_ok and metric_ok;
+}
+
+const RecursiveQueryBuilderAggregationFieldRole = enum { group, metric };
+
+fn recursiveQueryBuilderFieldCatalogSupportsRole(
+    field_metadata: []const QueryBuilderFieldMetadata,
+    field: []const u8,
+    role: RecursiveQueryBuilderAggregationFieldRole,
+) bool {
+    for (field_metadata) |metadata| {
+        if (!queryBuilderFieldMatches(field, metadata.name)) continue;
+        return switch (role) {
+            .group => queryBuilderFieldMetadataGroupable(metadata),
+            .metric => queryBuilderFieldMetadataMetric(metadata),
+        };
+    }
+    return false;
+}
+
+fn recursiveQueryBuilderAggregationStatHeuristic(doc_count: ?u64, bucket_size: ?u32) ?[]const u8 {
+    const docs = doc_count orelse return "unknown_table_stats";
+    const buckets = bucket_size orelse 10;
+    if (docs >= 1_000_000 or buckets >= 1_000) return "catalog_very_large";
+    if (docs >= 100_000 or buckets >= 100) return "catalog_large";
+    if (docs >= 10_000 or buckets >= 50) return "catalog_medium";
+    return "catalog_small";
+}
+
+fn recursiveQueryBuilderJoinSignal(
+    alloc: std.mem.Allocator,
+    context: QueryBuilderTableContext,
+    result: metadata_openapi.QueryBuilderResult,
+) !RecursiveQueryBuilderJoinSignal {
+    const query_request = result.query_request orelse return .{};
+    const join = query_request.join orelse return .{};
+    const related_table = queryBuilderRelatedTableForName(context.related_tables, join.right_table);
+    const right_doc_count = if (related_table) |table| table.doc_count else null;
+    const right_shard_count = if (related_table) |table| table.shard_count else null;
+    const right_key_stats = recursiveQueryBuilderRightKeyStats(join.on.right_field, related_table);
+    const right_key_selectivity = recursiveQueryBuilderRightKeySelectivity(right_key_stats, related_table);
+    const shard_colocation = if (related_table) |table| recursiveQueryBuilderShardColocation(table.colocated_with_left) else null;
+    const strategy_hint = if (join.strategy_hint) |strategy| @tagName(strategy) else null;
+    const strategy_options = try recursiveQueryBuilderJoinStrategyOptions(alloc, context.doc_count, right_doc_count, right_shard_count, right_key_stats, right_key_selectivity, shard_colocation);
+    const recommended_strategy = recursiveQueryBuilderRecommendedJoinStrategy(strategy_options);
+    return .{
+        .strategy_hint = strategy_hint,
+        .recommended_strategy = recommended_strategy,
+        .strategy_options = strategy_options,
+        .left_doc_count = context.doc_count,
+        .right_doc_count = right_doc_count,
+        .right_shard_count = right_shard_count,
+        .right_key_selectivity = right_key_selectivity,
+        .right_key_field = right_key_stats.field,
+        .right_key_unique = right_key_stats.unique,
+        .right_key_estimated_distinct = right_key_stats.estimated_distinct,
+        .right_key_avg_rows_per_key = right_key_stats.avg_rows_per_key,
+        .right_key_stats_source = right_key_stats.source,
+        .right_key_stats_confidence = right_key_stats.confidence,
+        .shard_colocation = shard_colocation,
+        .cardinality_heuristic = recursiveQueryBuilderJoinCardinalityHeuristic(context.doc_count, right_doc_count, strategy_hint),
+    };
+}
+
+fn recursiveQueryBuilderRightKeyStats(
+    right_field: []const u8,
+    related_table: ?*const QueryBuilderRelatedTable,
+) RecursiveQueryBuilderRightKeyStats {
+    const table = related_table orelse return .{ .field = right_field };
+    const doc_count = table.doc_count;
+    const primary_key_match = recursiveQueryBuilderRightFieldMatchesPrimaryKey(right_field, table.primary_key_fields);
+    if (primary_key_match or std.mem.eql(u8, right_field, "_id")) {
+        return .{
+            .field = right_field,
+            .unique = true,
+            .estimated_distinct = doc_count,
+            .avg_rows_per_key = if (doc_count != null) 1.0 else null,
+            .source = if (primary_key_match) "primary_key_metadata" else "document_id_convention",
+            .confidence = "high",
+        };
+    }
+    if (doc_count) |docs| {
+        const distinct = recursiveQueryBuilderHeuristicDistinctRightKey(docs, right_field);
+        return .{
+            .field = right_field,
+            .unique = false,
+            .estimated_distinct = distinct,
+            .avg_rows_per_key = if (distinct > 0) @as(f64, @floatFromInt(docs)) / @as(f64, @floatFromInt(distinct)) else null,
+            .source = "schema_name_heuristic",
+            .confidence = "low",
+        };
+    }
+    return .{
+        .field = right_field,
+        .source = "schema_name_heuristic",
+        .confidence = "low",
+    };
+}
+
+fn recursiveQueryBuilderRightFieldMatchesPrimaryKey(right_field: []const u8, primary_key_fields: []const []const u8) bool {
+    for (primary_key_fields) |field| {
+        if (queryBuilderFieldMatches(right_field, field)) return true;
+    }
+    return false;
+}
+
+fn recursiveQueryBuilderHeuristicDistinctRightKey(doc_count: u64, right_field: []const u8) u64 {
+    if (doc_count == 0) return 0;
+    if (std.ascii.eqlIgnoreCase(right_field, "id") or std.ascii.eqlIgnoreCase(right_field, "_id") or std.ascii.endsWithIgnoreCase(right_field, "_id")) {
+        return @max(@as(u64, 1), doc_count / 2);
+    }
+    if (queryBuilderFieldLooksCategorical(right_field)) return @min(doc_count, @as(u64, 100));
+    if (queryBuilderFieldLooksMetric(right_field)) return @min(doc_count, @as(u64, 10_000));
+    return @min(doc_count, @max(@as(u64, 10), doc_count / 10));
+}
+
+fn recursiveQueryBuilderRightKeySelectivity(
+    stats: RecursiveQueryBuilderRightKeyStats,
+    related_table: ?*const QueryBuilderRelatedTable,
+) ?[]const u8 {
+    if (stats.unique) return "primary_key_unique";
+    if (related_table) |table| {
+        if (table.key_selectivity_heuristic) |value| return value;
+    }
+    if (stats.avg_rows_per_key) |avg| {
+        if (avg <= 4.0) return "high_selectivity";
+        if (avg <= 32.0) return "medium_selectivity";
+        return "low_selectivity";
+    }
+    return null;
+}
+
+fn recursiveQueryBuilderJoinStrategyOptions(
+    alloc: std.mem.Allocator,
+    left_doc_count: ?u64,
+    right_doc_count: ?u64,
+    right_shard_count: ?u32,
+    right_key_stats: RecursiveQueryBuilderRightKeyStats,
+    right_key_selectivity: ?[]const u8,
+    shard_colocation: ?[]const u8,
+) !?[]const RecursiveQueryBuilderJoinStrategyOption {
+    if (left_doc_count == null and right_doc_count == null) return null;
+    const left = left_doc_count orelse 100_000;
+    const right = right_doc_count orelse 100_000;
+    const shard_factor: u64 = if (right_shard_count) |count| @max(@as(u32, 1), count) else 1;
+    const lookup_multiplier: u64 = if (right_key_stats.unique)
+        1
+    else if (right_key_stats.avg_rows_per_key) |avg|
+        if (avg <= 4.0) @as(u64, 2) else if (avg <= 32.0) @as(u64, 4) else @as(u64, 8)
+    else
+        6;
+    const colocation_discount: u64 = if (shard_colocation != null and std.mem.eql(u8, shard_colocation.?, "co_located")) 2 else 1;
+    const index_lookup_cost = (left *| lookup_multiplier *| shard_factor) / colocation_discount;
+    const broadcast_cost = right *| 4 +| left / 100;
+    const shuffle_cost = left +| right +| (shard_factor * 100);
+    var recommended: []const u8 = "index_lookup";
+    var recommended_cost = index_lookup_cost;
+    if (broadcast_cost < recommended_cost) {
+        recommended = "broadcast";
+        recommended_cost = broadcast_cost;
+    }
+    if (shuffle_cost < recommended_cost) {
+        recommended = "shuffle";
+    }
+    const options = try alloc.alloc(RecursiveQueryBuilderJoinStrategyOption, 3);
+    options[0] = .{
+        .strategy = "index_lookup",
+        .estimated_cost_score = index_lookup_cost,
+        .recommended = std.mem.eql(u8, recommended, "index_lookup"),
+        .feasible = right_key_selectivity != null,
+        .feasibility = if (right_key_stats.unique)
+            "right_key_unique"
+        else if (right_key_selectivity != null)
+            "right_key_selectivity_estimated"
+        else
+            "right_key_selectivity_unknown",
+    };
+    options[1] = .{
+        .strategy = "broadcast",
+        .estimated_cost_score = broadcast_cost,
+        .recommended = std.mem.eql(u8, recommended, "broadcast"),
+        .feasible = right <= 50_000,
+        .feasibility = if (right <= 50_000) "right_side_broadcastable" else "right_side_too_large",
+    };
+    options[2] = .{
+        .strategy = "shuffle",
+        .estimated_cost_score = shuffle_cost,
+        .recommended = std.mem.eql(u8, recommended, "shuffle"),
+        .feasible = shard_factor > 1 or left >= 50_000 or right >= 50_000,
+        .feasibility = if (shard_factor > 1 or left >= 50_000 or right >= 50_000) "distributed_shuffle_candidate" else "single_shard_shuffle_unnecessary",
+    };
+    return options;
+}
+
+fn recursiveQueryBuilderShardColocation(colocated_with_left: bool) []const u8 {
+    return if (colocated_with_left) "co_located" else "not_co_located";
+}
+
+fn recursiveQueryBuilderRecommendedJoinStrategy(options: ?[]const RecursiveQueryBuilderJoinStrategyOption) ?[]const u8 {
+    const items = options orelse return null;
+    for (items) |item| {
+        if (item.recommended) return item.strategy;
+    }
+    return null;
+}
+
+fn recursiveQueryBuilderJoinCardinalityHeuristic(left_doc_count: ?u64, right_doc_count: ?u64, strategy_hint: ?[]const u8) ?[]const u8 {
+    const right = right_doc_count orelse return null;
+    const strategy = strategy_hint orelse "unknown";
+    if (std.ascii.eqlIgnoreCase(strategy, "index_lookup")) {
+        if (right <= 10_000) return "small_right_index_lookup";
+        if (left_doc_count) |left| {
+            if (left >= 100_000 and right >= 100_000) return "large_bilateral_index_lookup";
+        }
+        return "large_right_index_lookup";
+    }
+    if (std.ascii.eqlIgnoreCase(strategy, "broadcast")) {
+        if (right <= 10_000) return "small_right_broadcast";
+        return "large_right_broadcast";
+    }
+    if (std.ascii.eqlIgnoreCase(strategy, "shuffle")) {
+        if (left_doc_count) |left| {
+            if (left >= 100_000 and right >= 100_000) return "large_bilateral_shuffle";
+        }
+        return "shuffle";
+    }
+    return "join_cardinality_known";
+}
+
+fn recursiveQueryBuilderJoinSignalScore(signal: RecursiveQueryBuilderJoinSignal, join_runtime_validated: bool) f64 {
+    var score: f64 = 0.0;
+    if (signal.strategy_hint != null and signal.recommended_strategy != null) {
+        if (std.mem.eql(u8, signal.strategy_hint.?, signal.recommended_strategy.?)) {
+            score += 0.03;
+        } else {
+            score += if (join_runtime_validated) -0.01 else -0.03;
+        }
+    }
+    if (signal.right_key_unique == true) score += 0.02;
+    if (signal.right_key_stats_confidence) |confidence| {
+        if (std.mem.eql(u8, confidence, "high")) score += 0.01;
+    }
+    if (signal.right_key_avg_rows_per_key) |avg| {
+        if (avg > 32.0) score -= 0.02;
+    }
+    if (signal.shard_colocation != null and std.mem.eql(u8, signal.shard_colocation.?, "co_located")) score += 0.01;
+    const heuristic = signal.cardinality_heuristic orelse return score;
+    if (std.mem.eql(u8, heuristic, "small_right_index_lookup")) score += 0.03;
+    if (std.mem.eql(u8, heuristic, "small_right_broadcast")) score += 0.02;
+    if (std.mem.eql(u8, heuristic, "large_bilateral_shuffle")) score += 0.01;
+    if (std.mem.eql(u8, heuristic, "large_bilateral_index_lookup") and !join_runtime_validated) score -= 0.04;
+    if (std.mem.eql(u8, heuristic, "large_right_broadcast")) score -= 0.03;
+    return score;
+}
+
+fn recursiveQueryBuilderJoinRuntimeFeasibility(signal: RecursiveQueryBuilderPreflightSignal, join_runtime_validated: bool) ?[]const u8 {
+    if (!join_runtime_validated) return null;
+    const shard_count = signal.shard_count orelse 0;
+    const remote_shard_count = signal.remote_shard_count orelse 0;
+    if (remote_shard_count > 0) return "runtime_validated_remote";
+    if (shard_count > 1) return "runtime_validated_distributed";
+    return "runtime_validated_local";
+}
+
+fn recursiveQueryBuilderJoinRuntimeSignalScore(
+    preflight_signal: RecursiveQueryBuilderPreflightSignal,
+    join_signal: RecursiveQueryBuilderJoinSignal,
+    join_runtime_validated: bool,
+) f64 {
+    if (join_signal.strategy_hint == null or !join_runtime_validated) return 0.0;
+    var score: f64 = 0.02;
+    if (preflight_signal.result_doc_estimate) |estimate| {
+        if (estimate <= 100)
+            score += 0.02
+        else if (estimate >= 10_000)
+            score -= 0.03;
+    } else if (preflight_signal.result_doc_upper_bound) |upper_bound| {
+        if (upper_bound <= 100)
+            score += 0.01
+        else if (upper_bound >= 10_000)
+            score -= 0.02;
+    }
+    if (preflight_signal.remote_shard_count) |remote_shards| {
+        if (remote_shards > 0) score -= 0.02;
+    }
+    return score;
+}
+
+fn queryBuilderResultPreflightErrorCount(result: metadata_openapi.QueryBuilderResult) usize {
+    const steps = result.steps orelse return 0;
+    var count: usize = 0;
+    for (steps) |step| {
+        const details = step.details orelse continue;
+        if (details != .object) continue;
+        const preflight = details.object.get("preflight") orelse continue;
+        if (preflight != .object) continue;
+        const diagnostics = preflight.object.get("diagnostics") orelse continue;
+        if (diagnostics != .array) continue;
+        for (diagnostics.array.items) |diagnostic| {
+            if (diagnostic != .object) continue;
+            const severity = diagnostic.object.get("severity") orelse continue;
+            if (severity == .string and std.mem.eql(u8, severity.string, "error")) count += 1;
+        }
+    }
+    return count;
+}
+
+fn queryBuilderResultPreflightSignal(result: metadata_openapi.QueryBuilderResult) RecursiveQueryBuilderPreflightSignal {
+    const steps = result.steps orelse return .{};
+    for (steps) |step| {
+        const details = step.details orelse continue;
+        if (details != .object) continue;
+        const preflight = details.object.get("preflight") orelse continue;
+        if (preflight != .object) continue;
+        const estimate = preflight.object.get("estimate_summary") orelse continue;
+        if (estimate != .object) continue;
+        const planner = preflight.object.get("join_planner_summary");
+        return .{
+            .has_estimate = true,
+            .latency_heuristic_score = queryBuilderJsonU32(estimate.object.get("latency_heuristic_score")),
+            .latency_heuristic = queryBuilderJsonString(estimate.object.get("latency_heuristic")),
+            .selectivity_heuristic = queryBuilderJsonString(estimate.object.get("selectivity_heuristic")),
+            .aggregation_may_scan_full_results = queryBuilderJsonBool(estimate.object.get("aggregation_may_scan_full_results")),
+            .aggregation_second_pass_doc_estimate = queryBuilderJsonU32(estimate.object.get("aggregation_second_pass_doc_estimate")),
+            .aggregation_second_pass_doc_upper_bound = queryBuilderJsonU32(estimate.object.get("aggregation_second_pass_doc_upper_bound")),
+            .aggregation_cost_heuristic = queryBuilderAggregationCostHeuristic(
+                queryBuilderJsonBool(estimate.object.get("aggregation_may_scan_full_results")),
+                queryBuilderJsonU32(estimate.object.get("aggregation_second_pass_doc_upper_bound")),
+            ),
+            .result_doc_estimate = queryBuilderJsonU32(estimate.object.get("result_doc_estimate")),
+            .result_doc_upper_bound = queryBuilderJsonU32(estimate.object.get("result_doc_upper_bound")),
+            .shard_count = queryBuilderJsonU32(estimate.object.get("shard_count")),
+            .remote_shard_count = queryBuilderJsonU32(estimate.object.get("remote_shard_count")),
+            .join_planner_strategy = queryBuilderNestedJsonString(planner, "strategy"),
+            .join_planner_estimated_cost = queryBuilderNestedJsonF64(planner, "estimated_cost"),
+            .join_planner_estimated_rows = queryBuilderNestedJsonU64(planner, "estimated_rows"),
+            .join_planner_estimated_memory_bytes = queryBuilderNestedJsonU64(planner, "estimated_memory_bytes"),
+            .join_planner_used_stats = queryBuilderNestedJsonBool(planner, "used_stats"),
+            .join_planner_shuffle_candidate = queryBuilderNestedJsonBool(planner, "shuffle_candidate"),
+            .join_planner_forced_broadcast_fallback = queryBuilderNestedJsonBool(planner, "forced_broadcast_fallback"),
+            .join_planner_left_sample_row_count = queryBuilderNestedJsonU32(planner, "left_sample_row_count"),
+            .join_planner_left_sample_source = queryBuilderNestedJsonString(planner, "left_sample_source"),
+        };
+    }
+    return .{};
+}
+
+fn queryBuilderAggregationCostHeuristic(may_scan_full_results: ?bool, second_pass_doc_upper_bound: ?u32) ?[]const u8 {
+    if (may_scan_full_results != true and second_pass_doc_upper_bound == null) return null;
+    if (may_scan_full_results == true) {
+        if (second_pass_doc_upper_bound) |upper_bound| {
+            if (upper_bound >= 10_000) return "full_result_second_pass_high";
+            if (upper_bound >= 1_000) return "full_result_second_pass_medium";
+        }
+        return "full_result_second_pass";
+    }
+    return "bounded_second_pass";
+}
+
+fn queryBuilderJsonString(value: ?std.json.Value) ?[]const u8 {
+    const raw = value orelse return null;
+    return if (raw == .string) raw.string else null;
+}
+
+fn queryBuilderJsonBool(value: ?std.json.Value) ?bool {
+    const raw = value orelse return null;
+    return if (raw == .bool) raw.bool else null;
+}
+
+fn queryBuilderNestedJsonString(value: ?std.json.Value, key: []const u8) ?[]const u8 {
+    const raw = value orelse return null;
+    if (raw != .object) return null;
+    return queryBuilderJsonString(raw.object.get(key));
+}
+
+fn queryBuilderNestedJsonBool(value: ?std.json.Value, key: []const u8) ?bool {
+    const raw = value orelse return null;
+    if (raw != .object) return null;
+    return queryBuilderJsonBool(raw.object.get(key));
+}
+
+fn queryBuilderNestedJsonU32(value: ?std.json.Value, key: []const u8) ?u32 {
+    const raw = value orelse return null;
+    if (raw != .object) return null;
+    return queryBuilderJsonU32(raw.object.get(key));
+}
+
+fn queryBuilderNestedJsonU64(value: ?std.json.Value, key: []const u8) ?u64 {
+    const raw = value orelse return null;
+    if (raw != .object) return null;
+    return queryBuilderJsonU64(raw.object.get(key));
+}
+
+fn queryBuilderNestedJsonF64(value: ?std.json.Value, key: []const u8) ?f64 {
+    const raw = value orelse return null;
+    if (raw != .object) return null;
+    return queryBuilderJsonF64(raw.object.get(key));
+}
+
+fn queryBuilderJsonU32(value: ?std.json.Value) ?u32 {
+    const raw = value orelse return null;
+    switch (raw) {
+        .integer => |integer| return if (integer >= 0) std.math.cast(u32, integer) orelse null else null,
+        .float => |float| return if (float >= 0 and @floor(float) == float) std.math.cast(u32, @as(u64, @intFromFloat(float))) orelse null else null,
+        else => return null,
+    }
+}
+
+fn queryBuilderJsonU64(value: ?std.json.Value) ?u64 {
+    const raw = value orelse return null;
+    switch (raw) {
+        .integer => |integer| return if (integer >= 0) std.math.cast(u64, integer) orelse null else null,
+        .float => |float| return if (float >= 0 and @floor(float) == float) std.math.cast(u64, @as(u64, @intFromFloat(float))) orelse null else null,
+        else => return null,
+    }
+}
+
+fn queryBuilderJsonF64(value: ?std.json.Value) ?f64 {
+    const raw = value orelse return null;
+    switch (raw) {
+        .integer => |integer| return @floatFromInt(integer),
+        .float => |float| return float,
+        else => return null,
+    }
+}
+
+fn queryBuilderResultArtifact(result: metadata_openapi.QueryBuilderResult) ?[]const u8 {
+    if (result.plan) |plan| {
+        if (plan == .object) {
+            if (plan.object.get("artifact")) |artifact| {
+                if (artifact == .string) return artifact.string;
+            }
+        }
+    }
+    if (result.retrieval_query_request != null) return "retrieval_query_request";
+    if (result.query_request != null) return "query_request";
+    return null;
+}
+
+fn recursiveQueryBuilderCandidatePlanValue(
+    alloc: std.mem.Allocator,
+    plan: RecursiveQueryBuilderCandidatePlanJson,
+) !std.json.Value {
+    return try jsonValueFromStruct(alloc, plan);
+}
+
+fn buildRecursiveQueryBuilderPlan(
+    alloc: std.mem.Allocator,
+    base_plan: ?std.json.Value,
+    cfg: recursive_agent.RecursiveConfig,
+    selected_candidate_id: ?[]const u8,
+    candidate_plans: std.json.Value,
+    budget: RecursiveQueryBuilderBudgetSummary,
+) !std.json.Value {
+    var plan = base_plan orelse std.json.Value{ .object = std.json.ObjectMap.empty };
+    if (plan != .object) plan = std.json.Value{ .object = std.json.ObjectMap.empty };
+    try plan.object.put(alloc, try alloc.dupe(u8, "execution_mode"), .{ .string = "recursive" });
+    try plan.object.put(alloc, try alloc.dupe(u8, "selected_candidate_id"), if (selected_candidate_id) |id| .{ .string = id } else .null);
+    try plan.object.put(alloc, try alloc.dupe(u8, "candidate_plans"), candidate_plans);
+    try plan.object.put(alloc, try alloc.dupe(u8, "recursive"), try jsonValueFromStruct(alloc, .{
+        .max_depth = cfg.max_depth,
+        .max_subcalls = cfg.max_subcalls,
+        .max_concurrency = cfg.max_concurrency,
+        .requested_concurrency = cfg.max_concurrency,
+        .max_wall_time_ms = cfg.max_wall_time_ms,
+        .split_policy = @tagName(cfg.split_policy),
+        .merge_policy = @tagName(cfg.merge_policy),
+        .child_tool_policy = @tagName(cfg.child_tool_policy),
+        .scheduled_concurrency = budget.scheduled_concurrency,
+        .actual_concurrency = budget.actual_concurrency,
+        .candidate_mode_count = budget.candidate_mode_count,
+        .scheduled_candidate_count = budget.scheduled_candidate_count,
+        .truncated_candidate_count = budget.truncated_candidate_count,
+        .budget_limited = budget.incomplete_reason != null,
+        .incomplete_reason = budget.incomplete_reason,
+        .wall_time_exhausted = budget.wall_time_exhausted,
+        .elapsed_ms = budget.elapsed_ms,
+    }));
+    return plan;
+}
+
+fn buildRecursiveQueryBuilderSteps(
+    alloc: std.mem.Allocator,
+    cfg: recursive_agent.RecursiveConfig,
+    selected_candidate_id: ?[]const u8,
+    candidate_modes: []const []const u8,
+    candidate_steps: []const metadata_openapi.AgentStep,
+    selected_steps: []const metadata_openapi.AgentStep,
+    selected_specialist: ?[]const u8,
+    selected_artifact: ?[]const u8,
+    budget: RecursiveQueryBuilderBudgetSummary,
+    merge_status: metadata_openapi.AgentStepStatus,
+    failure_reason: ?[]const u8,
+) ![]const metadata_openapi.AgentStep {
+    var out = std.ArrayListUnmanaged(metadata_openapi.AgentStep).empty;
+    defer out.deinit(alloc);
+    const root_frame_id = "query-builder-root";
+    try out.append(alloc, .{
+        .kind = .recursive_decomposition,
+        .name = "query_builder_recursive_decomposition",
+        .action = "Split query-builder planning into bounded specialist candidates",
+        .status = .success,
+        .details = try jsonValueFromStruct(alloc, RecursiveQueryBuilderDecompositionDetails{
+            .root_frame_id = root_frame_id,
+            .split_policy = @tagName(cfg.split_policy),
+            .merge_policy = @tagName(cfg.merge_policy),
+            .max_subcalls = cfg.max_subcalls,
+            .max_concurrency = cfg.max_concurrency,
+            .requested_concurrency = cfg.max_concurrency,
+            .max_wall_time_ms = cfg.max_wall_time_ms,
+            .scheduled_concurrency = budget.scheduled_concurrency,
+            .actual_concurrency = budget.actual_concurrency,
+            .candidate_mode_count = budget.candidate_mode_count,
+            .scheduled_candidate_count = budget.scheduled_candidate_count,
+            .truncated_candidate_count = budget.truncated_candidate_count,
+            .budget_limited = budget.incomplete_reason != null,
+            .candidate_modes = candidate_modes,
+        }),
+    });
+    try out.appendSlice(alloc, candidate_steps);
+    try out.append(alloc, .{
+        .kind = .recursive_merge,
+        .name = "query_builder_recursive_merge",
+        .action = if (merge_status == .success) "Selected the highest-scoring executable query-builder candidate" else "Failed to select an executable query-builder candidate",
+        .status = merge_status,
+        .details = try jsonValueFromStruct(alloc, RecursiveQueryBuilderMergeDetails{
+            .selected_candidate_id = selected_candidate_id,
+            .candidate_count = candidate_steps.len,
+            .selected_specialist = selected_specialist,
+            .selected_artifact = selected_artifact,
+            .incomplete_reason = budget.incomplete_reason,
+            .failure_reason = failure_reason,
+            .wall_time_exhausted = budget.wall_time_exhausted,
+            .elapsed_ms = budget.elapsed_ms,
+        }),
+    });
+    try out.appendSlice(alloc, selected_steps);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn appendRecursiveQueryBuilderWarning(
+    alloc: std.mem.Allocator,
+    existing: ?[]const []const u8,
+    message: []const u8,
+) !?[]const []const u8 {
+    const existing_values = existing orelse &.{};
+    const out = try alloc.alloc([]const u8, existing_values.len + 1);
+    for (existing_values, 0..) |value, i| out[i] = value;
+    out[existing_values.len] = message;
+    return out;
+}
+
+fn jsonValueFromStruct(alloc: std.mem.Allocator, value: anytype) !std.json.Value {
+    const encoded = try std.json.Stringify.valueAlloc(alloc, value, .{});
+    defer alloc.free(encoded);
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{ .allocate = .alloc_always });
+}
+
+fn buildQueryBuilderMatchNoneQuery(alloc: std.mem.Allocator) !std.json.Value {
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, "{\"match_none\":{}}", .{});
 }
 
 pub fn executeQueryBuilder(
@@ -1863,11 +3798,13 @@ fn buildQueryBuilderSpecialist(
     graph_index_metadata: []const QueryBuilderGraphIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: ?GenerationRunner,
+    preserve_generation_timeout_errors: bool,
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) !BuiltQueryBuilderQuery {
     const effective_mode = try queryBuilderEffectiveMode(alloc, request, fields, semantic_indexes);
     if (shouldUseGeneratedSemanticBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedSemanticOrHybridQueryBuilder(alloc, request, effective_mode.?, intent, fields, full_text_index_metadata, embedding_index_metadata, semantic_indexes, plan_validator, generation_runner.?, warnings) catch {
+        return buildGeneratedSemanticOrHybridQueryBuilder(alloc, request, effective_mode.?, intent, fields, full_text_index_metadata, embedding_index_metadata, semantic_indexes, plan_validator, generation_runner.?, preserve_generation_timeout_errors, warnings) catch |err| {
+            if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
             try warnings.append(alloc, "Generator-backed semantic or hybrid query building failed, so the deterministic semantic or hybrid builder was used.");
             if (try buildSemanticOrHybridQueryBuilder(alloc, request, effective_mode, intent, fields, semantic_indexes, warnings)) |built| {
                 return built;
@@ -1879,10 +3816,10 @@ fn buildQueryBuilderSpecialist(
         return built;
     }
     if (shouldUseGeneratedGraphBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedGraphQueryBuilder(alloc, request, intent, fields, graph_indexes, graph_index_metadata, plan_validator, generation_runner.?, warnings);
+        return buildGeneratedGraphQueryBuilder(alloc, request, intent, fields, graph_indexes, graph_index_metadata, plan_validator, generation_runner.?, preserve_generation_timeout_errors, warnings);
     }
     if (shouldUseGeneratedFullTextBuilder(request, effective_mode, generation_runner)) {
-        return buildGeneratedFullTextQueryBuilder(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner.?);
+        return buildGeneratedFullTextQueryBuilder(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner.?, preserve_generation_timeout_errors);
     }
     return try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
 }
@@ -1939,6 +3876,9 @@ fn shouldUseGeneratedFullTextBuilder(
         if (std.ascii.eqlIgnoreCase(mode, "hybrid")) return false;
         if (std.ascii.eqlIgnoreCase(mode, "tree")) return false;
         if (std.ascii.eqlIgnoreCase(mode, "graph")) return false;
+        if (std.ascii.eqlIgnoreCase(mode, "join")) return false;
+        if (std.ascii.eqlIgnoreCase(mode, "aggregation")) return false;
+        if (std.ascii.eqlIgnoreCase(mode, "join_aggregation")) return false;
     }
     return true;
 }
@@ -2026,6 +3966,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilder(
     semantic_indexes: []const []const u8,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) !BuiltQueryBuilderQuery {
     var base = try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
@@ -2040,6 +3981,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilder(
         semantic_indexes,
         plan_validator,
         generation_runner,
+        preserve_generation_timeout_errors,
     );
     const hybrid_mode = std.ascii.eqlIgnoreCase(mode, "hybrid");
     base.query_kind = if (hybrid_mode) .hybrid else .semantic;
@@ -2066,6 +4008,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     semantic_indexes: []const []const u8,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedSemanticQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
@@ -2073,10 +4016,10 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
     const source_indexes = try queryBuilderGeneratedSemanticIndexNames(alloc, embedding_index_metadata, semantic_indexes, preferred_indexes);
     if (source_indexes.len == 0) return error.InvalidQueryBuilderGeneration;
     const messages = try buildSemanticQueryBuilderMessages(alloc, intent, mode, fields, full_text_index_metadata, embedding_index_metadata, source_indexes, request.example_documents);
-    const first_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
+    const first_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, messages, preserve_generation_timeout_errors) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildSemanticQueryBuilderRepairMessages(alloc, messages, null);
-            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => first_err,
                 else => second_err,
             };
@@ -2091,7 +4034,7 @@ fn buildGeneratedSemanticOrHybridQueryBuilderPlan(
         .valid => |plan| plan,
         .feedback => |feedback| blk: {
             const repair_messages = try buildSemanticQueryBuilderRepairMessages(alloc, messages, feedback);
-            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedSemanticQueryBuilderAttemptFromMessages(alloc, request, mode, fields, source_indexes, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => error.InvalidQueryBuilderGeneration,
                 else => second_err,
             };
@@ -2134,8 +4077,12 @@ fn buildGeneratedSemanticQueryBuilderAttemptFromMessages(
     generation_runner: GenerationRunner,
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedSemanticQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
+        return error.UnsupportedQueryBuilderGeneration;
+    };
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -2205,8 +4152,9 @@ fn buildGeneratedFullTextQueryBuilder(
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !BuiltQueryBuilderQuery {
-    const generated = try buildGeneratedFullTextQueryBuilderPlan(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner);
+    const generated = try buildGeneratedFullTextQueryBuilderPlan(alloc, request, intent, fields, full_text_index_metadata, plan_validator, generation_runner, preserve_generation_timeout_errors);
     return .{
         .query = generated.query,
         .temporal_hint = detectTemporalHint(intent),
@@ -2226,14 +4174,15 @@ fn buildGeneratedFullTextQueryBuilderPlan(
     full_text_index_metadata: []const QueryBuilderFullTextIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedFullTextQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
     const messages = try buildBleveQueryBuilderMessages(alloc, intent, fields, full_text_index_metadata, request.example_documents);
-    const first_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
+    const first_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, messages, preserve_generation_timeout_errors) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildBleveQueryBuilderRepairMessages(alloc, messages, null);
-            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => first_err,
                 else => second_err,
             };
@@ -2248,7 +4197,7 @@ fn buildGeneratedFullTextQueryBuilderPlan(
         .valid => |plan| plan,
         .feedback => |feedback| blk: {
             const repair_messages = try buildBleveQueryBuilderRepairMessages(alloc, messages, feedback);
-            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedFullTextQueryBuilderAttemptFromMessages(alloc, request, fields, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => error.InvalidQueryBuilderGeneration,
                 else => second_err,
             };
@@ -2268,8 +4217,12 @@ fn buildGeneratedFullTextQueryBuilderAttemptFromMessages(
     generation_runner: GenerationRunner,
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedFullTextQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
+        return error.UnsupportedQueryBuilderGeneration;
+    };
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -2302,10 +4255,12 @@ fn buildGeneratedGraphQueryBuilder(
     graph_index_metadata: []const QueryBuilderGraphIndex,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
     warnings: *std.ArrayListUnmanaged([]const u8),
 ) !BuiltQueryBuilderQuery {
     var base = try buildQueryBuilderQuery(alloc, request, intent, fields, warnings);
-    const generated = buildGeneratedGraphQueryBuilderPlan(alloc, request, intent, fields, graph_indexes, graph_index_metadata, base, plan_validator, generation_runner) catch {
+    const generated = buildGeneratedGraphQueryBuilderPlan(alloc, request, intent, fields, graph_indexes, graph_index_metadata, base, plan_validator, generation_runner, preserve_generation_timeout_errors) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
         try warnings.append(alloc, "Generator-backed graph query building failed, so the deterministic graph builder was used.");
         return base;
     };
@@ -2326,15 +4281,16 @@ fn buildGeneratedGraphQueryBuilderPlan(
     base: BuiltQueryBuilderQuery,
     plan_validator: ?QueryBuilderPlanValidator,
     generation_runner: GenerationRunner,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedGraphQueryBuilderPlan {
     const generator_cfg = request.generator orelse return error.UnsupportedQueryBuilderGeneration;
     const chain = try buildQueryBuilderGenerationChain(alloc, generator_cfg);
     const messages = try buildGraphQueryBuilderMessages(alloc, intent, fields, graph_indexes, graph_index_metadata, request.example_documents);
     const seed_query_request = try buildQueryBuilderGraphSeedQueryRequest(alloc, request, base, fields);
-    const first_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, messages) catch |first_err| switch (first_err) {
+    const first_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, messages, preserve_generation_timeout_errors) catch |first_err| switch (first_err) {
         error.InvalidQueryBuilderGeneration => {
             const repair_messages = try buildGraphQueryBuilderRepairMessages(alloc, messages, null);
-            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => first_err,
                 else => second_err,
             };
@@ -2349,7 +4305,7 @@ fn buildGeneratedGraphQueryBuilderPlan(
         .valid => |plan| plan,
         .feedback => |feedback| blk: {
             const repair_messages = try buildGraphQueryBuilderRepairMessages(alloc, messages, feedback);
-            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages) catch |second_err| return switch (second_err) {
+            const second_attempt = buildGeneratedGraphQueryBuilderAttemptFromMessages(alloc, request, fields, graph_indexes, seed_query_request, plan_validator, generation_runner, chain, repair_messages, preserve_generation_timeout_errors) catch |second_err| return switch (second_err) {
                 error.InvalidQueryBuilderGeneration => error.InvalidQueryBuilderGeneration,
                 else => second_err,
             };
@@ -2371,8 +4327,12 @@ fn buildGeneratedGraphQueryBuilderAttemptFromMessages(
     generation_runner: GenerationRunner,
     chain: []const generating.ChainLink,
     messages: []const generating.ChatMessage,
+    preserve_generation_timeout_errors: bool,
 ) !GeneratedGraphQueryBuilderAttempt {
-    var result = generation_runner.executeChain(alloc, chain, messages) catch return error.UnsupportedQueryBuilderGeneration;
+    var result = generation_runner.executeChain(alloc, chain, messages) catch |err| {
+        if (preserve_generation_timeout_errors and recursive_agent.isGenerationTimeoutError(err)) return err;
+        return error.UnsupportedQueryBuilderGeneration;
+    };
     defer result.deinit();
 
     const json_text = extractJsonObjectSlice(result.content) orelse return error.InvalidQueryBuilderGeneration;
@@ -3645,6 +5605,9 @@ fn buildQueryBuilderQueryRequest(
     built: BuiltQueryBuilderQuery,
     fields: []const []const u8,
     graph_indexes: []const []const u8,
+    field_metadata: []const QueryBuilderFieldMetadata,
+    related_tables: []const QueryBuilderRelatedTable,
+    warnings: *std.ArrayListUnmanaged([]const u8),
 ) !metadata_openapi.QueryRequest {
     var out = metadata_openapi.QueryRequest{
         .table = queryBuilderEffectiveTable(request),
@@ -3653,6 +5616,10 @@ fn buildQueryBuilderQueryRequest(
         .count = queryBuilderConstraintOptionalBool(request.constraints, "count"),
         .profile = queryBuilderConstraintOptionalBool(request.constraints, "profile"),
     };
+    out.aggregations = (try queryBuilderConstraintAggregations(alloc, request.constraints)) orelse
+        try queryBuilderInferredAggregations(alloc, request, fields, field_metadata, warnings);
+    out.join = (try queryBuilderConstraintJoin(alloc, request.constraints)) orelse
+        try queryBuilderInferredJoin(alloc, request, fields, related_tables, warnings);
     var filter_query = try buildQueryBuilderFilterQueryValue(alloc, built);
     filter_query = try combineQueryBuilderFilterQueries(
         alloc,
@@ -4809,11 +6776,32 @@ fn validateRequiredExecutableQueryBuilderRequest(
         if (std.ascii.eqlIgnoreCase(mode, "graph") and query_request.graph_searches == null) {
             return error.InvalidQueryBuilderRequest;
         }
+        if (std.ascii.eqlIgnoreCase(mode, "join") and query_request.join == null) {
+            return error.InvalidQueryBuilderRequest;
+        }
+        if (std.ascii.eqlIgnoreCase(mode, "aggregation") and !queryRequestHasAggregations(query_request)) {
+            return error.InvalidQueryBuilderRequest;
+        }
+        if (std.ascii.eqlIgnoreCase(mode, "join_aggregation") and (query_request.join == null or !queryRequestHasAggregations(query_request))) {
+            return error.InvalidQueryBuilderRequest;
+        }
     }
     if (built.query_kind == .semantic or built.query_kind == .hybrid) {
         if (query_request.semantic_search == null) return error.InvalidQueryBuilderRequest;
         if (query_request.indexes == null or query_request.indexes.?.len == 0) return error.InvalidQueryBuilderRequest;
     }
+}
+
+fn queryPreflightHasErrors(preflight: *const QueryPreflightResult) bool {
+    for (preflight.diagnostics) |diagnostic| {
+        if (diagnostic.severity == .@"error") return true;
+    }
+    return false;
+}
+
+fn queryRequestHasAggregations(query_request: metadata_openapi.QueryRequest) bool {
+    const aggregations = query_request.aggregations orelse return false;
+    return aggregations.map.count() > 0;
 }
 
 fn queryBuilderConstraintStringSlice(
@@ -5010,7 +6998,7 @@ fn queryBuilderSelectedStrategy(request: metadata_openapi.QueryBuilderRequest) ?
     return queryBuilderConstraintString(request.constraints, "prefer_strategy");
 }
 
-fn queryBuilderEffectiveTable(request: metadata_openapi.QueryBuilderRequest) ?[]const u8 {
+pub fn queryBuilderEffectiveTable(request: metadata_openapi.QueryBuilderRequest) ?[]const u8 {
     if (request.table) |table| {
         if (table.len > 0) return table;
     }
@@ -5286,6 +7274,9 @@ fn pickQueryBuilderSpecialist(
     has_retrieval_query_request: bool,
 ) []const u8 {
     if (mode) |value| {
+        if (std.ascii.eqlIgnoreCase(value, "join_aggregation") and query_request.join != null and queryRequestHasAggregations(query_request)) return "join_aggregation";
+        if (std.ascii.eqlIgnoreCase(value, "join") and query_request.join != null) return "join";
+        if (std.ascii.eqlIgnoreCase(value, "aggregation") and queryRequestHasAggregations(query_request)) return "aggregation";
         if (std.ascii.eqlIgnoreCase(value, "tree") and has_retrieval_query_request) return "tree";
         if (std.ascii.eqlIgnoreCase(value, "graph") and query_request.graph_searches != null) return "graph";
         if (std.ascii.eqlIgnoreCase(value, "full_text")) return "full_text";
@@ -5293,6 +7284,9 @@ fn pickQueryBuilderSpecialist(
         if (std.ascii.eqlIgnoreCase(value, "semantic") and built.query_kind == .semantic) return "semantic";
         if (std.ascii.eqlIgnoreCase(value, "hybrid") and built.query_kind == .hybrid) return "hybrid";
     }
+    if (query_request.join != null and queryRequestHasAggregations(query_request)) return "join_aggregation";
+    if (query_request.join != null) return "join";
+    if (queryRequestHasAggregations(query_request)) return "aggregation";
     if (has_retrieval_query_request) return "tree";
     if (query_request.graph_searches != null) return "graph";
     return switch (built.query_kind) {
@@ -5312,6 +7306,9 @@ fn unsupportedQueryBuilderMode(mode: ?[]const u8) ?[]const u8 {
     if (std.ascii.eqlIgnoreCase(value, "hybrid")) return null;
     if (std.ascii.eqlIgnoreCase(value, "tree")) return null;
     if (std.ascii.eqlIgnoreCase(value, "graph")) return null;
+    if (std.ascii.eqlIgnoreCase(value, "join")) return null;
+    if (std.ascii.eqlIgnoreCase(value, "aggregation")) return null;
+    if (std.ascii.eqlIgnoreCase(value, "join_aggregation")) return null;
     return value;
 }
 
@@ -5435,6 +7432,7 @@ fn buildQueryBuilderStepDetails(
                 .diagnostics = summary.diagnostics,
                 .plan_summary = summary.plan_summary,
                 .estimate_summary = summary.estimate_summary,
+                .join_planner_summary = summary.join_planner_summary,
             }
     else
         null;
@@ -5448,7 +7446,7 @@ fn buildQueryBuilderStepDetails(
         .preflight = preflight_details,
     }, .{});
     defer alloc.free(encoded);
-    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{});
+    return try std.json.parseFromSliceLeaky(std.json.Value, alloc, encoded, .{ .allocate = .alloc_always });
 }
 
 fn pickQueryBuilderTextField(fields: []const []const u8, preferred: ?[]const u8) ?[]const u8 {
@@ -8661,6 +10659,271 @@ test "query builder require executable rejects missing semantic index without cl
         .schema_fields = &.{ "title", "body", "status" },
         .mode = "semantic",
         .constraints = constraints_tree.value,
+    }, null));
+}
+
+test "query builder accepts explicit pipeline execution mode without overloading strategy mode" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const result = try buildQueryBuilderResponse(arena_impl.allocator(), .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "hybrid",
+        .execution_mode = .pipeline,
+    }, null);
+
+    try std.testing.expectEqual(AgentStatus.completed, result.status.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expectEqualStrings("hybrid", result.plan.?.object.get("mode").?.string);
+}
+
+test "query builder recursive mode evaluates bounded candidate plans" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 2,
+            .max_concurrency = 2,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &.{.{ .name = "docs_text", .fields = &.{ "title", "body", "status" } }},
+    }, null);
+
+    try std.testing.expectEqual(AgentStatus.completed, result.status.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(result.steps != null);
+    try std.testing.expect(result.steps.?.len >= 4);
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_decomposition, result.steps.?[0].kind);
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_subcall, result.steps.?[1].kind);
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_subcall, result.steps.?[2].kind);
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_merge, result.steps.?[3].kind);
+    try std.testing.expect(result.plan != null);
+    const plan = result.plan.?;
+    try std.testing.expectEqualStrings("recursive", plan.object.get("execution_mode").?.string);
+    try std.testing.expect(plan.object.get("candidate_plans") != null);
+    try std.testing.expectEqual(@as(usize, 2), plan.object.get("candidate_plans").?.array.items.len);
+    try std.testing.expectEqualStrings("query-builder-candidate-1", plan.object.get("selected_candidate_id").?.string);
+}
+
+test "query builder recursive mode reports candidate budget truncation" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &.{.{ .name = "docs_text", .fields = &.{ "title", "body", "status" } }},
+    }, null);
+
+    try std.testing.expectEqual(AgentStatus.incomplete, result.status.?);
+    try std.testing.expect(result.incomplete_details != null);
+    try std.testing.expectEqualStrings("max_subcalls", result.incomplete_details.?.reason);
+
+    const plan = result.plan.?;
+    try std.testing.expectEqualStrings("recursive", plan.object.get("execution_mode").?.string);
+    const recursive_plan = plan.object.get("recursive").?.object;
+    try std.testing.expectEqual(@as(i64, 1), recursive_plan.get("scheduled_candidate_count").?.integer);
+    try std.testing.expect(recursive_plan.get("candidate_mode_count").?.integer >= 2);
+    try std.testing.expect(recursive_plan.get("truncated_candidate_count").?.integer >= 1);
+    try std.testing.expect(recursive_plan.get("budget_limited").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), recursive_plan.get("scheduled_concurrency").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), recursive_plan.get("actual_concurrency").?.integer);
+
+    const decomposition = result.steps.?[0];
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_decomposition, decomposition.kind.?);
+    try std.testing.expect(decomposition.details.?.object.get("budget_limited").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), decomposition.details.?.object.get("scheduled_candidate_count").?.integer);
+}
+
+test "query builder recursive mode carries typed join aggregation candidate artifacts" {
+    var constraints = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "join": {
+        \\    "right_table": "customers",
+        \\    "join_type": "inner",
+        \\    "on": {
+        \\      "left_field": "customer_id",
+        \\      "right_field": "id"
+        \\    },
+        \\    "strategy_hint": "index_lookup",
+        \\    "right_fields": ["name", "tier"]
+        \\  },
+        \\  "aggregations": {
+        \\    "by_tier": {
+        \\      "type": "terms",
+        \\      "field": "customers.tier",
+        \\      "size": 10,
+        \\      "sub_aggregations": {
+        \\        "total_amount": {
+        \\          "type": "sum",
+        \\          "field": "amount"
+        \\        }
+        \\      }
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer constraints.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try buildQueryBuilderResponseWithContext(arena, .{
+        .table = "orders",
+        .intent = "find pending orders by customer tier",
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .mode = "join_aggregation",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .constraints = constraints.value,
+    }, .{
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "customer_id", "amount", "status" } }},
+    }, null);
+
+    try std.testing.expectEqual(AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("join_aggregation", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(result.query_request.?.join != null);
+    try std.testing.expect(queryRequestHasAggregations(result.query_request.?));
+
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    const candidate = candidate_plans[0].object;
+    try std.testing.expectEqualStrings("join_aggregation", candidate.get("mode").?.string);
+    try std.testing.expectEqualStrings("join_aggregation", candidate.get("specialist").?.string);
+    const candidate_query = candidate.get("query_request").?.object;
+    try std.testing.expect(candidate_query.get("join") != null);
+    try std.testing.expect(candidate_query.get("aggregations") != null);
+    try std.testing.expectEqualStrings("customers", candidate_query.get("join").?.object.get("right_table").?.string);
+    try std.testing.expect(candidate.get("preflight_error_count").?.integer > 0);
+}
+
+test "query builder recursive mode infers aggregation candidate artifacts from intent" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try buildQueryBuilderResponseWithContext(arena, .{
+        .table = "orders",
+        .intent = "sum amount by status",
+        .schema_fields = &.{ "status", "amount", "customer_id" },
+        .mode = "aggregation",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "status", "amount", "customer_id" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "status", "amount", "customer_id" } }},
+    }, null);
+
+    try std.testing.expectEqual(AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("aggregation", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(queryRequestHasAggregations(result.query_request.?));
+
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    const candidate_query = candidate_plans[0].object.get("query_request").?.object;
+    const aggregations = candidate_query.get("aggregations").?.object;
+    const by_status = aggregations.get("by_status").?.object;
+    try std.testing.expectEqualStrings("terms", by_status.get("type").?.string);
+    try std.testing.expectEqualStrings("status", by_status.get("field").?.string);
+    const sub_aggregations = by_status.get("sub_aggregations").?.object;
+    const sum_amount = sub_aggregations.get("sum_amount").?.object;
+    try std.testing.expectEqualStrings("sum", sum_amount.get("type").?.string);
+    try std.testing.expectEqualStrings("amount", sum_amount.get("field").?.string);
+}
+
+test "query builder require executable rejects join until join preflight is supported" {
+    var constraints = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "require_executable": true,
+        \\  "join": {
+        \\    "right_table": "customers",
+        \\    "on": {
+        \\      "left_field": "customer_id",
+        \\      "right_field": "id"
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer constraints.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    try std.testing.expectError(error.InvalidQueryBuilderRequest, buildQueryBuilderResponseWithContext(arena_impl.allocator(), .{
+        .table = "orders",
+        .intent = "find pending orders with customers",
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .mode = "join",
+        .constraints = constraints.value,
+    }, .{
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "customer_id", "amount", "status" } }},
+    }, null));
+}
+
+test "query builder rejects unsupported agentic execution mode" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    try std.testing.expectError(error.UnsupportedQueryBuilderRequest, buildQueryBuilderResponse(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .execution_mode = .agentic,
+    }, null));
+}
+
+test "query builder rejects recursive config without recursive execution mode" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    try std.testing.expectError(error.InvalidQueryBuilderRequest, buildQueryBuilderResponse(arena_impl.allocator(), .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 4,
+            .max_concurrency = 2,
+        },
     }, null));
 }
 

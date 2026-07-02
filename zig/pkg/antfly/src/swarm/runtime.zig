@@ -1135,7 +1135,9 @@ fn localAntflyProvider(node: *inference.server.Node) antfly.inference.managed_em
         .embed_dense_parts = localAntflyEmbedDenseParts,
         .rerank_texts = localAntflyRerankTexts,
         .generate_text = localAntflyGenerateText,
+        .generate_text_with_timeout_ms = localAntflyGenerateTextWithTimeoutMs,
         .generate_messages = localAntflyGenerateMessages,
+        .generate_messages_with_timeout_ms = localAntflyGenerateMessagesWithTimeoutMs,
         .read_images = localAntflyReadImages,
         .transcribe_audio = localAntflyTranscribeAudio,
         .extract = localAntflyExtract,
@@ -1265,6 +1267,24 @@ fn localAntflyGenerateText(
     return try node.generateTextDirect(alloc, model, roles, contents);
 }
 
+fn localAntflyGenerateTextWithTimeoutMs(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    roles: []const []const u8,
+    contents: []const []const u8,
+    timeout_ms: u64,
+) anyerror![]u8 {
+    const deadline_ns = localGenerationDeadlineNs(timeout_ms) orelse return error.DeadlineExceeded;
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    const content = try node.generateTextDirectWithDeadlineNs(alloc, model, roles, contents, deadline_ns);
+    if (localGenerationDeadlineExpired(deadline_ns)) {
+        alloc.free(content);
+        return error.DeadlineExceeded;
+    }
+    return content;
+}
+
 fn localAntflyGenerateMessages(
     ptr: *anyopaque,
     alloc: std.mem.Allocator,
@@ -1275,6 +1295,36 @@ fn localAntflyGenerateMessages(
     var converted = try convertLocalGenerateMessages(alloc, messages);
     defer converted.deinit(alloc);
     return try node.generateMessagesDirect(alloc, model, converted.messages);
+}
+
+fn localAntflyGenerateMessagesWithTimeoutMs(
+    ptr: *anyopaque,
+    alloc: std.mem.Allocator,
+    model: []const u8,
+    messages: []const antfly.inference.ChatMessage,
+    timeout_ms: u64,
+) anyerror![]u8 {
+    const deadline_ns = localGenerationDeadlineNs(timeout_ms) orelse return error.DeadlineExceeded;
+    const node: *inference.server.Node = @ptrCast(@alignCast(ptr));
+    var converted = try convertLocalGenerateMessages(alloc, messages);
+    defer converted.deinit(alloc);
+    const content = try node.generateMessagesDirectWithDeadlineNs(alloc, model, converted.messages, deadline_ns);
+    if (localGenerationDeadlineExpired(deadline_ns)) {
+        alloc.free(content);
+        return error.DeadlineExceeded;
+    }
+    return content;
+}
+
+fn localGenerationDeadlineNs(timeout_ms: u64) ?u64 {
+    if (timeout_ms == 0) return null;
+    const now_ns = platform_time.monotonicNs();
+    const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+    return std.math.add(u64, now_ns, timeout_ns) catch std.math.maxInt(u64);
+}
+
+fn localGenerationDeadlineExpired(deadline_ns: u64) bool {
+    return platform_time.monotonicNs() >= deadline_ns;
 }
 
 fn localAntflyReadImages(

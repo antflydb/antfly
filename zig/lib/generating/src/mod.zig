@@ -399,11 +399,16 @@ pub const Generator = struct {
 
     pub const VTable = struct {
         generate: *const fn (ptr: *anyopaque, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) anyerror!GenerateResult,
+        set_request_timeout_ms: ?*const fn (ptr: *anyopaque, timeout_ms: u64) void = null,
         deinit: ?*const fn (ptr: *anyopaque) void = null,
     };
 
     pub fn generate(self: Generator, alloc: std.mem.Allocator, model: []const u8, messages: []const ChatMessage) !GenerateResult {
         return try self.vtable.generate(self.ptr, alloc, model, messages);
+    }
+
+    pub fn setRequestTimeoutMs(self: Generator, timeout_ms: u64) void {
+        if (self.vtable.set_request_timeout_ms) |set_fn| set_fn(self.ptr, timeout_ms);
     }
 
     pub fn deinit(self: Generator) void {
@@ -430,10 +435,33 @@ pub fn executeChain(
     factory: GeneratorFactory,
     messages: []const ChatMessage,
 ) !GenerateResult {
+    return try executeChainWithDeadline(alloc, chain, factory, messages, null);
+}
+
+pub fn executeChainWithTimeoutMs(
+    alloc: std.mem.Allocator,
+    chain: []const ChainLink,
+    factory: GeneratorFactory,
+    messages: []const ChatMessage,
+    timeout_ms: u64,
+) !GenerateResult {
+    return try executeChainWithDeadline(alloc, chain, factory, messages, try Deadline.start(timeout_ms));
+}
+
+fn executeChainWithDeadline(
+    alloc: std.mem.Allocator,
+    chain: []const ChainLink,
+    factory: GeneratorFactory,
+    messages: []const ChatMessage,
+    deadline: ?Deadline,
+) !GenerateResult {
     if (chain.len == 0) return error.EmptyGeneratorChain;
 
     var last_err: anyerror = error.EmptyGeneratorChain;
     for (chain, 0..) |link, i| {
+        if (deadline) |d| {
+            if (d.expired()) return error.DeadlineExceeded;
+        }
         try link.validate();
         var generator = factory.create(alloc, link.generator) catch |err| {
             last_err = err;
@@ -442,7 +470,7 @@ pub fn executeChain(
         };
         defer generator.deinit();
 
-        const result = executeWithRetry(alloc, generator, link.generator.model, messages, link.retry) catch |err| {
+        const result = executeWithRetry(alloc, generator, link.generator.model, messages, link.retry, deadline) catch |err| {
             last_err = err;
             if (i + 1 < chain.len and shouldTryNext(link.condition orelse .on_error, err)) continue;
             return err;
@@ -458,16 +486,30 @@ fn executeWithRetry(
     model: []const u8,
     messages: []const ChatMessage,
     retry_cfg: ?RetryConfig,
+    deadline: ?Deadline,
 ) !GenerateResult {
-    const retry = retry_cfg orelse return try generator.generate(alloc, model, messages);
+    if (retry_cfg == null) {
+        if (deadline) |d| generator.setRequestTimeoutMs(try d.remainingMsOrDeadline());
+        return try generator.generate(alloc, model, messages);
+    }
+    const retry = retry_cfg.?;
     try retry.validate();
 
     var attempt: u32 = 0;
     var backoff_ms = retry.initial_backoff_ms;
     while (true) : (attempt += 1) {
+        if (deadline) |d| generator.setRequestTimeoutMs(try d.remainingMsOrDeadline());
         const result = generator.generate(alloc, model, messages) catch |err| {
             if (attempt + 1 >= retry.max_attempts) return err;
-            if (backoff_ms > 0) sleepMs(backoff_ms);
+            if (backoff_ms > 0) {
+                if (deadline) |d| {
+                    const sleep_ms = @min(@as(u64, backoff_ms), try d.remainingMsOrDeadline());
+                    sleepMs(@intCast(sleep_ms));
+                    if (d.expired()) return error.DeadlineExceeded;
+                } else {
+                    sleepMs(backoff_ms);
+                }
+            }
             backoff_ms = if (backoff_ms == 0)
                 retry.max_backoff_ms
             else
@@ -478,6 +520,37 @@ fn executeWithRetry(
             continue;
         };
         return result;
+    }
+}
+
+const Deadline = struct {
+    deadline_ns: u64,
+
+    fn start(timeout_ms: u64) !Deadline {
+        const now_ns = monotonicNowNs() orelse return error.DeadlineExceeded;
+        const timeout_ns = std.math.mul(u64, timeout_ms, std.time.ns_per_ms) catch std.math.maxInt(u64);
+        return .{ .deadline_ns = std.math.add(u64, now_ns, timeout_ns) catch std.math.maxInt(u64) };
+    }
+
+    fn expired(self: Deadline) bool {
+        const now_ns = monotonicNowNs() orelse return true;
+        return now_ns >= self.deadline_ns;
+    }
+
+    fn remainingMsOrDeadline(self: Deadline) !u64 {
+        const now_ns = monotonicNowNs() orelse return error.DeadlineExceeded;
+        if (now_ns >= self.deadline_ns) return error.DeadlineExceeded;
+        const remaining_ns = self.deadline_ns - now_ns;
+        const remaining_ms = (remaining_ns + std.time.ns_per_ms - 1) / std.time.ns_per_ms;
+        return @max(@as(u64, 1), remaining_ms);
+    }
+};
+
+fn monotonicNowNs() ?u64 {
+    var ts: std.posix.timespec = undefined;
+    switch (std.posix.errno(std.posix.system.clock_gettime(.MONOTONIC, &ts))) {
+        .SUCCESS => return @intCast(@as(i128, ts.sec) * std.time.ns_per_s + ts.nsec),
+        else => return null,
     }
 }
 
@@ -741,6 +814,91 @@ test "executeChain falls back on timeout and retries within a link" {
     var fallback = try executeChain(alloc, &fallback_chain, factory, &.{.{ .role = .user, .content = .{ .text = "hello" } }});
     defer fallback.deinit();
     try std.testing.expectEqualStrings("fallback-success", fallback.content);
+}
+
+test "executeChainWithTimeoutMs bounds retries and fallback by one deadline" {
+    const alloc = std.testing.allocator;
+
+    const Fake = struct {
+        const Self = @This();
+
+        attempts: usize = 0,
+        fallback_attempts: usize = 0,
+        set_timeout_calls: usize = 0,
+        last_timeout_ms: u64 = 0,
+
+        const State = struct {
+            parent: *Self,
+            cfg: GeneratorConfig,
+        };
+
+        fn create(ptr: *anyopaque, _: std.mem.Allocator, cfg: GeneratorConfig) !Generator {
+            const self: *Self = @ptrCast(@alignCast(ptr));
+            const state = try std.testing.allocator.create(State);
+            state.* = .{ .parent = self, .cfg = cfg };
+            return .{
+                .ptr = state,
+                .vtable = &.{
+                    .generate = generate,
+                    .set_request_timeout_ms = setRequestTimeoutMs,
+                    .deinit = destroy,
+                },
+            };
+        }
+
+        fn setRequestTimeoutMs(ptr: *anyopaque, timeout_ms: u64) void {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            state.parent.set_timeout_calls += 1;
+            state.parent.last_timeout_ms = timeout_ms;
+        }
+
+        fn generate(ptr: *anyopaque, alloc_inner: std.mem.Allocator, _: []const u8, _: []const ChatMessage) !GenerateResult {
+            _ = alloc_inner;
+            const state: *State = @ptrCast(@alignCast(ptr));
+            switch (state.cfg.provider) {
+                .openai => {
+                    state.parent.attempts += 1;
+                    sleepMs(2);
+                    return error.Timeout;
+                },
+                .antfly => {
+                    state.parent.fallback_attempts += 1;
+                    return error.TestUnexpectedResult;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        }
+
+        fn destroy(ptr: *anyopaque) void {
+            const state: *State = @ptrCast(@alignCast(ptr));
+            std.testing.allocator.destroy(state);
+        }
+    };
+
+    var fake = Fake{};
+    const factory = GeneratorFactory{
+        .ptr = &fake,
+        .vtable = &.{ .create = Fake.create },
+    };
+    const chain = [_]ChainLink{
+        .{
+            .generator = GeneratorConfig.fromOpenAI(.{ .model = "gpt-4.1" }),
+            .condition = .on_timeout,
+            .retry = .{ .max_attempts = 2, .initial_backoff_ms = 50, .max_backoff_ms = 50 },
+        },
+        .{
+            .generator = GeneratorConfig.fromAntfly(.{ .model = "local" }),
+        },
+    };
+
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        executeChainWithTimeoutMs(alloc, &chain, factory, &.{.{ .role = .user, .content = .{ .text = "hello" } }}, 1),
+    );
+    try std.testing.expectEqual(@as(usize, 1), fake.attempts);
+    try std.testing.expectEqual(@as(usize, 0), fake.fallback_attempts);
+    try std.testing.expect(fake.set_timeout_calls >= 1);
+    try std.testing.expect(fake.last_timeout_ms >= 1);
 }
 
 test "executeChain falls back on rate limit" {

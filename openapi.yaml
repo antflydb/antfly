@@ -9619,6 +9619,15 @@ components:
           minimum: 0
           maximum: 20
           description: Force a user-facing decision after this many unresolved internal passes.
+        execution_mode:
+          $ref: '#/components/schemas/AgentExecutionMode'
+          description: >
+            Agent execution control. Do not confuse this with query-builder `mode`,
+
+            which remains a query-family strategy hint.
+        recursive:
+          $ref: '#/components/schemas/RecursiveAgentConfig'
+          description: Bounded recursive execution policy. Only meaningful when execution_mode is recursive.
         example_documents:
           type: array
           items:
@@ -9693,6 +9702,10 @@ components:
         status:
           $ref: '#/components/schemas/AgentStatus'
           description: Current status of the bounded query-builder execution.
+        incomplete_details:
+          $ref: '#/components/schemas/IncompleteDetails'
+          description: Explains why bounded query-builder execution stopped before all candidate work
+            completed.
         steps:
           type: array
           items:
@@ -9778,6 +9791,9 @@ components:
             - max_tokens
             - no_tools
             - clarification_required
+            - max_subcalls
+            - max_child_context_tokens
+            - max_wall_time_ms
           description: >
             Why the agent stopped:
 
@@ -9788,6 +9804,127 @@ components:
             - no_tools: No tools were available for agentic mode
 
             - clarification_required: The agent needs a user decision before it can continue
+
+            - max_subcalls: Recursive execution reached the configured child-frame limit
+
+            - max_child_context_tokens: Recursive execution skipped child context that exceeded the per-child
+            token budget
+
+            - max_wall_time_ms: Recursive scheduling exhausted the configured wall-clock budget
+    AgentExecutionMode:
+      type: string
+      enum:
+        - pipeline
+        - agentic
+        - recursive
+      description: >
+        Native agent control-flow mode:
+
+        - pipeline: execute declared steps directly
+
+        - agentic: run a bounded tool-selection/refinement loop
+
+        - recursive: decompose work into bounded child agent frames, then merge and verify results
+
+
+        This field is intentionally separate from domain-specific strategy fields such as
+
+        query-builder `mode` and retrieval `strategy`.
+    RecursiveSplitPolicy:
+      type: string
+      enum:
+        - auto
+        - by_document
+        - by_entity
+        - by_section
+        - by_query
+      description: Strategy for partitioning external context into child recursive work.
+    RecursiveMergePolicy:
+      type: string
+      enum:
+        - synthesize
+        - vote
+        - rank
+        - verify
+      description: Strategy for combining recursive child outputs.
+    RecursiveChildToolPolicy:
+      type: string
+      enum:
+        - inherit_narrowed
+        - inherit_readonly
+        - none
+      description: >
+        How child recursive frames receive tool permissions. Children cannot expand
+
+        permissions beyond the parent request.
+    ContextObjectKind:
+      type: string
+      enum:
+        - table
+        - query_result
+        - document
+        - section
+        - chunk
+        - artifact
+        - graph_neighborhood
+        - memory_set
+        - extension_object
+      description: Portable type tag for external context handles used by recursive agents.
+    RecursiveAgentConfig:
+      type: object
+      description: >
+        Bounded recursive execution policy shared by native agents. Defaults are
+
+        deliberately conservative while recursive execution is experimental.
+      properties:
+        max_depth:
+          type: integer
+          minimum: 1
+          maximum: 1
+          default: 1
+          description: Maximum recursive child-frame depth supported by this native executor.
+        max_subcalls:
+          type: integer
+          minimum: 1
+          maximum: 64
+          default: 8
+          description: Maximum total child subcalls allowed for one root agent request.
+        max_concurrency:
+          type: integer
+          minimum: 1
+          maximum: 16
+          default: 4
+          description: >
+            Maximum recursive child frames that may execute concurrently. Executors may
+
+            choose lower actual concurrency when a generation backend is not explicitly
+
+            safe for parallel calls; traces report scheduled and actual concurrency.
+        max_wall_time_ms:
+          type: integer
+          minimum: 1
+          maximum: 300000
+          default: 30000
+          description: Wall-clock budget for recursive scheduling.
+        max_child_context_tokens:
+          type: integer
+          minimum: 1
+          maximum: 200000
+          description: Optional context-token budget for each child frame.
+        split_policy:
+          $ref: '#/components/schemas/RecursiveSplitPolicy'
+          default: auto
+        merge_policy:
+          $ref: '#/components/schemas/RecursiveMergePolicy'
+          default: synthesize
+        child_tool_policy:
+          $ref: '#/components/schemas/RecursiveChildToolPolicy'
+          default: inherit_narrowed
+        allowed_context_object_types:
+          type: array
+          items:
+            $ref: '#/components/schemas/ContextObjectKind'
+          description: Optional allow-list for context object kinds this recursive run may inspect.
     RetrievalStrategy:
       type: string
       enum:
@@ -9938,6 +10075,9 @@ components:
         - generation
         - validation
         - clarification
+        - recursive_decomposition
+        - recursive_subcall
+        - recursive_merge
       description: Shared bounded-agent step category
     AgentStepStatus:
       type: string
@@ -9976,6 +10116,96 @@ components:
           type: object
           additionalProperties: true
           description: Additional details about the step
+    RecursiveTraceContextObject:
+      type: object
+      description: Portable context-object handle captured by a recursive agent trace.
+      required:
+        - kind
+        - id
+      properties:
+        kind:
+          $ref: '#/components/schemas/ContextObjectKind'
+        id:
+          type: string
+          description: Stable context object identifier, such as a document ID or memory ID.
+        label:
+          type: string
+          description: Human-readable context object label.
+        metadata:
+          type: object
+          additionalProperties: true
+          description: Optional domain-specific metadata for this context object.
+    RecursiveTraceSubcall:
+      type: object
+      description: One child invocation in a recursive agent trace.
+      required:
+        - id
+        - parent_frame_id
+        - child_frame_id
+        - status
+      properties:
+        id:
+          type: string
+          description: Stable subcall identifier within the trace artifact.
+        parent_frame_id:
+          type: string
+          description: Parent recursive frame identifier.
+        child_frame_id:
+          type: string
+          description: Child recursive frame identifier.
+        context_object_ids:
+          type: array
+          items:
+            type: string
+          description: Context object IDs used by this child invocation.
+        status:
+          $ref: '#/components/schemas/AgentStepStatus'
+        prompt_token_count:
+          type: integer
+          description: Token count used for child prompt budgeting.
+        token_count_method:
+          type: string
+          description: Token counter used for prompt accounting.
+        result_summary:
+          type: string
+          description: Child output summary captured for merge/debugging.
+        error_message:
+          type: string
+          description: Error or skip reason for unsuccessful child invocations.
+    RecursiveTraceArtifact:
+      type: object
+      description: Structured recursive execution artifact suitable for evaluation, debugging, and later
+        durable persistence.
+      required:
+        - root_frame_id
+        - final_status
+        - context_objects
+        - subcalls
+        - steps
+      properties:
+        root_frame_id:
+          type: string
+          description: Root recursive frame identifier.
+        final_status:
+          $ref: '#/components/schemas/AgentStatus'
+        context_objects:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecursiveTraceContextObject'
+          description: Context object handles inspected during recursive execution.
+        subcalls:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecursiveTraceSubcall'
+          description: Child invocations scheduled by the recursive executor.
+        steps:
+          type: array
+          items:
+            $ref: '#/components/schemas/AgentStep'
+          description: Ordered agent trace steps emitted for this recursive execution.
+        result_ref:
+          type: string
+          description: Optional reference to a durable stored trace artifact.
     SSEEvent:
       type: string
       description: SSE event types emitted by the retrieval agent streaming endpoint
@@ -10257,6 +10487,15 @@ components:
           minimum: 0
           maximum: 20
           description: Force a user-facing decision after this many unresolved internal passes.
+        execution_mode:
+          $ref: '#/components/schemas/AgentExecutionMode'
+          description: >
+            Agent execution control. When omitted, max_internal_iterations preserves
+
+            the existing pipeline-vs-agentic behavior.
+        recursive:
+          $ref: '#/components/schemas/RecursiveAgentConfig'
+          description: Bounded recursive execution policy. Only meaningful when execution_mode is recursive.
         max_context_tokens:
           type: integer
           description: >
@@ -10344,6 +10583,9 @@ components:
           items:
             $ref: '#/components/schemas/AgentStep'
           description: Shared bounded-agent execution trace for this retrieval run.
+        trace_artifact:
+          $ref: '#/components/schemas/RecursiveTraceArtifact'
+          description: Structured recursive trace artifact. Present for recursive execution mode.
         strategy_used:
           $ref: '#/components/schemas/RetrievalStrategy'
           description: Primary strategy that was used (optional in agentic mode)

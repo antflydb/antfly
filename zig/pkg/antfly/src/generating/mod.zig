@@ -45,6 +45,7 @@ pub const BackendFactory = struct {
     antfly_provider: ?managed_embedder.AntflyProvider = null,
     secret_store: ?*common_secrets.FileStore = null,
     inference_api_key: ?[]const u8 = null,
+    request_timeout_ms: ?u64 = null,
 
     pub fn init(alloc: std.mem.Allocator, http: *httpx.Client) BackendFactory {
         return .{ .alloc = alloc, .http = http };
@@ -62,6 +63,7 @@ pub const BackendFactory = struct {
         antfly_provider: ?managed_embedder.AntflyProvider = null,
         secret_store: ?*common_secrets.FileStore = null,
         inference_api_key: ?[]const u8 = null,
+        request_timeout_ms: ?u64 = null,
     };
 
     pub fn initWithOptions(
@@ -75,6 +77,7 @@ pub const BackendFactory = struct {
             .antfly_provider = options.antfly_provider,
             .secret_store = options.secret_store,
             .inference_api_key = options.inference_api_key,
+            .request_timeout_ms = options.request_timeout_ms,
         };
     }
 
@@ -87,7 +90,7 @@ pub const BackendFactory = struct {
 
     fn create(ptr: *anyopaque, alloc: std.mem.Allocator, cfg: GeneratorConfig) !lib.Generator {
         const self: *BackendFactory = @ptrCast(@alignCast(ptr));
-        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key);
+        return try BackendState.init(alloc, self.http, cfg, self.antfly_provider, self.secret_store, self.inference_api_key, self.request_timeout_ms);
     }
 };
 
@@ -97,6 +100,7 @@ const BackendState = struct {
     api_key: ?common_secrets.SecretValue = null,
     auth_header_cache: common_secrets.BearerAuthHeaderCache = .{},
     secret_store: ?*common_secrets.FileStore = null,
+    request_timeout_ms: ?u64 = null,
     provider: union(enum) {
         openai: openai_provider.Provider,
         remote_antfly: antfly_provider.Provider,
@@ -112,6 +116,7 @@ const BackendState = struct {
         embedded_antfly_provider: ?managed_embedder.AntflyProvider,
         secret_store: ?*common_secrets.FileStore,
         inference_api_key: ?[]const u8,
+        request_timeout_ms: ?u64,
     ) !lib.Generator {
         const state = try alloc.create(BackendState);
         errdefer alloc.destroy(state);
@@ -126,35 +131,44 @@ const BackendState = struct {
         errdefer if (state.api_key) |*api_key| api_key.deinit(alloc);
         state.auth_header_cache = .{};
         state.secret_store = secret_store;
+        state.request_timeout_ms = request_timeout_ms;
         state.provider = switch (cfg.provider) {
             .openai, .ollama => blk: {
-                const provider = openai_provider.Provider.init(alloc, http, cfg.url);
+                var provider = openai_provider.Provider.init(alloc, http, cfg.url);
+                if (state.request_timeout_ms) |timeout_ms| provider.setRequestTimeoutMs(timeout_ms);
                 break :blk .{ .openai = provider };
             },
             .gemini => blk: {
                 const api_key_ref = state.api_key orelse return error.MissingGeneratorCredentials;
                 const api_key = (try api_key_ref.resolveOwned(alloc, secret_store)) orelse return error.MissingGeneratorCredentials;
                 defer alloc.free(api_key);
-                break :blk .{ .gemini = try vertex_provider.GeminiProvider.init(alloc, http, .{
+                var provider = try vertex_provider.GeminiProvider.init(alloc, http, .{
                     .base_url = if (cfg.url.len > 0) cfg.url else "https://generativelanguage.googleapis.com/v1beta",
                     .api_key = api_key,
-                }) };
+                });
+                if (state.request_timeout_ms) |timeout_ms| provider.setRequestTimeoutMs(timeout_ms);
+                break :blk .{ .gemini = provider };
             },
             .vertex => blk: {
                 const bearer_token = if (state.api_key) |*api_key_ref| try api_key_ref.resolveOwned(alloc, secret_store) else null;
                 defer if (bearer_token) |value| alloc.free(value);
-                break :blk .{ .vertex = try vertex_provider.Provider.init(alloc, http, .{
+                var provider = try vertex_provider.Provider.init(alloc, http, .{
                     .base_url = if (cfg.url.len > 0) cfg.url else "https://aiplatform.googleapis.com/v1",
                     .project_id = cfg.project_id,
                     .location = cfg.location orelse "us-central1",
                     .credentials_path = cfg.credentials_path,
                     .bearer_token = bearer_token,
-                }) };
+                });
+                if (state.request_timeout_ms) |timeout_ms| provider.setRequestTimeoutMs(timeout_ms);
+                break :blk .{ .vertex = provider };
             },
             .antfly => if (cfg.url.len == 0 and embedded_antfly_provider != null)
                 .{ .embedded_antfly = embedded_antfly_provider.? }
-            else
-                .{ .remote_antfly = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082") },
+            else blk: {
+                var provider = antfly_provider.Provider.init(alloc, http, if (cfg.url.len > 0) cfg.url else "http://127.0.0.1:8082");
+                if (state.request_timeout_ms) |timeout_ms| provider.setRequestTimeoutMs(timeout_ms);
+                break :blk .{ .remote_antfly = provider };
+            },
             else => return error.UnsupportedGeneratorProvider,
         };
 
@@ -162,9 +176,22 @@ const BackendState = struct {
             .ptr = state,
             .vtable = &.{
                 .generate = generate,
+                .set_request_timeout_ms = setRequestTimeoutMs,
                 .deinit = deinit,
             },
         };
+    }
+
+    fn setRequestTimeoutMs(ptr: *anyopaque, timeout_ms: u64) void {
+        const self: *BackendState = @ptrCast(@alignCast(ptr));
+        self.request_timeout_ms = timeout_ms;
+        switch (self.provider) {
+            .openai => |*provider| provider.setRequestTimeoutMs(timeout_ms),
+            .remote_antfly => |*provider| provider.setRequestTimeoutMs(timeout_ms),
+            .vertex => |*provider| provider.setRequestTimeoutMs(timeout_ms),
+            .gemini => |*provider| provider.setRequestTimeoutMs(timeout_ms),
+            .embedded_antfly => {},
+        }
     }
 
     fn deinit(ptr: *anyopaque) void {
@@ -215,6 +242,31 @@ const BackendState = struct {
                 break :blk try provider.generator().generate(alloc, model, messages);
             },
             .embedded_antfly => |local| blk: {
+                if (self.request_timeout_ms) |timeout_ms| {
+                    if (local.generate_messages_with_timeout_ms) |generate_messages| {
+                        const content = try generate_messages(local.ptr, alloc, model, messages, timeout_ms);
+                        break :blk inference.GenerateResult{
+                            .content = content,
+                            .allocator = alloc,
+                        };
+                    }
+                    if (local.generate_text_with_timeout_ms) |generate_text| {
+                        const roles = try alloc.alloc([]const u8, messages.len);
+                        defer alloc.free(roles);
+                        const contents = try alloc.alloc([]const u8, messages.len);
+                        defer alloc.free(contents);
+                        for (messages, 0..) |message, i| {
+                            roles[i] = message.role.toSlice();
+                            contents[i] = textContent(message) orelse return error.UnsupportedGeneratorProvider;
+                        }
+                        const content = try generate_text(local.ptr, alloc, model, roles, contents, timeout_ms);
+                        break :blk inference.GenerateResult{
+                            .content = content,
+                            .allocator = alloc,
+                        };
+                    }
+                    return error.DeadlineExceeded;
+                }
                 if (local.generate_messages) |generate_messages| {
                     const content = try generate_messages(local.ptr, alloc, model, messages);
                     break :blk inference.GenerateResult{
@@ -350,6 +402,9 @@ pub fn executeChainWithOptions(
     messages: []const ChatMessage,
 ) !GenerateResult {
     var factory_impl = BackendFactory.initWithOptions(alloc, http, options);
+    if (options.request_timeout_ms) |timeout_ms| {
+        return try lib.executeChainWithTimeoutMs(alloc, chain, factory_impl.factory(), messages, timeout_ms);
+    }
     return try lib.executeChain(alloc, chain, factory_impl.factory(), messages);
 }
 
@@ -572,6 +627,87 @@ test "generating backend passes multimodal messages to local provider callback" 
     defer result.deinit();
     try std.testing.expectEqualStrings("local multimodal ok", result.content);
     try std.testing.expectEqual(@as(usize, 1), fake.calls);
+}
+
+test "generating backend requires deadline-aware embedded generation when timeout is set" {
+    const alloc = std.testing.allocator;
+    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+    defer io_impl.deinit();
+    const io = io_impl.io();
+
+    var client = httpx.Client.initWithConfig(alloc, io, .{ .keep_alive = false });
+    defer client.deinit();
+
+    const FakeLocal = struct {
+        calls: usize = 0,
+        timeout_calls: usize = 0,
+        timeout_ms: u64 = 0,
+
+        fn embedDenseTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![][]f32 {
+            return error.TestUnexpectedResult;
+        }
+
+        fn embedSparseTexts(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const []const u8) anyerror![]@import("../storage/db/enrichment/embedder.zig").SparseEmbedding {
+            return error.TestUnexpectedResult;
+        }
+
+        fn generateText(ptr: *anyopaque, a: std.mem.Allocator, _: []const u8, _: []const []const u8, _: []const []const u8) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return try a.dupe(u8, "unbounded local ok");
+        }
+
+        fn generateTextWithTimeoutMs(
+            ptr: *anyopaque,
+            a: std.mem.Allocator,
+            _: []const u8,
+            _: []const []const u8,
+            _: []const []const u8,
+            timeout_ms: u64,
+        ) anyerror![]u8 {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.timeout_calls += 1;
+            self.timeout_ms = timeout_ms;
+            return try a.dupe(u8, "bounded local ok");
+        }
+    };
+
+    const messages = [_]ChatMessage{.{ .role = .user, .content = .{ .text = "hello" } }};
+    const chain = [_]ChainLink{.{
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-model",
+            .url = "",
+        },
+    }};
+
+    var unbounded_fake = FakeLocal{};
+    const unbounded_provider = managed_embedder.AntflyProvider{
+        .ptr = &unbounded_fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_text = FakeLocal.generateText,
+    };
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        executeChainWithOptions(alloc, &client, &chain, .{ .antfly_provider = unbounded_provider, .request_timeout_ms = 1000 }, &messages),
+    );
+    try std.testing.expectEqual(@as(usize, 0), unbounded_fake.calls);
+
+    var bounded_fake = FakeLocal{};
+    const bounded_provider = managed_embedder.AntflyProvider{
+        .ptr = &bounded_fake,
+        .embed_dense_texts = FakeLocal.embedDenseTexts,
+        .embed_sparse_texts = FakeLocal.embedSparseTexts,
+        .generate_text = FakeLocal.generateText,
+        .generate_text_with_timeout_ms = FakeLocal.generateTextWithTimeoutMs,
+    };
+    var result = try executeChainWithOptions(alloc, &client, &chain, .{ .antfly_provider = bounded_provider, .request_timeout_ms = 1000 }, &messages);
+    defer result.deinit();
+    try std.testing.expectEqualStrings("bounded local ok", result.content);
+    try std.testing.expectEqual(@as(usize, 0), bounded_fake.calls);
+    try std.testing.expectEqual(@as(usize, 1), bounded_fake.timeout_calls);
+    try std.testing.expect(bounded_fake.timeout_ms > 0);
 }
 
 test "generating antfly backend treats missing default api key env as optional" {

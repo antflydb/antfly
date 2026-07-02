@@ -19,10 +19,13 @@ const generating_openapi = @import("antfly_generating_openapi");
 const indexes_openapi = @import("antfly_indexes_openapi");
 const metadata_openapi = @import("antfly_metadata_openapi");
 const generating = @import("antfly_generating");
+const HfTokenizer = @import("inference_hf_tokenizer").HfTokenizer;
+const fixed_tokenizer_data = @import("inference_fixed_tokenizer_data");
 const platform_time = @import("../platform/time.zig");
 const query_api = @import("query.zig");
 const query_builder_agent = @import("query_builder_agent.zig");
 const json_helpers = @import("json_helpers.zig");
+const recursive_agent = @import("recursive_agent.zig");
 
 const AgentDecision = metadata_openapi.AgentDecision;
 const AgentQuestion = metadata_openapi.AgentQuestion;
@@ -178,6 +181,18 @@ fn firstSseEventData(events: []const TestSseEvent, name: []const u8) ?[]const u8
     return null;
 }
 
+fn firstStepCompletedEventIndex(alloc: std.mem.Allocator, events: []const TestSseEvent, name: []const u8) !?usize {
+    for (events, 0..) |event, i| {
+        if (!std.mem.eql(u8, event.event, "step_completed")) continue;
+        var parsed = try std.json.parseFromSlice(std.json.Value, alloc, event.data, .{});
+        defer parsed.deinit();
+        const event_name = parsed.value.object.get("name") orelse continue;
+        if (event_name != .string) continue;
+        if (std.mem.eql(u8, event_name.string, name)) return i;
+    }
+    return null;
+}
+
 fn findStepByName(steps: []const AgentStep, name: []const u8) ?AgentStep {
     for (steps) |step| {
         if (std.mem.eql(u8, step.name, name)) return step;
@@ -256,6 +271,17 @@ pub const GenerationRunner = struct {
             chain: []const generating.ChainLink,
             messages: []const generating.ChatMessage,
         ) anyerror!generating.GenerateResult,
+        execute_chain_with_timeout_ms: ?*const fn (
+            ptr: *anyopaque,
+            alloc: std.mem.Allocator,
+            chain: []const generating.ChainLink,
+            messages: []const generating.ChatMessage,
+            timeout_ms: u64,
+        ) anyerror!generating.GenerateResult = null,
+        max_concurrent_chain_calls: ?*const fn (
+            ptr: *anyopaque,
+            chain: []const generating.ChainLink,
+        ) usize = null,
     };
 
     pub fn executeChain(
@@ -266,7 +292,46 @@ pub const GenerationRunner = struct {
     ) !generating.GenerateResult {
         return try self.vtable.execute_chain(self.ptr, alloc, chain, messages);
     }
+
+    pub fn executeChainWithTimeoutMs(
+        self: GenerationRunner,
+        alloc: std.mem.Allocator,
+        chain: []const generating.ChainLink,
+        messages: []const generating.ChatMessage,
+        timeout_ms: u64,
+    ) !generating.GenerateResult {
+        const func = self.vtable.execute_chain_with_timeout_ms orelse return error.DeadlineExceeded;
+        return try func(self.ptr, alloc, chain, messages, timeout_ms);
+    }
+
+    pub fn maxConcurrentChainCalls(
+        self: GenerationRunner,
+        chain: []const generating.ChainLink,
+    ) usize {
+        const func = self.vtable.max_concurrent_chain_calls orelse return 1;
+        return @max(@as(usize, 1), func(self.ptr, chain));
+    }
 };
+
+test "retrieval generation runner fails closed without timeout support" {
+    const FakeGeneration = struct {
+        fn iface() GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        FakeGeneration.iface().executeChainWithTimeoutMs(std.testing.allocator, &.{}, &.{}, 1),
+    );
+}
 
 const ResponseFormat = enum {
     json,
@@ -419,6 +484,10 @@ fn appendStep(alloc: std.mem.Allocator, steps: *std.ArrayListUnmanaged(AgentStep
     try live.emitStep(step);
 }
 
+fn recordStep(alloc: std.mem.Allocator, steps: *std.ArrayListUnmanaged(AgentStep), step: AgentStep) !void {
+    try steps.append(alloc, step);
+}
+
 fn finishAgentResult(
     alloc: std.mem.Allocator,
     format: ResponseFormat,
@@ -513,7 +582,9 @@ fn executeInternal(
     const tool_policy = try parseToolPolicy(request);
     const max_internal_iterations = try effectiveMaxInternalIterations(request, tool_policy);
     if (max_internal_iterations < 0) return error.InvalidRetrievalAgentRequest;
-    const agentic_mode = max_internal_iterations > 0;
+    const execution_mode = try recursive_agent.validateRetrievalExecutionMode(request, max_internal_iterations);
+    const recursive_mode = execution_mode == .recursive;
+    const agentic_mode = execution_mode == .agentic;
     if (request.accumulated_filters != null) return error.UnsupportedRetrievalAgentRequest;
 
     const retrieval_queries = request.queries;
@@ -538,6 +609,8 @@ fn executeInternal(
 
     const classification_cfg = try parseClassificationConfig(request);
     const generation_cfg = try parseGenerationConfig(arena, request);
+    const recursive_cfg = if (recursive_mode) try recursive_agent.normalizeConfig(request.recursive) else null;
+    if (recursive_mode and (generation_cfg == null or generation_runner == null)) return error.UnsupportedRetrievalAgentRequest;
     const followup_cfg = try parseFollowupConfig(request, generation_cfg != null);
     const eval_cfg = try parseEvalConfig(arena, request, generation_cfg != null);
     const confidence_enabled = try parseConfidenceEnabled(request, generation_cfg != null);
@@ -676,6 +749,10 @@ fn executeInternal(
 
     var generated_content: ?[]const u8 = null;
     var model_used: ?[]const u8 = null;
+    var result_status: AgentStatus = .completed;
+    var incomplete_reason: ?[]const u8 = null;
+    var recursive_trace_context_objects: []const metadata_openapi.RecursiveTraceContextObject = &.{};
+    var recursive_trace_subcalls: []const metadata_openapi.RecursiveTraceSubcall = &.{};
     if (agentic_mode) {
         if (selection) |value| if (value.indices) |selected| {
             try appendStep(arena, &steps_list, &live, .{
@@ -1217,7 +1294,33 @@ fn executeInternal(
         return try finishAgentResult(alloc, format, result, &live);
     }
 
-    if (generation_cfg) |cfg| {
+    if (recursive_mode) {
+        const cfg = generation_cfg.?;
+        const exec = generation_runner.?;
+        const recursive_generation = executeRecursiveRetrievalGeneration(
+            alloc,
+            arena,
+            exec,
+            request,
+            hit_list.items,
+            cfg,
+            recursive_cfg.?,
+            &steps_list,
+            &live,
+        ) catch |err| switch (format) {
+            .sse => return .{
+                .content_type = "text/event-stream",
+                .body = try encodeSseError(alloc, @errorName(err)),
+            },
+            .json => return err,
+        };
+        generated_content = recursive_generation.content;
+        model_used = recursive_generation.model;
+        result_status = recursive_generation.status;
+        incomplete_reason = recursive_generation.incomplete_reason;
+        recursive_trace_context_objects = recursive_generation.trace_context_objects;
+        recursive_trace_subcalls = recursive_generation.trace_subcalls;
+    } else if (generation_cfg) |cfg| {
         const exec = generation_runner orelse return error.UnsupportedRetrievalAgentRequest;
         const messages = try buildGenerationMessages(arena, request.query, hit_list.items, cfg);
         var result = exec.executeChain(alloc, cfg.chain, messages) catch |err| switch (format) {
@@ -1271,12 +1374,24 @@ fn executeInternal(
     }
 
     const steps = try steps_list.toOwnedSlice(arena);
+    const trace_artifact: ?metadata_openapi.RecursiveTraceArtifact = if (recursive_mode)
+        recursive_agent.buildTraceArtifact(
+            "recursive_root",
+            result_status,
+            recursive_trace_context_objects,
+            recursive_trace_subcalls,
+            steps,
+        )
+    else
+        null;
     const result = RetrievalAgentResult{
         .model = model_used,
         .created_at = 0,
-        .status = .completed,
+        .status = result_status,
+        .incomplete_details = if (incomplete_reason) |reason| .{ .reason = reason } else null,
         .hits = try hit_list.toOwnedSlice(arena),
         .steps = steps,
+        .trace_artifact = trace_artifact,
         .strategy_used = detectAggregateStrategy(strategies.items),
         .session_id = request.session_id,
         .iteration = if (agentic_mode) iteration_count else 0,
@@ -2509,6 +2624,755 @@ fn buildGenerationMessages(
     messages[0] = .{ .role = .system, .content = .{ .text = system_prompt } };
     messages[1] = .{ .role = .user, .content = .{ .text = user_prompt } };
     return messages;
+}
+
+const RecursiveGenerationResult = struct {
+    content: []const u8,
+    model: ?[]const u8 = null,
+    child_subcalls: usize,
+    status: AgentStatus = .completed,
+    incomplete_reason: ?[]const u8 = null,
+    trace_context_objects: []const metadata_openapi.RecursiveTraceContextObject = &.{},
+    trace_subcalls: []const metadata_openapi.RecursiveTraceSubcall = &.{},
+};
+
+const RecursiveChildTask = struct {
+    child_index: usize,
+    context_object: recursive_agent.ContextObject,
+    messages: []const generating.ChatMessage,
+    estimated_context_tokens: usize,
+    token_count_method: RecursiveTokenCountMethod,
+};
+
+const RecursiveSkippedChild = struct {
+    child_index: usize,
+    context_object: recursive_agent.ContextObject,
+    estimated_context_tokens: usize,
+    token_count_method: RecursiveTokenCountMethod,
+    max_child_context_tokens: usize,
+};
+
+const RecursiveTokenCountMethod = enum {
+    fixed_tokenizer,
+    heuristic,
+};
+
+const RecursiveTokenCount = struct {
+    tokens: usize,
+    method: RecursiveTokenCountMethod,
+};
+
+const RecursiveMergeVerification = struct {
+    requested: bool = false,
+    passed: bool = true,
+    required_context_ids: []const []const u8 = &.{},
+    missing_context_ids: []const []const u8 = &.{},
+};
+
+const RecursiveChildExecutionStats = struct {
+    max_actual_concurrency: usize = 0,
+    wall_time_skips: usize = 0,
+};
+
+const RecursiveTokenCounter = struct {
+    allocator: std.mem.Allocator,
+    tokenizer: ?*HfTokenizer = null,
+
+    fn init(allocator: std.mem.Allocator) RecursiveTokenCounter {
+        return .{
+            .allocator = allocator,
+            .tokenizer = HfTokenizer.loadFromBytes(allocator, fixed_tokenizer_data.tokenizer_json) catch null,
+        };
+    }
+
+    fn deinit(self: *RecursiveTokenCounter) void {
+        if (self.tokenizer) |tokenizer| tokenizer.deinitSelf();
+        self.* = undefined;
+    }
+
+    fn countMessages(self: *RecursiveTokenCounter, messages: []const generating.ChatMessage) RecursiveTokenCount {
+        if (self.tokenizer) |tokenizer| {
+            if (countMessagesWithTokenizer(self.allocator, tokenizer, messages)) |tokens| {
+                return .{ .tokens = tokens, .method = .fixed_tokenizer };
+            } else |_| {}
+        }
+        return .{ .tokens = estimateRecursiveMessagesTokens(messages), .method = .heuristic };
+    }
+
+    fn countMessagesWithTokenizer(
+        allocator: std.mem.Allocator,
+        tokenizer: *HfTokenizer,
+        messages: []const generating.ChatMessage,
+    ) !usize {
+        var total: usize = 0;
+        for (messages) |message| {
+            if (message.content) |content| {
+                const ids = try tokenizer.tokenizer().encode(allocator, content.text);
+                defer allocator.free(ids);
+                total += ids.len;
+            }
+        }
+        return total;
+    }
+};
+
+const RecursiveChildWorker = struct {
+    exec: GenerationRunner,
+    chain: []const generating.ChainLink,
+    task: RecursiveChildTask,
+    timeout_ms: u64,
+    result: ?generating.GenerateResult = null,
+    err: ?anyerror = null,
+
+    fn run(self: *@This()) void {
+        self.result = self.exec.executeChainWithTimeoutMs(std.heap.page_allocator, self.chain, self.task.messages, self.timeout_ms) catch |err| {
+            self.err = err;
+            return;
+        };
+    }
+};
+
+fn executeRecursiveRetrievalGeneration(
+    alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    exec: GenerationRunner,
+    request: RetrievalAgentRequest,
+    hits: []const QueryHit,
+    cfg: ParsedGenerationConfig,
+    recursive_cfg: recursive_agent.RecursiveConfig,
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+) !RecursiveGenerationResult {
+    if (!recursive_agent.contextKindAllowed(recursive_cfg, .document)) return error.UnsupportedRetrievalAgentRequest;
+
+    var token_counter = RecursiveTokenCounter.init(alloc);
+    defer token_counter.deinit();
+
+    const budget = recursive_agent.Budget.start(recursive_cfg);
+    const child_count = recursive_agent.childCountForContextCount(recursive_cfg, hits.len);
+    const scheduled_concurrency = @min(
+        recursive_agent.scheduledConcurrency(recursive_cfg, child_count),
+        exec.maxConcurrentChainCalls(cfg.chain),
+    );
+    const truncated_by_budget = child_count < hits.len;
+
+    var summaries = std.ArrayListUnmanaged([]const u8).empty;
+    defer summaries.deinit(arena);
+    var successful_context_ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer successful_context_ids.deinit(arena);
+    var child_context_objects = std.ArrayListUnmanaged(recursive_agent.ContextObject).empty;
+    defer child_context_objects.deinit(arena);
+    var trace_context_objects = std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceContextObject).empty;
+    defer trace_context_objects.deinit(arena);
+    var trace_subcalls = std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall).empty;
+    defer trace_subcalls.deinit(arena);
+    var child_tasks = std.ArrayListUnmanaged(RecursiveChildTask).empty;
+    defer child_tasks.deinit(arena);
+    var skipped_children = std.ArrayListUnmanaged(RecursiveSkippedChild).empty;
+    defer skipped_children.deinit(arena);
+    var recursive_steps = std.ArrayListUnmanaged(AgentStep).empty;
+    defer recursive_steps.deinit(arena);
+    var token_budget_skips: usize = 0;
+    var wall_time_exhausted = false;
+
+    for (hits[0..child_count], 0..) |hit, i| {
+        if (budget.expired()) {
+            wall_time_exhausted = true;
+            break;
+        }
+
+        const context_object = recursive_agent.ContextObject{
+            .kind = .document,
+            .id = hit._id,
+            .label = try std.fmt.allocPrint(arena, "retrieved hit {d}", .{i + 1}),
+        };
+        try child_context_objects.append(arena, context_object);
+        try trace_context_objects.append(arena, recursive_agent.traceContextObjectFromContextObject(context_object));
+
+        const hit_slice = try arena.dupe(QueryHit, &[_]QueryHit{hit});
+        const messages = try buildGenerationMessages(arena, request.query, hit_slice, cfg);
+        const token_count = token_counter.countMessages(messages);
+        if (recursive_cfg.max_child_context_tokens) |max_child_context_tokens| {
+            if (token_count.tokens > @as(usize, @intCast(max_child_context_tokens))) {
+                token_budget_skips += 1;
+                try skipped_children.append(arena, .{
+                    .child_index = i,
+                    .context_object = context_object,
+                    .estimated_context_tokens = token_count.tokens,
+                    .token_count_method = token_count.method,
+                    .max_child_context_tokens = @intCast(max_child_context_tokens),
+                });
+                continue;
+            }
+        }
+        _ = budget.remainingMs() orelse {
+            wall_time_exhausted = true;
+            break;
+        };
+        try child_tasks.append(arena, .{
+            .child_index = i,
+            .context_object = context_object,
+            .messages = messages,
+            .estimated_context_tokens = token_count.tokens,
+            .token_count_method = token_count.method,
+        });
+    }
+
+    for (skipped_children.items) |skipped| {
+        try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
+            arena,
+            skipped.child_index,
+            skipped.context_object.id,
+            .skipped,
+            skipped.estimated_context_tokens,
+            skipped.token_count_method,
+            null,
+            "max_child_context_tokens",
+        ));
+        try appendStep(arena, &recursive_steps, live, .{
+            .kind = .recursive_subcall,
+            .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{skipped.child_index + 1}),
+            .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because it exceeded max_child_context_tokens", .{skipped.context_object.id}),
+            .status = .skipped,
+            .details = try buildRecursiveSkippedSubcallDetails(arena, skipped.child_index, skipped.context_object, skipped.estimated_context_tokens, skipped.token_count_method, skipped.max_child_context_tokens),
+        });
+    }
+
+    const execution_stats = try runRecursiveChildTasks(
+        alloc,
+        arena,
+        exec,
+        cfg,
+        recursive_cfg,
+        scheduled_concurrency,
+        child_tasks.items,
+        budget,
+        &summaries,
+        &successful_context_ids,
+        &trace_subcalls,
+        &recursive_steps,
+        live,
+        &wall_time_exhausted,
+    );
+    const actual_concurrency = execution_stats.max_actual_concurrency;
+    const skipped_child_count = token_budget_skips + execution_stats.wall_time_skips;
+
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_decomposition,
+        .name = "recursive_decomposition",
+        .action = if (truncated_by_budget)
+            try std.fmt.allocPrint(arena, "partitioned {d} of {d} retrieved context objects into recursive child frames before hitting max_subcalls", .{ child_count, hits.len })
+        else
+            try std.fmt.allocPrint(arena, "partitioned retrieved context into {d} recursive child frames", .{child_count}),
+        .status = .success,
+        .details = try buildRecursiveDecompositionDetails(arena, recursive_cfg, hits.len, child_count, scheduled_concurrency, actual_concurrency),
+    });
+    for (recursive_steps.items) |step| try recordStep(arena, steps, step);
+
+    const merge_messages = try buildRecursiveMergeMessages(arena, request.query, summaries.items, recursive_cfg, cfg);
+    var merge_executed = true;
+    const merged_content = blk: {
+        const merge_timeout_ms = budget.remainingMs() orelse {
+            wall_time_exhausted = true;
+            merge_executed = false;
+            break :blk try buildRecursiveBudgetFallbackContent(arena, summaries.items, "max_wall_time_ms");
+        };
+        var merge_result = exec.executeChainWithTimeoutMs(alloc, cfg.chain, merge_messages, merge_timeout_ms) catch |err| {
+            if (recursive_agent.isGenerationTimeoutError(err) or budget.expired()) {
+                wall_time_exhausted = true;
+                merge_executed = false;
+                break :blk try buildRecursiveBudgetFallbackContent(arena, summaries.items, "max_wall_time_ms");
+            }
+            return err;
+        };
+        defer merge_result.deinit();
+        break :blk try arena.dupe(u8, merge_result.content);
+    };
+    const verification = if (merge_executed)
+        try verifyRecursiveMerge(arena, recursive_cfg, successful_context_ids.items, summaries.items, merged_content)
+    else
+        RecursiveMergeVerification{};
+    try live.emitTextChunks("generation", merged_content);
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_merge,
+        .name = "recursive_merge",
+        .action = if (merge_executed) "merged recursive child outputs into the final answer" else "skipped recursive merge because max_wall_time_ms was exhausted",
+        .status = if (merge_executed) .success else .skipped,
+        .details = try buildRecursiveMergeDetails(arena, recursive_cfg, summaries.items.len, skipped_child_count, wall_time_exhausted, budget.elapsedMs(), verification),
+    });
+    if (verification.requested) {
+        try appendStep(arena, steps, live, .{
+            .kind = .validation,
+            .name = "recursive_merge_verification",
+            .action = "verified recursive merge preserved child citations",
+            .status = if (verification.passed) .success else .@"error",
+            .error_message = if (verification.passed) null else "merged answer dropped child citations required by recursive merge verification",
+            .details = try buildRecursiveMergeVerificationDetails(arena, verification),
+        });
+    }
+
+    const reason = recursive_agent.incompleteReason(truncated_by_budget, token_budget_skips, wall_time_exhausted);
+    return .{
+        .content = merged_content,
+        .model = if (cfg.chain.len > 0) try arena.dupe(u8, cfg.chain[0].generator.model) else null,
+        .child_subcalls = summaries.items.len,
+        .status = if (reason != null) .incomplete else if (!verification.passed) .failed else .completed,
+        .incomplete_reason = reason,
+        .trace_context_objects = try trace_context_objects.toOwnedSlice(arena),
+        .trace_subcalls = try trace_subcalls.toOwnedSlice(arena),
+    };
+}
+
+fn runRecursiveChildTasks(
+    alloc: std.mem.Allocator,
+    arena: std.mem.Allocator,
+    exec: GenerationRunner,
+    cfg: ParsedGenerationConfig,
+    recursive_cfg: recursive_agent.RecursiveConfig,
+    scheduled_concurrency: usize,
+    tasks: []const RecursiveChildTask,
+    budget: recursive_agent.Budget,
+    summaries: *std.ArrayListUnmanaged([]const u8),
+    successful_context_ids: *std.ArrayListUnmanaged([]const u8),
+    trace_subcalls: *std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall),
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+    wall_time_exhausted: *bool,
+) !RecursiveChildExecutionStats {
+    _ = recursive_cfg;
+    const max_concurrency = @max(@as(usize, 1), scheduled_concurrency);
+    var stats = RecursiveChildExecutionStats{};
+    var cursor: usize = 0;
+    while (cursor < tasks.len) {
+        if (budget.expired()) {
+            wall_time_exhausted.* = true;
+            stats.wall_time_skips += tasks.len - cursor;
+            try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
+            break;
+        }
+
+        if (max_concurrency == 1) {
+            const timeout_ms = budget.remainingMs() orelse {
+                wall_time_exhausted.* = true;
+                stats.wall_time_skips += tasks.len - cursor;
+                try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
+                break;
+            };
+            stats.max_actual_concurrency = @max(stats.max_actual_concurrency, @as(usize, 1));
+            var worker = RecursiveChildWorker{
+                .exec = exec,
+                .chain = cfg.chain,
+                .task = tasks[cursor],
+                .timeout_ms = timeout_ms,
+            };
+            worker.run();
+            if (worker.err) |err| {
+                if (budget.expired()) {
+                    wall_time_exhausted.* = true;
+                    stats.wall_time_skips += tasks.len - cursor;
+                    try appendRecursiveTimeoutSubcall(arena, trace_subcalls, steps, live, worker.task, worker.timeout_ms);
+                    if (cursor + 1 < tasks.len) try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor + 1 ..], null);
+                    break;
+                }
+                return err;
+            }
+            var generated = worker.result orelse return error.UnsupportedRetrievalAgentRequest;
+            defer generated.deinit();
+            try appendRecursiveSuccessfulChildResult(arena, summaries, successful_context_ids, trace_subcalls, steps, live, &worker, generated.content);
+            cursor += 1;
+            continue;
+        }
+
+        const remaining = tasks.len - cursor;
+        const wave_len = @min(remaining, max_concurrency);
+        const timeout_ms = budget.remainingMs() orelse {
+            wall_time_exhausted.* = true;
+            stats.wall_time_skips += tasks.len - cursor;
+            try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
+            break;
+        };
+        const workers = try alloc.alloc(RecursiveChildWorker, wave_len);
+        defer alloc.free(workers);
+        const threads = try alloc.alloc(std.Thread, wave_len);
+        defer alloc.free(threads);
+
+        var spawned: usize = 0;
+        errdefer {
+            for (threads[0..spawned]) |thread| thread.join();
+        }
+        for (workers, 0..) |*worker, i| {
+            worker.* = .{
+                .exec = exec,
+                .chain = cfg.chain,
+                .task = tasks[cursor + i],
+                .timeout_ms = timeout_ms,
+            };
+            threads[i] = try std.Thread.spawn(.{}, RecursiveChildWorker.run, .{worker});
+            spawned += 1;
+        }
+        stats.max_actual_concurrency = @max(stats.max_actual_concurrency, spawned);
+
+        for (threads[0..spawned]) |thread| thread.join();
+
+        var first_err: ?anyerror = null;
+        for (workers) |*worker| {
+            if (worker.err) |err| {
+                first_err = first_err orelse err;
+            }
+        }
+        if (first_err) |err| {
+            if (budget.expired()) {
+                wall_time_exhausted.* = true;
+                var skipped_in_wave: usize = 0;
+                for (workers) |*worker| {
+                    if (worker.result) |*result| {
+                        defer result.deinit();
+                        try appendRecursiveSuccessfulChildResult(arena, summaries, successful_context_ids, trace_subcalls, steps, live, worker, result.content);
+                        continue;
+                    }
+                    skipped_in_wave += 1;
+                    try appendRecursiveTimeoutSubcall(arena, trace_subcalls, steps, live, worker.task, worker.timeout_ms);
+                }
+                const remaining_after_wave = tasks.len - @min(tasks.len, cursor + wave_len);
+                stats.wall_time_skips += skipped_in_wave + remaining_after_wave;
+                if (remaining_after_wave > 0) try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor + wave_len ..], null);
+                break;
+            }
+            for (workers) |*worker| {
+                if (worker.result) |*result| result.deinit();
+            }
+            return err;
+        }
+
+        for (workers) |*worker| {
+            var generated = worker.result orelse return error.UnsupportedRetrievalAgentRequest;
+            defer generated.deinit();
+            try appendRecursiveSuccessfulChildResult(arena, summaries, successful_context_ids, trace_subcalls, steps, live, worker, generated.content);
+        }
+
+        cursor += wave_len;
+        if (budget.expired()) {
+            wall_time_exhausted.* = true;
+            stats.wall_time_skips += tasks.len - cursor;
+            if (cursor < tasks.len) try appendRemainingRecursiveTimeoutSubcalls(arena, trace_subcalls, steps, live, tasks[cursor..], null);
+            break;
+        }
+    }
+    return stats;
+}
+
+fn appendRecursiveTimeoutSubcall(
+    arena: std.mem.Allocator,
+    trace_subcalls: *std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall),
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+    task: RecursiveChildTask,
+    timeout_ms: ?u64,
+) !void {
+    try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
+        arena,
+        task.child_index,
+        task.context_object.id,
+        .skipped,
+        task.estimated_context_tokens,
+        task.token_count_method,
+        null,
+        "max_wall_time_ms",
+    ));
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_subcall,
+        .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{task.child_index + 1}),
+        .action = try std.fmt.allocPrint(arena, "skipped recursive context object {s} because max_wall_time_ms was exhausted", .{task.context_object.id}),
+        .status = .skipped,
+        .details = try buildRecursiveTimeoutSubcallDetails(arena, task, timeout_ms),
+    });
+}
+
+fn appendRemainingRecursiveTimeoutSubcalls(
+    arena: std.mem.Allocator,
+    trace_subcalls: *std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall),
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+    tasks: []const RecursiveChildTask,
+    timeout_ms: ?u64,
+) !void {
+    for (tasks) |task| try appendRecursiveTimeoutSubcall(arena, trace_subcalls, steps, live, task, timeout_ms);
+}
+
+fn appendRecursiveSuccessfulChildResult(
+    arena: std.mem.Allocator,
+    summaries: *std.ArrayListUnmanaged([]const u8),
+    successful_context_ids: *std.ArrayListUnmanaged([]const u8),
+    trace_subcalls: *std.ArrayListUnmanaged(metadata_openapi.RecursiveTraceSubcall),
+    steps: *std.ArrayListUnmanaged(AgentStep),
+    live: *LiveEmitter,
+    worker: *const RecursiveChildWorker,
+    content: []const u8,
+) !void {
+    const summary = try arena.dupe(u8, content);
+    try summaries.append(arena, summary);
+    try successful_context_ids.append(arena, worker.task.context_object.id);
+    try trace_subcalls.append(arena, try buildRecursiveTraceSubcall(
+        arena,
+        worker.task.child_index,
+        worker.task.context_object.id,
+        .success,
+        worker.task.estimated_context_tokens,
+        worker.task.token_count_method,
+        summary,
+        null,
+    ));
+    try appendStep(arena, steps, live, .{
+        .kind = .recursive_subcall,
+        .name = try std.fmt.allocPrint(arena, "recursive_subcall_{d}", .{worker.task.child_index + 1}),
+        .action = try std.fmt.allocPrint(arena, "summarized recursive context object {s}", .{worker.task.context_object.id}),
+        .status = .success,
+        .details = try buildRecursiveSubcallDetails(arena, worker.task, worker.timeout_ms, summary),
+    });
+}
+
+fn estimateRecursiveMessagesTokens(messages: []const generating.ChatMessage) usize {
+    var total: usize = 0;
+    for (messages) |message| {
+        if (message.content) |content| {
+            total += estimateTextTokens(content.text);
+        }
+    }
+    return total;
+}
+
+fn estimateTextTokens(text: []const u8) usize {
+    var total: usize = 0;
+    var it = std.mem.tokenizeAny(u8, text, " \t\r\n,.;:!?()[]{}<>/\\|+-=_\"'");
+    while (it.next()) |_| total += 1;
+    return total;
+}
+
+fn buildRecursiveMergeMessages(
+    alloc: std.mem.Allocator,
+    query: []const u8,
+    summaries: []const []const u8,
+    recursive_cfg: recursive_agent.RecursiveConfig,
+    generation_cfg: ParsedGenerationConfig,
+) ![]const generating.ChatMessage {
+    var summaries_text = std.ArrayListUnmanaged(u8).empty;
+    defer summaries_text.deinit(alloc);
+    if (summaries.len == 0) {
+        try summaries_text.appendSlice(alloc, "No child summaries were produced because retrieval returned no context.\n");
+    } else {
+        for (summaries, 0..) |summary, i| {
+            const line = try std.fmt.allocPrint(alloc, "Child {d}: {s}\n", .{ i + 1, summary });
+            try summaries_text.appendSlice(alloc, line);
+        }
+    }
+
+    const system_prompt = if (generation_cfg.system_prompt) |prompt|
+        prompt
+    else
+        "Merge recursive child answers into one concise response. Use only child outputs and preserve citations when present.";
+    const policy_text = try std.fmt.allocPrint(
+        alloc,
+        "merge_policy={s}; split_policy={s}; child_count={d}",
+        .{ @tagName(recursive_cfg.merge_policy), @tagName(recursive_cfg.split_policy), summaries.len },
+    );
+    const user_prompt = try std.fmt.allocPrint(
+        alloc,
+        "User query: {s}\n\nRecursive policy: {s}\n\nChild outputs:\n{s}\nProduce the final answer. If the child outputs are insufficient, say what is missing.",
+        .{ query, policy_text, summaries_text.items },
+    );
+
+    const messages = try alloc.alloc(generating.ChatMessage, 2);
+    messages[0] = .{ .role = .system, .content = .{ .text = system_prompt } };
+    messages[1] = .{ .role = .user, .content = .{ .text = user_prompt } };
+    return messages;
+}
+
+fn buildRecursiveBudgetFallbackContent(
+    alloc: std.mem.Allocator,
+    summaries: []const []const u8,
+    reason: []const u8,
+) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    defer out.deinit(alloc);
+    try out.appendSlice(alloc, "Recursive execution stopped before merge: ");
+    try out.appendSlice(alloc, reason);
+    try out.append(alloc, '\n');
+    for (summaries, 0..) |summary, i| {
+        try out.print(alloc, "Child {d}: {s}\n", .{ i + 1, summary });
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn verifyRecursiveMerge(
+    alloc: std.mem.Allocator,
+    cfg: recursive_agent.RecursiveConfig,
+    context_ids: []const []const u8,
+    summaries: []const []const u8,
+    merged_content: []const u8,
+) !RecursiveMergeVerification {
+    if (cfg.merge_policy != .verify) return .{};
+
+    var required = std.ArrayListUnmanaged([]const u8).empty;
+    defer required.deinit(alloc);
+    var missing = std.ArrayListUnmanaged([]const u8).empty;
+    defer missing.deinit(alloc);
+
+    const count = @min(context_ids.len, summaries.len);
+    for (context_ids[0..count], summaries[0..count]) |context_id, summary| {
+        if (std.mem.indexOf(u8, summary, context_id) == null) continue;
+        try required.append(alloc, context_id);
+        if (std.mem.indexOf(u8, merged_content, context_id) == null) {
+            try missing.append(alloc, context_id);
+        }
+    }
+
+    return .{
+        .requested = true,
+        .passed = missing.items.len == 0,
+        .required_context_ids = try required.toOwnedSlice(alloc),
+        .missing_context_ids = try missing.toOwnedSlice(alloc),
+    };
+}
+
+fn buildRecursiveDecompositionDetails(
+    alloc: std.mem.Allocator,
+    cfg: recursive_agent.RecursiveConfig,
+    hit_count: usize,
+    child_count: usize,
+    scheduled_concurrency: usize,
+    actual_concurrency: usize,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "split_policy", .{ .string = @tagName(cfg.split_policy) });
+    try obj.put(alloc, "merge_policy", .{ .string = @tagName(cfg.merge_policy) });
+    try obj.put(alloc, "child_tool_policy", .{ .string = @tagName(cfg.child_tool_policy) });
+    try obj.put(alloc, "max_depth", .{ .integer = cfg.max_depth });
+    try obj.put(alloc, "max_subcalls", .{ .integer = cfg.max_subcalls });
+    try obj.put(alloc, "max_concurrency", .{ .integer = cfg.max_concurrency });
+    try obj.put(alloc, "max_wall_time_ms", .{ .integer = cfg.max_wall_time_ms });
+    try obj.put(alloc, "scheduled_concurrency", .{ .integer = @intCast(scheduled_concurrency) });
+    try obj.put(alloc, "actual_concurrency", .{ .integer = @intCast(actual_concurrency) });
+    try obj.put(alloc, "requested_concurrency", .{ .integer = cfg.max_concurrency });
+    try obj.put(alloc, "hit_count", .{ .integer = @intCast(hit_count) });
+    try obj.put(alloc, "child_frame_count", .{ .integer = @intCast(child_count) });
+    try obj.put(alloc, "truncated_context_count", .{ .integer = @intCast(hit_count - child_count) });
+    try obj.put(alloc, "budget_limited", .{ .bool = child_count < hit_count });
+    if (cfg.max_child_context_tokens) |tokens| try obj.put(alloc, "max_child_context_tokens", .{ .integer = tokens });
+    return .{ .object = obj };
+}
+
+fn buildRecursiveSubcallDetails(
+    alloc: std.mem.Allocator,
+    task: RecursiveChildTask,
+    timeout_ms: u64,
+    summary: []const u8,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "child_index", .{ .integer = @intCast(task.child_index) });
+    try obj.put(alloc, "context_kind", .{ .string = @tagName(task.context_object.kind) });
+    try obj.put(alloc, "context_id", .{ .string = task.context_object.id });
+    try obj.put(alloc, "estimated_context_tokens", .{ .integer = @intCast(task.estimated_context_tokens) });
+    try obj.put(alloc, "token_count_method", .{ .string = @tagName(task.token_count_method) });
+    try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(timeout_ms) });
+    try obj.put(alloc, "summary_bytes", .{ .integer = @intCast(summary.len) });
+    return .{ .object = obj };
+}
+
+fn buildRecursiveTraceSubcall(
+    alloc: std.mem.Allocator,
+    child_index: usize,
+    context_id: []const u8,
+    status: metadata_openapi.AgentStepStatus,
+    prompt_token_count: usize,
+    token_count_method: RecursiveTokenCountMethod,
+    result_summary: ?[]const u8,
+    error_message: ?[]const u8,
+) !metadata_openapi.RecursiveTraceSubcall {
+    const context_ids = try alloc.dupe([]const u8, &[_][]const u8{context_id});
+    return .{
+        .id = try std.fmt.allocPrint(alloc, "recursive_subcall_{d}", .{child_index + 1}),
+        .parent_frame_id = "recursive_root",
+        .child_frame_id = try std.fmt.allocPrint(alloc, "recursive_child_{d}", .{child_index + 1}),
+        .context_object_ids = context_ids,
+        .status = status,
+        .prompt_token_count = @intCast(prompt_token_count),
+        .token_count_method = @tagName(token_count_method),
+        .result_summary = result_summary,
+        .error_message = error_message,
+    };
+}
+
+fn buildRecursiveSkippedSubcallDetails(
+    alloc: std.mem.Allocator,
+    child_index: usize,
+    context_object: recursive_agent.ContextObject,
+    estimated_context_tokens: usize,
+    token_count_method: RecursiveTokenCountMethod,
+    max_child_context_tokens: usize,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "child_index", .{ .integer = @intCast(child_index) });
+    try obj.put(alloc, "context_kind", .{ .string = @tagName(context_object.kind) });
+    try obj.put(alloc, "context_id", .{ .string = context_object.id });
+    try obj.put(alloc, "estimated_context_tokens", .{ .integer = @intCast(estimated_context_tokens) });
+    try obj.put(alloc, "token_count_method", .{ .string = @tagName(token_count_method) });
+    try obj.put(alloc, "max_child_context_tokens", .{ .integer = @intCast(max_child_context_tokens) });
+    try obj.put(alloc, "skip_reason", .{ .string = "max_child_context_tokens" });
+    return .{ .object = obj };
+}
+
+fn buildRecursiveTimeoutSubcallDetails(
+    alloc: std.mem.Allocator,
+    task: RecursiveChildTask,
+    timeout_ms: ?u64,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "child_index", .{ .integer = @intCast(task.child_index) });
+    try obj.put(alloc, "context_kind", .{ .string = @tagName(task.context_object.kind) });
+    try obj.put(alloc, "context_id", .{ .string = task.context_object.id });
+    try obj.put(alloc, "estimated_context_tokens", .{ .integer = @intCast(task.estimated_context_tokens) });
+    try obj.put(alloc, "token_count_method", .{ .string = @tagName(task.token_count_method) });
+    if (timeout_ms) |value| try obj.put(alloc, "timeout_ms", .{ .integer = @intCast(value) });
+    try obj.put(alloc, "skip_reason", .{ .string = "max_wall_time_ms" });
+    return .{ .object = obj };
+}
+
+fn buildRecursiveMergeDetails(
+    alloc: std.mem.Allocator,
+    cfg: recursive_agent.RecursiveConfig,
+    child_count: usize,
+    skipped_child_count: usize,
+    wall_time_exhausted: bool,
+    elapsed_ms: i64,
+    verification: RecursiveMergeVerification,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "merge_policy", .{ .string = @tagName(cfg.merge_policy) });
+    try obj.put(alloc, "child_output_count", .{ .integer = @intCast(child_count) });
+    try obj.put(alloc, "skipped_child_count", .{ .integer = @intCast(skipped_child_count) });
+    try obj.put(alloc, "wall_time_exhausted", .{ .bool = wall_time_exhausted });
+    try obj.put(alloc, "elapsed_ms", .{ .integer = elapsed_ms });
+    try obj.put(alloc, "verification_requested", .{ .bool = verification.requested });
+    try obj.put(alloc, "verified", .{ .bool = verification.requested and verification.passed });
+    try obj.put(alloc, "missing_verified_context_count", .{ .integer = @intCast(verification.missing_context_ids.len) });
+    return .{ .object = obj };
+}
+
+fn buildRecursiveMergeVerificationDetails(
+    alloc: std.mem.Allocator,
+    verification: RecursiveMergeVerification,
+) !std.json.Value {
+    var obj = std.json.ObjectMap.empty;
+    try obj.put(alloc, "passed", .{ .bool = verification.passed });
+    try obj.put(alloc, "required_context_ids", try stringArrayJsonValue(alloc, verification.required_context_ids));
+    try obj.put(alloc, "missing_context_ids", try stringArrayJsonValue(alloc, verification.missing_context_ids));
+    return .{ .object = obj };
+}
+
+fn stringArrayJsonValue(alloc: std.mem.Allocator, values: []const []const u8) !std.json.Value {
+    var array = std.json.Array.init(alloc);
+    for (values) |value| try array.append(.{ .string = value });
+    return .{ .array = array };
 }
 
 fn buildGenerationDocumentsContext(
@@ -6073,6 +6937,62 @@ test "retrieval agent rejects out of range max tool iterations" {
     );
 }
 
+test "retrieval agent accepts explicit pipeline execution mode" {
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"pipeline","queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(AgentStatus.completed, parsed.value.status);
+}
+
+test "retrieval agent rejects contradictory execution mode controls" {
+    const pipeline_agentic_body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"pipeline","max_internal_iterations":1,"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, pipeline_agentic_body),
+    );
+
+    const agentic_without_budget_body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"agentic","queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, agentic_without_budget_body),
+    );
+
+    const recursive_config_without_mode_body =
+        \\{"query":"find alpha","stream":false,"recursive":{"max_depth":1,"max_subcalls":4,"max_concurrency":2},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, recursive_config_without_mode_body),
+    );
+}
+
+test "retrieval agent validates then rejects unsupported recursive execution mode" {
+    const unsupported_body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":4,"max_concurrency":2,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document","section"]},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.UnsupportedRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, unsupported_body),
+    );
+
+    const invalid_budget_body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":3},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    try std.testing.expectError(
+        error.InvalidRetrievalAgentRequest,
+        executeJson(std.testing.allocator, ValidationOnlyRunner.iface(), null, invalid_budget_body),
+    );
+}
+
 test "retrieval agent executes explicit query pipeline" {
     const FakeRunner = struct {
         fn iface() QueryRunner {
@@ -8658,6 +9578,105 @@ test "retrieval agent supports fixed-body sse streaming" {
     var parsed_done = try parseJsonBody(RetrievalAgentResult, std.testing.allocator, firstSseEventData(events, "done").?);
     defer parsed_done.deinit();
     try std.testing.expect(std.mem.indexOf(u8, parsed_done.value.generation.?, "Generated answer citing doc:a") != null);
+}
+
+test "retrieval agent recursive sse emits child progress before final ordered trace" {
+    const FakeRunner = struct {
+        fn iface() QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, _: []const u8, _: []const u8) !query_api.QueryResponse {
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.9,"_source":{"content":"beta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        fn iface() GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(_: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            return .{
+                .content = try alloc.dupe(u8, if (is_merge) "merged recursive answer" else "child recursive summary"),
+                .allocator = alloc,
+            };
+        }
+    };
+
+    const body =
+        \\{"query":"find alpha","stream":true,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+
+    const Sink = struct {
+        events: std.ArrayListUnmanaged(TestSseEvent) = .empty,
+
+        fn iface(self: *@This()) EventSink {
+            return .{ .ptr = self, .emit_json_fn = emitJson };
+        }
+
+        fn emitJson(ptr: *anyopaque, alloc: std.mem.Allocator, event_name: []const u8, json: []const u8) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try self.events.append(alloc, .{
+                .event = try alloc.dupe(u8, event_name),
+                .data = try alloc.dupe(u8, json),
+            });
+        }
+
+        fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+            for (self.events.items) |event| {
+                alloc.free(event.event);
+                alloc.free(event.data);
+            }
+            self.events.deinit(alloc);
+        }
+    };
+
+    var sink = Sink{};
+    defer sink.deinit(std.testing.allocator);
+    const encoded = try executeWithEventSink(std.testing.allocator, FakeRunner.iface(), FakeGeneration.iface(), body, sink.iface());
+    defer std.testing.allocator.free(encoded.body);
+    const events = try parseSseEventsAlloc(std.testing.allocator, encoded.body);
+    defer std.testing.allocator.free(events);
+
+    try std.testing.expectEqualStrings("text/event-stream", encoded.content_type);
+    const subcall_index = (try firstStepCompletedEventIndex(std.testing.allocator, sink.events.items, "recursive_subcall_1")) orelse return error.MissingRecursiveSubcallStep;
+    const decomposition_index = (try firstStepCompletedEventIndex(std.testing.allocator, sink.events.items, "recursive_decomposition")) orelse return error.MissingRecursiveDecompositionStep;
+    try std.testing.expect(subcall_index < decomposition_index);
+
+    var parsed_done = try parseJsonBody(RetrievalAgentResult, std.testing.allocator, firstSseEventData(events, "done").?);
+    defer parsed_done.deinit();
+    try std.testing.expectEqualStrings("merged recursive answer", parsed_done.value.generation.?);
+    try std.testing.expect(parsed_done.value.steps != null);
+    var done_decomposition_index: ?usize = null;
+    var done_subcall_index: ?usize = null;
+    for (parsed_done.value.steps.?, 0..) |step, i| {
+        if (step.kind == null) continue;
+        if (step.kind.? == .recursive_decomposition and done_decomposition_index == null) done_decomposition_index = i;
+        if (step.kind.? == .recursive_subcall and done_subcall_index == null) done_subcall_index = i;
+    }
+    try std.testing.expect(done_decomposition_index != null);
+    try std.testing.expect(done_subcall_index != null);
+    try std.testing.expect(done_decomposition_index.? < done_subcall_index.?);
 }
 
 test "retrieval agent sse emits followup events" {

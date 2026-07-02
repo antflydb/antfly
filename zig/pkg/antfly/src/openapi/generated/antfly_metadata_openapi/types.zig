@@ -6,8 +6,8 @@ const antfly_usermgr_openapi = @import("antfly_usermgr_openapi");
 const antfly_indexes_openapi = @import("antfly_indexes_openapi");
 const antfly_schema_openapi = @import("antfly_schema_openapi");
 const antfly_generating_api_openapi = @import("antfly_generating_api_openapi");
-const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_eval_openapi = @import("antfly_eval_openapi");
+const antfly_generating_openapi = @import("antfly_generating_openapi");
 const antfly_reranking_openapi = @import("antfly_reranking_openapi");
 
 pub const Error = antfly_usermgr_openapi.Error;
@@ -1103,8 +1103,180 @@ pub const BackupInfo = struct {
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
-    /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
+    /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue - max_subcalls: Recursive execution reached the configured child-frame limit - max_child_context_tokens: Recursive execution skipped child context that exceeded the per-child token budget - max_wall_time_ms: Recursive scheduling exhausted the configured wall-clock budget
     reason: []const u8,
+};
+
+/// Native agent control-flow mode: - pipeline: execute declared steps directly - agentic: run a bounded tool-selection/refinement loop - recursive: decompose work into bounded child agent frames, then merge and verify results This field is intentionally separate from domain-specific strategy fields such as query-builder `mode` and retrieval `strategy`.
+pub const AgentExecutionMode = enum {
+    pipeline,
+    agentic,
+    recursive,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pipeline => "pipeline",
+            .agentic => "agentic",
+            .recursive => "recursive",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pipeline", .pipeline },
+            .{ "agentic", .agentic },
+            .{ "recursive", .recursive },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for partitioning external context into child recursive work.
+pub const RecursiveSplitPolicy = enum {
+    auto,
+    by_document,
+    by_entity,
+    by_section,
+    by_query,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .by_document => "by_document",
+            .by_entity => "by_entity",
+            .by_section => "by_section",
+            .by_query => "by_query",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "by_document", .by_document },
+            .{ "by_entity", .by_entity },
+            .{ "by_section", .by_section },
+            .{ "by_query", .by_query },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for combining recursive child outputs.
+pub const RecursiveMergePolicy = enum {
+    synthesize,
+    vote,
+    rank,
+    verify,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .synthesize => "synthesize",
+            .vote => "vote",
+            .rank => "rank",
+            .verify => "verify",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "synthesize", .synthesize },
+            .{ "vote", .vote },
+            .{ "rank", .rank },
+            .{ "verify", .verify },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How child recursive frames receive tool permissions. Children cannot expand permissions beyond the parent request.
+pub const RecursiveChildToolPolicy = enum {
+    inherit_narrowed,
+    inherit_readonly,
+    none,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inherit_narrowed => "inherit_narrowed",
+            .inherit_readonly => "inherit_readonly",
+            .none => "none",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inherit_narrowed", .inherit_narrowed },
+            .{ "inherit_readonly", .inherit_readonly },
+            .{ "none", .none },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Portable type tag for external context handles used by recursive agents.
+pub const ContextObjectKind = enum {
+    table,
+    query_result,
+    document,
+    section,
+    chunk,
+    artifact,
+    graph_neighborhood,
+    memory_set,
+    extension_object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .table => "table",
+            .query_result => "query_result",
+            .document => "document",
+            .section => "section",
+            .chunk => "chunk",
+            .artifact => "artifact",
+            .graph_neighborhood => "graph_neighborhood",
+            .memory_set => "memory_set",
+            .extension_object => "extension_object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "table", .table },
+            .{ "query_result", .query_result },
+            .{ "document", .document },
+            .{ "section", .section },
+            .{ "chunk", .chunk },
+            .{ "artifact", .artifact },
+            .{ "graph_neighborhood", .graph_neighborhood },
+            .{ "memory_set", .memory_set },
+            .{ "extension_object", .extension_object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
@@ -1244,6 +1416,9 @@ pub const AgentStepKind = enum {
     generation,
     validation,
     clarification,
+    recursive_decomposition,
+    recursive_subcall,
+    recursive_merge,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -1253,6 +1428,9 @@ pub const AgentStepKind = enum {
             .generation => "generation",
             .validation => "validation",
             .clarification => "clarification",
+            .recursive_decomposition => "recursive_decomposition",
+            .recursive_subcall => "recursive_subcall",
+            .recursive_merge => "recursive_merge",
         };
         try jw.write(s);
     }
@@ -1269,6 +1447,9 @@ pub const AgentStepKind = enum {
             .{ "generation", .generation },
             .{ "validation", .validation },
             .{ "clarification", .clarification },
+            .{ "recursive_decomposition", .recursive_decomposition },
+            .{ "recursive_subcall", .recursive_subcall },
+            .{ "recursive_merge", .recursive_merge },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -2040,6 +2221,36 @@ pub const BackupListResponse = struct {
     backups: []const BackupInfo,
 };
 
+/// Bounded recursive execution policy shared by native agents. Defaults are deliberately conservative while recursive execution is experimental.
+pub const RecursiveAgentConfig = struct {
+    /// Maximum recursive child-frame depth supported by this native executor.
+    max_depth: ?i64 = null,
+    /// Maximum total child subcalls allowed for one root agent request.
+    max_subcalls: ?i64 = null,
+    /// Maximum recursive child frames that may execute concurrently. Executors may choose lower actual concurrency when a generation backend is not explicitly safe for parallel calls; traces report scheduled and actual concurrency.
+    max_concurrency: ?i64 = null,
+    /// Wall-clock budget for recursive scheduling.
+    max_wall_time_ms: ?i64 = null,
+    /// Optional context-token budget for each child frame.
+    max_child_context_tokens: ?i64 = null,
+    split_policy: ?RecursiveSplitPolicy = null,
+    merge_policy: ?RecursiveMergePolicy = null,
+    child_tool_policy: ?RecursiveChildToolPolicy = null,
+    /// Optional allow-list for context object kinds this recursive run may inspect.
+    allowed_context_object_types: ?[]const ContextObjectKind = null,
+};
+
+/// Portable context-object handle captured by a recursive agent trace.
+pub const RecursiveTraceContextObject = struct {
+    kind: ContextObjectKind,
+    /// Stable context object identifier, such as a document ID or memory ID.
+    id: []const u8,
+    /// Human-readable context object label.
+    label: ?[]const u8 = null,
+    /// Optional domain-specific metadata for this context object.
+    metadata: ?std.json.Value = null,
+};
+
 pub const AgentQuestion = struct {
     /// Stable question identifier for client-carried continuation
     id: []const u8,
@@ -2054,36 +2265,6 @@ pub const AgentQuestion = struct {
     default_answer: ?[]const u8 = null,
     /// High-level result areas affected by this decision
     affects: ?[]const []const u8 = null,
-};
-
-pub const QueryBuilderRequest = struct {
-    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
-    session_id: ?[]const u8 = null,
-    /// Structured answers provided by the user as part of client-carried continuation.
-    decisions: ?[]const AgentDecision = null,
-    /// If true, the agent may return clarification questions when needed.
-    interactive: ?bool = null,
-    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
-    max_internal_iterations: ?i64 = null,
-    /// Maximum number of clarification turns the agent may request from the user.
-    max_user_clarifications: ?i64 = null,
-    /// Force a user-facing decision after this many unresolved internal passes.
-    require_decision_after: ?i64 = null,
-    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
-    example_documents: ?[]const std.json.Value = null,
-    /// Name of the table to build query for. If provided, uses table schema for field context.
-    table: ?[]const u8 = null,
-    /// Natural language description of the search intent
-    intent: []const u8,
-    /// List of searchable field names to consider. Overrides table schema if provided.
-    schema_fields: ?[]const []const u8 = null,
-    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
-    mode: ?[]const u8 = null,
-    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
-    output: ?[]const u8 = null,
-    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
-    constraints: ?std.json.Value = null,
-    generator: ?antfly_generating_openapi.GeneratorConfig = null,
 };
 
 /// Emitted when a pipeline step begins execution
@@ -2113,6 +2294,27 @@ pub const AgentStep = struct {
     duration_ms: ?i64 = null,
     /// Additional details about the step
     details: ?std.json.Value = null,
+};
+
+/// One child invocation in a recursive agent trace.
+pub const RecursiveTraceSubcall = struct {
+    /// Stable subcall identifier within the trace artifact.
+    id: []const u8,
+    /// Parent recursive frame identifier.
+    parent_frame_id: []const u8,
+    /// Child recursive frame identifier.
+    child_frame_id: []const u8,
+    /// Context object IDs used by this child invocation.
+    context_object_ids: ?[]const []const u8 = null,
+    status: AgentStepStatus,
+    /// Token count used for child prompt budgeting.
+    prompt_token_count: ?i64 = null,
+    /// Token counter used for prompt accounting.
+    token_count_method: ?[]const u8 = null,
+    /// Child output summary captured for merge/debugging.
+    result_summary: ?[]const u8 = null,
+    /// Error or skip reason for unsuccessful child invocations.
+    error_message: ?[]const u8 = null,
 };
 
 /// Token usage and resource statistics from the retrieval agent execution
@@ -2321,58 +2523,55 @@ pub const TransactionSessionCommitResponse = struct {
     transaction_id: []const u8,
 };
 
+pub const QueryBuilderRequest = struct {
+    /// Correlation identifier for a bounded agent interaction. In Phase 1 this is echoed back to the client but does not imply server-side session persistence.
+    session_id: ?[]const u8 = null,
+    /// Structured answers provided by the user as part of client-carried continuation.
+    decisions: ?[]const AgentDecision = null,
+    /// If true, the agent may return clarification questions when needed.
+    interactive: ?bool = null,
+    /// Additive bounded-agent field for the query builder. Phase 1 remains a single-pass generation flow, but this field is echoed in result accounting.
+    max_internal_iterations: ?i64 = null,
+    /// Maximum number of clarification turns the agent may request from the user.
+    max_user_clarifications: ?i64 = null,
+    /// Force a user-facing decision after this many unresolved internal passes.
+    require_decision_after: ?i64 = null,
+    /// Agent execution control. Do not confuse this with query-builder `mode`, which remains a query-family strategy hint.
+    execution_mode: ?AgentExecutionMode = null,
+    /// Bounded recursive execution policy. Only meaningful when execution_mode is recursive.
+    recursive: ?RecursiveAgentConfig = null,
+    /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
+    example_documents: ?[]const std.json.Value = null,
+    /// Name of the table to build query for. If provided, uses table schema for field context.
+    table: ?[]const u8 = null,
+    /// Natural language description of the search intent
+    intent: []const u8,
+    /// List of searchable field names to consider. Overrides table schema if provided.
+    schema_fields: ?[]const []const u8 = null,
+    /// Optional strategy hint for the coordinator. Suggested values are `auto`, `full_text`, `semantic`, `hybrid`, `filter`, `tree`, and `graph`. Unknown values are accepted for forward compatibility and may fall back to `auto`.
+    mode: ?[]const u8 = null,
+    /// Preferred output artifact. Suggested values are `query_request`, `bleve`, and `filter_query`. The compatibility `query` field is still returned for existing clients.
+    output: ?[]const u8 = null,
+    /// Optional execution constraints for the coordinator, such as `limit`, `allowed_fields`, `prefer_indexes`, and `require_executable`.
+    constraints: ?std.json.Value = null,
+    generator: ?antfly_generating_openapi.GeneratorConfig = null,
+};
+
 pub const SSEStepCompleted = AgentStep;
 
-/// Result from the retrieval agent
-pub const RetrievalAgentResult = struct {
-    /// Unique response ID for logging and tracing
-    id: ?[]const u8 = null,
-    /// LLM model used for generation
-    model: ?[]const u8 = null,
-    /// Unix timestamp (seconds) when the response was created
-    created_at: ?i64 = null,
-    /// Current status of the bounded agent execution
-    status: AgentStatus,
-    /// Present when status is "incomplete" — explains why
-    incomplete_details: ?IncompleteDetails = null,
-    /// Token usage and resource statistics from this execution
-    usage: ?RetrievalAgentUsage = null,
-    /// Retrieved query hits
-    hits: []const QueryHit,
-    /// Shared bounded-agent execution trace for this retrieval run.
-    steps: ?[]const AgentStep = null,
-    /// Primary strategy that was used (optional in agentic mode)
-    strategy_used: ?RetrievalStrategy = null,
-    /// Correlation identifier for client-carried continuation.
-    session_id: ?[]const u8 = null,
-    /// Current internal iteration count for this bounded session.
-    iteration: ?i64 = null,
-    /// Number of user clarification turns already consumed in this session.
-    clarification_count: ?i64 = null,
-    /// Remaining internal reasoning/tool-use iterations for this session.
-    remaining_internal_iterations: ?i64 = null,
-    /// Remaining clarification turns allowed for this session.
-    remaining_user_clarifications: ?i64 = null,
-    /// Clarification questions exposed in the shared bounded-agent envelope.
-    questions: ?[]const AgentQuestion = null,
-    /// Filters that were applied during retrieval
-    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
-    /// Total number of tool calls made during retrieval
-    tool_calls_made: ?i64 = null,
-    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
-    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
-    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
-    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
-    /// Generated response in markdown format. Present when steps.generation was configured.
-    generation: ?[]const u8 = null,
-    /// Confidence in the generated response (requires steps.confidence)
-    generation_confidence: ?f32 = null,
-    /// Relevance of retrieved documents to the query (requires steps.confidence)
-    context_relevance: ?f32 = null,
-    /// Suggested follow-up questions (requires steps.followup)
-    followup_questions: ?[]const []const u8 = null,
-    /// Evaluation results when steps.eval was configured
-    eval_result: ?antfly_eval_openapi.EvalResult = null,
+/// Structured recursive execution artifact suitable for evaluation, debugging, and later durable persistence.
+pub const RecursiveTraceArtifact = struct {
+    /// Root recursive frame identifier.
+    root_frame_id: []const u8,
+    final_status: AgentStatus,
+    /// Context object handles inspected during recursive execution.
+    context_objects: []const RecursiveTraceContextObject,
+    /// Child invocations scheduled by the recursive executor.
+    subcalls: []const RecursiveTraceSubcall,
+    /// Ordered agent trace steps emitted for this recursive execution.
+    steps: []const AgentStep,
+    /// Optional reference to a durable stored trace artifact.
+    result_ref: ?[]const u8 = null,
 };
 
 /// Configuration for joining data from another table. Supports inner, left, and right joins with automatic strategy selection.
@@ -2445,6 +2644,60 @@ pub const BatchRequest = struct {
     /// Array of transform operations for in-place document updates using MongoDB-style operators. Transform operations allow you to modify documents without read-modify-write races: - Operations are applied atomically on the server - Multiple operations per document are applied in sequence - Supports numeric operations ($inc, $mul), array operations ($push, $pull), and more Common use cases: - Increment counters (views, likes, votes) - Update timestamps ($currentDate) - Manage arrays (add/remove tags, items) - Update nested fields without overwriting the entire document
     transforms: ?[]const Transform = null,
     sync_level: ?SyncLevel = null,
+};
+
+/// Result from the retrieval agent
+pub const RetrievalAgentResult = struct {
+    /// Unique response ID for logging and tracing
+    id: ?[]const u8 = null,
+    /// LLM model used for generation
+    model: ?[]const u8 = null,
+    /// Unix timestamp (seconds) when the response was created
+    created_at: ?i64 = null,
+    /// Current status of the bounded agent execution
+    status: AgentStatus,
+    /// Present when status is "incomplete" — explains why
+    incomplete_details: ?IncompleteDetails = null,
+    /// Token usage and resource statistics from this execution
+    usage: ?RetrievalAgentUsage = null,
+    /// Retrieved query hits
+    hits: []const QueryHit,
+    /// Shared bounded-agent execution trace for this retrieval run.
+    steps: ?[]const AgentStep = null,
+    /// Structured recursive trace artifact. Present for recursive execution mode.
+    trace_artifact: ?RecursiveTraceArtifact = null,
+    /// Primary strategy that was used (optional in agentic mode)
+    strategy_used: ?RetrievalStrategy = null,
+    /// Correlation identifier for client-carried continuation.
+    session_id: ?[]const u8 = null,
+    /// Current internal iteration count for this bounded session.
+    iteration: ?i64 = null,
+    /// Number of user clarification turns already consumed in this session.
+    clarification_count: ?i64 = null,
+    /// Remaining internal reasoning/tool-use iterations for this session.
+    remaining_internal_iterations: ?i64 = null,
+    /// Remaining clarification turns allowed for this session.
+    remaining_user_clarifications: ?i64 = null,
+    /// Clarification questions exposed in the shared bounded-agent envelope.
+    questions: ?[]const AgentQuestion = null,
+    /// Filters that were applied during retrieval
+    applied_filters: ?[]const antfly_generating_api_openapi.FilterSpec = null,
+    /// Total number of tool calls made during retrieval
+    tool_calls_made: ?i64 = null,
+    /// Optional conversational context including tool calls and responses. Decisions remain the authoritative continuation input for bounded agent interactions.
+    messages: ?[]const antfly_generating_openapi.ChatMessage = null,
+    /// Query classification and transformation result. Present when steps.classification was configured. Includes strategy, semantic_query, sub_questions (decompose), step_back_query, and reasoning.
+    classification: ?antfly_generating_api_openapi.ClassificationTransformationResult = null,
+    /// Generated response in markdown format. Present when steps.generation was configured.
+    generation: ?[]const u8 = null,
+    /// Confidence in the generated response (requires steps.confidence)
+    generation_confidence: ?f32 = null,
+    /// Relevance of retrieved documents to the query (requires steps.confidence)
+    context_relevance: ?f32 = null,
+    /// Suggested follow-up questions (requires steps.followup)
+    followup_questions: ?[]const []const u8 = null,
+    /// Evaluation results when steps.eval was configured
+    eval_result: ?antfly_eval_openapi.EvalResult = null,
 };
 
 pub const QueryRequest = struct {
@@ -2671,6 +2924,8 @@ pub const QueryBuilderResult = struct {
     clarification_count: ?i64 = null,
     /// Current status of the bounded query-builder execution.
     status: ?AgentStatus = null,
+    /// Explains why bounded query-builder execution stopped before all candidate work completed.
+    incomplete_details: ?IncompleteDetails = null,
     /// Shared bounded-agent execution trace for this query-builder run.
     steps: ?[]const AgentStep = null,
     /// Remaining internal reasoning passes for this interaction.
@@ -2721,6 +2976,10 @@ pub const RetrievalAgentRequest = struct {
     max_user_clarifications: ?i64 = null,
     /// Force a user-facing decision after this many unresolved internal passes.
     require_decision_after: ?i64 = null,
+    /// Agent execution control. When omitted, max_internal_iterations preserves the existing pipeline-vs-agentic behavior.
+    execution_mode: ?AgentExecutionMode = null,
+    /// Bounded recursive execution policy. Only meaningful when execution_mode is recursive.
+    recursive: ?RecursiveAgentConfig = null,
     /// Maximum tokens for document context in tool responses. Documents exceeding this limit are pruned to fit.
     max_context_tokens: ?i64 = null,
     /// Tokens to reserve for system prompt, answer generation, and other overhead. Subtracted from max_context_tokens to determine available context budget. Defaults to 4000 if max_context_tokens is set.

@@ -1121,8 +1121,180 @@ pub const BackupInfo = struct {
 
 /// Explains why the agent stopped before completion. Present when status is "incomplete".
 pub const IncompleteDetails = struct {
-    /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue
+    /// Why the agent stopped: - max_internal_iterations: Hit the configured max_internal_iterations limit - max_tokens: LLM output was truncated - no_tools: No tools were available for agentic mode - clarification_required: The agent needs a user decision before it can continue - max_subcalls: Recursive execution reached the configured child-frame limit - max_child_context_tokens: Recursive execution skipped child context that exceeded the per-child token budget - max_wall_time_ms: Recursive scheduling exhausted the configured wall-clock budget
     reason: []const u8,
+};
+
+/// Native agent control-flow mode: - pipeline: execute declared steps directly - agentic: run a bounded tool-selection/refinement loop - recursive: decompose work into bounded child agent frames, then merge and verify results This field is intentionally separate from domain-specific strategy fields such as query-builder `mode` and retrieval `strategy`.
+pub const AgentExecutionMode = enum {
+    pipeline,
+    agentic,
+    recursive,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .pipeline => "pipeline",
+            .agentic => "agentic",
+            .recursive => "recursive",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "pipeline", .pipeline },
+            .{ "agentic", .agentic },
+            .{ "recursive", .recursive },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for partitioning external context into child recursive work.
+pub const RecursiveSplitPolicy = enum {
+    auto,
+    by_document,
+    by_entity,
+    by_section,
+    by_query,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .auto => "auto",
+            .by_document => "by_document",
+            .by_entity => "by_entity",
+            .by_section => "by_section",
+            .by_query => "by_query",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "auto", .auto },
+            .{ "by_document", .by_document },
+            .{ "by_entity", .by_entity },
+            .{ "by_section", .by_section },
+            .{ "by_query", .by_query },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Strategy for combining recursive child outputs.
+pub const RecursiveMergePolicy = enum {
+    synthesize,
+    vote,
+    rank,
+    verify,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .synthesize => "synthesize",
+            .vote => "vote",
+            .rank => "rank",
+            .verify => "verify",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "synthesize", .synthesize },
+            .{ "vote", .vote },
+            .{ "rank", .rank },
+            .{ "verify", .verify },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// How child recursive frames receive tool permissions. Children cannot expand permissions beyond the parent request.
+pub const RecursiveChildToolPolicy = enum {
+    inherit_narrowed,
+    inherit_readonly,
+    none,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .inherit_narrowed => "inherit_narrowed",
+            .inherit_readonly => "inherit_readonly",
+            .none => "none",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "inherit_narrowed", .inherit_narrowed },
+            .{ "inherit_readonly", .inherit_readonly },
+            .{ "none", .none },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
+};
+
+/// Portable type tag for external context handles used by recursive agents.
+pub const ContextObjectKind = enum {
+    table,
+    query_result,
+    document,
+    section,
+    chunk,
+    artifact,
+    graph_neighborhood,
+    memory_set,
+    extension_object,
+
+    pub fn jsonStringify(self: @This(), jw: anytype) !void {
+        const s = switch (self) {
+            .table => "table",
+            .query_result => "query_result",
+            .document => "document",
+            .section => "section",
+            .chunk => "chunk",
+            .artifact => "artifact",
+            .graph_neighborhood => "graph_neighborhood",
+            .memory_set => "memory_set",
+            .extension_object => "extension_object",
+        };
+        try jw.write(s);
+    }
+
+    pub fn jsonParse(_: std.mem.Allocator, source: anytype, _: std.json.ParseOptions) !@This() {
+        const s = switch (try source.next()) {
+            .string => |v| v,
+            else => return error.UnexpectedToken,
+        };
+        const map = std.StaticStringMap(@This()).initComptime(.{
+            .{ "table", .table },
+            .{ "query_result", .query_result },
+            .{ "document", .document },
+            .{ "section", .section },
+            .{ "chunk", .chunk },
+            .{ "artifact", .artifact },
+            .{ "graph_neighborhood", .graph_neighborhood },
+            .{ "memory_set", .memory_set },
+            .{ "extension_object", .extension_object },
+        });
+        return map.get(s) orelse error.UnexpectedToken;
+    }
 };
 
 /// Strategy for document retrieval: - semantic: Vector similarity search using embeddings - bm25: Full-text search using BM25 scoring - metadata: Structured query on document fields - tree: Iterative tree navigation with summarization - graph: Relationship-based traversal - hybrid: Combine multiple strategies with RRF or rerank
@@ -1262,6 +1434,9 @@ pub const AgentStepKind = enum {
     generation,
     validation,
     clarification,
+    recursive_decomposition,
+    recursive_subcall,
+    recursive_merge,
 
     pub fn jsonStringify(self: @This(), jw: anytype) !void {
         const s = switch (self) {
@@ -1271,6 +1446,9 @@ pub const AgentStepKind = enum {
             .generation => "generation",
             .validation => "validation",
             .clarification => "clarification",
+            .recursive_decomposition => "recursive_decomposition",
+            .recursive_subcall => "recursive_subcall",
+            .recursive_merge => "recursive_merge",
         };
         try jw.write(s);
     }
@@ -1287,6 +1465,9 @@ pub const AgentStepKind = enum {
             .{ "generation", .generation },
             .{ "validation", .validation },
             .{ "clarification", .clarification },
+            .{ "recursive_decomposition", .recursive_decomposition },
+            .{ "recursive_subcall", .recursive_subcall },
+            .{ "recursive_merge", .recursive_merge },
         });
         return map.get(s) orelse error.UnexpectedToken;
     }
@@ -4315,6 +4496,36 @@ pub const BackupListResponse = struct {
     backups: []const BackupInfo,
 };
 
+/// Bounded recursive execution policy shared by native agents. Defaults are deliberately conservative while recursive execution is experimental.
+pub const RecursiveAgentConfig = struct {
+    /// Maximum recursive child-frame depth supported by this native executor.
+    max_depth: ?i64 = null,
+    /// Maximum total child subcalls allowed for one root agent request.
+    max_subcalls: ?i64 = null,
+    /// Maximum recursive child frames that may execute concurrently. Executors may choose lower actual concurrency when a generation backend is not explicitly safe for parallel calls; traces report scheduled and actual concurrency.
+    max_concurrency: ?i64 = null,
+    /// Wall-clock budget for recursive scheduling.
+    max_wall_time_ms: ?i64 = null,
+    /// Optional context-token budget for each child frame.
+    max_child_context_tokens: ?i64 = null,
+    split_policy: ?RecursiveSplitPolicy = null,
+    merge_policy: ?RecursiveMergePolicy = null,
+    child_tool_policy: ?RecursiveChildToolPolicy = null,
+    /// Optional allow-list for context object kinds this recursive run may inspect.
+    allowed_context_object_types: ?[]const ContextObjectKind = null,
+};
+
+/// Portable context-object handle captured by a recursive agent trace.
+pub const RecursiveTraceContextObject = struct {
+    kind: ContextObjectKind,
+    /// Stable context object identifier, such as a document ID or memory ID.
+    id: []const u8,
+    /// Human-readable context object label.
+    label: ?[]const u8 = null,
+    /// Optional domain-specific metadata for this context object.
+    metadata: ?std.json.Value = null,
+};
+
 pub const AgentQuestion = struct {
     /// Stable question identifier for client-carried continuation
     id: []const u8,
@@ -4358,6 +4569,27 @@ pub const AgentStep = struct {
     duration_ms: ?i64 = null,
     /// Additional details about the step
     details: ?std.json.Value = null,
+};
+
+/// One child invocation in a recursive agent trace.
+pub const RecursiveTraceSubcall = struct {
+    /// Stable subcall identifier within the trace artifact.
+    id: []const u8,
+    /// Parent recursive frame identifier.
+    parent_frame_id: []const u8,
+    /// Child recursive frame identifier.
+    child_frame_id: []const u8,
+    /// Context object IDs used by this child invocation.
+    context_object_ids: ?[]const []const u8 = null,
+    status: AgentStepStatus,
+    /// Token count used for child prompt budgeting.
+    prompt_token_count: ?i64 = null,
+    /// Token counter used for prompt accounting.
+    token_count_method: ?[]const u8 = null,
+    /// Child output summary captured for merge/debugging.
+    result_summary: ?[]const u8 = null,
+    /// Error or skip reason for unsuccessful child invocations.
+    error_message: ?[]const u8 = null,
 };
 
 /// Token usage and resource statistics from the retrieval agent execution
@@ -5380,6 +5612,21 @@ pub const TransactionSessionCommitResponse = struct {
 
 pub const SSEStepCompleted = AgentStep;
 
+/// Structured recursive execution artifact suitable for evaluation, debugging, and later durable persistence.
+pub const RecursiveTraceArtifact = struct {
+    /// Root recursive frame identifier.
+    root_frame_id: []const u8,
+    final_status: AgentStatus,
+    /// Context object handles inspected during recursive execution.
+    context_objects: []const RecursiveTraceContextObject,
+    /// Child invocations scheduled by the recursive executor.
+    subcalls: []const RecursiveTraceSubcall,
+    /// Ordered agent trace steps emitted for this recursive execution.
+    steps: []const AgentStep,
+    /// Optional reference to a durable stored trace artifact.
+    result_ref: ?[]const u8 = null,
+};
+
 pub const TraverseResponse = struct {
     results: ?[]const TraversalResult = null,
     /// Total number of results
@@ -5473,6 +5720,10 @@ pub const QueryBuilderRequest = struct {
     max_user_clarifications: ?i64 = null,
     /// Force a user-facing decision after this many unresolved internal passes.
     require_decision_after: ?i64 = null,
+    /// Agent execution control. Do not confuse this with query-builder `mode`, which remains a query-family strategy hint.
+    execution_mode: ?AgentExecutionMode = null,
+    /// Bounded recursive execution policy. Only meaningful when execution_mode is recursive.
+    recursive: ?RecursiveAgentConfig = null,
     /// Optional example documents to help the query builder infer field shapes and representative values. When omitted and the table has data but no schema, the server samples up to one document automatically.
     example_documents: ?[]const std.json.Value = null,
     /// Name of the table to build query for. If provided, uses table schema for field context.
@@ -6704,6 +6955,8 @@ pub const RetrievalAgentResult = struct {
     hits: []const QueryHit,
     /// Shared bounded-agent execution trace for this retrieval run.
     steps: ?[]const AgentStep = null,
+    /// Structured recursive trace artifact. Present for recursive execution mode.
+    trace_artifact: ?RecursiveTraceArtifact = null,
     /// Primary strategy that was used (optional in agentic mode)
     strategy_used: ?RetrievalStrategy = null,
     /// Correlation identifier for client-carried continuation.
@@ -6957,6 +7210,8 @@ pub const QueryBuilderResult = struct {
     clarification_count: ?i64 = null,
     /// Current status of the bounded query-builder execution.
     status: ?AgentStatus = null,
+    /// Explains why bounded query-builder execution stopped before all candidate work completed.
+    incomplete_details: ?IncompleteDetails = null,
     /// Shared bounded-agent execution trace for this query-builder run.
     steps: ?[]const AgentStep = null,
     /// Remaining internal reasoning passes for this interaction.
@@ -7074,6 +7329,10 @@ pub const RetrievalAgentRequest = struct {
     max_user_clarifications: ?i64 = null,
     /// Force a user-facing decision after this many unresolved internal passes.
     require_decision_after: ?i64 = null,
+    /// Agent execution control. When omitted, max_internal_iterations preserves the existing pipeline-vs-agentic behavior.
+    execution_mode: ?AgentExecutionMode = null,
+    /// Bounded recursive execution policy. Only meaningful when execution_mode is recursive.
+    recursive: ?RecursiveAgentConfig = null,
     /// Maximum tokens for document context in tool responses. Documents exceeding this limit are pruned to fit.
     max_context_tokens: ?i64 = null,
     /// Tokens to reserve for system prompt, answer generation, and other overhead. Subtracted from max_context_tokens to determine available context budget. Defaults to 4000 if max_context_tokens is set.

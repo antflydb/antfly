@@ -13,6 +13,9 @@
 // limitations.
 
 const std = @import("std");
+const metadata_openapi = @import("antfly_metadata_openapi");
+const generating = @import("antfly_generating");
+const db_mod = @import("../storage/db/mod.zig");
 const document_mapper = @import("../storage/db/document_mapper.zig");
 
 pub const cluster = @import("cluster.zig");
@@ -23,6 +26,7 @@ pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
 pub const cluster_api_http = @import("cluster_api_http.zig");
 pub const retrieval_agent = @import("retrieval_agent.zig");
+pub const recursive_agent = @import("recursive_agent.zig");
 pub const public_table_http = @import("public_table_http.zig");
 pub const public_embedding_query = @import("public_embedding_query.zig");
 pub const public_graph_query = @import("public_graph_query.zig");
@@ -207,6 +211,7 @@ test "api module compiles" {
     _ = query_contract;
     _ = cluster_api_http;
     _ = retrieval_agent;
+    _ = recursive_agent;
     _ = public_table_http;
     _ = public_graph_query;
     _ = public_query_string;
@@ -257,6 +262,1575 @@ test "api module compiles" {
     _ = ApiHttpClient;
 }
 
+test "api recursive execution mode validation fails closed" {
+    try std.testing.expect(@hasDecl(metadata_openapi, "AgentExecutionMode"));
+    try std.testing.expect(@hasDecl(metadata_openapi, "RecursiveAgentConfig"));
+    try std.testing.expect(@hasDecl(metadata_openapi, "ContextObjectKind"));
+    try std.testing.expect(@hasDecl(metadata_openapi, "RecursiveTraceArtifact"));
+    try std.testing.expect(@hasField(metadata_openapi.RetrievalAgentRequest, "execution_mode"));
+    try std.testing.expect(@hasField(metadata_openapi.RetrievalAgentRequest, "recursive"));
+    try std.testing.expect(@hasField(metadata_openapi.RetrievalAgentResult, "trace_artifact"));
+    try std.testing.expect(@hasField(metadata_openapi.QueryBuilderRequest, "execution_mode"));
+    try std.testing.expect(@hasField(metadata_openapi.QueryBuilderRequest, "recursive"));
+
+    const pipeline_request: metadata_openapi.RetrievalAgentRequest = .{
+        .query = "find docs",
+        .queries = &.{.{
+            .table = "docs",
+            .semantic_search = "find docs",
+        }},
+        .execution_mode = .pipeline,
+    };
+    try std.testing.expectEqual(metadata_openapi.AgentExecutionMode.pipeline, try recursive_agent.validateRetrievalExecutionMode(pipeline_request, 0));
+    try std.testing.expectError(error.InvalidRetrievalAgentRequest, recursive_agent.validateRetrievalExecutionMode(pipeline_request, 1));
+
+    const recursive_request: metadata_openapi.RetrievalAgentRequest = .{
+        .query = "find docs",
+        .queries = &.{.{
+            .table = "docs",
+            .semantic_search = "find docs",
+        }},
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 4,
+            .max_concurrency = 2,
+            .split_policy = .by_document,
+            .merge_policy = .verify,
+        },
+    };
+    try std.testing.expectEqual(metadata_openapi.AgentExecutionMode.recursive, try recursive_agent.validateRetrievalExecutionMode(recursive_request, 0));
+
+    const query_builder_request: metadata_openapi.QueryBuilderRequest = .{
+        .intent = "build a query",
+        .mode = "join_aggregation",
+        .execution_mode = .pipeline,
+    };
+    try recursive_agent.validateQueryBuilderExecutionMode(query_builder_request);
+
+    const recursive_query_builder_request: metadata_openapi.QueryBuilderRequest = .{
+        .intent = "build a query",
+        .mode = "join_aggregation",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 4,
+            .max_concurrency = 2,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    };
+    try recursive_agent.validateQueryBuilderExecutionMode(recursive_query_builder_request);
+
+    const recursive_cfg = try recursive_agent.normalizeConfig(recursive_query_builder_request.recursive);
+    try std.testing.expectEqual(@as(usize, 4), recursive_agent.childCountForContextCount(recursive_cfg, 12));
+    try std.testing.expectEqual(@as(usize, 2), recursive_agent.scheduledConcurrency(recursive_cfg, 4));
+    try std.testing.expect(recursive_agent.contextKindAllowed(recursive_cfg, .document));
+    try std.testing.expectEqualStrings("max_subcalls", recursive_agent.incompleteReason(true, 0, false).?);
+}
+
+test "api recursive generation runners require timeout support" {
+    const RetrievalGeneration = struct {
+        fn iface() retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    const QueryBuilderGeneration = struct {
+        fn iface() query_builder_agent.GenerationRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(_: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            return error.TestUnexpectedResult;
+        }
+    };
+
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        RetrievalGeneration.iface().executeChainWithTimeoutMs(std.testing.allocator, &.{}, &.{}, 1),
+    );
+    try std.testing.expectError(
+        error.DeadlineExceeded,
+        QueryBuilderGeneration.iface().executeChainWithTimeoutMs(std.testing.allocator, &.{}, &.{}, 1),
+    );
+}
+
+test "api query builder recursive aggregation inference emits typed candidate artifact" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const RuntimeValidator = struct {
+        fn iface() query_builder_agent.QueryBuilderRuntimeQueryRequestValidator {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .validate_query_request = validateQueryRequest,
+                    .preflight_query_request = preflightQueryRequest,
+                },
+            };
+        }
+
+        fn validateQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            query_request: metadata_openapi.QueryRequest,
+        ) !?[]const u8 {
+            if (query_request.aggregations == null) return error.TestExpectedEqual;
+            return null;
+        }
+
+        fn preflightQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            query_request: metadata_openapi.QueryRequest,
+            _: u32,
+        ) !?db_mod.RuntimePreflightSummary {
+            if (query_request.aggregations == null) return error.TestExpectedEqual;
+            return .{
+                .shard_count = 1,
+                .shard_result_window = 10,
+                .shard_result_window_total = 10,
+                .positive_id_result_upper_bound = 1500,
+                .structured_filter_doc_count_estimate = 1500,
+                .aggregation_may_scan_full_results = true,
+            };
+        }
+    };
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "orders",
+        .intent = "sum amount by status",
+        .schema_fields = &.{ "status", "amount", "customer_id" },
+        .mode = "aggregation",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "status", "amount", "customer_id" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "status", "amount", "customer_id" } }},
+        .runtime_query_request_validator = RuntimeValidator.iface(),
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("aggregation", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(result.query_request.?.aggregations != null);
+
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    const candidate_query = candidate_plans[0].object.get("query_request").?.object;
+    const aggregations = candidate_query.get("aggregations").?.object;
+    const by_status = aggregations.get("by_status").?.object;
+    try std.testing.expectEqualStrings("terms", by_status.get("type").?.string);
+    try std.testing.expectEqualStrings("status", by_status.get("field").?.string);
+    const sub_aggregations = by_status.get("sub_aggregations").?.object;
+    const sum_amount = sub_aggregations.get("sum_amount").?.object;
+    try std.testing.expectEqualStrings("sum", sum_amount.get("type").?.string);
+    try std.testing.expectEqualStrings("amount", sum_amount.get("field").?.string);
+    try std.testing.expect(candidate_plans[0].object.get("runtime_preflight_estimated").?.bool);
+    try std.testing.expect(candidate_plans[0].object.get("aggregation_may_scan_full_results").?.bool);
+    try std.testing.expectEqual(@as(i64, 1500), candidate_plans[0].object.get("aggregation_second_pass_doc_estimate").?.integer);
+    try std.testing.expectEqual(@as(i64, 1500), candidate_plans[0].object.get("aggregation_second_pass_doc_upper_bound").?.integer);
+    try std.testing.expectEqualStrings("full_result_second_pass_medium", candidate_plans[0].object.get("aggregation_cost_heuristic").?.string);
+}
+
+test "api query builder recursive aggregation inference uses field catalog metadata" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "subscriptions",
+        .intent = "total revenue by plan",
+        .schema_fields = &.{ "plan", "total_cents", "status" },
+        .mode = "aggregation",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "plan", "total_cents", "status" },
+        .doc_count = 12_000,
+        .field_metadata = &.{
+            .{
+                .name = "plan",
+                .aliases = &.{ "subscription plan", "tier" },
+                .kind = .keyword,
+                .groupable = true,
+            },
+            .{
+                .name = "total_cents",
+                .aliases = &.{ "revenue", "amount" },
+                .kind = .numeric,
+                .metric = true,
+            },
+            .{
+                .name = "status",
+                .kind = .keyword,
+                .groupable = true,
+            },
+        },
+        .full_text_index_metadata = &.{.{ .name = "subscriptions_text", .fields = &.{ "plan", "total_cents", "status" } }},
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("aggregation", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(result.query_request.?.aggregations != null);
+
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    const candidate_query = candidate_plans[0].object.get("query_request").?.object;
+    const aggregations = candidate_query.get("aggregations").?.object;
+    const by_plan = aggregations.get("by_plan").?.object;
+    try std.testing.expectEqualStrings("terms", by_plan.get("type").?.string);
+    try std.testing.expectEqualStrings("plan", by_plan.get("field").?.string);
+    const sub_aggregations = by_plan.get("sub_aggregations").?.object;
+    const sum_total = sub_aggregations.get("sum_total_cents").?.object;
+    try std.testing.expectEqualStrings("sum", sum_total.get("type").?.string);
+    try std.testing.expectEqualStrings("total_cents", sum_total.get("field").?.string);
+    try std.testing.expectEqualStrings("plan", candidate_plans[0].object.get("aggregation_group_field").?.string);
+    try std.testing.expectEqualStrings("total_cents", candidate_plans[0].object.get("aggregation_metric_field").?.string);
+    try std.testing.expect(candidate_plans[0].object.get("aggregation_field_catalog_backed").?.bool);
+    try std.testing.expectEqual(@as(i64, 12_000), candidate_plans[0].object.get("aggregation_table_doc_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 10), candidate_plans[0].object.get("aggregation_bucket_size").?.integer);
+    try std.testing.expectEqualStrings("catalog_medium", candidate_plans[0].object.get("aggregation_stat_heuristic").?.string);
+}
+
+test "api query builder recursive join aggregation inference emits typed candidate artifact" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "orders",
+        .intent = "sum amount by customer with customers including tier",
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .mode = "join_aggregation",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "customer_id", "amount", "status" } }},
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("join_aggregation", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(result.query_request.?.join != null);
+    try std.testing.expect(result.query_request.?.aggregations != null);
+
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    const candidate = candidate_plans[0].object;
+    try std.testing.expect(candidate.get("preflight_error_count").?.integer > 0);
+    const candidate_query = candidate.get("query_request").?.object;
+    const join = candidate_query.get("join").?.object;
+    try std.testing.expectEqualStrings("customers", join.get("right_table").?.string);
+    try std.testing.expectEqualStrings("inner", join.get("join_type").?.string);
+    try std.testing.expectEqualStrings("customer_id", join.get("on").?.object.get("left_field").?.string);
+    try std.testing.expectEqualStrings("id", join.get("on").?.object.get("right_field").?.string);
+    try std.testing.expectEqualStrings("index_lookup", join.get("strategy_hint").?.string);
+    try std.testing.expectEqualStrings("tier", join.get("right_fields").?.array.items[0].string);
+
+    const aggregations = candidate_query.get("aggregations").?.object;
+    const by_customer = aggregations.get("by_customer_id").?.object;
+    try std.testing.expectEqualStrings("terms", by_customer.get("type").?.string);
+    try std.testing.expectEqualStrings("customer_id", by_customer.get("field").?.string);
+    const sum_amount = by_customer.get("sub_aggregations").?.object.get("sum_amount").?.object;
+    try std.testing.expectEqualStrings("sum", sum_amount.get("type").?.string);
+    try std.testing.expectEqualStrings("amount", sum_amount.get("field").?.string);
+}
+
+test "api query builder recursive join inference uses related table catalog metadata" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "orders",
+        .intent = "join orders with accounts including region and plan",
+        .schema_fields = &.{ "account_uuid", "amount", "status" },
+        .mode = "join",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "account_uuid", "amount", "status" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "account_uuid", "amount", "status" } }},
+        .related_tables = &.{.{
+            .name = "accounts",
+            .schema_fields = &.{ "uuid", "region", "plan", "owner_email" },
+            .primary_key_fields = &.{"uuid"},
+        }},
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("join", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    const join = result.query_request.?.join orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("accounts", join.right_table);
+    try std.testing.expectEqualStrings("account_uuid", join.on.left_field);
+    try std.testing.expectEqualStrings("uuid", join.on.right_field);
+    try std.testing.expect(join.right_fields != null);
+    try std.testing.expectEqual(@as(usize, 2), join.right_fields.?.len);
+    try std.testing.expectEqualStrings("region", join.right_fields.?[0]);
+    try std.testing.expectEqualStrings("plan", join.right_fields.?[1]);
+
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    const candidate_join = candidate_plans[0].object.get("query_request").?.object.get("join").?.object;
+    try std.testing.expectEqualStrings("uuid", candidate_join.get("on").?.object.get("right_field").?.string);
+}
+
+test "api query builder require executable rejects inferred join until runtime support lands" {
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"require_executable":true}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    try std.testing.expectError(error.InvalidQueryBuilderRequest, query_builder_agent.buildQueryBuilderResponseWithContext(arena_impl.allocator(), .{
+        .table = "orders",
+        .intent = "orders with customers",
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .mode = "join",
+        .constraints = constraints_tree.value,
+    }, .{
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "customer_id", "amount", "status" } }},
+    }, null));
+}
+
+test "api query builder require executable accepts runtime validated join" {
+    const RuntimeValidator = struct {
+        fn iface() query_builder_agent.QueryBuilderRuntimeQueryRequestValidator {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .validate_query_request = validateQueryRequest,
+                    .preflight_query_request = preflightQueryRequest,
+                    .plan_join_query_request = planJoinQueryRequest,
+                },
+            };
+        }
+
+        fn validateQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            query_request: metadata_openapi.QueryRequest,
+        ) !?[]const u8 {
+            if (query_request.join == null) return error.TestExpectedEqual;
+            if (!std.mem.eql(u8, query_request.join.?.right_table, "customers")) return error.TestExpectedEqual;
+            return null;
+        }
+
+        fn preflightQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            query_request: metadata_openapi.QueryRequest,
+            _: u32,
+        ) !?db_mod.RuntimePreflightSummary {
+            if (query_request.join == null) return error.TestExpectedEqual;
+            return .{
+                .remote_shard_count = 1,
+                .shard_count = 2,
+                .shard_result_window = 64,
+                .shard_result_window_total = 64,
+                .positive_id_result_upper_bound = 12,
+                .structured_filter_doc_count_estimate = 8,
+                .stored_projection_doc_upper_bound_total = 12,
+            };
+        }
+
+        fn planJoinQueryRequest(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            query_request: metadata_openapi.QueryRequest,
+            runtime_preflight: db_mod.RuntimePreflightSummary,
+        ) !?query_builder_agent.QueryBuilderRuntimeJoinPlannerSummary {
+            if (query_request.join == null) return error.TestExpectedEqual;
+            try std.testing.expectEqual(@as(?u32, 8), runtime_preflight.result_doc_estimate);
+            return .{
+                .strategy = "index_lookup",
+                .estimated_cost = 8.0,
+                .estimated_rows = 8,
+                .estimated_memory_bytes = 1024,
+                .used_stats = true,
+                .shuffle_candidate = false,
+                .forced_broadcast_fallback = false,
+                .left_sample_row_count = 8,
+                .left_sample_source = "runtime_query",
+            };
+        }
+    };
+
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"require_executable":true}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena_impl.allocator(), .{
+        .table = "orders",
+        .intent = "orders with customers",
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .mode = "join",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .constraints = constraints_tree.value,
+    }, .{
+        .schema_fields = &.{ "customer_id", "amount", "status" },
+        .doc_count = 10_000,
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "customer_id", "amount", "status" } }},
+        .related_tables = &.{.{
+            .name = "customers",
+            .schema_fields = &.{ "id", "tier" },
+            .primary_key_fields = &.{"id"},
+            .doc_count = 250,
+            .shard_count = 1,
+            .key_selectivity_heuristic = "primary_key_unique",
+        }},
+        .runtime_query_request_validator = RuntimeValidator.iface(),
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("join", result.specialist.?);
+    try std.testing.expect(result.query_request != null);
+    try std.testing.expect(result.query_request.?.join != null);
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    try std.testing.expectEqual(@as(i64, 0), candidate_plans[0].object.get("preflight_error_count").?.integer);
+    try std.testing.expect(candidate_plans[0].object.get("runtime_preflight_estimated").?.bool);
+    try std.testing.expect(candidate_plans[0].object.get("join_runtime_validated").?.bool);
+    try std.testing.expectEqual(@as(i64, 4), candidate_plans[0].object.get("preflight_latency_heuristic_score").?.integer);
+    try std.testing.expectEqualStrings("medium", candidate_plans[0].object.get("preflight_latency_heuristic").?.string);
+    try std.testing.expectEqualStrings("index_lookup", candidate_plans[0].object.get("join_strategy_hint").?.string);
+    try std.testing.expectEqual(@as(i64, 10_000), candidate_plans[0].object.get("join_left_doc_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 250), candidate_plans[0].object.get("join_right_doc_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), candidate_plans[0].object.get("join_right_shard_count").?.integer);
+    try std.testing.expectEqualStrings("primary_key_unique", candidate_plans[0].object.get("join_right_key_selectivity").?.string);
+    try std.testing.expectEqualStrings("id", candidate_plans[0].object.get("join_right_key_field").?.string);
+    try std.testing.expect(candidate_plans[0].object.get("join_right_key_unique").?.bool);
+    try std.testing.expectEqual(@as(i64, 250), candidate_plans[0].object.get("join_right_key_estimated_distinct").?.integer);
+    switch (candidate_plans[0].object.get("join_right_key_avg_rows_per_key").?) {
+        .integer => |avg| try std.testing.expectEqual(@as(i64, 1), avg),
+        .float => |avg| try std.testing.expectEqual(@as(f64, 1.0), avg),
+        else => return error.UnexpectedJoinRightKeyAvgRowsPerKey,
+    }
+    try std.testing.expectEqualStrings("primary_key_metadata", candidate_plans[0].object.get("join_right_key_stats_source").?.string);
+    try std.testing.expectEqualStrings("high", candidate_plans[0].object.get("join_right_key_stats_confidence").?.string);
+    try std.testing.expectEqualStrings("not_co_located", candidate_plans[0].object.get("join_shard_colocation").?.string);
+    try std.testing.expectEqual(@as(i64, 8), candidate_plans[0].object.get("join_left_result_doc_estimate").?.integer);
+    try std.testing.expectEqual(@as(i64, 8), candidate_plans[0].object.get("join_left_result_doc_upper_bound").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), candidate_plans[0].object.get("join_runtime_shard_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), candidate_plans[0].object.get("join_runtime_remote_shard_count").?.integer);
+    try std.testing.expectEqualStrings("runtime_validated_remote", candidate_plans[0].object.get("join_runtime_feasibility").?.string);
+    try std.testing.expectEqualStrings("index_lookup", candidate_plans[0].object.get("join_planner_strategy").?.string);
+    switch (candidate_plans[0].object.get("join_planner_estimated_cost").?) {
+        .integer => |cost| try std.testing.expectEqual(@as(i64, 8), cost),
+        .float => |cost| try std.testing.expectEqual(@as(f64, 8.0), cost),
+        else => return error.UnexpectedJoinPlannerEstimatedCost,
+    }
+    try std.testing.expectEqual(@as(i64, 8), candidate_plans[0].object.get("join_planner_estimated_rows").?.integer);
+    try std.testing.expectEqual(@as(i64, 1024), candidate_plans[0].object.get("join_planner_estimated_memory_bytes").?.integer);
+    try std.testing.expect(candidate_plans[0].object.get("join_planner_used_stats").?.bool);
+    try std.testing.expect(!candidate_plans[0].object.get("join_planner_shuffle_candidate").?.bool);
+    try std.testing.expect(!candidate_plans[0].object.get("join_planner_forced_broadcast_fallback").?.bool);
+    try std.testing.expectEqual(@as(i64, 8), candidate_plans[0].object.get("join_planner_left_sample_row_count").?.integer);
+    try std.testing.expectEqualStrings("runtime_query", candidate_plans[0].object.get("join_planner_left_sample_source").?.string);
+    try std.testing.expectEqualStrings("small_right_index_lookup", candidate_plans[0].object.get("join_cardinality_heuristic").?.string);
+    try std.testing.expectEqualStrings("broadcast", candidate_plans[0].object.get("join_recommended_strategy").?.string);
+    const strategy_options = candidate_plans[0].object.get("join_strategy_options").?.array.items;
+    try std.testing.expectEqual(@as(usize, 3), strategy_options.len);
+    try std.testing.expectEqualStrings("index_lookup", strategy_options[0].object.get("strategy").?.string);
+    try std.testing.expect(strategy_options[0].object.get("feasible").?.bool);
+    try std.testing.expectEqualStrings("right_key_unique", strategy_options[0].object.get("feasibility").?.string);
+    try std.testing.expectEqualStrings("broadcast", strategy_options[1].object.get("strategy").?.string);
+    try std.testing.expect(strategy_options[1].object.get("recommended").?.bool);
+    try std.testing.expect(strategy_options[1].object.get("feasible").?.bool);
+    try std.testing.expectEqualStrings("right_side_broadcastable", strategy_options[1].object.get("feasibility").?.string);
+    try std.testing.expectEqualStrings("shuffle", strategy_options[2].object.get("strategy").?.string);
+    try std.testing.expect(!strategy_options[2].object.get("feasible").?.bool);
+    try std.testing.expectEqualStrings("single_shard_shuffle_unnecessary", strategy_options[2].object.get("feasibility").?.string);
+}
+
+test "api query builder recursive auto mode reports candidate budget truncation" {
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &.{.{ .name = "docs_text", .fields = &.{ "title", "body", "status" } }},
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, result.status.?);
+    try std.testing.expect(result.incomplete_details != null);
+    try std.testing.expectEqualStrings("max_subcalls", result.incomplete_details.?.reason);
+
+    const plan = result.plan.?;
+    try std.testing.expectEqualStrings("recursive", plan.object.get("execution_mode").?.string);
+    const recursive_plan = plan.object.get("recursive").?.object;
+    try std.testing.expectEqual(@as(i64, 1), recursive_plan.get("scheduled_candidate_count").?.integer);
+    try std.testing.expect(recursive_plan.get("candidate_mode_count").?.integer >= 2);
+    try std.testing.expect(recursive_plan.get("truncated_candidate_count").?.integer >= 1);
+    try std.testing.expect(recursive_plan.get("budget_limited").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), recursive_plan.get("scheduled_concurrency").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), recursive_plan.get("actual_concurrency").?.integer);
+
+    const decomposition = result.steps.?[0];
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_decomposition, decomposition.kind.?);
+    try std.testing.expect(decomposition.details.?.object.get("budget_limited").?.bool);
+    try std.testing.expectEqual(@as(i64, 1), decomposition.details.?.object.get("scheduled_candidate_count").?.integer);
+}
+
+test "api query builder recursive mode returns failed result when every candidate fails" {
+    const FakeQueryBuilderPlanValidator = struct {
+        fn iface() query_builder_agent.QueryBuilderPlanValidator {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .validate_query_request = validateQueryRequest },
+            };
+        }
+
+        fn validateQueryRequest(
+            _: *anyopaque,
+            alloc: std.mem.Allocator,
+            _: metadata_openapi.QueryBuilderRequest,
+            _: metadata_openapi.QueryRequest,
+            _: ?metadata_openapi.RetrievalQueryRequest,
+            _: []const u8,
+        ) !?[]const u8 {
+            return try alloc.dupe(u8, "query request validator rejected recursive candidate");
+        }
+    };
+
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{"require_executable":true}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "full_text",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .constraints = constraints_tree.value,
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .plan_validator = FakeQueryBuilderPlanValidator.iface(),
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.failed, result.status.?);
+    try std.testing.expect(result.incomplete_details == null);
+    try std.testing.expectEqualStrings("recursive", result.specialist.?);
+    try std.testing.expectEqual(@as(f64, 0), result.confidence.?);
+    try std.testing.expectEqualStrings("recursive", result.plan.?.object.get("execution_mode").?.string);
+    try std.testing.expect(result.plan.?.object.get("selected_candidate_id").? == .null);
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    try std.testing.expectEqualStrings("InvalidQueryBuilderRequest", candidate_plans[0].object.get("error").?.string);
+
+    const merge = result.steps.?[result.steps.?.len - 1];
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_merge, merge.kind.?);
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.@"error", merge.status.?);
+    try std.testing.expectEqualStrings("all_candidates_failed", merge.details.?.object.get("failure_reason").?.string);
+}
+
+test "api query builder recursive mode returns incomplete when candidate generation deadline expires" {
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) query_builder_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(timeout_ms > 0);
+            return error.DeadlineExceeded;
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            return try executeChainWithTimeoutMs(ptr, alloc, chain, messages, std.time.ms_per_s);
+        }
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const full_text_fields = [_][]const u8{ "title", "body" };
+    const full_text_metadata = [_]query_builder_agent.QueryBuilderFullTextIndex{.{
+        .name = "docs_text",
+        .fields = &full_text_fields,
+    }};
+    var fake_generation = FakeGeneration{};
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "full_text",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .max_wall_time_ms = 1000,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-generator",
+            .api_url = "http://127.0.0.1:8082",
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &full_text_metadata,
+    }, fake_generation.iface());
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, result.status.?);
+    try std.testing.expectEqualStrings("max_wall_time_ms", result.incomplete_details.?.reason);
+    try std.testing.expectEqualStrings("recursive", result.specialist.?);
+    try std.testing.expectEqual(@as(f64, 0), result.confidence.?);
+    try std.testing.expect(result.query.object.get("match_none") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
+
+    const plan = result.plan.?.object;
+    try std.testing.expect(plan.get("selected_candidate_id").? == .null);
+    try std.testing.expect(plan.get("recursive").?.object.get("wall_time_exhausted").?.bool);
+    const candidate_plans = plan.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    try std.testing.expectEqualStrings("DeadlineExceeded", candidate_plans[0].object.get("error").?.string);
+
+    const merge = result.steps.?[result.steps.?.len - 1];
+    try std.testing.expectEqual(metadata_openapi.AgentStepKind.recursive_merge, merge.kind.?);
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.@"error", merge.status.?);
+    try std.testing.expectEqualStrings("max_wall_time_ms", merge.details.?.object.get("failure_reason").?.string);
+}
+
+test "api query builder pipeline mode falls back when generated full-text candidate times out" {
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) query_builder_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .execute_chain = executeChain },
+            };
+        }
+
+        fn executeChain(ptr: *anyopaque, _: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            return error.DeadlineExceeded;
+        }
+    };
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const arena = arena_impl.allocator();
+    const full_text_fields = [_][]const u8{ "title", "body" };
+    const full_text_metadata = [_]query_builder_agent.QueryBuilderFullTextIndex{.{
+        .name = "docs_text",
+        .fields = &full_text_fields,
+    }};
+    var fake_generation = FakeGeneration{};
+
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena, .{
+        .table = "docs",
+        .intent = "find raft architecture",
+        .schema_fields = &.{ "title", "body", "status" },
+        .mode = "full_text",
+        .generator = .{
+            .provider = .antfly,
+            .model = "local-generator",
+            .api_url = "http://127.0.0.1:8082",
+        },
+    }, .{
+        .schema_fields = &.{ "title", "body", "status" },
+        .full_text_index_metadata = &full_text_metadata,
+    }, fake_generation.iface());
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    try std.testing.expectEqualStrings("full_text", result.specialist.?);
+    try std.testing.expect(result.query.object.get("match") != null);
+    try std.testing.expect(result.warnings != null);
+    try std.testing.expect(std.mem.indexOf(u8, result.warnings.?[0], "Generator-backed full-text query building failed") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
+}
+
+test "api query builder recursive join nonunique right key emits estimated key stats" {
+    var constraints_tree = try std.json.parseFromSlice(std.json.Value, std.testing.allocator,
+        \\{
+        \\  "join": {
+        \\    "right_table": "customers",
+        \\    "join_type": "inner",
+        \\    "on": {
+        \\      "left_field": "customer_tier",
+        \\      "right_field": "tier"
+        \\    }
+        \\  }
+        \\}
+    , .{});
+    defer constraints_tree.deinit();
+
+    var arena_impl = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_impl.deinit();
+    const result = try query_builder_agent.buildQueryBuilderResponseWithContext(arena_impl.allocator(), .{
+        .table = "orders",
+        .intent = "orders with customers by tier",
+        .schema_fields = &.{ "customer_tier", "amount", "status" },
+        .mode = "join",
+        .execution_mode = .recursive,
+        .recursive = .{
+            .max_depth = 1,
+            .max_subcalls = 1,
+            .max_concurrency = 1,
+            .split_policy = .by_query,
+            .merge_policy = .verify,
+        },
+        .constraints = constraints_tree.value,
+    }, .{
+        .schema_fields = &.{ "customer_tier", "amount", "status" },
+        .doc_count = 5_000,
+        .full_text_index_metadata = &.{.{ .name = "orders_text", .fields = &.{ "customer_tier", "amount", "status" } }},
+        .related_tables = &.{.{
+            .name = "customers",
+            .schema_fields = &.{ "tier", "region" },
+            .doc_count = 1_000,
+            .shard_count = 2,
+        }},
+    }, null);
+
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, result.status.?);
+    const candidate_plans = result.plan.?.object.get("candidate_plans").?.array.items;
+    try std.testing.expectEqual(@as(usize, 1), candidate_plans.len);
+    try std.testing.expectEqualStrings("tier", candidate_plans[0].object.get("join_right_key_field").?.string);
+    try std.testing.expect(!candidate_plans[0].object.get("join_right_key_unique").?.bool);
+    try std.testing.expectEqual(@as(i64, 100), candidate_plans[0].object.get("join_right_key_estimated_distinct").?.integer);
+    switch (candidate_plans[0].object.get("join_right_key_avg_rows_per_key").?) {
+        .integer => |avg| try std.testing.expectEqual(@as(i64, 10), avg),
+        .float => |avg| try std.testing.expectEqual(@as(f64, 10.0), avg),
+        else => return error.UnexpectedJoinRightKeyAvgRowsPerKey,
+    }
+    try std.testing.expectEqualStrings("schema_name_heuristic", candidate_plans[0].object.get("join_right_key_stats_source").?.string);
+    try std.testing.expectEqualStrings("low", candidate_plans[0].object.get("join_right_key_stats_confidence").?.string);
+    try std.testing.expectEqualStrings("medium_selectivity", candidate_plans[0].object.get("join_right_key_selectivity").?.string);
+    const strategy_options = candidate_plans[0].object.get("join_strategy_options").?.array.items;
+    try std.testing.expectEqualStrings("right_key_selectivity_estimated", strategy_options[0].object.get("feasibility").?.string);
+}
+
+test "api retrieval agent recursive mode maps child subcalls and merges" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                    .max_concurrent_chain_calls = maxConcurrentChainCalls,
+                },
+            };
+        }
+
+        fn maxConcurrentChainCalls(_: *anyopaque, _: []const generating.ChainLink) usize {
+            return 2;
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expectEqual(@as(usize, 1), chain.len);
+            try std.testing.expectEqualStrings("local-generator", chain[0].generator.model);
+
+            const prompt = messages[1].content.?.text;
+            const content = switch (self.calls) {
+                1 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "doc:a") != null);
+                    break :blk "child summary a cites doc:a";
+                },
+                2 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "doc:b") != null);
+                    break :blk "child summary b cites doc:b";
+                },
+                3 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "Child 1") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "child summary a cites doc:a") != null);
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "child summary b cites doc:b") != null);
+                    break :blk "merged recursive answer cites doc:a and doc:b";
+                },
+                else => return error.UnexpectedGenerationCall,
+            };
+
+            return .{
+                .content = try alloc.dupe(u8, content),
+                .allocator = alloc,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status);
+    try std.testing.expectEqualStrings("merged recursive answer cites doc:a and doc:b", parsed.value.generation.?);
+    try std.testing.expectEqualStrings("local-generator", parsed.value.model.?);
+    try std.testing.expectEqual(@as(usize, 3), fake_generation.calls);
+    try std.testing.expect(parsed.value.trace_artifact != null);
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.trace_artifact.?.final_status);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.trace_artifact.?.context_objects.len);
+    try std.testing.expectEqual(@as(usize, 2), parsed.value.trace_artifact.?.subcalls.len);
+    try std.testing.expectEqual(parsed.value.steps.?.len, parsed.value.trace_artifact.?.steps.len);
+    try std.testing.expectEqualStrings("doc:a", parsed.value.trace_artifact.?.context_objects[0].id);
+    try std.testing.expectEqualStrings("recursive_subcall_1", parsed.value.trace_artifact.?.subcalls[0].id);
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.success, parsed.value.trace_artifact.?.subcalls[0].status);
+    try std.testing.expectEqualStrings("fixed_tokenizer", parsed.value.trace_artifact.?.subcalls[0].token_count_method.?);
+
+    var saw_decomposition = false;
+    var subcall_count: usize = 0;
+    var saw_merge = false;
+    var saw_validation = false;
+    for (parsed.value.steps.?) |step| {
+        if (step.kind) |kind| switch (kind) {
+            .recursive_decomposition => {
+                saw_decomposition = true;
+                try std.testing.expectEqual(@as(i64, 1), step.details.?.object.get("scheduled_concurrency").?.integer);
+                try std.testing.expectEqual(@as(i64, 1), step.details.?.object.get("actual_concurrency").?.integer);
+            },
+            .recursive_subcall => {
+                subcall_count += 1;
+                try std.testing.expectEqualStrings("fixed_tokenizer", step.details.?.object.get("token_count_method").?.string);
+                try std.testing.expect(step.details.?.object.get("estimated_context_tokens").?.integer > 0);
+            },
+            .recursive_merge => saw_merge = true,
+            .validation => {
+                if (std.mem.eql(u8, step.name, "recursive_merge_verification")) {
+                    saw_validation = true;
+                    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.success, step.status.?);
+                    try std.testing.expect(step.details.?.object.get("passed").?.bool);
+                }
+            },
+            else => {},
+        };
+    }
+    try std.testing.expect(saw_decomposition);
+    try std.testing.expectEqual(@as(usize, 2), subcall_count);
+    try std.testing.expect(saw_merge);
+    try std.testing.expect(saw_validation);
+}
+
+test "api retrieval agent recursive mode executes child subcalls with configured concurrency" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.9,"_source":{"content":"beta body"}},{"_id":"doc:c","_score":0.8,"_source":{"content":"gamma body"}},{"_id":"doc:d","_score":0.7,"_source":{"content":"delta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: std.atomic.Value(usize) = .init(0),
+        active_children: std.atomic.Value(usize) = .init(0),
+        max_active_children: std.atomic.Value(usize) = .init(0),
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                    .max_concurrent_chain_calls = maxConcurrentChainCalls,
+                },
+            };
+        }
+
+        fn maxConcurrentChainCalls(_: *anyopaque, _: []const generating.ChainLink) usize {
+            return 2;
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = self.calls.fetchAdd(1, .seq_cst);
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child 1") != null;
+            if (!is_merge) {
+                const active = self.active_children.fetchAdd(1, .seq_cst) + 1;
+                updateMax(&self.max_active_children, active);
+                sleepMs(100);
+                _ = self.active_children.fetchSub(1, .seq_cst);
+            }
+            return .{
+                .content = try alloc.dupe(u8, if (is_merge) "concurrent merged answer" else "child summary"),
+                .allocator = alloc,
+            };
+        }
+
+        fn updateMax(max_active: *std.atomic.Value(usize), value: usize) void {
+            var observed = max_active.load(.monotonic);
+            while (value > observed) {
+                observed = max_active.cmpxchgWeak(observed, value, .monotonic, .monotonic) orelse break;
+            }
+        }
+
+        fn sleepMs(ms: u64) void {
+            var req: std.posix.timespec = .{
+                .sec = @intCast(ms / std.time.ms_per_s),
+                .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+            };
+            while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => return,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":4,"max_concurrency":2,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status);
+    try std.testing.expectEqualStrings("concurrent merged answer", parsed.value.generation.?);
+    try std.testing.expectEqual(@as(usize, 5), fake_generation.calls.load(.seq_cst));
+    try std.testing.expect(fake_generation.max_active_children.load(.seq_cst) >= 2);
+
+    const decomposition = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_decomposition) break step;
+    } else return error.MissingRecursiveDecompositionStep;
+    try std.testing.expectEqual(@as(i64, 2), decomposition.details.?.object.get("scheduled_concurrency").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), decomposition.details.?.object.get("actual_concurrency").?.integer);
+}
+
+test "api retrieval agent recursive verify merge fails when child citations are dropped" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const prompt = messages[1].content.?.text;
+            const content = switch (self.calls) {
+                1 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "doc:a") != null);
+                    break :blk "child summary cites doc:a";
+                },
+                2 => blk: {
+                    try std.testing.expect(std.mem.indexOf(u8, prompt, "doc:b") != null);
+                    break :blk "child summary cites doc:b";
+                },
+                3 => "merged answer drops citations",
+                else => return error.UnexpectedGenerationCall,
+            };
+            return .{
+                .content = try alloc.dupe(u8, content),
+                .allocator = alloc,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.failed, parsed.value.status);
+    try std.testing.expectEqualStrings("merged answer drops citations", parsed.value.generation.?);
+    try std.testing.expectEqual(@as(usize, 3), fake_generation.calls);
+
+    const verification = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .validation and std.mem.eql(u8, step.name, "recursive_merge_verification")) break step;
+    } else return error.MissingRecursiveMergeVerificationStep;
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.@"error", verification.status.?);
+    try std.testing.expect(!verification.details.?.object.get("passed").?.bool);
+    try std.testing.expectEqual(@as(usize, 2), verification.details.?.object.get("missing_context_ids").?.array.items.len);
+
+    const merge = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_merge) break step;
+    } else return error.MissingRecursiveMergeStep;
+    try std.testing.expectEqual(@as(i64, 2), merge.details.?.object.get("missing_verified_context_count").?.integer);
+    try std.testing.expect(!merge.details.?.object.get("verified").?.bool);
+}
+
+test "api retrieval agent recursive mode reports incomplete when max_subcalls truncates context" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body"}},{"_id":"doc:c","_score":0.7,"_source":{"content":"gamma body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, _: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const content = if (self.calls == 3) "partial merged answer" else "child summary";
+            return .{
+                .content = try alloc.dupe(u8, content),
+                .allocator = alloc,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, parsed.value.status);
+    try std.testing.expect(parsed.value.incomplete_details != null);
+    try std.testing.expectEqualStrings("max_subcalls", parsed.value.incomplete_details.?.reason);
+    try std.testing.expectEqualStrings("partial merged answer", parsed.value.generation.?);
+    try std.testing.expectEqual(@as(usize, 3), fake_generation.calls);
+
+    const decomposition = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_decomposition) break step;
+    } else return error.MissingRecursiveDecompositionStep;
+    try std.testing.expectEqual(@as(i64, 3), decomposition.details.?.object.get("hit_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 2), decomposition.details.?.object.get("child_frame_count").?.integer);
+    try std.testing.expectEqual(@as(i64, 1), decomposition.details.?.object.get("truncated_context_count").?.integer);
+    try std.testing.expect(decomposition.details.?.object.get("budget_limited").?.bool);
+}
+
+test "api retrieval agent recursive mode skips children over context token budget" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body has several words"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body also has several words"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(std.mem.indexOf(u8, messages[1].content.?.text, "No child summaries were produced") != null);
+            return .{
+                .content = try alloc.dupe(u8, "incomplete answer without child context"),
+                .allocator = alloc,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"max_child_context_tokens":1,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, parsed.value.status);
+    try std.testing.expect(parsed.value.incomplete_details != null);
+    try std.testing.expectEqualStrings("max_child_context_tokens", parsed.value.incomplete_details.?.reason);
+    try std.testing.expectEqualStrings("incomplete answer without child context", parsed.value.generation.?);
+    try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
+
+    var skipped_subcalls: usize = 0;
+    var decomposition_actual_concurrency: ?i64 = null;
+    var merge_skipped_count: ?i64 = null;
+    for (parsed.value.steps.?) |step| {
+        if (step.kind) |kind| switch (kind) {
+            .recursive_decomposition => {
+                decomposition_actual_concurrency = step.details.?.object.get("actual_concurrency").?.integer;
+            },
+            .recursive_subcall => {
+                if (step.status != null and step.status.? == .skipped) {
+                    skipped_subcalls += 1;
+                    try std.testing.expectEqualStrings("max_child_context_tokens", step.details.?.object.get("skip_reason").?.string);
+                    try std.testing.expectEqualStrings("fixed_tokenizer", step.details.?.object.get("token_count_method").?.string);
+                    try std.testing.expect(step.details.?.object.get("estimated_context_tokens").?.integer > 1);
+                }
+            },
+            .recursive_merge => merge_skipped_count = step.details.?.object.get("skipped_child_count").?.integer,
+            else => {},
+        };
+    }
+    try std.testing.expectEqual(@as(i64, 0), decomposition_actual_concurrency.?);
+    try std.testing.expectEqual(@as(usize, 2), skipped_subcalls);
+    try std.testing.expectEqual(@as(i64, 2), merge_skipped_count.?);
+}
+
+test "api retrieval agent recursive mode stops scheduling after wall time budget" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body"}},{"_id":"doc:c","_score":0.7,"_source":{"content":"gamma body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            try std.testing.expect(timeout_ms > 0);
+            return try executeChain(ptr, alloc, chain, messages);
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            if (!is_merge) sleepMs(1200);
+            return .{
+                .content = try alloc.dupe(u8, if (is_merge) "wall-time bounded answer" else "slow child summary"),
+                .allocator = alloc,
+            };
+        }
+
+        fn sleepMs(ms: u64) void {
+            var req: std.posix.timespec = .{
+                .sec = @intCast(ms / std.time.ms_per_s),
+                .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+            };
+            while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => return,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":3,"max_concurrency":1,"max_wall_time_ms":1000,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, parsed.value.status);
+    try std.testing.expect(parsed.value.incomplete_details != null);
+    try std.testing.expectEqualStrings("max_wall_time_ms", parsed.value.incomplete_details.?.reason);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.value.generation.?, "Recursive execution stopped before merge: max_wall_time_ms"));
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.generation.?, "slow child summary") != null);
+    try std.testing.expectEqual(@as(usize, 1), fake_generation.calls);
+
+    var subcall_count: usize = 0;
+    var decomposition_actual_concurrency: ?i64 = null;
+    const merge = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_decomposition) {
+            decomposition_actual_concurrency = step.details.?.object.get("actual_concurrency").?.integer;
+        }
+        if (step.kind != null and step.kind.? == .recursive_subcall) subcall_count += 1;
+        if (step.kind != null and step.kind.? == .recursive_merge) break step;
+    } else return error.MissingRecursiveMergeStep;
+    try std.testing.expectEqual(@as(i64, 1), decomposition_actual_concurrency.?);
+    try std.testing.expectEqual(@as(usize, 3), subcall_count);
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.skipped, merge.status.?);
+    try std.testing.expectEqual(@as(i64, 2), merge.details.?.object.get("skipped_child_count").?.integer);
+    try std.testing.expect(merge.details.?.object.get("wall_time_exhausted").?.bool);
+    try std.testing.expect(merge.details.?.object.get("elapsed_ms").?.integer >= 1);
+}
+
+test "api retrieval agent recursive mode returns incomplete when merge deadline expires" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(timeout_ms > 0);
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            if (is_merge) return error.DeadlineExceeded;
+            return .{
+                .content = try alloc.dupe(u8, "child summary before merge timeout"),
+                .allocator = alloc,
+            };
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            return try executeChainWithTimeoutMs(ptr, alloc, chain, messages, std.time.ms_per_s);
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":1,"max_concurrency":1,"max_wall_time_ms":1000,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.incomplete, parsed.value.status);
+    try std.testing.expectEqualStrings("max_wall_time_ms", parsed.value.incomplete_details.?.reason);
+    try std.testing.expect(std.mem.startsWith(u8, parsed.value.generation.?, "Recursive execution stopped before merge: max_wall_time_ms"));
+    try std.testing.expect(std.mem.indexOf(u8, parsed.value.generation.?, "child summary before merge timeout") != null);
+    try std.testing.expectEqual(@as(usize, 2), fake_generation.calls);
+
+    const merge = for (parsed.value.steps.?) |step| {
+        if (step.kind != null and step.kind.? == .recursive_merge) break step;
+    } else return error.MissingRecursiveMergeStep;
+    try std.testing.expectEqual(metadata_openapi.AgentStepStatus.skipped, merge.status.?);
+    try std.testing.expect(merge.details.?.object.get("wall_time_exhausted").?.bool);
+}
+
+test "api retrieval agent recursive mode refreshes serial child timeout at launch" {
+    const FakeRunner = struct {
+        fn iface() retrieval_agent.QueryRunner {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{ .run_query = runQuery },
+            };
+        }
+
+        fn runQuery(_: *anyopaque, alloc: std.mem.Allocator, table_name: []const u8, _: []const u8) !QueryResponse {
+            try std.testing.expectEqualStrings("docs", table_name);
+            return .{
+                .json = try alloc.dupe(u8,
+                    \\{"responses":[{"status":200,"took":1,"hits":{"hits":[{"_id":"doc:a","_score":1.0,"_source":{"content":"alpha body"}},{"_id":"doc:b","_score":0.8,"_source":{"content":"beta body"}}]}}]}
+                ),
+            };
+        }
+    };
+
+    const FakeGeneration = struct {
+        calls: usize = 0,
+        child_calls: usize = 0,
+        first_child_timeout_ms: u64 = 0,
+
+        fn iface(self: *@This()) retrieval_agent.GenerationRunner {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .execute_chain = executeChain,
+                    .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                },
+            };
+        }
+
+        fn executeChainWithTimeoutMs(ptr: *anyopaque, alloc: std.mem.Allocator, _: []const generating.ChainLink, messages: []const generating.ChatMessage, timeout_ms: u64) !generating.GenerateResult {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            try std.testing.expect(timeout_ms > 0);
+            const is_merge = std.mem.indexOf(u8, messages[1].content.?.text, "Child outputs:") != null;
+            if (is_merge) {
+                return .{
+                    .content = try alloc.dupe(u8, "fresh-timeout merged answer"),
+                    .allocator = alloc,
+                };
+            }
+
+            self.child_calls += 1;
+            if (self.child_calls == 1) {
+                self.first_child_timeout_ms = timeout_ms;
+                sleepMs(150);
+            } else if (self.child_calls == 2) {
+                try std.testing.expect(timeout_ms < self.first_child_timeout_ms);
+            } else {
+                return error.UnexpectedGenerationCall;
+            }
+
+            return .{
+                .content = try alloc.dupe(u8, if (self.child_calls == 1) "first child summary" else "second child summary"),
+                .allocator = alloc,
+            };
+        }
+
+        fn executeChain(ptr: *anyopaque, alloc: std.mem.Allocator, chain: []const generating.ChainLink, messages: []const generating.ChatMessage) !generating.GenerateResult {
+            return try executeChainWithTimeoutMs(ptr, alloc, chain, messages, std.time.ms_per_s);
+        }
+
+        fn sleepMs(ms: u64) void {
+            var req: std.posix.timespec = .{
+                .sec = @intCast(ms / std.time.ms_per_s),
+                .nsec = @intCast((ms % std.time.ms_per_s) * std.time.ns_per_ms),
+            };
+            while (true) switch (std.posix.errno(std.posix.system.nanosleep(&req, &req))) {
+                .SUCCESS => return,
+                .INTR => continue,
+                else => return,
+            };
+        }
+    };
+
+    var fake_generation = FakeGeneration{};
+    const body =
+        \\{"query":"find alpha","stream":false,"execution_mode":"recursive","recursive":{"max_depth":1,"max_subcalls":2,"max_concurrency":1,"max_wall_time_ms":1000,"split_policy":"by_document","merge_policy":"verify","child_tool_policy":"inherit_narrowed","allowed_context_object_types":["document"]},"generator":{"provider":"antfly","model":"local-generator","api_url":"http://127.0.0.1:8082"},"steps":{"generation":{"enabled":true}},"queries":[{"table":"docs","semantic_search":"alpha concept","indexes":["semantic_idx"],"limit":5}]}
+    ;
+    const encoded = try retrieval_agent.executeJson(std.testing.allocator, FakeRunner.iface(), fake_generation.iface(), body);
+    defer std.testing.allocator.free(encoded);
+
+    var parsed = try std.json.parseFromSlice(metadata_openapi.RetrievalAgentResult, std.testing.allocator, encoded, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqual(metadata_openapi.AgentStatus.completed, parsed.value.status);
+    try std.testing.expectEqualStrings("fresh-timeout merged answer", parsed.value.generation.?);
+    try std.testing.expectEqual(@as(usize, 3), fake_generation.calls);
+    try std.testing.expectEqual(@as(usize, 2), fake_generation.child_calls);
+}
+
 test "artifact enrichment request permits asset full text routing" {
     const config_json = try table_contract.parseArtifactEnrichmentRequest(
         std.testing.allocator,
@@ -286,8 +1860,6 @@ test "public graph result_ref fail-closed guards are covered" {
 }
 
 test "api table reads reject distributed resolved doc filters" {
-    const db_mod = @import("../storage/db/mod.zig");
-
     var sentinel: u8 = 0;
     var req: db_mod.types.SearchRequest = .{
         .resolved_doc_filter = &sentinel,

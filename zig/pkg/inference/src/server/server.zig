@@ -642,7 +642,30 @@ pub const Node = struct {
             };
         }
 
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, null);
+    }
+
+    pub fn generateTextDirectWithDeadlineNs(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        roles: []const []const u8,
+        contents: []const []const u8,
+        deadline_ns: u64,
+    ) ![]u8 {
+        if (roles.len != contents.len) return error.InvalidGenerationRequest;
+        if (roles.len == 0) return error.InvalidGenerationRequest;
+
+        var messages = try allocator.alloc(generation.Message, roles.len);
+        defer allocator.free(messages);
+        for (roles, contents, 0..) |role, content, i| {
+            messages[i] = .{
+                .role = role,
+                .content = content,
+            };
+        }
+
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, deadline_ns, null);
     }
 
     pub fn generateMessagesDirect(
@@ -651,7 +674,17 @@ pub const Node = struct {
         model_name: []const u8,
         messages: []const generation.Message,
     ) ![]u8 {
-        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null);
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, null, null);
+    }
+
+    pub fn generateMessagesDirectWithDeadlineNs(
+        self: *Node,
+        allocator: std.mem.Allocator,
+        model_name: []const u8,
+        messages: []const generation.Message,
+        deadline_ns: u64,
+    ) ![]u8 {
+        return self.generateMessagesDirectMaxTokens(allocator, model_name, messages, 256, null, deadline_ns, null);
     }
 
     const DirectGenerateTiming = struct {
@@ -696,9 +729,13 @@ pub const Node = struct {
         messages: []const generation.Message,
         max_tokens: i32,
         preferred_backends: ?[]const backends_mod.BackendType,
+        deadline_ns: ?u64,
         timing: ?*DirectGenerateTiming,
     ) ![]u8 {
         if (messages.len == 0) return error.InvalidGenerationRequest;
+        if (deadline_ns) |deadline| {
+            if (generation.generationDeadlineExpired(deadline)) return error.DeadlineExceeded;
+        }
         const started_at_ns = embedTimingNowNs();
 
         const queue_units = self.estimateGenerateQueueUnits(messages, max_tokens);
@@ -718,6 +755,9 @@ pub const Node = struct {
         else
             try self.model_manager.loadFromDir(model_path);
         const loaded_at_ns = embedTimingNowNs();
+        if (deadline_ns) |deadline| {
+            if (generation.generationDeadlineExpired(deadline)) return error.DeadlineExceeded;
+        }
         model.lockNativeGeneration();
         defer model.unlockNativeGeneration();
         const gpt_config = session_factory.getGptConfig(model.session) orelse return error.UnsupportedGeneratorProvider;
@@ -817,7 +857,11 @@ pub const Node = struct {
         const debug_metal_timing = timing != null and use_metal_whole_model and platform.env.getenvBool("TERMITE_DEBUG_METAL_TIMING");
         if (debug_metal_timing) graph_mod.metal_executor.resetTimingStats();
         const setup_at_ns = embedTimingNowNs();
-        var result = try pipeline.generate(messages, .{ .max_tokens = max_tokens, .prefill_chunk_size = 256 });
+        var result = try pipeline.generate(messages, .{
+            .max_tokens = max_tokens,
+            .prefill_chunk_size = 256,
+            .deadline_ns = deadline_ns,
+        });
         const generated_at_ns = embedTimingNowNs();
         defer result.deinit();
         if (debug_metal_timing) {
@@ -868,7 +912,7 @@ pub const Node = struct {
             .content = "ping",
         }};
         var timing = DirectGenerateTiming{};
-        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, &timing);
+        const text = try self.generateMessagesDirectMaxTokens(allocator, model_name, &messages, 1, preferred_backends, null, &timing);
         defer allocator.free(text);
         const elapsed_ms = elapsedMs(started_at_ns, embedTimingNowNs());
         std.log.info(

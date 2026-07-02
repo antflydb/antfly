@@ -130,6 +130,13 @@ const QueryBuilderIndexContext = struct {
     graph_index_metadata: []const query_builder_agent.QueryBuilderGraphIndex = &.{},
 };
 
+const QueryBuilderSchemaContext = struct {
+    schema_fields: []const []const u8 = &.{},
+    field_metadata: []const query_builder_agent.QueryBuilderFieldMetadata = &.{},
+};
+
+const join_planner_left_sample_limit = 32;
+
 pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
     server: *ApiHttpServer,
     source: table_reads.TableReadSource,
@@ -141,6 +148,7 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             .vtable = &.{
                 .validate_query_request = validateQueryRequest,
                 .preflight_query_request = preflightQueryRequest,
+                .plan_join_query_request = planJoinQueryRequest,
             },
         };
     }
@@ -151,19 +159,12 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         query_request: metadata_openapi.QueryRequest,
     ) !?[]const u8 {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        var semantic_resolver = SemanticStatusResolver{
-            .source = self.server.source,
-            .antfly_provider = self.server.antfly_provider,
-            .remote_content = self.server.cfg.remote_content,
-            .inference_api_url = self.server.configuredInferenceAPIURL(),
-            .inference_api_key = self.server.cfg.inference_api_key,
-        };
-        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
-        defer alloc.free(encoded);
-        var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
-            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return try std.fmt.allocPrint(alloc, "query_request failed runtime parse: {s}", .{@errorName(err)}),
-            else => return err,
-        };
+        if (query_request.join != null) {
+            if (try self.validateSupportedJoinRequest(alloc, query_request)) |feedback| return feedback;
+            return null;
+        }
+
+        var parsed = try self.parseRuntimeQueryRequest(alloc, query_request);
         defer parsed.deinit(alloc);
 
         var summary = (try self.source.preflightQuery(alloc, self.table_name, parsed.req, .read_index, 0)) orelse return null;
@@ -181,22 +182,27 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
         return try runtimePreflightQueryRequest(self, alloc, query_request, max_work);
     }
 
+    fn planJoinQueryRequest(
+        ptr: *anyopaque,
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        runtime_preflight: db_mod.RuntimePreflightSummary,
+    ) !?query_builder_agent.QueryBuilderRuntimeJoinPlannerSummary {
+        const self: *@This() = @ptrCast(@alignCast(ptr));
+        return try self.planSupportedJoinQueryRequest(alloc, query_request, runtime_preflight);
+    }
+
     fn runtimePreflightQueryRequest(
         self: *@This(),
         alloc: std.mem.Allocator,
         query_request: metadata_openapi.QueryRequest,
         max_work: u32,
     ) !?db_mod.RuntimePreflightSummary {
-        var semantic_resolver = SemanticStatusResolver{
-            .source = self.server.source,
-            .antfly_provider = self.server.antfly_provider,
-            .remote_content = self.server.cfg.remote_content,
-            .inference_api_url = self.server.configuredInferenceAPIURL(),
-            .inference_api_key = self.server.cfg.inference_api_key,
-        };
-        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
-        defer alloc.free(encoded);
-        var parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
+        if (query_request.join != null) {
+            return try self.preflightSupportedJoinRequest(alloc, query_request, max_work);
+        }
+
+        var parsed = self.parseRuntimeQueryRequest(alloc, query_request) catch |err| switch (err) {
             error.InvalidQueryRequest, error.UnsupportedQueryRequest => return null,
             else => return err,
         };
@@ -207,7 +213,376 @@ pub const QueryBuilderRuntimeQueryRequestValidatorContext = struct {
             else => return err,
         };
     }
+
+    fn parseRuntimeQueryRequest(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+    ) !query_contract.OwnedQueryRequest {
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.server.source,
+            .antfly_provider = self.server.antfly_provider,
+            .remote_content = self.server.cfg.remote_content,
+            .inference_api_url = self.server.configuredInferenceAPIURL(),
+            .inference_api_key = self.server.cfg.inference_api_key,
+        };
+        const encoded = try std.json.Stringify.valueAlloc(alloc, query_request, .{});
+        defer alloc.free(encoded);
+        return query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, encoded) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            else => return err,
+        };
+    }
+
+    fn validateSupportedJoinRequest(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+    ) !?[]const u8 {
+        var summary = self.preflightSupportedJoinRequestStrict(alloc, query_request, 0) catch |err| switch (err) {
+            error.InvalidQueryRequest => return try alloc.dupe(u8, "query_request.join failed runtime validation for the supported join executor"),
+            error.UnsupportedQueryRequest => return try alloc.dupe(u8, "query_request.join is not supported by the runtime join executor"),
+            else => return err,
+        };
+        summary.deinit(alloc);
+        return null;
+    }
+
+    fn preflightSupportedJoinRequest(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        max_work: u32,
+    ) !?db_mod.RuntimePreflightSummary {
+        return try self.preflightSupportedJoinRequestOptional(alloc, query_request, max_work);
+    }
+
+    fn preflightSupportedJoinRequestOptional(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        max_work: u32,
+    ) !?db_mod.RuntimePreflightSummary {
+        const join_clause = query_request.join orelse return null;
+        var join = distributed_join.supportedJoinRequestFromOpenApi(alloc, join_clause) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return null,
+            else => return err,
+        };
+        defer distributed_join.freeSupportedJoinRequest(alloc, &join);
+
+        const base_rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, query_request, join.left_field);
+        defer alloc.free(base_rewrite.body);
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.server.source,
+            .antfly_provider = self.server.antfly_provider,
+            .remote_content = self.server.cfg.remote_content,
+            .inference_api_url = self.server.configuredInferenceAPIURL(),
+            .inference_api_key = self.server.cfg.inference_api_key,
+        };
+        var left_parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, base_rewrite.body) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return null,
+            else => return err,
+        };
+        defer left_parsed.deinit(alloc);
+
+        var left_summary = (self.source.preflightQuery(alloc, self.table_name, left_parsed.req, .read_index, max_work) catch |err| switch (err) {
+            error.InvalidArgument, error.IndexNotFound => return null,
+            else => return err,
+        }) orelse return null;
+        errdefer left_summary.deinit(alloc);
+
+        var right_summary = (self.source.preflightQuery(alloc, join.right_table, .{ .limit = 1 }, .read_index, max_work) catch |err| switch (err) {
+            error.InvalidArgument, error.IndexNotFound, error.TableNotFound => {
+                left_summary.deinit(alloc);
+                return null;
+            },
+            else => return err,
+        }) orelse {
+            left_summary.deinit(alloc);
+            return null;
+        };
+        defer right_summary.deinit(alloc);
+        foldJoinRuntimePreflightWork(&left_summary, right_summary);
+        return left_summary;
+    }
+
+    fn preflightSupportedJoinRequestStrict(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        max_work: u32,
+    ) !db_mod.RuntimePreflightSummary {
+        const join_clause = query_request.join orelse return error.InvalidQueryRequest;
+        var join = try distributed_join.supportedJoinRequestFromOpenApi(alloc, join_clause);
+        defer distributed_join.freeSupportedJoinRequest(alloc, &join);
+
+        const base_rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, query_request, join.left_field);
+        defer alloc.free(base_rewrite.body);
+        var semantic_resolver = SemanticStatusResolver{
+            .source = self.server.source,
+            .antfly_provider = self.server.antfly_provider,
+            .remote_content = self.server.cfg.remote_content,
+            .inference_api_url = self.server.configuredInferenceAPIURL(),
+            .inference_api_key = self.server.cfg.inference_api_key,
+        };
+        var left_parsed = query_api.parsePublicQueryRequest(alloc, semantic_resolver.iface(), self.table_name, base_rewrite.body) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return error.InvalidQueryRequest,
+            else => return err,
+        };
+        defer left_parsed.deinit(alloc);
+
+        var left_summary = (self.source.preflightQuery(alloc, self.table_name, left_parsed.req, .read_index, max_work) catch |err| switch (err) {
+            error.InvalidArgument, error.IndexNotFound => return error.InvalidQueryRequest,
+            else => return err,
+        }) orelse return error.UnsupportedQueryRequest;
+        errdefer left_summary.deinit(alloc);
+
+        var right_summary = (self.source.preflightQuery(alloc, join.right_table, .{ .limit = 1 }, .read_index, max_work) catch |err| switch (err) {
+            error.InvalidArgument, error.IndexNotFound, error.TableNotFound => return error.UnsupportedQueryRequest,
+            else => return err,
+        }) orelse return error.UnsupportedQueryRequest;
+        defer right_summary.deinit(alloc);
+        foldJoinRuntimePreflightWork(&left_summary, right_summary);
+        return left_summary;
+    }
+
+    fn planSupportedJoinQueryRequest(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        runtime_preflight: db_mod.RuntimePreflightSummary,
+    ) !?query_builder_agent.QueryBuilderRuntimeJoinPlannerSummary {
+        const join_clause = query_request.join orelse return null;
+        var join = distributed_join.supportedJoinRequestFromOpenApi(alloc, join_clause) catch |err| switch (err) {
+            error.InvalidQueryRequest, error.UnsupportedQueryRequest => return null,
+            else => return err,
+        };
+        defer distributed_join.freeSupportedJoinRequest(alloc, &join);
+
+        var planner_hits = (try self.sampledJoinPlannerHits(alloc, query_request, join)) orelse
+            try syntheticJoinPlannerHits(alloc, join.left_field, runtime_preflight);
+        defer planner_hits.deinit(alloc);
+
+        const plan = try distributed_join.planSupportedJoinExecution(
+            self.server.joinContext(),
+            alloc,
+            self.table_name,
+            join,
+            planner_hits.hits,
+            .{},
+        );
+        return .{
+            .strategy = distributedJoinStrategyName(plan.strategy),
+            .estimated_cost = plan.estimated_cost,
+            .estimated_rows = plan.estimated_rows,
+            .estimated_memory_bytes = plan.estimated_memory_bytes,
+            .used_stats = plan.used_stats,
+            .shuffle_candidate = plan.shuffle_candidate,
+            .forced_broadcast_fallback = plan.forced_broadcast_fallback,
+            .left_sample_row_count = @intCast(planner_hits.hits.len),
+            .left_sample_source = planner_hits.source,
+        };
+    }
+
+    fn sampledJoinPlannerHits(
+        self: *@This(),
+        alloc: std.mem.Allocator,
+        query_request: metadata_openapi.QueryRequest,
+        join: distributed_join.SupportedJoinRequest,
+    ) !?OwnedJoinPlannerHits {
+        var sample_request = query_request;
+        sample_request.limit = join_planner_left_sample_limit;
+        sample_request.count = false;
+        const base_rewrite = try distributed_join.rewriteJoinedBaseQueryBodyAlloc(alloc, sample_request, join.left_field);
+        defer alloc.free(base_rewrite.body);
+
+        var result = self.server.joinContext().executePlainQuery(alloc, self.source, self.table_name, base_rewrite.body, null) catch |err| switch (err) {
+            error.OutOfMemory => return err,
+            else => return null,
+        };
+        defer result.deinit(alloc);
+
+        var root = parseOwnedJsonValueAlloc(alloc, result.json) catch return null;
+        errdefer ApiHttpServer.deinitJsonValue(alloc, &root);
+        const hits_ptr = distributed_join.queryHitsArrayPtr(&root) catch {
+            ApiHttpServer.deinitJsonValue(alloc, &root);
+            return null;
+        };
+        if (hits_ptr.items.len == 0) {
+            ApiHttpServer.deinitJsonValue(alloc, &root);
+            return null;
+        }
+
+        return .{
+            .hits = hits_ptr.items,
+            .owned_response = root,
+            .source = "runtime_query",
+        };
+    }
 };
+
+const OwnedJoinPlannerHits = struct {
+    hits: []std.json.Value,
+    owned_response: ?std.json.Value = null,
+    synthetic_hits: []std.json.Value = &.{},
+    source: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.owned_response) |*root| {
+            ApiHttpServer.deinitJsonValue(alloc, root);
+        }
+        if (self.synthetic_hits.len > 0) freeSyntheticJoinPlannerHits(alloc, self.synthetic_hits);
+        self.* = undefined;
+    }
+};
+
+fn syntheticJoinPlannerHits(
+    alloc: std.mem.Allocator,
+    left_field: []const u8,
+    runtime_preflight: db_mod.RuntimePreflightSummary,
+) !OwnedJoinPlannerHits {
+    const estimate = runtime_preflight.result_doc_estimate orelse runtime_preflight.result_doc_upper_bound orelse runtime_preflight.shard_result_window;
+    const count: usize = @intCast(@max(@as(u32, 1), @min(@as(u32, 128), estimate)));
+    const hits = try alloc.alloc(std.json.Value, count);
+    var initialized: usize = 0;
+    errdefer {
+        for (hits[0..initialized]) |*hit| deinitSyntheticJoinPlannerHit(alloc, hit);
+        alloc.free(hits);
+    }
+    for (hits, 0..) |*hit, i| {
+        var source = std.json.ObjectMap.empty;
+        errdefer source.deinit(alloc);
+        const field_key = try alloc.dupe(u8, left_field);
+        errdefer alloc.free(field_key);
+        const field_value = try std.fmt.allocPrint(alloc, "join-key-{d}", .{i});
+        errdefer alloc.free(field_value);
+        try source.put(alloc, field_key, .{ .string = field_value });
+        var object = std.json.ObjectMap.empty;
+        errdefer object.deinit(alloc);
+        const source_key = try alloc.dupe(u8, "_source");
+        errdefer alloc.free(source_key);
+        try object.put(alloc, source_key, .{ .object = source });
+        hit.* = .{ .object = object };
+        initialized += 1;
+    }
+    return .{
+        .hits = hits,
+        .synthetic_hits = hits,
+        .source = "synthetic_preflight",
+    };
+}
+
+fn freeSyntheticJoinPlannerHits(alloc: std.mem.Allocator, hits: []std.json.Value) void {
+    for (hits) |*hit| deinitSyntheticJoinPlannerHit(alloc, hit);
+    if (hits.len > 0) alloc.free(hits);
+}
+
+fn deinitSyntheticJoinPlannerHit(alloc: std.mem.Allocator, hit: *std.json.Value) void {
+    if (hit.* != .object) return;
+    var it = hit.object.iterator();
+    while (it.next()) |entry| {
+        alloc.free(entry.key_ptr.*);
+        if (entry.value_ptr.* == .object) {
+            var inner = entry.value_ptr.object.iterator();
+            while (inner.next()) |inner_entry| {
+                alloc.free(inner_entry.key_ptr.*);
+                if (inner_entry.value_ptr.* == .string) alloc.free(@constCast(inner_entry.value_ptr.string));
+            }
+            entry.value_ptr.object.deinit(alloc);
+        }
+    }
+    hit.object.deinit(alloc);
+}
+
+fn distributedJoinStrategyName(strategy: distributed_join.RightJoinQueryResult.StrategyUsed) []const u8 {
+    return switch (strategy) {
+        .index_lookup => "index_lookup",
+        .broadcast => "broadcast",
+        .shuffle => "shuffle",
+    };
+}
+
+fn foldJoinRuntimePreflightWork(left: *db_mod.RuntimePreflightSummary, right: db_mod.RuntimePreflightSummary) void {
+    left.doc_id_value_count +|= right.doc_id_value_count;
+    left.filter_id_count +|= right.filter_id_count;
+    left.exclude_id_count +|= right.exclude_id_count;
+    left.numeric_range_clause_count +|= right.numeric_range_clause_count;
+    left.term_range_clause_count +|= right.term_range_clause_count;
+    left.ip_range_clause_count +|= right.ip_range_clause_count;
+    left.bool_field_clause_count +|= right.bool_field_clause_count;
+    left.geo_filter_clause_count +|= right.geo_filter_clause_count;
+    left.structured_filter_count_sample_size +|= right.structured_filter_count_sample_size;
+    left.structured_filter_count_budget_limit = addOptionalU64(left.structured_filter_count_budget_limit, right.structured_filter_count_budget_limit);
+    left.shard_result_window = @max(left.shard_result_window, right.shard_result_window);
+    left.shard_result_window_total +|= right.shard_result_window_total;
+    left.stored_projection_doc_upper_bound_total +|= right.stored_projection_doc_upper_bound_total;
+    left.rerank_doc_upper_bound +|= right.rerank_doc_upper_bound;
+    left.aggregation_may_scan_full_results = left.aggregation_may_scan_full_results or right.aggregation_may_scan_full_results;
+    left.aggregation_second_pass_doc_estimate = addOptionalU32(left.aggregation_second_pass_doc_estimate, right.aggregation_second_pass_doc_estimate);
+    left.aggregation_second_pass_doc_upper_bound = addOptionalU32(left.aggregation_second_pass_doc_upper_bound, right.aggregation_second_pass_doc_upper_bound);
+    left.shard_count +|= right.shard_count;
+    left.remote_shard_count +|= right.remote_shard_count;
+    left.dense_query_count +|= right.dense_query_count;
+    left.vector_worker_candidate_count +|= right.vector_worker_candidate_count;
+    left.vector_worker_fallback_count +|= right.vector_worker_fallback_count;
+    left.vector_worker_filter_constraint_count +|= right.vector_worker_filter_constraint_count;
+    left.vector_worker_requires_algebraic_filter_resolution = left.vector_worker_requires_algebraic_filter_resolution or right.vector_worker_requires_algebraic_filter_resolution;
+    left.dense_effective_k_total +|= right.dense_effective_k_total;
+    left.dense_search_width_total +|= right.dense_search_width_total;
+    left.dense_search_width_max = @max(left.dense_search_width_max, right.dense_search_width_max);
+    left.dense_epsilon_max = @max(left.dense_epsilon_max, right.dense_epsilon_max);
+}
+
+fn addOptionalU32(left: ?u32, right: ?u32) ?u32 {
+    if (left == null) return right;
+    if (right == null) return left;
+    return left.? +| right.?;
+}
+
+fn addOptionalU64(left: ?u64, right: ?u64) ?u64 {
+    if (left == null) return right;
+    if (right == null) return left;
+    return left.? +| right.?;
+}
+
+test "api http server join preflight folds right side runtime work into latency summary" {
+    var left = db_mod.RuntimePreflightSummary{
+        .positive_id_result_upper_bound = 12,
+        .shard_result_window = 64,
+        .shard_result_window_total = 64,
+        .stored_projection_doc_upper_bound_total = 12,
+        .shard_count = 2,
+        .remote_shard_count = 1,
+        .dense_query_count = 1,
+        .dense_search_width_total = 256,
+        .dense_search_width_max = 256,
+    };
+    const right = db_mod.RuntimePreflightSummary{
+        .positive_id_result_upper_bound = 100,
+        .shard_result_window = 8,
+        .shard_result_window_total = 8,
+        .stored_projection_doc_upper_bound_total = 8,
+        .shard_count = 1,
+        .remote_shard_count = 1,
+        .dense_query_count = 1,
+        .dense_search_width_total = 128,
+        .dense_search_width_max = 128,
+        .rerank_doc_upper_bound = 5,
+    };
+
+    foldJoinRuntimePreflightWork(&left, right);
+
+    try std.testing.expectEqual(@as(?u32, 12), left.positive_id_result_upper_bound);
+    try std.testing.expectEqual(@as(u32, 64), left.shard_result_window);
+    try std.testing.expectEqual(@as(u64, 72), left.shard_result_window_total);
+    try std.testing.expectEqual(@as(u64, 20), left.stored_projection_doc_upper_bound_total);
+    try std.testing.expectEqual(@as(u32, 3), left.shard_count);
+    try std.testing.expectEqual(@as(u32, 2), left.remote_shard_count);
+    try std.testing.expectEqual(@as(u32, 2), left.dense_query_count);
+    try std.testing.expectEqual(@as(u64, 384), left.dense_search_width_total);
+    try std.testing.expectEqual(@as(u32, 256), left.dense_search_width_max);
+    try std.testing.expectEqual(@as(u32, 5), left.rerank_doc_upper_bound);
+}
 
 const QueryBuilderIndexContextType = enum {
     full_text,
@@ -2998,7 +3373,7 @@ pub const ApiHttpServer = struct {
             var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
             defer if (table_context) |context| freeQueryBuilderTableContext(self.alloc, context);
             var runtime_validator_context: ?QueryBuilderRuntimeQueryRequestValidatorContext = null;
-            if (parsed.value.table) |table_name| {
+            if (query_builder_agent.queryBuilderEffectiveTable(parsed.value)) |table_name| {
                 if (self.cfg.auth_enabled) {
                     const identity = authenticated_identity orelse return try unauthorizedResponse(self.alloc);
                     if (!permissionsAllow(identity.permissions, .table, table_name, .read)) {
@@ -3029,7 +3404,10 @@ pub const ApiHttpServer = struct {
                 fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                     return .{
                         .ptr = runner,
-                        .vtable = &.{ .execute_chain = executeChain },
+                        .vtable = &.{
+                            .execute_chain = executeChain,
+                            .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                        },
                     };
                 }
 
@@ -3046,11 +3424,31 @@ pub const ApiHttpServer = struct {
                     defer client.deinit();
                     return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
                 }
+
+                fn executeChainWithTimeoutMs(
+                    ptr: *anyopaque,
+                    alloc: std.mem.Allocator,
+                    chain: []const generating_runtime.ChainLink,
+                    messages: []const generating_runtime.ChatMessage,
+                    timeout_ms: u64,
+                ) !generating_runtime.GenerateResult {
+                    const runner: *@This() = @ptrCast(@alignCast(ptr));
+                    var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                    defer io_impl.deinit();
+                    var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+                    defer client.deinit();
+                    return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{
+                        .antfly_provider = runner.antfly_provider,
+                        .secret_store = runner.secret_store,
+                        .inference_api_key = runner.inference_api_key,
+                        .request_timeout_ms = timeout_ms,
+                    }, messages);
+                }
             };
             var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
             var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
             const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
-                error.InvalidQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
+                error.InvalidQueryBuilderRequest, error.UnsupportedQueryBuilderRequest => return try jsonErrorResponse(self.alloc, 400, "invalid query builder request"),
                 error.DocIdentityNamespaceMismatch => return try jsonErrorResponse(self.alloc, 503, "doc identity unavailable"),
                 else => return err,
             };
@@ -3629,7 +4027,10 @@ pub const ApiHttpServer = struct {
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
                     .ptr = runner,
-                    .vtable = &.{ .execute_chain = executeChain },
+                    .vtable = &.{
+                        .execute_chain = executeChain,
+                        .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                    },
                 };
             }
 
@@ -3645,6 +4046,26 @@ pub const ApiHttpServer = struct {
                 var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
+            }
+
+            fn executeChainWithTimeoutMs(
+                runner_ptr: *anyopaque,
+                inner_alloc: std.mem.Allocator,
+                chain: []const generating_runtime.ChainLink,
+                messages: []const generating_runtime.ChatMessage,
+                timeout_ms: u64,
+            ) !generating_runtime.GenerateResult {
+                const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                var client = httpx.Client.initWithConfig(inner_alloc, io_impl.io(), .{ .keep_alive = false });
+                defer client.deinit();
+                return try generating_runtime.executeChainWithOptions(inner_alloc, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                    .request_timeout_ms = timeout_ms,
+                }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
@@ -3812,7 +4233,10 @@ pub const ApiHttpServer = struct {
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
                     .ptr = runner,
-                    .vtable = &.{ .execute_chain = executeChain },
+                    .vtable = &.{
+                        .execute_chain = executeChain,
+                        .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                    },
                 };
             }
 
@@ -3828,6 +4252,26 @@ pub const ApiHttpServer = struct {
                 var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
                 return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store, .inference_api_key = runner.inference_api_key }, messages);
+            }
+
+            fn executeChainWithTimeoutMs(
+                runner_ptr: *anyopaque,
+                alloc: std.mem.Allocator,
+                chain: []const generating_runtime.ChainLink,
+                messages: []const generating_runtime.ChatMessage,
+                timeout_ms: u64,
+            ) !generating_runtime.GenerateResult {
+                const runner: *@This() = @ptrCast(@alignCast(runner_ptr));
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                var client = httpx.Client.initWithConfig(alloc, io_impl.io(), .{ .keep_alive = false });
+                defer client.deinit();
+                return try generating_runtime.executeChainWithOptions(alloc, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                    .request_timeout_ms = timeout_ms,
+                }, messages);
             }
         };
         var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.antfly_provider, .secret_store = self.cfg.secret_store, .inference_api_key = self.cfg.inference_api_key };
@@ -4672,20 +5116,160 @@ pub const ApiHttpServer = struct {
         var snapshot = (try self.source.adminSnapshot()) orelse return error.TableNotFound;
         defer self.source.freeAdminSnapshot(&snapshot);
         const table = tables_api.findTableByName(&snapshot, table_name) orelse return error.TableNotFound;
-        const schema_fields = try self.loadQueryBuilderSchemaFieldsFromJson(table.schema_json);
-        errdefer freeOwnedStrings(self.alloc, schema_fields);
+        const schema_context = try self.loadQueryBuilderSchemaContextFromJson(table.schema_json);
+        errdefer freeQueryBuilderSchemaContext(self.alloc, schema_context);
         const index_context = try self.loadQueryBuilderIndexContextFromJson(table.indexes_json);
         errdefer freeQueryBuilderIndexContext(self.alloc, index_context);
+        const related_tables = try self.loadQueryBuilderRelatedTablesFromSnapshot(&snapshot, table, schema_context.schema_fields);
+        errdefer freeQueryBuilderRelatedTables(self.alloc, related_tables);
         return .{
-            .schema_fields = schema_fields,
+            .schema_fields = schema_context.schema_fields,
+            .doc_count = queryBuilderTableDocCountFromSnapshot(&snapshot, table.table_id),
             .full_text_index_metadata = index_context.full_text_index_metadata,
             .embedding_index_metadata = index_context.embedding_index_metadata,
             .graph_index_metadata = index_context.graph_index_metadata,
+            .field_metadata = schema_context.field_metadata,
+            .related_tables = related_tables,
         };
     }
 
+    fn queryBuilderTableDocCountFromSnapshot(snapshot: *const metadata_api.AdminSnapshot, table_id: u64) ?u64 {
+        var doc_count: u64 = 0;
+        var found = false;
+        for (snapshot.ranges) |range| {
+            if (range.table_id != table_id) continue;
+            for (snapshot.merged_group_statuses) |status| {
+                if (status.group_id != range.group_id) continue;
+                doc_count +|= status.doc_count;
+                found = true;
+                break;
+            }
+        }
+        return if (found) doc_count else null;
+    }
+
+    fn queryBuilderTableShardCountFromSnapshot(snapshot: *const metadata_api.AdminSnapshot, table_id: u64) ?u32 {
+        var count: u32 = 0;
+        for (snapshot.ranges) |range| {
+            if (range.table_id == table_id) count +|= 1;
+        }
+        return if (count == 0) null else count;
+    }
+
+    fn queryBuilderTablesShareGroup(snapshot: *const metadata_api.AdminSnapshot, left_table_id: u64, right_table_id: u64) bool {
+        for (snapshot.ranges) |left_range| {
+            if (left_range.table_id != left_table_id) continue;
+            for (snapshot.ranges) |right_range| {
+                if (right_range.table_id == right_table_id and right_range.group_id == left_range.group_id) return true;
+            }
+        }
+        return false;
+    }
+
+    fn queryBuilderRelatedTableKeySelectivity(primary_key_fields: []const []const u8) ?[]const u8 {
+        return if (primary_key_fields.len > 0) "primary_key_unique" else null;
+    }
+
+    fn loadQueryBuilderRelatedTablesFromSnapshot(
+        self: *ApiHttpServer,
+        snapshot: *const metadata_api.AdminSnapshot,
+        left_table: *const metadata_table_manager.TableRecord,
+        left_schema_fields: []const []const u8,
+    ) ![]const query_builder_agent.QueryBuilderRelatedTable {
+        var related = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderRelatedTable).empty;
+        errdefer {
+            freeQueryBuilderRelatedTableItems(self.alloc, related.items);
+            related.deinit(self.alloc);
+        }
+
+        for (snapshot.tables) |table| {
+            if (table.table_id == left_table.table_id) continue;
+            if (!std.mem.eql(u8, table.placement_role, "data")) continue;
+            {
+                const schema_fields = self.loadQueryBuilderSchemaFieldsFromJson(table.schema_json) catch continue;
+                errdefer freeOwnedStrings(self.alloc, schema_fields);
+                if (!queryBuilderTablesLookJoinRelated(left_schema_fields, table.name, schema_fields)) {
+                    freeOwnedStrings(self.alloc, schema_fields);
+                    continue;
+                }
+                const primary_key_fields = try queryBuilderRelatedTablePrimaryKeyFields(self.alloc, schema_fields);
+                errdefer freeOwnedStrings(self.alloc, primary_key_fields);
+                const name = try self.alloc.dupe(u8, table.name);
+                errdefer self.alloc.free(name);
+                try related.append(self.alloc, .{
+                    .name = name,
+                    .schema_fields = schema_fields,
+                    .primary_key_fields = primary_key_fields,
+                    .doc_count = queryBuilderTableDocCountFromSnapshot(snapshot, table.table_id),
+                    .shard_count = queryBuilderTableShardCountFromSnapshot(snapshot, table.table_id),
+                    .colocated_with_left = queryBuilderTablesShareGroup(snapshot, left_table.table_id, table.table_id),
+                    .key_selectivity_heuristic = queryBuilderRelatedTableKeySelectivity(primary_key_fields),
+                });
+            }
+        }
+
+        return try related.toOwnedSlice(self.alloc);
+    }
+
+    fn queryBuilderTablesLookJoinRelated(
+        left_schema_fields: []const []const u8,
+        right_table_name: []const u8,
+        right_schema_fields: []const []const u8,
+    ) bool {
+        _ = right_schema_fields;
+        const singular = queryBuilderSingularName(right_table_name);
+        for (left_schema_fields) |field| {
+            const leaf = queryBuilderFieldLeaf(field);
+            if (std.ascii.eqlIgnoreCase(leaf, right_table_name) or std.ascii.eqlIgnoreCase(leaf, singular)) return true;
+            if (std.ascii.endsWithIgnoreCase(leaf, "_id") and leaf.len > "_id".len) {
+                const stem = leaf[0 .. leaf.len - "_id".len];
+                if (std.ascii.eqlIgnoreCase(stem, right_table_name) or std.ascii.eqlIgnoreCase(stem, singular)) return true;
+            }
+        }
+        return false;
+    }
+
+    fn queryBuilderRelatedTablePrimaryKeyFields(alloc: std.mem.Allocator, schema_fields: []const []const u8) ![]const []const u8 {
+        const primary_key = if (queryBuilderFieldInSlice(schema_fields, "_id"))
+            "_id"
+        else if (queryBuilderFieldInSlice(schema_fields, "id"))
+            "id"
+        else
+            "_id";
+        const fields = try alloc.alloc([]const u8, 1);
+        fields[0] = try alloc.dupe(u8, primary_key);
+        return fields;
+    }
+
+    fn queryBuilderFieldInSlice(fields: []const []const u8, needle: []const u8) bool {
+        for (fields) |field| {
+            if (std.ascii.eqlIgnoreCase(field, needle)) return true;
+        }
+        return false;
+    }
+
+    fn queryBuilderFieldLeaf(field: []const u8) []const u8 {
+        if (std.mem.lastIndexOfScalar(u8, field, '.')) |idx| {
+            if (idx + 1 < field.len) return field[idx + 1 ..];
+        }
+        return field;
+    }
+
+    fn queryBuilderSingularName(name: []const u8) []const u8 {
+        if (name.len > 1 and name[name.len - 1] == 's') return name[0 .. name.len - 1];
+        return name;
+    }
+
     fn loadQueryBuilderSchemaFieldsFromJson(self: *ApiHttpServer, schema_json: []const u8) ![]const []const u8 {
-        if (schema_json.len == 0) return try self.alloc.alloc([]const u8, 0);
+        var context = try self.loadQueryBuilderSchemaContextFromJson(schema_json);
+        const schema_fields = context.schema_fields;
+        context.schema_fields = &.{};
+        freeQueryBuilderSchemaContext(self.alloc, context);
+        return schema_fields;
+    }
+
+    fn loadQueryBuilderSchemaContextFromJson(self: *ApiHttpServer, schema_json: []const u8) !QueryBuilderSchemaContext {
+        if (schema_json.len == 0) return .{};
         var arena_impl = std.heap.ArenaAllocator.init(self.alloc);
         defer arena_impl.deinit();
         const arena = arena_impl.allocator();
@@ -4697,20 +5281,96 @@ pub const ApiHttpServer = struct {
         defer seen.deinit(arena);
 
         var fields = std.ArrayListUnmanaged([]const u8).empty;
+        var field_metadata = std.ArrayListUnmanaged(query_builder_agent.QueryBuilderFieldMetadata).empty;
+        defer field_metadata.deinit(self.alloc);
         errdefer {
             for (fields.items) |field| self.alloc.free(@constCast(field));
             fields.deinit(self.alloc);
+            freeQueryBuilderFieldMetadataItems(self.alloc, field_metadata.items);
         }
 
         for (runtime_schema.full_text_documents) |document_schema| {
             for (document_schema.fields) |field| {
-                if (seen.contains(field.path)) continue;
+                if (seen.contains(field.path)) {
+                    queryBuilderPromoteFieldMetadataFromRuntimeField(field_metadata.items, field);
+                    continue;
+                }
                 try seen.put(arena, field.path, {});
-                try fields.append(self.alloc, try self.alloc.dupe(u8, field.path));
+                const owned_path = try self.alloc.dupe(u8, field.path);
+                errdefer self.alloc.free(owned_path);
+                try fields.append(self.alloc, owned_path);
+                try field_metadata.append(self.alloc, try queryBuilderFieldMetadataFromRuntimeField(self.alloc, field));
             }
         }
 
-        return try fields.toOwnedSlice(self.alloc);
+        return .{
+            .schema_fields = if (fields.items.len == 0) &.{} else try fields.toOwnedSlice(self.alloc),
+            .field_metadata = if (field_metadata.items.len == 0) &.{} else try field_metadata.toOwnedSlice(self.alloc),
+        };
+    }
+
+    fn queryBuilderFieldMetadataFromRuntimeField(
+        alloc: std.mem.Allocator,
+        field: anytype,
+    ) !query_builder_agent.QueryBuilderFieldMetadata {
+        return .{
+            .name = try alloc.dupe(u8, field.path),
+            .kind = queryBuilderFieldKindFromRuntimeField(field),
+            .groupable = queryBuilderRuntimeFieldGroupable(field),
+            .metric = queryBuilderRuntimeFieldMetric(field),
+            .aggregatable = true,
+        };
+    }
+
+    fn queryBuilderPromoteFieldMetadataFromRuntimeField(
+        metadata: []query_builder_agent.QueryBuilderFieldMetadata,
+        field: anytype,
+    ) void {
+        for (metadata) |*item| {
+            if (!std.mem.eql(u8, item.name, field.path)) continue;
+            if (queryBuilderRuntimeFieldGroupable(field)) item.groupable = true;
+            if (queryBuilderRuntimeFieldMetric(field)) item.metric = true;
+            if (item.kind == .text and std.mem.eql(u8, field.analyzer, "keyword")) item.kind = .keyword;
+            return;
+        }
+    }
+
+    fn queryBuilderFieldKindFromRuntimeField(field: anytype) query_builder_agent.QueryBuilderFieldKind {
+        if (std.mem.eql(u8, field.analyzer, "keyword")) return .keyword;
+        if (queryBuilderFieldLooksMetric(field.path)) return .numeric;
+        if (queryBuilderFieldLooksBoolean(field.path)) return .boolean;
+        return .text;
+    }
+
+    fn queryBuilderRuntimeFieldGroupable(field: anytype) bool {
+        return std.mem.eql(u8, field.analyzer, "keyword") or queryBuilderFieldLooksCategorical(field.path) or queryBuilderFieldLooksBoolean(field.path);
+    }
+
+    fn queryBuilderRuntimeFieldMetric(field: anytype) bool {
+        return queryBuilderFieldLooksMetric(field.path);
+    }
+
+    fn queryBuilderFieldLooksCategorical(field: []const u8) bool {
+        for ([_][]const u8{ "status", "state", "type", "kind", "category", "tier", "segment", "customer", "customer_id", "user", "user_id", "tenant", "tenant_id", "region", "country" }) |candidate| {
+            if (std.ascii.eqlIgnoreCase(field, candidate)) return true;
+            if (std.ascii.endsWithIgnoreCase(field, candidate)) return true;
+        }
+        return false;
+    }
+
+    fn queryBuilderFieldLooksMetric(field: []const u8) bool {
+        for ([_][]const u8{ "amount", "price", "cost", "total", "duration", "latency", "score", "count", "quantity", "qty", "revenue", "value", "size", "bytes" }) |candidate| {
+            if (std.ascii.eqlIgnoreCase(field, candidate)) return true;
+            if (std.ascii.endsWithIgnoreCase(field, candidate)) return true;
+        }
+        return false;
+    }
+
+    fn queryBuilderFieldLooksBoolean(field: []const u8) bool {
+        return std.ascii.eqlIgnoreCase(field, "active") or
+            std.ascii.eqlIgnoreCase(field, "enabled") or
+            std.ascii.startsWithIgnoreCase(field, "is_") or
+            std.ascii.startsWithIgnoreCase(field, "has_");
     }
 
     fn loadQueryBuilderIndexContextFromJson(self: *ApiHttpServer, indexes_json: []const u8) !QueryBuilderIndexContext {
@@ -7508,6 +8168,50 @@ pub fn freeQueryBuilderTableContext(alloc: std.mem.Allocator, context: query_bui
     freeQueryBuilderFullTextIndexMetadata(alloc, context.full_text_index_metadata);
     freeQueryBuilderEmbeddingIndexMetadata(alloc, context.embedding_index_metadata);
     freeQueryBuilderGraphIndexMetadata(alloc, context.graph_index_metadata);
+    freeQueryBuilderFieldMetadata(alloc, context.field_metadata);
+    freeQueryBuilderRelatedTables(alloc, context.related_tables);
+}
+
+fn freeQueryBuilderSchemaContext(alloc: std.mem.Allocator, context: QueryBuilderSchemaContext) void {
+    freeOwnedStrings(alloc, context.schema_fields);
+    freeQueryBuilderFieldMetadata(alloc, context.field_metadata);
+}
+
+fn freeQueryBuilderFieldMetadata(
+    alloc: std.mem.Allocator,
+    metadata: []const query_builder_agent.QueryBuilderFieldMetadata,
+) void {
+    freeQueryBuilderFieldMetadataItems(alloc, metadata);
+    if (metadata.len > 0) alloc.free(@constCast(metadata));
+}
+
+fn freeQueryBuilderFieldMetadataItems(
+    alloc: std.mem.Allocator,
+    metadata: []const query_builder_agent.QueryBuilderFieldMetadata,
+) void {
+    for (metadata) |item| {
+        alloc.free(@constCast(item.name));
+        freeOwnedStrings(alloc, item.aliases);
+    }
+}
+
+fn freeQueryBuilderRelatedTables(
+    alloc: std.mem.Allocator,
+    related_tables: []const query_builder_agent.QueryBuilderRelatedTable,
+) void {
+    freeQueryBuilderRelatedTableItems(alloc, related_tables);
+    if (related_tables.len > 0) alloc.free(@constCast(related_tables));
+}
+
+fn freeQueryBuilderRelatedTableItems(
+    alloc: std.mem.Allocator,
+    related_tables: []const query_builder_agent.QueryBuilderRelatedTable,
+) void {
+    for (related_tables) |table| {
+        alloc.free(@constCast(table.name));
+        freeOwnedStrings(alloc, table.schema_fields);
+        freeOwnedStrings(alloc, table.primary_key_fields);
+    }
 }
 
 fn freeQueryBuilderFullTextIndexMetadata(
@@ -14872,6 +15576,287 @@ test "api http server query builder maps doc identity mismatch to unavailable" {
     try std.testing.expectEqualStrings("{\"error\":\"doc identity unavailable\"}", resp.body);
 }
 
+test "api http server query builder join planner samples bounded left hits" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 1, .name = "orders", .placement_role = "data" },
+                    .{ .table_id = 2, .name = "customers", .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null },
+                    .{ .group_id = 20, .table_id = 2, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{ .group_id = 10, .doc_count = 1_000, .disk_bytes = 4096, .empty = false },
+                    .{ .group_id = 20, .doc_count = 200, .disk_bytes = 4096, .empty = false },
+                })[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .preflight_query = preflightQuery,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            _: *anyopaque,
+            inner_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            try std.testing.expectEqualStrings("orders", table_name);
+            try std.testing.expectEqual(@as(u32, join_planner_left_sample_limit), req.limit);
+            return .{ .json = try inner_alloc.dupe(u8, "{\"responses\":[{\"hits\":{\"total\":2,\"max_score\":0,\"hits\":[{\"_id\":\"order:1\",\"_score\":0,\"_source\":{\"customer_id\":\"cust:a\"}},{\"_id\":\"order:2\",\"_score\":0,\"_source\":{\"customer_id\":\"cust:b\"}}]}}]}") };
+        }
+
+        fn preflightQuery(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+            _: u32,
+        ) anyerror!?db_mod.RuntimePreflightSummary {
+            try std.testing.expect(std.mem.eql(u8, table_name, "orders") or std.mem.eql(u8, table_name, "customers"));
+            return .{
+                .shard_count = 1,
+                .shard_result_window = 64,
+                .shard_result_window_total = 64,
+                .positive_id_result_upper_bound = 64,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), FakeReads.source(), null);
+    defer server.deinit();
+
+    var validator_context = QueryBuilderRuntimeQueryRequestValidatorContext{
+        .server = &server,
+        .source = FakeReads.source(),
+        .table_name = "orders",
+    };
+    const summary = try validator_context.planSupportedJoinQueryRequest(alloc, .{
+        .table = "orders",
+        .fields = &.{"customer_id"},
+        .limit = 100,
+        .join = .{
+            .right_table = "customers",
+            .join_type = .inner,
+            .on = .{
+                .left_field = "customer_id",
+                .right_field = "_id",
+            },
+        },
+    }, .{
+        .shard_count = 1,
+        .shard_result_window = 64,
+        .shard_result_window_total = 64,
+        .positive_id_result_upper_bound = 64,
+    });
+
+    try std.testing.expect(summary != null);
+    try std.testing.expectEqualStrings("runtime_query", summary.?.left_sample_source);
+    try std.testing.expectEqual(@as(u32, 2), summary.?.left_sample_row_count);
+}
+
+test "api http server query builder validator rejects unsupported join runtime" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(_: *@This()) StatusSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .status = status,
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
+        }
+
+        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{
+                    .{ .table_id = 1, .name = "orders", .placement_role = "data" },
+                    .{ .table_id = 2, .name = "customers", .placement_role = "data" },
+                })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null },
+                    .{ .group_id = 20, .table_id = 2, .start_key = "", .end_key = null },
+                })[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeReads = struct {
+        fn source() table_reads.TableReadSource {
+            return .{
+                .ptr = undefined,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                    .preflight_query = preflightQuery,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.LookupResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn scan(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: []const u8,
+            _: []const u8,
+            _: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?table_reads.ScanResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) anyerror!?query_api.QueryResponse {
+            return error.UnsupportedOperation;
+        }
+
+        fn preflightQuery(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            table_name: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+            _: u32,
+        ) anyerror!?db_mod.RuntimePreflightSummary {
+            if (std.mem.eql(u8, table_name, "missing_customers")) return error.TableNotFound;
+            try std.testing.expectEqualStrings("orders", table_name);
+            return .{
+                .shard_count = 1,
+                .shard_result_window = 64,
+                .shard_result_window_total = 64,
+                .positive_id_result_upper_bound = 64,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), FakeReads.source(), null);
+    defer server.deinit();
+
+    var validator_context = QueryBuilderRuntimeQueryRequestValidatorContext{
+        .server = &server,
+        .source = FakeReads.source(),
+        .table_name = "orders",
+    };
+    const validator = validator_context.iface();
+    const request = metadata_openapi.QueryRequest{
+        .table = "orders",
+        .fields = &.{"customer_id"},
+        .limit = 100,
+        .join = .{
+            .right_table = "missing_customers",
+            .join_type = .inner,
+            .on = .{
+                .left_field = "customer_id",
+                .right_field = "_id",
+            },
+        },
+    };
+    var preflight = try validator.preflightQueryRequest(alloc, request, 0);
+    defer if (preflight) |*summary| summary.deinit(alloc);
+    try std.testing.expect(preflight == null);
+
+    const feedback = try validator.validateQueryRequest(alloc, request);
+    defer if (feedback) |text| alloc.free(text);
+
+    try std.testing.expect(feedback != null);
+    try std.testing.expect(std.mem.indexOf(u8, feedback.?, "not supported") != null);
+}
+
 test "api http server query builder loads structured table index metadata" {
     const alloc = std.testing.allocator;
     const FakeSource = struct {
@@ -14893,18 +15878,31 @@ test "api http server query builder loads structured table index metadata" {
         fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
             return .{
                 .status = .{ .metadata_group_id = 1, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
+                .tables = @constCast((&[_]metadata_table_manager.TableRecord{ .{
                     .table_id = 1,
                     .name = "docs",
-                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"}}}}}}",
-                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"fields\":[\"title\",\"body\"]},\"semantic_idx\":{\"type\":\"dense_vector\",\"dimension\":384,\"embedder\":{\"model\":\"e5-small\"}},\"sparse_idx\":{\"type\":\"sparse_vector\",\"model\":\"splade\"},\"doc_graph\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"references\",\"topology\":\"graph\"},{\"name\":\"parent\",\"topology\":\"tree\"}]}}",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"body\":{\"type\":\"text\"},\"customer_id\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{\"search_idx\":{\"type\":\"full_text\",\"fields\":[\"title\",\"body\",\"customer_id\"]},\"semantic_idx\":{\"type\":\"dense_vector\",\"dimension\":384,\"embedder\":{\"model\":\"e5-small\"}},\"sparse_idx\":{\"type\":\"sparse_vector\",\"model\":\"splade\"},\"doc_graph\":{\"type\":\"graph\",\"edge_types\":[{\"name\":\"references\",\"topology\":\"graph\"},{\"name\":\"parent\",\"topology\":\"tree\"}]}}",
                     .placement_role = "data",
-                }})[0..]),
-                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{.{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null }})[0..]),
+                }, .{
+                    .table_id = 2,
+                    .name = "customers",
+                    .schema_json = "{\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"tier\":{\"type\":\"text\"},\"region\":{\"type\":\"text\"}}}}}}",
+                    .indexes_json = "{}",
+                    .placement_role = "data",
+                } })[0..]),
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{
+                    .{ .group_id = 10, .table_id = 1, .start_key = "", .end_key = null },
+                    .{ .group_id = 20, .table_id = 2, .start_key = "", .end_key = null },
+                })[0..]),
                 .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
                 .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
                 .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
                 .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+                .merged_group_statuses = @constCast((&[_]metadata_reconciler.MergedGroupStatus{
+                    .{ .group_id = 10, .doc_count = 42, .disk_bytes = 4096, .empty = false },
+                    .{ .group_id = 20, .doc_count = 250, .disk_bytes = 8192, .empty = false },
+                })[0..]),
             };
         }
 
@@ -14916,9 +15914,24 @@ test "api http server query builder loads structured table index metadata" {
     const context = try server.loadQueryBuilderTableContext("docs");
     defer freeQueryBuilderTableContext(alloc, context);
 
+    try std.testing.expectEqual(@as(?u64, 42), context.doc_count);
     try std.testing.expectEqualStrings("search_idx", context.full_text_index_metadata[0].name);
     try std.testing.expectEqualStrings("title", context.full_text_index_metadata[0].fields[0]);
     try std.testing.expectEqualStrings("body", context.full_text_index_metadata[0].fields[1]);
+    try std.testing.expectEqualStrings("customer_id", context.full_text_index_metadata[0].fields[2]);
+    try std.testing.expectEqual(@as(usize, 3), context.field_metadata.len);
+    try std.testing.expectEqualStrings("title", context.field_metadata[0].name);
+    try std.testing.expectEqual(query_builder_agent.QueryBuilderFieldKind.text, context.field_metadata[0].kind);
+    try std.testing.expectEqualStrings("customer_id", context.field_metadata[2].name);
+    try std.testing.expect(context.field_metadata[2].groupable.?);
+    try std.testing.expectEqual(@as(usize, 1), context.related_tables.len);
+    try std.testing.expectEqualStrings("customers", context.related_tables[0].name);
+    try std.testing.expectEqual(@as(?u64, 250), context.related_tables[0].doc_count);
+    try std.testing.expectEqual(@as(?u32, 1), context.related_tables[0].shard_count);
+    try std.testing.expect(!context.related_tables[0].colocated_with_left);
+    try std.testing.expectEqualStrings("primary_key_unique", context.related_tables[0].key_selectivity_heuristic.?);
+    try std.testing.expectEqualStrings("_id", context.related_tables[0].primary_key_fields[0]);
+    try std.testing.expectEqualStrings("tier", context.related_tables[0].schema_fields[0]);
 
     try std.testing.expectEqual(@as(usize, 2), context.embedding_index_metadata.len);
     try std.testing.expectEqualStrings("semantic_idx", context.embedding_index_metadata[0].name);

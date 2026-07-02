@@ -31,6 +31,7 @@ pub const GeminiProvider = struct {
     base_url: []const u8,
     api_key_header: [2][]const u8,
     max_tokens: ?i64 = null,
+    request_timeout_ms: ?u64 = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: GeminiOptions) !GeminiProvider {
         var provider = GeminiProvider{
@@ -64,6 +65,10 @@ pub const GeminiProvider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setRequestTimeoutMs(self: *GeminiProvider, timeout_ms: u64) void {
+        self.request_timeout_ms = timeout_ms;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *GeminiProvider = @ptrCast(@alignCast(ptr));
 
@@ -74,7 +79,7 @@ pub const GeminiProvider = struct {
         defer alloc.free(json_body);
 
         const headers = [_][2][]const u8{self.api_key_header};
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = &headers });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = &headers, .timeout_ms = self.request_timeout_ms });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
         return try parseGenerateResponseAlloc(alloc, resp.body orelse return error.EmptyResponse);
@@ -102,6 +107,7 @@ pub const Provider = struct {
     auth_header: ?[2][]const u8 = null,
     token_source: ?*google_auth.CachedTokenSource = null,
     max_tokens: ?i64 = null,
+    request_timeout_ms: ?u64 = null,
 
     pub fn init(allocator: Allocator, http: *httpx.Client, options: Options) !Provider {
         var provider = Provider{
@@ -160,6 +166,10 @@ pub const Provider = struct {
         self.max_tokens = max_tokens;
     }
 
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: u64) void {
+        self.request_timeout_ms = timeout_ms;
+    }
+
     fn generateImpl(ptr: *anyopaque, alloc: Allocator, model: []const u8, messages: []const inference.ChatMessage) anyerror!inference.GenerateResult {
         const self: *Provider = @ptrCast(@alignCast(ptr));
 
@@ -181,7 +191,7 @@ pub const Provider = struct {
         defer if (minted_auth) |value| alloc.free(value);
         try self.appendAuthHeaders(alloc, &headers, &minted_auth);
 
-        var resp = try self.http.post(url, .{ .json = json_body, .headers = headers.items });
+        var resp = try self.http.post(url, .{ .json = json_body, .headers = headers.items, .timeout_ms = self.request_timeout_ms });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
         const body = resp.body orelse return error.EmptyResponse;

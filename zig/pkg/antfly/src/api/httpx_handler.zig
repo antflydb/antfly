@@ -1252,7 +1252,7 @@ pub const AntflyApiHandler = struct {
         var table_context: ?query_builder_agent.QueryBuilderTableContext = null;
         defer if (table_context) |context| http_server_mod.freeQueryBuilderTableContext(alloc, context);
         var runtime_validator_context: ?http_server_mod.QueryBuilderRuntimeQueryRequestValidatorContext = null;
-        if (parsed.value.table) |table_name| {
+        if (query_builder_agent.queryBuilderEffectiveTable(parsed.value)) |table_name| {
             if (authenticated_identity) |identity| {
                 if (!http_server_mod.permissionsAllow(identity.permissions, .table, table_name, .read)) {
                     _ = ctx.status(403);
@@ -1281,11 +1281,15 @@ pub const AntflyApiHandler = struct {
         const QueryBuilderGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) query_builder_agent.GenerationRunner {
                 return .{
                     .ptr = runner,
-                    .vtable = &.{ .execute_chain = executeChain },
+                    .vtable = &.{
+                        .execute_chain = executeChain,
+                        .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                    },
                 };
             }
 
@@ -1300,13 +1304,41 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                }, messages);
+            }
+
+            fn executeChainWithTimeoutMs(
+                ptr: *anyopaque,
+                a: std.mem.Allocator,
+                chain: []const generating_runtime.ChainLink,
+                messages: []const generating_runtime.ChatMessage,
+                timeout_ms: u64,
+            ) !generating_runtime.GenerateResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+                defer client.deinit();
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                    .request_timeout_ms = timeout_ms,
+                }, messages);
             }
         };
-        var generation_runner = QueryBuilderGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = QueryBuilderGenerationRunner{
+            .antfly_provider = self.api_server.antfly_provider,
+            .secret_store = self.api_server.cfg.secret_store,
+            .inference_api_key = self.api_server.cfg.inference_api_key,
+        };
         var collected_context = query_builder_agent.collectQueryBuilderContext(table_context);
         const response = query_builder_agent.buildQueryBuilderResponseWithCollectedContext(arena_impl.allocator(), parsed.value, &collected_context, generation_runner.iface()) catch |err| switch (err) {
-            error.InvalidQueryBuilderRequest => {
+            error.InvalidQueryBuilderRequest, error.UnsupportedQueryBuilderRequest => {
                 _ = ctx.status(400);
                 return ctx.text("invalid query builder request");
             },
@@ -1418,11 +1450,15 @@ pub const AntflyApiHandler = struct {
         const RetrievalGenerationRunner = struct {
             antfly_provider: ?managed_embedder.AntflyProvider,
             secret_store: ?*common_secrets.FileStore,
+            inference_api_key: ?[]const u8,
 
             fn iface(runner: *@This()) retrieval_agent.GenerationRunner {
                 return .{
                     .ptr = runner,
-                    .vtable = &.{ .execute_chain = executeChain },
+                    .vtable = &.{
+                        .execute_chain = executeChain,
+                        .execute_chain_with_timeout_ms = executeChainWithTimeoutMs,
+                    },
                 };
             }
 
@@ -1437,10 +1473,38 @@ pub const AntflyApiHandler = struct {
                 defer io_impl.deinit();
                 var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
                 defer client.deinit();
-                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{ .antfly_provider = runner.antfly_provider, .secret_store = runner.secret_store }, messages);
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                }, messages);
+            }
+
+            fn executeChainWithTimeoutMs(
+                ptr: *anyopaque,
+                a: std.mem.Allocator,
+                chain: []const generating_runtime.ChainLink,
+                messages: []const generating_runtime.ChatMessage,
+                timeout_ms: u64,
+            ) !generating_runtime.GenerateResult {
+                const runner: *@This() = @ptrCast(@alignCast(ptr));
+                var io_impl = std.Io.Threaded.init(std.heap.page_allocator, .{});
+                defer io_impl.deinit();
+                var client = httpx.Client.initWithConfig(a, io_impl.io(), .{ .keep_alive = false });
+                defer client.deinit();
+                return try generating_runtime.executeChainWithOptions(a, &client, chain, .{
+                    .antfly_provider = runner.antfly_provider,
+                    .secret_store = runner.secret_store,
+                    .inference_api_key = runner.inference_api_key,
+                    .request_timeout_ms = timeout_ms,
+                }, messages);
             }
         };
-        var generation_runner = RetrievalGenerationRunner{ .antfly_provider = self.api_server.antfly_provider, .secret_store = self.api_server.cfg.secret_store };
+        var generation_runner = RetrievalGenerationRunner{
+            .antfly_provider = self.api_server.antfly_provider,
+            .secret_store = self.api_server.cfg.secret_store,
+            .inference_api_key = self.api_server.cfg.inference_api_key,
+        };
 
         var query_runner = RetrievalQueryRunner{
             .server = self.api_server,

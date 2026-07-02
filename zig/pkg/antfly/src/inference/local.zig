@@ -42,6 +42,7 @@ pub const Provider = struct {
     tools_json: ?[]const u8 = null,
     tool_choice_json: ?[]const u8 = null,
     max_tokens: ?i64 = null,
+    request_timeout_ms: ?u64 = null,
 
     pub fn init(allocator: std.mem.Allocator, http: *httpx.Client, base_url: []const u8) Provider {
         return .{
@@ -79,6 +80,10 @@ pub const Provider = struct {
 
     pub fn setMaxTokens(self: *Provider, max_tokens: i64) void {
         self.max_tokens = max_tokens;
+    }
+
+    pub fn setRequestTimeoutMs(self: *Provider, timeout_ms: u64) void {
+        self.request_timeout_ms = timeout_ms;
     }
 
     fn authHeaders(self: *const Provider) ?[]const [2][]const u8 {
@@ -322,7 +327,7 @@ pub const Provider = struct {
         var resp = try self.http.post(url, .{
             .json = json_body,
             .headers = self.authHeaders(),
-            .timeout_ms = 300_000,
+            .timeout_ms = self.request_timeout_ms orelse 300_000,
         });
         defer resp.deinit();
         if (!resp.ok()) return error.GenerateRequestFailed;
