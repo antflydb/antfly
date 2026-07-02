@@ -1,0 +1,111 @@
+\* All TLC check configs for AntflyMlCompilerPublication.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyMlCompilerPublication.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleCompile = FALSE
+    BuggyMissingExternalInput = FALSE
+    BuggyWrongOutputSelection = FALSE
+    BuggyFallbackPublish = FALSE
+    BuggyPartialArtifactPublish = FALSE
+
+INVARIANTS
+    TypeOK
+    ExportMaterializesRequiredRuntimeInputs
+    ExportIncludesCompilerOutputs
+    CompileUsesFreshCompleteExport
+    FailedCompileArtifactNotVisible
+    RuntimePublishesOnlyFreshCompleteArtifact
+    RuntimeOutputSelectionIsExact
+    RuntimeGateFailsClosed
+    Safety
+
+==== BadFallbackPublish
+\* Expected-failure config: runtime publishes an executor despite a fallback
+\* partition and a fail-closed runtime gate.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleCompile = FALSE
+    BuggyMissingExternalInput = FALSE
+    BuggyWrongOutputSelection = FALSE
+    BuggyFallbackPublish = TRUE
+    BuggyPartialArtifactPublish = FALSE
+
+INVARIANTS
+    RuntimeGateFailsClosed
+
+==== BadMissingInput
+\* Expected-failure config: partition export omits a required parameter or
+\* semantic KV cache input.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleCompile = FALSE
+    BuggyMissingExternalInput = TRUE
+    BuggyWrongOutputSelection = FALSE
+    BuggyFallbackPublish = FALSE
+    BuggyPartialArtifactPublish = FALSE
+
+INVARIANTS
+    ExportMaterializesRequiredRuntimeInputs
+
+==== BadOutputSelection
+\* Expected-failure config: runtime publication leaks semantic KV side outputs
+\* instead of exposing only the selected final graph output.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleCompile = FALSE
+    BuggyMissingExternalInput = FALSE
+    BuggyWrongOutputSelection = TRUE
+    BuggyFallbackPublish = FALSE
+    BuggyPartialArtifactPublish = FALSE
+
+INVARIANTS
+    RuntimeOutputSelectionIsExact
+
+==== BadPartialArtifact
+\* Expected-failure config: a failed compiler leaves a partial artifact visible
+\* to publication logic.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleCompile = FALSE
+    BuggyMissingExternalInput = FALSE
+    BuggyWrongOutputSelection = FALSE
+    BuggyFallbackPublish = FALSE
+    BuggyPartialArtifactPublish = TRUE
+
+INVARIANTS
+    FailedCompileArtifactNotVisible
+
+==== BadStaleCompile
+\* Expected-failure config: compiler artifact is built from a stale export after
+\* the source graph version changes.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyStaleCompile = TRUE
+    BuggyMissingExternalInput = FALSE
+    BuggyWrongOutputSelection = FALSE
+    BuggyFallbackPublish = FALSE
+    BuggyPartialArtifactPublish = FALSE
+
+INVARIANTS
+    RuntimePublishesOnlyFreshCompleteArtifact

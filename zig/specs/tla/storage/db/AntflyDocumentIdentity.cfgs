@@ -1,0 +1,69 @@
+\* All TLC check configs for AntflyDocumentIdentity.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyDocumentIdentity.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyReuseOrdinal = FALSE
+    BuggyAcceptStaleFilter = FALSE
+    BuggyAcceptNamespaceMismatch = FALSE
+
+INVARIANTS
+    TypeOK
+    AllocatedOrdinalsHaveStableOwner
+    LiveDocsHaveVisibleOrdinals
+    NoTwoLiveDocsShareOrdinal
+    TombstoneHidesCurrentGeneration
+    ResolvedFilterMatchesCurrentContext
+    CanonicalRowsMatchStoredNamespace
+    StrictOpenRejectsNamespaceMismatch
+    Safety
+
+==== BadNamespaceMismatch
+\* Expected-failure config: strict open accepts a configured namespace that does
+\* not match the stored identity namespace.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyReuseOrdinal = FALSE
+    BuggyAcceptStaleFilter = FALSE
+    BuggyAcceptNamespaceMismatch = TRUE
+
+INVARIANTS
+    StrictOpenRejectsNamespaceMismatch
+    Safety
+
+==== BadReuseOrdinal
+\* Expected-failure config: reusing a tombstoned ordinal for another document
+\* breaks stable ordinal ownership.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyReuseOrdinal = TRUE
+    BuggyAcceptStaleFilter = FALSE
+    BuggyAcceptNamespaceMismatch = FALSE
+
+INVARIANTS
+    AllocatedOrdinalsHaveStableOwner
+    Safety
+
+==== BadStaleFilter
+\* Expected-failure config: accepting a resolved-doc-filter built for an old
+\* identity generation lets stale filter context constrain current search.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyReuseOrdinal = FALSE
+    BuggyAcceptStaleFilter = TRUE
+    BuggyAcceptNamespaceMismatch = FALSE
+
+INVARIANTS
+    ResolvedFilterMatchesCurrentContext
+    Safety

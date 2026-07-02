@@ -1,0 +1,22 @@
+\* All TLC check configs for TraceAntflyDocumentIdentityRangeRepair.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION TraceSpec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+VIEW TraceView
+
+CHECK_DEADLOCK FALSE
+
+INVARIANT TraceSafety
+
+PROPERTY TraceMatched

@@ -1,0 +1,113 @@
+\* All TLC check configs for AntflyMlGraphPasses.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyMlGraphPasses.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDanglingCse = FALSE
+    BuggyParameterDedup = FALSE
+    BuggyMissingLowerClosure = FALSE
+    BuggyFallbackRuntime = FALSE
+    BuggyPartialPublish = FALSE
+
+INVARIANTS
+    TypeOK
+    CurrentGraphReferencesValid
+    ExportedGraphReferencesValid
+    OutputNodePreserved
+    PassOrderRespected
+    ParameterAndConstantIdentityPreserved
+    FailedPassOutputNotVisible
+    ExternalPartitionInputsMaterialized
+    RuntimeGateFailsClosed
+    Safety
+
+==== BadDanglingCse
+\* Expected-failure config: CSE removes a duplicate producer without remapping
+\* consumers, leaving a dangling input reference.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDanglingCse = TRUE
+    BuggyParameterDedup = FALSE
+    BuggyMissingLowerClosure = FALSE
+    BuggyFallbackRuntime = FALSE
+    BuggyPartialPublish = FALSE
+
+INVARIANTS
+    CurrentGraphReferencesValid
+
+==== BadFallbackRuntime
+\* Expected-failure config: graph runtime publishes a native executor even
+\* though the partition summary contains a fallback partition and the gate is
+\* configured to fail closed.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDanglingCse = FALSE
+    BuggyParameterDedup = FALSE
+    BuggyMissingLowerClosure = FALSE
+    BuggyFallbackRuntime = TRUE
+    BuggyPartialPublish = FALSE
+
+INVARIANTS
+    RuntimeGateFailsClosed
+
+==== BadMissingLowerClosure
+\* Expected-failure config: partition export publishes a fused node while
+\* omitting its primitive vjp/lowering closure.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDanglingCse = FALSE
+    BuggyParameterDedup = FALSE
+    BuggyMissingLowerClosure = TRUE
+    BuggyFallbackRuntime = FALSE
+    BuggyPartialPublish = FALSE
+
+INVARIANTS
+    ExportedGraphReferencesValid
+
+==== BadParameterDedup
+\* Expected-failure config: CSE incorrectly collapses parameter/constant
+\* identity while still leaving a structurally valid graph.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDanglingCse = FALSE
+    BuggyParameterDedup = TRUE
+    BuggyMissingLowerClosure = FALSE
+    BuggyFallbackRuntime = FALSE
+    BuggyPartialPublish = FALSE
+
+INVARIANTS
+    ParameterAndConstantIdentityPreserved
+
+==== BadPartialPublish
+\* Expected-failure config: a failed pass leaves partial output visible to
+\* later pipeline/export steps.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDanglingCse = FALSE
+    BuggyParameterDedup = FALSE
+    BuggyMissingLowerClosure = FALSE
+    BuggyFallbackRuntime = FALSE
+    BuggyPartialPublish = TRUE
+
+INVARIANTS
+    FailedPassOutputNotVisible

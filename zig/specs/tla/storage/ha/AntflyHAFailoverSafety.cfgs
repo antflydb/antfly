@@ -1,0 +1,68 @@
+\* All TLC check configs for AntflyHAFailoverSafety.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHAFailoverSafety.tla.
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyPromoteMissingAck = FALSE
+    BuggyOldPrimaryWrite = FALSE
+    BuggyAckWithoutReceipt = FALSE
+
+INVARIANTS
+    TypeOK
+    AckEvidenceExists
+    PromotedNodeHasAllSyncAckedWrites
+    NoSplitBrainWritablePrimaries
+    PromotionRequiresFence
+    NoSplitBrainWrites
+    Safety
+
+PROPERTIES
+    EventuallyPromoted
+
+==== BadAckWithoutReceipt
+\* Expected-failure config: a sync acknowledgement is recorded without durable
+\* standby receipt evidence (ack-bookkeeping bug). Pinned to AckEvidenceExists.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyPromoteMissingAck = FALSE
+    BuggyOldPrimaryWrite = FALSE
+    BuggyAckWithoutReceipt = TRUE
+
+INVARIANTS
+    AckEvidenceExists
+
+==== BadOldPrimaryWrite
+\* Expected-failure config: old primary writes after a promoted standby is writable.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyPromoteMissingAck = FALSE
+    BuggyOldPrimaryWrite = TRUE
+    BuggyAckWithoutReceipt = FALSE
+
+INVARIANTS
+    NoSplitBrainWrites
+
+==== BadPromoteMissingAck
+\* Expected-failure config: promote a standby that lacks a sync-acknowledged
+\* write. Async-acked writes carry no preservation promise, so only the
+\* sync-scoped invariant is pinned.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyPromoteMissingAck = TRUE
+    BuggyOldPrimaryWrite = FALSE
+    BuggyAckWithoutReceipt = FALSE
+
+INVARIANTS
+    PromotedNodeHasAllSyncAckedWrites

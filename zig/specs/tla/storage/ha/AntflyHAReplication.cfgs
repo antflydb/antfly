@@ -1,0 +1,39 @@
+\* All TLC check configs for AntflyHAReplication.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHAReplication.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyAcceptStaleTimelineAck = FALSE
+
+INVARIANTS
+    TypeOK
+    SlotProgressOrdered
+    EligibleSlotsAreCurrentActiveAndNotReseed
+    DurabilityCountsEligibleOnly
+    SatisfiedDurabilityHasEnoughProgress
+    FailClosedDoesNotAcknowledgeUnsatisfied
+    FenceReceiptValid
+    PromotionMatchesFenceAndSwitchRecord
+    RewindRequiresRetainedFork
+    SyncAckMatchesTargetTimeline
+    SyncAckProgressMatchesMode
+    Safety
+
+==== BadStaleTimelineAck
+\* Expected-failure config for AntflyHAReplication.tla.
+\* Enables a mutant that lets a status update from a stale timeline satisfy a
+\* current sync wait target.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyAcceptStaleTimelineAck = TRUE
+
+INVARIANTS
+    SyncAckMatchesTargetTimeline

@@ -21,6 +21,31 @@ leftover `_TTrace_` artifacts, `Buggy*` constants without an enabling
 expected-failure config (hard failures), and Safety-conjunction-pinned
 negative configs (reported migration debt). Run it before any handoff.
 
+## Layout
+
+Specs are organized by the code they model, mirroring `pkg/antfly/src`:
+`metadata/` (topology, split routing, node/table lifecycle, CDC cutover),
+`raft/` (snapshot transfer/content), `storage/ha/`, `storage/db/`,
+`storage/lsm/`, `storage/lmdb/`, `storage/lite/`, `api/`, and `ml/`.
+Vendored/legacy specs (the etcd raft family, `occ-2pc`) stay at the root in
+their upstream layout, as do the docs and `traces/` fixtures.
+
+Each model `<Model>.tla` has a sibling `<Model>.cfgs` file holding ALL of its
+checks as named sections in verbatim TLC config syntax:
+
+    ==== positive
+    SPECIFICATION FairSpec
+    ...
+    ==== BadSomething
+    SPECIFICATION Spec
+    ...
+
+The build extracts sections into `specs/tla/.generated/` at run time
+(`scripts/tla-cfg.sh`); section names match the make-target check ids
+(`positive`, `Bad*` mutants, `heavy-*`/`safety` variants). To hand-run one
+check: `bash ../scripts/tla-cfg.sh <CheckId> <Model>` prints the generated
+config path and the spec path to pass to TLC.
+
 ## Model Header Template
 
 Every new `.tla` model must start with a comment block containing:
@@ -46,16 +71,16 @@ Formal verification of the distributed 2PC + OCC + recovery + cleanup protocol.
 
 - `AntflyTransaction.tla` -- Main specification (11 actions, 6 safety invariants, 3 liveness properties)
 - `MC.tla` -- Model checking module with concrete constants for a small model
-- `AntflyTransaction.cfg` -- TLC configuration
-- `AntflyTransactionBadSkipIntentConflict.cfg` -- Expected-failure pending-intent conflict mutant used by `make tla-check-negative`
+- `AntflyTransaction.cfgs` -- TLC configuration
+- `AntflyTransactionBadSkipIntentConflict` -- Expected-failure pending-intent conflict mutant used by `make tla-check-negative`
 - `occ-2pc.tla` / `occ-2pc.cfg` -- Historical Piledriver spec that found the OCC lost update bug (PR #381)
 
 ### Shard Split Protocol
 
 - `AntflyShardSplit.tla` -- Shard split lifecycle with delta replay, dual-actor cutover, child leader election, and non-atomic finalize (18 actions, 10 safety invariants, 1 liveness property)
 - `ShardSplitMC.tla` -- Model checking module
-- `AntflyShardSplit.cfg` -- TLC configuration
-- `AntflyShardSplitBadPrematureChildDefault.cfg` -- Expected-failure child-default-before-cutover mutant used by `make tla-check-negative`
+- `AntflyShardSplit.cfgs` -- TLC configuration
+- `AntflyShardSplitBadPrematureChildDefault` -- Expected-failure child-default-before-cutover mutant used by `make tla-check-negative`
 
 ### Snapshot Transfer Protocol
 
@@ -63,155 +88,155 @@ Formal verification of the multi-raft snapshot creation, transfer, GC, and error
 
 - `AntflySnapshotTransfer.tla` -- Main specification (10 actions, 6 safety invariants, 2 liveness properties)
 - `SnapshotTransferMC.tla` -- Model checking module (3 nodes, configurable retries/snapshots)
-- `AntflySnapshotTransfer.cfg` -- Full TLC configuration (safety + liveness)
-- `AntflySnapshotTransfer-safety.cfg` -- Safety-only configuration (fast, ~90s)
-- `AntflySnapshotTransferBadApplyWithoutPut.cfg` -- Expected-failure transfer-done-without-local-archive mutant used by `make tla-check-negative`
+- `AntflySnapshotTransfer.cfgs` -- Full TLC configuration (safety + liveness)
+- `AntflySnapshotTransfer-safety` -- Safety-only configuration (fast, ~90s)
+- `AntflySnapshotTransferBadApplyWithoutPut` -- Expected-failure transfer-done-without-local-archive mutant used by `make tla-check-negative`
 
 ### LSM Lifecycle OOM Safety
 
 Formal verification of allocator-failure safety for Zig LSM cleanup ownership handoffs.
 
 - `AntflyLsmLifecycle.tla` -- Provisioned read/write cache entry retirement, LSM mutable read snapshot retirement, and `IndexWriter.removeSegments` temporary allocation cleanup.
-- `AntflyLsmLifecycle.cfg` -- TLC configuration for safety invariants.
-- `AntflyLsmLifecycleBadIndexTempLeak.cfg` -- Expected-failure index temporary allocation leak mutant used by `make tla-check-negative`.
+- `AntflyLsmLifecycle.cfgs` -- TLC configuration for safety invariants.
+- `AntflyLsmLifecycleBadIndexTempLeak` -- Expected-failure index temporary allocation leak mutant used by `make tla-check-negative`.
 
 ### Focused Lower-Level Models
 
 These specs are intentionally separate bounded models. They cover implementation-level contracts that are too specific to fold into one monolithic system model, while keeping each model check independently runnable.
 
 - `AntflyHAGates.tla` -- Exhaustive HA gate decision table for commit/read/write/owner-job/background-runtime behavior across role, fence, handoff, consistency, LSN, commit-mode, and failure-policy inputs.
-- `AntflyHAGatesBadStandbyRuntime.cfg` -- Expected-failure standby mutating background runtime mutant used by `make tla-check-negative`.
+- `AntflyHAGatesBadStandbyRuntime` -- Expected-failure standby mutating background runtime mutant used by `make tla-check-negative`.
 - `AntflyHAGateTransitions.tla` -- Transition sibling for HA gate stale-decision safety across role and fence changes.
-- `AntflyHAGateTransitionsBadStaleAllow.cfg` -- Expected-failure stale allow after role/fence transition mutant used by `make tla-check-negative`.
+- `AntflyHAGateTransitionsBadStaleAllow` -- Expected-failure stale allow after role/fence transition mutant used by `make tla-check-negative`.
 - `AntflyHAReplication.tla` -- Concrete HA replication slot progress, active/reseed/timeline eligibility, sync selection, sync wait target provenance, stale timeline ack rejection, fail-closed/degrade decisions, fencing receipts, standby promotion switch records, retained WAL floors, and former-primary rejoin.
-- `AntflyHAReplicationBadStaleTimelineAck.cfg` -- Expected-failure stale timeline ack mutant used by `make tla-check-negative`.
+- `AntflyHAReplicationBadStaleTimelineAck` -- Expected-failure stale timeline ack mutant used by `make tla-check-negative`.
 - `AntflyHASyncWait.tla` -- Fast HA sync-wait submodel for frozen target timeline/LSN provenance, captured standby ack evidence, timeline promotion after freeze, and below-target/wrong-timeline ack rejection.
-- `AntflyHASyncWaitBadMoveTarget.cfg` -- Expected-failure promotion-mutates-frozen-target mutant used by `make tla-check-negative`.
-- `AntflyHASyncWaitBadWrongTimelineAck.cfg` -- Expected-failure wrong-timeline ack mutant used by `make tla-check-negative`.
-- `AntflyHASyncWaitBadBelowTargetAck.cfg` -- Expected-failure below-target ack mutant used by `make tla-check-negative`.
+- `AntflyHASyncWaitBadMoveTarget` -- Expected-failure promotion-mutates-frozen-target mutant used by `make tla-check-negative`.
+- `AntflyHASyncWaitBadWrongTimelineAck` -- Expected-failure wrong-timeline ack mutant used by `make tla-check-negative`.
+- `AntflyHASyncWaitBadBelowTargetAck` -- Expected-failure below-target ack mutant used by `make tla-check-negative`.
 - `AntflyHATimelineSwitch.tla` -- Fast HA timeline-switch boundary submodel for parent received/applied/safe progress, monotonic switch timeline/epoch, crash recovery from a durable switch record, and old-timeline rejection after switch.
-- `AntflyHATimelineSwitchBadBeforeApplied.cfg` -- Expected-failure switch-before-parent-apply mutant used by `make tla-check-negative`.
-- `AntflyHATimelineSwitchBadNonMonotonic.cfg` -- Expected-failure non-monotonic timeline/epoch switch mutant used by `make tla-check-negative`.
-- `AntflyHATimelineSwitchBadOldTimeline.cfg` -- Expected-failure old-timeline record accepted after switch mutant used by `make tla-check-negative`.
-- `AntflyHATimelineSwitchBadRecoveryPrevious.cfg` -- Expected-failure crash recovery with mismatched switch `previous_lsn` mutant used by `make tla-check-negative`.
+- `AntflyHATimelineSwitchBadBeforeApplied` -- Expected-failure switch-before-parent-apply mutant used by `make tla-check-negative`.
+- `AntflyHATimelineSwitchBadNonMonotonic` -- Expected-failure non-monotonic timeline/epoch switch mutant used by `make tla-check-negative`.
+- `AntflyHATimelineSwitchBadOldTimeline` -- Expected-failure old-timeline record accepted after switch mutant used by `make tla-check-negative`.
+- `AntflyHATimelineSwitchBadRecoveryPrevious` -- Expected-failure crash recovery with mismatched switch `previous_lsn` mutant used by `make tla-check-negative`.
 - `AntflyHAStandbyApply.tla` -- Fast HA standby-apply submodel for durable receive, failed-apply progress, idempotent replay side effects, crash/reopen receive preservation, standby write rejection, and mutating-runtime suppression.
-- `AntflyHAStandbyApplyBadFailureAdvances.cfg` -- Expected-failure apply-failure-advances-progress mutant used by `make tla-check-negative`.
-- `AntflyHAStandbyApplyBadDuplicateEffect.cfg` -- Expected-failure duplicate replay side effect mutant used by `make tla-check-negative`.
-- `AntflyHAStandbyApplyBadCrashLosesReceive.cfg` -- Expected-failure crash-loses-durable-receive mutant used by `make tla-check-negative`.
-- `AntflyHAStandbyApplyBadClientWrite.cfg` -- Expected-failure standby client write mutant used by `make tla-check-negative`.
-- `AntflyHAStandbyApplyBadBackgroundRuntime.cfg` -- Expected-failure standby mutating background runtime mutant used by `make tla-check-negative`.
+- `AntflyHAStandbyApplyBadFailureAdvances` -- Expected-failure apply-failure-advances-progress mutant used by `make tla-check-negative`.
+- `AntflyHAStandbyApplyBadDuplicateEffect` -- Expected-failure duplicate replay side effect mutant used by `make tla-check-negative`.
+- `AntflyHAStandbyApplyBadCrashLosesReceive` -- Expected-failure crash-loses-durable-receive mutant used by `make tla-check-negative`.
+- `AntflyHAStandbyApplyBadClientWrite` -- Expected-failure standby client write mutant used by `make tla-check-negative`.
+- `AntflyHAStandbyApplyBadBackgroundRuntime` -- Expected-failure standby mutating background runtime mutant used by `make tla-check-negative`.
 - `AntflyHARejoin.tla` -- Fast HA former-primary rejoin submodel for fenced assessment, retained fork coverage, forced-promotion policy, stale assessment rejection, fork-record identity validation, rewind truncation, and reseed publication.
-- `AntflyHARejoinBadUnfencedRewind.cfg` -- Expected-failure unfenced rewind mutant used by `make tla-check-negative`.
-- `AntflyHARejoinBadExpiredWalRewind.cfg` -- Expected-failure expired-WAL rewind mutant used by `make tla-check-negative`.
-- `AntflyHARejoinBadForcedRewind.cfg` -- Expected-failure forced-promotion rewind-without-policy mutant used by `make tla-check-negative`.
-- `AntflyHARejoinBadIdentityMismatchRewind.cfg` -- Expected-failure identity/timeline mismatch rewind mutant used by `make tla-check-negative`.
-- `AntflyHARejoinBadStaleAssessment.cfg` -- Expected-failure stale assessment truncate mutant used by `make tla-check-negative`.
-- `AntflyHARejoinBadForkMismatch.cfg` -- Expected-failure fork-record mismatch truncate mutant used by `make tla-check-negative`.
+- `AntflyHARejoinBadUnfencedRewind` -- Expected-failure unfenced rewind mutant used by `make tla-check-negative`.
+- `AntflyHARejoinBadExpiredWalRewind` -- Expected-failure expired-WAL rewind mutant used by `make tla-check-negative`.
+- `AntflyHARejoinBadForcedRewind` -- Expected-failure forced-promotion rewind-without-policy mutant used by `make tla-check-negative`.
+- `AntflyHARejoinBadIdentityMismatchRewind` -- Expected-failure identity/timeline mismatch rewind mutant used by `make tla-check-negative`.
+- `AntflyHARejoinBadStaleAssessment` -- Expected-failure stale assessment truncate mutant used by `make tla-check-negative`.
+- `AntflyHARejoinBadForkMismatch` -- Expected-failure fork-record mismatch truncate mutant used by `make tla-check-negative`.
 - `AntflyHAFailoverSafety.tla` -- Focused HA failover safety model for acknowledged-write preservation, promotion fencing, and old-primary split-brain write suppression. Durability is commit-mode parameterized: sync-acked writes must survive promotion, async-acked writes may be lost by design. Its positive config also checks the `EventuallyPromoted` liveness property via `FairSpec`; `AntflyHARejoin`, `AntflyDerivedReplay`, and `AntflyEnrichmentLease` follow the same pattern (fair positive spec with no-permanent-stall properties, unfair `Spec` for mutants).
-- `AntflyHAFailoverSafetyBadPromoteMissingAck.cfg` -- Expected-failure promoted standby missing an acknowledged write mutant used by `make tla-check-negative`.
-- `AntflyHAFailoverSafetyBadOldPrimaryWrite.cfg` -- Expected-failure old-primary post-promotion write mutant used by `make tla-check-negative`.
+- `AntflyHAFailoverSafetyBadPromoteMissingAck` -- Expected-failure promoted standby missing an acknowledged write mutant used by `make tla-check-negative`.
+- `AntflyHAFailoverSafetyBadOldPrimaryWrite` -- Expected-failure old-primary post-promotion write mutant used by `make tla-check-negative`.
 - `AntflyHAPartitionFence.tla` -- Focused HA partition model for asynchronous fence delivery before promotion and old-primary write suppression after promotion.
-- `AntflyHAPartitionFenceBadPromoteBeforeFence.cfg` -- Expected-failure promote-before-fence-delivery mutant used by `make tla-check-negative`.
+- `AntflyHAPartitionFenceBadPromoteBeforeFence` -- Expected-failure promote-before-fence-delivery mutant used by `make tla-check-negative`.
 - `AntflyBatcherCoalescing.tla` -- Batcher per-key coalescing order and flush visibility for delete/write sequences.
-- `AntflyBatcherCoalescingBadDeleteWriteInversion.cfg` -- Expected-failure delete/write inversion mutant used by `make tla-check-negative`.
-- `AntflyBatcherCoalescingBadWriteDeleteInversion.cfg` -- Expected-failure write/delete inversion mutant used by `make tla-check-negative`.
-- `AntflyBatcherCoalescingBadPartialVisibility.cfg` -- Expected-failure partial flush visibility mutant used by `make tla-check-negative`.
+- `AntflyBatcherCoalescingBadDeleteWriteInversion` -- Expected-failure delete/write inversion mutant used by `make tla-check-negative`.
+- `AntflyBatcherCoalescingBadWriteDeleteInversion` -- Expected-failure write/delete inversion mutant used by `make tla-check-negative`.
+- `AntflyBatcherCoalescingBadPartialVisibility` -- Expected-failure partial flush visibility mutant used by `make tla-check-negative`.
 - `AntflyCdcCutover.tla` -- CDC snapshot high-water, stream cutover, and checkpoint-delivery safety.
-- `AntflyCdcCutoverBadBoundaryDuplicate.cfg` -- Expected-failure snapshot/stream boundary duplicate mutant used by `make tla-check-negative`.
-- `AntflyCdcCutoverBadCheckpointAhead.cfg` -- Expected-failure checkpoint-ahead-of-delivery mutant used by `make tla-check-negative`.
-- `AntflyCdcCutoverBadResumeReplay.cfg` -- Expected-failure crash/resume cursor replay mutant used by `make tla-check-negative`.
+- `AntflyCdcCutoverBadBoundaryDuplicate` -- Expected-failure snapshot/stream boundary duplicate mutant used by `make tla-check-negative`.
+- `AntflyCdcCutoverBadCheckpointAhead` -- Expected-failure checkpoint-ahead-of-delivery mutant used by `make tla-check-negative`.
+- `AntflyCdcCutoverBadResumeReplay` -- Expected-failure crash/resume cursor replay mutant used by `make tla-check-negative`.
 - `AntflyShardSplitSeq.tla` -- Sequence-level shard split delta safety for repeated writes to the same key.
-- `AntflyShardSplitSeqBadKeySetCutover.cfg` -- Expected-failure key-set cutover mutant used by `make tla-check-negative`.
+- `AntflyShardSplitSeqBadKeySetCutover` -- Expected-failure key-set cutover mutant used by `make tla-check-negative`.
 - `AntflySnapshotContent.tla` -- Snapshot content/index provenance model.
-- `AntflySnapshotContentBadWrongContent.cfg` -- Expected-failure wrong-content-for-index mutant used by `make tla-check-negative`.
-- `AntflySnapshotContentBadGcNeededContent.cfg` -- Expected-failure GC-of-needed-content mutant used by `make tla-check-negative`.
+- `AntflySnapshotContentBadWrongContent` -- Expected-failure wrong-content-for-index mutant used by `make tla-check-negative`.
+- `AntflySnapshotContentBadGcNeededContent` -- Expected-failure GC-of-needed-content mutant used by `make tla-check-negative`.
 - `AntflyLsmReserveCleanup.tla` -- Explicit LSM reserve/fail/cleanup ownership model.
-- `AntflyLsmReserveCleanupBadPublishWithoutReserve.cfg` -- Expected-failure publish-without-cleanup-reserve mutant used by `make tla-check-negative`.
-- `AntflyLsmReserveCleanupBadFailureLeaksTemp.cfg` -- Expected-failure failure-leaks-temp mutant used by `make tla-check-negative`.
+- `AntflyLsmReserveCleanupBadPublishWithoutReserve` -- Expected-failure publish-without-cleanup-reserve mutant used by `make tla-check-negative`.
+- `AntflyLsmReserveCleanupBadFailureLeaksTemp` -- Expected-failure failure-leaks-temp mutant used by `make tla-check-negative`.
 - `AntflyQueryCompleteness.tla` -- Split query routing completeness model for no missing or duplicate docs during route/serving transitions.
 - `AntflyNodeDrainLifecycle.tla` -- Node drain/scale-down lifecycle: drain/store-flag raft-transaction consistency, finalize preconditions, safe_to_terminate debt gate, registration-preserves-drain, and drain-eventually-safe liveness.
 - `AntflyTableLifecycle.tla` -- Table create/drop lifecycle: in-memory desired vs raft-committed topology, per-command applies, crash rebuilding desired from committed, planner scope, and convergence liveness.
 - `AntflyHARetentionReseed.tla` -- WAL retention floor vs per-slot reseed marking vs truncation, plus backup slots as retention pins with fail-closed backup end; no-permanent-unmarked-lag liveness.
 - `AntflyPromotionOwnerHandoff.tla` -- Entity promotion single-owner handoff across split/merge: detach-before-transfer-before-attach, non-durable attachment with crash/reattach, isLocalOwner promotion gate, handoff-completes liveness. Sketch-tier authority guardrail; intentionally collapses raft leadership and runtime detail.
 - `AntflyIndexLifecycle.tla` -- Index lifecycle (stale->building->fresh) with non-atomic durable status snapshots, shadow-swap completeness, watermark-validating crash recovery, and build-converges liveness.
-- `AntflyQueryCompletenessBadRouteBeforeChildReady.cfg` -- Expected-failure route-before-child-ready mutant used by `make tla-check-negative`.
-- `AntflyQueryCompletenessBadDoubleServe.cfg` -- Expected-failure parent/child double-serve mutant used by `make tla-check-negative`.
-- `AntflyQueryCompletenessBadMissingDoc.cfg` -- Expected-failure child-serving-without-moved-doc mutant used by `make tla-check-negative`.
+- `AntflyQueryCompletenessBadRouteBeforeChildReady` -- Expected-failure route-before-child-ready mutant used by `make tla-check-negative`.
+- `AntflyQueryCompletenessBadDoubleServe` -- Expected-failure parent/child double-serve mutant used by `make tla-check-negative`.
+- `AntflyQueryCompletenessBadMissingDoc` -- Expected-failure child-serving-without-moved-doc mutant used by `make tla-check-negative`.
 - `AntflyDerivedReplay.tla` -- Derived index replay-all rows, hint lane visibility, latest hint metadata, per-index catch-up targets, applied/query targets, bulk-session blocking, and replay truncation floors.
-- `AntflyDerivedReplay-heavy-depth.cfg` -- Depth-heavy single-index derived replay bounds used by `make tla-check-derived-replay-heavy`.
-- `AntflyDerivedReplay-heavy-multi-index.cfg` -- Multi-index derived replay bounds used by `make tla-check-derived-replay-heavy`.
-- `AntflyDerivedReplay-heavy.cfg` -- Full MaxSeq=3/two-index manual confidence bounds used by `make tla-check-derived-replay-heavy-full`.
-- `AntflyDerivedReplayBad.cfg` -- Expected-failure stale/empty hint-lane mutant used by `make tla-check-negative`.
+- `AntflyDerivedReplay-heavy-depth` -- Depth-heavy single-index derived replay bounds used by `make tla-check-derived-replay-heavy`.
+- `AntflyDerivedReplay-heavy-multi-index` -- Multi-index derived replay bounds used by `make tla-check-derived-replay-heavy`.
+- `AntflyDerivedReplay-heavy` -- Full MaxSeq=3/two-index manual confidence bounds used by `make tla-check-derived-replay-heavy-full`.
+- `AntflyDerivedReplayBad` -- Expected-failure stale/empty hint-lane mutant used by `make tla-check-negative`.
 - `AntflyEnrichmentLease.tla` -- Generated enrichment worker target/applied watermarks, replay visibility, retry/isolation state, and lease-owned collection/generation/publication so stale work cannot publish and hidden pending generated work cannot be skipped.
-- `AntflyEnrichmentLeaseBadStalePublish.cfg` -- Expected-failure stale lease publication mutant used by `make tla-check-negative`.
-- `AntflyEnrichmentLeaseBadEmptyPending.cfg` -- Expected-failure hidden pending advancement mutant used by `make tla-check-negative`.
+- `AntflyEnrichmentLeaseBadStalePublish` -- Expected-failure stale lease publication mutant used by `make tla-check-negative`.
+- `AntflyEnrichmentLeaseBadEmptyPending` -- Expected-failure hidden pending advancement mutant used by `make tla-check-negative`.
 - `AntflyLmdbCommit.tla` -- Zig LMDB prepared data pages, data-sync/meta-write/meta-sync publication phases, crash reopen meta selection, nested child transaction merge/abort, reader snapshots, and free-record reuse gated by oldest reader.
-- `AntflyLmdbCommitBadMetaBeforeData.cfg` -- Expected-failure meta-before-data mutant used by `make tla-check-negative`.
-- `AntflyLmdbCommitBadReaderReuse.cfg` -- Expected-failure reader-visible page reuse mutant used by `make tla-check-negative`.
+- `AntflyLmdbCommitBadMetaBeforeData` -- Expected-failure meta-before-data mutant used by `make tla-check-negative`.
+- `AntflyLmdbCommitBadReaderReuse` -- Expected-failure reader-visible page reuse mutant used by `make tla-check-negative`.
 - `AntflyLsmWalCompaction.tla` -- Segment-aware WAL append/sync/replay, crash truncation of unsynced tails, corrupt current-tail isolation, durable checkpointing, compaction publication, and reader-pinned segment retention.
-- `AntflyLsmWalCompactionBadCheckpoint.cfg` -- Expected-failure unsynced checkpoint mutant used by `make tla-check-negative`.
-- `AntflyLsmWalCompactionBadCorruptRotate.cfg` -- Expected-failure corrupt-tail rotation mutant used by `make tla-check-negative`.
-- `AntflyLsmWalCompactionBadPinnedRetire.cfg` -- Expected-failure reader-pinned segment retirement mutant used by `make tla-check-negative`.
+- `AntflyLsmWalCompactionBadCheckpoint` -- Expected-failure unsynced checkpoint mutant used by `make tla-check-negative`.
+- `AntflyLsmWalCompactionBadCorruptRotate` -- Expected-failure corrupt-tail rotation mutant used by `make tla-check-negative`.
+- `AntflyLsmWalCompactionBadPinnedRetire` -- Expected-failure reader-pinned segment retirement mutant used by `make tla-check-negative`.
 - `AntflyDbSplitVisibility.tla` -- DB split/merge visibility for right-range snapshot copy, parent split deltas, child replay, text/sparse/graph shadow index catch-up, child artifact placement, enrichment owner fencing, direct child writes, and merge receiver index routing.
-- `AntflyDbSplitVisibilityBadParentWrite.cfg` -- Expected-failure post-cutover parent child-range write mutant used by `make tla-check-negative`.
-- `AntflyDbSplitVisibilityBadChildServe.cfg` -- Expected-failure premature child serving before replay/index catch-up mutant used by `make tla-check-negative`.
-- `AntflyDbSplitVisibilityBadMergeDonor.cfg` -- Expected-failure merge donor post-handoff serving mutant used by `make tla-check-negative`.
-- `AntflyDbSplitVisibilityBadEnrichmentOwner.cfg` -- Expected-failure stale/non-owning enrichment publication mutant used by `make tla-check-negative`.
+- `AntflyDbSplitVisibilityBadParentWrite` -- Expected-failure post-cutover parent child-range write mutant used by `make tla-check-negative`.
+- `AntflyDbSplitVisibilityBadChildServe` -- Expected-failure premature child serving before replay/index catch-up mutant used by `make tla-check-negative`.
+- `AntflyDbSplitVisibilityBadMergeDonor` -- Expected-failure merge donor post-handoff serving mutant used by `make tla-check-negative`.
+- `AntflyDbSplitVisibilityBadEnrichmentOwner` -- Expected-failure stale/non-owning enrichment publication mutant used by `make tla-check-negative`.
 - `AntflySplitRefinementBridge.tla` -- Boundary model linking shard split fence/cutover readiness to DB-local replay/index readiness and metadata child routing.
-- `AntflySplitRefinementBridgeBadRouteBeforeDbServing.cfg` -- Expected-failure metadata route-before-DB-serving mutant used by `make tla-check-negative`.
-- `AntflySplitRefinementBridgeBadDbServeBeforeShardCutover.cfg` -- Expected-failure DB child-serving-before-shard-cutover mutant used by `make tla-check-negative`.
-- `AntflySplitRefinementBridgeBadStaleFenceCutover.cfg` -- Expected-failure stale-fence split cutover mutant used by `make tla-check-negative`.
+- `AntflySplitRefinementBridgeBadRouteBeforeDbServing` -- Expected-failure metadata route-before-DB-serving mutant used by `make tla-check-negative`.
+- `AntflySplitRefinementBridgeBadDbServeBeforeShardCutover` -- Expected-failure DB child-serving-before-shard-cutover mutant used by `make tla-check-negative`.
+- `AntflySplitRefinementBridgeBadStaleFenceCutover` -- Expected-failure stale-fence split cutover mutant used by `make tla-check-negative`.
 - `AntflyDocumentIdentity.tla` -- Document identity namespace, stable ordinal ownership, generation visibility, resolved-doc-filter context, canonical namespace repair, and strict namespace-open behavior.
-- `AntflyDocumentIdentityBadReuseOrdinal.cfg` -- Expected-failure tombstoned ordinal reuse mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityBadStaleFilter.cfg` -- Expected-failure stale resolved-doc-filter generation mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityBadNamespaceMismatch.cfg` -- Expected-failure strict namespace-open mismatch mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityBadReuseOrdinal` -- Expected-failure tombstoned ordinal reuse mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityBadStaleFilter` -- Expected-failure stale resolved-doc-filter generation mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityBadNamespaceMismatch` -- Expected-failure strict namespace-open mismatch mutant used by `make tla-check-negative`.
 - `AntflyDocumentIdentityRangeRepair.tla` -- Document identity split/merge namespace compatibility and restore/import/runtime-repair ordering across representative healthy, mixed-version, reassignment-active, conflict, rebuild-required, and ordinal-capacity states.
-- `AntflyDocumentIdentityRangeRepairBadSplitUnhealthy.cfg` -- Expected-failure split validation accepts unhealthy source identity status mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityRangeRepairBadSplitDestNamespace.cfg` -- Expected-failure split destination reports the wrong identity namespace mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityRangeRepairBadMergeMismatch.cfg` -- Expected-failure merge accepts incompatible donor/receiver namespaces without opt-in mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityRangeRepairBadMergeActiveReassign.cfg` -- Expected-failure merge reassignment runs without opt-in or healthy status mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityRangeRepairBadRestoreNamespace.cfg` -- Expected-failure strict deferred restore accepts a mismatched doc identity namespace mutant used by `make tla-check-negative`.
-- `AntflyDocumentIdentityRangeRepairBadRestoreEarlyClear.cfg` -- Expected-failure restore intent clears before import recovery and runtime repair complete mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityRangeRepairBadSplitUnhealthy` -- Expected-failure split validation accepts unhealthy source identity status mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityRangeRepairBadSplitDestNamespace` -- Expected-failure split destination reports the wrong identity namespace mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityRangeRepairBadMergeMismatch` -- Expected-failure merge accepts incompatible donor/receiver namespaces without opt-in mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityRangeRepairBadMergeActiveReassign` -- Expected-failure merge reassignment runs without opt-in or healthy status mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityRangeRepairBadRestoreNamespace` -- Expected-failure strict deferred restore accepts a mismatched doc identity namespace mutant used by `make tla-check-negative`.
+- `AntflyDocumentIdentityRangeRepairBadRestoreEarlyClear` -- Expected-failure restore intent clears before import recovery and runtime repair complete mutant used by `make tla-check-negative`.
 - `TraceAntflyDocumentIdentityRangeRepair.tla` -- Trace fixture validator for document identity range/restore repair sequences, including strict deferred restore namespace rejection and import recovery before runtime repair/intent clear.
-- `TraceAntflyDocumentIdentityRangeRepair.cfg` -- Trace validation config used by `make tla-trace-doc-identity-range-repair`.
+- `TraceAntflyDocumentIdentityRangeRepair.cfgs` -- Trace validation config used by `make tla-trace-doc-identity-range-repair`.
 - `traces/doc_identity_restore_namespace_reject.ndjson` and `traces/doc_identity_restore_repair_order.ndjson` -- Checked-in positive restore repair fixtures.
 - `traces/negative/doc_identity_restore_accept_mismatch.ndjson` and `traces/negative/doc_identity_restore_early_clear.ndjson` -- Expected-failure restore repair fixtures used by trace-negative targets.
 - `AntflyTransactionSession.tla` -- Session savepoints over distributed transaction prepare/commit/abort/recovery/resolve/cleanup, with committed-base visibility separated from staged writes, crash-finalized orphan intent recovery, identity-row side effects, and participant cleanup gating.
-- `AntflyTransactionSessionBadRollback.cfg` -- Expected-failure rollback leakage mutant used by `make tla-check-negative`.
-- `AntflyTransactionSessionBadRecoveryDecision.cfg` -- Expected-failure aborted-orphan wrong recovery decision mutant used by `make tla-check-negative`.
-- `AntflyTransactionSessionBadCleanup.cfg` -- Expected-failure unresolved participant cleanup mutant used by `make tla-check-negative`.
+- `AntflyTransactionSessionBadRollback` -- Expected-failure rollback leakage mutant used by `make tla-check-negative`.
+- `AntflyTransactionSessionBadRecoveryDecision` -- Expected-failure aborted-orphan wrong recovery decision mutant used by `make tla-check-negative`.
+- `AntflyTransactionSessionBadCleanup` -- Expected-failure unresolved participant cleanup mutant used by `make tla-check-negative`.
 - `AntflyManagedHostLifecycle.tla` -- Managed raft host desired/hosted/active/routes reconciliation, durable apply stores, replica catalog persistence, restart recovery, backup-restore bootstrap prepare/success/failure, and restore cancellation.
-- `AntflyManagedHostLifecycleBadPrematureRestore.cfg` -- Expected-failure restore activation before bootstrap completion mutant used by `make tla-check-negative`.
-- `AntflyManagedHostLifecycleBadStaleRoute.cfg` -- Expected-failure stale route after metadata removal mutant used by `make tla-check-negative`.
-- `AntflyManagedHostLifecycleBadReviveRemoved.cfg` -- Expected-failure removed replica catalog revival mutant used by `make tla-check-negative`.
-- `AntflyManagedHostLifecycleBadRestoreCancel.cfg` -- Expected-failure uncancelled restore bootstrap mutant used by `make tla-check-negative`.
+- `AntflyManagedHostLifecycleBadPrematureRestore` -- Expected-failure restore activation before bootstrap completion mutant used by `make tla-check-negative`.
+- `AntflyManagedHostLifecycleBadStaleRoute` -- Expected-failure stale route after metadata removal mutant used by `make tla-check-negative`.
+- `AntflyManagedHostLifecycleBadReviveRemoved` -- Expected-failure removed replica catalog revival mutant used by `make tla-check-negative`.
+- `AntflyManagedHostLifecycleBadRestoreCancel` -- Expected-failure uncancelled restore bootstrap mutant used by `make tla-check-negative`.
 - `AntflyLitePublication.tla` -- Lite/serverless publication ordering for document/mutation/text/vector/sparse/graph artifacts, manifest references, HEAD advancement, crash-before-HEAD retry, reader generation pinning, failed publication discard, and cleanup retention.
-- `AntflyLitePublicationBadManifestBeforeArtifacts.cfg` -- Expected-failure manifest-before-artifacts mutant used by `make tla-check-negative`.
-- `AntflyLitePublicationBadFailedHead.cfg` -- Expected-failure failed-publication visible HEAD mutant used by `make tla-check-negative`.
-- `AntflyLitePublicationBadPinnedCleanup.cfg` -- Expected-failure reader-pinned cleanup mutant used by `make tla-check-negative`.
-- `AntflyLitePublicationBadMixedGeneration.cfg` -- Expected-failure mixed visible generation mutant used by `make tla-check-negative`.
+- `AntflyLitePublicationBadManifestBeforeArtifacts` -- Expected-failure manifest-before-artifacts mutant used by `make tla-check-negative`.
+- `AntflyLitePublicationBadFailedHead` -- Expected-failure failed-publication visible HEAD mutant used by `make tla-check-negative`.
+- `AntflyLitePublicationBadPinnedCleanup` -- Expected-failure reader-pinned cleanup mutant used by `make tla-check-negative`.
+- `AntflyLitePublicationBadMixedGeneration` -- Expected-failure mixed visible generation mutant used by `make tla-check-negative`.
 - `AntflyMlGraphPasses.tla` -- ML graph const-fold/CSE/fuse/DCE pass publication, parameter/constant identity preservation, fused lower-closure export, external partition runtime inputs, fallback runtime gates, and failed-pass partial-output suppression.
-- `AntflyMlGraphPassesBadDanglingCse.cfg` -- Expected-failure CSE stale remap/dangling edge mutant used by `make tla-check-negative`.
-- `AntflyMlGraphPassesBadParameterDedup.cfg` -- Expected-failure parameter/constant identity collapse mutant used by `make tla-check-negative`.
-- `AntflyMlGraphPassesBadMissingLowerClosure.cfg` -- Expected-failure fused partition export without primitive lower closure mutant used by `make tla-check-negative`.
-- `AntflyMlGraphPassesBadFallbackRuntime.cfg` -- Expected-failure fallback partition runtime publication mutant used by `make tla-check-negative`.
-- `AntflyMlGraphPassesBadPartialPublish.cfg` -- Expected-failure failed-pass partial output publication mutant used by `make tla-check-negative`.
+- `AntflyMlGraphPassesBadDanglingCse` -- Expected-failure CSE stale remap/dangling edge mutant used by `make tla-check-negative`.
+- `AntflyMlGraphPassesBadParameterDedup` -- Expected-failure parameter/constant identity collapse mutant used by `make tla-check-negative`.
+- `AntflyMlGraphPassesBadMissingLowerClosure` -- Expected-failure fused partition export without primitive lower closure mutant used by `make tla-check-negative`.
+- `AntflyMlGraphPassesBadFallbackRuntime` -- Expected-failure fallback partition runtime publication mutant used by `make tla-check-negative`.
+- `AntflyMlGraphPassesBadPartialPublish` -- Expected-failure failed-pass partial output publication mutant used by `make tla-check-negative`.
 - `AntflyMlGraphDagPasses.tla` -- Bounded arbitrary-DAG ML CSE/DCE remapping model for duplicate elimination, consumer/output/parameter remaps, reachable-node DCE, compact topological `id_map`, and final dangling-reference exclusion.
-- `AntflyMlGraphDagPassesBadCseMissDuplicate.cfg` -- Expected-failure missed duplicate CSE mutant used by `make tla-check-negative`.
-- `AntflyMlGraphDagPassesBadCseNoConsumerRemap.cfg` -- Expected-failure stale consumer/output remap mutant used by `make tla-check-negative`.
-- `AntflyMlGraphDagPassesBadDceDropReachable.cfg` -- Expected-failure reachable node dropped by DCE mutant used by `make tla-check-negative`.
-- `AntflyMlGraphDagPassesBadDceNonTopoMap.cfg` -- Expected-failure non-topological compact DCE map mutant used by `make tla-check-negative`.
+- `AntflyMlGraphDagPassesBadCseMissDuplicate` -- Expected-failure missed duplicate CSE mutant used by `make tla-check-negative`.
+- `AntflyMlGraphDagPassesBadCseNoConsumerRemap` -- Expected-failure stale consumer/output remap mutant used by `make tla-check-negative`.
+- `AntflyMlGraphDagPassesBadDceDropReachable` -- Expected-failure reachable node dropped by DCE mutant used by `make tla-check-negative`.
+- `AntflyMlGraphDagPassesBadDceNonTopoMap` -- Expected-failure non-topological compact DCE map mutant used by `make tla-check-negative`.
 - `AntflyMlCompilerPublication.tla` -- ML partition export, PJRT/native compiler artifact, semantic KV input/output selection, graph-version freshness, fallback gate, and runtime executor publication boundaries.
-- `AntflyMlCompilerPublicationBadStaleCompile.cfg` -- Expected-failure stale graph/export compile publication mutant used by `make tla-check-negative`.
-- `AntflyMlCompilerPublicationBadMissingInput.cfg` -- Expected-failure missing parameter/cache runtime input mutant used by `make tla-check-negative`.
-- `AntflyMlCompilerPublicationBadOutputSelection.cfg` -- Expected-failure semantic KV side-output leak mutant used by `make tla-check-negative`.
-- `AntflyMlCompilerPublicationBadFallbackPublish.cfg` -- Expected-failure fallback partition executor publication mutant used by `make tla-check-negative`.
-- `AntflyMlCompilerPublicationBadPartialArtifact.cfg` -- Expected-failure partial compiler artifact visibility mutant used by `make tla-check-negative`.
+- `AntflyMlCompilerPublicationBadStaleCompile` -- Expected-failure stale graph/export compile publication mutant used by `make tla-check-negative`.
+- `AntflyMlCompilerPublicationBadMissingInput` -- Expected-failure missing parameter/cache runtime input mutant used by `make tla-check-negative`.
+- `AntflyMlCompilerPublicationBadOutputSelection` -- Expected-failure semantic KV side-output leak mutant used by `make tla-check-negative`.
+- `AntflyMlCompilerPublicationBadFallbackPublish` -- Expected-failure fallback partition executor publication mutant used by `make tla-check-negative`.
+- `AntflyMlCompilerPublicationBadPartialArtifact` -- Expected-failure partial compiler artifact visibility mutant used by `make tla-check-negative`.
 - `AntflyOpenApiCodegen.tla` -- OpenAPI checked-generation publication across modular spec versions, joined/prefixed public specs, root `openapi.yaml`, generated package modes, import mappings, public/internal package boundaries, committed state, failed partial generation, and `generated-check` pass/fail state.
-- `AntflyOpenApiCodegenBadStalePackage.cfg` -- Expected-failure stale generated package mutant used by `make tla-check-negative`.
-- `AntflyOpenApiCodegenBadStaleRoot.cfg` -- Expected-failure stale root `openapi.yaml` mutant used by `make tla-check-negative`.
-- `AntflyOpenApiCodegenBadInternalLeak.cfg` -- Expected-failure public client internal import mutant used by `make tla-check-negative`.
-- `AntflyOpenApiCodegenBadPartialCommit.cfg` -- Expected-failure failed partial generation commit mutant used by `make tla-check-negative`.
+- `AntflyOpenApiCodegenBadStalePackage` -- Expected-failure stale generated package mutant used by `make tla-check-negative`.
+- `AntflyOpenApiCodegenBadStaleRoot` -- Expected-failure stale root `openapi.yaml` mutant used by `make tla-check-negative`.
+- `AntflyOpenApiCodegenBadInternalLeak` -- Expected-failure public client internal import mutant used by `make tla-check-negative`.
+- `AntflyOpenApiCodegenBadPartialCommit` -- Expected-failure failed partial generation commit mutant used by `make tla-check-negative`.
 
 ### Raft Consensus (etcd/raft)
 
@@ -236,7 +261,7 @@ Validates that the zig raft implementation (`../raft/`) conforms to `etcdraft.tl
 Validates that the distributed transaction implementation conforms to `AntflyTransaction.tla` by replaying ndjson traces. Constants (transactions, shards, keys) are derived from the trace file -- no MC module needed.
 
 - `TraceAntflyTransaction.tla` -- Trace refinement spec
-- `TraceAntflyTransaction.cfg` -- TLC configuration (checks `TraceMatched` and 5 safety invariants)
+- `TraceAntflyTransaction.cfgs` -- TLC configuration (checks `TraceMatched` and 5 safety invariants)
 - `../../scripts/tla-filter-txn-trace.py` -- Filters transaction traces for spec compatibility
 
 ### Transaction Session Trace Fixture Validation
@@ -244,7 +269,7 @@ Validates that the distributed transaction implementation conforms to `AntflyTra
 Validates checked-in transaction/session fixtures against `AntflyTransactionSession.tla`. These fixtures mirror storage transaction recovery and public session savepoint scenarios, but they are not currently emitted live by Zig tests. Each event can assert post-action state fields so replay checks visible document count, identity-row count, staged intent count, savepoint state, participant resolution, and cleanup state.
 
 - `TraceAntflyTransactionSession.tla` -- Trace refinement spec for `txn-session-trace` NDJSON events (`BeginSession`, `StageWrite`, `CreateSavepoint`, `RollbackToSavepoint`, `PrepareParticipant`, `Commit`, `Abort`, `MarkStalePending`, `RecoverStalePending`, `CrashFinalizeCommittedOrphan`, `CrashFinalizeAbortedOrphan`, `RecoverFinalizedIntents`, `ResolveParticipant`, `Cleanup`)
-- `TraceAntflyTransactionSession.cfg` -- TLC configuration (checks `TraceMatched` and session trace safety)
+- `TraceAntflyTransactionSession.cfgs` -- TLC configuration (checks `TraceMatched` and session trace safety)
 - `traces/txn_session_savepoint.ndjson` -- Savepoint rollback and commit fixture
 - `traces/txn_session_orphan_recovery.ndjson` -- Committed and aborted finalized-orphan recovery fixture
 - `traces/txn_session_stale_pending.ndjson` -- Stale pending auto-abort fixture
@@ -255,7 +280,7 @@ Validates checked-in transaction/session fixtures against `AntflyTransactionSess
 Validates checked-in HA trace fixtures against the focused HA contracts for standby receive/apply, sync-wait acknowledgements, timeline switch boundaries, and former-primary rejoin/reseed. These fixtures mirror existing HA chaos/rejoin scenarios, but they are not currently emitted live by the Zig HA tests.
 
 - `TraceAntflyHA.tla` -- Trace refinement spec for `ha-trace` NDJSON events (`PrimaryAppend`, `StandbyReceive`, `StandbyApplySuccess`, `StandbyApplyFailure`, `FreezeSyncWait`, `StatusAck`, `TimelineSwitch`, `RejectOldTimeline`, `AssessRejoin`, `LateFormerPrimaryWrite`, `ExecuteRewind`, `ExecuteReseed`)
-- `TraceAntflyHA.cfg` -- TLC configuration (checks `TraceMatched` and HA trace safety invariants)
+- `TraceAntflyHA.cfgs` -- TLC configuration (checks `TraceMatched` and HA trace safety invariants)
 - `traces/ha_sync_apply.ndjson` -- Sync/apply fixture covering durable receive, failed apply, retry, idempotence, and frozen-target acknowledgement
 - `traces/ha_timeline_switch.ndjson` -- Timeline-switch fixture covering parent progress, switch record, status acknowledgement, and old-timeline rejection
 - `traces/ha_rejoin.ndjson` -- Rejoin fixture covering assessment, late write, rewind, and reseed publication paths
@@ -265,7 +290,7 @@ Validates checked-in HA trace fixtures against the focused HA contracts for stan
 Validates checked-in split bridge fixtures against `AntflySplitRefinementBridge.tla`. These fixtures mirror representative shard fence/cutover, DB replay/index catch-up, metadata routing, and rollback orderings, but they are not currently emitted live by Zig tests.
 
 - `TraceAntflySplitRefinementBridge.tla` -- Trace fixture spec for `split-bridge-trace` NDJSON events (`BeginSplit`, `ParentRightWrite`, `ReplayDelta`, `BuildTextIndex`, `BuildSparseIndex`, `BuildGraphIndex`, `SetShardFence`, `CompleteShardCutover`, `PublishDbChildServing`, `RouteMetadataToChild`, `Rollback`)
-- `TraceAntflySplitRefinementBridge.cfg` -- TLC configuration (checks `TraceMatched` and bridge safety invariants)
+- `TraceAntflySplitRefinementBridge.cfgs` -- TLC configuration (checks `TraceMatched` and bridge safety invariants)
 - `traces/split_bridge_cutover.ndjson` -- Positive cutover fixture covering DB catch-up before serving and metadata routing
 - `traces/split_bridge_rollback.ndjson` -- Positive rollback fixture covering no child exposure after rollback
 - `traces/negative/split_bridge_route_before_db_serving.ndjson` -- Expected-failure fixture where metadata routes to the child before DB serving is published
@@ -517,7 +542,7 @@ JAVA="/Applications/TLA+ Toolbox.app/Contents/Eclipse/plugins/org.lamport.openjd
 TLA2TOOLS="/Applications/TLA+ Toolbox.app/Contents/Eclipse/tla2tools.jar"
 
 "$JAVA" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC MC.tla \
-    -config AntflyTransaction.cfg -workers auto -deadlock
+    -config AntflyTransaction.cfgs -workers auto -deadlock
 ```
 
 ### Using system Java + standalone jar
@@ -525,7 +550,7 @@ TLA2TOOLS="/Applications/TLA+ Toolbox.app/Contents/Eclipse/tla2tools.jar"
 ```bash
 cd specs/tla
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar tlc2.TLC MC.tla \
-    -config AntflyTransaction.cfg -workers auto -deadlock
+    -config AntflyTransaction.cfgs -workers auto -deadlock
 ```
 
 ### Expected output
@@ -617,7 +642,7 @@ Transaction setup:
 
 ```bash
 "$JAVA" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC SnapshotTransferMC.tla \
-    -config AntflySnapshotTransfer-safety.cfg -workers auto -deadlock
+    -config AntflySnapshotTransfer-safety -workers auto -deadlock
 ```
 
 **Safety + liveness** (requires reduced constants — edit `SnapshotTransferMC.tla`):
@@ -626,7 +651,7 @@ Set `MCMaxRetries == 1` and `MCMaxSnapshots == 1`, then:
 
 ```bash
 "$JAVA" -XX:+UseParallelGC -cp "$TLA2TOOLS" tlc2.TLC SnapshotTransferMC.tla \
-    -config AntflySnapshotTransfer.cfg -workers auto -deadlock
+    -config AntflySnapshotTransfer.cfgs -workers auto -deadlock
 ```
 
 > **Note**: Liveness checking with strong fairness (SF) is expensive.
@@ -706,7 +731,7 @@ or directly:
 cd zig/specs/tla
 java -XX:+UseParallelGC -cp /path/to/tla2tools.jar tlc2.TLC \
     AntflyLsmLifecycle.tla \
-    -config AntflyLsmLifecycle.cfg -workers auto -deadlock
+    -config AntflyLsmLifecycle.cfgs -workers auto -deadlock
 ```
 
 ### What it Verifies

@@ -1,0 +1,69 @@
+\* All TLC check configs for AntflyHASyncWait.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHASyncWait.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyMoveFrozenTarget = FALSE
+    BuggyAckWrongTimeline = FALSE
+    BuggyAckBelowTarget = FALSE
+
+INVARIANTS
+    TypeOK
+    FrozenTargetDoesNotMove
+    AckMatchesFrozenTimeline
+    AckSatisfiesFrozenLsn
+    AckComesFromMatchingSlot
+    AckSlotAppliedEnough
+    Safety
+
+==== BadBelowTargetAck
+\* Expected-failure config: a standby ack below the frozen LSN satisfies the
+\* sync wait.
+\* Pinned to the specific semantic invariant this mutant must violate.
+\* AckSlotAppliedEnough is intentionally coupled (same ack-evidence step).
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyMoveFrozenTarget = FALSE
+    BuggyAckWrongTimeline = FALSE
+    BuggyAckBelowTarget = TRUE
+
+INVARIANTS
+    AckSatisfiesFrozenLsn
+
+==== BadMoveTarget
+\* Expected-failure config: promotion mutates an already frozen sync-wait
+\* target to the new timeline.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyMoveFrozenTarget = TRUE
+    BuggyAckWrongTimeline = FALSE
+    BuggyAckBelowTarget = FALSE
+
+INVARIANTS
+    FrozenTargetDoesNotMove
+
+==== BadWrongTimelineAck
+\* Expected-failure config: a standby ack from the wrong timeline satisfies a
+\* frozen sync-wait target.
+\* Pinned to the specific semantic invariant this mutant must violate.
+\* AckComesFromMatchingSlot is intentionally coupled (same ack-evidence step).
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyMoveFrozenTarget = FALSE
+    BuggyAckWrongTimeline = TRUE
+    BuggyAckBelowTarget = FALSE
+
+INVARIANTS
+    AckMatchesFrozenTimeline

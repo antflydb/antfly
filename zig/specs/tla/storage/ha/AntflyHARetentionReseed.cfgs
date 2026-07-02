@@ -1,0 +1,49 @@
+\* All TLC check configs for AntflyHARetentionReseed.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHARetentionReseed.tla.
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyTruncateIgnoresUnmarkedSlot = FALSE
+    BuggyBackupEndIgnoresLostWal = FALSE
+
+INVARIANTS
+    TypeOK
+    TruncationCoversUnmarkedActiveSlots
+    BackupEndFailsClosed
+    Safety
+
+PROPERTIES
+    NoPermanentUnmarkedLag
+
+==== BadBackupIgnoresLostWal
+\* Expected-failure config: endBaseBackup skips retention validation and
+\* reports success after its slot was lost or its WAL truncated. Pinned to
+\* the fail-closed backup invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyTruncateIgnoresUnmarkedSlot = FALSE
+    BuggyBackupEndIgnoresLostWal = TRUE
+
+INVARIANTS
+    BackupEndFailsClosed
+
+==== BadTruncateUnmarked
+\* Expected-failure config: truncation uses a floor that assumes the
+\* mark-reseed loop already ran, deleting WAL a still-unmarked lagging slot
+\* needs. Pinned to the mark-before-truncate invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyTruncateIgnoresUnmarkedSlot = TRUE
+    BuggyBackupEndIgnoresLostWal = FALSE
+
+INVARIANTS
+    TruncationCoversUnmarkedActiveSlots

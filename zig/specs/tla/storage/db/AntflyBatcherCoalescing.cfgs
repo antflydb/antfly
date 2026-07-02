@@ -1,0 +1,75 @@
+\* All TLC check configs for AntflyBatcherCoalescing.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDeleteWriteInversion = FALSE
+    BuggyWriteDeleteInversion = FALSE
+    BuggyPartialVisibility = FALSE
+
+INVARIANTS
+    TypeOK
+    LastOperationWinsPerKey
+    DeleteVisibleBeforeWriteOnly
+    NoPartialVisibility
+    Safety
+
+==== BadDeleteVisibleWithoutDelete
+\* Expected-failure config for AntflyBatcherCoalescing.tla.
+\* Reuses the delete->write inversion mutant, pinned to the invariant that a
+\* durable deleted value must come from a trailing delete operation.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDeleteWriteInversion = TRUE
+    BuggyWriteDeleteInversion = FALSE
+    BuggyPartialVisibility = FALSE
+
+INVARIANTS
+    DeleteVisibleBeforeWriteOnly
+
+==== BadDeleteWriteInversion
+\* Expected-failure config for AntflyBatcherCoalescing.tla.
+\* Enables a mutant where delete+write for the same key flushes as delete.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDeleteWriteInversion = TRUE
+    BuggyWriteDeleteInversion = FALSE
+    BuggyPartialVisibility = FALSE
+
+INVARIANTS
+    LastOperationWinsPerKey
+
+==== BadPartialVisibility
+\* Expected-failure config for AntflyBatcherCoalescing.tla.
+\* Enables a mutant where a partially coalesced batch becomes visible.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDeleteWriteInversion = FALSE
+    BuggyWriteDeleteInversion = FALSE
+    BuggyPartialVisibility = TRUE
+
+INVARIANTS
+    NoPartialVisibility
+
+==== BadWriteDeleteInversion
+\* Expected-failure config for AntflyBatcherCoalescing.tla.
+\* Enables a mutant where write+delete for the same key flushes as written.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyDeleteWriteInversion = FALSE
+    BuggyWriteDeleteInversion = TRUE
+    BuggyPartialVisibility = FALSE
+
+INVARIANTS
+    LastOperationWinsPerKey

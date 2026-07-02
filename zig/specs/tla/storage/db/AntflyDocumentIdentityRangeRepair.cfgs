@@ -1,0 +1,136 @@
+\* All TLC check configs for AntflyDocumentIdentityRangeRepair.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyDocumentIdentityRangeRepair.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+INVARIANTS
+    TypeOK
+    SplitRequiresHealthySource
+    SplitDestinationStatusMatchesExpectedNamespace
+    MergeRequiresCompatibleIdentityStatus
+    MergeReassignmentRequiresOptInAndHealthyStatus
+    StrictRestoreRejectsNamespaceMismatch
+    RuntimeRepairRequiresRecoveredPrimaryImport
+    RestoreIntentClearsOnlyAfterRepairComplete
+    Safety
+
+==== BadMergeActiveReassign
+\* Expected-failure config: merge namespace reassignment runs without the
+\* required opt-in and healthy donor/receiver identity status.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = TRUE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+INVARIANTS
+    MergeReassignmentRequiresOptInAndHealthyStatus
+
+==== BadMergeMismatch
+\* Expected-failure config: merge validation accepts incompatible document
+\* identity namespaces without explicit reassignment opt-in.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = TRUE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+INVARIANTS
+    MergeRequiresCompatibleIdentityStatus
+
+==== BadRestoreEarlyClear
+\* Expected-failure config: metadata clears restore intent before primary
+\* import recovery and runtime repair have both completed.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = TRUE
+
+INVARIANTS
+    RestoreIntentClearsOnlyAfterRepairComplete
+
+==== BadRestoreNamespace
+\* Expected-failure config: strict deferred restore accepts a source snapshot
+\* whose document identity namespace does not match the target namespace.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = TRUE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+INVARIANTS
+    StrictRestoreRejectsNamespaceMismatch
+
+==== BadSplitDestNamespace
+\* Expected-failure config: split destination status accepts a stale document
+\* identity namespace instead of the expected destination namespace.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = FALSE
+    BuggySplitAcceptsStaleDestNamespace = TRUE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+INVARIANTS
+    SplitDestinationStatusMatchesExpectedNamespace
+
+==== BadSplitUnhealthy
+\* Expected-failure config: split validation accepts a source group whose
+\* document identity lifecycle is active, conflicted, rebuild-required, or
+\* ordinal-exhausted.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySplitAllowsUnhealthySource = TRUE
+    BuggySplitAcceptsStaleDestNamespace = FALSE
+    BuggyMergeAllowsMismatchWithoutOptIn = FALSE
+    BuggyMergeAllowsActiveReassignment = FALSE
+    BuggyRestoreAcceptsNamespaceMismatch = FALSE
+    BuggyRestoreClearsBeforeRepair = FALSE
+
+INVARIANTS
+    SplitRequiresHealthySource

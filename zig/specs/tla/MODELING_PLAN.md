@@ -279,11 +279,11 @@ Validation:
 
 - `make tla-check-lsm-wal-compaction` is green with the segment-aware model.
 - Negative model: checkpoint includes unsynced entry fails via
-  `AntflyLsmWalCompactionBadCheckpoint.cfg`.
+  `AntflyLsmWalCompactionBadCheckpoint`.
 - Negative model: corrupt current tail rotates into retained history fails via
-  `AntflyLsmWalCompactionBadCorruptRotate.cfg`.
+  `AntflyLsmWalCompactionBadCorruptRotate`.
 - Negative model: compaction frees reader-pinned segment fails via
-  `AntflyLsmWalCompactionBadPinnedRetire.cfg`.
+  `AntflyLsmWalCompactionBadPinnedRetire`.
 - Current Zig alignment includes full `wal-test`, focused root snapshot pinning,
   and broad `lsm-backend-test` checkpoint/reopen/retirement coverage. The next
   validation step is to map backend APIs and tests directly to model actions and
@@ -323,9 +323,9 @@ Validation:
 
 - `make tla-check-lmdb-commit` is green with the page/free-record model.
 - Negative model: write meta before dirty page sync fails via
-  `AntflyLmdbCommitBadMetaBeforeData.cfg`.
+  `AntflyLmdbCommitBadMetaBeforeData`.
 - Negative model: reuse reader-visible free page fails via
-  `AntflyLmdbCommitBadReaderReuse.cfg`.
+  `AntflyLmdbCommitBadReaderReuse`.
 - Current Zig alignment includes LMDB engine reader-reclaim tests, wrapper crash
   publish phase tests, nested child transaction commit/abort tests, and full
   `lmdb-test` / `storage-lmdb-test` targets. The next validation step is to map
@@ -415,64 +415,64 @@ Required invariants:
 Validation:
 
 - Negative model: stale timeline ack satisfies current write must fail. Current
-  status: implemented by `AntflyHAReplicationBadStaleTimelineAck.cfg`.
+  status: implemented by `AntflyHAReplicationBadStaleTimelineAck`.
 - Negative model: failover promotes a standby that lacks an acknowledged write
   must fail. Current status: implemented by
-  `AntflyHAFailoverSafetyBadPromoteMissingAck.cfg`.
+  `AntflyHAFailoverSafetyBadPromoteMissingAck`.
 - Negative model: old primary accepts a post-promotion write must fail. Current
-  status: implemented by `AntflyHAFailoverSafetyBadOldPrimaryWrite.cfg`.
+  status: implemented by `AntflyHAFailoverSafetyBadOldPrimaryWrite`.
 - Negative model: standby starts mutating background runtime must fail. Current
-  status: implemented by `AntflyHAGatesBadStandbyRuntime.cfg`.
+  status: implemented by `AntflyHAGatesBadStandbyRuntime`.
 - Negative model: promotion mutates a frozen sync-wait target must fail.
-  Current status: implemented by `AntflyHASyncWaitBadMoveTarget.cfg`.
+  Current status: implemented by `AntflyHASyncWaitBadMoveTarget`.
 - Negative model: wrong-timeline ack satisfies a frozen sync-wait target must
   fail. Current status: implemented by
-  `AntflyHASyncWaitBadWrongTimelineAck.cfg`.
+  `AntflyHASyncWaitBadWrongTimelineAck`.
 - Negative model: below-target ack satisfies a frozen sync-wait target must
   fail. Current status: implemented by
-  `AntflyHASyncWaitBadBelowTargetAck.cfg`.
+  `AntflyHASyncWaitBadBelowTargetAck`.
 - Negative model: timeline switch before parent received/applied/safe progress
   catches up must fail. Current status: implemented by
-  `AntflyHATimelineSwitchBadBeforeApplied.cfg`.
+  `AntflyHATimelineSwitchBadBeforeApplied`.
 - Negative model: non-monotonic timeline/epoch switch must fail. Current
-  status: implemented by `AntflyHATimelineSwitchBadNonMonotonic.cfg`.
+  status: implemented by `AntflyHATimelineSwitchBadNonMonotonic`.
 - Negative model: old-timeline record accepted after switch must fail. Current
-  status: implemented by `AntflyHATimelineSwitchBadOldTimeline.cfg`.
+  status: implemented by `AntflyHATimelineSwitchBadOldTimeline`.
 - Negative model: crash recovery from a durable switch with mismatched
   `previous_lsn` must fail. Current status: implemented by
-  `AntflyHATimelineSwitchBadRecoveryPrevious.cfg`.
+  `AntflyHATimelineSwitchBadRecoveryPrevious`.
 - Negative model: failed standby apply advances applied/safe-read/DB marker
   progress must fail. Current status: implemented by
-  `AntflyHAStandbyApplyBadFailureAdvances.cfg`.
+  `AntflyHAStandbyApplyBadFailureAdvances`.
 - Negative model: duplicate replay of an already-applied record repeats side
   effects must fail. Current status: implemented by
-  `AntflyHAStandbyApplyBadDuplicateEffect.cfg`.
+  `AntflyHAStandbyApplyBadDuplicateEffect`.
 - Negative model: crash/reopen loses a durably received unapplied record must
   fail. Current status: implemented by
-  `AntflyHAStandbyApplyBadCrashLosesReceive.cfg`.
+  `AntflyHAStandbyApplyBadCrashLosesReceive`.
 - Negative model: standby accepts a client write must fail. Current status:
-  implemented by `AntflyHAStandbyApplyBadClientWrite.cfg`.
+  implemented by `AntflyHAStandbyApplyBadClientWrite`.
 - Negative model: standby starts a mutating background runtime must fail.
   Current status: implemented by
-  `AntflyHAStandbyApplyBadBackgroundRuntime.cfg`.
+  `AntflyHAStandbyApplyBadBackgroundRuntime`.
 - Negative model: former primary rewinds without a promotion fence must fail.
-  Current status: implemented by `AntflyHARejoinBadUnfencedRewind.cfg`.
+  Current status: implemented by `AntflyHARejoinBadUnfencedRewind`.
 - Negative model: former primary rewinds after retained WAL no longer covers
   the fork must fail. Current status: implemented by
-  `AntflyHARejoinBadExpiredWalRewind.cfg`.
+  `AntflyHARejoinBadExpiredWalRewind`.
 - Negative model: forced-promotion rewind proceeds without explicit policy must
-  fail. Current status: implemented by `AntflyHARejoinBadForcedRewind.cfg`.
+  fail. Current status: implemented by `AntflyHARejoinBadForcedRewind`.
 - Negative model: identity, old-primary, or parent-timeline mismatch still
   rewinds must fail. Current status: implemented by
-  `AntflyHARejoinBadIdentityMismatchRewind.cfg`.
+  `AntflyHARejoinBadIdentityMismatchRewind`.
 - Negative model: stale assessment truncates after a late write must fail.
-  Current status: implemented by `AntflyHARejoinBadStaleAssessment.cfg`.
+  Current status: implemented by `AntflyHARejoinBadStaleAssessment`.
 - Negative model: missing or mismatched fork record is truncated must fail.
-  Current status: implemented by `AntflyHARejoinBadForkMismatch.cfg`.
+  Current status: implemented by `AntflyHARejoinBadForkMismatch`.
 - Trace refinement: sync/apply, timeline switch, and rejoin fixtures must be
   consumed by `TraceAntflyHA.tla` and preserve HA trace safety invariants.
   Current status: implemented by `TraceAntflyHA.tla`,
-  `TraceAntflyHA.cfg`, and `specs/tla/traces/ha_*.ndjson`; validated by
+  `TraceAntflyHA.cfgs`, and `specs/tla/traces/ha_*.ndjson`; validated by
   `make tla-trace-ha TRACE_FILES="specs/tla/traces/ha_*.ndjson"`.
 - Map to `ha-compat-test`, `ha-chaos-test`, and HA DB tests.
 - Keep `AntflyHAReplication` heavy, but add smaller fast configs for each slice.
@@ -494,22 +494,22 @@ Implemented:
 - Hosted replicas must have durable apply-store state, but inactive hosted
   replicas may exist temporarily during cleanup.
 - Added expected-failure configs:
-  `AntflyManagedHostLifecycleBadPrematureRestore.cfg`,
-  `AntflyManagedHostLifecycleBadStaleRoute.cfg`,
-  `AntflyManagedHostLifecycleBadReviveRemoved.cfg`, and
-  `AntflyManagedHostLifecycleBadRestoreCancel.cfg`.
+  `AntflyManagedHostLifecycleBadPrematureRestore`,
+  `AntflyManagedHostLifecycleBadStaleRoute`,
+  `AntflyManagedHostLifecycleBadReviveRemoved`, and
+  `AntflyManagedHostLifecycleBadRestoreCancel`.
 
 Validation:
 
 - `make tla-check-managed-host-lifecycle`: green, 288 distinct states.
 - Negative model: restore activates/routes before bootstrap success fails via
-  `AntflyManagedHostLifecycleBadPrematureRestore.cfg`.
+  `AntflyManagedHostLifecycleBadPrematureRestore`.
 - Negative model: metadata removal leaves stale route fails via
-  `AntflyManagedHostLifecycleBadStaleRoute.cfg`.
+  `AntflyManagedHostLifecycleBadStaleRoute`.
 - Negative model: removed catalog entry can revive after restart fails via
-  `AntflyManagedHostLifecycleBadReviveRemoved.cfg`.
+  `AntflyManagedHostLifecycleBadReviveRemoved`.
 - Negative model: restore bootstrap is not cancelled on metadata removal fails
-  via `AntflyManagedHostLifecycleBadRestoreCancel.cfg`.
+  via `AntflyManagedHostLifecycleBadRestoreCancel`.
 - `make tla-check-negative` and `make tla-check-new-fast` are green after the
   managed-host deepening.
 - Zig validation includes focused `raft-test` filters for backup-bootstrap
@@ -573,11 +573,11 @@ Validation:
 
 - `make tla-check-transaction-session` is green with 1,946 distinct states.
 - Negative model: savepoint rollback leaves visible write fails via
-  `AntflyTransactionSessionBadRollback.cfg`.
+  `AntflyTransactionSessionBadRollback`.
 - Negative model: recovery resolves participant with wrong decision fails via
-  `AntflyTransactionSessionBadRecoveryDecision.cfg`.
+  `AntflyTransactionSessionBadRecoveryDecision`.
 - Negative model: cleanup before prepared participants resolve fails via
-  `AntflyTransactionSessionBadCleanup.cfg`.
+  `AntflyTransactionSessionBadCleanup`.
 - Trace refinement: checked-in savepoint, orphan recovery, and stale pending
   fixtures pass via `TraceAntflyTransactionSession.tla`; premature cleanup
   fixture fails via `make tla-check-transaction-session-trace-negative-cleanup`.
@@ -639,11 +639,11 @@ Validation:
 
 - `make tla-check-document-identity` is green with 899 distinct states.
 - Negative model: reuse a tombstoned ordinal for a different logical document
-  fails via `AntflyDocumentIdentityBadReuseOrdinal.cfg`.
+  fails via `AntflyDocumentIdentityBadReuseOrdinal`.
 - Negative model: search accepts a resolved-doc-filter with stale identity
-  generation fails via `AntflyDocumentIdentityBadStaleFilter.cfg`.
+  generation fails via `AntflyDocumentIdentityBadStaleFilter`.
 - Negative model: strict open accepts mismatched configured/stored namespace
-  fails via `AntflyDocumentIdentityBadNamespaceMismatch.cfg`.
+  fails via `AntflyDocumentIdentityBadNamespaceMismatch`.
 - `AntflyDocumentIdentityRangeRepair.tla` is green with 95,040 distinct states.
 - Negative range/restore models fail for unhealthy split acceptance, stale split
   destination namespace, merge namespace mismatch without opt-in, unapproved
@@ -762,13 +762,13 @@ Validation:
 
 - `make tla-check-lite-publication` is green with 599 distinct states.
 - Negative model: manifest published before segment fails via
-  `AntflyLitePublicationBadManifestBeforeArtifacts.cfg`.
+  `AntflyLitePublicationBadManifestBeforeArtifacts`.
 - Negative model: failed publication advances visible HEAD fails via
-  `AntflyLitePublicationBadFailedHead.cfg`.
+  `AntflyLitePublicationBadFailedHead`.
 - Negative model: cleanup deletes reader-pinned generation data fails via
-  `AntflyLitePublicationBadPinnedCleanup.cfg`.
+  `AntflyLitePublicationBadPinnedCleanup`.
 - Negative model: visible generation mixes segment refs across generations fails
-  via `AntflyLitePublicationBadMixedGeneration.cfg`.
+  via `AntflyLitePublicationBadMixedGeneration`.
 - `make tla-check-negative` and `make tla-check-new-fast` are green after the
   Lite publication deepening.
 - Zig validation currently includes broad `serverless-test` runs, full
@@ -823,13 +823,13 @@ Validation:
 
 - `make tla-check-openapi-codegen` is green with 216,814 distinct states.
 - Negative model: generated-check passes with a stale generated package fails
-  via `AntflyOpenApiCodegenBadStalePackage.cfg`.
+  via `AntflyOpenApiCodegenBadStalePackage`.
 - Negative model: generated-check passes with stale root `openapi.yaml` fails
-  via `AntflyOpenApiCodegenBadStaleRoot.cfg`.
+  via `AntflyOpenApiCodegenBadStaleRoot`.
 - Negative model: public client imports an internal-only generated package fails
-  via `AntflyOpenApiCodegenBadInternalLeak.cfg`.
+  via `AntflyOpenApiCodegenBadInternalLeak`.
 - Negative model: failed partial generation is committed fails via
-  `AntflyOpenApiCodegenBadPartialCommit.cfg`.
+  `AntflyOpenApiCodegenBadPartialCommit`.
 - `make tla-check-negative` and `make tla-check-new-fast` are green after the
   OpenAPI deepening.
 - Zig validation includes `zig build openapi-root-check`, standalone
@@ -879,22 +879,22 @@ Implemented:
   consumer/output/parameter remapping, reachable-node DCE, compact topological
   `id_map`, and final dangling-reference exclusion.
 - Added expected-failure configs:
-  `AntflyMlGraphPassesBadDanglingCse.cfg`,
-  `AntflyMlGraphPassesBadParameterDedup.cfg`,
-  `AntflyMlGraphPassesBadMissingLowerClosure.cfg`,
-  `AntflyMlGraphPassesBadFallbackRuntime.cfg`, and
-  `AntflyMlGraphPassesBadPartialPublish.cfg`.
+  `AntflyMlGraphPassesBadDanglingCse`,
+  `AntflyMlGraphPassesBadParameterDedup`,
+  `AntflyMlGraphPassesBadMissingLowerClosure`,
+  `AntflyMlGraphPassesBadFallbackRuntime`, and
+  `AntflyMlGraphPassesBadPartialPublish`.
 - Added compiler-publication expected-failure configs:
-  `AntflyMlCompilerPublicationBadStaleCompile.cfg`,
-  `AntflyMlCompilerPublicationBadMissingInput.cfg`,
-  `AntflyMlCompilerPublicationBadOutputSelection.cfg`,
-  `AntflyMlCompilerPublicationBadFallbackPublish.cfg`, and
-  `AntflyMlCompilerPublicationBadPartialArtifact.cfg`.
+  `AntflyMlCompilerPublicationBadStaleCompile`,
+  `AntflyMlCompilerPublicationBadMissingInput`,
+  `AntflyMlCompilerPublicationBadOutputSelection`,
+  `AntflyMlCompilerPublicationBadFallbackPublish`, and
+  `AntflyMlCompilerPublicationBadPartialArtifact`.
 - Added DAG pass expected-failure configs:
-  `AntflyMlGraphDagPassesBadCseMissDuplicate.cfg`,
-  `AntflyMlGraphDagPassesBadCseNoConsumerRemap.cfg`,
-  `AntflyMlGraphDagPassesBadDceDropReachable.cfg`, and
-  `AntflyMlGraphDagPassesBadDceNonTopoMap.cfg`.
+  `AntflyMlGraphDagPassesBadCseMissDuplicate`,
+  `AntflyMlGraphDagPassesBadCseNoConsumerRemap`,
+  `AntflyMlGraphDagPassesBadDceDropReachable`, and
+  `AntflyMlGraphDagPassesBadDceNonTopoMap`.
 - Wired all fourteen ML negative configs into `make tla-check-negative`.
 
 Tasks:
@@ -954,33 +954,33 @@ Validation:
 - `make tla-check-ml-graph-dag-passes`: green, 9 distinct states over three
   bounded DAG shapes.
 - Negative model: stale CSE remap/dangling edge fails via
-  `AntflyMlGraphPassesBadDanglingCse.cfg`.
+  `AntflyMlGraphPassesBadDanglingCse`.
 - Negative model: parameter/constant identity collapse fails via
-  `AntflyMlGraphPassesBadParameterDedup.cfg`.
+  `AntflyMlGraphPassesBadParameterDedup`.
 - Negative model: exported fused node without lower closure fails via
-  `AntflyMlGraphPassesBadMissingLowerClosure.cfg`.
+  `AntflyMlGraphPassesBadMissingLowerClosure`.
 - Negative model: runtime publication despite fallback partition fails via
-  `AntflyMlGraphPassesBadFallbackRuntime.cfg`.
+  `AntflyMlGraphPassesBadFallbackRuntime`.
 - Negative model: failed pass leaves partial output visible fails via
-  `AntflyMlGraphPassesBadPartialPublish.cfg`.
+  `AntflyMlGraphPassesBadPartialPublish`.
 - Negative model: stale graph/export compiler artifact publication fails via
-  `AntflyMlCompilerPublicationBadStaleCompile.cfg`.
+  `AntflyMlCompilerPublicationBadStaleCompile`.
 - Negative model: missing parameter/cache runtime input fails via
-  `AntflyMlCompilerPublicationBadMissingInput.cfg`.
+  `AntflyMlCompilerPublicationBadMissingInput`.
 - Negative model: semantic KV side-output leak fails via
-  `AntflyMlCompilerPublicationBadOutputSelection.cfg`.
+  `AntflyMlCompilerPublicationBadOutputSelection`.
 - Negative model: executor publication despite fallback partition fails via
-  `AntflyMlCompilerPublicationBadFallbackPublish.cfg`.
+  `AntflyMlCompilerPublicationBadFallbackPublish`.
 - Negative model: failed compiler partial artifact visibility fails via
-  `AntflyMlCompilerPublicationBadPartialArtifact.cfg`.
+  `AntflyMlCompilerPublicationBadPartialArtifact`.
 - Negative model: missed duplicate CSE fails via
-  `AntflyMlGraphDagPassesBadCseMissDuplicate.cfg`.
+  `AntflyMlGraphDagPassesBadCseMissDuplicate`.
 - Negative model: stale consumer/output/parameter remap after CSE fails via
-  `AntflyMlGraphDagPassesBadCseNoConsumerRemap.cfg`.
+  `AntflyMlGraphDagPassesBadCseNoConsumerRemap`.
 - Negative model: DCE dropping a reachable node fails via
-  `AntflyMlGraphDagPassesBadDceDropReachable.cfg`.
+  `AntflyMlGraphDagPassesBadDceDropReachable`.
 - Negative model: DCE non-topological compact map fails via
-  `AntflyMlGraphDagPassesBadDceNonTopoMap.cfg`.
+  `AntflyMlGraphDagPassesBadDceNonTopoMap`.
 - `make tla-check-negative` and `make tla-check-new-fast` are green after the
   ML graph, DAG pass, and compiler-publication deepening.
 - Zig validation includes focused `lib/ml` graph root filters for default

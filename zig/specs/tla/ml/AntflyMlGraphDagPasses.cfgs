@@ -1,0 +1,88 @@
+\* All TLC check configs for AntflyMlGraphDagPasses.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyMlGraphDagPasses.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyCseMissDuplicate = FALSE
+    BuggyCseNoConsumerRemap = FALSE
+    BuggyDceDropReachable = FALSE
+    BuggyDceNonTopoMap = FALSE
+
+INVARIANTS
+    TypeOK
+    CseRemapsConsumersOutputsAndParameters
+    CseMapIsSemantic
+    CseKeepsDataNodesDistinct
+    CseGraphReferencesReachableNodes
+    DceKeepsExactlyReachableNodes
+    DceMapIsCompactTopological
+    FinalGraphReferencesValid
+    ParametersPreservedWhenReachable
+    Safety
+
+==== BadCseMissDuplicate
+\* Expected-failure config: CSE misses an earlier semantically identical op.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyCseMissDuplicate = TRUE
+    BuggyCseNoConsumerRemap = FALSE
+    BuggyDceDropReachable = FALSE
+    BuggyDceNonTopoMap = FALSE
+
+INVARIANTS
+    CseMapIsSemantic
+
+==== BadCseNoConsumerRemap
+\* Expected-failure config: CSE redirects a duplicate but leaves consumers
+\* pointing at the old node IDs.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyCseMissDuplicate = FALSE
+    BuggyCseNoConsumerRemap = TRUE
+    BuggyDceDropReachable = FALSE
+    BuggyDceNonTopoMap = FALSE
+
+INVARIANTS
+    CseRemapsConsumersOutputsAndParameters
+
+==== BadDceDropReachable
+\* Expected-failure config: DCE drops a reachable parameter while rebuilding.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyCseMissDuplicate = FALSE
+    BuggyCseNoConsumerRemap = FALSE
+    BuggyDceDropReachable = TRUE
+    BuggyDceNonTopoMap = FALSE
+
+INVARIANTS
+    DceKeepsExactlyReachableNodes
+
+==== BadDceNonTopoMap
+\* Expected-failure config: DCE creates a compact id_map that violates the
+\* original topological order.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyCseMissDuplicate = FALSE
+    BuggyCseNoConsumerRemap = FALSE
+    BuggyDceDropReachable = FALSE
+    BuggyDceNonTopoMap = TRUE
+
+INVARIANTS
+    DceMapIsCompactTopological

@@ -1,0 +1,50 @@
+\* All TLC check configs for AntflyIndexLifecycle.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyIndexLifecycle.tla.
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggySwapIncompleteShadow = FALSE
+    BuggyRecoverTrustsStaleStatus = FALSE
+
+INVARIANTS
+    TypeOK
+    FreshImpliesCaughtUp
+    NoFreshServeBehind
+    Safety
+
+PROPERTIES
+    BuildEventuallyConverges
+
+==== BadRecoverTrustsStatus
+\* Expected-failure config: crash recovery trusts a stale durable "fresh"
+\* status snapshot without re-validating the watermarks, and a query is then
+\* served fresh results from a behind index. Pinned to the query-facing
+\* invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwapIncompleteShadow = FALSE
+    BuggyRecoverTrustsStaleStatus = TRUE
+
+INVARIANTS
+    NoFreshServeBehind
+
+==== BadSwapIncomplete
+\* Expected-failure config: the shadow index swaps in while its applied
+\* watermark is still behind the write target. Pinned to the freshness
+\* contract.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggySwapIncompleteShadow = TRUE
+    BuggyRecoverTrustsStaleStatus = FALSE
+
+INVARIANTS
+    FreshImpliesCaughtUp

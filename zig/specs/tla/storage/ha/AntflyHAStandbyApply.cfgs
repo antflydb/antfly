@@ -1,0 +1,106 @@
+\* All TLC check configs for AntflyHAStandbyApply.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyHAStandbyApply.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyApplyFailureAdvances = FALSE
+    BuggyDuplicateEffect = FALSE
+    BuggyCrashLosesReceive = FALSE
+    BuggyClientWrite = FALSE
+    BuggyBackgroundRuntime = FALSE
+
+INVARIANTS
+    TypeOK
+    ProgressOrder
+    FailedApplyDoesNotAdvance
+    ReplicatedApplyIsIdempotent
+    DurableReceiveSurvivesCrash
+    ClientWritesRejectedOnStandby
+    MutatingRuntimeSuppressedOnStandby
+    Safety
+
+==== BadBackgroundRuntime
+\* Expected-failure config: standby starts a mutating background runtime.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyApplyFailureAdvances = FALSE
+    BuggyDuplicateEffect = FALSE
+    BuggyCrashLosesReceive = FALSE
+    BuggyClientWrite = FALSE
+    BuggyBackgroundRuntime = TRUE
+
+INVARIANTS
+    MutatingRuntimeSuppressedOnStandby
+
+==== BadClientWrite
+\* Expected-failure config: standby accepts a client write.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyApplyFailureAdvances = FALSE
+    BuggyDuplicateEffect = FALSE
+    BuggyCrashLosesReceive = FALSE
+    BuggyClientWrite = TRUE
+    BuggyBackgroundRuntime = FALSE
+
+INVARIANTS
+    ClientWritesRejectedOnStandby
+
+==== BadCrashLosesReceive
+\* Expected-failure config: crash/reopen loses durable received WAL progress.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyApplyFailureAdvances = FALSE
+    BuggyDuplicateEffect = FALSE
+    BuggyCrashLosesReceive = TRUE
+    BuggyClientWrite = FALSE
+    BuggyBackgroundRuntime = FALSE
+
+INVARIANTS
+    DurableReceiveSurvivesCrash
+
+==== BadDuplicateEffect
+\* Expected-failure config: duplicate replicated apply replays side effects even
+\* though the HA marker already covers the record.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyApplyFailureAdvances = FALSE
+    BuggyDuplicateEffect = TRUE
+    BuggyCrashLosesReceive = FALSE
+    BuggyClientWrite = FALSE
+    BuggyBackgroundRuntime = FALSE
+
+INVARIANTS
+    ReplicatedApplyIsIdempotent
+
+==== BadFailureAdvances
+\* Expected-failure config: failed apply advances applied/safe/marker progress.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyApplyFailureAdvances = TRUE
+    BuggyDuplicateEffect = FALSE
+    BuggyCrashLosesReceive = FALSE
+    BuggyClientWrite = FALSE
+    BuggyBackgroundRuntime = FALSE
+
+INVARIANTS
+    FailedApplyDoesNotAdvance

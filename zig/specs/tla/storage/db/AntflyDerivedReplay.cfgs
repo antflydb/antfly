@@ -1,0 +1,95 @@
+\* All TLC check configs for AntflyDerivedReplay.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyDerivedReplay.tla
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyEmptyHintAdvance = FALSE
+    Indexes = {"dense"}
+    MaxSeq = 2
+
+INVARIANTS
+    TypeOK
+    ReplayPublicationOrdered
+    WatermarksOrdered
+    LatestHintMetadataHasHintRows
+    NoAppliedSkipsTargetedReplay
+    QueryTargetNeverObservesBeyondSafeApplied
+    TruncationKeepsNeededReplay
+    UnavailableHintLaneCannotBeTreatedAsApplied
+    Safety
+
+PROPERTIES
+    CatchupEventuallyCompletes
+
+==== Bad
+\* Expected-failure config for AntflyDerivedReplay.tla.
+\*
+\* Enables a mutant where per-hint latest metadata is advanced without the
+\* corresponding hint-lane row. The shipped primary-store reader requires the
+\* hint lane; replay-all rows alone are not treated as a fallback for hinted
+\* replay.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyEmptyHintAdvance = TRUE
+    Indexes = {"dense"}
+    MaxSeq = 2
+
+INVARIANTS
+    LatestHintMetadataHasHintRows
+
+==== heavy
+\* Heavier config for AntflyDerivedReplay.tla.
+\*
+\* This keeps the deeper two-index/state-space coverage out of the fast tier.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyEmptyHintAdvance = FALSE
+    Indexes = {"dense", "fulltext"}
+    MaxSeq = 3
+
+INVARIANTS
+    Safety
+
+==== heavy-depth
+\* Depth-focused heavier config for AntflyDerivedReplay.tla.
+\*
+\* Keeps one index but raises MaxSeq to cover longer replay, metadata,
+\* catch-up, and truncation interleavings without the full two-index cross
+\* product from AntflyDerivedReplay-heavy.cfg.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyEmptyHintAdvance = FALSE
+    Indexes = {"dense"}
+    MaxSeq = 3
+
+INVARIANTS
+    Safety
+
+==== heavy-multi-index
+\* Multi-index heavier config for AntflyDerivedReplay.tla.
+\*
+\* Keeps MaxSeq at the fast bound but enables both representative derived
+\* indexes to cover cross-index catch-up, hint-lane availability, bulk-session,
+\* and truncation interactions without the full MaxSeq=3 cross product.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyEmptyHintAdvance = FALSE
+    Indexes = {"dense", "fulltext"}
+    MaxSeq = 2
+
+INVARIANTS
+    Safety

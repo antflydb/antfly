@@ -1,0 +1,19 @@
+\* All TLC check configs for TraceAntflySplitRefinementBridge.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION TraceSpec
+
+CONSTANTS
+    BuggyRouteBeforeDbServing = FALSE
+    BuggyDbServeBeforeShardCutover = FALSE
+    BuggyCompleteWithStaleFence = FALSE
+
+VIEW TraceView
+
+CHECK_DEADLOCK FALSE
+
+INVARIANT TraceSafety
+
+PROPERTY TraceMatched

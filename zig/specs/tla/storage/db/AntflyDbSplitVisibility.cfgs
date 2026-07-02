@@ -1,0 +1,95 @@
+\* All TLC check configs for AntflyDbSplitVisibility.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyDbSplitVisibility.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyParentAcceptsChildAfterCutover = FALSE
+    BuggyChildServesBeforeReplay = FALSE
+    BuggyDonorServesAfterMerge = FALSE
+    BuggyEnrichmentWrongOwner = FALSE
+
+INVARIANTS
+    TypeOK
+    RightOwnershipMatchesPhase
+    RoutesCurrentOwner
+    SplitDeltasTracked
+    ParentCannotAcceptChildRangeAfterCutover
+    ChildServingRequiresReplayAndIndexes
+    ChildArtifactRemoteAfterSplit
+    EnrichmentOnlyForCurrentRightOwner
+    MergeDonorDoesNotServeAfterHandoff
+    MergeReceiverRoutesAllIndexes
+    Safety
+
+==== BadChildServe
+\* Expected-failure config: child range serves before replaying split deltas
+\* and completing text/sparse/graph shadow indexes.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyParentAcceptsChildAfterCutover = FALSE
+    BuggyChildServesBeforeReplay = TRUE
+    BuggyDonorServesAfterMerge = FALSE
+    BuggyEnrichmentWrongOwner = FALSE
+
+INVARIANTS
+    TypeOK
+    ChildServingRequiresReplayAndIndexes
+    Safety
+
+==== BadEnrichmentOwner
+\* Expected-failure config: generated enrichment publishes under a stale or
+\* otherwise non-owning right-range owner.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyParentAcceptsChildAfterCutover = FALSE
+    BuggyChildServesBeforeReplay = FALSE
+    BuggyDonorServesAfterMerge = FALSE
+    BuggyEnrichmentWrongOwner = TRUE
+
+INVARIANTS
+    TypeOK
+    EnrichmentOnlyForCurrentRightOwner
+    Safety
+
+==== BadMergeDonor
+\* Expected-failure config: merge donor still serves right-range writes after
+\* receiver cutover.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyParentAcceptsChildAfterCutover = FALSE
+    BuggyChildServesBeforeReplay = FALSE
+    BuggyDonorServesAfterMerge = TRUE
+    BuggyEnrichmentWrongOwner = FALSE
+
+INVARIANTS
+    TypeOK
+    MergeDonorDoesNotServeAfterHandoff
+    Safety
+
+==== BadParentWrite
+\* Expected-failure config: parent accepts a right-range write after split
+\* cutover transferred ownership to the child.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyParentAcceptsChildAfterCutover = TRUE
+    BuggyChildServesBeforeReplay = FALSE
+    BuggyDonorServesAfterMerge = FALSE
+    BuggyEnrichmentWrongOwner = FALSE
+
+INVARIANTS
+    TypeOK
+    ParentCannotAcceptChildRangeAfterCutover
+    Safety

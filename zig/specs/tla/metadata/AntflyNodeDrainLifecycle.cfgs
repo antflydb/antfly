@@ -1,0 +1,68 @@
+\* All TLC check configs for AntflyNodeDrainLifecycle.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyNodeDrainLifecycle.tla.
+
+SPECIFICATION FairSpec
+
+CONSTANTS
+    BuggyFinalizeActiveNode = FALSE
+    BuggyRegistrationClearsDrain = FALSE
+    BuggySafeIgnoresPlacementDebt = FALSE
+
+INVARIANTS
+    TypeOK
+    DrainStateConsistent
+    FinalizeRequiresDrained
+    SafeReportMatchesDebt
+    TerminationSafe
+    Safety
+
+PROPERTIES
+    DrainEventuallyReportsSafe
+
+==== BadFinalizeActive
+\* Expected-failure config: finalize accepted while the node is still active.
+\* Pinned to the specific semantic invariant this mutant must violate.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyFinalizeActiveNode = TRUE
+    BuggyRegistrationClearsDrain = FALSE
+    BuggySafeIgnoresPlacementDebt = FALSE
+
+INVARIANTS
+    FinalizeRequiresDrained
+
+==== BadRegistrationClearsDrain
+\* Expected-failure config: node re-registration resets lifecycle to active
+\* while hosted stores keep drain_requested (historical regression guarded by
+\* normalizeNodeRegistrationDrainIntentTxn). Pinned to drain consistency.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyFinalizeActiveNode = FALSE
+    BuggyRegistrationClearsDrain = TRUE
+    BuggySafeIgnoresPlacementDebt = FALSE
+
+INVARIANTS
+    DrainStateConsistent
+
+==== BadSafeIgnoresDebt
+\* Expected-failure config: safe_to_terminate reported while placement/hosted
+\* debt remains; the operator terminates a node that still hosts replicas.
+\* Pinned to the status-computation invariant.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyFinalizeActiveNode = FALSE
+    BuggyRegistrationClearsDrain = FALSE
+    BuggySafeIgnoresPlacementDebt = TRUE
+
+INVARIANTS
+    SafeReportMatchesDebt

@@ -1,0 +1,43 @@
+\* All TLC check configs for AntflyHAPartitionFence.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyPromoteBeforeFenceDelivered = FALSE
+
+INVARIANTS
+    TypeOK
+    PromotionRequiresDeliveredFence
+    NoSplitBrainWritable
+    NoOldPrimaryWritesAfterPromotion
+    Safety
+
+==== BadOldPrimaryWriteAfterPromotion
+\* Expected-failure config for AntflyHAPartitionFence.tla.
+\* Reuses the promote-before-fence-delivery mutant, pinned to the write-level
+\* invariant: the still-unfenced old primary appends via its NORMAL write path
+\* after promotion.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyPromoteBeforeFenceDelivered = TRUE
+
+INVARIANTS
+    NoOldPrimaryWritesAfterPromotion
+
+==== BadPromoteBeforeFence
+\* Expected-failure config for AntflyHAPartitionFence.tla.
+\* Promotion is allowed while the old primary is partitioned from fence delivery.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyPromoteBeforeFenceDelivered = TRUE
+
+INVARIANTS
+    PromotionRequiresDeliveredFence
+    NoSplitBrainWritable

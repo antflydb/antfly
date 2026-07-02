@@ -1,0 +1,70 @@
+\* All TLC check configs for AntflyLsmWalCompaction.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+\* TLC config for AntflyLsmWalCompaction.tla
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxSeq = 4
+    MaxSegment = 3
+    BuggyCheckpointUnsynced = FALSE
+    BuggyRotateCorruptTail = FALSE
+    BuggyRetirePinned = FALSE
+
+INVARIANTS
+    TypeOK
+    SequenceOrder
+    CompactionInputBounded
+    RetiredSegmentsSafe
+    ReaderPinsRetained
+    CorruptTailOnlyOnCurrentSegment
+    CheckpointOnlyCoversDurableWal
+    Safety
+
+==== BadCheckpoint
+\* Expected-failure config for AntflyLsmWalCompaction.tla.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxSeq = 4
+    MaxSegment = 3
+    BuggyCheckpointUnsynced = TRUE
+    BuggyRotateCorruptTail = FALSE
+    BuggyRetirePinned = FALSE
+
+INVARIANTS
+    Safety
+
+==== BadCorruptRotate
+\* Expected-failure config for AntflyLsmWalCompaction.tla.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxSeq = 4
+    MaxSegment = 3
+    BuggyCheckpointUnsynced = FALSE
+    BuggyRotateCorruptTail = TRUE
+    BuggyRetirePinned = FALSE
+
+INVARIANTS
+    Safety
+
+==== BadPinnedRetire
+\* Expected-failure config for AntflyLsmWalCompaction.tla.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    MaxSeq = 4
+    MaxSegment = 3
+    BuggyCheckpointUnsynced = FALSE
+    BuggyRotateCorruptTail = FALSE
+    BuggyRetirePinned = TRUE
+
+INVARIANTS
+    Safety

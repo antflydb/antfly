@@ -1,0 +1,41 @@
+\* All TLC check configs for AntflySnapshotContent.tla, one section per check.
+\* Sections are verbatim TLC config syntax; the build extracts them
+\* (scripts/tla-cfg.sh). Section names match the make-target check ids.
+
+==== positive
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyWrongContent = FALSE
+    BuggyGcNeededContent = FALSE
+
+INVARIANTS
+    TypeOK
+    AppliedContentMatchesIndex
+    TargetContentNotGcBeforeApply
+    Safety
+
+==== BadGcNeededContent
+\* Expected-failure config for AntflySnapshotContent.tla.
+\* Enables a mutant where fetched follower content is GC'd before apply.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyWrongContent = FALSE
+    BuggyGcNeededContent = TRUE
+
+INVARIANTS
+    TargetContentNotGcBeforeApply
+
+==== BadWrongContent
+\* Expected-failure config for AntflySnapshotContent.tla.
+
+SPECIFICATION Spec
+
+CONSTANTS
+    BuggyWrongContent = TRUE
+    BuggyGcNeededContent = FALSE
+
+INVARIANTS
+    AppliedContentMatchesIndex
