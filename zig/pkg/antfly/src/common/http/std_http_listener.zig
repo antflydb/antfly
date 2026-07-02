@@ -212,7 +212,7 @@ pub const StdHttpListener = struct {
                     error.Canceled => return,
                     else => {
                         if (self.stopping.load(.acquire)) return;
-                        std.log.warn("std http listener accept failed err={}", .{err});
+                        std.log.warn("std http listener accept failed err={s}", .{@errorName(err)});
                         sleepMs(1);
                         continue;
                     },
@@ -228,7 +228,7 @@ pub const StdHttpListener = struct {
                 connection_group.concurrent(io, serveStreamFiber, .{ self, stream }) catch |err| {
                     slot_held = false;
                     self.releaseConnectionThreadSlot();
-                    std.log.warn("std http listener connection fiber handoff failed err={}", .{err});
+                    std.log.warn("std http listener connection fiber handoff failed err={s}", .{@errorName(err)});
                     self.serveStream(stream);
                     continue;
                 };
@@ -277,15 +277,20 @@ pub const StdHttpListener = struct {
             // that is awaiting a response; keep the common idle-close quiet
             // but record anything else so resets are diagnosable from logs.
             if (err != error.HttpConnectionClosing and err != error.EndOfStream) {
-                std.log.warn("http receive head failed err={}", .{err});
+                std.log.warn("http receive head failed err={s}", .{@errorName(err)});
             }
             return;
         };
+        const request_method = @tagName(request.head.method);
+        var request_target_buf: [512]u8 = undefined;
+        const request_target_len = @min(request.head.target.len, request_target_buf.len);
+        @memcpy(request_target_buf[0..request_target_len], request.head.target[0..request_target_len]);
+        const request_target = request_target_buf[0..request_target_len];
         self.handleRequest(&request) catch |err| {
-            std.log.err("http request handler error method={s} target={s} err={}", .{
-                @tagName(request.head.method),
-                request.head.target,
-                err,
+            std.log.err("http request handler error method={s} target={s} err={s}", .{
+                request_method,
+                request_target,
+                @errorName(err),
             });
             _ = request.respond("internal server error", .{
                 .status = .internal_server_error,
@@ -358,7 +363,7 @@ pub const StdHttpListener = struct {
             };
             const handled = streaming_app.execute(self.alloc, http_req, stream_writer.iface()) catch |err| {
                 if (stream_writer.started()) {
-                    std.log.err("http streaming request handler error after response start: {}", .{err});
+                    std.log.err("http streaming request handler error after response start: {s}", .{@errorName(err)});
                     _ = stream_writer.end() catch {};
                     return;
                 }
