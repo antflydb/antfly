@@ -1,0 +1,29 @@
+{
+  "fixture_format": 1,
+  "entries": [
+    {
+      "id": "graph-index-edge-operator",
+      "family": "ddl",
+      "category": "operator",
+      "token_kinds": ["arrow_json", "lparen", "rparen"],
+      "token_keywords": ["graph", "type", "weight"],
+      "lexer_test": "sql adapter lexer tokenizes graph relationship labels",
+      "tokenized_test": "sql adapter parsed sql retains generated graph nodes as DDL",
+      "valid_sql": "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence WITH (edge_policy = 'all')",
+      "malformed_sql": "CREATE GRAPH INDEX docs_edge_graph_syntax ON doc_edges EDGE (source_doc ->) TYPE edge_type WEIGHT confidence",
+      "contextual_identifier_sql": ""
+    },
+    {
+      "id": "graph-match-contextual-return",
+      "family": "query",
+      "category": "contextual_keyword",
+      "token_kinds": ["arrow_json", "colon", "lbracket", "rbracket"],
+      "token_keywords": ["graph", "match", "return", "start"],
+      "lexer_test": "sql adapter lexer tokenizes graph relationship labels",
+      "tokenized_test": "sql adapter parsed sql rejects malformed generated graph and antfly source metadata",
+      "valid_sql": "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN target",
+      "malformed_sql": "MATCH (doc)-[:cites]-> RETURN target",
+      "contextual_identifier_sql": "SELECT return FROM usage_records"
+    }
+  ]
+}

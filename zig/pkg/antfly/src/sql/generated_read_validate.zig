@@ -275,115 +275,7 @@ pub fn validateGeneratedEmptyList(list: generated_parser.GeneratedSqlListAst) !v
 }
 
 fn validateGeneratedEmptyExpression(expression: generated_parser.GeneratedSqlExpressionAst) !void {
-    if (expression.kind != .token_range or
-        expression.tokens != null or
-        expression.inner_tokens != null or
-        expression.inner_expression_kind != null or
-        expression.inner_expression != null or
-        expression.subquery_read_kind != null or
-        expression.subquery_select_tokens != null or
-        expression.subquery_projection_tokens != null or
-        expression.subquery_source_tokens != null or
-        expression.subquery_where_tokens != null or
-        expression.subquery_where_expression_kind != null or
-        expression.subquery_where_expression != null or
-        expression.subquery_set_operation_tokens != null or
-        expression.subquery_set_operation != null or
-        expression.subquery_tail != null or
-        expression.function_name_tokens != null or
-        expression.aggregate_function_kind != null or
-        expression.window_function_kind != null or
-        expression.argument_tokens != null or
-        expression.argument_distinct_tokens != null or
-        expression.argument_value_tokens != null or
-        expression.argument_order_tokens != null or
-        expression.within_group_tokens != null or
-        expression.within_group_order_tokens != null or
-        expression.filter_tokens != null or
-        expression.filter_predicate_tokens != null or
-        expression.filter_expression_kind != null or
-        expression.filter_expression != null or
-        expression.over_tokens != null or
-        expression.over_name_tokens != null or
-        expression.over_definition_tokens != null or
-        expression.over_partition_tokens != null or
-        expression.over_order_tokens != null or
-        expression.over_frame_tokens != null or
-        expression.over_frame_unit != null or
-        expression.over_frame_start_bound != null or
-        expression.over_frame_start_expression_tokens != null or
-        expression.over_frame_start_expression_kind != null or
-        expression.over_frame_start_expression != null or
-        expression.over_frame_end_bound != null or
-        expression.over_frame_end_expression_tokens != null or
-        expression.over_frame_end_expression_kind != null or
-        expression.over_frame_end_expression != null or
-        expression.array_tokens != null or
-        expression.cast_expression_tokens != null or
-        expression.cast_expression_kind != null or
-        expression.cast_expression != null or
-        expression.cast_type_tokens != null or
-        expression.case_branch_count != 0 or
-        expression.case_first_when_tokens != null or
-        expression.case_last_when_tokens != null or
-        expression.case_first_condition_tokens != null or
-        expression.case_first_condition_kind != null or
-        expression.case_first_condition != null or
-        expression.case_first_result_tokens != null or
-        expression.case_first_result_kind != null or
-        expression.case_first_result != null or
-        expression.case_else_tokens != null or
-        expression.case_else_expression_tokens != null or
-        expression.case_else_expression_kind != null or
-        expression.case_else_expression != null or
-        expression.boolean_condition_count != 0 or
-        expression.boolean_first_condition_tokens != null or
-        expression.boolean_first_condition_kind != null or
-        expression.boolean_first_condition != null or
-        expression.boolean_last_condition_tokens != null or
-        expression.boolean_last_condition_kind != null or
-        expression.boolean_last_condition != null or
-        expression.interval_value_tokens != null or
-        expression.timestamp_type_tokens != null or
-        expression.timestamp_value_tokens != null or
-        expression.current_timestamp_precision_tokens != null or
-        expression.extract_field_tokens != null or
-        expression.extract_source_tokens != null or
-        expression.extract_source_expression_kind != null or
-        expression.extract_source_expression != null or
-        expression.left_tokens != null or
-        expression.left_expression_kind != null or
-        expression.left_expression != null or
-        expression.negation_tokens != null or
-        expression.operator_tokens != null or
-        expression.between_modifier_tokens != null or
-        expression.between_modifier != null or
-        expression.between_lower_tokens != null or
-        expression.between_lower_expression_kind != null or
-        expression.between_lower_expression != null or
-        expression.between_upper_tokens != null or
-        expression.between_upper_expression_kind != null or
-        expression.between_upper_expression != null or
-        expression.quantifier_tokens != null or
-        expression.right_tokens != null or
-        expression.right_expression_kind != null or
-        expression.right_expression != null or
-        expression.escape_tokens != null or
-        expression.escape_expression_kind != null or
-        expression.escape_expression != null)
-    {
-        return error.UnsupportedSqlShape;
-    }
-    try validateGeneratedEmptyList(expression.subquery_projection_items);
-    try validateGeneratedEmptyList(expression.argument_items);
-    try validateGeneratedEmptyList(expression.argument_order_items);
-    try validateGeneratedEmptyList(expression.within_group_order_items);
-    try validateGeneratedEmptyList(expression.over_partition_items);
-    try validateGeneratedEmptyList(expression.over_order_items);
-    try validateGeneratedEmptyList(expression.array_items);
-    try validateGeneratedEmptyList(expression.case_condition_items);
-    try validateGeneratedEmptyList(expression.case_result_items);
-    try validateGeneratedEmptyList(expression.boolean_condition_items);
+    if (!std.meta.eql(expression, generated_parser.GeneratedSqlExpressionAst{})) return error.UnsupportedSqlShape;
 }
 
 fn validateGeneratedExpressionRangeListPayloads(
@@ -3817,6 +3709,35 @@ pub fn validateGeneratedSingleJoinForClause(
     condition_tokens: generated_parser.GeneratedSqlTokenRange,
     predicate_tokens: generated_parser.GeneratedSqlTokenRange,
 ) !void {
+    const expected_kind: generated_parser.GeneratedSqlJoinKind = switch (join_type) {
+        .inner => .inner,
+        .left => .left,
+        .full => .full,
+    };
+    try validateGeneratedSingleJoinForClauseKind(
+        generated_read_ast,
+        expected_read_kind,
+        tokens,
+        left_tokens,
+        operator_tokens,
+        expected_kind,
+        right_tokens,
+        condition_tokens,
+        predicate_tokens,
+    );
+}
+
+pub fn validateGeneratedSingleJoinForClauseKind(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    expected_read_kind: generated_parser.GeneratedSqlReadKind,
+    tokens: []const Token,
+    left_tokens: generated_parser.GeneratedSqlTokenRange,
+    operator_tokens: generated_parser.GeneratedSqlTokenRange,
+    expected_kind: generated_parser.GeneratedSqlJoinKind,
+    right_tokens: generated_parser.GeneratedSqlTokenRange,
+    condition_tokens: generated_parser.GeneratedSqlTokenRange,
+    predicate_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
     const read = generated_read_ast orelse return;
     if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
     try validateGeneratedJoinItemsMetadata(tokens, read.*);
@@ -3832,10 +3753,6 @@ pub fn validateGeneratedSingleJoinForClause(
     if (join.condition_tokens.start != condition_tokens.start or join.condition_tokens.end != condition_tokens.end) return error.UnsupportedSqlShape;
     const join_predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
     if (join_predicate_tokens.start != predicate_tokens.start or join_predicate_tokens.end != predicate_tokens.end) return error.UnsupportedSqlShape;
-    const expected_kind: generated_parser.GeneratedSqlJoinKind = switch (join_type) {
-        .inner => .inner,
-        .left => .left,
-    };
     if (join.kind != expected_kind) return error.UnsupportedSqlShape;
     if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
 }
@@ -3847,6 +3764,35 @@ pub fn validateGeneratedSingleJoinUsingForClause(
     left_tokens: generated_parser.GeneratedSqlTokenRange,
     operator_tokens: generated_parser.GeneratedSqlTokenRange,
     join_type: db_mod.types.RelationalRowsJoinType,
+    right_tokens: generated_parser.GeneratedSqlTokenRange,
+    using_tokens: generated_parser.GeneratedSqlTokenRange,
+    column_tokens: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const expected_kind: generated_parser.GeneratedSqlJoinKind = switch (join_type) {
+        .inner => .inner,
+        .left => .left,
+        .full => .full,
+    };
+    try validateGeneratedSingleJoinUsingForClauseKind(
+        generated_read_ast,
+        expected_read_kind,
+        tokens,
+        left_tokens,
+        operator_tokens,
+        expected_kind,
+        right_tokens,
+        using_tokens,
+        column_tokens,
+    );
+}
+
+pub fn validateGeneratedSingleJoinUsingForClauseKind(
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+    expected_read_kind: generated_parser.GeneratedSqlReadKind,
+    tokens: []const Token,
+    left_tokens: generated_parser.GeneratedSqlTokenRange,
+    operator_tokens: generated_parser.GeneratedSqlTokenRange,
+    expected_kind: generated_parser.GeneratedSqlJoinKind,
     right_tokens: generated_parser.GeneratedSqlTokenRange,
     using_tokens: generated_parser.GeneratedSqlTokenRange,
     column_tokens: generated_parser.GeneratedSqlTokenRange,
@@ -3869,10 +3815,6 @@ pub fn validateGeneratedSingleJoinUsingForClause(
     if (generated_using_tokens.start != using_tokens.start or generated_using_tokens.end != using_tokens.end) return error.UnsupportedSqlShape;
     if (generated_column_tokens.start != column_tokens.start or generated_column_tokens.end != column_tokens.end) return error.UnsupportedSqlShape;
     if (join.using_columns.count == 0) return error.UnsupportedSqlShape;
-    const expected_kind: generated_parser.GeneratedSqlJoinKind = switch (join_type) {
-        .inner => .inner,
-        .left => .left,
-    };
     if (join.kind != expected_kind) return error.UnsupportedSqlShape;
     if (join.tokens.end > tokens.len) return error.UnsupportedSqlShape;
 }
@@ -4255,12 +4197,24 @@ pub fn validateGeneratedJoinExecutableContract(
     if (read.kind != expected_read_kind and read.kind != .cte) return error.UnsupportedSqlShape;
     try validateGeneratedJoinItemsMetadata(tokens, read.*);
     const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (expected_read_kind == .join and read.join_items.len > 1) {
+        if (root_index != read.join_items.len - 1 or read.join_tree_depth != read.join_items.len) return error.UnsupportedSqlShape;
+        for (read.join_items) |join| {
+            if (join.tree_index >= read.join_items.len or join.tree_depth != join.tree_index + 1) return error.UnsupportedSqlShape;
+            if (join.tree_index == 0) {
+                if (join.left_child_index != null) return error.UnsupportedSqlShape;
+            } else if (join.left_child_index != join.tree_index - 1) {
+                return error.UnsupportedSqlShape;
+            }
+            if (join.kind != .inner or join.condition_kind != .on or join.predicate_tokens == null) return error.UnsupportedSqlShape;
+        }
+        return;
+    }
     if (read.join_items.len != 1 or root_index != 0 or read.join_tree_depth != 1) return error.UnsupportedSqlShape;
     const join = read.join_items[0];
     if (join.tree_index != 0 or join.tree_depth != 1 or join.left_child_index != null) return error.UnsupportedSqlShape;
     switch (join.kind) {
-        .inner, .left, .cross, .natural => {},
-        .right, .full => return error.UnsupportedSqlShape,
+        .inner, .left, .right, .full, .cross, .natural => {},
     }
     switch (join.condition_kind) {
         .none => if (join.kind != .cross and join.kind != .natural) return error.UnsupportedSqlShape,

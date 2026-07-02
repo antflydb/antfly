@@ -29,12 +29,12 @@
       "id": "table-emptying-secondary-index-chaos",
       "relational_slices_section": "Release parity and production chaos gate",
       "scope": "table_emptying_secondary_index_rebuild",
-      "status": "partial_release_gated",
+      "status": "release_evidence",
       "required_behavior": "Table-emptying and secondary-index rebuild chaos must combine concurrent row writers, abort paths, stale lease takeover, range repair, durable reopen, and deterministic terminal state assertions.",
-      "current_evidence": "Release-gated table-emptying worker contention, stale lease takeover, malformed/stale range invalidation, durable job persistence, and secondary-index rebuild lifecycle tests cover individual failure modes.",
-      "missing_evidence": "One combined chaos harness must run table-emptying and secondary-index rebuild through concurrent writers, abort/reopen, stale leases, range repair, and terminal-state convergence.",
+      "current_evidence": "Release-gated combined chaos harness runs table-emptying and secondary-index rebuild with a concurrent row writer, writer abort, partial progress, stale lease takeover, topology invalidation, range repair, durable reopen, stale secondary-index artifact cleanup, and terminal state assertions.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/api/table_writes/schema_jobs.zig",
-      "evidence_symbol": "table emptying worker stale lease lets next worker delete rows and finish job",
+      "evidence_symbol": "table emptying and secondary index rebuild converge across chaos and reopen",
       "release_gate": "relational-release-gate"
     }
   ]

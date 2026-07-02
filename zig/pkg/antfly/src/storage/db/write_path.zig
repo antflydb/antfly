@@ -7639,6 +7639,69 @@ pub fn Impl(comptime DB: type) type {
             };
         }
 
+        fn documentGeneratedColumnCount(runtime_schema: schema_mod.TableSchema) usize {
+            if (runtime_schema.storage_mode != .document) return 0;
+            var count: usize = 0;
+            for (runtime_schema.relational_columns) |column| {
+                if (column.generated != null) count += 1;
+            }
+            return count;
+        }
+
+        fn putGeneratedDocumentJsonPathLeaky(
+            alloc: Allocator,
+            object: *std.json.ObjectMap,
+            path: []const u8,
+            value: std.json.Value,
+        ) !void {
+            var current = object;
+            var remaining = path;
+            while (true) {
+                if (std.mem.indexOfScalar(u8, remaining, '.')) |dot_idx| {
+                    const segment = remaining[0..dot_idx];
+                    if (segment.len == 0) return error.InvalidBatchRequest;
+                    remaining = remaining[dot_idx + 1 ..];
+                    if (current.getPtr(segment)) |existing| {
+                        if (existing.* != .object) existing.* = .{ .object = std.json.ObjectMap.empty };
+                        current = &existing.object;
+                    } else {
+                        try current.put(alloc, try alloc.dupe(u8, segment), .{ .object = std.json.ObjectMap.empty });
+                        current = &current.getPtr(segment).?.object;
+                    }
+                    continue;
+                }
+
+                if (remaining.len == 0) return error.InvalidBatchRequest;
+                try current.put(alloc, try alloc.dupe(u8, remaining), value);
+                return;
+            }
+        }
+
+        fn documentGeneratedFieldsValueAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            cleaned_value: []const u8,
+        ) !?[]u8 {
+            if (documentGeneratedColumnCount(runtime_schema) == 0) return null;
+
+            var arena = std.heap.ArenaAllocator.init(alloc);
+            defer arena.deinit();
+            const arena_alloc = arena.allocator();
+
+            var parsed = std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, cleaned_value, .{}) catch return error.InvalidBatchRequest;
+            if (parsed != .object) return error.InvalidBatchRequest;
+
+            for (runtime_schema.relational_columns) |column| {
+                const generated = column.generated orelse continue;
+                const value_json = try self.relationalRowsGeneratedColumnValueJsonAlloc(arena_alloc, parsed, generated);
+                const value = std.json.parseFromSliceLeaky(std.json.Value, arena_alloc, value_json, .{}) catch return error.InvalidBatchRequest;
+                try putGeneratedDocumentJsonPathLeaky(arena_alloc, &parsed.object, column.path, value);
+            }
+
+            return try std.json.Stringify.valueAlloc(alloc, parsed, .{});
+        }
+
         pub fn appendGeneratedEnrichments(
             self: *DB,
             derived_batch_out: *derived_types.DerivedBatch,
@@ -7944,6 +8007,14 @@ pub fn Impl(comptime DB: type) type {
                 const mapper_extract_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                 extracted[i] = try mapper.extractWrite(self.alloc, write.key, write.value);
                 if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.extract_mapper_ns, mapper_extract_start_ns);
+                if (self.core.schema) |runtime_schema| {
+                    if (extracted[i].cleaned_value) |cleaned| {
+                        if (try documentGeneratedFieldsValueAlloc(self, self.alloc, runtime_schema, cleaned)) |generated_value| {
+                            self.alloc.free(cleaned);
+                            extracted[i].cleaned_value = generated_value;
+                        }
+                    }
+                }
                 const graph_field_extract_start_ns = DB.WritePathCallbacks.monotonic_time_ns();
                 try DB.WritePathCallbacks.augment_extracted_write_with_graph_field_edges(self, self.alloc, write.key, write.value, &extracted[i]);
                 if (profile) |active_profile| DB.WritePathCallbacks.record_profile_ns(profile, &active_profile.extract_graph_fields_ns, graph_field_extract_start_ns);

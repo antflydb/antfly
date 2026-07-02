@@ -24,7 +24,7 @@
 %reference postgres_scan_l https://github.com/postgres/postgres/blob/4cc02b80774ecdc4cf2a2d5df09c07df36d68ca5/src/backend/parser/scan.l
 %reference cockroach_sql_y https://github.com/cockroachdb/cockroach/blob/master/pkg/sql/parser/sql.y
 
-%expect 10444
+%expect 10435
 
 %start statement
 
@@ -38,7 +38,7 @@
 %token CREATE COPY CROSS DATA DATABASE DATE DEALLOCATE DECLARE DEFAULT DELETE DESC DISCARD DISTINCT DO DOMAIN DROP EXECUTE
 %token ELSE END ESCAPE EXPLAIN EXISTS EXTENSION EXTRACT FALSE FETCH FILTER FIRST FOLLOWING FOR FOREIGN FROM FULL FUNCTION GENERATED GRANT GRAPH GROUP HASH HAVING IDENTITY IF ILIKE INCLUDE IN INDEX INNER INSERT INTERVAL INTO IS
 %token ISNULL JOIN KEY LABEL LAST LATERAL LEFT LIKE LIMIT LIST LISTEN LOAD LOCAL LOCK LOCKED MATCH MATCHED MATERIALIZED MERGE METHOD METRIC MOVE NATURAL NO NOT NULL NOTIFY NOTNULL NOWAIT NULLS OF ON OR ORDER OUTER OVER OVERLAY OWNED PARTITION PLACING POLICY POSITION PRECEDING PREPARE PRIMARY PUBLIC PUBLICATION IMPORT
-%token NEXT NOTHING OFFSET ONLY OPERATOR OVERRIDING OVERLAPS PERIOD PORTION PREPARED PRIVILEGES PROCEDURE QUERY RANGE REASSIGN RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURNING REVOKE RIGHT ROLLBACK ROLE ROUTINE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION SYSTEM TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
+%token NEXT NOTHING OFFSET ONLY OPERATOR OVERRIDING OVERLAPS PERIOD PORTION PREPARED PRIVILEGES PROCEDURE QUERY RANGE REASSIGN RECURSIVE REFRESH REINDEX RELEASE RENAME REPLACE RESET RESTART RESTRICT RETURN RETURNING REVOKE RIGHT ROLLBACK ROLE ROUTINE ROW ROWS RULE SAVEPOINT SCHEMA SECURITY SELECT SERVER SET SHARE SHOW SKIP SOME SUBSCRIPTION SYSTEM TABLE TEMP TEMPORARY TIMESTAMP TIMESTAMPTZ TO TRUNCATE
 %token SEQUENCE STORED SUBSTRING SYMMETRIC TABLESPACE THEN TRUE TRIGGER UNION UNIQUE UNKNOWN UNLISTEN UNLOGGED UPDATE USER USING VACUUM VALUE VALUES VIEW VIRTUAL WHEN WHERE WINDOW WITH WITHIN WITHOUT
 %token BINARY CURSOR HOLD SCROLL
 %token ANALYZE_VERBOSE SYSTEM_TIME_FOR
@@ -300,7 +300,7 @@ create_domain_statement:
   ;
 
 create_sequence_statement:
-    CREATE SEQUENCE if_not_exists_opt qualified_name diagnostic_tail_opt
+    CREATE SEQUENCE if_not_exists_opt qualified_name sequence_options_opt
   ;
 
 create_type_statement:
@@ -499,6 +499,25 @@ alter_domain_statement:
 
 alter_sequence_statement:
     ALTER SEQUENCE if_exists_opt qualified_name diagnostic_tail
+  ;
+
+sequence_options_opt:
+    /* empty */
+  | sequence_option_list
+  ;
+
+sequence_option_list:
+    sequence_option
+  | sequence_option_list sequence_option
+  ;
+
+sequence_option:
+    AS type_name
+  | START WITH expression
+  | identifier_name BY expression
+  | identifier_name expression
+  | NO identifier_name
+  | OWNED BY qualified_name
   ;
 
 alter_type_statement:
@@ -810,8 +829,8 @@ unsupported_statement:
   | CREATE OPERATOR IDENT diagnostic_tail_opt
   | CREATE RULE diagnostic_tail_opt
   | CREATE SERVER diagnostic_tail_opt
-  | CREATE OR REPLACE TRIGGER diagnostic_tail_opt
-  | CREATE TRIGGER diagnostic_tail_opt
+  | CREATE OR REPLACE TRIGGER trigger_diagnostic_tail_opt
+  | CREATE TRIGGER trigger_diagnostic_tail_opt
   | CREATE USER diagnostic_tail_opt
   | ALTER FOREIGN DATA identifier_name diagnostic_tail_opt
   | ALTER DEFAULT PRIVILEGES diagnostic_tail_opt
@@ -864,7 +883,8 @@ unsupported_statement:
   | LISTEN diagnostic_tail_opt
   | LOAD diagnostic_tail_opt
   | LOCK diagnostic_tail_opt
-  | MATCH diagnostic_tail_opt
+  | MATCH graph_path graph_where_opt RETURN graph_match_tail
+  | MATCH graph_path graph_source_binding graph_where_opt RETURN graph_match_tail
   | NOTIFY diagnostic_tail_opt
   | SET ROLE diagnostic_tail_opt
   | SET SESSION AUTHORIZATION diagnostic_tail_opt
@@ -876,6 +896,204 @@ unsupported_statement:
   | REVOKE diagnostic_tail_opt
   | SECURITY diagnostic_tail_opt
   | UNLISTEN diagnostic_tail_opt
+  ;
+
+graph_match_tail:
+    graph_match_token
+  | graph_match_tail graph_match_token
+  ;
+
+graph_path:
+    graph_node
+  | graph_node graph_out_relationship graph_node
+  | graph_node graph_in_relationship graph_node
+  ;
+
+graph_node:
+    LPAREN identifier_name RPAREN
+  ;
+
+graph_out_relationship:
+    MINUS LBRACKET graph_relationship_label_opt RBRACKET ARROW_JSON
+  ;
+
+graph_in_relationship:
+    LT MINUS LBRACKET graph_relationship_label_opt RBRACKET MINUS
+  ;
+
+graph_relationship_label_opt:
+    /* empty */
+  | COLON identifier_name
+  ;
+
+graph_source_binding:
+    WITH GRAPH graph_binding_value ON graph_binding_value START graph_binding_value
+  ;
+
+graph_binding_value:
+    IDENT
+  | STRING
+  ;
+
+graph_where_opt:
+    /* empty */
+  | WHERE graph_match_tail
+  ;
+
+graph_match_token:
+    IDENT
+  | STRING
+  | NUMBER
+  | PLACEHOLDER
+  | COMMA
+  | DOT
+  | STAR
+  | EQ
+  | NEQ
+  | LT
+  | LTE
+  | GT
+  | GTE
+  | PLUS
+  | MINUS
+  | SLASH
+  | PERCENT
+  | COLON
+  | COLON_COLON
+  | LPAREN
+  | RPAREN
+  | LBRACKET
+  | RBRACKET
+  | ARROW_JSON
+  | ARROW_TEXT
+  | PATH_ARROW_JSON
+  | PATH_ARROW_TEXT
+  | PIPE_CONCAT
+  | AT_CONTAINS
+  | RANGE_OVERLAP
+  | QUESTION
+  | QUESTION_ANY
+  | QUESTION_ALL
+  | REGEX_MATCH
+  | REGEX_IMATCH
+  | REGEX_NOT_MATCH
+  | REGEX_NOT_IMATCH
+  | ACCESS
+  | ADD
+  | AGGREGATE
+  | ALL
+  | ALTER
+  | ANALYZE
+  | AS
+  | ASC
+  | BY
+  | CASCADE
+  | CALL
+  | CHECK
+  | CHECKPOINT
+  | CLOSE
+  | CLUSTER
+  | COLLATION
+  | COMMENT
+  | CONSTRAINT
+  | COPY
+  | DATA
+  | DATABASE
+  | DATE
+  | DECLARE
+  | DEFAULT
+  | DELETE
+  | DESC
+  | DO
+  | DOMAIN
+  | DROP
+  | EXECUTE
+  | EXISTS
+  | FALSE
+  | FETCH
+  | FIRST
+  | FOR
+  | FOREIGN
+  | FROM
+  | FULL
+  | FUNCTION
+  | GENERATED
+  | GRAPH
+  | GRANT
+  | GROUP
+  | IF
+  | INCLUDE
+  | IN
+  | INDEX
+  | INSERT
+  | IS
+  | LABEL
+  | LAST
+  | LEFT
+  | LIMIT
+  | LISTEN
+  | LOAD
+  | LOCK
+  | MATCH
+  | METHOD
+  | MOVE
+  | NAME
+  | NEXT
+  | NO
+  | NOT
+  | NOTIFY
+  | NULL
+  | OF
+  | OFFSET
+  | ON
+  | OR
+  | ORDER
+  | POLICY
+  | PREPARE
+  | PRIVILEGES
+  | PROCEDURE
+  | PUBLICATION
+  | QUERY
+  | RANGE
+  | REASSIGN
+  | REINDEX
+  | RELEASE
+  | RENAME
+  | RESET
+  | RESTRICT
+  | REVOKE
+  | ROLE
+  | ROUTINE
+  | RULE
+  | SAVEPOINT
+  | SCHEMA
+  | SECURITY
+  | SELECT
+  | SEQUENCE
+  | SERVER
+  | SET
+  | SHARE
+  | SHOW
+  | SKIP
+  | SUBSCRIPTION
+  | TABLE
+  | TABLESPACE
+  | TEMP
+  | TEMPORARY
+  | TIMESTAMP
+  | TIMESTAMPTZ
+  | TO
+  | TRIGGER
+  | TRUE
+  | TYPE
+  | UNLISTEN
+  | UPDATE
+  | USER
+  | VACUUM
+  | VALUE
+  | VIEW
+  | WHERE
+  | WITH
   ;
 
 insert_overriding_body:
@@ -1083,7 +1301,7 @@ generated_column_storage_opt:
 
 identity_options_opt:
     /* empty */
-  | LPAREN diagnostic_tail RPAREN
+  | LPAREN sequence_option_list RPAREN
   ;
 
 insert_columns_opt:
@@ -1529,8 +1747,10 @@ function_argument_name:
   | NAME
   | OFFSET
   | QUERY
+  | RETURN
   | SOURCE
   | SOURCES
+  | START
   | TABLE
   | TYPE
   | WEIGHT
@@ -1700,6 +1920,7 @@ primary_expression:
   | PLACEHOLDER
   | LPAREN expression COMMA expression_list RPAREN
   | LPAREN expression RPAREN
+  | LPAREN read_statement RPAREN
   | ARRAY LBRACKET array_element_list_opt RBRACKET
   | LBRACKET array_element_list_opt RBRACKET
   | CAST LPAREN expression AS type_name RPAREN
@@ -1874,6 +2095,21 @@ analyze_column_list_opt:
 diagnostic_tail_opt:
     /* empty */
   | diagnostic_tail
+  ;
+
+trigger_diagnostic_tail_opt:
+    /* empty */
+  | trigger_diagnostic_tail
+  ;
+
+trigger_diagnostic_tail:
+    trigger_diagnostic_token
+  | trigger_diagnostic_tail trigger_diagnostic_token
+  ;
+
+trigger_diagnostic_token:
+    diagnostic_token
+  | TRUNCATE
   ;
 
 diagnostic_tail:

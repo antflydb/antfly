@@ -20,6 +20,7 @@ pub const TokenKind = enum {
     number,
     placeholder,
     comma,
+    colon,
     star,
     eq,
     neq,
@@ -301,6 +302,7 @@ pub const TokenKeyword = enum {
     replace,
     repeat,
     range,
+    @"return",
     returning,
     revoke,
     reverse,
@@ -332,6 +334,7 @@ pub const TokenKeyword = enum {
     sources,
     split_part,
     sqrt,
+    start,
     starts_with,
     stdin,
     stored,
@@ -403,6 +406,7 @@ pub const Token = struct {
     source_start: usize = 0,
     source_end: usize = 0,
     keyword: ?TokenKeyword = null,
+    postfix_cast_type: ?TokenPostfixCastType = null,
 
     pub fn isKeyword(self: Token, keyword: TokenKeyword) bool {
         return self.kind == .identifier and self.keyword == keyword;
@@ -439,6 +443,13 @@ pub const Token = struct {
     pub fn sourceSpan(self: Token) SourceSpan {
         return .{ .start = self.source_start, .end = self.source_end };
     }
+};
+
+pub const TokenPostfixCastType = enum {
+    text,
+    numeric,
+    bool,
+    datetime,
 };
 
 pub const SourceSpan = struct {
@@ -586,12 +597,14 @@ test "sql adapter tokens match keyword tags without treating quoted identifiers 
     try std.testing.expectEqual(TokenKeyword.reindex, keywordFromIdentifier("REINDEX").?);
     try std.testing.expectEqual(TokenKeyword.refresh, keywordFromIdentifier("REFRESH").?);
     try std.testing.expectEqual(TokenKeyword.release, keywordFromIdentifier("RELEASE").?);
+    try std.testing.expectEqual(TokenKeyword.@"return", keywordFromIdentifier("RETURN").?);
     try std.testing.expectEqual(TokenKeyword.revoke, keywordFromIdentifier("REVOKE").?);
     try std.testing.expectEqual(TokenKeyword.role, keywordFromIdentifier("ROLE").?);
     try std.testing.expectEqual(TokenKeyword.savepoint, keywordFromIdentifier("SAVEPOINT").?);
     try std.testing.expectEqual(TokenKeyword.security, keywordFromIdentifier("SECURITY").?);
     try std.testing.expectEqual(TokenKeyword.sequence, keywordFromIdentifier("SEQUENCE").?);
     try std.testing.expectEqual(TokenKeyword.settings, keywordFromIdentifier("SETTINGS").?);
+    try std.testing.expectEqual(TokenKeyword.start, keywordFromIdentifier("START").?);
     try std.testing.expectEqual(TokenKeyword.string_to_array, keywordFromIdentifier("STRING_TO_ARRAY").?);
     try std.testing.expectEqual(TokenKeyword.summary, keywordFromIdentifier("SUMMARY").?);
     try std.testing.expectEqual(TokenKeyword.system, keywordFromIdentifier("SYSTEM").?);

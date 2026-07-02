@@ -10,6 +10,7 @@ const raft_mod = @import("../raft/mod.zig");
 const document_sql_corpus = @import("document_sql_corpus.zig");
 const sql_adapter = @import("document_plan.zig");
 const sql_plan = @import("plan.zig");
+const source_binding = @import("source_binding.zig");
 const storage_schema = @import("../storage/schema.zig");
 
 pub const LookupOptions = struct {};
@@ -464,7 +465,7 @@ fn collectDocumentProducerCandidateIdsAlloc(
         },
         .indexed_query => |query| {
             const query_limit = query.max_candidate_rows orelse return error.DocumentSqlRequiresBoundedScan;
-            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, query_limit, query.residual_filter_json != null, false, consistency)) orelse return error.UnsupportedOperation;
+            var query_response = (try documentSqlIndexQueryAlloc(alloc, source, native_table_name, public_table_name, query, documentSqlIndexedCandidateProbeLimit(query_limit), query.residual_filter_json != null, false, consistency)) orelse return error.UnsupportedOperation;
             defer query_response.deinit(alloc);
             const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, query_response.json);
             try documentSqlAdmitBoundedRowCount(total_hits, query_limit);
@@ -665,6 +666,409 @@ pub fn executeProducerMutationPlanAlloc(
     return batch;
 }
 
+fn documentSqlLookupTableAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    table_name: []const u8,
+    key: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) !?LookupResponse {
+    return try source.lookup(alloc, table_name, key, .{}, consistency);
+}
+
+const DocumentJoinedCandidate = struct {
+    id: []const u8,
+    join_value_json: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(@constCast(self.id));
+        alloc.free(@constCast(self.join_value_json));
+        self.* = undefined;
+    }
+};
+
+fn freeDocumentJoinedCandidates(alloc: std.mem.Allocator, candidates: []DocumentJoinedCandidate) void {
+    for (candidates) |*candidate| candidate.deinit(alloc);
+    if (candidates.len > 0) alloc.free(candidates);
+}
+
+fn documentJoinedCandidateJoinValueJsonAlloc(
+    alloc: std.mem.Allocator,
+    id: []const u8,
+    doc_json: []const u8,
+    field: []const u8,
+) !?[]const u8 {
+    if (std.ascii.eqlIgnoreCase(field, "_id")) {
+        return try std.json.Stringify.valueAlloc(alloc, std.json.Value{ .string = id }, .{});
+    }
+
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer parsed.deinit();
+    const value = documentSqlProjectedValue(parsed.value, field) orelse return null;
+    return try std.json.Stringify.valueAlloc(alloc, value, .{});
+}
+
+fn collectDocumentJoinedCandidatesAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    table_name: []const u8,
+    ids: []const []const u8,
+    join_field: []const u8,
+    consistency: raft_mod.ReadConsistency,
+) ![]DocumentJoinedCandidate {
+    var candidates = std.ArrayListUnmanaged(DocumentJoinedCandidate).empty;
+    errdefer {
+        for (candidates.items) |*candidate| candidate.deinit(alloc);
+        candidates.deinit(alloc);
+    }
+
+    for (ids) |id| {
+        var lookup = (try documentSqlLookupTableAlloc(alloc, source, table_name, id, consistency)) orelse continue;
+        defer lookup.deinit(alloc);
+        const join_value_json = (try documentJoinedCandidateJoinValueJsonAlloc(alloc, id, lookup.json, join_field)) orelse continue;
+        errdefer alloc.free(@constCast(join_value_json));
+        const owned_id = try alloc.dupe(u8, id);
+        errdefer alloc.free(owned_id);
+        try candidates.append(alloc, .{
+            .id = owned_id,
+            .join_value_json = join_value_json,
+        });
+    }
+
+    return try candidates.toOwnedSlice(alloc);
+}
+
+fn documentJoinedSourceCandidateForTarget(
+    source_candidates: []const DocumentJoinedCandidate,
+    target: DocumentJoinedCandidate,
+) ?DocumentJoinedCandidate {
+    for (source_candidates) |source_candidate| {
+        if (std.mem.eql(u8, source_candidate.join_value_json, target.join_value_json)) return source_candidate;
+    }
+    return null;
+}
+
+fn documentJoinedSourceCandidatesContainDuplicateJoinValue(source_candidates: []const DocumentJoinedCandidate, join_value_json: []const u8) bool {
+    var seen = false;
+    for (source_candidates) |source_candidate| {
+        if (!std.mem.eql(u8, source_candidate.join_value_json, join_value_json)) continue;
+        if (seen) return true;
+        seen = true;
+    }
+    return false;
+}
+
+fn documentJoinedFilterPathForFieldAlloc(alloc: std.mem.Allocator, field: []const u8) ![]const u8 {
+    if (field.len == 0) return error.DocumentSqlWriteUnsupported;
+    if (field[0] == '/') return try alloc.dupe(u8, field);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '/');
+    for (field) |ch| {
+        try out.append(alloc, if (ch == '.') '/' else ch);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentJoinedSourceLookupFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    source_field: []const u8,
+    join_value_json: []const u8,
+) ![]const u8 {
+    const path = try documentJoinedFilterPathForFieldAlloc(alloc, source_field);
+    defer alloc.free(path);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "{\"term\":{\"path\":");
+    try appendJsonString(alloc, &out, path);
+    try out.appendSlice(alloc, ",\"value\":");
+    try out.appendSlice(alloc, join_value_json);
+    try out.appendSlice(alloc, "}}");
+    return try out.toOwnedSlice(alloc);
+}
+
+fn collectDocumentJoinedSourceCandidateForTargetAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    source_table_name: []const u8,
+    source_field: []const u8,
+    target: DocumentJoinedCandidate,
+    consistency: raft_mod.ReadConsistency,
+) !?DocumentJoinedCandidate {
+    const filter_json = try documentJoinedSourceLookupFilterJsonAlloc(alloc, source_field, target.join_value_json);
+    defer alloc.free(filter_json);
+    const query = sql_adapter.DocumentIndexQuery{
+        .filter_query_json = filter_json,
+        .max_candidate_rows = 2,
+    };
+    var response = (try documentSqlIndexQueryAlloc(alloc, source, source_table_name, source_table_name, query, documentSqlIndexedCandidateProbeLimit(2), false, false, consistency)) orelse return error.UnsupportedOperation;
+    defer response.deinit(alloc);
+    const total_hits = try documentSqlTotalHitsFromQueryResponse(alloc, response.json);
+    if (total_hits == 0) return null;
+    if (total_hits > 1) return error.DocumentSqlWriteDuplicateSource;
+
+    var ids = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        for (ids.items) |id| alloc.free(@constCast(id));
+        ids.deinit(alloc);
+    }
+    try appendDocumentCandidateIdsFromQueryResponseAlloc(
+        alloc,
+        source,
+        source_table_name,
+        source_table_name,
+        response.json,
+        null,
+        consistency,
+        &ids,
+    );
+    if (ids.items.len == 0) return null;
+    if (ids.items.len > 1) return error.DocumentSqlWriteDuplicateSource;
+    var candidates = try collectDocumentJoinedCandidatesAlloc(alloc, source, source_table_name, ids.items[0..1], source_field, consistency);
+    defer {
+        for (candidates) |*candidate| candidate.deinit(alloc);
+        if (candidates.len > 0) alloc.free(candidates);
+    }
+    if (candidates.len == 0) return null;
+    if (!std.mem.eql(u8, candidates[0].join_value_json, target.join_value_json)) return null;
+    const out = candidates[0];
+    candidates[0] = .{ .id = "", .join_value_json = "" };
+    return out;
+}
+
+fn documentJoinedSourceAssignmentOpsAlloc(
+    alloc: std.mem.Allocator,
+    operations_template: []const db_mod.types.TransformOp,
+    source_doc_json: []const u8,
+    assignments: []const sql_plan.DocumentJoinedMutationSourceAssignment,
+) ![]db_mod.types.TransformOp {
+    var source_doc = std.json.parseFromSlice(std.json.Value, alloc, source_doc_json, .{ .allocate = .alloc_always }) catch return error.InvalidRowsRequest;
+    defer source_doc.deinit();
+
+    var operations = try alloc.alloc(db_mod.types.TransformOp, operations_template.len + assignments.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (operations[0..initialized]) |op| {
+            alloc.free(@constCast(op.path));
+            if (op.value_json) |value_json| alloc.free(@constCast(value_json));
+        }
+        if (operations.len > 0) alloc.free(operations);
+    }
+
+    for (operations_template) |op| {
+        const path = try alloc.dupe(u8, op.path);
+        errdefer alloc.free(path);
+        const value_json = if (op.value_json) |value| try alloc.dupe(u8, value) else null;
+        errdefer if (value_json) |value| alloc.free(value);
+        operations[initialized] = .{
+            .op = op.op,
+            .path = path,
+            .value_json = value_json,
+        };
+        initialized += 1;
+    }
+
+    for (assignments) |assignment| {
+        const path = try alloc.dupe(u8, assignment.target_path);
+        errdefer alloc.free(path);
+        const value_json = if (documentSqlProjectedValue(source_doc.value, assignment.source_field)) |value|
+            try std.json.Stringify.valueAlloc(alloc, value, .{})
+        else
+            try alloc.dupe(u8, "null");
+        errdefer alloc.free(value_json);
+        operations[initialized] = .{
+            .op = .set,
+            .path = path,
+            .value_json = value_json,
+        };
+        initialized += 1;
+    }
+
+    return operations;
+}
+
+fn documentJoinedMutationPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    target_ids: []const []const u8,
+    expected_version: ?u64,
+) ![]db_mod.types.TransactionVersionPredicate {
+    const version = expected_version orelse return &.{};
+    if (target_ids.len == 0) return &.{};
+    var predicates = try alloc.alloc(db_mod.types.TransactionVersionPredicate, target_ids.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (predicates[0..initialized]) |predicate| alloc.free(@constCast(predicate.key));
+        if (predicates.len > 0) alloc.free(predicates);
+    }
+    for (target_ids) |id| {
+        predicates[initialized] = .{
+            .key = try alloc.dupe(u8, id),
+            .expected_version = version,
+        };
+        initialized += 1;
+    }
+    return predicates;
+}
+
+pub fn materializeJoinedMutationBatchAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    lowered: sql_plan.LoweredDocumentJoinedMutation,
+    consistency: raft_mod.ReadConsistency,
+) !sql_plan.OwnedDocumentBatchRequest {
+    if (lowered.join_keys.len != 1) return error.DocumentSqlWriteUnsupported;
+    const join_key = lowered.join_keys[0];
+
+    const target_ids = try collectDocumentProducerCandidateIdsAlloc(alloc, source, source.native_table_name, source.public_table_name, lowered.target_producer, consistency);
+    defer freeDocumentCandidateIds(alloc, target_ids);
+
+    if (lowered.max_target_rows) |max_target_rows| {
+        if (target_ids.len > max_target_rows) return error.DocumentSqlBoundedScanRowCapExceeded;
+    }
+    const target_candidates = try collectDocumentJoinedCandidatesAlloc(alloc, source, lowered.table_name, target_ids, join_key.target_field, consistency);
+    defer freeDocumentJoinedCandidates(alloc, target_candidates);
+
+    var static_source_candidates: []DocumentJoinedCandidate = &.{};
+    var static_source_candidates_initialized = false;
+    defer if (static_source_candidates_initialized) freeDocumentJoinedCandidates(alloc, static_source_candidates);
+    switch (lowered.source_producer) {
+        .static => |producer| {
+            const source_ids = try collectDocumentProducerCandidateIdsAlloc(alloc, source, lowered.source_table_name, lowered.source_table_name, producer, consistency);
+            defer freeDocumentCandidateIds(alloc, source_ids);
+            if (lowered.max_source_rows) |max_source_rows| {
+                if (source_ids.len > max_source_rows) return error.DocumentSqlBoundedScanRowCapExceeded;
+            }
+            static_source_candidates = try collectDocumentJoinedCandidatesAlloc(alloc, source, lowered.source_table_name, source_ids, join_key.source_field, consistency);
+            static_source_candidates_initialized = true;
+            for (static_source_candidates) |source_candidate| {
+                if (documentJoinedSourceCandidatesContainDuplicateJoinValue(static_source_candidates, source_candidate.join_value_json)) return error.DocumentSqlWriteDuplicateSource;
+            }
+        },
+        .join_key_indexed_lookup => {},
+    }
+
+    var matched_ids = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (matched_ids.items) |id| alloc.free(@constCast(id));
+        matched_ids.deinit(alloc);
+    }
+
+    switch (lowered.template) {
+        .delete => {
+            for (target_candidates) |target_candidate| {
+                var owned_source_candidate: ?DocumentJoinedCandidate = null;
+                defer if (owned_source_candidate) |*candidate| candidate.deinit(alloc);
+                const source_candidate = switch (lowered.source_producer) {
+                    .static => documentJoinedSourceCandidateForTarget(static_source_candidates, target_candidate) orelse continue,
+                    .join_key_indexed_lookup => blk: {
+                        owned_source_candidate = try collectDocumentJoinedSourceCandidateForTargetAlloc(alloc, source, lowered.source_table_name, join_key.source_field, target_candidate, consistency);
+                        break :blk owned_source_candidate orelse continue;
+                    },
+                };
+                var target_lookup = (try documentSqlLookupTableAlloc(alloc, source, lowered.table_name, target_candidate.id, consistency)) orelse continue;
+                defer target_lookup.deinit(alloc);
+                var source_lookup = (try documentSqlLookupTableAlloc(alloc, source, lowered.source_table_name, source_candidate.id, consistency)) orelse continue;
+                defer source_lookup.deinit(alloc);
+                try matched_ids.append(alloc, try alloc.dupe(u8, target_candidate.id));
+            }
+            const deletes = try matched_ids.toOwnedSlice(alloc);
+            matched_ids = .empty;
+            errdefer freeDocumentCandidateIds(alloc, deletes);
+            const predicates = try documentJoinedMutationPredicatesAlloc(alloc, deletes, lowered.expected_version);
+            errdefer {
+                for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+                if (predicates.len > 0) alloc.free(predicates);
+            }
+            return .{
+                .deletes = deletes,
+                .predicates = predicates,
+                .req = .{
+                    .deletes = deletes,
+                    .predicates = predicates,
+                    .sync_level = lowered.sync_level,
+                },
+                .deleted = @intCast(deletes.len),
+            };
+        },
+        .transform => |operations_template| {
+            var transforms = std.ArrayListUnmanaged(db_mod.types.DocumentTransform).empty;
+            errdefer {
+                for (transforms.items) |transform| {
+                    alloc.free(@constCast(transform.key));
+                    freeDocumentMutationTemplateOps(alloc, transform.operations);
+                }
+                transforms.deinit(alloc);
+            }
+            for (target_candidates) |target_candidate| {
+                var owned_source_candidate: ?DocumentJoinedCandidate = null;
+                defer if (owned_source_candidate) |*candidate| candidate.deinit(alloc);
+                const source_candidate = switch (lowered.source_producer) {
+                    .static => documentJoinedSourceCandidateForTarget(static_source_candidates, target_candidate) orelse continue,
+                    .join_key_indexed_lookup => blk: {
+                        owned_source_candidate = try collectDocumentJoinedSourceCandidateForTargetAlloc(alloc, source, lowered.source_table_name, join_key.source_field, target_candidate, consistency);
+                        break :blk owned_source_candidate orelse continue;
+                    },
+                };
+                var target_lookup = (try documentSqlLookupTableAlloc(alloc, source, lowered.table_name, target_candidate.id, consistency)) orelse continue;
+                defer target_lookup.deinit(alloc);
+                var source_lookup = (try documentSqlLookupTableAlloc(alloc, source, lowered.source_table_name, source_candidate.id, consistency)) orelse continue;
+                defer source_lookup.deinit(alloc);
+
+                const transform_key = try alloc.dupe(u8, target_candidate.id);
+                errdefer alloc.free(transform_key);
+                const operations = try documentJoinedSourceAssignmentOpsAlloc(alloc, operations_template, source_lookup.json, lowered.source_assignments);
+                errdefer freeDocumentMutationTemplateOps(alloc, operations);
+                try transforms.append(alloc, .{
+                    .key = transform_key,
+                    .operations = operations,
+                });
+                try matched_ids.append(alloc, try alloc.dupe(u8, target_candidate.id));
+            }
+
+            const transform_slice = try transforms.toOwnedSlice(alloc);
+            transforms = .empty;
+            errdefer {
+                for (transform_slice) |transform| {
+                    alloc.free(@constCast(transform.key));
+                    freeDocumentMutationTemplateOps(alloc, transform.operations);
+                }
+                if (transform_slice.len > 0) alloc.free(transform_slice);
+            }
+            const matched_slice = try matched_ids.toOwnedSlice(alloc);
+            matched_ids = .empty;
+            defer freeDocumentCandidateIds(alloc, matched_slice);
+            const predicates = try documentJoinedMutationPredicatesAlloc(alloc, matched_slice, lowered.expected_version);
+            errdefer {
+                for (predicates) |predicate| alloc.free(@constCast(predicate.key));
+                if (predicates.len > 0) alloc.free(predicates);
+            }
+            return .{
+                .transforms = transform_slice,
+                .predicates = predicates,
+                .req = .{
+                    .transforms = transform_slice,
+                    .predicates = predicates,
+                    .sync_level = lowered.sync_level,
+                },
+                .transformed = @intCast(transform_slice.len),
+            };
+        },
+    }
+}
+
+pub fn executeJoinedMutationPlanAlloc(
+    alloc: std.mem.Allocator,
+    source: Source,
+    sink: BatchSink,
+    lowered: sql_plan.LoweredDocumentJoinedMutation,
+    consistency: raft_mod.ReadConsistency,
+) !sql_plan.OwnedDocumentBatchRequest {
+    var batch = try materializeJoinedMutationBatchAlloc(alloc, source, lowered, consistency);
+    errdefer batch.deinit(alloc);
+    try sink.batch(batch.req);
+    return batch;
+}
+
 fn documentSqlAdmitBoundedScanPayload(
     scan_plan: sql_adapter.BoundedDocumentScan,
     payload: []const u8,
@@ -676,6 +1080,10 @@ fn documentSqlAdmitBoundedScanPayload(
 fn documentSqlBoundedScanProbeLimit(max_rows: u32) u32 {
     if (max_rows == std.math.maxInt(u32)) return max_rows;
     return max_rows + 1;
+}
+
+fn documentSqlIndexedCandidateProbeLimit(max_rows: u32) u32 {
+    return @max(max_rows, source_binding.default_document_sql_bounded_scan_rows);
 }
 
 fn documentSqlAdmitBoundedRowCount(row_count: u32, max_rows: u32) !void {
@@ -3569,6 +3977,23 @@ test "document SQL producer mutation materializes bounded residual transform bat
         .value_json = "\"Ready\"",
     }};
     const residual_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"active\"}}";
+
+    const byte_capped_lowered = sql_plan.LoweredDocumentProducerMutation{
+        .table_name = "docs",
+        .producer = .{ .bounded_scan = .{
+            .max_rows = 3,
+            .max_bytes = 8,
+            .residual_filter_json = residual_filter_json,
+        } },
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+    };
+    var byte_capped_source = MockSource{};
+    try std.testing.expectError(
+        error.DocumentSqlBoundedScanByteCapExceeded,
+        materializeProducerMutationBatchAlloc(alloc, byte_capped_source.source(), byte_capped_lowered, .stale),
+    );
+
     const lowered = sql_plan.LoweredDocumentProducerMutation{
         .table_name = "docs",
         .producer = .{ .bounded_scan = .{
@@ -3730,6 +4155,460 @@ test "document SQL producer mutation applies materialized native batch through s
     try std.testing.expectEqualStrings("doc:a", sink.first_key);
     try std.testing.expectEqual(@as(usize, 1), batch.req.transforms.len);
     try std.testing.expectEqualStrings("doc:a", batch.req.transforms[0].key);
+}
+
+test "document SQL joined mutation materializes exact id source assignment update" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = opts;
+            _ = consistency;
+            if (!std.mem.eql(u8, table_name, "docs")) return null;
+            if (!std.mem.eql(u8, key, "doc:a")) return null;
+            return .{ .json = try lookup_alloc.dupe(u8, "{\"title\":\"Source Title\",\"status\":\"draft\"}"), .version = 3 };
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return .{ .ndjson = try scan_alloc.dupe(u8, "") };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    var operations = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "status",
+        .value_json = "\"ready\"",
+    }};
+    var join_keys = [_]sql_plan.DocumentJoinedMutationJoinKey{.{
+        .target_field = "_id",
+        .source_field = "_id",
+    }};
+    var assignments = [_]sql_plan.DocumentJoinedMutationSourceAssignment{.{
+        .target_path = "title",
+        .source_field = "title",
+        .field_type = .text,
+    }};
+    const ids = [_][]const u8{"doc:a"};
+    const lowered = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "docs",
+        .target_producer = .{ .id_lookup = .{ .ids = ids[0..] } },
+        .source_producer = .{ .static = .{ .id_lookup = .{ .ids = ids[0..] } } },
+        .join_keys = join_keys[0..],
+        .source_assignments = assignments[0..],
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .expected_version = 11,
+        .max_target_rows = 1,
+        .max_source_rows = 1,
+        .duplicate_source_policy = .reject,
+        .sync_level = .enrichments,
+    };
+
+    var source = MockSource{};
+    var batch = try materializeJoinedMutationBatchAlloc(alloc, source.source(), lowered, .stale);
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), batch.req.transforms.len);
+    try std.testing.expectEqual(@as(usize, 1), batch.req.predicates.len);
+    try std.testing.expectEqual(db_mod.types.SyncLevel.enrichments, batch.req.sync_level);
+    try std.testing.expectEqualStrings("doc:a", batch.req.transforms[0].key);
+    try std.testing.expectEqual(@as(usize, 2), batch.req.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("status", batch.req.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"ready\"", batch.req.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("title", batch.req.transforms[0].operations[1].path);
+    try std.testing.expectEqualStrings("\"Source Title\"", batch.req.transforms[0].operations[1].value_json.?);
+    try std.testing.expectEqualStrings("doc:a", batch.req.predicates[0].key);
+    try std.testing.expectEqual(@as(u64, 11), batch.req.predicates[0].expected_version);
+}
+
+test "document SQL joined mutation handles exact id no-match duplicate source delete and sink" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = opts;
+            _ = consistency;
+            if (std.mem.eql(u8, table_name, "docs") and std.mem.eql(u8, key, "doc:a")) {
+                return .{ .json = try lookup_alloc.dupe(u8, "{\"title\":\"Target\"}"), .version = 5 };
+            }
+            if (std.mem.eql(u8, table_name, "source_docs") and std.mem.eql(u8, key, "doc:z")) {
+                return .{ .json = try lookup_alloc.dupe(u8, "{\"title\":\"Source\"}"), .version = 7 };
+            }
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return .{ .ndjson = try scan_alloc.dupe(u8, "") };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            _ = ptr;
+            _ = query_alloc;
+            _ = table_name;
+            _ = req;
+            _ = consistency;
+            return null;
+        }
+    };
+
+    const MockSink = struct {
+        calls: usize = 0,
+        delete_count: usize = 0,
+        predicate_count: usize = 0,
+
+        fn sink(self: *@This()) BatchSink {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .batch = batch,
+                },
+            };
+        }
+
+        fn batch(ptr: *anyopaque, req: db_mod.types.BatchRequest) !void {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            self.calls += 1;
+            self.delete_count = req.deletes.len;
+            self.predicate_count = req.predicates.len;
+        }
+    };
+
+    var join_keys = [_]sql_plan.DocumentJoinedMutationJoinKey{.{
+        .target_field = "_id",
+        .source_field = "_id",
+    }};
+    const doc_a = [_][]const u8{"doc:a"};
+    const doc_z = [_][]const u8{"doc:z"};
+    const duplicate = [_][]const u8{ "doc:a", "doc:a" };
+
+    const delete_lowered = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "docs",
+        .target_producer = .{ .id_lookup = .{ .ids = doc_a[0..] } },
+        .source_producer = .{ .static = .{ .id_lookup = .{ .ids = doc_a[0..] } } },
+        .join_keys = join_keys[0..],
+        .operation = .non_identity_delete,
+        .template = .delete,
+        .expected_version = 5,
+        .max_target_rows = 1,
+        .max_source_rows = 1,
+    };
+
+    var source = MockSource{};
+    var sink = MockSink{};
+    var delete_batch = try executeJoinedMutationPlanAlloc(alloc, source.source(), sink.sink(), delete_lowered, .stale);
+    defer delete_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 1), sink.calls);
+    try std.testing.expectEqual(@as(usize, 1), sink.delete_count);
+    try std.testing.expectEqual(@as(usize, 1), sink.predicate_count);
+    try std.testing.expectEqual(@as(u32, 1), delete_batch.deleted);
+    try std.testing.expectEqualStrings("doc:a", delete_batch.req.deletes[0]);
+    try std.testing.expectEqual(@as(u64, 5), delete_batch.req.predicates[0].expected_version);
+
+    const source_missing = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "source_docs",
+        .target_producer = .{ .id_lookup = .{ .ids = doc_a[0..] } },
+        .source_producer = .{ .static = .{ .id_lookup = .{ .ids = doc_a[0..] } } },
+        .join_keys = join_keys[0..],
+        .operation = .non_identity_delete,
+        .template = .delete,
+        .expected_version = 5,
+    };
+    var source_missing_batch = try materializeJoinedMutationBatchAlloc(alloc, source.source(), source_missing, .stale);
+    defer source_missing_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), source_missing_batch.req.deletes.len);
+    try std.testing.expectEqual(@as(usize, 0), source_missing_batch.req.predicates.len);
+
+    const target_missing = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "source_docs",
+        .target_producer = .{ .id_lookup = .{ .ids = doc_z[0..] } },
+        .source_producer = .{ .static = .{ .id_lookup = .{ .ids = doc_z[0..] } } },
+        .join_keys = join_keys[0..],
+        .operation = .non_identity_delete,
+        .template = .delete,
+        .expected_version = 5,
+    };
+    var target_missing_batch = try materializeJoinedMutationBatchAlloc(alloc, source.source(), target_missing, .stale);
+    defer target_missing_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(usize, 0), target_missing_batch.req.deletes.len);
+    try std.testing.expectEqual(@as(usize, 0), target_missing_batch.req.predicates.len);
+
+    const duplicate_source = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "docs",
+        .target_producer = .{ .id_lookup = .{ .ids = doc_a[0..] } },
+        .source_producer = .{ .static = .{ .id_lookup = .{ .ids = duplicate[0..] } } },
+        .join_keys = join_keys[0..],
+        .operation = .non_identity_delete,
+        .template = .delete,
+        .max_source_rows = 2,
+    };
+    try std.testing.expectError(error.DocumentSqlWriteDuplicateSource, materializeJoinedMutationBatchAlloc(alloc, source.source(), duplicate_source, .stale));
+}
+
+test "document SQL joined mutation materializes mapped-field indexed source and bounded target" {
+    const alloc = std.testing.allocator;
+
+    const MockSource = struct {
+        duplicate_source: bool = false,
+        target_no_match: bool = false,
+
+        fn source(self: *@This()) Source {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+                .native_table_name = "docs",
+                .public_table_name = "docs",
+            };
+        }
+
+        fn lookup(
+            ptr: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            opts: LookupOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            _ = ptr;
+            _ = opts;
+            _ = consistency;
+            if (std.mem.eql(u8, table_name, "docs") and std.mem.eql(u8, key, "doc:target-a")) {
+                return .{ .json = try lookup_alloc.dupe(u8, "{\"account_id\":\"acct:1\",\"title\":\"Target A\"}"), .version = 5 };
+            }
+            if (std.mem.eql(u8, table_name, "docs") and std.mem.eql(u8, key, "doc:target-b")) {
+                return .{ .json = try lookup_alloc.dupe(u8, "{\"account_id\":\"acct:2\",\"title\":\"Target B\"}"), .version = 6 };
+            }
+            if (std.mem.eql(u8, table_name, "source_docs") and std.mem.eql(u8, key, "doc:source-a")) {
+                return .{ .json = try lookup_alloc.dupe(u8, "{\"account_id\":\"acct:1\",\"title\":\"Source A\"}"), .version = 7 };
+            }
+            if (std.mem.eql(u8, table_name, "source_docs") and std.mem.eql(u8, key, "doc:source-duplicate")) {
+                return .{ .json = try lookup_alloc.dupe(u8, "{\"account_id\":\"acct:1\",\"title\":\"Source Duplicate\"}"), .version = 8 };
+            }
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: ScanOptions,
+            consistency: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            _ = ptr;
+            _ = table_name;
+            _ = from_key;
+            _ = to_key;
+            _ = opts;
+            _ = consistency;
+            return .{ .ndjson = try scan_alloc.dupe(u8,
+                \\{"key":"doc:target-a"}
+                \\{"key":"doc:target-b"}
+                \\
+            ) };
+        }
+
+        fn query(
+            ptr: *anyopaque,
+            query_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            req: QueryRequest,
+            consistency: raft_mod.ReadConsistency,
+        ) !?QueryResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            _ = req;
+            _ = consistency;
+            if (std.mem.eql(u8, table_name, "docs")) {
+                const target_response_json =
+                    if (self.target_no_match)
+                        \\{"responses":[{"hits":{"total":0,"hits":[]}}]}
+                    else
+                        \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:target-a"}]}}]}
+                    ;
+                return .{ .json = try query_alloc.dupe(u8, target_response_json) };
+            }
+            const response_json =
+                if (self.duplicate_source)
+                    \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:source-a"},{"_id":"doc:source-duplicate"}]}}]}
+                else
+                    \\{"responses":[{"hits":{"total":1,"hits":[{"_id":"doc:source-a"}]}}]}
+                ;
+            return .{ .json = try query_alloc.dupe(u8, response_json) };
+        }
+    };
+
+    var operations = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "status",
+        .value_json = "\"copied\"",
+    }};
+    var join_keys = [_]sql_plan.DocumentJoinedMutationJoinKey{.{
+        .target_field = "account_id",
+        .source_field = "account_id",
+    }};
+    var assignments = [_]sql_plan.DocumentJoinedMutationSourceAssignment{.{
+        .target_path = "title",
+        .source_field = "title",
+        .field_type = .text,
+    }};
+    const lowered = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "source_docs",
+        .target_producer = .{ .bounded_scan = .{ .max_rows = 5 } },
+        .source_producer = .join_key_indexed_lookup,
+        .join_keys = join_keys[0..],
+        .source_assignments = assignments[0..],
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .max_target_rows = 5,
+        .max_source_rows = 5,
+    };
+
+    var source = MockSource{};
+    var batch = try materializeJoinedMutationBatchAlloc(alloc, source.source(), lowered, .stale);
+    defer batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), batch.req.transforms.len);
+    try std.testing.expectEqualStrings("doc:target-a", batch.req.transforms[0].key);
+    try std.testing.expectEqual(@as(usize, 2), batch.req.transforms[0].operations.len);
+    try std.testing.expectEqualStrings("status", batch.req.transforms[0].operations[0].path);
+    try std.testing.expectEqualStrings("\"copied\"", batch.req.transforms[0].operations[0].value_json.?);
+    try std.testing.expectEqualStrings("title", batch.req.transforms[0].operations[1].path);
+    try std.testing.expectEqualStrings("\"Source A\"", batch.req.transforms[0].operations[1].value_json.?);
+
+    source.duplicate_source = true;
+    try std.testing.expectError(error.DocumentSqlWriteDuplicateSource, materializeJoinedMutationBatchAlloc(alloc, source.source(), lowered, .stale));
+
+    source.duplicate_source = false;
+    const indexed_target_lowered = sql_plan.LoweredDocumentJoinedMutation{
+        .table_name = "docs",
+        .source_table_name = "source_docs",
+        .target_producer = .{ .indexed_query = .{
+            .filter_query_json = "{\"term\":{\"path\":\"/account_id\",\"value\":\"acct:1\"}}",
+            .max_candidate_rows = 1,
+        } },
+        .source_producer = .join_key_indexed_lookup,
+        .join_keys = join_keys[0..],
+        .source_assignments = assignments[0..],
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .max_target_rows = 1,
+        .max_source_rows = 1,
+    };
+    var indexed_batch = try materializeJoinedMutationBatchAlloc(alloc, source.source(), indexed_target_lowered, .stale);
+    defer indexed_batch.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 1), indexed_batch.transformed);
+    try std.testing.expectEqual(@as(usize, 1), indexed_batch.req.transforms.len);
+    try std.testing.expectEqualStrings("doc:target-a", indexed_batch.req.transforms[0].key);
+
+    source.target_no_match = true;
+    var no_match_batch = try materializeJoinedMutationBatchAlloc(alloc, source.source(), indexed_target_lowered, .stale);
+    defer no_match_batch.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 0), no_match_batch.transformed);
+    try std.testing.expectEqual(@as(usize, 0), no_match_batch.req.transforms.len);
 }
 
 test "document SQL producer mutation materializes explicit delete batch" {
@@ -4606,6 +5485,12 @@ test "document SQL executes algebraic materialized aggregate rows" {
     try std.testing.expectEqual(@as(usize, 1), ordered_result.rows.len);
     try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":30}", ordered_result.rows[0]);
 
+    var having_predicates = [_]sql_adapter.DocumentAggregateHavingPredicate{.{
+        .key = .aggregate,
+        .field_type = .numeric,
+        .op = .gt,
+        .value_json = "25",
+    }};
     const having_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .index_name = "alg",
@@ -4621,14 +5506,7 @@ test "document SQL executes algebraic materialized aggregate rows" {
             .field_type = .keyword,
             .output = "status",
         },
-        .having = &.{
-            .{
-                .key = .aggregate,
-                .field_type = .numeric,
-                .op = .gt,
-                .value_json = "25",
-            },
-        },
+        .having = having_predicates[0..],
         .order_by = .{
             .key = .aggregate,
             .field_type = .numeric,
@@ -4643,6 +5521,20 @@ test "document SQL executes algebraic materialized aggregate rows" {
     try std.testing.expectEqual(@as(usize, 1), having_result.rows.len);
     try std.testing.expectEqualStrings("{\"status\":\"archived\",\"total_amount\":30}", having_result.rows[0]);
 
+    var having_conjunction_predicates = [_]sql_adapter.DocumentAggregateHavingPredicate{
+        .{
+            .key = .aggregate,
+            .field_type = .numeric,
+            .op = .gt,
+            .value_json = "20",
+        },
+        .{
+            .key = .group,
+            .field_type = .keyword,
+            .op = .eq,
+            .value_json = "\"archived\"",
+        },
+    };
     const having_conjunction_plan = sql_adapter.DocumentAlgebraicAggregatePlan{
         .table_name = "docs",
         .index_name = "alg",
@@ -4658,20 +5550,7 @@ test "document SQL executes algebraic materialized aggregate rows" {
             .field_type = .keyword,
             .output = "status",
         },
-        .having = &.{
-            .{
-                .key = .aggregate,
-                .field_type = .numeric,
-                .op = .gt,
-                .value_json = "20",
-            },
-            .{
-                .key = .group,
-                .field_type = .keyword,
-                .op = .eq,
-                .value_json = "\"archived\"",
-            },
-        },
+        .having = having_conjunction_predicates[0..],
         .order_by = .{
             .key = .aggregate,
             .field_type = .numeric,

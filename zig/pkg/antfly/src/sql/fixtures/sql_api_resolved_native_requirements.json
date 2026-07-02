@@ -87,7 +87,6 @@
         "unsupported_write_document_sql_non_identity_delete",
         "unsupported_write_document_sql_ordered_delete",
         "unsupported_write_document_sql_range_delete",
-        "unsupported_write_document_sql_truncate_table",
         "unsupported_write_document_sql_write_unsupported"
       ]
     },

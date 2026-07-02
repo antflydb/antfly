@@ -15,9 +15,19 @@ Feature and plan-parity coverage belongs in named entries in
 required buckets added to the coverage manifest when a feature becomes part of
 the tracked contract. Runtime result parity that needs seeded rows should live
 in executable Zig integration tests, with the JSON corpus naming the SQL shapes,
-plan summaries, and coverage buckets. Local Zig tests should otherwise prove
-helper behavior such as structured-summary extraction, fixture validators,
-inventory validators, and diagnostic classifiers.
+plan summaries, and coverage buckets. Public SQL endpoint parity that needs a
+real `ApiHttpServer` belongs in
+`zig/pkg/antfly/src/api/public_sql_endpoint_parity.zig`; keep
+`zig/pkg/antfly/src/api/http_server.zig` focused on routing, session, auth, DDL,
+and server-mechanics behavior. Local Zig tests should otherwise prove helper
+behavior such as structured-summary extraction, fixture validators, inventory
+validators, and diagnostic classifiers.
+
+Document SQL read-plan and residual-expression evidence belongs in
+`zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json`. If a document-write
+slice needs fixture-backed lowering evidence, extend that fixture with a write
+case class in the same patch rather than proving document-only behavior solely
+through the SQL/API parity corpus.
 
 ## Document SQL
 
@@ -28,61 +38,59 @@ document SQL implementation gates.
   Admit each document-write shape only after it lowers to the typed native
   document request model and has SQL/native parity evidence. Keep
   `ON CONFLICT`, `RETURNING`, source-query projection inserts, broad
-  projection updates, broad insert/update/delete, truncate, and merge rejected
-  until the specific slice below admits that shape with corpus and runtime
-  proof.
+  projection updates, broad insert/update/delete, remaining truncate variants,
+  and merge rejected until the specific slice below admits that shape with
+  corpus and runtime proof.
 
-  - [ ] Admit indexed-producer document mutations.
-        Lower `UPDATE docs SET ... WHERE mapped_field <op> value` and
-        `DELETE FROM docs WHERE mapped_field <op> value` through
-        `LoweredDocumentProducerMutation` only when the predicate has an exact
-        indexed/native producer. Close this with equality, `IN`, range,
-        boolean/null, nested mapped-path, version-predicate, no-match,
-        stale-version, residual-rejection, corpus-summary, coverage-bucket, and
-        runtime-parity tests.
-  - [ ] Admit bounded-scan document mutations.
-        Lower residual-filtered `UPDATE` and `DELETE` only when the producer
-        carries explicit row and byte caps plus a stable residual predicate.
-        Close this with cap-enforcement, ordering/limit rejection or exact
-        semantics, partial-match, no-match, audit/filter/auth ordering,
-        corpus-summary, coverage-bucket, and runtime-parity tests.
-  - [ ] Admit joined and source-derived document mutations.
-        Lower `UPDATE docs ... FROM ...`, `DELETE FROM docs USING ...`, and
-        source-derived assignments only when the join/source has deterministic
-        cardinality, deterministic ordering, and an exact native candidate
-        producer. Close this with duplicate-source handling, assignment
-        expression binding, version predicates, conflict/no-match behavior,
-        stable rejection of relational mutation-row fallbacks, corpus summaries,
-        required coverage buckets, and runtime parity.
   - [ ] Admit projection-write `ON CONFLICT`.
-        Lower `DO NOTHING` and `DO UPDATE` only to native document write
-        semantics, with explicit behavior for `_version`, generated fields,
-        nested-path assignments, conflict target validation, conflict/no-op row
-        reporting, corpus plan summaries, required coverage buckets, and runtime
-        parity.
+        Land `INSERT INTO docs (...) ... ON CONFLICT` only when `DO NOTHING`
+        and `DO UPDATE` lower to native document write semantics. Required
+        proof: conflict-target validation, duplicate-key behavior, no-op row
+        reporting, `_version` behavior, generated-field rejection, nested-path
+        assignment behavior, schema-validation failures, document-write
+        lowering fixtures, required SQL/API coverage buckets, and executable
+        runtime parity.
   - [ ] Admit projection-write `RETURNING`.
-        Return `_id`, `_doc`, virtual fields, projection aliases, generated
-        columns, conflict/no-op rows, and updated version metadata with the same
-        shape as the native/API path. Close this with corpus plan summaries,
-        required coverage buckets, runtime parity, and stable diagnostics for
-        unsupported returning expressions.
+        Land `RETURNING` for document projection inserts, projection updates,
+        producer mutations, and admitted conflict actions only when result rows
+        match the native/API write response shape. Required proof: `_id`,
+        `_doc`, `_version`, virtual fields, projection aliases, generated
+        columns, conflict/no-op rows, deleted-row behavior, unsupported
+        expression diagnostics, document-write lowering fixtures, required
+        SQL/API coverage buckets, and executable runtime parity.
+    - [ ] Admit `_version` only after the native document write path exposes a
+          post-write version value that can be returned deterministically.
+    - [ ] Admit projection-update, producer-mutation, joined-mutation,
+          conflict/no-op, and delete `RETURNING` only with executable native/API
+          parity for returned row shape and row-count semantics.
+    - [ ] Add stable diagnostics for unsupported document `RETURNING`
+          expressions, duplicate outputs, generated columns, and unsupported
+          virtual fields.
   - [ ] Admit source-query projection writes.
-        Lower `INSERT INTO docs (...) SELECT ...` only when the source has
-        deterministic ordering and bounded cardinality or an explicit native
-        producer contract. Prove source ordering, source limits, duplicate-key
-        handling, conflict behavior, schema validation, corpus plan summaries,
-        required coverage buckets, runtime parity, and stable rejection of
-        relational mutation-source plans.
-  - [ ] Admit `TRUNCATE docs`.
-        Close this with source-corpus fixtures and runtime parity for document
-        table-emptying, bounded deletion, audit-required behavior, row-filter
-        interaction, conflict/no-match reporting, identity-reset behavior, and
-        stable diagnostics for unsupported restart/cascade variants.
+        Land `INSERT INTO docs (...) SELECT ...` only when the source has
+        deterministic ordering plus bounded cardinality, or an explicit native
+        producer contract. Required proof: source ordering, source `LIMIT`
+        semantics, duplicate-key handling, conflict behavior, schema
+        validation, generated-id behavior, rejection of unbounded or
+        nondeterministic sources, rejection of relational mutation-source
+        plans, document-write lowering fixtures, required SQL/API coverage
+        buckets, and executable runtime parity.
+  - [ ] Finish document `TRUNCATE` variant hardening.
+    - [ ] Add row-filter/audit interaction coverage before exposing truncate
+          through guarded document tables.
+    - [ ] Add bounded-delete/native-truncate selection coverage for large
+          document ranges.
+    - [ ] Define future identity-reset semantics before admitting
+          `RESTART IDENTITY`.
   - [ ] Admit `MERGE INTO docs ...`.
-        Close this with source-corpus fixtures and runtime parity for document
-        match, insert, update, delete, no-op, conflict, audit-required,
-        row-filter, stale-filter, generated-field, schema-validation, and
-        no-match ordering semantics.
+        Land only merge shapes that can be expressed as deterministic native
+        document insert/update/delete requests. Required proof: matched insert,
+        update, delete, and no-op branches, branch ordering, duplicate-source
+        handling, conflict behavior, audit-required behavior, row-filter and
+        stale-filter behavior, generated-field rejection, schema-validation
+        failures, no-match ordering semantics, document-write lowering
+        fixtures, required SQL/API coverage buckets, and executable runtime
+        parity.
 
 - [ ] **Finish document query and view-mapping hardening**
   Keep the tracking manifests
@@ -100,33 +108,37 @@ document SQL implementation gates.
         `document_sql_bounded_scan_missing_exact_producer` diagnostic. Delete
         the inventory entry only in the same patch that replaces it with an
         exact native/indexed producer and matching runtime parity tests.
-  - [ ] Admit `additional-array-unnest-patterns`: add JSON corpus fixtures for
-        multiple arrays, nested arrays, aliasing, non-equality predicates, empty
-        arrays, missing arrays, and rejected cartesian-expansion shapes; add
-        required coverage buckets and executable runtime parity tests proving
-        exact native `array_any`/indexed-array behavior before expanding the
-        admitted array-unnest contract.
-  - [ ] Admit `additional-mapped-fields`: add JSON corpus fixtures for scalar,
-        numeric, boolean, text, optional, missing, nested, and multi-field view
-        mappings; add required coverage buckets and executable runtime parity
-        tests proving exact native/indexed producers, projection shape, residual
-        behavior, and stable diagnostics for unmapped or mistyped fields.
-  - [ ] Admit `derived-index-producer-types`: add JSON corpus fixtures for every
-        document derived-index producer shape SQL can select, including stale,
-        missing, partial, ordered, and rebuild-in-progress indexes; add required
-        coverage buckets and executable runtime parity tests proving SQL and
-        native derived-index reads choose the same producer or emit the same
-        rejection.
-  - [ ] Admit `document-aggregates`: add JSON corpus fixtures for mapped-field
-        `COUNT`, `MIN`/`MAX`, `SUM`/`AVG`, grouped aggregates, `HAVING`, order,
-        and limit shapes; add required coverage buckets and executable runtime
-        parity tests proving aggregate results, residual filtering, empty input,
-        null handling, and rejection of unbounded aggregate scans.
-  - [ ] Admit `lateral-view-mapping-joins`: add JSON corpus fixtures for each
-        allowed lateral document/view-mapping join shape, join predicate family,
-        limit interaction, and unsupported correlated form; add required
-        coverage buckets and executable runtime parity tests proving row
-        identity, cardinality, residual filtering, and stable diagnostics.
+  - [ ] Admit `additional-array-unnest-patterns`: add
+        `document_sql_corpus.json` cases for multiple arrays, nested arrays,
+        aliasing, non-equality predicates, empty arrays, missing arrays, and
+        rejected cartesian-expansion shapes; add required coverage buckets and
+        executable runtime parity tests proving exact native
+        `array_any`/indexed-array behavior before expanding the admitted
+        array-unnest contract.
+  - [ ] Admit `additional-mapped-fields`: add `document_sql_corpus.json` cases
+        for scalar, numeric, boolean, text, optional, missing, nested, and
+        multi-field view mappings; add required coverage buckets and executable
+        runtime parity tests proving exact native/indexed producers, projection
+        shape, residual behavior, and stable diagnostics for unmapped or
+        mistyped fields.
+  - [ ] Admit `derived-index-producer-types`: add `document_sql_corpus.json`
+        cases for every document derived-index producer shape SQL can select,
+        including stale, missing, partial, ordered, and rebuild-in-progress
+        indexes; add required coverage buckets and executable runtime parity
+        tests proving SQL and native derived-index reads choose the same
+        producer or emit the same rejection.
+  - [ ] Admit `document-aggregates`: add `document_sql_corpus.json` cases for
+        mapped-field `COUNT`, `MIN`/`MAX`, `SUM`/`AVG`, grouped aggregates,
+        `HAVING`, order, and limit shapes; add required coverage buckets and
+        executable runtime parity tests proving aggregate results, residual
+        filtering, empty input, null handling, and rejection of unbounded
+        aggregate scans.
+  - [ ] Admit `lateral-view-mapping-joins`: add `document_sql_corpus.json`
+        cases for each allowed lateral document/view-mapping join shape, join
+        predicate family, limit interaction, and unsupported correlated form;
+        add required coverage buckets and executable runtime parity tests
+        proving row identity, cardinality, residual filtering, and stable
+        diagnostics.
 
 ## Whole SQL Adapter
 

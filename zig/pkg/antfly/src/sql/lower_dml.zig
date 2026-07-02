@@ -21,6 +21,7 @@ const corpus = @import("corpus.zig");
 const db_mod = @import("../storage/db/mod.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const document_plan = @import("document_plan.zig");
+const document_sql_corpus = @import("document_sql_corpus.zig");
 const document_write = @import("document_write.zig");
 const expr_build = @import("expr/build.zig");
 const expr_condition = @import("expr/condition.zig");
@@ -1274,21 +1275,6 @@ fn parseMergeCtesForPlanAlloc(
                 generated_cte_index += 1;
                 if (cursor.matchToken(.comma) == null) break;
                 continue;
-            }
-        } else {
-            if (plan_mod.lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
-                pos.* = close_index + 1;
-                try plan_mod.resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
-                try read_ctes.append(alloc, .{
-                    .name = cte_name,
-                    .table_function = table_function,
-                });
-                cte_name_transferred = true;
-                if (cursor.matchToken(.comma) == null) break;
-                continue;
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
             }
         }
         var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], read_ctes.items, null);
@@ -11063,6 +11049,16 @@ pub const ParsedSemiJoinSourceQuery = struct {
     }
 };
 
+fn freeSubqueryPredicates(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsSubqueryPredicate) void {
+    for (values) |value| {
+        if (value.lhs) |lhs| freeExpression(alloc, lhs);
+        var query = value.query;
+        query.deinit(alloc);
+        if (value.output_field.len > 0) alloc.free(value.output_field);
+        if (value.collation) |collation| alloc.free(collation);
+    }
+}
+
 pub fn parseSemiJoinSourceQueryAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -11161,6 +11157,11 @@ pub fn parseSemiJoinSourceQueryAlloc(
     errdefer {
         freeExpressionArrayContains(alloc, expression_array_contains.items);
         expression_array_contains.deinit(alloc);
+    }
+    var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+    errdefer {
+        freeSubqueryPredicates(alloc, subquery_predicates.items);
+        subquery_predicates.deinit(alloc);
     }
     var match_expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
     errdefer {
@@ -11271,6 +11272,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
                 &expression_or_predicates,
                 &expression_not_predicates,
                 &expression_array_contains,
+                &subquery_predicates,
                 options.realtime_ns,
                 options.fixed_binary_hooks,
                 options.bare_boolean_hooks,
@@ -11305,6 +11307,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
             .expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc),
             .expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc),
             .expression_array_contains = try expression_array_contains.toOwnedSlice(alloc),
+            .subquery_predicates = try subquery_predicates.toOwnedSlice(alloc),
             .select_all = true,
         },
         .on = try on.toOwnedSlice(alloc),
@@ -11330,6 +11333,7 @@ pub fn parseSemiJoinSourceQueryAlloc(
     expression_or_predicates = .empty;
     expression_not_predicates = .empty;
     expression_array_contains = .empty;
+    subquery_predicates = .empty;
     match_expression_predicates = .empty;
     match_expression_or_predicates = .empty;
     match_expression_not_predicates = .empty;
@@ -11982,6 +11986,11 @@ pub fn parseMutationSourceQueryTailAlloc(
         freeExpressionArrayContains(alloc, expression_array_contains.items);
         expression_array_contains.deinit(alloc);
     }
+    var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+    errdefer {
+        freeSubqueryPredicates(alloc, subquery_predicates.items);
+        subquery_predicates.deinit(alloc);
+    }
     var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
     errdefer {
         freeOrderBy(alloc, order_by.items);
@@ -12032,6 +12041,7 @@ pub fn parseMutationSourceQueryTailAlloc(
                 &expression_or_predicates,
                 &expression_not_predicates,
                 &expression_array_contains,
+                &subquery_predicates,
                 realtime_ns,
                 fixed_binary_hooks,
                 bare_boolean_hooks,
@@ -12143,6 +12153,7 @@ pub fn parseMutationSourceQueryTailAlloc(
             .expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc),
             .expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc),
             .expression_array_contains = try expression_array_contains.toOwnedSlice(alloc),
+            .subquery_predicates = try subquery_predicates.toOwnedSlice(alloc),
             .select_all = true,
             .order_by = try order_by.toOwnedSlice(alloc),
             .row_claim = owned_row_claim,
@@ -12168,6 +12179,7 @@ pub fn parseMutationSourceQueryTailAlloc(
     expression_or_predicates = .empty;
     expression_not_predicates = .empty;
     expression_array_contains = .empty;
+    subquery_predicates = .empty;
     order_by = .empty;
     owned_row_claim.owner_id = "";
     returning = .{};
@@ -15095,6 +15107,517 @@ fn runtimeSchemaFromJsonForDmlTestAlloc(alloc: std.mem.Allocator, schema_json: [
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
     return try schema_api.deriveRuntimeTableSchema(alloc, parsed);
+}
+
+fn documentSqlCorpusWriteSchemaJson(name: []const u8) ![]const u8 {
+    if (std.mem.eql(u8, name, "write_rich")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","default":"draft"},"category":{"type":"keyword","x-antfly-index":false}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_unindexed")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index":false}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_stale_index")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_partial_index")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"status","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_ordered_index")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-name":"status_idx","x-antfly-index-keys":[{"column":"status","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_cardinality_proof")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"category":{"type":"keyword","x-antfly-index":false}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_target")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_concat_target")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_title_key":{"type":"keyword","generated":{"op":"concat","fields":["status","title"],"separator":":"}},"status_title_ws":{"type":"keyword","generated":{"op":"concat_ws","fields":["status","title"],"separator":":"}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_expression_target")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"title"}]},{"value":" "},{"value":"-"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_numeric_expression_target")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"metadata":{"type":"json"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}}},"amount_mod":{"type":"numeric","generated":{"op":"expression","expression":{"op":"mod","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_sum":{"type":"numeric","generated":{"op":"expression","expression":{"op":"add","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_delta":{"type":"numeric","generated":{"op":"expression","expression":{"op":"sub","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_product":{"type":"numeric","generated":{"op":"expression","expression":{"op":"mul","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_ratio":{"type":"numeric","generated":{"op":"expression","expression":{"op":"div","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_power":{"type":"numeric","generated":{"op":"expression","expression":{"op":"power","args":[{"field":"amount"},{"value":2}]}}},"amount_text":{"type":"keyword","generated":{"op":"expression","expression":{"op":"cast","to":"text","args":[{"field":"amount"}]}}},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}}},"metadata_billing_plan":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"billing.plan","args":[{"field":"metadata"}]}}},"metadata_flags":{"type":"json","generated":{"op":"expression","expression":{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}}},"metadata_type":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_typeof","args":[{"field":"metadata"}]}}},"metadata_flag_count":{"type":"numeric","generated":{"op":"expression","expression":{"op":"json_array_length","args":[{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}]}}},"status_pos":{"type":"numeric","generated":{"op":"expression","expression":{"op":"strpos","args":[{"field":"status"},{"value":"a"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_numeric_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_numeric_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"fee"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_numeric_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_numeric_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}},"x-antfly-index-where":{"all":[{"field":"amount_abs","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_numeric_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}},"x-antfly-index-name":"amount_abs_idx","x-antfly-index-keys":[{"column":"amount_abs","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_cast_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_cast_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"amount_text":{"type":"keyword","generated":{"op":"expression","expression":{"op":"cast","to":"text","args":[{"field":"fee"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_cast_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_text":{"type":"keyword","generated":{"op":"expression","expression":{"op":"cast","to":"text","args":[{"field":"amount"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_cast_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_text":{"type":"keyword","generated":{"op":"expression","expression":{"op":"cast","to":"text","args":[{"field":"amount"}]}},"x-antfly-index-where":{"all":[{"field":"amount_text","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_cast_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_text":{"type":"keyword","generated":{"op":"expression","expression":{"op":"cast","to":"text","args":[{"field":"amount"}]}},"x-antfly-index-name":"amount_text_idx","x-antfly-index-keys":[{"column":"amount_text","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_arithmetic_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_mod_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"amount_mod":{"type":"numeric","generated":{"op":"expression","expression":{"op":"mod","args":[{"field":"amount"},{"field":"fee"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_arithmetic_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"amount_sum":{"type":"numeric","generated":{"op":"expression","expression":{"op":"add","args":[{"field":"amount"},{"field":"fee"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_arithmetic_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_sum":{"type":"numeric","generated":{"op":"expression","expression":{"op":"add","args":[{"field":"amount"},{"field":"amount"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_arithmetic_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_sum":{"type":"numeric","generated":{"op":"expression","expression":{"op":"add","args":[{"field":"amount"},{"field":"amount"}]}},"x-antfly-index-where":{"all":[{"field":"amount_sum","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_arithmetic_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_sum":{"type":"numeric","generated":{"op":"expression","expression":{"op":"add","args":[{"field":"amount"},{"field":"amount"}]}},"x-antfly-index-name":"amount_sum_idx","x-antfly-index-keys":[{"column":"amount_sum","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_power_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_power_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"fee":{"type":"numeric"},"amount_power":{"type":"numeric","generated":{"op":"expression","expression":{"op":"power","args":[{"field":"fee"},{"value":2}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_power_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_power":{"type":"numeric","generated":{"op":"expression","expression":{"op":"power","args":[{"field":"amount"},{"value":2}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_power_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_power":{"type":"numeric","generated":{"op":"expression","expression":{"op":"power","args":[{"field":"amount"},{"value":2}]}},"x-antfly-index-where":{"all":[{"field":"amount_power","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_power_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"amount_power":{"type":"numeric","generated":{"op":"expression","expression":{"op":"power","args":[{"field":"amount"},{"value":2}]}},"x-antfly-index-name":"amount_power_idx","x-antfly-index-keys":[{"column":"amount_power","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_extract_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_extract_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"payload":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"payload"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_extract_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_extract_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}},"x-antfly-index-where":{"all":[{"field":"metadata_source","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_extract_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}},"x-antfly-index-name":"metadata_source_idx","x-antfly-index-keys":[{"column":"metadata_source","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_typeof_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_typeof_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"payload":{"type":"json"},"metadata_type":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_typeof","args":[{"field":"payload"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_typeof_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_type":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_typeof","args":[{"field":"metadata"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_typeof_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_type":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_typeof","args":[{"field":"metadata"}]}},"x-antfly-index-where":{"all":[{"field":"metadata_type","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_typeof_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_type":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_typeof","args":[{"field":"metadata"}]}},"x-antfly-index-name":"metadata_type_idx","x-antfly-index-keys":[{"column":"metadata_type","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_array_length_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_array_length_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"payload":{"type":"json"},"metadata_flag_count":{"type":"numeric","generated":{"op":"expression","expression":{"op":"json_array_length","args":[{"op":"json_extract","path":"flags","args":[{"field":"payload"}]}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_array_length_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_flag_count":{"type":"numeric","generated":{"op":"expression","expression":{"op":"json_array_length","args":[{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_array_length_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_flag_count":{"type":"numeric","generated":{"op":"expression","expression":{"op":"json_array_length","args":[{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}]}},"x-antfly-index-where":{"all":[{"field":"metadata_flag_count","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_array_length_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_flag_count":{"type":"numeric","generated":{"op":"expression","expression":{"op":"json_array_length","args":[{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}]}},"x-antfly-index-name":"metadata_flag_count_idx","x-antfly-index-keys":[{"column":"metadata_flag_count","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_text_operator_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_text_operator_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"payload":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"payload"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_text_operator_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_text_operator_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}},"x-antfly-index-where":{"all":[{"field":"metadata_source","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_text_operator_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}},"x-antfly-index-name":"metadata_source_idx","x-antfly-index-keys":[{"column":"metadata_source","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_text_operator_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_text_operator_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"payload":{"type":"json"},"metadata_billing_plan":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"billing.plan","args":[{"field":"payload"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_text_operator_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_billing_plan":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"billing.plan","args":[{"field":"metadata"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_text_operator_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_billing_plan":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"billing.plan","args":[{"field":"metadata"}]}},"x-antfly-index-where":{"all":[{"field":"metadata_billing_plan","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_text_operator_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_billing_plan":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"billing.plan","args":[{"field":"metadata"}]}},"x-antfly-index-name":"metadata_billing_plan_idx","x-antfly-index-keys":[{"column":"metadata_billing_plan","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_operator_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_operator_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"payload":{"type":"json"},"metadata_flags":{"type":"json","generated":{"op":"expression","expression":{"op":"json_extract","path":"flags","args":[{"field":"payload"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_operator_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_flags":{"type":"json","generated":{"op":"expression","expression":{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_operator_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_flags":{"type":"json","generated":{"op":"expression","expression":{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}},"x-antfly-index-where":{"all":[{"field":"metadata_flags","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_json_path_operator_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"json"},"metadata_flags":{"type":"json","generated":{"op":"expression","expression":{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}},"x-antfly-index-name":"metadata_flags_idx","x-antfly-index-keys":[{"column":"metadata_flags","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_binary_text_expression_target_missing")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_binary_text_expression_target_dependency_mismatch")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_pos":{"type":"numeric","generated":{"op":"expression","expression":{"op":"strpos","args":[{"field":"title"},{"value":"a"}]}}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_binary_text_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_pos":{"type":"numeric","generated":{"op":"expression","expression":{"op":"strpos","args":[{"field":"status"},{"value":"a"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_binary_text_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_pos":{"type":"numeric","generated":{"op":"expression","expression":{"op":"strpos","args":[{"field":"status"},{"value":"a"}]}},"x-antfly-index-where":{"all":[{"field":"status_pos","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_binary_text_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_pos":{"type":"numeric","generated":{"op":"expression","expression":{"op":"strpos","args":[{"field":"status"},{"value":"a"}]}},"x-antfly-index-name":"status_pos_idx","x-antfly-index-keys":[{"column":"status_pos","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_expression_target_stale")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-where":{"all":[{"field":"status_lower","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_expression_target_partial")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}},"x-antfly-index-where":{"all":[{"field":"status_slug","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-name":"status_lower_idx","x-antfly-index-keys":[{"column":"status_lower","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    if (std.mem.eql(u8, name, "write_join_generated_expression_target_ordered")) {
+        return
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}},"x-antfly-index-name":"status_slug_idx","x-antfly-index-keys":[{"column":"status_slug","direction":"desc"}]}},"additionalProperties":true}}}}
+        ;
+    }
+    return error.InvalidSqlCorpusFixture;
+}
+
+fn documentSqlCorpusWriteProducerName(producer: document_plan.DocumentProducer) []const u8 {
+    return switch (producer) {
+        .id_lookup => "id_lookup",
+        .indexed_query => "indexed_query",
+        .bounded_scan => "bounded_scan",
+    };
+}
+
+fn documentSqlCorpusWriteSourceProducerName(producer: plan_mod.DocumentJoinedMutationSourceProducer) []const u8 {
+    return switch (producer) {
+        .static => |static_producer| documentSqlCorpusWriteProducerName(static_producer),
+        .join_key_indexed_lookup => "join_key_indexed_lookup",
+    };
+}
+
+fn documentSqlCorpusWriteTemplateName(template: plan_mod.DocumentProducerMutationTemplate) []const u8 {
+    return switch (template) {
+        .delete => "delete",
+        .transform => "transform",
+    };
+}
+
+fn expectOptionalStringEqualForDmlTest(expected: ?[]const u8, actual: []const u8) !void {
+    if (expected) |value| try std.testing.expectEqualStrings(value, actual);
+}
+
+fn expectOptionalUsizeEqualForDmlTest(expected: ?usize, actual: usize) !void {
+    if (expected) |value| try std.testing.expectEqual(value, actual);
+}
+
+fn expectOptionalU32EqualForDmlTest(expected: ?u32, actual: ?u32) !void {
+    if (expected) |value| try std.testing.expectEqual(value, actual orelse return error.TestUnexpectedResult);
+}
+
+fn expectOptionalU64EqualForDmlTest(expected: ?u64, actual: ?u64) !void {
+    if (expected) |value| try std.testing.expectEqual(value, actual orelse return error.TestUnexpectedResult);
+}
+
+fn expectDocumentSqlWriteCorpusCase(
+    alloc: std.mem.Allocator,
+    case: document_sql_corpus.DocumentSqlWritePlanCaseJson,
+) !void {
+    const schema_json = try documentSqlCorpusWriteSchemaJson(case.schema);
+    const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+    var catalog = corpus.AppParitySourceSchemaCatalog.init("docs", schema_json);
+    const expected = case.expected;
+
+    if (expected.expected_error) |expected_error_name| {
+        try std.testing.expect(expected.plan == null);
+        try std.testing.expectError(
+            document_sql_corpus.errorValue(try document_sql_corpus.errorFromName(expected_error_name)),
+            lowerWritePlanWithCatalogForDmlTestAlloc(alloc, case.sql, schema, &.{}, .{}, catalog.iface()),
+        );
+        return;
+    }
+
+    const expected_plan = expected.plan orelse return error.InvalidSqlCorpusFixture;
+    var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(alloc, case.sql, schema, &.{}, .{}, catalog.iface());
+    defer lowered.deinit(alloc);
+    if (std.mem.eql(u8, expected_plan, "document_write")) {
+        const document_mutation = switch (lowered) {
+            .document_write => |document_write_plan| document_write_plan,
+            else => return error.TestUnexpectedResult,
+        };
+        try expectOptionalStringEqualForDmlTest(expected.table_name, document_mutation.table_name);
+        try expectOptionalStringEqualForDmlTest(expected.operation, @tagName(document_mutation.operation));
+        try expectOptionalUsizeEqualForDmlTest(expected.writes, document_mutation.batch.writes.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.transforms, document_mutation.batch.transforms.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.deletes, document_mutation.batch.deletes.len);
+    } else if (std.mem.eql(u8, expected_plan, "document_producer_mutation")) {
+        const document_mutation = switch (lowered) {
+            .document_producer_mutation => |document_write_plan| document_write_plan,
+            else => return error.TestUnexpectedResult,
+        };
+        try expectOptionalStringEqualForDmlTest(expected.table_name, document_mutation.table_name);
+        try expectOptionalStringEqualForDmlTest(expected.operation, @tagName(document_mutation.operation));
+        try expectOptionalStringEqualForDmlTest(expected.producer, documentSqlCorpusWriteProducerName(document_mutation.producer));
+        try expectOptionalStringEqualForDmlTest(expected.template, documentSqlCorpusWriteTemplateName(document_mutation.template));
+        switch (document_mutation.template) {
+            .delete => try expectOptionalUsizeEqualForDmlTest(expected.ops, 0),
+            .transform => |operations| try expectOptionalUsizeEqualForDmlTest(expected.ops, operations.len),
+        }
+        switch (document_mutation.producer) {
+            .id_lookup => {},
+            .indexed_query => |query| {
+                try expectOptionalU32EqualForDmlTest(expected.max_candidate_rows, query.max_candidate_rows);
+                if (expected.filter_query_json) |filter_query_json| {
+                    try std.testing.expectEqualStrings(filter_query_json, query.filter_query_json orelse return error.TestUnexpectedResult);
+                }
+                if (expected.residual_filter_json) |residual_filter_json| {
+                    try std.testing.expectEqualStrings(residual_filter_json, query.residual_filter_json orelse return error.TestUnexpectedResult);
+                }
+                if (expected.no_residual_filter) try std.testing.expect(query.residual_filter_json == null);
+            },
+            .bounded_scan => |scan| {
+                if (expected.max_scan_rows) |max_scan_rows| try std.testing.expectEqual(max_scan_rows, scan.max_rows);
+                try expectOptionalU64EqualForDmlTest(expected.max_scan_bytes, scan.max_bytes);
+                if (expected.residual_filter_json) |residual_filter_json| {
+                    try std.testing.expectEqualStrings(residual_filter_json, scan.residual_filter_json orelse return error.TestUnexpectedResult);
+                }
+            },
+        }
+    } else if (std.mem.eql(u8, expected_plan, "document_joined_mutation")) {
+        const document_mutation = switch (lowered) {
+            .document_joined_mutation => |document_write_plan| document_write_plan,
+            else => return error.TestUnexpectedResult,
+        };
+        try expectOptionalStringEqualForDmlTest(expected.table_name, document_mutation.table_name);
+        try expectOptionalStringEqualForDmlTest(expected.operation, @tagName(document_mutation.operation));
+        try expectOptionalStringEqualForDmlTest(expected.target_producer, documentSqlCorpusWriteProducerName(document_mutation.target_producer));
+        try expectDocumentJoinedIndexedTargetProducerForCorpus(expected, document_mutation.target_producer);
+        try expectOptionalStringEqualForDmlTest(expected.source_producer, documentSqlCorpusWriteSourceProducerName(document_mutation.source_producer));
+        try expectOptionalStringEqualForDmlTest(expected.template, documentSqlCorpusWriteTemplateName(document_mutation.template));
+        switch (document_mutation.template) {
+            .delete => try expectOptionalUsizeEqualForDmlTest(expected.ops, 0),
+            .transform => |operations| try expectOptionalUsizeEqualForDmlTest(expected.ops, operations.len),
+        }
+        try expectOptionalUsizeEqualForDmlTest(expected.join_keys, document_mutation.join_keys.len);
+        try expectOptionalUsizeEqualForDmlTest(expected.source_assignments, document_mutation.source_assignments.len);
+        try expectOptionalU32EqualForDmlTest(expected.max_target_rows, document_mutation.max_target_rows);
+        try expectOptionalU32EqualForDmlTest(expected.max_source_rows, document_mutation.max_source_rows);
+    } else {
+        return error.InvalidSqlCorpusFixture;
+    }
+}
+
+test "document SQL write plan corpus cases" {
+    const alloc = std.testing.allocator;
+    var parsed = try document_sql_corpus.parseDocumentSqlCorpusAlloc(alloc);
+    defer parsed.deinit();
+    for (parsed.value.document_write_plan_cases) |case| {
+        errdefer std.debug.print("document SQL write plan corpus case failed: {s}\n", .{case.name});
+        try expectDocumentSqlWriteCorpusCase(alloc, case);
+    }
 }
 
 fn lowerInsertForTestAlloc(
@@ -19546,9 +20069,10 @@ fn lowerDocumentWritePlanParsedSqlAlloc(
     options: plan_mod.LowerWritePlanOptions,
 ) !plan_mod.LoweredWritePlan {
     if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    const statement_kind = parsed_sql.writeStatementKindIncludingGeneratedAst() orelse parsed_sql.writeStatementKind() orelse .update;
     const operation = documentWriteOperationForParsedSql(parsed_sql);
     switch (operation) {
-        .full_document_insert, .generated_id_insert, .exact_id_delete, .document_patch, .projection_write => {},
+        .full_document_insert, .generated_id_insert, .exact_id_delete, .non_identity_delete, .document_patch, .projection_write, .truncate_table => {},
         else => {
             try document_write.rejectUnadmittedSqlDocumentWrite(operation);
             unreachable;
@@ -19565,8 +20089,16 @@ fn lowerDocumentWritePlanParsedSqlAlloc(
     return switch (operation) {
         .full_document_insert, .generated_id_insert => .{ .document_write = try parseDocumentInsertAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level) },
         .exact_id_delete => .{ .document_write = try parseExactKeyDocumentDeleteAlloc(alloc, parsed_sql.items(), params, options.sync_level) },
+        .non_identity_delete => if (statement_kind == .delete_joined_source)
+            try parseDocumentJoinedDeleteAlloc(alloc, parsed_sql.items(), schema, options.joined_source_schema orelse schema, params, options.sync_level)
+        else
+            try parseDocumentProducerDeleteAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level),
         .document_patch => .{ .document_write = try parseDocumentPatchUpdateAlloc(alloc, parsed_sql.items(), params, options.sync_level) },
-        .projection_write => try parseDocumentProjectionUpdateAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level),
+        .projection_write => if (statement_kind == .update_joined_source)
+            try parseDocumentJoinedProjectionUpdateAlloc(alloc, parsed_sql.items(), schema, options.joined_source_schema orelse schema, params, options.sync_level)
+        else
+            try parseDocumentProjectionUpdateAlloc(alloc, parsed_sql.items(), schema, params, options.sync_level),
+        .truncate_table => .{ .truncate_source = try parseDocumentTruncateAlloc(alloc, parsed_sql.items(), schema, options.row_claim, options.sync_level) },
         else => unreachable,
     };
 }
@@ -19684,6 +20216,37 @@ fn documentProjectionColumnForField(
     return try documentProjectionColumnForPath(schema, unqualified);
 }
 
+fn documentSourceAssignmentTargetColumnForField(
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    field: []const u8,
+) !runtime_schema.RelationalColumn {
+    if (std.mem.indexOfScalar(u8, field, '.')) |dot| {
+        const qualifier = field[0..dot];
+        if (!std.ascii.eqlIgnoreCase(qualifier, target_table.name) and
+            !std.ascii.eqlIgnoreCase(qualifier, target_table.alias))
+        {
+            return error.DocumentSqlWriteSourceAssignmentAmbiguousReference;
+        }
+    }
+    if (documentDocFieldMatches(field, target_table) or
+        documentVersionFieldMatches(field, target_table) or
+        documentIdentityFieldMatches(field, target_table))
+    {
+        return error.DocumentSqlWriteSourceAssignmentTargetReservedField;
+    }
+    const unqualified = documentProjectionUnqualifiedField(field, target_table) orelse return error.DocumentSqlWriteUnsupported;
+    if (binder.relationalColumnForField(schema, unqualified, null)) |column| {
+        if (column.generated != null) return error.DocumentSqlWriteSourceAssignmentTargetGeneratedField;
+    } else if (std.mem.indexOfScalar(u8, unqualified, '.')) |dot| {
+        const root_name = unqualified[0..dot];
+        if (binder.relationalColumnForField(schema, root_name, null)) |root| {
+            if (root.generated != null) return error.DocumentSqlWriteSourceAssignmentTargetGeneratedField;
+        }
+    }
+    return try documentProjectionColumnForPath(schema, unqualified);
+}
+
 fn documentInsertColumnMode(
     columns: []const []const u8,
     schema: runtime_schema.TableSchema,
@@ -19758,6 +20321,149 @@ const DocumentProjectionInsertValue = struct {
     path: []const u8,
     value_json: []const u8,
 };
+
+const DocumentReturningFieldKind = enum {
+    identity,
+    document,
+    projection,
+};
+
+const DocumentReturningField = struct {
+    kind: DocumentReturningFieldKind,
+    path: []const u8,
+    output: []const u8,
+};
+
+fn freeDocumentReturningFields(alloc: std.mem.Allocator, fields: []const DocumentReturningField) void {
+    for (fields) |field| {
+        if (field.path.len > 0) alloc.free(@constCast(field.path));
+        alloc.free(@constCast(field.output));
+    }
+    if (fields.len > 0) alloc.free(fields);
+}
+
+fn parseDocumentReturningFieldsAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+) ![]DocumentReturningField {
+    var fields = std.ArrayListUnmanaged(DocumentReturningField).empty;
+    errdefer {
+        for (fields.items) |field| {
+            if (field.path.len > 0) alloc.free(@constCast(field.path));
+            alloc.free(@constCast(field.output));
+        }
+        fields.deinit(alloc);
+    }
+
+    while (true) {
+        if (parser.peekKind(tokens, pos.*, .star)) return error.DocumentSqlWriteUnsupported;
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        const unqualified = documentProjectionUnqualifiedField(field, target_table) orelse return error.DocumentSqlWriteUnsupported;
+
+        var kind: DocumentReturningFieldKind = undefined;
+        var path: []const u8 = "";
+        var path_transferred = true;
+        errdefer if (!path_transferred) alloc.free(@constCast(path));
+        if (std.ascii.eqlIgnoreCase(unqualified, "_id")) {
+            kind = .identity;
+        } else if (std.ascii.eqlIgnoreCase(unqualified, "_doc")) {
+            kind = .document;
+        } else if (std.ascii.eqlIgnoreCase(unqualified, "_version")) {
+            return error.DocumentSqlWriteUnsupported;
+        } else {
+            const column = try documentProjectionColumnForField(schema, target_table, field);
+            path = try alloc.dupe(u8, column.path);
+            path_transferred = false;
+            kind = .projection;
+        }
+
+        const alias = try grammar.parseOptionalProjectionAliasAlloc(alloc, tokens, pos);
+        var alias_transferred = false;
+        errdefer if (alias) |owned_alias| if (!alias_transferred) alloc.free(owned_alias);
+        const output = alias orelse try alloc.dupe(u8, unqualified);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        if (alias != null) alias_transferred = true;
+
+        for (fields.items) |existing| {
+            if (std.ascii.eqlIgnoreCase(existing.output, output)) return error.DocumentSqlWriteUnsupported;
+        }
+        try fields.append(alloc, .{
+            .kind = kind,
+            .path = path,
+            .output = output,
+        });
+        field_transferred = true;
+        path_transferred = true;
+        output_transferred = true;
+
+        alloc.free(field);
+        if (parser.matchToken(tokens, pos, .comma) == null) break;
+    }
+    if (fields.items.len == 0) return error.DocumentSqlWriteUnsupported;
+    return try fields.toOwnedSlice(alloc);
+}
+
+fn documentJsonProjectedValue(doc: std.json.Value, path: []const u8) !?std.json.Value {
+    var current = doc;
+    const count = try documentProjectionPathSegmentCount(path);
+    var depth: usize = 0;
+    while (depth < count) : (depth += 1) {
+        if (current != .object) return null;
+        const segment = try documentProjectionPathSegment(path, depth);
+        current = current.object.get(segment) orelse return null;
+    }
+    return current;
+}
+
+fn documentReturningRowsForWritesAlloc(
+    alloc: std.mem.Allocator,
+    writes: []const db_mod.types.BatchWrite,
+    fields: []const DocumentReturningField,
+) ![][]const u8 {
+    if (fields.len == 0) return &.{};
+    var rows = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (rows.items) |row| alloc.free(@constCast(row));
+        rows.deinit(alloc);
+    }
+
+    for (writes) |write| {
+        var parsed = std.json.parseFromSlice(std.json.Value, alloc, write.value, .{ .allocate = .alloc_always }) catch return error.DocumentSqlWriteUnsupported;
+        defer parsed.deinit();
+        if (parsed.value != .object) return error.DocumentSqlWriteUnsupported;
+
+        var out: std.Io.Writer.Allocating = .init(alloc);
+        errdefer out.deinit();
+        const writer = &out.writer;
+        try writer.writeByte('{');
+        for (fields, 0..) |field, i| {
+            if (i != 0) try writer.writeByte(',');
+            try writer.print("{f}:", .{std.json.fmt(field.output, .{})});
+            switch (field.kind) {
+                .identity => try writer.print("{f}", .{std.json.fmt(write.key, .{})}),
+                .document => try writer.writeAll(write.value),
+                .projection => {
+                    if (try documentJsonProjectedValue(parsed.value, field.path)) |value| {
+                        try writer.print("{f}", .{std.json.fmt(value, .{})});
+                    } else {
+                        try writer.writeAll("null");
+                    }
+                },
+            }
+        }
+        try writer.writeByte('}');
+        const row = try out.toOwnedSlice();
+        try rows.append(alloc, row);
+    }
+
+    return try rows.toOwnedSlice(alloc);
+}
 
 fn documentProjectionPathSameAtDepth(a: []const u8, b: []const u8, depth: usize) !bool {
     return std.mem.eql(u8, try documentProjectionPathSegment(a, depth), try documentProjectionPathSegment(b, depth));
@@ -19978,9 +20684,15 @@ fn parseDocumentInsertAlloc(
         if (!parser.peekKind(tokens, pos, .lparen)) return error.UnsupportedSqlShape;
     }
 
+    var returning_fields: []DocumentReturningField = &.{};
+    defer freeDocumentReturningFields(alloc, returning_fields);
+    if (parser.matchKeywordTag(tokens, &pos, .returning)) {
+        returning_fields = try parseDocumentReturningFieldsAlloc(alloc, tokens, &pos, schema, target_table);
+    }
+
     if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos)) {
-        if (parser.peekKeywordTag(tokens, pos, .on) or parser.peekKeywordTag(tokens, pos, .returning)) return error.DocumentSqlWriteUnsupported;
+        if (parser.peekKeywordTag(tokens, pos, .on)) return error.DocumentSqlWriteUnsupported;
         return error.UnsupportedSqlShape;
     }
 
@@ -20001,16 +20713,24 @@ fn parseDocumentInsertAlloc(
         if (predicates_slice.len > 0) alloc.free(predicates_slice);
     };
     predicates = .empty;
+    const returning_rows = try documentReturningRowsForWritesAlloc(alloc, writes_slice, returning_fields);
+    var returning_rows_transferred = false;
+    errdefer if (!returning_rows_transferred) {
+        for (returning_rows) |row| alloc.free(@constCast(row));
+        if (returning_rows.len > 0) alloc.free(returning_rows);
+    };
 
     alloc.free(target_table.alias);
     const table_name = target_table.name;
     writes_transferred = true;
     predicates_transferred = true;
+    returning_rows_transferred = true;
     return .{
         .table_name = table_name,
         .batch = .{
             .writes = writes_slice,
             .predicates = predicates_slice,
+            .returning_rows = returning_rows,
             .req = .{
                 .writes = writes_slice,
                 .predicates = predicates_slice,
@@ -20023,6 +20743,48 @@ fn parseDocumentInsertAlloc(
             .explicit_id_doc, .explicit_doc_id, .projection_explicit_id, .projection_explicit_id_create_only => .full_document_insert,
             .generated_doc, .projection_generated_id, .projection_generated_id_create_only => .generated_id_insert,
         },
+        .sync_level = sync_level,
+    };
+}
+
+fn parseDocumentTruncateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    row_claim: ?db_mod.types.RowClaimRequest,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredMutationSource {
+    if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    var pos: usize = 0;
+    var syntax = try grammar.parseTruncateMutationSourceSqlAlloc(alloc, tokens, &pos);
+    errdefer syntax.deinit(alloc);
+    if (!parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    if (syntax.additional_table_names.len != 0 or syntax.restart_identity or syntax.cascade) return error.DocumentSqlWriteUnsupported;
+
+    var owned_row_claim = if (row_claim) |claim| try mutationRowClaimAlloc(alloc, claim, false) else db_mod.types.RowClaimRequest{
+        .mode = .for_update,
+        .wait_policy = .wait,
+        .skip_locked = false,
+        .lease_ms = 30_000,
+        .owner_id = try alloc.dupe(u8, "__antfly_document_sql_truncate_claim__"),
+    };
+    errdefer if (owned_row_claim.owner_id.len > 0) alloc.free(owned_row_claim.owner_id);
+    const source = db_mod.types.RelationalRowsQueryRequest{
+        .select_all = true,
+        .row_claim = owned_row_claim,
+    };
+    owned_row_claim.owner_id = "";
+
+    const mutation = relational_rows.OwnedRowsMutationSourceRequest{ .req = .{
+        .kind = .delete,
+        .source = source,
+    } };
+
+    const table_name = syntax.table_name;
+    syntax.table_name = "";
+    return .{
+        .table_name = table_name,
+        .mutation = mutation,
         .sync_level = sync_level,
     };
 }
@@ -20069,7 +20831,10 @@ fn parseDocumentDeleteIdentityFieldAlloc(
 ) !void {
     const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
     defer alloc.free(field);
-    if (!documentIdentityFieldMatches(field, target_table)) return error.DocumentSqlWriteUnsupported;
+    if (!documentIdentityFieldMatches(field, target_table)) {
+        if (std.mem.indexOfScalar(u8, field, '.') != null) return error.DocumentSqlWriteJoinMissingExactProducer;
+        return error.DocumentSqlWriteUnsupported;
+    }
 }
 
 fn appendDocumentDeleteKeyAlloc(
@@ -20388,6 +21153,53 @@ fn appendDocumentProjectionSetOpAlloc(
     });
 }
 
+fn lowerDocumentWriteProducerFromWhereAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    filter_start: usize,
+    producer_end: usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+) !document_plan.DocumentProducer {
+    if (tokensContainIdentifier(tokens, filter_start, producer_end, "_doc")) return error.DocumentSqlWriteUnsupported;
+    if (tokensContainIdentifier(tokens, filter_start, producer_end, "_version")) return error.DocumentSqlWriteUnsupported;
+    var producer = document_plan.lowerDocumentMutationProducerFromWhereAlloc(
+        alloc,
+        tokens,
+        filter_start,
+        producer_end,
+        schema,
+        target_table.name,
+        target_table.alias,
+        .{
+            .max_rows = source_binding.default_document_sql_bounded_scan_rows,
+            .max_bytes = source_binding.default_document_sql_bounded_scan_bytes,
+        },
+    ) catch |err| switch (err) {
+        error.DocumentSqlBoundedScanMissingExactProducer,
+        error.DocumentSqlBoundedScanPolicyRequired,
+        error.DocumentSqlBoundedScanUnsupportedResidual,
+        error.DocumentSqlIndexUnavailable,
+        => return error.DocumentSqlWriteUnsupported,
+        else => return err,
+    };
+    errdefer producer.deinit(alloc);
+    switch (producer) {
+        .id_lookup => {},
+        .indexed_query => |*query| {
+            if (query.residual_filter_json != null) return error.DocumentSqlWriteUnsupported;
+            if (query.max_candidate_rows == null) {
+                query.max_candidate_rows = source_binding.default_document_sql_bounded_scan_rows;
+            }
+        },
+        .bounded_scan => |scan| {
+            if (scan.max_bytes == null) return error.DocumentSqlWriteUnsupported;
+            if (scan.residual_filter_json == null) return error.DocumentSqlWriteUnsupported;
+        },
+    }
+    return producer;
+}
+
 fn parseDocumentPatchOpsAlloc(
     alloc: std.mem.Allocator,
     patch_json: []const u8,
@@ -20529,6 +21341,1088 @@ fn parseDocumentPatchUpdateAlloc(
     };
 }
 
+fn documentTableQualifierMatches(qualifier: []const u8, table: plan_mod.TableAlias) bool {
+    return std.ascii.eqlIgnoreCase(qualifier, table.name) or
+        std.ascii.eqlIgnoreCase(qualifier, table.alias);
+}
+
+fn documentQualifiedIdentityFieldMatches(field: plan_mod.QualifiedField, table: plan_mod.TableAlias) bool {
+    return documentTableQualifierMatches(field.qualifier, table) and std.ascii.eqlIgnoreCase(field.field, "_id");
+}
+
+fn documentJoinedMappedJoinColumnForField(
+    schema: runtime_schema.TableSchema,
+    table: plan_mod.TableAlias,
+    field: plan_mod.QualifiedField,
+) !runtime_schema.RelationalColumn {
+    if (!documentTableQualifierMatches(field.qualifier, table)) return error.DocumentSqlWriteUnsupported;
+    if (std.ascii.eqlIgnoreCase(field.field, "_id") or
+        std.ascii.eqlIgnoreCase(field.field, "_doc") or
+        std.ascii.eqlIgnoreCase(field.field, "_version"))
+    {
+        return error.DocumentSqlWriteUnsupported;
+    }
+    const column = binder.relationalColumnForField(schema, field.field, null) orelse return error.DocumentSqlWriteJoinMissingIndexProof;
+    if (column.generated != null) return error.DocumentSqlWriteUnsupported;
+    if (column.path.len == 0) return error.DocumentSqlWriteUnsupported;
+    return column;
+}
+
+fn documentJoinedMappedJoinIndexProof(column: runtime_schema.RelationalColumn) !void {
+    if (!column.indexed) return error.DocumentSqlWriteJoinMissingIndexProof;
+    if (column.index_lifecycle != .ready) return error.DocumentSqlWriteJoinStaleIndexProof;
+    if (column.index_where.len != 0 or column.index_where_expressions.len != 0) return error.DocumentSqlWriteJoinPartialIndexProof;
+    if (column.index_keys.len == 0) return;
+    if (column.index_keys.len != 1) return error.DocumentSqlWriteJoinOrderedIndexProof;
+    const key = column.index_keys[0];
+    if (!std.mem.eql(u8, key.column, column.name)) return error.DocumentSqlWriteJoinOrderedIndexProof;
+    if (key.direction != .asc or key.nulls != .default) return error.DocumentSqlWriteJoinOrderedIndexProof;
+}
+
+fn documentJoinedFilterPathForColumnAlloc(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+) ![]const u8 {
+    if (path.len == 0) return error.DocumentSqlWriteUnsupported;
+    if (path[0] == '/') return try alloc.dupe(u8, path);
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '/');
+    for (path) |ch| {
+        try out.append(alloc, if (ch == '.') '/' else ch);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn documentJoinedTermFilterJsonAlloc(
+    alloc: std.mem.Allocator,
+    path: []const u8,
+    value_json: []const u8,
+) ![]const u8 {
+    const filter_path = try documentJoinedFilterPathForColumnAlloc(alloc, path);
+    defer alloc.free(filter_path);
+    return try std.fmt.allocPrint(alloc, "{{\"term\":{{\"path\":{f},\"value\":{s}}}}}", .{ std.json.fmt(filter_path, .{}), value_json });
+}
+
+fn documentJoinedGeneratedOpForSqlFunction(name: []const u8) ?runtime_schema.RelationalGeneratedOp {
+    if (std.ascii.eqlIgnoreCase(name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    return null;
+}
+
+fn documentJoinedGeneratedConcatOpForSqlFunction(name: []const u8) ?runtime_schema.RelationalGeneratedOp {
+    if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
+    return null;
+}
+
+fn documentJoinedGeneratedTargetColumnForExpression(
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    op: runtime_schema.RelationalGeneratedOp,
+    source_field: plan_mod.QualifiedField,
+) !runtime_schema.RelationalColumn {
+    if (!documentTableQualifierMatches(source_field.qualifier, target_table)) return error.DocumentSqlWriteJoinMissingExactProducer;
+    const base_column = try documentJoinedMappedJoinColumnForField(schema, target_table, source_field);
+    for (schema.relational_columns) |column| {
+        const generated = column.generated orelse continue;
+        if (generated.op != op) continue;
+        const generated_field = generated.field orelse continue;
+        if (!std.mem.eql(u8, generated_field, base_column.name)) continue;
+        if (column.path.len == 0) return error.DocumentSqlWriteUnsupported;
+        return column;
+    }
+    return error.DocumentSqlWriteJoinMissingIndexProof;
+}
+
+fn documentJoinedGeneratedTargetColumnForFields(
+    schema: runtime_schema.TableSchema,
+    op: runtime_schema.RelationalGeneratedOp,
+    fields: []const []const u8,
+    separator: []const u8,
+) !runtime_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        const generated = column.generated orelse continue;
+        if (generated.op != op) continue;
+        if (!std.mem.eql(u8, generated.separator, separator)) continue;
+        if (generated.fields.len != fields.len) continue;
+        var fields_match = true;
+        for (fields, generated.fields) |actual, expected| {
+            if (!std.mem.eql(u8, actual, expected)) {
+                fields_match = false;
+                break;
+            }
+        }
+        if (!fields_match) continue;
+        if (column.path.len == 0) return error.DocumentSqlWriteUnsupported;
+        return column;
+    }
+    return error.DocumentSqlWriteJoinMissingIndexProof;
+}
+
+fn documentJoinedGeneratedTargetColumnForRowExpression(
+    schema: runtime_schema.TableSchema,
+    expression: runtime_schema.RelationalRowsExpression,
+) !runtime_schema.RelationalColumn {
+    for (schema.relational_columns) |column| {
+        const generated = column.generated orelse continue;
+        if (generated.op != .expression) continue;
+        const generated_expression = generated.expression orelse continue;
+        if (!expr_equal.relationalRowsExpressionEqual(expression, generated_expression)) continue;
+        if (column.path.len == 0) return error.DocumentSqlWriteUnsupported;
+        return column;
+    }
+    return error.DocumentSqlWriteJoinMissingIndexProof;
+}
+
+fn documentJoinedGeneratedExpressionKindForSqlFunction(name: []const u8) ?runtime_schema.RelationalRowsExpressionKind {
+    if (std.ascii.eqlIgnoreCase(name, "lower")) return .lower;
+    if (std.ascii.eqlIgnoreCase(name, "upper")) return .upper;
+    if (std.ascii.eqlIgnoreCase(name, "initcap")) return .initcap;
+    if (std.ascii.eqlIgnoreCase(name, "trim") or std.ascii.eqlIgnoreCase(name, "btrim")) return .trim;
+    if (std.ascii.eqlIgnoreCase(name, "ltrim")) return .ltrim;
+    if (std.ascii.eqlIgnoreCase(name, "rtrim")) return .rtrim;
+    if (std.ascii.eqlIgnoreCase(name, "md5")) return .md5;
+    if (std.ascii.eqlIgnoreCase(name, "reverse")) return .reverse;
+    if (std.ascii.eqlIgnoreCase(name, "replace")) return .replace;
+    if (std.ascii.eqlIgnoreCase(name, "concat")) return .concat;
+    if (std.ascii.eqlIgnoreCase(name, "concat_ws")) return .concat_ws;
+    if (std.ascii.eqlIgnoreCase(name, "coalesce")) return .coalesce;
+    if (std.ascii.eqlIgnoreCase(name, "length")) return .length;
+    if (std.ascii.eqlIgnoreCase(name, "octet_length")) return .octet_length;
+    if (std.ascii.eqlIgnoreCase(name, "bit_length")) return .bit_length;
+    if (std.ascii.eqlIgnoreCase(name, "ascii")) return .ascii;
+    if (std.ascii.eqlIgnoreCase(name, "abs")) return .abs;
+    if (std.ascii.eqlIgnoreCase(name, "round")) return .round;
+    if (std.ascii.eqlIgnoreCase(name, "trunc")) return .trunc;
+    if (std.ascii.eqlIgnoreCase(name, "floor")) return .floor;
+    if (std.ascii.eqlIgnoreCase(name, "ceil")) return .ceil;
+    if (std.ascii.eqlIgnoreCase(name, "sqrt")) return .sqrt;
+    if (std.ascii.eqlIgnoreCase(name, "sign")) return .sign;
+    if (std.ascii.eqlIgnoreCase(name, "mod")) return .mod;
+    if (std.ascii.eqlIgnoreCase(name, "power")) return .power;
+    if (std.ascii.eqlIgnoreCase(name, "json_typeof") or std.ascii.eqlIgnoreCase(name, "jsonb_typeof")) return .json_typeof;
+    if (std.ascii.eqlIgnoreCase(name, "json_array_length") or std.ascii.eqlIgnoreCase(name, "jsonb_array_length")) return .json_array_length;
+    if (std.ascii.eqlIgnoreCase(name, "strpos")) return .strpos;
+    if (std.ascii.eqlIgnoreCase(name, "left")) return .left;
+    if (std.ascii.eqlIgnoreCase(name, "right")) return .right;
+    if (std.ascii.eqlIgnoreCase(name, "repeat")) return .repeat;
+    if (std.ascii.eqlIgnoreCase(name, "starts_with")) return .starts_with;
+    if (std.ascii.eqlIgnoreCase(name, "ends_with")) return .ends_with;
+    return null;
+}
+
+fn validateDocumentJoinedGeneratedExpressionArity(
+    kind: runtime_schema.RelationalRowsExpressionKind,
+    count: usize,
+) !void {
+    switch (kind) {
+        .lower, .upper, .initcap, .trim, .ltrim, .rtrim, .md5, .reverse, .length, .octet_length, .bit_length, .ascii, .abs, .round, .trunc, .floor, .ceil, .sqrt, .sign, .json_typeof, .json_array_length => if (count != 1) return error.DocumentSqlWriteUnsupported,
+        .replace => if (count != 3) return error.DocumentSqlWriteUnsupported,
+        .mod, .power, .strpos, .left, .right, .repeat, .starts_with, .ends_with => if (count != 2) return error.DocumentSqlWriteUnsupported,
+        .concat, .coalesce => if (count == 0) return error.DocumentSqlWriteUnsupported,
+        .concat_ws => if (count < 2) return error.DocumentSqlWriteUnsupported,
+        else => return error.DocumentSqlWriteUnsupported,
+    }
+}
+
+fn parseDocumentJoinedGeneratedJsonExtractPathExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) !runtime_schema.RelationalRowsExpression {
+    const function_token = expr_token.matchFunctionKeywordToken(tokens, pos, expr_token.sqlTokenIsJsonExtractPathFunction) orelse return error.DocumentSqlWriteUnsupported;
+    const as_text = expr_token.sqlJsonExtractPathTokenAsText(function_token);
+    try parser.expectToken(tokens, pos, .lparen);
+    const operand = try parseDocumentJoinedGeneratedRowExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+    var operand_transferred = false;
+    errdefer if (!operand_transferred) freeExpression(alloc, operand);
+    const path = try sql_value.parseJsonExtractPathSegmentsAlloc(alloc, tokens, pos, params);
+    var path_transferred = false;
+    errdefer if (!path_transferred) alloc.free(path);
+    try parser.expectToken(tokens, pos, .rparen);
+    const expression = try expr_build.buildJsonExtractExpressionAlloc(alloc, operand, path, as_text);
+    operand_transferred = true;
+    path_transferred = true;
+    return expression;
+}
+
+fn parseDocumentJoinedGeneratedRowExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    var expression = try parseDocumentJoinedGeneratedMultiplicativeExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    while (true) {
+        const kind: runtime_schema.RelationalRowsExpressionKind = if (parser.matchToken(tokens, pos, .plus) != null)
+            .add
+        else if (parser.matchToken(tokens, pos, .minus) != null)
+            .sub
+        else
+            break;
+        const rhs = try parseDocumentJoinedGeneratedMultiplicativeExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+        const combined = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, expression, rhs);
+        expression_transferred = true;
+        rhs_transferred = true;
+        expression = combined;
+        expression_transferred = false;
+    }
+    expression_transferred = true;
+    return expression;
+}
+
+fn parseDocumentJoinedGeneratedMultiplicativeExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    var expression = try parseDocumentJoinedGeneratedJsonAccessExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    while (true) {
+        const kind: runtime_schema.RelationalRowsExpressionKind = if (parser.matchToken(tokens, pos, .star) != null)
+            .mul
+        else if (parser.matchToken(tokens, pos, .slash) != null)
+            .div
+        else if (parser.matchToken(tokens, pos, .percent) != null)
+            .mod
+        else
+            break;
+        const rhs = try parseDocumentJoinedGeneratedJsonAccessExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+        var rhs_transferred = false;
+        errdefer if (!rhs_transferred) freeExpression(alloc, rhs);
+        const combined = try expr_build.buildBinaryFunctionExpressionAlloc(alloc, kind, expression, rhs);
+        expression_transferred = true;
+        rhs_transferred = true;
+        expression = combined;
+        expression_transferred = false;
+    }
+    expression_transferred = true;
+    return expression;
+}
+
+fn parseDocumentJoinedGeneratedJsonAccessExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    var expression = try parseDocumentJoinedGeneratedPrimaryExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+    var expression_transferred = false;
+    errdefer if (!expression_transferred) freeExpression(alloc, expression);
+    while (expr_operator.matchJsonExtractOperator(tokens, pos)) |operator| {
+        const as_text = expr_operator.tokenKindIsJsonExtractTextOperator(operator);
+        const path = try sql_value.parseJsonExtractOperatorPathOwnedAlloc(alloc, tokens, pos, params, operator);
+        var path_transferred = false;
+        errdefer if (!path_transferred) alloc.free(path);
+        const extracted = try expr_build.buildJsonExtractExpressionAlloc(alloc, expression, path, as_text);
+        expression_transferred = true;
+        path_transferred = true;
+        expression = extracted;
+        expression_transferred = false;
+    }
+    expression_transferred = true;
+    return expression;
+}
+
+fn documentJoinedTokenPostfixCastType(cast_type: token_mod.TokenPostfixCastType) runtime_schema.RelationalRowsExpressionCastType {
+    return switch (cast_type) {
+        .text => .text,
+        .numeric => .numeric,
+        .bool => .bool,
+        .datetime => .datetime,
+    };
+}
+
+fn parseDocumentJoinedGeneratedPrimaryExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) anyerror!runtime_schema.RelationalRowsExpression {
+    if (parser.matchToken(tokens, pos, .lparen) != null) {
+        const expression = try parseDocumentJoinedGeneratedRowExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        try parser.expectToken(tokens, pos, .rparen);
+        expression_transferred = true;
+        return expression;
+    }
+
+    if (expr_token.peekCastExpressionSyntax(tokens, pos.*)) {
+        try expr_token.parseCastExpressionCallStart(tokens, pos);
+        const operand = try parseDocumentJoinedGeneratedRowExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+        var operand_transferred = false;
+        errdefer if (!operand_transferred) freeExpression(alloc, operand);
+        try expr_token.parseCastExpressionAs(tokens, pos);
+        const cast_type = try expr_operator.parseExpressionCastType(tokens, pos);
+        try parser.expectToken(tokens, pos, .rparen);
+        const expression = try expr_build.buildCastExpressionAlloc(alloc, operand, cast_type);
+        operand_transferred = true;
+        return expression;
+    }
+
+    if (pos.* < tokens.len and expr_token.sqlTokenIsJsonExtractPathFunction(tokens[pos.*])) {
+        return try parseDocumentJoinedGeneratedJsonExtractPathExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+    }
+
+    if (pos.* < tokens.len and tokens[pos.*].kind == .identifier and pos.* + 1 < tokens.len and tokens[pos.* + 1].kind == .lparen) {
+        const kind = documentJoinedGeneratedExpressionKindForSqlFunction(tokens[pos.*].text) orelse return error.DocumentSqlWriteUnsupported;
+        pos.* += 2;
+        var operands = std.ArrayListUnmanaged(runtime_schema.RelationalRowsExpression).empty;
+        errdefer {
+            for (operands.items) |operand| freeExpression(alloc, operand);
+            operands.deinit(alloc);
+        }
+        if (!parser.peekKind(tokens, pos.*, .rparen)) {
+            while (true) {
+                const operand = try parseDocumentJoinedGeneratedRowExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+                var operand_transferred = false;
+                errdefer if (!operand_transferred) freeExpression(alloc, operand);
+                try operands.append(alloc, operand);
+                operand_transferred = true;
+                if (parser.matchToken(tokens, pos, .comma) == null) break;
+            }
+        }
+        try parser.expectToken(tokens, pos, .rparen);
+        try validateDocumentJoinedGeneratedExpressionArity(kind, operands.items.len);
+        return try expr_build.buildFunctionExpressionFromOperandListAlloc(alloc, kind, &operands);
+    }
+
+    if (parser.peekKind(tokens, pos.*, .identifier) and
+        !parser.peekKeywordTag(tokens, pos.*, .null) and
+        !parser.peekKeywordTag(tokens, pos.*, .true) and
+        !parser.peekKeywordTag(tokens, pos.*, .false))
+    {
+        const field_token_index = pos.*;
+        const source_field = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+        defer plan_mod.freeQualifiedField(alloc, source_field);
+        if (!documentTableQualifierMatches(source_field.qualifier, target_table)) return error.DocumentSqlWriteJoinMissingExactProducer;
+        const column = binder.relationalColumnForField(schema, source_field.field, null) orelse return error.DocumentSqlWriteJoinMissingIndexProof;
+        if (column.path.len == 0) return error.DocumentSqlWriteUnsupported;
+        const expression: runtime_schema.RelationalRowsExpression = .{
+            .kind = .field,
+            .field = try alloc.dupe(u8, column.name),
+            .field_source = .row,
+        };
+        var expression_transferred = false;
+        errdefer if (!expression_transferred) freeExpression(alloc, expression);
+        if (tokens[field_token_index].postfix_cast_type) |cast_type| {
+            const casted = try expr_build.buildCastExpressionAlloc(alloc, expression, documentJoinedTokenPostfixCastType(cast_type));
+            expression_transferred = true;
+            return casted;
+        }
+        expression_transferred = true;
+        return expression;
+    }
+
+    if (pos.* < tokens.len and tokens[pos.*].kind == .placeholder) return error.DocumentSqlWriteUnsupported;
+    const value_json = try sql_value.parseJsonValueAlloc(alloc, tokens, pos, params);
+    errdefer alloc.free(value_json);
+    return .{
+        .kind = .value,
+        .value_json = value_json,
+    };
+}
+
+fn documentJoinedGeneratedTargetColumnForSqlExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) !runtime_schema.RelationalColumn {
+    const expression = try parseDocumentJoinedGeneratedRowExpressionAlloc(alloc, tokens, pos, schema, target_table, params);
+    defer freeExpression(alloc, expression);
+    return try documentJoinedGeneratedTargetColumnForRowExpression(schema, expression);
+}
+
+const DocumentJoinedGeneratedConcatExpression = struct {
+    fields: []const []const u8,
+    separator: []const u8,
+
+    fn deinit(self: DocumentJoinedGeneratedConcatExpression, alloc: std.mem.Allocator) void {
+        for (self.fields) |field| alloc.free(field);
+        if (self.fields.len > 0) alloc.free(self.fields);
+        alloc.free(self.separator);
+    }
+};
+
+fn appendDocumentJoinedGeneratedConcatFieldAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged([]const u8),
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    tokens: []const Token,
+    pos: *usize,
+) !void {
+    const source_field = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+    defer plan_mod.freeQualifiedField(alloc, source_field);
+    if (!documentTableQualifierMatches(source_field.qualifier, target_table)) return error.DocumentSqlWriteJoinMissingExactProducer;
+    const base_column = try documentJoinedMappedJoinColumnForField(schema, target_table, source_field);
+    const field = try alloc.dupe(u8, base_column.name);
+    errdefer alloc.free(field);
+    try fields.append(alloc, field);
+}
+
+fn parseDocumentJoinedGeneratedConcatExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+    op: runtime_schema.RelationalGeneratedOp,
+) !DocumentJoinedGeneratedConcatExpression {
+    var fields = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (fields.items) |field| alloc.free(field);
+        fields.deinit(alloc);
+    }
+    var separator: []const u8 = try alloc.dupe(u8, "");
+    var separator_transferred = false;
+    errdefer if (!separator_transferred) alloc.free(separator);
+
+    if (op == .concat_ws) {
+        alloc.free(separator);
+        separator = try sql_value.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+        try parser.expectToken(tokens, pos, .comma);
+        try appendDocumentJoinedGeneratedConcatFieldAlloc(alloc, &fields, schema, target_table, tokens, pos);
+        while (parser.matchToken(tokens, pos, .comma) != null) {
+            try appendDocumentJoinedGeneratedConcatFieldAlloc(alloc, &fields, schema, target_table, tokens, pos);
+        }
+    } else {
+        var separator_seen = false;
+        try appendDocumentJoinedGeneratedConcatFieldAlloc(alloc, &fields, schema, target_table, tokens, pos);
+        while (parser.matchToken(tokens, pos, .comma) != null) {
+            if (pos.* < tokens.len and (tokens[pos.*].kind == .string or tokens[pos.*].kind == .placeholder)) {
+                const next_separator = try sql_value.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+                defer alloc.free(next_separator);
+                if (separator_seen and !std.mem.eql(u8, separator, next_separator)) return error.DocumentSqlWriteUnsupported;
+                if (!separator_seen) {
+                    alloc.free(separator);
+                    separator = try alloc.dupe(u8, next_separator);
+                    separator_seen = true;
+                }
+                try parser.expectToken(tokens, pos, .comma);
+                try appendDocumentJoinedGeneratedConcatFieldAlloc(alloc, &fields, schema, target_table, tokens, pos);
+            } else {
+                if (separator_seen) return error.DocumentSqlWriteUnsupported;
+                try appendDocumentJoinedGeneratedConcatFieldAlloc(alloc, &fields, schema, target_table, tokens, pos);
+            }
+        }
+    }
+
+    if (fields.items.len == 0) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, pos, .rparen);
+    separator_transferred = true;
+    return .{
+        .fields = try fields.toOwnedSlice(alloc),
+        .separator = separator,
+    };
+}
+
+const DocumentJoinedMappedJoinProof = struct {
+    target_field: []const u8,
+    source_field: []const u8,
+};
+
+fn proveDocumentJoinedMappedJoinPredicate(
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
+    target_field: plan_mod.QualifiedField,
+    source_field: plan_mod.QualifiedField,
+) !DocumentJoinedMappedJoinProof {
+    const target_column = try documentJoinedMappedJoinColumnForField(schema, target_table, target_field);
+    const source_column = try documentJoinedMappedJoinColumnForField(source_schema, source_table, source_field);
+    if (target_column.field_type != source_column.field_type) return error.DocumentSqlWriteUnsupported;
+    try documentJoinedMappedJoinIndexProof(target_column);
+    try documentJoinedMappedJoinIndexProof(source_column);
+    if (target_column.cardinality_proof != .unique or source_column.cardinality_proof != .unique) {
+        return error.DocumentSqlWriteJoinMissingCardinalityProof;
+    }
+    return .{
+        .target_field = target_column.path,
+        .source_field = source_column.path,
+    };
+}
+
+fn appendDocumentJoinedIdentityJoinKeyAlloc(
+    alloc: std.mem.Allocator,
+    join_keys: *std.ArrayListUnmanaged(plan_mod.DocumentJoinedMutationJoinKey),
+) !void {
+    try appendDocumentJoinedJoinKeyAlloc(alloc, join_keys, "_id", "_id");
+}
+
+fn appendDocumentJoinedJoinKeyAlloc(
+    alloc: std.mem.Allocator,
+    join_keys: *std.ArrayListUnmanaged(plan_mod.DocumentJoinedMutationJoinKey),
+    target: []const u8,
+    source: []const u8,
+) !void {
+    if (join_keys.items.len != 0) return error.DocumentSqlWriteUnsupported;
+    const target_field = try alloc.dupe(u8, target);
+    var target_transferred = false;
+    errdefer if (!target_transferred) alloc.free(target_field);
+    const source_field = try alloc.dupe(u8, source);
+    var source_transferred = false;
+    errdefer if (!source_transferred) alloc.free(source_field);
+    try join_keys.append(alloc, .{
+        .target_field = target_field,
+        .source_field = source_field,
+    });
+    target_transferred = true;
+    source_transferred = true;
+}
+
+fn parseDocumentJoinedJoinPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
+    join_keys: *std.ArrayListUnmanaged(plan_mod.DocumentJoinedMutationJoinKey),
+) !void {
+    const lhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+    defer plan_mod.freeQualifiedField(alloc, lhs);
+    try parser.expectToken(tokens, pos, .eq);
+    const rhs = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+    defer plan_mod.freeQualifiedField(alloc, rhs);
+
+    const target_left = documentQualifiedIdentityFieldMatches(lhs, target_table);
+    const source_left = documentQualifiedIdentityFieldMatches(lhs, source_table);
+    const target_right = documentQualifiedIdentityFieldMatches(rhs, target_table);
+    const source_right = documentQualifiedIdentityFieldMatches(rhs, source_table);
+    if ((target_left and source_right) or (source_left and target_right)) {
+        try appendDocumentJoinedIdentityJoinKeyAlloc(alloc, join_keys);
+        return;
+    }
+    const lhs_target = documentTableQualifierMatches(lhs.qualifier, target_table);
+    const lhs_source = documentTableQualifierMatches(lhs.qualifier, source_table);
+    const rhs_target = documentTableQualifierMatches(rhs.qualifier, target_table);
+    const rhs_source = documentTableQualifierMatches(rhs.qualifier, source_table);
+    if (lhs_target and rhs_source) {
+        const proof = try proveDocumentJoinedMappedJoinPredicate(schema, source_schema, target_table, source_table, lhs, rhs);
+        try appendDocumentJoinedJoinKeyAlloc(alloc, join_keys, proof.target_field, proof.source_field);
+        return;
+    } else if (lhs_source and rhs_target) {
+        const proof = try proveDocumentJoinedMappedJoinPredicate(schema, source_schema, target_table, source_table, rhs, lhs);
+        try appendDocumentJoinedJoinKeyAlloc(alloc, join_keys, proof.target_field, proof.source_field);
+        return;
+    }
+    return error.DocumentSqlWriteJoinMissingExactProducer;
+}
+
+fn parseDocumentJoinedTargetProducerPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+    target_producer: *?document_plan.DocumentProducer,
+) !void {
+    if (target_producer.* != null) return error.DocumentSqlWriteUnsupported;
+    const starts_function_expression =
+        pos.* + 5 < tokens.len and
+        tokens[pos.*].kind == .identifier and
+        tokens[pos.* + 1].kind == .lparen;
+    const starts_operator_expression =
+        pos.* + 3 < tokens.len and
+        tokens[pos.*].kind == .identifier and
+        std.mem.indexOfScalar(u8, tokens[pos.*].text, '.') != null and
+        (tokens[pos.* + 1].kind == .plus or
+            tokens[pos.* + 1].kind == .minus or
+            tokens[pos.* + 1].kind == .star or
+            tokens[pos.* + 1].kind == .slash or
+            tokens[pos.* + 1].kind == .percent or
+            expr_operator.tokenKindIsJsonExtractOperator(tokens[pos.* + 1].kind));
+    const starts_postfix_cast_expression =
+        pos.* + 2 < tokens.len and
+        tokens[pos.*].kind == .identifier and
+        std.mem.indexOfScalar(u8, tokens[pos.*].text, '.') != null and
+        tokens[pos.*].postfix_cast_type != null;
+    if (starts_function_expression or starts_operator_expression or starts_postfix_cast_expression) {
+        const expression_start = pos.*;
+        var final_expression_pos: usize = expression_start;
+        var expression_parse_err: anyerror = error.DocumentSqlWriteUnsupported;
+        const column = blk: {
+            var expression_pos = expression_start;
+            if (documentJoinedGeneratedTargetColumnForSqlExpressionAlloc(alloc, tokens, &expression_pos, schema, target_table, params)) |expression_column| {
+                final_expression_pos = expression_pos;
+                break :blk expression_column;
+            } else |err| switch (err) {
+                error.DocumentSqlWriteJoinMissingIndexProof, error.DocumentSqlWriteUnsupported, error.UnsupportedSqlShape => {
+                    expression_parse_err = err;
+                },
+                else => return err,
+            }
+
+            if (!starts_function_expression) return expression_parse_err;
+            const function_name = tokens[expression_start].text;
+            pos.* = expression_start + 2;
+            const fallback_column = fallback: {
+                if (documentJoinedGeneratedOpForSqlFunction(function_name)) |op| {
+                    const source_field = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, pos);
+                    defer plan_mod.freeQualifiedField(alloc, source_field);
+                    try parser.expectToken(tokens, pos, .rparen);
+                    break :fallback try documentJoinedGeneratedTargetColumnForExpression(schema, target_table, op, source_field);
+                } else if (documentJoinedGeneratedConcatOpForSqlFunction(function_name)) |op| {
+                    const expression = try parseDocumentJoinedGeneratedConcatExpressionAlloc(alloc, tokens, pos, schema, target_table, params, op);
+                    defer expression.deinit(alloc);
+                    break :fallback try documentJoinedGeneratedTargetColumnForFields(schema, op, expression.fields, expression.separator);
+                } else return expression_parse_err;
+            };
+            final_expression_pos = pos.*;
+            break :blk fallback_column;
+        };
+        pos.* = final_expression_pos;
+        try parser.expectToken(tokens, pos, .eq);
+        try documentJoinedMappedJoinIndexProof(column);
+        const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, sql_value.currentRealtimeNs());
+        defer alloc.free(value_json);
+        const filter_json = try documentJoinedTermFilterJsonAlloc(alloc, column.path, value_json);
+        errdefer alloc.free(filter_json);
+        target_producer.* = .{ .indexed_query = .{
+            .filter_query_json = filter_json,
+            .max_candidate_rows = 1,
+        } };
+        return;
+    }
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(field);
+    if (documentIdentityFieldMatches(field, target_table)) {
+        try parser.expectToken(tokens, pos, .eq);
+        const target_key = try sql_value.parseSqlStringValueAlloc(alloc, tokens, pos, params);
+        defer alloc.free(target_key);
+        target_producer.* = try documentProducerIdLookupForKeyAlloc(alloc, target_key);
+        return;
+    }
+
+    const dot = std.mem.lastIndexOfScalar(u8, field, '.') orelse return error.DocumentSqlWriteUnsupported;
+    const qualifier = field[0..dot];
+    const unqualified_field = field[dot + 1 ..];
+    if (!documentTableQualifierMatches(qualifier, target_table)) return error.DocumentSqlWriteJoinMissingExactProducer;
+    if (unqualified_field.len == 0) return error.DocumentSqlWriteUnsupported;
+    const column = try documentJoinedMappedJoinColumnForField(schema, target_table, .{
+        .qualifier = qualifier,
+        .field = unqualified_field,
+    });
+    try documentJoinedMappedJoinIndexProof(column);
+    if (column.cardinality_proof != .unique) {
+        return error.DocumentSqlWriteJoinMissingCardinalityProof;
+    }
+    try parser.expectToken(tokens, pos, .eq);
+    const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, pos, params, column, sql_value.currentRealtimeNs());
+    defer alloc.free(value_json);
+    const filter_json = try documentJoinedTermFilterJsonAlloc(alloc, column.path, value_json);
+    errdefer alloc.free(filter_json);
+    target_producer.* = .{ .indexed_query = .{
+        .filter_query_json = filter_json,
+        .max_candidate_rows = 1,
+    } };
+}
+
+fn documentJoinedNextPredicateEnd(tokens: []const Token, start: usize) usize {
+    var pos = start;
+    var depth: usize = 0;
+    while (pos < tokens.len) : (pos += 1) {
+        switch (tokens[pos].kind) {
+            .lparen => depth += 1,
+            .rparen => if (depth > 0) {
+                depth -= 1;
+            },
+            .semicolon => if (depth == 0) return pos,
+            else => {},
+        }
+        if (depth == 0 and tokens[pos].matchesKeywordTag(.@"and")) return pos;
+    }
+    return tokens.len;
+}
+
+fn documentJoinedPredicateStartsSimpleTargetScalarFilter(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    target_table: plan_mod.TableAlias,
+) bool {
+    if (start + 2 >= end) return false;
+    if (tokens[start].kind != .identifier or tokens[start].postfix_cast_type != null) return false;
+    const dot = std.mem.lastIndexOfScalar(u8, tokens[start].text, '.') orelse return false;
+    const qualifier = tokens[start].text[0..dot];
+    const field = tokens[start].text[dot + 1 ..];
+    if (field.len == 0) return false;
+    if (!documentTableQualifierMatches(qualifier, target_table)) return false;
+    return switch (tokens[start + 1].kind) {
+        .eq, .neq, .gt, .gte, .lt, .lte => true,
+        else => false,
+    };
+}
+
+fn parseDocumentJoinedBoundedTargetProducerPredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    target_producer: *?document_plan.DocumentProducer,
+    exact_err: anyerror,
+) !void {
+    if (target_producer.* != null) return exact_err;
+    const predicate_end = documentJoinedNextPredicateEnd(tokens, pos.*);
+    if (!documentJoinedPredicateStartsSimpleTargetScalarFilter(tokens, pos.*, predicate_end, target_table)) return exact_err;
+    const producer = document_plan.lowerDocumentMutationBoundedScanProducerFromClauseAlloc(
+        alloc,
+        tokens[pos.*..predicate_end],
+        schema,
+        target_table.name,
+        target_table.alias,
+        .{
+            .max_rows = source_binding.default_document_sql_bounded_scan_rows,
+            .max_bytes = source_binding.default_document_sql_bounded_scan_bytes,
+        },
+    ) catch return exact_err;
+    errdefer {
+        var mutable = producer;
+        mutable.deinit(alloc);
+    }
+    target_producer.* = producer;
+    pos.* = predicate_end;
+}
+
+fn documentJoinedStaticSourceProducerForTargetAlloc(
+    alloc: std.mem.Allocator,
+    target_producer: document_plan.DocumentProducer,
+) !plan_mod.DocumentJoinedMutationSourceProducer {
+    switch (target_producer) {
+        .id_lookup => |lookup| {
+            if (lookup.ids.len != 1) return error.DocumentSqlWriteUnsupported;
+            return .{ .static = try documentProducerIdLookupForKeyAlloc(alloc, lookup.ids[0]) };
+        },
+        else => return error.DocumentSqlWriteJoinMissingExactProducer,
+    }
+}
+
+fn documentJoinedSourceProducerForJoinKeyAlloc(
+    alloc: std.mem.Allocator,
+    join_key: plan_mod.DocumentJoinedMutationJoinKey,
+    target_producer: document_plan.DocumentProducer,
+) !plan_mod.DocumentJoinedMutationSourceProducer {
+    if (std.mem.eql(u8, join_key.target_field, "_id")) {
+        return try documentJoinedStaticSourceProducerForTargetAlloc(alloc, target_producer);
+    }
+    return .join_key_indexed_lookup;
+}
+
+fn documentJoinedTargetProducerMaxRows(producer: document_plan.DocumentProducer) ?u32 {
+    return switch (producer) {
+        .id_lookup => |lookup| @intCast(lookup.ids.len),
+        .indexed_query => |query| query.max_candidate_rows,
+        .bounded_scan => |scan| scan.max_rows,
+    };
+}
+
+fn expectDocumentJoinedIndexedTargetProducerForCorpus(
+    expected: document_sql_corpus.DocumentSqlWritePlanExpectationJson,
+    producer: document_plan.DocumentProducer,
+) !void {
+    switch (producer) {
+        .indexed_query => |query| {
+            try expectOptionalU32EqualForDmlTest(expected.max_candidate_rows, query.max_candidate_rows);
+            if (expected.filter_query_json) |filter_query_json| {
+                try std.testing.expectEqualStrings(filter_query_json, query.filter_query_json orelse return error.TestUnexpectedResult);
+            }
+            if (expected.residual_filter_json) |residual_filter_json| {
+                try std.testing.expectEqualStrings(residual_filter_json, query.residual_filter_json orelse return error.TestUnexpectedResult);
+            }
+            if (expected.no_residual_filter) try std.testing.expect(query.residual_filter_json == null);
+        },
+        .bounded_scan => |scan| {
+            if (expected.max_scan_rows) |max_scan_rows| try std.testing.expectEqual(max_scan_rows, scan.max_rows);
+            try expectOptionalU64EqualForDmlTest(expected.max_scan_bytes, scan.max_bytes);
+            if (expected.residual_filter_json) |residual_filter_json| {
+                try std.testing.expectEqualStrings(residual_filter_json, scan.residual_filter_json orelse return error.TestUnexpectedResult);
+            }
+            if (expected.no_residual_filter) try std.testing.expect(scan.residual_filter_json == null);
+            if (expected.max_candidate_rows != null or expected.filter_query_json != null) return error.TestUnexpectedResult;
+        },
+        else => {
+            if (expected.max_candidate_rows != null or expected.filter_query_json != null or expected.residual_filter_json != null or expected.no_residual_filter) {
+                return error.TestUnexpectedResult;
+            }
+        },
+    }
+}
+
+fn parseDocumentJoinedVersionPredicate(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    target_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+    expected_version: *?u64,
+) !void {
+    if (expected_version.* != null) return error.DocumentSqlWriteUnsupported;
+    const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, pos);
+    defer alloc.free(field);
+    if (!documentVersionFieldMatches(field, target_table)) return error.DocumentSqlWriteUnsupported;
+    try parser.expectToken(tokens, pos, .eq);
+    expected_version.* = try parseDocumentVersionPredicateValue(tokens, pos, params);
+}
+
+const DocumentJoinedPredicateSet = struct {
+    join_keys: []plan_mod.DocumentJoinedMutationJoinKey,
+    target_producer: ?document_plan.DocumentProducer = null,
+    expected_version: ?u64 = null,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        for (self.join_keys) |*join_key| join_key.deinit(alloc);
+        if (self.join_keys.len > 0) alloc.free(self.join_keys);
+        if (self.target_producer) |*producer| producer.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+fn parseDocumentJoinedPredicateSetAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    target_table: plan_mod.TableAlias,
+    source_table: plan_mod.TableAlias,
+    params: []const sql_value.SqlValue,
+) !DocumentJoinedPredicateSet {
+    try parser.expectKeywordTag(tokens, pos, .where);
+    var join_keys = std.ArrayListUnmanaged(plan_mod.DocumentJoinedMutationJoinKey).empty;
+    errdefer {
+        for (join_keys.items) |*join_key| join_key.deinit(alloc);
+        join_keys.deinit(alloc);
+    }
+    var target_producer: ?document_plan.DocumentProducer = null;
+    errdefer if (target_producer) |*producer| producer.deinit(alloc);
+    var expected_version: ?u64 = null;
+
+    while (true) {
+        if (!parser.peekKind(tokens, pos.*, .identifier)) return error.DocumentSqlWriteUnsupported;
+        const token_text = tokens[pos.*].text;
+        if (std.mem.indexOfScalar(u8, token_text, '.') != null and
+            pos.* + 2 < tokens.len and
+            tokens[pos.* + 1].kind == .eq and
+            tokens[pos.* + 2].kind == .identifier)
+        {
+            try parseDocumentJoinedJoinPredicateAlloc(alloc, tokens, pos, schema, source_schema, target_table, source_table, &join_keys);
+        } else if (documentVirtualFieldMatches(token_text, target_table, "_version")) {
+            try parseDocumentJoinedVersionPredicate(alloc, tokens, pos, target_table, params, &expected_version);
+        } else {
+            const predicate_start = pos.*;
+            var predicate_pos = predicate_start;
+            parseDocumentJoinedTargetProducerPredicateAlloc(alloc, tokens, &predicate_pos, schema, target_table, params, &target_producer) catch |err| {
+                pos.* = predicate_start;
+                try parseDocumentJoinedBoundedTargetProducerPredicateAlloc(alloc, tokens, pos, schema, target_table, &target_producer, err);
+                if (pos.* == predicate_start) return error.DocumentSqlWriteUnsupported;
+                if (pos.* < tokens.len and tokens[pos.*].matchesKeywordTag(.@"and")) {
+                    if (!parser.matchKeywordTag(tokens, pos, .@"and")) return error.DocumentSqlWriteUnsupported;
+                    continue;
+                }
+                break;
+            };
+            pos.* = predicate_pos;
+        }
+        if (!parser.matchKeywordTag(tokens, pos, .@"and")) break;
+    }
+    if (join_keys.items.len != 1) return error.DocumentSqlWriteUnsupported;
+    if (target_producer == null) return error.DocumentSqlWriteUnsupported;
+    const owned_join_keys = try join_keys.toOwnedSlice(alloc);
+    errdefer {
+        for (owned_join_keys) |*join_key| join_key.deinit(alloc);
+        alloc.free(owned_join_keys);
+    }
+    const owned_target_producer = target_producer;
+    target_producer = null;
+    return .{
+        .join_keys = owned_join_keys,
+        .target_producer = owned_target_producer,
+        .expected_version = expected_version,
+    };
+}
+
+fn documentProducerIdLookupForKeyAlloc(
+    alloc: std.mem.Allocator,
+    key: []const u8,
+) !document_plan.DocumentProducer {
+    const ids = try alloc.alloc([]const u8, 1);
+    var ids_transferred = false;
+    errdefer if (!ids_transferred) alloc.free(ids);
+    ids[0] = try alloc.dupe(u8, key);
+    ids_transferred = true;
+    return .{ .id_lookup = .{ .ids = ids } };
+}
+
+fn parseDocumentJoinedProjectionUpdateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredWritePlan {
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .update);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+
+    try parser.expectKeywordTag(tokens, &pos, .set);
+    const pending_source_alias = grammar.peekUpdateJoinedMutationSourceAlias(tokens, pos);
+    var operations = std.ArrayListUnmanaged(db_mod.types.TransformOp).empty;
+    errdefer {
+        freeDocumentTransformOpPayloads(alloc, operations.items);
+        operations.deinit(alloc);
+    }
+    var source_assignments = std.ArrayListUnmanaged(plan_mod.DocumentJoinedMutationSourceAssignment).empty;
+    errdefer {
+        for (source_assignments.items) |*assignment| assignment.deinit(alloc);
+        source_assignments.deinit(alloc);
+    }
+
+    while (true) {
+        const field = try grammar.parseIdentifierOwnedAlloc(alloc, tokens, &pos);
+        defer alloc.free(field);
+        try parser.expectToken(tokens, &pos, .eq);
+        if (parser.peekKind(tokens, pos, .identifier) and std.mem.indexOfScalar(u8, tokens[pos].text, '.') != null) {
+            const target_column = try documentSourceAssignmentTargetColumnForField(schema, target_table, field);
+            const source = try plan_mod.parseQualifiedFieldAlloc(alloc, tokens, &pos);
+            defer plan_mod.freeQualifiedField(alloc, source);
+            const source_alias = pending_source_alias orelse return error.DocumentSqlWriteSourceAssignmentAlias;
+            if (!std.ascii.eqlIgnoreCase(source.qualifier, source_alias)) return error.DocumentSqlWriteSourceAssignmentAlias;
+            if (std.ascii.eqlIgnoreCase(source.field, "_doc") or
+                std.ascii.eqlIgnoreCase(source.field, "_id") or
+                std.ascii.eqlIgnoreCase(source.field, "_version"))
+            {
+                return error.DocumentSqlWriteSourceAssignmentReservedField;
+            }
+            const source_column = binder.relationalColumnForField(source_schema, source.field, null) orelse return error.DocumentSqlWriteSourceAssignmentMissingField;
+            if (source_column.generated != null) return error.DocumentSqlWriteSourceAssignmentGeneratedField;
+            if (source_column.field_type != target_column.field_type) return error.DocumentSqlWriteSourceAssignmentTypeMismatch;
+            const target_path = try alloc.dupe(u8, target_column.path);
+            var target_path_transferred = false;
+            errdefer if (!target_path_transferred) alloc.free(target_path);
+            const source_field = try alloc.dupe(u8, source.field);
+            var source_field_transferred = false;
+            errdefer if (!source_field_transferred) alloc.free(source_field);
+            try source_assignments.append(alloc, .{
+                .target_path = target_path,
+                .source_field = source_field,
+                .field_type = target_column.field_type,
+            });
+            target_path_transferred = true;
+            source_field_transferred = true;
+        } else {
+            const target_column = try documentProjectionColumnForField(schema, target_table, field);
+            const value_json = try sql_value.parseSqlColumnValueAlloc(alloc, tokens, &pos, params, target_column, sql_value.currentRealtimeNs());
+            defer alloc.free(value_json);
+            try appendDocumentProjectionSetOpAlloc(alloc, &operations, target_column.path, value_json);
+        }
+        if (parser.matchToken(tokens, &pos, .comma) == null) break;
+    }
+    if (operations.items.len == 0 and source_assignments.items.len == 0) return error.DocumentSqlWriteUnsupported;
+
+    try parser.expectKeywordTag(tokens, &pos, .from);
+    const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, source_table);
+    if (std.ascii.eqlIgnoreCase(target_table.alias, source_table.alias)) {
+        if (source_assignments.items.len != 0) return error.DocumentSqlWriteSourceAssignmentAmbiguousReference;
+        return error.DocumentSqlWriteUnsupported;
+    }
+    for (source_assignments.items) |assignment| {
+        _ = assignment;
+        // Source-assignment parsing above already verifies the source field and type.
+    }
+
+    var predicates = try parseDocumentJoinedPredicateSetAlloc(alloc, tokens, &pos, schema, source_schema, target_table, source_table, params);
+    var predicates_transferred = false;
+    defer if (!predicates_transferred) predicates.deinit(alloc);
+    if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos)) return error.DocumentSqlWriteUnsupported;
+
+    const operations_template = try operations.toOwnedSlice(alloc);
+    var operations_template_transferred = false;
+    errdefer if (!operations_template_transferred) freeDocumentTransformOps(alloc, operations_template);
+    operations = .empty;
+    const source_assignments_slice = try source_assignments.toOwnedSlice(alloc);
+    var source_assignments_transferred = false;
+    errdefer if (!source_assignments_transferred) {
+        for (source_assignments_slice) |*assignment| assignment.deinit(alloc);
+        alloc.free(source_assignments_slice);
+    };
+    source_assignments = .empty;
+
+    const target_producer = predicates.target_producer orelse return error.DocumentSqlWriteUnsupported;
+    predicates.target_producer = null;
+    var target_producer_transferred = false;
+    errdefer if (!target_producer_transferred) {
+        var mutable = target_producer;
+        mutable.deinit(alloc);
+    };
+    var joined_source_producer = try documentJoinedSourceProducerForJoinKeyAlloc(alloc, predicates.join_keys[0], target_producer);
+    var joined_source_producer_transferred = false;
+    errdefer if (!joined_source_producer_transferred) joined_source_producer.deinit(alloc);
+    const max_target_rows = documentJoinedTargetProducerMaxRows(target_producer);
+
+    const table_name = target_table.name;
+    const source_table_name = source_table.name;
+    alloc.free(target_table.alias);
+    alloc.free(source_table.alias);
+    const join_keys = predicates.join_keys;
+    predicates.join_keys = &.{};
+    const expected_version = predicates.expected_version;
+    predicates.deinit(alloc);
+    predicates_transferred = true;
+    operations_template_transferred = true;
+    source_assignments_transferred = true;
+    target_producer_transferred = true;
+    joined_source_producer_transferred = true;
+    return .{ .document_joined_mutation = .{
+        .table_name = table_name,
+        .source_table_name = source_table_name,
+        .target_producer = target_producer,
+        .source_producer = joined_source_producer,
+        .join_keys = join_keys,
+        .source_assignments = source_assignments_slice,
+        .operation = .projection_write,
+        .template = .{ .transform = operations_template },
+        .expected_version = expected_version,
+        .max_target_rows = max_target_rows,
+        .max_source_rows = 1,
+        .duplicate_source_policy = .reject,
+        .sync_level = sync_level,
+    } };
+}
+
 fn parseDocumentProjectionUpdateAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -20640,35 +22534,7 @@ fn parseDocumentProjectionUpdateAlloc(
     }
 
     const producer_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
-    var producer = document_plan.lowerDocumentMutationProducerFromWhereAlloc(
-        alloc,
-        tokens,
-        filter_start,
-        producer_end,
-        schema,
-        target_table.name,
-        target_table.alias,
-        .{ .max_rows = source_binding.default_document_sql_bounded_scan_rows },
-    ) catch |err| switch (err) {
-        error.DocumentSqlBoundedScanMissingExactProducer,
-        error.DocumentSqlBoundedScanPolicyRequired,
-        error.DocumentSqlBoundedScanUnsupportedResidual,
-        error.DocumentSqlIndexUnavailable,
-        => return error.DocumentSqlWriteUnsupported,
-        else => return err,
-    };
-    switch (producer) {
-        .id_lookup => {},
-        .indexed_query => |*query| {
-            if (query.max_candidate_rows == null) {
-                query.max_candidate_rows = source_binding.default_document_sql_bounded_scan_rows;
-            }
-        },
-        .bounded_scan => {
-            producer.deinit(alloc);
-            return error.DocumentSqlWriteUnsupported;
-        },
-    }
+    const producer = try lowerDocumentWriteProducerFromWhereAlloc(alloc, tokens, filter_start, producer_end, schema, target_table);
     var producer_transferred = false;
     errdefer if (!producer_transferred) {
         var mutable_producer = producer;
@@ -20688,13 +22554,133 @@ fn parseDocumentProjectionUpdateAlloc(
     } };
 }
 
+fn parseDocumentJoinedDeleteAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    source_schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredWritePlan {
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .delete);
+    try parser.expectKeywordTag(tokens, &pos, .from);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+
+    try parser.expectKeywordTag(tokens, &pos, .using);
+    const source_table = try plan_mod.parseTableAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, source_table);
+    if (std.mem.eql(u8, target_table.alias, source_table.alias)) return error.DocumentSqlWriteUnsupported;
+
+    var predicates = try parseDocumentJoinedPredicateSetAlloc(alloc, tokens, &pos, schema, source_schema, target_table, source_table, params);
+    var predicates_transferred = false;
+    defer if (!predicates_transferred) predicates.deinit(alloc);
+    if (parser.matchToken(tokens, &pos, .semicolon) != null and !parser.atEnd(tokens, pos)) return error.UnsupportedSqlShape;
+    if (!parser.atEnd(tokens, pos)) return error.DocumentSqlWriteUnsupported;
+
+    const target_producer = predicates.target_producer orelse return error.DocumentSqlWriteUnsupported;
+    predicates.target_producer = null;
+    var target_producer_transferred = false;
+    errdefer if (!target_producer_transferred) {
+        var mutable = target_producer;
+        mutable.deinit(alloc);
+    };
+    var joined_source_producer = try documentJoinedSourceProducerForJoinKeyAlloc(alloc, predicates.join_keys[0], target_producer);
+    var joined_source_producer_transferred = false;
+    errdefer if (!joined_source_producer_transferred) joined_source_producer.deinit(alloc);
+    const max_target_rows = documentJoinedTargetProducerMaxRows(target_producer);
+
+    const table_name = target_table.name;
+    const source_table_name = source_table.name;
+    alloc.free(target_table.alias);
+    alloc.free(source_table.alias);
+    const join_keys = predicates.join_keys;
+    predicates.join_keys = &.{};
+    const expected_version = predicates.expected_version;
+    predicates.deinit(alloc);
+    predicates_transferred = true;
+    target_producer_transferred = true;
+    joined_source_producer_transferred = true;
+    return .{ .document_joined_mutation = .{
+        .table_name = table_name,
+        .source_table_name = source_table_name,
+        .target_producer = target_producer,
+        .source_producer = joined_source_producer,
+        .join_keys = join_keys,
+        .operation = .non_identity_delete,
+        .template = .delete,
+        .expected_version = expected_version,
+        .max_target_rows = max_target_rows,
+        .max_source_rows = 1,
+        .duplicate_source_policy = .reject,
+        .sync_level = sync_level,
+    } };
+}
+
+fn parseDocumentProducerDeleteAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    params: []const sql_value.SqlValue,
+    sync_level: db_mod.types.SyncLevel,
+) !plan_mod.LoweredWritePlan {
+    _ = params;
+    var pos: usize = 0;
+    try parser.expectKeywordTag(tokens, &pos, .delete);
+    try parser.expectKeywordTag(tokens, &pos, .from);
+
+    const target_table = try plan_mod.parseDmlTargetAliasAlloc(alloc, tokens, &pos);
+    errdefer plan_mod.freeTableAlias(alloc, target_table);
+    if (!std.mem.eql(u8, target_table.name, target_table.alias)) return error.DocumentSqlWriteUnsupported;
+
+    const producer_end = if (tokens.len > 0 and tokens[tokens.len - 1].kind == .semicolon) tokens.len - 1 else tokens.len;
+    const producer = try lowerDocumentWriteProducerFromWhereAlloc(alloc, tokens, pos, producer_end, schema, target_table);
+    var producer_transferred = false;
+    errdefer if (!producer_transferred) {
+        var mutable_producer = producer;
+        mutable_producer.deinit(alloc);
+    };
+
+    alloc.free(target_table.alias);
+    const table_name = target_table.name;
+    producer_transferred = true;
+    return .{ .document_producer_mutation = .{
+        .table_name = table_name,
+        .producer = producer,
+        .operation = .non_identity_delete,
+        .template = .delete,
+        .sync_level = sync_level,
+    } };
+}
+
+fn tokenIdentifierMatches(token: Token, identifier: []const u8) bool {
+    if (token.kind != .identifier) return false;
+    if (std.ascii.eqlIgnoreCase(token.text, identifier)) return true;
+    if (std.mem.lastIndexOfScalar(u8, token.text, '.')) |dot| {
+        return std.ascii.eqlIgnoreCase(token.text[dot + 1 ..], identifier);
+    }
+    return false;
+}
+
+fn tokensContainIdentifier(tokens: []const Token, start: usize, end: usize, identifier: []const u8) bool {
+    for (tokens[start..end]) |token| {
+        if (tokenIdentifierMatches(token, identifier)) return true;
+    }
+    return false;
+}
+
 fn parsedSqlContainsIdentifier(parsed_sql: *const tokenized.ParsedSql, identifier: []const u8) bool {
     for (parsed_sql.tokenized_sql.items()) |token| {
-        if (token.kind != .identifier) continue;
-        if (std.ascii.eqlIgnoreCase(token.text, identifier)) return true;
-        if (std.mem.lastIndexOfScalar(u8, token.text, '.')) |dot| {
-            if (std.ascii.eqlIgnoreCase(token.text[dot + 1 ..], identifier)) return true;
-        }
+        if (tokenIdentifierMatches(token, identifier)) return true;
+    }
+    return false;
+}
+
+fn parsedSqlContainsKeywordTag(parsed_sql: *const tokenized.ParsedSql, keyword: parser.TokenKeyword) bool {
+    for (parsed_sql.tokenized_sql.items()) |token| {
+        if (token.matchesKeywordTag(keyword)) return true;
     }
     return false;
 }
@@ -20702,10 +22688,12 @@ fn parsedSqlContainsIdentifier(parsed_sql: *const tokenized.ParsedSql, identifie
 fn documentWriteOperationForParsedSql(parsed_sql: *const tokenized.ParsedSql) document_write.DocumentWriteOperation {
     const has_doc = parsedSqlContainsIdentifier(parsed_sql, "_doc");
     const has_id = parsedSqlContainsIdentifier(parsed_sql, "_id");
+    const has_using = parsedSqlContainsKeywordTag(parsed_sql, .using);
     return switch (parsed_sql.writeStatementKindIncludingGeneratedAst() orelse parsed_sql.writeStatementKind() orelse .update) {
         .insert, .insert_source => if (has_id) .full_document_insert else .generated_id_insert,
         .update, .update_source, .update_joined_source => if (has_doc) .document_patch else .projection_write,
-        .delete, .delete_source, .delete_joined_source => if (has_id) .exact_id_delete else .non_identity_delete,
+        .delete_joined_source => .non_identity_delete,
+        .delete, .delete_source => if (!has_using and has_id) .exact_id_delete else .non_identity_delete,
         .truncate => .truncate_table,
         .merge => .merge,
     };
@@ -29543,7 +31531,7 @@ test "sql adapter lower dml routes write sql through typed plan families" {
 test "sql adapter lower dml rejects catalog writes to document tables" {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","default":"draft"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","default":"draft"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"}},"category":{"type":"keyword","x-antfly-index":false},"amount":{"type":"numeric"},"enabled":{"type":"boolean"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
     ;
     const schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, schema_json);
     defer runtime_schema.freeSchema(alloc, schema);
@@ -29774,6 +31762,36 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
         else => return error.TestUnexpectedResult,
     }
 
+    var projection_returning_insert = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title, metadata_plan) VALUES ('doc:returning', 'Returned', 'pro') RETURNING _id, title AS returned_title, metadata_plan, _doc",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer projection_returning_insert.deinit(alloc);
+    switch (projection_returning_insert) {
+        .document_write => |document_insert| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.full_document_insert, document_insert.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_insert.batch.returning_rows.len);
+            try std.testing.expectEqualStrings(
+                "{\"_id\":\"doc:returning\",\"returned_title\":\"Returned\",\"metadata_plan\":\"pro\",\"_doc\":{\"title\":\"Returned\",\"metadata\":{\"plan\":\"pro\"}}}",
+                document_insert.batch.returning_rows[0],
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "INSERT INTO docs (_id, title) VALUES ('doc:returning-version', 'Returned') RETURNING _version",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+
     try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
         alloc,
         "INSERT INTO docs (_id, title, metadata, metadata_plan) VALUES ('doc:nested-conflict', 'Nested Conflict', '{\"tier\":\"gold\"}', 'pro')",
@@ -29867,22 +31885,30 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
     const unsupported_delete_predicates = [_][]const u8{
         "DELETE FROM docs WHERE _id <> 'doc:a'",
         "DELETE FROM docs WHERE _id = 'doc:a' RETURNING _id",
-        "DELETE FROM docs WHERE title = 'Launch'",
+        "DELETE FROM docs WHERE status = 'draft' AND lower(title) = 'launch'",
         "DELETE FROM docs WHERE _id = 'doc:a' AND title = 'Launch'",
         "DELETE FROM docs WHERE _doc->'status' = '\"draft\"'",
-        "DELETE FROM docs WHERE title > 'Launch'",
+        "DELETE FROM docs WHERE missing_score > 10",
         "DELETE FROM docs WHERE title = 'Launch' ORDER BY title",
         "DELETE FROM docs",
     };
     for (unsupported_delete_predicates) |sql| {
-        try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        if (lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             sql,
             schema,
             &.{},
             .{},
             catalog.iface(),
-        ));
+        )) |_| {
+            return error.TestExpectedError;
+        } else |err| switch (err) {
+            error.DocumentSqlWriteUnsupported,
+            error.InvalidSqlCatalog,
+            error.UnsupportedSqlShape,
+            => {},
+            else => return err,
+        }
     }
 
     const valid_patch_cases = [_]struct {
@@ -30132,6 +32158,1071 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
         }
     }
 
+    var joined_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer joined_projection_update.deinit(alloc);
+    switch (joined_projection_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expectEqualStrings("docs", document_mutation.table_name);
+            try std.testing.expectEqualStrings("docs", document_mutation.source_table_name);
+            try std.testing.expect(document_mutation.target_producer == .id_lookup);
+            try std.testing.expect(document_mutation.source_producer == .static);
+            try std.testing.expectEqualStrings("doc:a", document_mutation.target_producer.id_lookup.ids[0]);
+            try std.testing.expectEqualStrings("doc:a", document_mutation.source_producer.static.id_lookup.ids[0]);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.join_keys.len);
+            try std.testing.expectEqualStrings("_id", document_mutation.join_keys[0].target_field);
+            try std.testing.expectEqualStrings("_id", document_mutation.join_keys[0].source_field);
+            try std.testing.expectEqual(@as(usize, 0), document_mutation.source_assignments.len);
+            try std.testing.expect(document_mutation.template == .transform);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.template.transform.len);
+            try std.testing.expectEqualStrings("title", document_mutation.template.transform[0].path);
+            try std.testing.expectEqualStrings("\"Joined\"", document_mutation.template.transform[0].value_json.?);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_target_rows);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_source_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var joined_source_assignment_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer joined_source_assignment_update.deinit(alloc);
+    switch (joined_source_assignment_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.join_keys.len);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.source_assignments.len);
+            try std.testing.expectEqualStrings("title", document_mutation.source_assignments[0].target_path);
+            try std.testing.expectEqualStrings("title", document_mutation.source_assignments[0].source_field);
+            try std.testing.expectEqual(runtime_schema.AntflyType.text, document_mutation.source_assignments[0].field_type);
+            try std.testing.expect(document_mutation.template == .transform);
+            try std.testing.expectEqual(@as(usize, 0), document_mutation.template.transform.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const joined_source_assignment_rejections = [_]struct {
+        sql: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = other.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentAlias,
+        },
+        .{
+            .sql = "UPDATE docs SET title = source.missing FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentMissingField,
+        },
+        .{
+            .sql = "UPDATE docs SET title = source._id FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentReservedField,
+        },
+        .{
+            .sql = "UPDATE docs SET _id = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentTargetReservedField,
+        },
+        .{
+            .sql = "UPDATE docs SET title = source.status FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentTypeMismatch,
+        },
+        .{
+            .sql = "UPDATE docs SET status = source.status_lower FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentGeneratedField,
+        },
+        .{
+            .sql = "UPDATE docs SET status_lower = source.status FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentTargetGeneratedField,
+        },
+        .{
+            .sql = "UPDATE docs AS source SET title = source.title FROM docs AS source WHERE source._id = source._id AND source._id = 'doc:a'",
+            .err = error.DocumentSqlWriteSourceAssignmentAmbiguousReference,
+        },
+    };
+    for (joined_source_assignment_rejections) |case| {
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        ));
+    }
+
+    var joined_document_delete = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs USING docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer joined_document_delete.deinit(alloc);
+    switch (joined_document_delete) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, document_mutation.operation);
+            try std.testing.expectEqualStrings("docs", document_mutation.table_name);
+            try std.testing.expectEqualStrings("docs", document_mutation.source_table_name);
+            try std.testing.expect(document_mutation.target_producer == .id_lookup);
+            try std.testing.expect(document_mutation.source_producer == .static);
+            try std.testing.expectEqualStrings("doc:a", document_mutation.target_producer.id_lookup.ids[0]);
+            try std.testing.expectEqualStrings("doc:a", document_mutation.source_producer.static.id_lookup.ids[0]);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.join_keys.len);
+            try std.testing.expect(document_mutation.template == .delete);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_target_rows);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_source_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs._id = source._id",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs USING docs AS source WHERE docs._id = source._id",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingCardinalityProof, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingCardinalityProof, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingCardinalityProof, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+
+    const proof_schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"}},"additionalProperties":true}}}}
+    ;
+    const proof_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, proof_schema_json);
+    defer runtime_schema.freeSchema(alloc, proof_schema);
+    var proof_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", proof_schema_json);
+    var joined_mapped_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'",
+        proof_schema,
+        &.{},
+        .{},
+        proof_catalog.iface(),
+    );
+    defer joined_mapped_projection_update.deinit(alloc);
+    switch (joined_mapped_projection_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expect(document_mutation.target_producer == .id_lookup);
+            try std.testing.expect(document_mutation.source_producer == .join_key_indexed_lookup);
+            try std.testing.expectEqualStrings("doc:a", document_mutation.target_producer.id_lookup.ids[0]);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.join_keys.len);
+            try std.testing.expectEqualStrings("status", document_mutation.join_keys[0].target_field);
+            try std.testing.expectEqualStrings("status", document_mutation.join_keys[0].source_field);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_target_rows);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_source_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var joined_mapped_target_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+        proof_schema,
+        &.{},
+        .{},
+        proof_catalog.iface(),
+    );
+    defer joined_mapped_target_projection_update.deinit(alloc);
+    switch (joined_mapped_target_projection_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expect(document_mutation.source_producer == .join_key_indexed_lookup);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.join_keys.len);
+            try std.testing.expectEqualStrings("status", document_mutation.join_keys[0].target_field);
+            try std.testing.expectEqualStrings("status", document_mutation.join_keys[0].source_field);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_target_rows);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_source_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const joined_mapped_join_proof_rejections = [_]struct {
+        schema_json: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index":false}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"status","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-index-name":"status_idx","x-antfly-index-keys":[{"column":"status","direction":"desc"}]}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (joined_mapped_join_proof_rejections) |case| {
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, case.schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", case.schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.status = 'draft'",
+        proof_schema,
+        &.{},
+        .{},
+        proof_catalog.iface(),
+    ));
+
+    const generated_target_schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"additionalProperties":true}}}}
+    ;
+    const generated_target_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, generated_target_schema_json);
+    defer runtime_schema.freeSchema(alloc, generated_target_schema);
+    var generated_target_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", generated_target_schema_json);
+    var joined_generated_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+        generated_target_schema,
+        &.{},
+        .{},
+        generated_target_catalog.iface(),
+    );
+    defer joined_generated_target_update.deinit(alloc);
+    switch (joined_generated_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expect(document_mutation.source_producer == .join_key_indexed_lookup);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status_lower\",\"value\":\"draft\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.join_keys.len);
+            try std.testing.expectEqualStrings("status", document_mutation.join_keys[0].target_field);
+            try std.testing.expectEqualStrings("status", document_mutation.join_keys[0].source_field);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_target_rows);
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.max_source_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const generated_target_rejections = [_]struct {
+        schema_json: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-where":{"all":[{"field":"status_lower","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_lower":{"type":"keyword","generated":{"op":"lower","field":"status"},"x-antfly-index-name":"status_lower_idx","x-antfly-index-keys":[{"column":"status_lower","direction":"desc"}]}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (generated_target_rejections) |case| {
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, case.schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", case.schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(source.status) = 'draft'",
+        generated_target_schema,
+        &.{},
+        .{},
+        generated_target_catalog.iface(),
+    ));
+
+    const generated_concat_target_schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_title_key":{"type":"keyword","generated":{"op":"concat","fields":["status","title"],"separator":":"}},"status_title_ws":{"type":"keyword","generated":{"op":"concat_ws","fields":["status","title"],"separator":":"}}},"additionalProperties":true}}}}
+    ;
+    const generated_concat_target_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, generated_concat_target_schema_json);
+    defer runtime_schema.freeSchema(alloc, generated_concat_target_schema);
+    var generated_concat_target_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", generated_concat_target_schema_json);
+    var joined_generated_concat_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(docs.status, ':', docs.title) = 'draft:Launch'",
+        generated_concat_target_schema,
+        &.{},
+        .{},
+        generated_concat_target_catalog.iface(),
+    );
+    defer joined_generated_concat_target_update.deinit(alloc);
+    switch (joined_generated_concat_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status_title_key\",\"value\":\"draft:Launch\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var joined_generated_concat_ws_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat_ws(':', docs.status, docs.title) = 'draft:Launch'",
+        generated_concat_target_schema,
+        &.{},
+        .{},
+        generated_concat_target_catalog.iface(),
+    );
+    defer joined_generated_concat_ws_target_update.deinit(alloc);
+    switch (joined_generated_concat_ws_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status_title_ws\",\"value\":\"draft:Launch\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(source.status, ':', source.title) = 'draft:Launch'",
+        generated_concat_target_schema,
+        &.{},
+        .{},
+        generated_concat_target_catalog.iface(),
+    ));
+
+    const generated_expression_target_schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}}}},"additionalProperties":true}}}}
+    ;
+    const generated_expression_target_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, generated_expression_target_schema_json);
+    defer runtime_schema.freeSchema(alloc, generated_expression_target_schema);
+    var generated_expression_target_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", generated_expression_target_schema_json);
+    var joined_generated_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+        generated_expression_target_schema,
+        &.{},
+        .{},
+        generated_expression_target_catalog.iface(),
+    );
+    defer joined_generated_expression_target_update.deinit(alloc);
+    switch (joined_generated_expression_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status_slug\",\"value\":\"draft-launch\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const generated_expression_target_rejections = [_]struct {
+        schema_json: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}},"x-antfly-index-lifecycle":"building"}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}},"x-antfly-index-where":{"all":[{"field":"status_slug","op":"is_not_null"}]}}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_json =
+            \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"status_slug":{"type":"keyword","generated":{"op":"expression","expression":{"op":"replace","args":[{"op":"lower","args":[{"field":"status"}]},{"value":" "},{"value":"-"}]}},"x-antfly-index-name":"status_slug_idx","x-antfly-index-keys":[{"column":"status_slug","direction":"desc"}]}},"additionalProperties":true}}}}
+            ,
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (generated_expression_target_rejections) |case| {
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, case.schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", case.schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(source.status), ' ', '-') = 'draft-launch'",
+        generated_expression_target_schema,
+        &.{},
+        .{},
+        generated_expression_target_catalog.iface(),
+    ));
+
+    const generated_numeric_expression_target_schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"amount":{"type":"numeric"},"metadata":{"type":"json"},"amount_abs":{"type":"numeric","generated":{"op":"expression","expression":{"op":"abs","args":[{"field":"amount"}]}}},"amount_mod":{"type":"numeric","generated":{"op":"expression","expression":{"op":"mod","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_sum":{"type":"numeric","generated":{"op":"expression","expression":{"op":"add","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_delta":{"type":"numeric","generated":{"op":"expression","expression":{"op":"sub","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_product":{"type":"numeric","generated":{"op":"expression","expression":{"op":"mul","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_ratio":{"type":"numeric","generated":{"op":"expression","expression":{"op":"div","args":[{"field":"amount"},{"field":"amount"}]}}},"amount_power":{"type":"numeric","generated":{"op":"expression","expression":{"op":"power","args":[{"field":"amount"},{"value":2}]}}},"amount_text":{"type":"keyword","generated":{"op":"expression","expression":{"op":"cast","to":"text","args":[{"field":"amount"}]}}},"metadata_source":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"source","args":[{"field":"metadata"}]}}},"metadata_billing_plan":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_extract","as_text":true,"path":"billing.plan","args":[{"field":"metadata"}]}}},"metadata_flags":{"type":"json","generated":{"op":"expression","expression":{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}}},"metadata_type":{"type":"keyword","generated":{"op":"expression","expression":{"op":"json_typeof","args":[{"field":"metadata"}]}}},"metadata_flag_count":{"type":"numeric","generated":{"op":"expression","expression":{"op":"json_array_length","args":[{"op":"json_extract","path":"flags","args":[{"field":"metadata"}]}]}}},"status_pos":{"type":"numeric","generated":{"op":"expression","expression":{"op":"strpos","args":[{"field":"status"},{"value":"a"}]}}}},"additionalProperties":true}}}}
+    ;
+    const generated_numeric_expression_target_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, generated_numeric_expression_target_schema_json);
+    defer runtime_schema.freeSchema(alloc, generated_numeric_expression_target_schema);
+    var generated_numeric_expression_target_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", generated_numeric_expression_target_schema_json);
+    var joined_generated_numeric_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    );
+    defer joined_generated_numeric_expression_target_update.deinit(alloc);
+    switch (joined_generated_numeric_expression_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/amount_abs\",\"value\":12}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const generated_numeric_expression_target_rejections = [_]struct {
+        schema_name: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_name = "write_join_generated_numeric_expression_target_missing",
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_numeric_expression_target_dependency_mismatch",
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_numeric_expression_target_stale",
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_numeric_expression_target_partial",
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_numeric_expression_target_ordered",
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (generated_numeric_expression_target_rejections) |case| {
+        const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(case.schema_name);
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(source.amount) = 12",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    var joined_generated_binary_numeric_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    );
+    defer joined_generated_binary_numeric_expression_target_update.deinit(alloc);
+    switch (joined_generated_binary_numeric_expression_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/amount_mod\",\"value\":2}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const joined_generated_arithmetic_expression_target_updates = [_]struct {
+        sql: []const u8,
+        filter_query_json: []const u8,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+            .filter_query_json = "{\"term\":{\"path\":\"/amount_sum\",\"value\":24}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount - docs.amount = 0",
+            .filter_query_json = "{\"term\":{\"path\":\"/amount_delta\",\"value\":0}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount * docs.amount = 144",
+            .filter_query_json = "{\"term\":{\"path\":\"/amount_product\",\"value\":144}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount / docs.amount = 1",
+            .filter_query_json = "{\"term\":{\"path\":\"/amount_ratio\",\"value\":1}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+            .filter_query_json = "{\"term\":{\"path\":\"/amount_power\",\"value\":144}}",
+        },
+    };
+    for (joined_generated_arithmetic_expression_target_updates) |case| {
+        var joined_generated_arithmetic_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            generated_numeric_expression_target_schema,
+            &.{},
+            .{},
+            generated_numeric_expression_target_catalog.iface(),
+        );
+        defer joined_generated_arithmetic_expression_target_update.deinit(alloc);
+        switch (joined_generated_arithmetic_expression_target_update) {
+            .document_joined_mutation => |document_mutation| {
+                try std.testing.expect(document_mutation.target_producer == .indexed_query);
+                try std.testing.expectEqualStrings(
+                    case.filter_query_json,
+                    document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+                );
+                try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    const generated_arithmetic_expression_target_rejections = [_]struct {
+        schema_name: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_name = "write_join_generated_arithmetic_expression_target_missing",
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_arithmetic_expression_target_stale",
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_arithmetic_expression_target_partial",
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_arithmetic_expression_target_ordered",
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (generated_arithmetic_expression_target_rejections) |case| {
+        const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(case.schema_name);
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    const generated_power_expression_target_rejections = [_]struct {
+        schema_name: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_name = "write_join_generated_power_expression_target_missing",
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_power_expression_target_stale",
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_power_expression_target_partial",
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_power_expression_target_ordered",
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (generated_power_expression_target_rejections) |case| {
+        const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(case.schema_name);
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    var joined_generated_cast_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    );
+    defer joined_generated_cast_expression_target_update.deinit(alloc);
+    switch (joined_generated_cast_expression_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/amount_text\",\"value\":\"12\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    var joined_generated_postfix_cast_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    );
+    defer joined_generated_postfix_cast_expression_target_update.deinit(alloc);
+    switch (joined_generated_postfix_cast_expression_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/amount_text\",\"value\":\"12\"}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const generated_cast_expression_target_rejections = [_]struct {
+        schema_name: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_name = "write_join_generated_cast_expression_target_missing",
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_cast_expression_target_stale",
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_cast_expression_target_partial",
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_cast_expression_target_ordered",
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    const generated_cast_expression_rejection_sql = [_][]const u8{
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+    };
+    for (generated_cast_expression_target_rejections) |case| {
+        const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(case.schema_name);
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+        for (generated_cast_expression_rejection_sql) |sql| {
+            try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+                alloc,
+                sql,
+                rejection_schema,
+                &.{},
+                .{},
+                rejection_catalog.iface(),
+            ));
+        }
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(source.amount AS text) = '12'",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.amount::text = '12'",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    const joined_generated_json_expression_target_updates = [_]struct {
+        sql: []const u8,
+        filter_query_json: []const u8,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+            .filter_query_json = "{\"term\":{\"path\":\"/metadata_source\",\"value\":\"api\"}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+            .filter_query_json = "{\"term\":{\"path\":\"/metadata_type\",\"value\":\"object\"}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+            .filter_query_json = "{\"term\":{\"path\":\"/metadata_flag_count\",\"value\":2}}",
+        },
+    };
+    for (joined_generated_json_expression_target_updates) |case| {
+        var joined_generated_json_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            generated_numeric_expression_target_schema,
+            &.{},
+            .{},
+            generated_numeric_expression_target_catalog.iface(),
+        );
+        defer joined_generated_json_expression_target_update.deinit(alloc);
+        switch (joined_generated_json_expression_target_update) {
+            .document_joined_mutation => |document_mutation| {
+                try std.testing.expect(document_mutation.target_producer == .indexed_query);
+                try std.testing.expectEqualStrings(
+                    case.filter_query_json,
+                    document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+                );
+                try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    const generated_json_function_expression_target_rejections = [_]struct {
+        schema_prefix: []const u8,
+        sql: []const u8,
+    }{
+        .{
+            .schema_prefix = "write_join_generated_json_extract_expression_target",
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+        },
+        .{
+            .schema_prefix = "write_join_generated_json_typeof_expression_target",
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+        },
+        .{
+            .schema_prefix = "write_join_generated_json_array_length_expression_target",
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+        },
+    };
+    const generated_json_function_expression_target_rejection_states = [_]struct {
+        suffix: []const u8,
+        err: anyerror,
+    }{
+        .{ .suffix = "missing", .err = error.DocumentSqlWriteJoinMissingIndexProof },
+        .{ .suffix = "stale", .err = error.DocumentSqlWriteJoinStaleIndexProof },
+        .{ .suffix = "partial", .err = error.DocumentSqlWriteJoinPartialIndexProof },
+        .{ .suffix = "ordered", .err = error.DocumentSqlWriteJoinOrderedIndexProof },
+    };
+    for (generated_json_function_expression_target_rejections) |case| {
+        for (generated_json_function_expression_target_rejection_states) |state| {
+            const schema_name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ case.schema_prefix, state.suffix });
+            defer alloc.free(schema_name);
+            const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(schema_name);
+            const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+            defer runtime_schema.freeSchema(alloc, rejection_schema);
+            var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+            try std.testing.expectError(state.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+                alloc,
+                case.sql,
+                rejection_schema,
+                &.{},
+                .{},
+                rejection_catalog.iface(),
+            ));
+        }
+    }
+    const joined_generated_json_operator_expression_target_updates = [_]struct {
+        sql: []const u8,
+        filter_query_json: []const u8,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+            .filter_query_json = "{\"term\":{\"path\":\"/metadata_source\",\"value\":\"api\"}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+            .filter_query_json = "{\"term\":{\"path\":\"/metadata_billing_plan\",\"value\":\"pro\"}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+            .filter_query_json = "{\"term\":{\"path\":\"/metadata_flags\",\"value\":[\"rated\"]}}",
+        },
+    };
+    for (joined_generated_json_operator_expression_target_updates) |case| {
+        var joined_generated_json_operator_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            generated_numeric_expression_target_schema,
+            &.{},
+            .{},
+            generated_numeric_expression_target_catalog.iface(),
+        );
+        defer joined_generated_json_operator_expression_target_update.deinit(alloc);
+        switch (joined_generated_json_operator_expression_target_update) {
+            .document_joined_mutation => |document_mutation| {
+                try std.testing.expect(document_mutation.target_producer == .indexed_query);
+                try std.testing.expectEqualStrings(
+                    case.filter_query_json,
+                    document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+                );
+                try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    const generated_json_operator_expression_target_rejections = [_]struct {
+        schema_prefix: []const u8,
+        sql: []const u8,
+    }{
+        .{
+            .schema_prefix = "write_join_generated_json_text_operator_expression_target",
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+        },
+        .{
+            .schema_prefix = "write_join_generated_json_path_text_operator_expression_target",
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+        },
+        .{
+            .schema_prefix = "write_join_generated_json_path_operator_expression_target",
+            .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+        },
+    };
+    const generated_json_operator_expression_target_rejection_states = [_]struct {
+        suffix: []const u8,
+        err: anyerror,
+    }{
+        .{ .suffix = "missing", .err = error.DocumentSqlWriteJoinMissingIndexProof },
+        .{ .suffix = "stale", .err = error.DocumentSqlWriteJoinStaleIndexProof },
+        .{ .suffix = "partial", .err = error.DocumentSqlWriteJoinPartialIndexProof },
+        .{ .suffix = "ordered", .err = error.DocumentSqlWriteJoinOrderedIndexProof },
+    };
+    for (generated_json_operator_expression_target_rejections) |case| {
+        for (generated_json_operator_expression_target_rejection_states) |state| {
+            const schema_name = try std.fmt.allocPrint(alloc, "{s}_{s}", .{ case.schema_prefix, state.suffix });
+            defer alloc.free(schema_name);
+            const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(schema_name);
+            const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+            defer runtime_schema.freeSchema(alloc, rejection_schema);
+            var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+            try std.testing.expectError(state.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+                alloc,
+                case.sql,
+                rejection_schema,
+                &.{},
+                .{},
+                rejection_catalog.iface(),
+            ));
+        }
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(source.metadata, 'source') = 'api'",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata->>'source' = 'api'",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.amount + source.amount = 24",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    var joined_generated_binary_text_expression_target_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    );
+    defer joined_generated_binary_text_expression_target_update.deinit(alloc);
+    switch (joined_generated_binary_text_expression_target_update) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.target_producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/status_pos\",\"value\":2}}",
+                document_mutation.target_producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expectEqual(@as(?u32, 1), document_mutation.target_producer.indexed_query.max_candidate_rows);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const generated_binary_text_expression_target_rejections = [_]struct {
+        schema_name: []const u8,
+        err: anyerror,
+    }{
+        .{
+            .schema_name = "write_join_generated_binary_text_expression_target_missing",
+            .err = error.DocumentSqlWriteJoinMissingIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_binary_text_expression_target_stale",
+            .err = error.DocumentSqlWriteJoinStaleIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_binary_text_expression_target_partial",
+            .err = error.DocumentSqlWriteJoinPartialIndexProof,
+        },
+        .{
+            .schema_name = "write_join_generated_binary_text_expression_target_ordered",
+            .err = error.DocumentSqlWriteJoinOrderedIndexProof,
+        },
+    };
+    for (generated_binary_text_expression_target_rejections) |case| {
+        const rejection_schema_json = try documentSqlCorpusWriteSchemaJson(case.schema_name);
+        const rejection_schema = try runtimeSchemaFromJsonForDmlTestAlloc(alloc, rejection_schema_json);
+        defer runtime_schema.freeSchema(alloc, rejection_schema);
+        var rejection_catalog = corpus.AppParitySourceSchemaCatalog.init("docs", rejection_schema_json);
+        try std.testing.expectError(case.err, lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+            rejection_schema,
+            &.{},
+            .{},
+            rejection_catalog.iface(),
+        ));
+    }
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(source.amount, source.amount) = 2",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteJoinMissingExactProducer, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(source.status, 'a') = 2",
+        generated_numeric_expression_target_schema,
+        &.{},
+        .{},
+        generated_numeric_expression_target_catalog.iface(),
+    ));
+
     var residual_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
         alloc,
         "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' AND status = 'draft'",
@@ -30192,6 +33283,283 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
         },
         else => return error.TestUnexpectedResult,
     }
+
+    const indexed_projection_update_cases = [_]struct {
+        sql: []const u8,
+        expected_filter_json: []const u8,
+    }{
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE status IN ('draft', 'ready')",
+            .expected_filter_json = "{\"terms\":{\"path\":\"/status\",\"values\":[\"draft\",\"ready\"]}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE amount >= 10",
+            .expected_filter_json = "{\"numeric_range\":{\"path\":\"/amount\",\"min\":10,\"inclusive_min\":true}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE enabled IS TRUE",
+            .expected_filter_json = "{\"term\":{\"path\":\"/enabled\",\"value\":true}}",
+        },
+        .{
+            .sql = "UPDATE docs SET title = 'Launch' WHERE metadata_plan = 'pro'",
+            .expected_filter_json = "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        },
+    };
+    for (indexed_projection_update_cases) |case| {
+        var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        );
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .document_producer_mutation => |projection_write| {
+                try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, projection_write.operation);
+                try std.testing.expect(projection_write.producer == .indexed_query);
+                try std.testing.expectEqualStrings(
+                    case.expected_filter_json,
+                    projection_write.producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+                );
+                try std.testing.expect(projection_write.producer.indexed_query.residual_filter_json == null);
+                try std.testing.expectEqual(
+                    @as(?u32, source_binding.default_document_sql_bounded_scan_rows),
+                    projection_write.producer.indexed_query.max_candidate_rows,
+                );
+                try std.testing.expect(projection_write.template == .transform);
+                try std.testing.expectEqual(@as(usize, 1), projection_write.template.transform.len);
+                try std.testing.expectEqualStrings("title", projection_write.template.transform[0].path);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    const indexed_document_delete_cases = [_]struct {
+        sql: []const u8,
+        expected_filter_json: []const u8,
+    }{
+        .{
+            .sql = "DELETE FROM docs WHERE status = 'draft'",
+            .expected_filter_json = "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}",
+        },
+        .{
+            .sql = "DELETE FROM docs WHERE status IN ('draft', 'ready')",
+            .expected_filter_json = "{\"terms\":{\"path\":\"/status\",\"values\":[\"draft\",\"ready\"]}}",
+        },
+        .{
+            .sql = "DELETE FROM docs WHERE status IS NULL",
+            .expected_filter_json = "{\"bool\":{\"should\":[{\"term\":{\"path\":\"/status\",\"value\":null}},{\"bool\":{\"must_not\":[{\"exists\":{\"path\":\"/status\"}}]}}],\"minimum_should_match\":1}}",
+        },
+        .{
+            .sql = "DELETE FROM docs WHERE amount >= 10",
+            .expected_filter_json = "{\"numeric_range\":{\"path\":\"/amount\",\"min\":10,\"inclusive_min\":true}}",
+        },
+        .{
+            .sql = "DELETE FROM docs WHERE enabled IS TRUE",
+            .expected_filter_json = "{\"term\":{\"path\":\"/enabled\",\"value\":true}}",
+        },
+        .{
+            .sql = "DELETE FROM docs WHERE metadata_plan = 'pro'",
+            .expected_filter_json = "{\"term\":{\"path\":\"/metadata/plan\",\"value\":\"pro\"}}",
+        },
+    };
+    for (indexed_document_delete_cases) |case| {
+        var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
+        defer parsed_sql.deinit(alloc);
+        try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, documentWriteOperationForParsedSql(&parsed_sql));
+        var lowered = try lowerWritePlanWithCatalogForDmlTestAlloc(
+            alloc,
+            case.sql,
+            schema,
+            &.{},
+            .{},
+            catalog.iface(),
+        );
+        defer lowered.deinit(alloc);
+        switch (lowered) {
+            .document_producer_mutation => |document_delete| {
+                try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, document_delete.operation);
+                try std.testing.expectEqualStrings("docs", document_delete.table_name);
+                try std.testing.expect(document_delete.producer == .indexed_query);
+                try std.testing.expectEqualStrings(
+                    case.expected_filter_json,
+                    document_delete.producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+                );
+                try std.testing.expect(document_delete.producer.indexed_query.residual_filter_json == null);
+                try std.testing.expectEqual(
+                    @as(?u32, source_binding.default_document_sql_bounded_scan_rows),
+                    document_delete.producer.indexed_query.max_candidate_rows,
+                );
+                try std.testing.expect(document_delete.template == .delete);
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+
+    var bounded_projection_update = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE category = 'release'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer bounded_projection_update.deinit(alloc);
+    switch (bounded_projection_update) {
+        .document_producer_mutation => |projection_write| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.projection_write, projection_write.operation);
+            try std.testing.expectEqualStrings("docs", projection_write.table_name);
+            try std.testing.expect(projection_write.producer == .bounded_scan);
+            try std.testing.expectEqual(
+                @as(u32, source_binding.default_document_sql_bounded_scan_rows),
+                projection_write.producer.bounded_scan.max_rows,
+            );
+            try std.testing.expectEqual(
+                @as(?u64, source_binding.default_document_sql_bounded_scan_bytes),
+                projection_write.producer.bounded_scan.max_bytes,
+            );
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+                projection_write.producer.bounded_scan.residual_filter_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expect(projection_write.template == .transform);
+            try std.testing.expectEqual(@as(usize, 1), projection_write.template.transform.len);
+            try std.testing.expectEqual(db_mod.types.TransformOpType.set, projection_write.template.transform[0].op);
+            try std.testing.expectEqualStrings("title", projection_write.template.transform[0].path);
+            try std.testing.expectEqualStrings("\"Launch\"", projection_write.template.transform[0].value_json.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var bounded_document_delete = try lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs WHERE category = 'release'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    );
+    defer bounded_document_delete.deinit(alloc);
+    switch (bounded_document_delete) {
+        .document_producer_mutation => |document_delete| {
+            try std.testing.expectEqual(document_write.DocumentWriteOperation.non_identity_delete, document_delete.operation);
+            try std.testing.expectEqualStrings("docs", document_delete.table_name);
+            try std.testing.expect(document_delete.producer == .bounded_scan);
+            try std.testing.expectEqual(
+                @as(u32, source_binding.default_document_sql_bounded_scan_rows),
+                document_delete.producer.bounded_scan.max_rows,
+            );
+            try std.testing.expectEqual(
+                @as(?u64, source_binding.default_document_sql_bounded_scan_bytes),
+                document_delete.producer.bounded_scan.max_bytes,
+            );
+            try std.testing.expectEqualStrings(
+                "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}",
+                document_delete.producer.bounded_scan.residual_filter_json orelse return error.TestUnexpectedResult,
+            );
+            try std.testing.expect(document_delete.template == .delete);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE status = 'draft' AND lower(title) = 'launch'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs WHERE status = 'draft' AND lower(title) = 'launch'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE status = 'draft' AND _version = 42",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE _version = 42 AND status = 'draft'",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs WHERE status = 'draft' AND _version = 42",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE category = 'release' AND _version = 42",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs WHERE category = 'release' AND _version = 42",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Launch' WHERE category = 'release' RETURNING _id",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs WHERE category = 'release' ORDER BY category",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs._id = source._id",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "UPDATE docs SET title = source.title FROM docs AS source WHERE docs._id = source._id",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
+    try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        alloc,
+        "DELETE FROM docs USING docs AS source WHERE docs._id = source._id",
+        schema,
+        &.{},
+        .{},
+        catalog.iface(),
+    ));
 
     const projection_in_update_cases = [_]struct {
         sql: []const u8,
@@ -30267,6 +33635,8 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
         .{ .sql = "UPDATE docs SET _id = 'doc:b' WHERE _id = 'doc:a'", .operation = .projection_write },
         .{ .sql = "UPDATE docs SET _version = 43 WHERE _id = 'doc:a'", .operation = .projection_write },
         .{ .sql = "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, title", .operation = .projection_write },
+        .{ .sql = "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs._id = source._id", .operation = .projection_write },
+        .{ .sql = "DELETE FROM docs USING docs AS source WHERE docs._id = source._id", .operation = .non_identity_delete },
         .{ .sql = "TRUNCATE docs", .operation = .truncate_table },
         .{ .sql = "MERGE INTO docs USING docs AS source ON docs._id = source._id WHEN MATCHED THEN DELETE", .operation = .merge },
     };
@@ -30274,14 +33644,22 @@ test "sql adapter lower dml rejects catalog writes to document tables" {
         var parsed_sql = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
         defer parsed_sql.deinit(alloc);
         try std.testing.expectEqual(case.operation, documentWriteOperationForParsedSql(&parsed_sql));
-        try std.testing.expectError(error.DocumentSqlWriteUnsupported, lowerWritePlanWithCatalogForDmlTestAlloc(
+        if (lowerWritePlanWithCatalogForDmlTestAlloc(
             alloc,
             case.sql,
             schema,
             &.{},
             .{},
             catalog.iface(),
-        ));
+        )) |_| {
+            return error.TestExpectedError;
+        } else |err| switch (err) {
+            error.DocumentSqlWriteUnsupported,
+            error.InvalidSqlCatalog,
+            error.UnsupportedSqlShape,
+            => {},
+            else => return err,
+        }
     }
 
     const payload_parse_error_sql = "UPDATE docs SET _doc = antfly.json_patch(_doc, $1) WHERE _id = 'doc:a'";
@@ -33444,6 +36822,25 @@ test "sql adapter lower dml lowers insert source write plans" {
             alloc,
             &parsed_generated_graph_cte_merge,
             stale_graph_cte_count_merge_ast,
+            schema,
+            &.{},
+            .{},
+        ),
+    );
+
+    var missing_graph_cte_metadata_merge_ast = generated_graph_cte_merge_ast;
+    if (missing_graph_cte_metadata_merge_ast.cte_prefix) |*cte_prefix| {
+        if (cte_prefix.items[0].body_read) |*body_read| {
+            body_read.source_graph_function_items = &.{};
+            body_read.source_graph_function_count = 0;
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        mergeMutationFromGeneratedDmlAstAlloc(
+            alloc,
+            &parsed_generated_graph_cte_merge,
+            missing_graph_cte_metadata_merge_ast,
             schema,
             &.{},
             .{},

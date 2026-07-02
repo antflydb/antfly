@@ -13,6 +13,7 @@
 // limitations.
 
 const http_server = @import("api/http_server.zig");
+const public_sql_endpoint_parity = @import("api/public_sql_endpoint_parity.zig");
 const api_distributed_txn = @import("api/distributed_txn.zig");
 const pgwire = @import("pgwire/mod.zig");
 const sql_adapter_integration = @import("api/sql_adapter_integration.zig");
@@ -36,6 +37,7 @@ const table_writes_schema_jobs = @import("api/table_writes/schema_jobs.zig");
 
 test {
     _ = http_server;
+    _ = public_sql_endpoint_parity;
     _ = api_distributed_txn;
     _ = pgwire;
     _ = sql_adapter_integration;

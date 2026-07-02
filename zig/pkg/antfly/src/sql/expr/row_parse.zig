@@ -135,6 +135,7 @@ pub const SqlFunctionBindings = struct {
 
 pub const SelectParserContext = struct {
     schema: runtime_schema.TableSchema,
+    joined_source_schema: ?runtime_schema.TableSchema = null,
     field_expression_qualifiers: []const []const u8 = &.{},
     returning_expression_qualifiers: []const []const u8 = &.{},
     defer_row_expression_field_validation: bool = false,

@@ -269,6 +269,1564 @@
       "expected_error": "DocumentSqlBoundedScanUnsupportedResidual"
     }
   ],
+  "document_write_plan_cases": [
+    {
+      "name": "projection update by exact document id lowers to transform batch",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'",
+      "expected": {
+        "plan": "document_write",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "writes": 0,
+        "transforms": 1,
+        "deletes": 0
+      }
+    },
+    {
+      "name": "indexed projection update lowers to indexed producer mutation",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft'",
+      "expected": {
+        "plan": "document_producer_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "producer": "indexed_query",
+        "template": "transform",
+        "ops": 1,
+        "max_candidate_rows": 10000,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "bounded delete lowers to bounded residual producer mutation",
+      "schema": "write_rich",
+      "sql": "DELETE FROM docs WHERE category = 'release'",
+      "expected": {
+        "plan": "document_producer_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "producer": "bounded_scan",
+        "template": "delete",
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "joined source assignment update lowers to bounded joined mutation",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "id_lookup",
+        "source_producer": "id_lookup",
+        "template": "transform",
+        "ops": 0,
+        "join_keys": 1,
+        "source_assignments": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1
+      }
+    },
+    {
+      "name": "non-identity joined projection update with bounded target lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.category = 'release'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "max_target_rows": 10000,
+        "max_source_rows": 1,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined delete with bounded target lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.category = 'release'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "target_producer": "bounded_scan",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "delete",
+        "ops": 0,
+        "join_keys": 1,
+        "max_scan_rows": 10000,
+        "max_scan_bytes": 8388608,
+        "max_target_rows": 10000,
+        "max_source_rows": 1,
+        "residual_filter_json": "{\"term\":{\"path\":\"/category\",\"value\":\"release\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects match-all bounded target policy",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined delete rejects match-all bounded target policy",
+      "schema": "write_join_cardinality_proof",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document truncate rejects multi-table variant",
+      "schema": "write_rich",
+      "sql": "TRUNCATE docs, docs_archive",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document truncate rejects restart identity variant",
+      "schema": "write_rich",
+      "sql": "TRUNCATE docs RESTART IDENTITY",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "document truncate rejects cascade variant",
+      "schema": "write_rich",
+      "sql": "TRUNCATE docs CASCADE",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update stays unsupported without cardinality proof",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingCardinalityProof"
+      }
+    },
+    {
+      "name": "non-identity joined source assignment update stays unsupported without cardinality proof",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingCardinalityProof"
+      }
+    },
+    {
+      "name": "non-identity joined delete stays unsupported without cardinality proof",
+      "schema": "write_rich",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingCardinalityProof"
+      }
+    },
+    {
+      "name": "non-identity joined update rejects missing join-field index proof",
+      "schema": "write_join_unindexed",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined update rejects stale join-field index proof",
+      "schema": "write_join_stale_index",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined update rejects partial join-field index proof",
+      "schema": "write_join_partial_index",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined update rejects ordered join-field index proof",
+      "schema": "write_join_ordered_index",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with cardinality proof and indexed target lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source-side constant still requires exact target producer",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.status = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_lower\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with concat derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_concat_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(docs.status, ':', docs.title) = 'draft:Launch'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_title_key\",\"value\":\"draft:Launch\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with concat_ws derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_concat_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat_ws(':', docs.status, docs.title) = 'draft:Launch'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_title_ws\",\"value\":\"draft:Launch\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source concat still requires exact target producer",
+      "schema": "write_join_generated_concat_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(source.status, ':', source.title) = 'draft:Launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_slug\",\"value\":\"draft-launch\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing expression derived target index",
+      "schema": "write_join_generated_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after expression target producer",
+      "schema": "write_join_generated_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source expression still requires exact target producer",
+      "schema": "write_join_generated_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(source.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with numeric expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_abs\",\"value\":12}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source numeric expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(source.amount) = 12",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after numeric expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12 AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects numeric expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_numeric_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with binary numeric expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_mod\",\"value\":2}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source binary numeric expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(source.amount, source.amount) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing binary numeric expression derived target index",
+      "schema": "write_join_generated_arithmetic_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after binary numeric expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2 AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects binary numeric expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_mod_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with additive expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_sum\",\"value\":24}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with subtractive expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount - docs.amount = 0",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_delta\",\"value\":0}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with multiplicative expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount * docs.amount = 144",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_product\",\"value\":144}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with divisive expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount / docs.amount = 1",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_ratio\",\"value\":1}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with power expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_power\",\"value\":144}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source arithmetic expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.amount + source.amount = 24",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source power expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(source.amount, 2) = 144",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after arithmetic expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24 AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after power expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144 AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing arithmetic expression derived target index",
+      "schema": "write_join_generated_arithmetic_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects arithmetic expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_arithmetic_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale arithmetic expression derived target index",
+      "schema": "write_join_generated_arithmetic_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial arithmetic expression derived target index",
+      "schema": "write_join_generated_arithmetic_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered arithmetic expression derived target index",
+      "schema": "write_join_generated_arithmetic_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing power expression derived target index",
+      "schema": "write_join_generated_power_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects power expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_power_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale power expression derived target index",
+      "schema": "write_join_generated_power_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial power expression derived target index",
+      "schema": "write_join_generated_power_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered power expression derived target index",
+      "schema": "write_join_generated_power_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with cast expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_text\",\"value\":\"12\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with postfix cast expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/amount_text\",\"value\":\"12\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source cast expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(source.amount AS text) = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source postfix cast expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.amount::text = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after cast expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after postfix cast expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects cast expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_cast_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing postfix cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects postfix cast expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_cast_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale postfix cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial postfix cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered postfix cast expression derived target index",
+      "schema": "write_join_generated_cast_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with json extract expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata_source\",\"value\":\"api\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with json typeof expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata_type\",\"value\":\"object\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with nested json array length expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata_flag_count\",\"value\":2}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing json extract expression derived target index",
+      "schema": "write_join_generated_json_extract_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects json extract expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_json_extract_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale json extract expression derived target index",
+      "schema": "write_join_generated_json_extract_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial json extract expression derived target index",
+      "schema": "write_join_generated_json_extract_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered json extract expression derived target index",
+      "schema": "write_join_generated_json_extract_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing json typeof expression derived target index",
+      "schema": "write_join_generated_json_typeof_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects json typeof expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_json_typeof_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale json typeof expression derived target index",
+      "schema": "write_join_generated_json_typeof_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial json typeof expression derived target index",
+      "schema": "write_join_generated_json_typeof_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered json typeof expression derived target index",
+      "schema": "write_join_generated_json_typeof_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing json array length expression derived target index",
+      "schema": "write_join_generated_json_array_length_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects json array length expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_json_array_length_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale json array length expression derived target index",
+      "schema": "write_join_generated_json_array_length_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial json array length expression derived target index",
+      "schema": "write_join_generated_json_array_length_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered json array length expression derived target index",
+      "schema": "write_join_generated_json_array_length_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source json expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(source.metadata, 'source') = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source json typeof expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(source.metadata) = 'object'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source nested json array length expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(source.metadata, 'flags')) = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after json extract expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after json typeof expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after json array length expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2 AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with json text access expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata_source\",\"value\":\"api\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with json path text access expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata_billing_plan\",\"value\":\"pro\"}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with json path access expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/metadata_flags\",\"value\":[\"rated\"]}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing json text operator expression derived target index",
+      "schema": "write_join_generated_json_text_operator_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects json text operator expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_json_text_operator_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale json text operator expression derived target index",
+      "schema": "write_join_generated_json_text_operator_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial json text operator expression derived target index",
+      "schema": "write_join_generated_json_text_operator_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered json text operator expression derived target index",
+      "schema": "write_join_generated_json_text_operator_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing json path text operator expression derived target index",
+      "schema": "write_join_generated_json_path_text_operator_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects json path text operator expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_json_path_text_operator_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale json path text operator expression derived target index",
+      "schema": "write_join_generated_json_path_text_operator_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial json path text operator expression derived target index",
+      "schema": "write_join_generated_json_path_text_operator_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered json path text operator expression derived target index",
+      "schema": "write_join_generated_json_path_text_operator_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing json path operator expression derived target index",
+      "schema": "write_join_generated_json_path_operator_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects json path operator expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_json_path_operator_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale json path operator expression derived target index",
+      "schema": "write_join_generated_json_path_operator_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial json path operator expression derived target index",
+      "schema": "write_join_generated_json_path_operator_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered json path operator expression derived target index",
+      "schema": "write_join_generated_json_path_operator_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source json text access expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata->>'source' = 'api'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source json path text access expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata#>>'{billing,plan}' = 'pro'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source json path access expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata#>'{flags}' = '[\"rated\"]'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after json text access expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after json path text access expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after json path access expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]' AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with binary text expression derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_pos\",\"value\":2}}",
+        "no_residual_filter": true
+      }
+    },
+    {
+      "name": "non-identity joined projection update with source binary text expression still requires exact target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(source.status, 'a') = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingExactProducer"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects broad residual after binary text expression target producer",
+      "schema": "write_join_generated_numeric_expression_target",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2 AND docs.status = 'ready'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing binary text expression derived target index",
+      "schema": "write_join_generated_binary_text_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects binary text expression target whose generated dependencies do not match",
+      "schema": "write_join_generated_binary_text_expression_target_dependency_mismatch",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale binary text expression derived target index",
+      "schema": "write_join_generated_binary_text_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial binary text expression derived target index",
+      "schema": "write_join_generated_binary_text_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered binary text expression derived target index",
+      "schema": "write_join_generated_binary_text_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing numeric expression derived target index",
+      "schema": "write_join_generated_numeric_expression_target_missing",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale numeric expression derived target index",
+      "schema": "write_join_generated_numeric_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial numeric expression derived target index",
+      "schema": "write_join_generated_numeric_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered numeric expression derived target index",
+      "schema": "write_join_generated_numeric_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale expression derived target index",
+      "schema": "write_join_generated_expression_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial expression derived target index",
+      "schema": "write_join_generated_expression_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered expression derived target index",
+      "schema": "write_join_generated_expression_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects missing derived target index",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinMissingIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects stale derived target index",
+      "schema": "write_join_generated_target_stale",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinStaleIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects partial derived target index",
+      "schema": "write_join_generated_target_partial",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinPartialIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update rejects ordered derived target index",
+      "schema": "write_join_generated_target_ordered",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "expected_error": "DocumentSqlWriteJoinOrderedIndexProof"
+      }
+    },
+    {
+      "name": "non-identity joined projection update with cardinality proof and target id lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "id_lookup",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 1,
+        "join_keys": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1
+      }
+    },
+    {
+      "name": "non-identity joined source assignment update with cardinality proof and indexed target lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 0,
+        "join_keys": 1,
+        "source_assignments": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined source assignment update with derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_target",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 0,
+        "join_keys": 1,
+        "source_assignments": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_lower\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined source assignment update with cardinality proof and target id lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "projection_write",
+        "table_name": "docs",
+        "target_producer": "id_lookup",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "transform",
+        "ops": 0,
+        "join_keys": 1,
+        "source_assignments": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1
+      }
+    },
+    {
+      "name": "non-identity joined delete with cardinality proof and indexed target lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.status = 'draft'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "delete",
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined delete with derived indexed target lowers to parameterized source lookup",
+      "schema": "write_join_generated_target",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "target_producer": "indexed_query",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "delete",
+        "join_keys": 1,
+        "max_candidate_rows": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1,
+        "filter_query_json": "{\"term\":{\"path\":\"/status_lower\",\"value\":\"draft\"}}"
+      }
+    },
+    {
+      "name": "non-identity joined delete with cardinality proof and target id lowers to parameterized source lookup",
+      "schema": "write_join_cardinality_proof",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'",
+      "expected": {
+        "plan": "document_joined_mutation",
+        "operation": "non_identity_delete",
+        "table_name": "docs",
+        "target_producer": "id_lookup",
+        "source_producer": "join_key_indexed_lookup",
+        "template": "delete",
+        "join_keys": 1,
+        "max_target_rows": 1,
+        "max_source_rows": 1
+      }
+    },
+    {
+      "name": "indexed projection update with version predicate stays unsupported",
+      "schema": "write_rich",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft' AND _version = 42",
+      "expected": {
+        "expected_error": "DocumentSqlWriteUnsupported"
+      }
+    }
+  ],
   "document_read_plan_cases": [
     {
       "name": "explicit unnest equality over indexed array lowers to indexed array element producer",

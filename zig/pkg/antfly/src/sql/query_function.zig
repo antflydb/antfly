@@ -171,8 +171,8 @@ pub fn parseAntflyQueryFunctionExpressionAlloc(
             const name = name_token.text;
             _ = try expectSqlToken(tokens, pos, .eq);
             _ = matchSqlToken(tokens, pos, .gt);
-            const value = try parseAntflyQueryFunctionArgValueAlloc(alloc, tokens, pos, name_token);
             if (antflyQueryFunctionArg(args.items, name) != null) return error.UnsupportedSqlShape;
+            const value = try parseAntflyQueryFunctionArgValueAlloc(alloc, tokens, pos, name_token);
             try args.append(alloc, .{ .name = name, .value = value });
             if (matchSqlToken(tokens, pos, .comma) == null) break;
         }
@@ -764,7 +764,7 @@ pub fn lowerAntflyQueryFunctionExpressionRawBodyTokensAlloc(
     };
 }
 
-pub fn lowerAntflyGraphTableFunctionTokensAlloc(
+fn lowerAntflyGraphTableFunctionTokensAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
 ) !db_mod.types.RelationalRowsTableFunction {
@@ -800,6 +800,9 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {
             if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
             if (lowered.req.graph_queries.len != 1 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const alias_projections = try graphAliasProjectionsFromArgsAlloc(alloc, args.items);
+            errdefer freeGraphAliasProjections(alloc, alias_projections);
+            if (alias_projections.len > 0 and function != .graph_match) return error.UnsupportedSqlShape;
             const graph_queries = lowered.req.graph_queries;
             const graph_query = graph_queries[0];
             lowered.req.graph_queries = &.{};
@@ -807,6 +810,7 @@ pub fn lowerAntflyGraphTableFunctionTokensAlloc(
             return .{ .graph_query = .{
                 .table_name = owned_table_name,
                 .query = graph_query,
+                .alias_projections = alias_projections,
             } };
         },
         .graph_metric => {
@@ -851,13 +855,19 @@ pub fn lowerAntflyGraphTableFunctionGeneratedAstAlloc(
     if (graph_item.kind != expected_graph_kind) return error.UnsupportedSqlShape;
 
     var args = std.ArrayListUnmanaged(SqlQueryFunctionArg).empty;
-    defer args.deinit(alloc);
+    defer {
+        deinitAntflyQueryFunctionArgs(alloc, args.items);
+        args.deinit(alloc);
+    }
     try args.ensureTotalCapacity(alloc, antfly_item.argument_items.len);
     for (antfly_item.argument_items) |argument| {
         if (argument.name_tokens.end != argument.name_tokens.start + 1 or argument.name_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+        const name_token = tokens[argument.name_tokens.start];
+        if (name_token.kind != .identifier) return error.UnsupportedSqlShape;
+        if (antflyQueryFunctionArg(args.items, name_token.text) != null) return error.UnsupportedSqlShape;
         args.appendAssumeCapacity(.{
-            .name = tokens[argument.name_tokens.start].text,
-            .value = try generatedAntflyQueryFunctionArgValueAlloc(alloc, tokens, tokens[argument.name_tokens.start], argument.value_tokens),
+            .name = name_token.text,
+            .value = try generatedAntflyQueryFunctionArgValueAlloc(alloc, tokens, name_token, argument.value_tokens),
         });
     }
 
@@ -887,6 +897,9 @@ pub fn lowerAntflyGraphTableFunctionGeneratedAstAlloc(
         .graph_traverse, .graph_neighbors, .graph_shortest_path, .graph_k_shortest_paths, .graph_match => {
             if (lowered.req.full_text != null or lowered.req.graph_metric_rerank != null) return error.UnsupportedSqlShape;
             if (lowered.req.graph_queries.len != 1 or lowered.req.graph_metric_queries.len != 0) return error.UnsupportedSqlShape;
+            const alias_projections = try graphAliasProjectionsFromArgsAlloc(alloc, args.items);
+            errdefer freeGraphAliasProjections(alloc, alias_projections);
+            if (alias_projections.len > 0 and function != .graph_match) return error.UnsupportedSqlShape;
             const graph_queries = lowered.req.graph_queries;
             const graph_query = graph_queries[0];
             lowered.req.graph_queries = &.{};
@@ -894,6 +907,7 @@ pub fn lowerAntflyGraphTableFunctionGeneratedAstAlloc(
             return .{ .graph_query = .{
                 .table_name = owned_table_name,
                 .query = graph_query,
+                .alias_projections = alias_projections,
             } };
         },
         .graph_metric => {
@@ -920,6 +934,87 @@ pub fn lowerAntflyGraphTableFunctionGeneratedAstAlloc(
         },
         else => return error.UnsupportedSqlShape,
     }
+}
+
+fn graphAliasProjectionsFromArgsAlloc(
+    alloc: std.mem.Allocator,
+    args: []const SqlQueryFunctionArg,
+) ![]const db_mod.types.RelationalRowsGraphAliasProjection {
+    const raw = antflyQueryFunctionStringArg(args, "alias_fields") orelse return &.{};
+    if (raw.len == 0) return error.UnsupportedSqlShape;
+
+    var projections = std.ArrayListUnmanaged(db_mod.types.RelationalRowsGraphAliasProjection).empty;
+    errdefer {
+        for (projections.items) |projection| projection.deinit(alloc);
+        projections.deinit(alloc);
+    }
+
+    var it = std.mem.splitScalar(u8, raw, ',');
+    while (it.next()) |part_raw| {
+        const part = std.mem.trim(u8, part_raw, " \t\r\n");
+        if (part.len == 0) return error.UnsupportedSqlShape;
+        const dot = std.mem.indexOfScalar(u8, part, '.') orelse return error.UnsupportedSqlShape;
+        if (std.mem.indexOfScalar(u8, part[dot + 1 ..], '.') != null) return error.UnsupportedSqlShape;
+        const alias = part[0..dot];
+        const field = part[dot + 1 ..];
+        if (!graphAliasIdentifierIsValid(alias) or !graphAliasFieldIsValid(field)) return error.UnsupportedSqlShape;
+        const output = try graphAliasProjectionOutputAlloc(alloc, alias, field);
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        for (projections.items) |projection| {
+            if (std.mem.eql(u8, projection.output, output)) return error.UnsupportedSqlShape;
+        }
+        const alias_owned = try alloc.dupe(u8, alias);
+        var alias_transferred = false;
+        errdefer if (!alias_transferred) alloc.free(alias_owned);
+        const field_owned = try alloc.dupe(u8, field);
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field_owned);
+        try projections.append(alloc, .{
+            .alias = alias_owned,
+            .field = field_owned,
+            .output = output,
+        });
+        alias_transferred = true;
+        field_transferred = true;
+        output_transferred = true;
+    }
+
+    return try projections.toOwnedSlice(alloc);
+}
+
+fn freeGraphAliasProjections(
+    alloc: std.mem.Allocator,
+    projections: []const db_mod.types.RelationalRowsGraphAliasProjection,
+) void {
+    for (projections) |projection| projection.deinit(alloc);
+    if (projections.len > 0) alloc.free(projections);
+}
+
+fn graphAliasIdentifierIsValid(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value, 0..) |ch, index| {
+        if (index == 0) {
+            if (!(std.ascii.isAlphabetic(ch) or ch == '_')) return false;
+        } else if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn graphAliasFieldIsValid(value: []const u8) bool {
+    return std.mem.eql(u8, value, "key") or
+        std.mem.eql(u8, value, "depth") or
+        std.mem.eql(u8, value, "distance");
+}
+
+fn graphAliasProjectionOutputAlloc(
+    alloc: std.mem.Allocator,
+    alias: []const u8,
+    field: []const u8,
+) ![]const u8 {
+    return try std.fmt.allocPrint(alloc, "{s}_{s}", .{ alias, field });
 }
 
 fn generatedAntflyQueryFunctionArgValueAlloc(
@@ -2460,6 +2555,80 @@ test "sql adapter query function read accepts projected hit columns" {
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expect(!parsedSqlHasGeneratedAntflyReadSource(&missing_ast));
+}
+
+test "sql adapter query function read rejects corrupted generated graph table function payloads" {
+    const alloc = std.testing.allocator;
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT _id FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2);",
+    );
+    defer parsed_sql.deinit(alloc);
+
+    var lowered = try lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &parsed_sql);
+    defer lowered.deinit(alloc);
+    try std.testing.expectEqualStrings("docs", lowered.table_name);
+    try std.testing.expectEqual(@as(usize, 1), lowered.request.req.graph_metric_queries.len);
+    try std.testing.expectEqualStrings("docs_edge_graph", lowered.request.req.graph_metric_queries[0].query.index_name);
+    try std.testing.expectEqualStrings("pagerank", lowered.request.req.graph_metric_queries[0].query.metric_name);
+
+    const generated_statement = parsed_sql.generated_statement orelse return error.TestUnexpectedResult;
+    switch (generated_statement.ast.?) {
+        .read => |read_ast| {
+            if (read_ast.source_graph_function_items.len != 1) return error.TestUnexpectedResult;
+            read_ast.source_graph_function_items[0].metric_value_tokens = null;
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    try std.testing.expect(parsedSqlHasGeneratedAntflyReadSource(&parsed_sql));
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerAntflyQueryFunctionReadParsedSqlAlloc(alloc, null, &parsed_sql));
+}
+
+test "sql adapter generated graph table function lowerer validates retained argument metadata" {
+    const alloc = std.testing.allocator;
+
+    var parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT * FROM antfly.graph_metric(table_name => 'docs', index => 'docs_edge_graph', metric => 'pagerank', top_k => 2, sources => ARRAY[antfly.source('docs_body_fts', field => 'body')]);",
+    );
+    defer parsed_sql.deinit(alloc);
+
+    const generated_statement = parsed_sql.generated_statement orelse return error.TestUnexpectedResult;
+    const read_ast = switch (generated_statement.ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    };
+    if (read_ast.source_antfly_function_items.len != 1 or read_ast.source_graph_function_items.len != 1) return error.TestUnexpectedResult;
+
+    var table_function = try lowerAntflyGraphTableFunctionGeneratedAstAlloc(
+        alloc,
+        parsed_sql.items(),
+        read_ast.source_antfly_function_items[0],
+        read_ast.source_graph_function_items[0],
+    );
+    defer table_function.deinit(alloc);
+    switch (table_function) {
+        .graph_metric_query => |metric_table_function| {
+            try std.testing.expectEqualStrings("docs", metric_table_function.table_name);
+            try std.testing.expectEqualStrings("docs_edge_graph", metric_table_function.query.query.index_name);
+            try std.testing.expectEqualStrings("pagerank", metric_table_function.query.query.metric_name);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_function = &read_ast.source_antfly_function_items[0];
+    if (graph_function.argument_items.len < 2) return error.TestUnexpectedResult;
+    graph_function.argument_items[1].name_tokens = graph_function.argument_items[0].name_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        lowerAntflyGraphTableFunctionGeneratedAstAlloc(
+            alloc,
+            parsed_sql.items(),
+            graph_function.*,
+            read_ast.source_graph_function_items[0],
+        ),
+    );
 }
 
 test "sql adapter query function read keeps projected columns for derived search functions" {

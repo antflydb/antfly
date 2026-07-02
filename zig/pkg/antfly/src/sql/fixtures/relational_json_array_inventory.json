@@ -38,11 +38,11 @@
       "id": "unsupported-json-array-operator-fixtures",
       "relational_slices_section": "JSONB, arrays, and embedded document fields",
       "surface": "unsupported_operator_fixtures",
-      "status": "partial_release_gated",
-      "current_evidence": "Promoted JSONB containment, extraction, array transform, and string_to_array paths lower into typed expressions and reject malformed typed request shapes deterministically.",
-      "missing_evidence": "Every remaining unsupported JSON/array SQL operator still needs a deterministic unsupported fixture or a typed expression/transform implementation with shared SQL and REST/SDK execution evidence.",
-      "evidence_file": "zig/pkg/antfly/src/sql/lower_expr.zig",
-      "evidence_symbol": "sql adapter lower expr lowers jsonb containment existence and extraction projections",
+      "status": "release_evidence",
+      "current_evidence": "SQL/API required coverage pins promoted JSON/array expression lowering, REST/SDK typed-plan exposure, deterministic document JSON patch/path unsupported fixtures, and joined document-update JSON/array index-proof unsupported fixtures. The corpus fails closed for unsupported document JSON write shapes instead of leaving string-only compatibility paths untracked.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_required_coverage.json",
+      "evidence_symbol": "unsupported_write_document_sql_json_path_delete",
       "release_gate": "relational-release-gate"
     }
   ]

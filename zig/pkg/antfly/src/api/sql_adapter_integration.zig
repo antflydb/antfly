@@ -1111,6 +1111,20 @@ fn lowerAppParityWritePlanParsedSqlAlloc(
             },
         });
         defer logical_plan.deinit(alloc);
+        if (effective_schema.storage_mode == .document) {
+            if (entry.family == .truncate_source) {
+                var owned_row_claim = row_claim;
+                owned_row_claim.owner_id = if (row_claim.owner_id.len > 0) try alloc.dupe(u8, row_claim.owner_id) else "";
+                errdefer if (owned_row_claim.owner_id.len > 0) alloc.free(owned_row_claim.owner_id);
+                return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
+                    .unique_resolver = unique_resolver,
+                    .row_claim = owned_row_claim,
+                });
+            }
+            return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
+                .unique_resolver = unique_resolver,
+            });
+        }
         return try sql_adapter.lower_dml.lowerWritePlanWithLogicalPlanAndFunctionBindingsAlloc(alloc, parsed_sql, &logical_plan, effective_schema, entry.params, .{});
     }
     return try lowerWritePlanParsedSqlAlloc(alloc, parsed_sql, effective_schema, entry.params, .{
@@ -1148,6 +1162,11 @@ fn expectAppParityWritePlanEntry(
                 try expectAppParityPlan(entry.plan, fingerprint);
             },
             .document_producer_mutation => {
+                const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+                defer alloc.free(fingerprint);
+                try expectAppParityPlan(entry.plan, fingerprint);
+            },
+            .document_joined_mutation => {
                 const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
                 defer alloc.free(fingerprint);
                 try expectAppParityPlan(entry.plan, fingerprint);
@@ -1394,6 +1413,18 @@ fn expectAppParityCorpusEntry(
                     owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_source_schema);
                     effective_schema = owned_setup_schema.?;
                 }
+            }
+        }
+    }
+    if (owned_setup_schema == null and entry.family != .ddl and entry.catalog_tables.len > 0) {
+        if (entry.summary.table_name) |table_name| {
+            for (entry.catalog_tables) |table| {
+                if (!std.mem.eql(u8, table.name, table_name)) continue;
+                var parsed_catalog_schema = try schema_api.parseValidatedTableSchema(alloc, table.schema_json);
+                defer parsed_catalog_schema.deinit(alloc);
+                owned_setup_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_catalog_schema);
+                effective_schema = owned_setup_schema.?;
+                break;
             }
         }
     }
@@ -2750,7 +2781,7 @@ test "postgres sql adapter validates app parity fixture metadata with applied sc
         .sql = "SELECT id FROM usage_records",
         .family = .join,
         .summary = .{ .table_name = "usage_records" },
-        .plan = "join:left=usage_records:right=archived_records:on=1",
+        .plan = "join:left=archived_records:right=archived_records:on=1",
         .source_schema_json =
         \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
         ,
@@ -3407,7 +3438,7 @@ test "postgres sql adapter temporal portion mutation sources execute through rel
 fn expectDocumentFullDocumentInsertRuntime() !void {
     const alloc = std.testing.allocator;
     const schema_json =
-        \\{"version":1,"storage_mode":"document","default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"archived_at":{"type":"numeric","nullable":true},"metadata":{"type":"object","properties":{"status":{"type":"keyword"},"archived_at":{"type":"numeric","nullable":true},"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"obsolete":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}},"title_lc":{"type":"keyword","generated":{"op":"lower","field":"title"}}},"required":["title"],"additionalProperties":false}}}}
+        \\{"version":1,"storage_mode":"document","default_type":"doc","enforce_types":true,"document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"category":{"type":"keyword","x-antfly-index":false},"amount":{"type":"numeric"},"archived_at":{"type":"numeric","nullable":true},"metadata":{"type":"object","properties":{"status":{"type":"keyword"},"archived_at":{"type":"numeric","nullable":true},"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan"},"tier":{"type":"keyword"}},"additionalProperties":false},"obsolete":{"type":"text"},"tags":{"type":"array","items":{"type":"keyword"}}},"required":["title"],"additionalProperties":false}}}}
     ;
     var parsed = try schema_api.parseValidatedTableSchema(alloc, schema_json);
     defer parsed.deinit(alloc);
@@ -4140,14 +4171,33 @@ fn expectDocumentFullDocumentInsertRuntime() !void {
             opts: sql_adapter.document_runtime.ScanOptions,
             consistency: raft_mod.ReadConsistency,
         ) !?sql_adapter.document_runtime.ScanResponse {
-            _ = ptr;
-            _ = scan_alloc;
+            const self: *@This() = @ptrCast(@alignCast(ptr));
             _ = table_name;
             _ = from_key;
             _ = to_key;
-            _ = opts;
             _ = consistency;
-            return null;
+            const keys = [_][]const u8{
+                "doc:bounded-projection-a",
+                "doc:bounded-projection-b",
+                "doc:bounded-projection-skip",
+                "doc:bounded-delete-a",
+                "doc:bounded-delete-b",
+                "doc:bounded-delete-keep",
+            };
+            var rows = std.ArrayListUnmanaged(u8).empty;
+            errdefer rows.deinit(scan_alloc);
+            var emitted: u32 = 0;
+            for (keys) |key| {
+                if (opts.limit != 0 and emitted >= opts.limit) break;
+                if (try self.db.get(scan_alloc, key)) |json| {
+                    scan_alloc.free(json);
+                    const line = try std.fmt.allocPrint(scan_alloc, "{{\"key\":\"{s}\"}}\n", .{key});
+                    defer scan_alloc.free(line);
+                    try rows.appendSlice(scan_alloc, line);
+                    emitted += 1;
+                }
+            }
+            return .{ .ndjson = try rows.toOwnedSlice(scan_alloc) };
         }
 
         fn query(
@@ -4159,20 +4209,175 @@ fn expectDocumentFullDocumentInsertRuntime() !void {
         ) !?sql_adapter.document_runtime.QueryResponse {
             _ = ptr;
             _ = consistency;
-            if (!std.mem.eql(u8, table_name, "docs") or
-                std.mem.indexOf(u8, req.body_json, "status") == null or
-                std.mem.indexOf(u8, req.body_json, "draft") == null)
-            {
+            if (!std.mem.eql(u8, table_name, "docs")) {
                 return null;
             }
-            const response_json =
-                \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:indexed-projection-a"},{"_id":"doc:indexed-projection-b"}]}}]}
-            ;
+            const response_json = blk: {
+                if (std.mem.indexOf(u8, req.body_json, "amount") != null and
+                    std.mem.indexOf(u8, req.body_json, "99") != null)
+                {
+                    break :blk
+                    \\{"responses":[{"hits":{"total":0,"hits":[]}}]}
+                    ;
+                }
+                if (std.mem.indexOf(u8, req.body_json, "amount") != null and
+                    std.mem.indexOf(u8, req.body_json, "10") != null)
+                {
+                    break :blk
+                    \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:indexed-range-a"},{"_id":"doc:indexed-range-b"}]}}]}
+                    ;
+                }
+                if (std.mem.indexOf(u8, req.body_json, "status") != null and
+                    std.mem.indexOf(u8, req.body_json, "delete-me") != null)
+                {
+                    break :blk
+                    \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:indexed-delete-a"},{"_id":"doc:indexed-delete-b"}]}}]}
+                    ;
+                }
+                if (std.mem.indexOf(u8, req.body_json, "status") != null and
+                    std.mem.indexOf(u8, req.body_json, "draft") != null)
+                {
+                    break :blk
+                    \\{"responses":[{"hits":{"total":2,"hits":[{"_id":"doc:indexed-projection-a"},{"_id":"doc:indexed-projection-b"}]}}]}
+                    ;
+                }
+                return null;
+            };
             const owned = try query_alloc.dupe(u8, response_json);
             errdefer query_alloc.free(owned);
             return .{ .json = owned };
         }
     };
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:joined-source", .value = "{\"title\":\"Joined Source\",\"status\":\"draft\"}" },
+    } });
+    var joined_source_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET status = 'copied', title = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:joined-source'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer joined_source_plan.deinit(alloc);
+    switch (joined_source_plan) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expectEqual(@as(usize, 1), document_mutation.source_assignments.len);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeJoinedMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 1), executed.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:joined-source", executed.req.transforms[0].key);
+            try std.testing.expectEqual(@as(usize, 0), executed.req.predicates.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const joined_source = (try db.get(alloc, "doc:joined-source")) orelse return error.TestExpectedEqual;
+    defer alloc.free(joined_source);
+    var parsed_joined_source = try std.json.parseFromSlice(std.json.Value, alloc, joined_source, .{});
+    defer parsed_joined_source.deinit();
+    try std.testing.expectEqualStrings("Joined Source", parsed_joined_source.value.object.get("title").?.string);
+    try std.testing.expectEqualStrings("copied", parsed_joined_source.value.object.get("status").?.string);
+
+    var joined_missing_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Missing Joined' FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:joined-missing'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer joined_missing_plan.deinit(alloc);
+    switch (joined_missing_plan) {
+        .document_joined_mutation => |document_mutation| {
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeJoinedMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 0), executed.req.transforms.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:joined-stale", .value = "{\"title\":\"Joined Stale\",\"status\":\"draft\"}" },
+    } });
+    var joined_stale_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Stale Joined' FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:joined-stale' AND docs._version = 999999",
+        schema,
+        &.{},
+        .{},
+    );
+    defer joined_stale_plan.deinit(alloc);
+    switch (joined_stale_plan) {
+        .document_joined_mutation => |document_mutation| {
+            var source = DocumentDbSource{ .db = &db };
+            try std.testing.expectError(
+                transactions_mod.TxnError.VersionConflict,
+                sql_adapter.document_runtime.executeJoinedMutationPlanAlloc(
+                    alloc,
+                    source.source(),
+                    sql_adapter.document_runtime.dbBatchSink(&db),
+                    document_mutation,
+                    .stale,
+                ),
+            );
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const joined_stale = (try db.get(alloc, "doc:joined-stale")) orelse return error.TestExpectedEqual;
+    defer alloc.free(joined_stale);
+    var parsed_joined_stale = try std.json.parseFromSlice(std.json.Value, alloc, joined_stale, .{});
+    defer parsed_joined_stale.deinit();
+    try std.testing.expectEqualStrings("Joined Stale", parsed_joined_stale.value.object.get("title").?.string);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:joined-delete", .value = "{\"title\":\"Joined Delete\",\"status\":\"delete\"}" },
+    } });
+    var joined_delete_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM docs USING docs AS source WHERE docs._id = source._id AND docs._id = 'doc:joined-delete'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer joined_delete_plan.deinit(alloc);
+    switch (joined_delete_plan) {
+        .document_joined_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.non_identity_delete, document_mutation.operation);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeJoinedMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 1), executed.deleted);
+            try std.testing.expectEqual(@as(usize, 1), executed.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:joined-delete", executed.req.deletes[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    if (try db.get(alloc, "doc:joined-delete")) |json| {
+        alloc.free(json);
+        return error.TestExpectedEqual;
+    }
 
     try db.batch(.{ .writes = &.{
         .{ .key = "doc:projection-residual-match", .value = "{\"title\":\"Residual Match\",\"status\":\"draft\"}" },
@@ -4267,6 +4472,309 @@ fn expectDocumentFullDocumentInsertRuntime() !void {
     var parsed_indexed_projection_ready = try std.json.parseFromSlice(std.json.Value, alloc, indexed_projection_ready, .{});
     defer parsed_indexed_projection_ready.deinit();
     try std.testing.expectEqualStrings("Indexed Ready", parsed_indexed_projection_ready.value.object.get("title").?.string);
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:indexed-range-a", .value = "{\"title\":\"Range A\",\"amount\":12}" },
+        .{ .key = "doc:indexed-range-b", .value = "{\"title\":\"Range B\",\"amount\":15}" },
+        .{ .key = "doc:indexed-range-low", .value = "{\"title\":\"Range Low\",\"amount\":5}" },
+    } });
+    var indexed_range_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Range Patched' WHERE amount >= 10",
+        schema,
+        &.{},
+        .{},
+    );
+    defer indexed_range_plan.deinit(alloc);
+    switch (indexed_range_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expect(document_mutation.producer == .indexed_query);
+            try std.testing.expectEqualStrings(
+                "{\"numeric_range\":{\"path\":\"/amount\",\"min\":10,\"inclusive_min\":true}}",
+                document_mutation.producer.indexed_query.filter_query_json orelse return error.TestUnexpectedResult,
+            );
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 2), executed.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:indexed-range-a", executed.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:indexed-range-b", executed.req.transforms[1].key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const indexed_range_a = (try db.get(alloc, "doc:indexed-range-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(indexed_range_a);
+    var parsed_indexed_range_a = try std.json.parseFromSlice(std.json.Value, alloc, indexed_range_a, .{});
+    defer parsed_indexed_range_a.deinit();
+    try std.testing.expectEqualStrings("Range Patched", parsed_indexed_range_a.value.object.get("title").?.string);
+    const indexed_range_low = (try db.get(alloc, "doc:indexed-range-low")) orelse return error.TestExpectedEqual;
+    defer alloc.free(indexed_range_low);
+    var parsed_indexed_range_low = try std.json.parseFromSlice(std.json.Value, alloc, indexed_range_low, .{});
+    defer parsed_indexed_range_low.deinit();
+    try std.testing.expectEqualStrings("Range Low", parsed_indexed_range_low.value.object.get("title").?.string);
+
+    var indexed_no_match_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'No Match' WHERE amount >= 99",
+        schema,
+        &.{},
+        .{},
+    );
+    defer indexed_no_match_plan.deinit(alloc);
+    switch (indexed_no_match_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.producer == .indexed_query);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 0), executed.req.transforms.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:indexed-delete-a", .value = "{\"title\":\"Delete A\",\"status\":\"delete-me\"}" },
+        .{ .key = "doc:indexed-delete-b", .value = "{\"title\":\"Delete B\",\"status\":\"delete-me\"}" },
+        .{ .key = "doc:indexed-delete-keep", .value = "{\"title\":\"Delete Keep\",\"status\":\"keep\"}" },
+    } });
+    var indexed_delete_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM docs WHERE status = 'delete-me'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer indexed_delete_plan.deinit(alloc);
+    switch (indexed_delete_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.non_identity_delete, document_mutation.operation);
+            try std.testing.expect(document_mutation.producer == .indexed_query);
+            try std.testing.expect(document_mutation.template == .delete);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), executed.deleted);
+            try std.testing.expectEqual(@as(usize, 2), executed.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:indexed-delete-a", executed.req.deletes[0]);
+            try std.testing.expectEqualStrings("doc:indexed-delete-b", executed.req.deletes[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    if (try db.get(alloc, "doc:indexed-delete-a")) |json| {
+        alloc.free(json);
+        return error.TestExpectedEqual;
+    }
+    if (try db.get(alloc, "doc:indexed-delete-b")) |json| {
+        alloc.free(json);
+        return error.TestExpectedEqual;
+    }
+    const indexed_delete_keep = (try db.get(alloc, "doc:indexed-delete-keep")) orelse return error.TestExpectedEqual;
+    defer alloc.free(indexed_delete_keep);
+    var parsed_indexed_delete_keep = try std.json.parseFromSlice(std.json.Value, alloc, indexed_delete_keep, .{});
+    defer parsed_indexed_delete_keep.deinit();
+    try std.testing.expectEqualStrings("Delete Keep", parsed_indexed_delete_keep.value.object.get("title").?.string);
+
+    var indexed_delete_no_match_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM docs WHERE amount >= 99",
+        schema,
+        &.{},
+        .{},
+    );
+    defer indexed_delete_no_match_plan.deinit(alloc);
+    switch (indexed_delete_no_match_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.non_identity_delete, document_mutation.operation);
+            try std.testing.expect(document_mutation.producer == .indexed_query);
+            try std.testing.expect(document_mutation.template == .delete);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), executed.deleted);
+            try std.testing.expectEqual(@as(usize, 0), executed.req.deletes.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:bounded-projection-a", .value = "{\"title\":\"Bounded A\",\"category\":\"release\"}" },
+        .{ .key = "doc:bounded-projection-b", .value = "{\"title\":\"Bounded B\",\"category\":\"release\"}" },
+        .{ .key = "doc:bounded-projection-skip", .value = "{\"title\":\"Bounded Skip\",\"category\":\"other\"}" },
+    } });
+    var bounded_projection_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Bounded Patched' WHERE category = 'release'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer bounded_projection_plan.deinit(alloc);
+    switch (bounded_projection_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.projection_write, document_mutation.operation);
+            try std.testing.expect(document_mutation.producer == .bounded_scan);
+            try std.testing.expectEqual(
+                @as(u32, sql_adapter.default_document_sql_bounded_scan_rows),
+                document_mutation.producer.bounded_scan.max_rows,
+            );
+            try std.testing.expectEqual(
+                @as(?u64, sql_adapter.default_document_sql_bounded_scan_bytes),
+                document_mutation.producer.bounded_scan.max_bytes,
+            );
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 2), executed.req.transforms.len);
+            try std.testing.expectEqualStrings("doc:bounded-projection-a", executed.req.transforms[0].key);
+            try std.testing.expectEqualStrings("doc:bounded-projection-b", executed.req.transforms[1].key);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    const bounded_projection_a = (try db.get(alloc, "doc:bounded-projection-a")) orelse return error.TestExpectedEqual;
+    defer alloc.free(bounded_projection_a);
+    var parsed_bounded_projection_a = try std.json.parseFromSlice(std.json.Value, alloc, bounded_projection_a, .{});
+    defer parsed_bounded_projection_a.deinit();
+    try std.testing.expectEqualStrings("Bounded Patched", parsed_bounded_projection_a.value.object.get("title").?.string);
+    const bounded_projection_skip = (try db.get(alloc, "doc:bounded-projection-skip")) orelse return error.TestExpectedEqual;
+    defer alloc.free(bounded_projection_skip);
+    var parsed_bounded_projection_skip = try std.json.parseFromSlice(std.json.Value, alloc, bounded_projection_skip, .{});
+    defer parsed_bounded_projection_skip.deinit();
+    try std.testing.expectEqualStrings("Bounded Skip", parsed_bounded_projection_skip.value.object.get("title").?.string);
+
+    var bounded_projection_no_match_plan = try lowerWritePlanAlloc(
+        alloc,
+        "UPDATE docs SET title = 'Bounded No Match' WHERE category = 'missing'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer bounded_projection_no_match_plan.deinit(alloc);
+    switch (bounded_projection_no_match_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.producer == .bounded_scan);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), executed.transformed);
+            try std.testing.expectEqual(@as(usize, 0), executed.req.transforms.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    try db.batch(.{ .writes = &.{
+        .{ .key = "doc:bounded-delete-a", .value = "{\"title\":\"Bounded Delete A\",\"category\":\"delete-me\"}" },
+        .{ .key = "doc:bounded-delete-b", .value = "{\"title\":\"Bounded Delete B\",\"category\":\"delete-me\"}" },
+        .{ .key = "doc:bounded-delete-keep", .value = "{\"title\":\"Bounded Delete Keep\",\"category\":\"keep\"}" },
+    } });
+    var bounded_delete_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM docs WHERE category = 'delete-me'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer bounded_delete_plan.deinit(alloc);
+    switch (bounded_delete_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expectEqual(sql_adapter.document_write.DocumentWriteOperation.non_identity_delete, document_mutation.operation);
+            try std.testing.expect(document_mutation.producer == .bounded_scan);
+            try std.testing.expect(document_mutation.template == .delete);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 2), executed.deleted);
+            try std.testing.expectEqual(@as(usize, 2), executed.req.deletes.len);
+            try std.testing.expectEqualStrings("doc:bounded-delete-a", executed.req.deletes[0]);
+            try std.testing.expectEqualStrings("doc:bounded-delete-b", executed.req.deletes[1]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+    if (try db.get(alloc, "doc:bounded-delete-a")) |json| {
+        alloc.free(json);
+        return error.TestExpectedEqual;
+    }
+    if (try db.get(alloc, "doc:bounded-delete-b")) |json| {
+        alloc.free(json);
+        return error.TestExpectedEqual;
+    }
+    const bounded_delete_keep = (try db.get(alloc, "doc:bounded-delete-keep")) orelse return error.TestExpectedEqual;
+    defer alloc.free(bounded_delete_keep);
+    var parsed_bounded_delete_keep = try std.json.parseFromSlice(std.json.Value, alloc, bounded_delete_keep, .{});
+    defer parsed_bounded_delete_keep.deinit();
+    try std.testing.expectEqualStrings("Bounded Delete Keep", parsed_bounded_delete_keep.value.object.get("title").?.string);
+
+    var bounded_delete_no_match_plan = try lowerWritePlanAlloc(
+        alloc,
+        "DELETE FROM docs WHERE category = 'absent'",
+        schema,
+        &.{},
+        .{},
+    );
+    defer bounded_delete_no_match_plan.deinit(alloc);
+    switch (bounded_delete_no_match_plan) {
+        .document_producer_mutation => |document_mutation| {
+            try std.testing.expect(document_mutation.producer == .bounded_scan);
+            try std.testing.expect(document_mutation.template == .delete);
+            var source = DocumentDbSource{ .db = &db };
+            var executed = try sql_adapter.document_runtime.executeProducerMutationPlanAlloc(
+                alloc,
+                source.source(),
+                sql_adapter.document_runtime.dbBatchSink(&db),
+                document_mutation,
+                .stale,
+            );
+            defer executed.deinit(alloc);
+            try std.testing.expectEqual(@as(u32, 0), executed.deleted);
+            try std.testing.expectEqual(@as(usize, 0), executed.req.deletes.len);
+        },
+        else => return error.TestUnexpectedResult,
+    }
 
     const projection_version = try db.getTimestamp(alloc, "doc:projection");
     const projection_versioned_sql = try std.fmt.allocPrint(

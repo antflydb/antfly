@@ -1342,10 +1342,13 @@ pub const InsertSourceTableNames = struct {
 pub const ReadSourceTableNames = struct {
     left: []const u8,
     source: []const u8,
+    extra_sources: []const []const u8 = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.left));
         alloc.free(@constCast(self.source));
+        for (self.extra_sources) |source| alloc.free(@constCast(source));
+        if (self.extra_sources.len > 0) alloc.free(self.extra_sources);
         self.* = undefined;
     }
 };
@@ -1371,13 +1374,16 @@ pub const CatalogBoundWritePlanOptions = struct {
 pub const CatalogBoundReadPlanSourceSchema = struct {
     target_binding: ?source_binding.SqlSourceBinding = null,
     source_schema: ?runtime_schema.TableSchema = null,
+    source_schema_owned: bool = false,
     source_binding: ?source_binding.SqlSourceBinding = null,
     bound_objects: []BoundCatalogObject = &.{},
     authorization: BoundSqlAuthorization = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
-        if (self.source_binding == null) {
+        if (self.source_schema_owned) {
+            if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        } else if (self.source_binding == null) {
             if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         }
         if (self.source_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
@@ -1583,13 +1589,16 @@ pub const CatalogLogicalReadPlan = struct {
     session: BoundSqlSession,
     target_binding: ?source_binding.SqlSourceBinding = null,
     source_schema: ?runtime_schema.TableSchema = null,
+    source_schema_owned: bool = false,
     source_binding: ?source_binding.SqlSourceBinding = null,
     bound_objects: []BoundCatalogObject = &.{},
     authorization: BoundSqlAuthorization = .{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         if (self.target_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
-        if (self.source_binding == null) {
+        if (self.source_schema_owned) {
+            if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
+        } else if (self.source_binding == null) {
             if (self.source_schema) |schema| runtime_schema.freeSchema(alloc, schema);
         }
         if (self.source_binding) |*binding| deinitSqlSourceBinding(alloc, binding);
@@ -1809,6 +1818,8 @@ pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlP
     read.target_binding = null;
     const source_schema = read.source_schema;
     read.source_schema = null;
+    const source_schema_owned = read.source_schema_owned;
+    read.source_schema_owned = false;
     const source_binding_value = read.source_binding;
     read.source_binding = null;
     const bound_objects = read.bound_objects;
@@ -1822,6 +1833,7 @@ pub fn logicalReadPlanFromBoundStatement(bound: *BoundSqlStatement) !LogicalSqlP
         .session = session,
         .target_binding = target_binding,
         .source_schema = source_schema,
+        .source_schema_owned = source_schema_owned,
         .source_binding = source_binding_value,
         .bound_objects = bound_objects,
         .authorization = authorization,
@@ -1915,10 +1927,13 @@ pub fn lowerWriteCatalogLogicalPlan(logical: *LogicalSqlPlan, hooks: WritePlanCa
 const SelectReadTableNames = struct {
     left: []const u8,
     source: ?[]const u8 = null,
+    extra_sources: []const []const u8 = &.{},
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.left));
         if (self.source) |source| alloc.free(@constCast(source));
+        for (self.extra_sources) |source| alloc.free(@constCast(source));
+        if (self.extra_sources.len > 0) alloc.free(self.extra_sources);
         self.* = undefined;
     }
 };
@@ -2697,11 +2712,127 @@ fn resolveReadPlanCatalogSourceSchemaFromParsedSqlWithSessionAndAuthorizationAll
                 .lake => |binding| binding.schema,
             };
         }
+        if (tables.extra_sources.len != 0) {
+            if (out.source_schema_owned) return error.InvalidSqlCatalog;
+            var merged_schema = try mergedReadSourceSchemaForBoundTablesAlloc(
+                alloc,
+                out.target_binding.?,
+                out.source_binding,
+            );
+            errdefer runtime_schema.freeSchema(alloc, merged_schema);
+            for (tables.extra_sources) |extra_source| {
+                if (std.mem.eql(u8, extra_source, tables.left) or std.mem.eql(u8, extra_source, tables.source)) continue;
+                var extra_binding = try sourceBindingForCatalogTableWithSessionAlloc(alloc, catalog, extra_source, session, true);
+                defer deinitSqlSourceBinding(alloc, &extra_binding);
+                try appendBoundCatalogObjectForBindingAlloc(alloc, &bound_objects, .source, extra_binding);
+                try appendReadSourceBindingColumnsAlloc(alloc, &merged_schema, extra_binding);
+            }
+            if (out.source_schema != null and !out.source_schema_owned) out.source_schema = null;
+            out.source_schema = merged_schema;
+            out.source_schema_owned = true;
+        }
     }
     out.bound_objects = try bound_objects.toOwnedSlice(alloc);
     bound_objects_transferred = true;
     out.authorization = try boundSqlAuthorizationForObjectsAlloc(alloc, out.bound_objects, authorization_options, .read);
     return out;
+}
+
+fn mergedReadSourceSchemaForBoundTablesAlloc(
+    alloc: std.mem.Allocator,
+    target_binding: source_binding.SqlSourceBinding,
+    maybe_source_binding: ?source_binding.SqlSourceBinding,
+) !runtime_schema.TableSchema {
+    const target_schema = switch (target_binding) {
+        .relational => |relational| relational.schema,
+        .document => return error.InvalidSqlCatalog,
+        .lake => return error.InvalidSqlCatalog,
+    };
+    const default_type = try alloc.dupe(u8, target_schema.default_type);
+    errdefer alloc.free(default_type);
+    const ttl_field = try alloc.dupe(u8, target_schema.ttl_field);
+    errdefer alloc.free(ttl_field);
+    var schema = runtime_schema.TableSchema{
+        .version = target_schema.version,
+        .default_type = default_type,
+        .ttl_duration_ns = target_schema.ttl_duration_ns,
+        .ttl_field = ttl_field,
+        .enforce_types = target_schema.enforce_types,
+        .storage_mode = .relational,
+        .relational_columns = try ddl_plan.cloneDdlRelationalColumns(alloc, target_schema.relational_columns),
+        .primary_key = if (target_schema.primary_key) |primary_key|
+            try cloneReadSourcePrimaryKeyAlloc(alloc, primary_key)
+        else
+            null,
+        .system_versioned = target_schema.system_versioned,
+    };
+    errdefer runtime_schema.freeSchema(alloc, schema);
+    if (maybe_source_binding) |source| try appendReadSourceBindingColumnsAlloc(alloc, &schema, source);
+    return schema;
+}
+
+fn cloneReadSourcePrimaryKeyAlloc(
+    alloc: std.mem.Allocator,
+    primary_key: runtime_schema.PrimaryKey,
+) !runtime_schema.PrimaryKey {
+    const out = runtime_schema.PrimaryKey{
+        .name = if (primary_key.name) |name| try alloc.dupe(u8, name) else null,
+        .columns = try cloneStringSliceAlloc(alloc, primary_key.columns),
+        .include_columns = try cloneStringSliceAlloc(alloc, primary_key.include_columns),
+        .without_overlaps_period = if (primary_key.without_overlaps_period) |period| try alloc.dupe(u8, period) else null,
+        .deferrable = primary_key.deferrable,
+        .timing = primary_key.timing,
+    };
+    errdefer {
+        if (out.name) |name| alloc.free(name);
+        for (out.columns) |column| alloc.free(@constCast(column));
+        if (out.columns.len > 0) alloc.free(out.columns);
+        for (out.include_columns) |column| alloc.free(@constCast(column));
+        if (out.include_columns.len > 0) alloc.free(out.include_columns);
+        if (out.without_overlaps_period) |period| alloc.free(period);
+    }
+    return out;
+}
+
+fn cloneStringSliceAlloc(
+    alloc: std.mem.Allocator,
+    values: []const []const u8,
+) ![]const []const u8 {
+    if (values.len == 0) return &.{};
+    const out = try alloc.alloc([]const u8, values.len);
+    var initialized: usize = 0;
+    errdefer {
+        for (out[0..initialized]) |value| alloc.free(@constCast(value));
+        alloc.free(out);
+    }
+    for (values, 0..) |value, index| {
+        out[index] = try alloc.dupe(u8, value);
+        initialized += 1;
+    }
+    return out;
+}
+
+fn appendReadSourceBindingColumnsAlloc(
+    alloc: std.mem.Allocator,
+    target: *runtime_schema.TableSchema,
+    binding: source_binding.SqlSourceBinding,
+) !void {
+    const schema = switch (binding) {
+        .relational => |relational| relational.schema,
+        .document => return error.InvalidSqlCatalog,
+        .lake => return error.InvalidSqlCatalog,
+    };
+    if (schema.storage_mode != .relational) return error.InvalidSqlCatalog;
+    for (schema.relational_columns) |column| {
+        if (relationalColumnIndex(target.relational_columns, column.name) != null) continue;
+        const len = target.relational_columns.len;
+        const out = try alloc.alloc(runtime_schema.RelationalColumn, len + 1);
+        errdefer alloc.free(out);
+        @memcpy(out[0..len], target.relational_columns);
+        out[len] = try ddl_plan.cloneDdlRelationalColumn(alloc, column);
+        if (len > 0) alloc.free(target.relational_columns);
+        target.relational_columns = out;
+    }
 }
 
 fn appendOptionalBoundCatalogObjectForCatalogTableAlloc(
@@ -3364,7 +3495,9 @@ fn readSourceTableNamesFromGeneratedReadAstAlloc(
         return null;
     };
     tables.source = null;
-    return .{ .left = tables.left, .source = source };
+    const extra_sources = tables.extra_sources;
+    tables.extra_sources = &.{};
+    return .{ .left = tables.left, .source = source, .extra_sources = extra_sources };
 }
 
 fn generatedGraphTableFunctionSourceNameAlloc(
@@ -3411,6 +3544,9 @@ fn readSourceTableNamesFromGeneratedReadBodyAlloc(
         else
             try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, join.right_tokens);
         errdefer alloc.free(source);
+        if (join.kind == .right or generatedJoinOperatorIsRight(tokens, join)) {
+            return .{ .left = source, .source = left };
+        }
         return .{ .left = left, .source = source };
     }
 
@@ -3429,11 +3565,24 @@ fn readSourceTableNamesFromGeneratedReadBodyAlloc(
     if (maybe_set_operation_tokens != null) {
         const source = try generatedSetOperationRightSourceTableNameAlloc(alloc, tokens, set_operation);
         errdefer alloc.free(source);
-        return .{ .left = left, .source = source };
+        const extra_sources = try generatedSetOperationRightExtraSourceTableNamesAlloc(alloc, tokens, set_operation, source);
+        errdefer {
+            for (extra_sources) |extra| alloc.free(@constCast(extra));
+            if (extra_sources.len > 0) alloc.free(extra_sources);
+        }
+        return .{ .left = left, .source = source, .extra_sources = extra_sources };
     }
     const source = try alloc.dupe(u8, left);
     errdefer alloc.free(source);
     return .{ .left = left, .source = source };
+}
+
+fn generatedJoinOperatorIsRight(tokens: []const Token, join: generated_parser.GeneratedSqlJoinAst) bool {
+    if (join.operator_tokens.start >= join.operator_tokens.end or join.operator_tokens.end > tokens.len) return false;
+    for (tokens[join.operator_tokens.start..join.operator_tokens.end]) |token| {
+        if (token.matchesKeywordTag(.right)) return true;
+    }
+    return false;
 }
 
 fn generatedSourceRangeStartsWithUnnest(tokens: []const Token, source_tokens: generated_parser.GeneratedSqlTokenRange) bool {
@@ -3510,11 +3659,95 @@ fn generatedSetOperationRightSourceTableNameAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
     set_operation: generated_parser.GeneratedSqlSetOperationAst,
-) ![]const u8 {
+) anyerror![]const u8 {
     const right_source_tokens = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
+    if (set_operation.right_join_items.len != 0) {
+        const root_index = set_operation.right_join_tree_root_index orelse return error.UnsupportedSqlShape;
+        if (root_index != set_operation.right_join_items.len - 1 or set_operation.right_join_tree_depth != set_operation.right_join_items.len) return error.UnsupportedSqlShape;
+        const first_join = set_operation.right_join_items[0];
+        if (first_join.tokens.start != right_source_tokens.start) return error.UnsupportedSqlShape;
+        const join = set_operation.right_join_items[set_operation.right_join_items.len - 1];
+        if (join.tokens.end != right_source_tokens.end) return error.UnsupportedSqlShape;
+        if (set_operation.right_join_items.len > 1) {
+            for (set_operation.right_join_items) |item| {
+                if (item.kind != .inner or item.condition_kind != .on) return error.UnsupportedSqlShape;
+                if (item.right_lateral_subquery_read_ast != null or item.right_lateral_subquery_tokens != null) return error.UnsupportedSqlShape;
+                if (item.left_child_index != null and item.left_child_index.? + 1 != item.tree_index) return error.UnsupportedSqlShape;
+            }
+        }
+        if (join.kind == .right or generatedJoinOperatorIsRight(tokens, join)) {
+            return try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, join.left_tokens);
+        }
+        return if (join.right_lateral_subquery_read_ast != null or join.right_lateral_subquery_tokens != null)
+            try generatedLateralJoinRightSourceNameAlloc(alloc, tokens, join)
+        else
+            try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, join.right_tokens);
+    }
     const right_source_table_tokens = set_operation.right_source_table_tokens orelse return error.UnsupportedSqlShape;
     try validateGeneratedSimpleReadSourceTableTokens(tokens, right_source_tokens, right_source_table_tokens);
     return try normalizeSqlObjectIdentifierAlloc(alloc, tokens[right_source_table_tokens.start].text);
+}
+
+fn generatedSetOperationRightExtraSourceTableNamesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    set_operation: generated_parser.GeneratedSqlSetOperationAst,
+    primary_source: []const u8,
+) ![]const []const u8 {
+    if (set_operation.right_join_items.len == 0) return &.{};
+    const root_index = set_operation.right_join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (root_index != set_operation.right_join_items.len - 1 or set_operation.right_join_tree_depth != set_operation.right_join_items.len) return error.UnsupportedSqlShape;
+    for (set_operation.right_join_items) |join| {
+        if (join.kind != .inner or join.condition_kind != .on) return &.{};
+        if (join.right_lateral_subquery_read_ast != null or join.right_lateral_subquery_tokens != null) return &.{};
+    }
+
+    var names = std.ArrayListUnmanaged([]const u8).empty;
+    errdefer {
+        for (names.items) |name| alloc.free(name);
+        names.deinit(alloc);
+    }
+    const first_join = set_operation.right_join_items[0];
+    try appendGeneratedSetOperationExtraSourceIfNeededAlloc(
+        alloc,
+        tokens,
+        &names,
+        first_join.left_table_tokens orelse first_join.left_tokens,
+        primary_source,
+    );
+    for (set_operation.right_join_items) |join| {
+        if (join.left_child_index != null and join.left_child_index.? + 1 != join.tree_index) return error.UnsupportedSqlShape;
+        try appendGeneratedSetOperationExtraSourceIfNeededAlloc(
+            alloc,
+            tokens,
+            &names,
+            join.right_table_tokens orelse join.right_tokens,
+            primary_source,
+        );
+    }
+    return try names.toOwnedSlice(alloc);
+}
+
+fn appendGeneratedSetOperationExtraSourceIfNeededAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    names: *std.ArrayListUnmanaged([]const u8),
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    primary_source: []const u8,
+) !void {
+    const source = try normalizeGeneratedSourceRangeTableNameAlloc(alloc, tokens, source_tokens);
+    errdefer alloc.free(source);
+    if (std.mem.eql(u8, source, primary_source)) {
+        alloc.free(source);
+        return;
+    }
+    for (names.items) |existing| {
+        if (std.mem.eql(u8, existing, source)) {
+            alloc.free(source);
+            return;
+        }
+    }
+    try names.append(alloc, source);
 }
 
 fn generatedReadBodySourceNameAlloc(
@@ -3561,15 +3794,18 @@ fn readSourceTableNamesFromGeneratedCteReadAstAlloc(
             if (cte.body_join_items.len != 0) return error.UnsupportedSqlShape;
             break :blk try generatedGraphTableFunctionSourceNameAlloc(alloc, tokens, cte.body_source_graph_function_items);
         } else blk: {
-            if (cte.body_source_antfly_function_items.len != 0 or cte.body_join_items.len != 0) return error.UnsupportedSqlShape;
-            break :blk try generatedReadBodySourceNameAlloc(
+            if (cte.body_source_antfly_function_items.len != 0) return error.UnsupportedSqlShape;
+            var body_tables = try readSourceTableNamesFromGeneratedReadBodyAlloc(
                 alloc,
                 tokens,
                 cte.body_source_tokens,
                 cte.body_source_table_tokens,
+                cte.body_join_items,
                 if (!read_ast.cte_recursive) cte.body_set_operation_tokens else null,
                 cte.body_set_operation,
-            );
+            ) orelse return error.UnsupportedSqlShape;
+            defer body_tables.deinit(alloc);
+            break :blk try alloc.dupe(u8, body_tables.left);
         };
         errdefer alloc.free(cte_source);
         cte_source = try resolveTableNameAgainstCtesAlloc(alloc, cte_bindings.items, cte_source);
@@ -3598,7 +3834,9 @@ fn readSourceTableNamesFromGeneratedCteReadAstAlloc(
         return null;
     };
     final_tables.source = null;
-    return .{ .left = final_tables.left, .source = source };
+    const extra_sources = final_tables.extra_sources;
+    final_tables.extra_sources = &.{};
+    return .{ .left = final_tables.left, .source = source, .extra_sources = extra_sources };
 }
 
 fn validateGeneratedSimpleReadSourceTableTokens(
@@ -3967,6 +4205,10 @@ fn resolveSelectReadTablesAgainstCtes(
     if (tables.source) |source| {
         tables.source = try resolveTableNameAgainstCtesAlloc(alloc, bindings, source);
     }
+    const extra_sources = @constCast(tables.extra_sources);
+    for (extra_sources, 0..) |source, index| {
+        extra_sources[index] = try resolveTableNameAgainstCtesAlloc(alloc, bindings, source);
+    }
 }
 
 fn resolveTableNameAgainstCtesAlloc(
@@ -4069,6 +4311,16 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     try std.testing.expectEqualStrings("usage_records", set_operation.left);
     try std.testing.expectEqualStrings("usage_archive", set_operation.source);
 
+    var set_operation_right_join_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records UNION ALL SELECT u.id FROM usage_records AS u JOIN archived_records AS a ON u.id = a.id",
+    );
+    defer set_operation_right_join_sql.deinit(alloc);
+    var set_operation_right_join = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &set_operation_right_join_sql)).?;
+    defer set_operation_right_join.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", set_operation_right_join.left);
+    try std.testing.expectEqualStrings("archived_records", set_operation_right_join.source);
+
     var malformed_set_operation_source_table = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT id FROM usage_records UNION SELECT id FROM usage_archive",
@@ -4132,6 +4384,16 @@ test "sql adapter binder resolves read source tables through non recursive ctes"
     defer joined.deinit(alloc);
     try std.testing.expectEqualStrings("usage_records", joined.left);
     try std.testing.expectEqualStrings("customer_records", joined.source);
+
+    var right_joined_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id",
+    );
+    defer right_joined_sql.deinit(alloc);
+    var right_joined = (try readSourceTableNamesFromParsedSqlAlloc(alloc, &right_joined_sql)).?;
+    defer right_joined.deinit(alloc);
+    try std.testing.expectEqualStrings("customer_records", right_joined.left);
+    try std.testing.expectEqualStrings("usage_records", right_joined.source);
 
     const lateral_query =
         "WITH orgs AS (SELECT id FROM usage_records), balances AS (SELECT organization_id, amount FROM balance_records) SELECT org.id, latest.amount FROM orgs AS org LEFT JOIN LATERAL (SELECT amount FROM balances AS bal WHERE bal.organization_id = org.id LIMIT 1) AS latest ON true";

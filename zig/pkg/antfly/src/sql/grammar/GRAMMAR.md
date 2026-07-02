@@ -151,6 +151,15 @@ Implementation requirements:
 - Keep unsupported semantics explicit. A syntax shape that parses but lacks
   executable semantics should produce a stable unsupported diagnostic, not a
   generic syntax error or legacy-parser fallback.
+- Source-bound native graph syntax, such as
+  `MATCH ... WITH GRAPH ... ON ... START ... RETURN ...`, lowers through the
+  same typed graph table-function semantics as `antfly.graph_match`. Dotted
+  node-alias fields in `RETURN` and `ORDER BY`, currently `alias.key`,
+  `alias.depth`, and `alias.distance`, bind to per-match graph table-function
+  columns such as `target_key` and `target_depth`. Bare alias-object projection
+  such as `RETURN target` remains unsupported, and bare `MATCH ... RETURN ...`
+  without explicit table, index, and start binding remains generated-owned
+  unsupported until a native binding contract exists.
 - Preserve Antfly API parity: generated SQL plans and native API requests
   should reach the same service contracts.
 

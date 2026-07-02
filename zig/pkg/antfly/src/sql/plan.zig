@@ -28,6 +28,7 @@ const strings = @import("strings.zig");
 const tokenized = @import("tokenized.zig");
 const value_mod = @import("value.zig");
 const document_plan = @import("document_plan.zig");
+const expr_projection = @import("expr/projection.zig");
 
 pub const RelationLifetimeKind = grammar.RelationLifetimeKind;
 pub const RelationPopulationMode = grammar.RelationPopulationMode;
@@ -440,6 +441,17 @@ pub const LoweredSetOperationPlan = struct {
     }
 };
 
+const LoweredSetOperationBranch = struct {
+    plan: LoweredQueryPlan,
+    output_columns: []const runtime_schema.RelationalColumn,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.plan.deinit(alloc);
+        freeSetOperationOutputColumns(alloc, self.output_columns);
+        self.* = undefined;
+    }
+};
+
 pub const LoweredRecursiveCtePlan = struct {
     cte_name: []const u8,
     operation: SelectSetOperation,
@@ -532,6 +544,7 @@ pub const OwnedDocumentBatchRequest = struct {
     deletes: [][]const u8 = &.{},
     transforms: []db_mod.types.DocumentTransform = &.{},
     predicates: []db_mod.types.TransactionVersionPredicate = &.{},
+    returning_rows: [][]const u8 = &.{},
     req: db_mod.types.BatchRequest = .{},
     inserted: u32 = 0,
     deleted: u32 = 0,
@@ -556,6 +569,8 @@ pub const OwnedDocumentBatchRequest = struct {
         if (self.transforms.len > 0) alloc.free(self.transforms);
         for (self.predicates) |predicate| alloc.free(@constCast(predicate.key));
         if (self.predicates.len > 0) alloc.free(self.predicates);
+        for (self.returning_rows) |row| alloc.free(@constCast(row));
+        if (self.returning_rows.len > 0) alloc.free(self.returning_rows);
         self.* = undefined;
     }
 };
@@ -603,6 +618,76 @@ pub const LoweredDocumentProducerMutation = struct {
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(self.table_name);
         self.producer.deinit(alloc);
+        self.template.deinit(alloc);
+        self.* = undefined;
+    }
+};
+
+pub const DocumentJoinedMutationDuplicateSourcePolicy = enum {
+    reject,
+};
+
+pub const DocumentJoinedMutationJoinKey = struct {
+    target_field: []const u8,
+    source_field: []const u8,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.target_field.len > 0) alloc.free(@constCast(self.target_field));
+        if (self.source_field.len > 0) alloc.free(@constCast(self.source_field));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentJoinedMutationSourceAssignment = struct {
+    target_path: []const u8,
+    source_field: []const u8,
+    field_type: runtime_schema.AntflyType,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        if (self.target_path.len > 0) alloc.free(@constCast(self.target_path));
+        if (self.source_field.len > 0) alloc.free(@constCast(self.source_field));
+        self.* = undefined;
+    }
+};
+
+pub const DocumentJoinedMutationSourceProducer = union(enum) {
+    static: document_plan.DocumentProducer,
+    join_key_indexed_lookup,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        switch (self.*) {
+            .static => |*producer| producer.deinit(alloc),
+            .join_key_indexed_lookup => {},
+        }
+        self.* = undefined;
+    }
+};
+
+pub const LoweredDocumentJoinedMutation = struct {
+    table_name: []const u8,
+    source_table_name: []const u8,
+    target_producer: document_plan.DocumentProducer,
+    source_producer: DocumentJoinedMutationSourceProducer,
+    join_keys: []DocumentJoinedMutationJoinKey = &.{},
+    source_assignments: []DocumentJoinedMutationSourceAssignment = &.{},
+    operation: db_mod.document_write.DocumentWriteOperation,
+    template: DocumentProducerMutationTemplate,
+    expected_version: ?u64 = null,
+    max_target_rows: ?u32 = null,
+    max_source_rows: ?u32 = null,
+    max_source_bytes: ?u64 = null,
+    duplicate_source_policy: DocumentJoinedMutationDuplicateSourcePolicy = .reject,
+    sync_level: db_mod.types.SyncLevel = .write,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.table_name);
+        alloc.free(self.source_table_name);
+        self.target_producer.deinit(alloc);
+        self.source_producer.deinit(alloc);
+        for (self.join_keys) |*join_key| join_key.deinit(alloc);
+        if (self.join_keys.len > 0) alloc.free(self.join_keys);
+        for (self.source_assignments) |*assignment| assignment.deinit(alloc);
+        if (self.source_assignments.len > 0) alloc.free(self.source_assignments);
         self.template.deinit(alloc);
         self.* = undefined;
     }
@@ -831,6 +916,7 @@ pub const LoweredWritePlan = union(enum) {
     insert: LoweredInsert,
     document_write: LoweredDocumentWrite,
     document_producer_mutation: LoweredDocumentProducerMutation,
+    document_joined_mutation: LoweredDocumentJoinedMutation,
     insert_source: LoweredInsertSource,
     recursive_insert_source: LoweredRecursiveInsertSource,
     update: LoweredMutation,
@@ -850,6 +936,7 @@ pub const LoweredWritePlan = union(enum) {
             .insert => |*insert| insert.deinit(alloc),
             .document_write => |*document_write| document_write.deinit(alloc),
             .document_producer_mutation => |*document_producer_mutation| document_producer_mutation.deinit(alloc),
+            .document_joined_mutation => |*document_joined_mutation| document_joined_mutation.deinit(alloc),
             .insert_source => |*insert_source| insert_source.deinit(alloc),
             .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.deinit(alloc),
             .update => |*update| update.deinit(alloc),
@@ -884,6 +971,9 @@ fn applyLoweredWritePlanSyncLevel(plan: *LoweredWritePlan, sync_level: db_mod.ty
         },
         .document_producer_mutation => |*document_producer_mutation| {
             document_producer_mutation.sync_level = sync_level;
+        },
+        .document_joined_mutation => |*document_joined_mutation| {
+            document_joined_mutation.sync_level = sync_level;
         },
         .insert_source => |*insert_source| insert_source.sync_level = sync_level,
         .recursive_insert_source => |*recursive_insert_source| recursive_insert_source.insert_source.sync_level = sync_level,
@@ -1234,6 +1324,12 @@ pub const CteSelectParserHooks = struct {
         []const db_mod.types.RelationalRowsCte,
         ?*const generated_parser.GeneratedSqlCteAst,
     ) anyerror!LoweredSelect,
+    parse_join: *const fn (
+        *anyopaque,
+        []const Token,
+        []const db_mod.types.RelationalRowsCte,
+        ?*const generated_parser.GeneratedSqlCteAst,
+    ) anyerror!LoweredJoin,
 };
 
 pub const ReadPlanParserContext = struct {
@@ -1263,8 +1359,18 @@ pub const AggregatePlanParserHooks = struct {
 
 pub const JoinPlanParserHooks = struct {
     ptr: *anyopaque,
+    params: []const value_mod.SqlValue = &.{},
+    generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
+    allow_distinct_table_names: bool = false,
     context_hooks: ReadPlanParserContextHooks,
     parse_join: *const fn (*anyopaque) anyerror!LoweredJoin,
+    parse_top_level_multi_join_order_by: ?*const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        []const db_mod.types.RelationalRowsJoinProjection,
+        ?*const generated_parser.GeneratedSqlReadAst,
+    ) anyerror![]const db_mod.types.RelationalRowsQueryOrder = null,
 };
 
 pub const LateralPlanParserHooks = struct {
@@ -1540,9 +1646,26 @@ pub const RecursiveCteMemberProjectionExpression = struct {
 
 pub const SetOperationParserHooks = struct {
     ptr: *anyopaque,
+    params: []const value_mod.SqlValue = &.{},
     cte_hooks: CteSelectParserHooks,
     context_hooks: ReadPlanParserContextHooks,
     parse_select: *const fn (*anyopaque) anyerror!LoweredSelect,
+    parse_join: *const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        runtime_schema.TableSchema,
+        runtime_schema.TableSchema,
+        ?*const generated_parser.GeneratedSqlReadAst,
+    ) anyerror!LoweredJoin,
+    parse_lateral: *const fn (
+        *anyopaque,
+        []const Token,
+        *usize,
+        runtime_schema.TableSchema,
+        runtime_schema.TableSchema,
+        ?*const generated_parser.GeneratedSqlReadAst,
+    ) anyerror!LoweredLateralPlan,
     select_output_columns: *const fn (
         *anyopaque,
         LoweredSelect,
@@ -1811,20 +1934,41 @@ pub fn parseCtesForPlanAlloc(
                 if (cursor.matchToken(.comma) == null) break;
                 continue;
             }
-        } else {
-            if (lowerAntflyGraphTableFunctionCteAlloc(alloc, tokens[pos.*..close_index])) |table_function| {
+        }
+        if (generated_cte) |cte| {
+            if (cte.body_kind == .join) {
+                if (try appendGeneratedCteBodyMultiJoinCtesAlloc(
+                    alloc,
+                    tokens,
+                    cte.*,
+                    cte_name,
+                    cte_column_aliases,
+                    &ctes,
+                    base_table_name,
+                )) {
+                    pos.* = close_index + 1;
+                    cte_name_transferred = true;
+                    generated_cte_index += 1;
+                    if (cursor.matchToken(.comma) == null) break;
+                    continue;
+                }
+                var lowered = try hooks.parse_join(hooks.ptr, tokens[pos.*..close_index], ctes.items, cte);
+                errdefer lowered.deinit(alloc);
                 pos.* = close_index + 1;
-                try resolveTableFunctionBaseSourceTableAlloc(alloc, table_function, base_table_name);
+                try resolveJoinSourcesForPlanAlloc(alloc, &lowered, ctes.items, base_table_name);
                 try ctes.append(alloc, .{
                     .name = cte_name,
-                    .table_function = table_function,
+                    .join = lowered.join,
                 });
+                lowered.join = .{};
+                alloc.free(lowered.left_table_name);
+                alloc.free(lowered.right_table_name);
+                lowered.left_table_name = "";
+                lowered.right_table_name = "";
                 cte_name_transferred = true;
+                generated_cte_index += 1;
                 if (cursor.matchToken(.comma) == null) break;
                 continue;
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
             }
         }
         var lowered = try hooks.parse_select(hooks.ptr, tokens[pos.*..close_index], ctes.items, generated_cte);
@@ -1961,11 +2105,917 @@ fn lowerGeneratedReadGraphTableFunctionCteAlloc(
     return error.UnsupportedSqlShape;
 }
 
-pub fn lowerAntflyGraphTableFunctionCteAlloc(
+const GeneratedCteJoinSide = enum { left, right };
+
+const GeneratedCteJoinSource = struct {
+    name: []const u8,
+    alias: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.name);
+        alloc.free(self.alias);
+        self.* = undefined;
+    }
+};
+
+const GeneratedCteJoinField = struct {
+    alias: []const u8,
+    field: []const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        alloc.free(self.alias);
+        alloc.free(self.field);
+        self.* = undefined;
+    }
+};
+
+fn freeGeneratedCteJoinFields(alloc: std.mem.Allocator, fields: []GeneratedCteJoinField) void {
+    for (fields) |*field| field.deinit(alloc);
+}
+
+fn generatedCteJoinFieldExists(fields: []const GeneratedCteJoinField, alias: []const u8, field: []const u8) bool {
+    for (fields) |existing| {
+        if (std.mem.eql(u8, existing.alias, alias) and std.mem.eql(u8, existing.field, field)) return true;
+    }
+    return false;
+}
+
+fn appendGeneratedCteJoinFieldAlloc(
+    alloc: std.mem.Allocator,
+    fields: *std.ArrayListUnmanaged(GeneratedCteJoinField),
+    alias: []const u8,
+    field: []const u8,
+) !void {
+    if (generatedCteJoinFieldExists(fields.items, alias, field)) return;
+    const owned_alias = try alloc.dupe(u8, alias);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(owned_alias);
+    const owned_field = try alloc.dupe(u8, field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(owned_field);
+    try fields.append(alloc, .{ .alias = owned_alias, .field = owned_field });
+    alias_transferred = true;
+    field_transferred = true;
+}
+
+fn generatedCteJoinOutputFieldNameAlloc(
+    alloc: std.mem.Allocator,
+    alias: []const u8,
+    field: []const u8,
+) ![]const u8 {
+    return try std.fmt.allocPrint(alloc, "{s}__{s}", .{ alias, field });
+}
+
+fn generatedCteJoinSourceForAlias(sources: []const GeneratedCteJoinSource, alias: []const u8) ?usize {
+    for (sources, 0..) |source, index| {
+        if (std.mem.eql(u8, source.alias, alias)) return index;
+    }
+    return null;
+}
+
+fn generatedCteJoinSourceAliasAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
-) !db_mod.types.RelationalRowsTableFunction {
-    return try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, tokens);
+    join: generated_parser.GeneratedSqlJoinAst,
+    side: GeneratedCteJoinSide,
+) !GeneratedCteJoinSource {
+    const source_tokens = switch (side) {
+        .left => join.left_tokens,
+        .right => join.right_tokens,
+    };
+    const table_tokens = switch (side) {
+        .left => join.left_table_tokens,
+        .right => join.right_table_tokens,
+    } orelse return error.UnsupportedSqlShape;
+    const alias_name_tokens = switch (side) {
+        .left => join.left_alias_name_tokens,
+        .right => join.right_alias_name_tokens,
+    };
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (table_tokens.end != table_tokens.start + 1 or table_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[table_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+    const name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[table_tokens.start].text);
+    var name_transferred = false;
+    errdefer if (!name_transferred) alloc.free(name);
+    const alias = if (alias_name_tokens) |alias_tokens| alias: {
+        if (alias_tokens.end != alias_tokens.start + 1 or alias_tokens.end > source_tokens.end) return error.UnsupportedSqlShape;
+        if (tokens[alias_tokens.start].kind != .identifier) return error.UnsupportedSqlShape;
+        break :alias try alloc.dupe(u8, tokens[alias_tokens.start].text);
+    } else try alloc.dupe(u8, name);
+    var alias_transferred = false;
+    errdefer if (!alias_transferred) alloc.free(alias);
+    name_transferred = true;
+    alias_transferred = true;
+    return .{ .name = name, .alias = alias };
+}
+
+fn generatedCteJoinQualifiedFieldAtRangeAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !QualifiedField {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var pos = range.start;
+    const field = try parseQualifiedFieldAlloc(alloc, tokens, &pos);
+    errdefer freeQualifiedField(alloc, field);
+    if (pos != range.end) return error.UnsupportedSqlShape;
+    return field;
+}
+
+fn generatedCteJoinParseProjectionListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    projection_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    items: generated_parser.GeneratedSqlListAst,
+    needed_fields: *std.ArrayListUnmanaged(GeneratedCteJoinField),
+) ![]const QualifiedProjection {
+    const projection_range = projection_tokens orelse return error.UnsupportedSqlShape;
+    if (items.count == 0 or
+        items.items.len != items.count or
+        items.expression_items.len != items.count or
+        items.alias_items.len != items.count or
+        items.alias_name_items.len != items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
+    var projections = std.ArrayListUnmanaged(QualifiedProjection).empty;
+    errdefer {
+        freeQualifiedProjections(alloc, projections.items);
+        projections.deinit(alloc);
+    }
+    for (items.items, 0..) |item, index| {
+        if (item.start < projection_range.start or item.end > projection_range.end) return error.UnsupportedSqlShape;
+        const expression_item = items.expression_items[index];
+        if (expression_item.start != item.start or expression_item.end > item.end) return error.UnsupportedSqlShape;
+        const source = try generatedCteJoinQualifiedFieldAtRangeAlloc(alloc, tokens, expression_item);
+        var source_transferred = false;
+        errdefer if (!source_transferred) freeQualifiedField(alloc, source);
+        try appendGeneratedCteJoinFieldAlloc(alloc, needed_fields, source.qualifier, source.field);
+        const output = if (items.alias_items[index]) |alias_item| output: {
+            const alias_name = items.alias_name_items[index] orelse return error.UnsupportedSqlShape;
+            if (alias_item.start != expression_item.end or alias_item.end != item.end) return error.UnsupportedSqlShape;
+            if (alias_item.start + 2 != alias_item.end or !tokens[alias_item.start].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+            if (alias_name.start + 1 != alias_name.end or alias_name.end != item.end or tokens[alias_name.start].kind != .identifier) return error.UnsupportedSqlShape;
+            break :output try alloc.dupe(u8, tokens[alias_name.start].text);
+        } else output: {
+            if (items.alias_name_items[index] != null or expression_item.end != item.end) return error.UnsupportedSqlShape;
+            break :output try alloc.dupe(u8, source.field);
+        };
+        var output_transferred = false;
+        errdefer if (!output_transferred) alloc.free(output);
+        try projections.append(alloc, .{ .source = source, .output = output });
+        source_transferred = true;
+        output_transferred = true;
+    }
+    return try projections.toOwnedSlice(alloc);
+}
+
+const GeneratedCteJoinOn = struct {
+    left: QualifiedField,
+    right: QualifiedField,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeQualifiedField(alloc, self.left);
+        freeQualifiedField(alloc, self.right);
+        self.* = undefined;
+    }
+};
+
+fn freeGeneratedCteJoinOns(alloc: std.mem.Allocator, values: []GeneratedCteJoinOn) void {
+    for (values) |*value| value.deinit(alloc);
+}
+
+fn parseGeneratedCteJoinOnListAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    predicate_tokens: generated_parser.GeneratedSqlTokenRange,
+    needed_fields: *std.ArrayListUnmanaged(GeneratedCteJoinField),
+) ![]GeneratedCteJoinOn {
+    var pos = predicate_tokens.start;
+    var values = std.ArrayListUnmanaged(GeneratedCteJoinOn).empty;
+    errdefer {
+        freeGeneratedCteJoinOns(alloc, values.items);
+        values.deinit(alloc);
+    }
+    while (true) {
+        const left = try parseQualifiedFieldAlloc(alloc, tokens, &pos);
+        var left_transferred = false;
+        errdefer if (!left_transferred) freeQualifiedField(alloc, left);
+        if (pos >= predicate_tokens.end or tokens[pos].kind != .eq) return error.UnsupportedSqlShape;
+        pos += 1;
+        const right = try parseQualifiedFieldAlloc(alloc, tokens, &pos);
+        var right_transferred = false;
+        errdefer if (!right_transferred) freeQualifiedField(alloc, right);
+        try appendGeneratedCteJoinFieldAlloc(alloc, needed_fields, left.qualifier, left.field);
+        try appendGeneratedCteJoinFieldAlloc(alloc, needed_fields, right.qualifier, right.field);
+        try values.append(alloc, .{ .left = left, .right = right });
+        left_transferred = true;
+        right_transferred = true;
+        if (pos == predicate_tokens.end) break;
+        if (!tokens[pos].matchesKeywordTag(.@"and")) return error.UnsupportedSqlShape;
+        pos += 1;
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
+const GeneratedCteJoinPredicate = struct {
+    source: QualifiedField,
+    op: runtime_schema.RelationalCheckOp,
+    value_json: ?[]const u8,
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeQualifiedField(alloc, self.source);
+        if (self.value_json) |value| alloc.free(value);
+        self.* = undefined;
+    }
+};
+
+fn freeGeneratedCteJoinPredicates(alloc: std.mem.Allocator, values: []GeneratedCteJoinPredicate) void {
+    for (values) |*value| value.deinit(alloc);
+}
+
+fn parseGeneratedCteJoinPredicatesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    where_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    where_expression: generated_parser.GeneratedSqlExpressionAst,
+    needed_fields: *std.ArrayListUnmanaged(GeneratedCteJoinField),
+) ![]GeneratedCteJoinPredicate {
+    const expression_tokens = where_expression.tokens orelse {
+        if (where_tokens != null) return error.UnsupportedSqlShape;
+        return &.{};
+    };
+    var pos = expression_tokens.start;
+    var values = std.ArrayListUnmanaged(GeneratedCteJoinPredicate).empty;
+    errdefer {
+        freeGeneratedCteJoinPredicates(alloc, values.items);
+        values.deinit(alloc);
+    }
+    while (true) {
+        const source = try parseQualifiedFieldAlloc(alloc, tokens, &pos);
+        var source_transferred = false;
+        errdefer if (!source_transferred) freeQualifiedField(alloc, source);
+        if (pos >= expression_tokens.end or tokens[pos].kind != .eq) return error.UnsupportedSqlShape;
+        pos += 1;
+        const value_json = try value_mod.parseSqlUntypedValueJsonAlloc(alloc, tokens, &pos);
+        var value_transferred = false;
+        errdefer if (!value_transferred) alloc.free(value_json);
+        try appendGeneratedCteJoinFieldAlloc(alloc, needed_fields, source.qualifier, source.field);
+        try values.append(alloc, .{ .source = source, .op = .eq, .value_json = value_json });
+        source_transferred = true;
+        value_transferred = true;
+        if (pos == expression_tokens.end) break;
+        if (!tokens[pos].matchesKeywordTag(.@"and")) return error.UnsupportedSqlShape;
+        pos += 1;
+    }
+    return try values.toOwnedSlice(alloc);
+}
+
+fn appendGeneratedCteJoinPredicateAlloc(
+    alloc: std.mem.Allocator,
+    predicates: *std.ArrayListUnmanaged(runtime_schema.RelationalCheck),
+    field_name: []const u8,
+    predicate: GeneratedCteJoinPredicate,
+) !void {
+    const field = try alloc.dupe(u8, field_name);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(field);
+    const value_json = if (predicate.value_json) |value| try alloc.dupe(u8, value) else null;
+    var value_transferred = false;
+    errdefer if (!value_transferred) if (value_json) |value| alloc.free(value);
+    try predicates.append(alloc, .{
+        .name = "",
+        .field = field,
+        .op = predicate.op,
+        .value_json = value_json,
+    });
+    field_transferred = true;
+    value_transferred = true;
+}
+
+fn generatedCteJoinFieldAvailable(sources: []const GeneratedCteJoinSource, count: usize, field: GeneratedCteJoinField) bool {
+    for (sources[0..count]) |source| {
+        if (std.mem.eql(u8, source.alias, field.alias)) return true;
+    }
+    return false;
+}
+
+fn appendGeneratedCteJoinProjectionAlloc(
+    alloc: std.mem.Allocator,
+    select: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection),
+    output: []const u8,
+    side: db_mod.types.RelationalRowsJoinProjectionSide,
+    field: []const u8,
+) !void {
+    const owned_output = try alloc.dupe(u8, output);
+    var output_transferred = false;
+    errdefer if (!output_transferred) alloc.free(owned_output);
+    const owned_field = try alloc.dupe(u8, field);
+    var field_transferred = false;
+    errdefer if (!field_transferred) alloc.free(owned_field);
+    try select.append(alloc, .{ .output = owned_output, .side = side, .field = owned_field });
+    output_transferred = true;
+    field_transferred = true;
+}
+
+fn appendGeneratedCteBodyMultiJoinCtesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    cte: generated_parser.GeneratedSqlCteAst,
+    cte_name: []const u8,
+    cte_column_aliases: []const []const u8,
+    ctes: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte),
+    base_table_name: *?[]const u8,
+) !bool {
+    if (cte.body_kind != .join or cte.body_join_items.len <= 1) return false;
+    if (cte_column_aliases.len != 0) return error.UnsupportedSqlShape;
+    if (cte.body_order_tokens != null or cte.body_limit_tokens != null or cte.body_offset_tokens != null or cte.body_fetch_tokens != null) return error.UnsupportedSqlShape;
+    if (cte.body_group_tokens != null or cte.body_having_tokens != null or cte.body_set_operation_tokens != null) return error.UnsupportedSqlShape;
+    const root_index = cte.body_join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (root_index != cte.body_join_items.len - 1 or cte.body_join_tree_depth != cte.body_join_items.len) return error.UnsupportedSqlShape;
+
+    var sources = std.ArrayListUnmanaged(GeneratedCteJoinSource).empty;
+    defer {
+        for (sources.items) |*source| source.deinit(alloc);
+        sources.deinit(alloc);
+    }
+    try sources.append(alloc, try generatedCteJoinSourceAliasAlloc(alloc, tokens, cte.body_join_items[0], .left));
+    for (cte.body_join_items) |join| {
+        if (join.kind != .inner or join.condition_kind != .on) return error.UnsupportedSqlShape;
+        if (join.left_child_index != null and join.left_child_index.? + 1 != join.tree_index) return error.UnsupportedSqlShape;
+        var right_source = try generatedCteJoinSourceAliasAlloc(alloc, tokens, join, .right);
+        errdefer right_source.deinit(alloc);
+        if (generatedCteJoinSourceForAlias(sources.items, right_source.alias) != null) return error.UnsupportedSqlShape;
+        try sources.append(alloc, right_source);
+        right_source = .{ .name = "", .alias = "" };
+    }
+
+    var needed_fields = std.ArrayListUnmanaged(GeneratedCteJoinField).empty;
+    defer {
+        freeGeneratedCteJoinFields(alloc, needed_fields.items);
+        needed_fields.deinit(alloc);
+    }
+    const final_projections = try generatedCteJoinParseProjectionListAlloc(alloc, tokens, cte.body_projection_tokens, cte.body_projection_items, &needed_fields);
+    defer freeQualifiedProjections(alloc, final_projections);
+    const where_predicates = try parseGeneratedCteJoinPredicatesAlloc(alloc, tokens, cte.body_where_tokens, cte.body_where_expression, &needed_fields);
+    defer {
+        freeGeneratedCteJoinPredicates(alloc, where_predicates);
+        if (where_predicates.len > 0) alloc.free(where_predicates);
+    }
+    for (cte.body_join_items) |join| {
+        const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+        const parsed_on = try parseGeneratedCteJoinOnListAlloc(alloc, tokens, predicate_tokens, &needed_fields);
+        defer {
+            freeGeneratedCteJoinOns(alloc, parsed_on);
+            if (parsed_on.len > 0) alloc.free(parsed_on);
+        }
+    }
+
+    var previous_cte_name: ?[]const u8 = null;
+    defer if (previous_cte_name) |name| alloc.free(name);
+    for (cte.body_join_items, 0..) |join, join_index| {
+        const right_source = sources.items[join_index + 1];
+        try resolveBaseSourceTableAlloc(alloc, right_source.name, base_table_name);
+        if (join_index == 0) try resolveBaseSourceTableAlloc(alloc, sources.items[0].name, base_table_name);
+        const current_cte_name = if (join_index + 1 == cte.body_join_items.len)
+            try alloc.dupe(u8, cte_name)
+        else
+            try std.fmt.allocPrint(alloc, "__antfly_cte_body_join_{d}_{s}", .{ join_index, cte_name });
+        var current_name_transferred = false;
+        errdefer if (!current_name_transferred) alloc.free(current_cte_name);
+        if (findCteByName(ctes.items, current_cte_name) != null) return error.UnsupportedSqlShape;
+
+        const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+        const parsed_on = try parseGeneratedCteJoinOnListAlloc(alloc, tokens, predicate_tokens, &needed_fields);
+        defer {
+            freeGeneratedCteJoinOns(alloc, parsed_on);
+            if (parsed_on.len > 0) alloc.free(parsed_on);
+        }
+        var on = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn).empty;
+        errdefer {
+            freeJoinOn(alloc, on.items);
+            on.deinit(alloc);
+        }
+        for (parsed_on) |item| {
+            const left_is_right_source = std.mem.eql(u8, item.left.qualifier, right_source.alias);
+            const right_is_right_source = std.mem.eql(u8, item.right.qualifier, right_source.alias);
+            if (left_is_right_source == right_is_right_source) return error.UnsupportedSqlShape;
+            const left_field_source = if (left_is_right_source) item.right else item.left;
+            const right_field_source = if (left_is_right_source) item.left else item.right;
+            if (generatedCteJoinSourceForAlias(sources.items[0 .. join_index + 1], left_field_source.qualifier) == null) return error.UnsupportedSqlShape;
+            const left_field = if (join_index == 0 and std.mem.eql(u8, left_field_source.qualifier, sources.items[0].alias))
+                try alloc.dupe(u8, left_field_source.field)
+            else
+                try generatedCteJoinOutputFieldNameAlloc(alloc, left_field_source.qualifier, left_field_source.field);
+            var left_transferred = false;
+            errdefer if (!left_transferred) alloc.free(left_field);
+            const right_field = try alloc.dupe(u8, right_field_source.field);
+            var right_transferred = false;
+            errdefer if (!right_transferred) alloc.free(right_field);
+            try on.append(alloc, .{ .left_field = left_field, .right_field = right_field });
+            left_transferred = true;
+            right_transferred = true;
+        }
+
+        var left_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(alloc, left_predicates.items);
+            left_predicates.deinit(alloc);
+        }
+        var right_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(alloc, right_predicates.items);
+            right_predicates.deinit(alloc);
+        }
+        if (join_index + 1 == cte.body_join_items.len) {
+            for (where_predicates) |predicate| {
+                if (std.mem.eql(u8, predicate.source.qualifier, right_source.alias)) {
+                    try appendGeneratedCteJoinPredicateAlloc(alloc, &right_predicates, predicate.source.field, predicate);
+                } else if (generatedCteJoinSourceForAlias(sources.items[0 .. join_index + 1], predicate.source.qualifier) != null) {
+                    const field_name = try generatedCteJoinOutputFieldNameAlloc(alloc, predicate.source.qualifier, predicate.source.field);
+                    defer alloc.free(field_name);
+                    try appendGeneratedCteJoinPredicateAlloc(alloc, &left_predicates, field_name, predicate);
+                } else {
+                    return error.UnsupportedSqlShape;
+                }
+            }
+        }
+
+        var select = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection).empty;
+        errdefer {
+            freeJoinProjections(alloc, select.items);
+            select.deinit(alloc);
+        }
+        if (join_index + 1 == cte.body_join_items.len) {
+            for (final_projections) |projection| {
+                if (std.mem.eql(u8, projection.source.qualifier, right_source.alias)) {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, projection.output, .right, projection.source.field);
+                } else if (generatedCteJoinSourceForAlias(sources.items[0 .. join_index + 1], projection.source.qualifier) != null) {
+                    const field_name = try generatedCteJoinOutputFieldNameAlloc(alloc, projection.source.qualifier, projection.source.field);
+                    defer alloc.free(field_name);
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, projection.output, .left, field_name);
+                } else {
+                    return error.UnsupportedSqlShape;
+                }
+            }
+        } else {
+            for (needed_fields.items) |field| {
+                if (!generatedCteJoinFieldAvailable(sources.items, join_index + 2, field)) continue;
+                const output = try generatedCteJoinOutputFieldNameAlloc(alloc, field.alias, field.field);
+                defer alloc.free(output);
+                if (std.mem.eql(u8, field.alias, right_source.alias)) {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, output, .right, field.field);
+                } else if (join_index == 0 and std.mem.eql(u8, field.alias, sources.items[0].alias)) {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, output, .left, field.field);
+                } else {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, output, .left, output);
+                }
+            }
+        }
+        if (select.items.len == 0) return error.UnsupportedSqlShape;
+
+        const left_source_cte = if (join_index == 0)
+            ""
+        else
+            try alloc.dupe(u8, previous_cte_name orelse return error.UnsupportedSqlShape);
+        var left_source_transferred = false;
+        errdefer if (!left_source_transferred and left_source_cte.len > 0) alloc.free(left_source_cte);
+        var join_request = db_mod.types.RelationalRowsJoinRequest{
+            .left = .{
+                .source_cte = left_source_cte,
+                .predicates = try left_predicates.toOwnedSlice(alloc),
+                .select_all = true,
+            },
+            .right = .{
+                .predicates = try right_predicates.toOwnedSlice(alloc),
+                .select_all = true,
+            },
+            .on = try on.toOwnedSlice(alloc),
+            .join_type = .inner,
+            .select = try select.toOwnedSlice(alloc),
+        };
+        var join_transferred = false;
+        errdefer if (!join_transferred) join_request.deinit(alloc);
+        left_source_transferred = true;
+        on = .empty;
+        left_predicates = .empty;
+        right_predicates = .empty;
+        select = .empty;
+        try ctes.append(alloc, .{
+            .name = current_cte_name,
+            .join = join_request,
+        });
+        current_name_transferred = true;
+        join_transferred = true;
+        if (previous_cte_name) |name| alloc.free(name);
+        previous_cte_name = try alloc.dupe(u8, current_cte_name);
+    }
+    return true;
+}
+
+fn generatedTopLevelMultiJoinAppendOrderWithNullPlacementAlloc(
+    alloc: std.mem.Allocator,
+    order_by: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder),
+    order: db_mod.types.RelationalRowsQueryOrder,
+    explicit_nulls_first: ?bool,
+) !void {
+    if (explicit_nulls_first) |nulls_first| {
+        if (order.null_test != null or order.expression != null or order.collation != null) return error.UnsupportedSqlShape;
+        const null_field = try alloc.dupe(u8, order.field);
+        var null_field_transferred = false;
+        errdefer if (!null_field_transferred) alloc.free(null_field);
+        try order_by.append(alloc, .{
+            .field = null_field,
+            .direction = if (nulls_first) .desc else .asc,
+            .null_test = .is_null,
+        });
+        null_field_transferred = true;
+    }
+    try order_by.append(alloc, order);
+}
+
+fn lowerGeneratedTopLevelMultiJoinOrderByAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    read: *const generated_parser.GeneratedSqlReadAst,
+    select: []const db_mod.types.RelationalRowsJoinProjection,
+    hooks: JoinPlanParserHooks,
+) ![]const db_mod.types.RelationalRowsQueryOrder {
+    const range = read.order_tokens orelse return &.{};
+    if (hooks.parse_top_level_multi_join_order_by) |parse_order_by| {
+        var order_pos = range.start;
+        const order_by = try parse_order_by(hooks.ptr, tokens, &order_pos, select, read);
+        errdefer freeOrderBy(alloc, order_by);
+        if (order_pos != range.end) return error.UnsupportedSqlShape;
+        return order_by;
+    }
+    const list = read.order_items;
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    if (list.count == 0 or list.items.len != list.count or list.expression_items.len != list.count or list.expressions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.alias_items.len != list.count or list.alias_name_items.len != list.count) return error.UnsupportedSqlShape;
+    if (list.direction_items.len != list.count or list.directions.len != list.count) return error.UnsupportedSqlShape;
+    if (list.order_using_operator_items.len != list.count or list.nulls_order_items.len != list.count or list.nulls_orders.len != list.count) return error.UnsupportedSqlShape;
+    if (list.first_tokens == null or !generatedTokenRangeEqual(list.first_tokens.?, list.items[0])) return error.UnsupportedSqlShape;
+    if (list.last_tokens == null or !generatedTokenRangeEqual(list.last_tokens.?, list.items[list.count - 1])) return error.UnsupportedSqlShape;
+
+    var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+    errdefer {
+        freeOrderBy(alloc, order_by.items);
+        order_by.deinit(alloc);
+    }
+    for (list.items, 0..) |item, index| {
+        if (item.start >= item.end or item.start < range.start or item.end > range.end) return error.UnsupportedSqlShape;
+        if (index == 0) {
+            if (item.start != range.start) return error.UnsupportedSqlShape;
+        } else {
+            const previous = list.items[index - 1];
+            if (previous.end + 1 != item.start or previous.end >= tokens.len or tokens[previous.end].kind != .comma) return error.UnsupportedSqlShape;
+        }
+        if (index + 1 == list.count and item.end != range.end) return error.UnsupportedSqlShape;
+        if (list.alias_items[index] != null or list.alias_name_items[index] != null) return error.UnsupportedSqlShape;
+
+        const expression_range = list.expression_items[index];
+        if (expression_range.start < item.start or expression_range.end > item.end or expression_range.start >= expression_range.end) return error.UnsupportedSqlShape;
+        const generated_expression = list.expressions[index];
+        if (generated_expression.kind != .token_range) return error.UnsupportedSqlShape;
+        if (!generatedTokenRangeEqual(generated_expression.tokens orelse return error.UnsupportedSqlShape, expression_range)) return error.UnsupportedSqlShape;
+
+        var direction: db_mod.types.RelationalRowsQueryOrderDirection = .asc;
+        const direction_end = if (list.direction_items[index]) |direction_range| blk: {
+            if (direction_range.start != expression_range.end or direction_range.end > item.end or direction_range.start >= direction_range.end) return error.UnsupportedSqlShape;
+            if (tokens[direction_range.start].matchesKeywordTag(.using) or list.order_using_operator_items[index] != null) return error.UnsupportedSqlShape;
+            const generated_direction = list.directions[index] orelse return error.UnsupportedSqlShape;
+            if (direction_range.end != direction_range.start + 1) return error.UnsupportedSqlShape;
+            direction = switch (generated_direction) {
+                .asc => blk_dir: {
+                    if (!tokens[direction_range.start].matchesKeywordTag(.asc)) return error.UnsupportedSqlShape;
+                    break :blk_dir .asc;
+                },
+                .desc => blk_dir: {
+                    if (!tokens[direction_range.start].matchesKeywordTag(.desc)) return error.UnsupportedSqlShape;
+                    break :blk_dir .desc;
+                },
+            };
+            break :blk direction_range.end;
+        } else blk: {
+            if (list.directions[index] != null or list.order_using_operator_items[index] != null) return error.UnsupportedSqlShape;
+            break :blk expression_range.end;
+        };
+
+        const explicit_nulls_first: ?bool = if (list.nulls_order_items[index]) |nulls_range| blk: {
+            if (nulls_range.start != direction_end or nulls_range.end != nulls_range.start + 2 or nulls_range.end > item.end) return error.UnsupportedSqlShape;
+            if (!tokens[nulls_range.start].matchesKeywordTag(.nulls)) return error.UnsupportedSqlShape;
+            const nulls_order = list.nulls_orders[index] orelse return error.UnsupportedSqlShape;
+            const nulls_first = switch (nulls_order) {
+                .first => blk_null: {
+                    if (!tokens[nulls_range.start + 1].matchesKeywordTag(.first)) return error.UnsupportedSqlShape;
+                    break :blk_null true;
+                },
+                .last => blk_null: {
+                    if (!tokens[nulls_range.start + 1].matchesKeywordTag(.last)) return error.UnsupportedSqlShape;
+                    break :blk_null false;
+                },
+            };
+            break :blk nulls_first;
+        } else blk: {
+            if (list.nulls_orders[index] != null) return error.UnsupportedSqlShape;
+            break :blk null;
+        };
+        const item_end = if (list.nulls_order_items[index]) |nulls_range| nulls_range.end else direction_end;
+        if (item_end != item.end) return error.UnsupportedSqlShape;
+
+        const field = if (expression_range.end == expression_range.start + 1 and tokens[expression_range.start].kind == .number) blk: {
+            const ordinal = std.fmt.parseInt(u32, tokens[expression_range.start].text, 10) catch return error.UnsupportedSqlShape;
+            break :blk try expr_projection.joinOutputFieldByOrdinalAlloc(alloc, select, ordinal);
+        } else if (expression_range.end == expression_range.start + 1 and tokens[expression_range.start].kind == .identifier) blk: {
+            const output = tokens[expression_range.start].text;
+            if (!expr_projection.joinOutputIsUnique(select, output)) return error.UnsupportedSqlShape;
+            break :blk try alloc.dupe(u8, output);
+        } else return error.UnsupportedSqlShape;
+        var field_transferred = false;
+        errdefer if (!field_transferred) alloc.free(field);
+        try generatedTopLevelMultiJoinAppendOrderWithNullPlacementAlloc(alloc, &order_by, .{
+            .field = field,
+            .direction = direction,
+        }, explicit_nulls_first);
+        field_transferred = true;
+    }
+
+    const owned_order_by = try order_by.toOwnedSlice(alloc);
+    order_by = .empty;
+    return owned_order_by;
+}
+
+fn lowerGeneratedTopLevelMultiJoinAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    hooks: JoinPlanParserHooks,
+    read: *const generated_parser.GeneratedSqlReadAst,
+) !?LoweredJoin {
+    if (read.kind != .join or read.join_items.len <= 1) return null;
+    if (read.cte_count != 0 or read.cte_items.len != 0) return null;
+    if (read.distinct_tokens != null or read.group_tokens != null or read.having_tokens != null or read.window_tokens != null or read.set_operation_tokens != null) return error.UnsupportedSqlShape;
+    if (read.row_lock_tokens != null) return error.UnsupportedSqlShape;
+    const root_index = read.join_tree_root_index orelse return error.UnsupportedSqlShape;
+    if (root_index != read.join_items.len - 1 or read.join_tree_depth != read.join_items.len) return error.UnsupportedSqlShape;
+
+    var final_limit: ?u32 = null;
+    var final_offset: u32 = 0;
+    if (read.limit_tokens) |range| {
+        if (range.start == 0) return error.UnsupportedSqlShape;
+        var limit_pos = range.start;
+        const parsed_limit = (try parseGeneratedLimitValueForClause(tokens, range.start - 1, &limit_pos, hooks.params, read)) orelse return error.UnsupportedSqlShape;
+        if (limit_pos != range.end) return error.UnsupportedSqlShape;
+        final_limit = parsed_limit.value;
+    }
+    if (read.offset_tokens) |range| {
+        if (range.start == 0) return error.UnsupportedSqlShape;
+        var offset_pos = range.start;
+        final_offset = (try parseGeneratedOffsetValueForClause(tokens, range.start - 1, &offset_pos, hooks.params, read)) orelse return error.UnsupportedSqlShape;
+        if (offset_pos != range.end) return error.UnsupportedSqlShape;
+    }
+    if (read.fetch_tokens) |range| {
+        if (read.limit_tokens != null or range.start == 0) return error.UnsupportedSqlShape;
+        var fetch_pos = range.start;
+        const parsed_fetch = (try parseGeneratedFetchLimitValueForClause(tokens, range.start - 1, &fetch_pos, hooks.params, read)) orelse return error.UnsupportedSqlShape;
+        if (fetch_pos != range.end) return error.UnsupportedSqlShape;
+        final_limit = parsed_fetch.value;
+    }
+
+    var sources = std.ArrayListUnmanaged(GeneratedCteJoinSource).empty;
+    defer {
+        for (sources.items) |*source| source.deinit(alloc);
+        sources.deinit(alloc);
+    }
+    try sources.append(alloc, try generatedCteJoinSourceAliasAlloc(alloc, tokens, read.join_items[0], .left));
+    for (read.join_items) |join| {
+        if (join.kind != .inner or join.condition_kind != .on) return error.UnsupportedSqlShape;
+        if (join.left_child_index != null and join.left_child_index.? + 1 != join.tree_index) return error.UnsupportedSqlShape;
+        var right_source = try generatedCteJoinSourceAliasAlloc(alloc, tokens, join, .right);
+        errdefer right_source.deinit(alloc);
+        if (!hooks.allow_distinct_table_names and !std.mem.eql(u8, sources.items[0].name, right_source.name)) return error.UnsupportedSqlShape;
+        if (generatedCteJoinSourceForAlias(sources.items, right_source.alias) != null) return error.UnsupportedSqlShape;
+        try sources.append(alloc, right_source);
+        right_source = .{ .name = "", .alias = "" };
+    }
+
+    var needed_fields = std.ArrayListUnmanaged(GeneratedCteJoinField).empty;
+    defer {
+        freeGeneratedCteJoinFields(alloc, needed_fields.items);
+        needed_fields.deinit(alloc);
+    }
+    const final_projections = try generatedCteJoinParseProjectionListAlloc(alloc, tokens, read.projection_tokens, read.projection_items, &needed_fields);
+    defer freeQualifiedProjections(alloc, final_projections);
+    const where_predicates = try parseGeneratedCteJoinPredicatesAlloc(alloc, tokens, read.where_tokens, read.where_expression, &needed_fields);
+    defer {
+        freeGeneratedCteJoinPredicates(alloc, where_predicates);
+        if (where_predicates.len > 0) alloc.free(where_predicates);
+    }
+    for (read.join_items) |join| {
+        const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+        const parsed_on = try parseGeneratedCteJoinOnListAlloc(alloc, tokens, predicate_tokens, &needed_fields);
+        defer {
+            freeGeneratedCteJoinOns(alloc, parsed_on);
+            if (parsed_on.len > 0) alloc.free(parsed_on);
+        }
+    }
+
+    var ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
+    errdefer {
+        for (ctes.items) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        ctes.deinit(alloc);
+    }
+    var previous_cte_name: ?[]const u8 = null;
+    defer if (previous_cte_name) |name| alloc.free(name);
+
+    var final_join: ?db_mod.types.RelationalRowsJoinRequest = null;
+    var final_left_table_name: []const u8 = "";
+    var final_right_table_name: []const u8 = "";
+    errdefer {
+        if (final_join) |*join| join.deinit(alloc);
+        if (final_left_table_name.len > 0) alloc.free(final_left_table_name);
+        if (final_right_table_name.len > 0) alloc.free(final_right_table_name);
+    }
+
+    for (read.join_items, 0..) |join, join_index| {
+        const right_source = sources.items[join_index + 1];
+        const is_final = join_index + 1 == read.join_items.len;
+        const predicate_tokens = join.predicate_tokens orelse return error.UnsupportedSqlShape;
+        const parsed_on = try parseGeneratedCteJoinOnListAlloc(alloc, tokens, predicate_tokens, &needed_fields);
+        defer {
+            freeGeneratedCteJoinOns(alloc, parsed_on);
+            if (parsed_on.len > 0) alloc.free(parsed_on);
+        }
+
+        var on = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn).empty;
+        errdefer {
+            freeJoinOn(alloc, on.items);
+            on.deinit(alloc);
+        }
+        for (parsed_on) |item| {
+            const left_is_right_source = std.mem.eql(u8, item.left.qualifier, right_source.alias);
+            const right_is_right_source = std.mem.eql(u8, item.right.qualifier, right_source.alias);
+            if (left_is_right_source == right_is_right_source) return error.UnsupportedSqlShape;
+            const left_field_source = if (left_is_right_source) item.right else item.left;
+            const right_field_source = if (left_is_right_source) item.left else item.right;
+            if (generatedCteJoinSourceForAlias(sources.items[0 .. join_index + 1], left_field_source.qualifier) == null) return error.UnsupportedSqlShape;
+            const left_field = if (join_index == 0 and std.mem.eql(u8, left_field_source.qualifier, sources.items[0].alias))
+                try alloc.dupe(u8, left_field_source.field)
+            else
+                try generatedCteJoinOutputFieldNameAlloc(alloc, left_field_source.qualifier, left_field_source.field);
+            var left_transferred = false;
+            errdefer if (!left_transferred) alloc.free(left_field);
+            const right_field = try alloc.dupe(u8, right_field_source.field);
+            var right_transferred = false;
+            errdefer if (!right_transferred) alloc.free(right_field);
+            try on.append(alloc, .{ .left_field = left_field, .right_field = right_field });
+            left_transferred = true;
+            right_transferred = true;
+        }
+
+        var left_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(alloc, left_predicates.items);
+            left_predicates.deinit(alloc);
+        }
+        var right_predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(alloc, right_predicates.items);
+            right_predicates.deinit(alloc);
+        }
+        if (is_final) {
+            for (where_predicates) |predicate| {
+                if (std.mem.eql(u8, predicate.source.qualifier, right_source.alias)) {
+                    try appendGeneratedCteJoinPredicateAlloc(alloc, &right_predicates, predicate.source.field, predicate);
+                } else if (generatedCteJoinSourceForAlias(sources.items[0 .. join_index + 1], predicate.source.qualifier) != null) {
+                    const field_name = if (join_index == 0 and std.mem.eql(u8, predicate.source.qualifier, sources.items[0].alias))
+                        try alloc.dupe(u8, predicate.source.field)
+                    else
+                        try generatedCteJoinOutputFieldNameAlloc(alloc, predicate.source.qualifier, predicate.source.field);
+                    defer alloc.free(field_name);
+                    try appendGeneratedCteJoinPredicateAlloc(alloc, &left_predicates, field_name, predicate);
+                } else {
+                    return error.UnsupportedSqlShape;
+                }
+            }
+        }
+
+        var select = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinProjection).empty;
+        errdefer {
+            freeJoinProjections(alloc, select.items);
+            select.deinit(alloc);
+        }
+        if (is_final) {
+            for (final_projections) |projection| {
+                if (std.mem.eql(u8, projection.source.qualifier, right_source.alias)) {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, projection.output, .right, projection.source.field);
+                } else if (generatedCteJoinSourceForAlias(sources.items[0 .. join_index + 1], projection.source.qualifier) != null) {
+                    const field_name = if (join_index == 0 and std.mem.eql(u8, projection.source.qualifier, sources.items[0].alias))
+                        try alloc.dupe(u8, projection.source.field)
+                    else
+                        try generatedCteJoinOutputFieldNameAlloc(alloc, projection.source.qualifier, projection.source.field);
+                    defer alloc.free(field_name);
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, projection.output, .left, field_name);
+                } else {
+                    return error.UnsupportedSqlShape;
+                }
+            }
+        } else {
+            for (needed_fields.items) |field| {
+                if (!generatedCteJoinFieldAvailable(sources.items, join_index + 2, field)) continue;
+                const output = try generatedCteJoinOutputFieldNameAlloc(alloc, field.alias, field.field);
+                defer alloc.free(output);
+                if (std.mem.eql(u8, field.alias, right_source.alias)) {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, output, .right, field.field);
+                } else if (join_index == 0 and std.mem.eql(u8, field.alias, sources.items[0].alias)) {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, output, .left, field.field);
+                } else {
+                    try appendGeneratedCteJoinProjectionAlloc(alloc, &select, output, .left, output);
+                }
+            }
+        }
+        if (select.items.len == 0) return error.UnsupportedSqlShape;
+
+        const left_source_cte = if (join_index == 0)
+            ""
+        else
+            try alloc.dupe(u8, previous_cte_name orelse return error.UnsupportedSqlShape);
+        var left_source_transferred = false;
+        errdefer if (!left_source_transferred and left_source_cte.len > 0) alloc.free(left_source_cte);
+        var join_request = db_mod.types.RelationalRowsJoinRequest{
+            .left = .{
+                .source_cte = left_source_cte,
+                .predicates = try left_predicates.toOwnedSlice(alloc),
+                .select_all = true,
+            },
+            .right = .{
+                .predicates = try right_predicates.toOwnedSlice(alloc),
+                .select_all = true,
+            },
+            .on = try on.toOwnedSlice(alloc),
+            .join_type = .inner,
+            .select = try select.toOwnedSlice(alloc),
+        };
+        if (is_final) {
+            join_request.order_by = try lowerGeneratedTopLevelMultiJoinOrderByAlloc(alloc, tokens, read, join_request.select, hooks);
+            join_request.limit = final_limit;
+            join_request.offset = final_offset;
+        }
+        var join_transferred = false;
+        errdefer if (!join_transferred) join_request.deinit(alloc);
+        left_source_transferred = true;
+        on = .empty;
+        left_predicates = .empty;
+        right_predicates = .empty;
+        select = .empty;
+
+        if (is_final) {
+            final_left_table_name = try alloc.dupe(u8, sources.items[0].name);
+            final_right_table_name = try alloc.dupe(u8, right_source.name);
+            final_join = join_request;
+            join_transferred = true;
+        } else {
+            const current_cte_name = try std.fmt.allocPrint(alloc, "__antfly_read_join_{d}", .{join_index});
+            var current_name_transferred = false;
+            errdefer if (!current_name_transferred) alloc.free(current_cte_name);
+            const cte_left_table_name = try alloc.dupe(u8, sources.items[0].name);
+            var cte_left_table_transferred = false;
+            errdefer if (!cte_left_table_transferred) alloc.free(cte_left_table_name);
+            const cte_right_table_name = try alloc.dupe(u8, right_source.name);
+            var cte_right_table_transferred = false;
+            errdefer if (!cte_right_table_transferred) alloc.free(cte_right_table_name);
+            try ctes.append(alloc, .{
+                .name = current_cte_name,
+                .left_table = cte_left_table_name,
+                .right_table = cte_right_table_name,
+                .join = join_request,
+            });
+            current_name_transferred = true;
+            cte_left_table_transferred = true;
+            cte_right_table_transferred = true;
+            join_transferred = true;
+            if (previous_cte_name) |name| alloc.free(name);
+            previous_cte_name = try alloc.dupe(u8, current_cte_name);
+        }
+    }
+
+    const owned_ctes = try ctes.toOwnedSlice(alloc);
+    ctes = .empty;
+    const join = final_join orelse return error.UnsupportedSqlShape;
+    final_join = null;
+    const left_table_name = final_left_table_name;
+    final_left_table_name = "";
+    const right_table_name = final_right_table_name;
+    final_right_table_name = "";
+    return .{
+        .left_table_name = left_table_name,
+        .right_table_name = right_table_name,
+        .ctes = owned_ctes,
+        .join = join,
+    };
 }
 
 pub fn resolveTableFunctionBaseSourceTableAlloc(
@@ -2161,7 +3211,15 @@ pub fn parseJoinPlanAlloc(
     cte_hooks: CteSelectParserHooks,
     hooks: JoinPlanParserHooks,
 ) !LoweredJoin {
-    if (!parser.peekKeywordTag(tokens, pos.*, .with)) return try parseJoinWithCtes(hooks, &.{});
+    if (!parser.peekKeywordTag(tokens, pos.*, .with)) {
+        if (hooks.generated_read_ast) |read_ast| {
+            if (try lowerGeneratedTopLevelMultiJoinAlloc(alloc, tokens, hooks, read_ast)) |lowered| {
+                pos.* = tokens.len;
+                return lowered;
+            }
+        }
+        return try parseJoinWithCtes(hooks, &.{});
+    }
 
     var base_table_name: ?[]const u8 = null;
     defer if (base_table_name) |table| alloc.free(table);
@@ -2341,13 +3399,16 @@ pub fn parseSetOperationPlanAlloc(
         ctes,
         &base_table_name,
     );
+    if (final.ctes.len != 0) ctes = &.{};
     errdefer final.deinit(alloc);
     if (parser.matchToken(tokens, pos, .semicolon) != null and !parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
     if (!parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
     _ = base_table_name orelse return error.UnsupportedSqlShape;
 
-    final.ctes = ctes;
-    ctes = &.{};
+    if (final.ctes.len == 0) {
+        final.ctes = ctes;
+        ctes = &.{};
+    }
     return final;
 }
 
@@ -2372,11 +3433,16 @@ fn parseSetOperationPlanWithCtesAlloc(
     if (parser.atEnd(tokens, pos.*)) return error.UnsupportedSqlShape;
 
     const op = try grammar.parseSelectSetOperation(tokens, pos);
-    var right = try parseSetOperationSelectWithContext(hooks, right_schema, null, true);
-    errdefer right.deinit(alloc);
-    if (base_table_name) |base| try resolveSetOperationSelectSourceForPlanAlloc(alloc, &right, ctes, base);
-    const right_columns = try hooks.select_output_columns(hooks.ptr, right);
-    defer freeSetOperationOutputColumns(alloc, right_columns);
+    var extra_ctes = std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte).empty;
+    errdefer {
+        for (extra_ctes.items) |cte| {
+            var owned = cte;
+            owned.deinit(alloc);
+        }
+        extra_ctes.deinit(alloc);
+    }
+    var right = try parseSetOperationRightBranchWithContextAlloc(alloc, tokens, pos, previous_context.schema, right_schema, allow_distinct_table_names, hooks, ctes, base_table_name, &extra_ctes);
+    defer right.deinit(alloc);
 
     const tail = try hooks.parse_result_tail(hooks.ptr, left);
     var tail_transferred = false;
@@ -2384,32 +3450,31 @@ fn parseSetOperationPlanWithCtesAlloc(
         freeOrderBy(alloc, tail.order_by);
         if (tail.order_by.len > 0) alloc.free(tail.order_by);
     };
-    if (!std.mem.eql(u8, left.table_name, right.table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
-    if (!(try reconcileSetOperationOutputColumns(alloc, left_columns, right_columns))) return error.UnsupportedSqlShape;
+    if (!std.mem.eql(u8, left.table_name, right.plan.table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
+    if (!(try reconcileSetOperationOutputColumns(alloc, left_columns, right.output_columns))) return error.UnsupportedSqlShape;
     const system_time_as_of_sequence = if (left.system_time_as_of_sequence) |left_sequence| blk: {
-        const right_sequence = right.system_time_as_of_sequence orelse return error.UnsupportedSqlShape;
-        if (left.system_time_as_of_timestamp_ns != null or right.system_time_as_of_timestamp_ns != null) return error.UnsupportedSqlShape;
+        const right_sequence = right.plan.system_time_as_of_sequence orelse return error.UnsupportedSqlShape;
+        if (left.system_time_as_of_timestamp_ns != null or right.plan.system_time_as_of_timestamp_ns != null) return error.UnsupportedSqlShape;
         if (left_sequence != right_sequence) return error.UnsupportedSqlShape;
         break :blk left_sequence;
     } else blk: {
-        if (right.system_time_as_of_sequence != null) return error.UnsupportedSqlShape;
+        if (right.plan.system_time_as_of_sequence != null) return error.UnsupportedSqlShape;
         break :blk null;
     };
     const system_time_as_of_timestamp_ns = if (left.system_time_as_of_timestamp_ns) |left_timestamp_ns| blk: {
-        const right_timestamp_ns = right.system_time_as_of_timestamp_ns orelse return error.UnsupportedSqlShape;
+        const right_timestamp_ns = right.plan.system_time_as_of_timestamp_ns orelse return error.UnsupportedSqlShape;
         if (left_timestamp_ns != right_timestamp_ns) return error.UnsupportedSqlShape;
         break :blk left_timestamp_ns;
     } else blk: {
-        if (right.system_time_as_of_timestamp_ns != null) return error.UnsupportedSqlShape;
+        if (right.plan.system_time_as_of_timestamp_ns != null) return error.UnsupportedSqlShape;
         break :blk null;
     };
 
     const left_table_name = left.table_name;
     left.table_name = "";
-    const right_table_name = right.table_name;
-    right.table_name = "";
+    var right_plan = right.plan;
+    right.plan = .{ .table_name = "", .plan = .{ .query = .{} } };
     left.clearSelectOutputs(alloc);
-    right.clearSelectOutputs(alloc);
 
     var left_plan = LoweredQueryPlan{
         .table_name = left_table_name,
@@ -2420,20 +3485,19 @@ fn parseSetOperationPlanWithCtesAlloc(
     left.query = .{};
     errdefer left_plan.deinit(alloc);
 
-    var right_plan = LoweredQueryPlan{
-        .table_name = right_table_name,
-        .plan = .{ .query = right.query },
-        .system_time_as_of_sequence = system_time_as_of_sequence,
-        .system_time_as_of_timestamp_ns = system_time_as_of_timestamp_ns,
-    };
-    right.query = .{};
+    right_plan.system_time_as_of_sequence = system_time_as_of_sequence;
+    right_plan.system_time_as_of_timestamp_ns = system_time_as_of_timestamp_ns;
     errdefer right_plan.deinit(alloc);
+
+    const plan_ctes = try combineSetOperationPlanCtesAlloc(alloc, ctes, extra_ctes.items);
+    extra_ctes.deinit(alloc);
+    extra_ctes = .empty;
 
     left_columns_transferred = true;
     tail_transferred = true;
     return .{
         .operation = op,
-        .ctes = &.{},
+        .ctes = plan_ctes,
         .left = left_plan,
         .right = right_plan,
         .output_columns = left_columns,
@@ -2462,6 +3526,349 @@ fn resolveSetOperationSelectSourceForPlanAlloc(
     const physical_table_name = try alloc.dupe(u8, base);
     alloc.free(lowered.table_name);
     lowered.table_name = physical_table_name;
+}
+
+fn generatedSetOperationRightJoinReadAst(
+    tokens: []const Token,
+    read: *const generated_parser.GeneratedSqlReadAst,
+) !generated_parser.GeneratedSqlReadAst {
+    if (read.kind != .set_operation or read.set_operation_tokens == null) return error.UnsupportedSqlShape;
+    const set_operation = read.set_operation;
+    if (set_operation.right_join_items.len == 0) return error.UnsupportedSqlShape;
+    const right_query = set_operation.right_query_tokens orelse return error.UnsupportedSqlShape;
+    if (right_query.start >= right_query.end or right_query.end > tokens.len) return error.UnsupportedSqlShape;
+    const right_select = set_operation.right_select_tokens orelse return error.UnsupportedSqlShape;
+    if (right_select.start >= right_select.end or right_select.end > tokens.len) return error.UnsupportedSqlShape;
+    const join_tokens = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
+    const first_join = set_operation.right_join_items[0];
+    if (first_join.tokens.start != join_tokens.start) return error.UnsupportedSqlShape;
+    const read_kind: generated_parser.GeneratedSqlReadKind = if (first_join.right_tokens.start < first_join.right_tokens.end and
+        first_join.right_tokens.end <= tokens.len and
+        tokens[first_join.right_tokens.start].matchesKeywordTag(.lateral))
+        .lateral
+    else
+        .join;
+    return .{
+        .kind = read_kind,
+        .statement_span = .{
+            .start = tokens[right_query.start].sourceSpan().start,
+            .end = tokens[right_query.end - 1].sourceSpan().end,
+        },
+        .command_span = tokens[right_select.start].sourceSpan(),
+        .projection_tokens = set_operation.right_projection_tokens,
+        .projection_items = set_operation.right_projection_items,
+        .projection_first_expression = set_operation.right_projection_first_expression,
+        .projection_last_expression = set_operation.right_projection_last_expression,
+        .source_tokens = set_operation.right_source_tokens,
+        .join_tokens = join_tokens,
+        .join_operator_tokens = first_join.operator_tokens,
+        .join_kind = first_join.kind,
+        .join_left_tokens = first_join.left_tokens,
+        .join_right_tokens = first_join.right_tokens,
+        .join_predicate_tokens = first_join.predicate_tokens,
+        .join_predicate_expression = first_join.predicate_expression,
+        .join_items = set_operation.right_join_items,
+        .join_tree_root_index = set_operation.right_join_tree_root_index,
+        .join_tree_depth = set_operation.right_join_tree_depth,
+        .where_tokens = set_operation.right_where_tokens,
+        .where_expression = set_operation.right_where_expression,
+    };
+}
+
+fn parseSetOperationRightBranchWithContextAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    base_schema: runtime_schema.TableSchema,
+    right_schema: runtime_schema.TableSchema,
+    allow_distinct_table_names: bool,
+    hooks: SetOperationParserHooks,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: ?*?[]const u8,
+    extra_ctes: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsCte),
+) !LoweredSetOperationBranch {
+    const generated_read = hooks.cte_hooks.generated_read_ast orelse {
+        const lowered = try parseSetOperationSelectWithContext(hooks, right_schema, null, true);
+        return try loweredSetOperationSelectBranchAlloc(alloc, hooks, lowered, ctes, base_table_name);
+    };
+    if (generated_read.kind != .set_operation or generated_read.set_operation.right_join_items.len == 0) {
+        const lowered = try parseSetOperationSelectWithContext(hooks, right_schema, null, true);
+        return try loweredSetOperationSelectBranchAlloc(alloc, hooks, lowered, ctes, base_table_name);
+    }
+
+    var right_join_read_abs = try generatedSetOperationRightJoinReadAst(tokens, generated_read);
+    const right_query = generated_read.set_operation.right_query_tokens orelse return error.UnsupportedSqlShape;
+    if (pos.* != right_query.start) return error.UnsupportedSqlShape;
+    var right_join_read = try generated_parser.cloneRebasedGeneratedReadAstPtrAlloc(alloc, &right_join_read_abs, right_query.start, right_query.end);
+    defer {
+        right_join_read.deinit(alloc);
+        alloc.destroy(right_join_read);
+    }
+    const right_tokens = tokens[right_query.start..right_query.end];
+    var branch_pos: usize = 0;
+    if (right_join_read.kind == .lateral) {
+        if (right_join_read.join_items.len != 1) return error.UnsupportedSqlShape;
+        var lowered = try hooks.parse_lateral(hooks.ptr, right_tokens, &branch_pos, base_schema, right_schema, right_join_read);
+        defer lowered.deinit(alloc);
+        if (!std.mem.eql(u8, lowered.left_table_name, lowered.right_table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
+        if (base_table_name) |base| try resolveLateralSourcesForPlanAlloc(alloc, &lowered, ctes, base);
+        if (branch_pos != right_query.end - right_query.start) return error.UnsupportedSqlShape;
+        pos.* = right_query.end;
+
+        var output_ctes: []const db_mod.types.RelationalRowsCte = ctes;
+        var output_ctes_owned = false;
+        defer if (output_ctes_owned) alloc.free(output_ctes);
+        if (lowered.plan.ctes.len != 0) {
+            if (ctes.len == 0) {
+                output_ctes = lowered.plan.ctes;
+            } else {
+                const combined_output_ctes = try alloc.alloc(db_mod.types.RelationalRowsCte, ctes.len + lowered.plan.ctes.len);
+                @memcpy(combined_output_ctes[0..ctes.len], ctes);
+                @memcpy(combined_output_ctes[ctes.len..], lowered.plan.ctes);
+                output_ctes = combined_output_ctes;
+                output_ctes_owned = true;
+            }
+        }
+
+        var output_plan = lowered.plan;
+        output_plan.ctes = output_ctes;
+        const cte_sources = try setOperationRhsOutputCteSourcesAlloc(alloc, lowered.left_table_name, base_schema, right_schema, output_ctes);
+        defer if (cte_sources.len > 0) alloc.free(cte_sources);
+        const output_columns = try relational_rows.rowsReadPlanOutputColumnsWithSchemasAndJsonSourcesAlloc(
+            alloc,
+            base_schema,
+            base_schema,
+            right_schema,
+            .{ .lateral = output_plan },
+            cte_sources,
+        );
+        errdefer freeSetOperationOutputColumns(alloc, output_columns);
+
+        if (lowered.plan.ctes.len != 0) {
+            try extra_ctes.appendSlice(alloc, lowered.plan.ctes);
+            alloc.free(lowered.plan.ctes);
+            lowered.plan.ctes = &.{};
+        }
+
+        const cte_name = try std.fmt.allocPrint(alloc, "__antfly_set_right_lateral_{d}", .{extra_ctes.items.len});
+        var cte_name_transferred = false;
+        errdefer if (!cte_name_transferred) alloc.free(cte_name);
+        const query_source_cte = try alloc.dupe(u8, cte_name);
+        var query_source_cte_transferred = false;
+        errdefer if (!query_source_cte_transferred) alloc.free(query_source_cte);
+        const table_name = try alloc.dupe(u8, lowered.left_table_name);
+        errdefer alloc.free(table_name);
+
+        var lateral_request = lowered.plan.lateral;
+        lowered.plan.lateral = .{};
+        errdefer lateral_request.deinit(alloc);
+        const cte_left_table = try alloc.dupe(u8, lowered.left_table_name);
+        var cte_left_table_transferred = false;
+        errdefer if (!cte_left_table_transferred) alloc.free(cte_left_table);
+        const cte_right_table = try alloc.dupe(u8, lowered.right_table_name);
+        var cte_right_table_transferred = false;
+        errdefer if (!cte_right_table_transferred) alloc.free(cte_right_table);
+        try extra_ctes.append(alloc, .{
+            .name = cte_name,
+            .left_table = cte_left_table,
+            .right_table = cte_right_table,
+            .lateral = lateral_request,
+        });
+        cte_name_transferred = true;
+        cte_left_table_transferred = true;
+        cte_right_table_transferred = true;
+        lateral_request = .{};
+
+        query_source_cte_transferred = true;
+        return .{
+            .plan = .{
+                .table_name = table_name,
+                .plan = .{ .query = .{
+                    .source_cte = query_source_cte,
+                    .select_all = true,
+                } },
+                .system_time_as_of_sequence = null,
+                .system_time_as_of_timestamp_ns = null,
+            },
+            .output_columns = output_columns,
+        };
+    }
+    var lowered = if (right_join_read.join_items.len > 1) lowered: {
+        const multi_join = (try lowerGeneratedTopLevelMultiJoinAlloc(alloc, right_tokens, .{
+            .ptr = hooks.ptr,
+            .params = hooks.params,
+            .generated_read_ast = right_join_read,
+            .allow_distinct_table_names = allow_distinct_table_names,
+            .context_hooks = hooks.context_hooks,
+            .parse_join = failingGeneratedSetOperationMultiJoinParseHook,
+        }, right_join_read)) orelse return error.UnsupportedSqlShape;
+        branch_pos = right_tokens.len;
+        break :lowered multi_join;
+    } else try hooks.parse_join(hooks.ptr, right_tokens, &branch_pos, base_schema, right_schema, right_join_read);
+    defer lowered.deinit(alloc);
+    if (!std.mem.eql(u8, lowered.left_table_name, lowered.right_table_name) and !allow_distinct_table_names) return error.UnsupportedSqlShape;
+    if (base_table_name) |base| try resolveJoinSourcesForPlanAlloc(alloc, &lowered, ctes, base);
+    if (branch_pos != right_query.end - right_query.start) return error.UnsupportedSqlShape;
+    pos.* = right_query.end;
+
+    var output_ctes: []const db_mod.types.RelationalRowsCte = ctes;
+    var output_ctes_owned = false;
+    defer if (output_ctes_owned) alloc.free(output_ctes);
+    if (lowered.ctes.len != 0) {
+        if (ctes.len == 0) {
+            output_ctes = lowered.ctes;
+        } else {
+            const combined_output_ctes = try alloc.alloc(db_mod.types.RelationalRowsCte, ctes.len + lowered.ctes.len);
+            @memcpy(combined_output_ctes[0..ctes.len], ctes);
+            @memcpy(combined_output_ctes[ctes.len..], lowered.ctes);
+            output_ctes = combined_output_ctes;
+            output_ctes_owned = true;
+        }
+    }
+
+    var output_plan = lowered.asPlan();
+    output_plan.ctes = output_ctes;
+    const cte_sources = try setOperationRhsOutputCteSourcesAlloc(alloc, lowered.left_table_name, base_schema, right_schema, output_ctes);
+    defer if (cte_sources.len > 0) alloc.free(cte_sources);
+    const output_columns = try relational_rows.rowsReadPlanOutputColumnsWithSchemasAndJsonSourcesAlloc(
+        alloc,
+        base_schema,
+        base_schema,
+        right_schema,
+        .{ .join = output_plan },
+        cte_sources,
+    );
+    errdefer freeSetOperationOutputColumns(alloc, output_columns);
+
+    if (lowered.ctes.len != 0) {
+        try extra_ctes.appendSlice(alloc, lowered.ctes);
+        alloc.free(lowered.ctes);
+        lowered.ctes = &.{};
+    }
+
+    const cte_name = try std.fmt.allocPrint(alloc, "__antfly_set_right_join_{d}", .{extra_ctes.items.len});
+    var cte_name_transferred = false;
+    errdefer if (!cte_name_transferred) alloc.free(cte_name);
+    const query_source_cte = try alloc.dupe(u8, cte_name);
+    var query_source_cte_transferred = false;
+    errdefer if (!query_source_cte_transferred) alloc.free(query_source_cte);
+    const table_name = try alloc.dupe(u8, lowered.left_table_name);
+    errdefer alloc.free(table_name);
+
+    var join_request = lowered.join;
+    lowered.join = .{};
+    errdefer join_request.deinit(alloc);
+    const cte_left_table = try alloc.dupe(u8, lowered.left_table_name);
+    var cte_left_table_transferred = false;
+    errdefer if (!cte_left_table_transferred) alloc.free(cte_left_table);
+    const cte_right_table = try alloc.dupe(u8, lowered.right_table_name);
+    var cte_right_table_transferred = false;
+    errdefer if (!cte_right_table_transferred) alloc.free(cte_right_table);
+    try extra_ctes.append(alloc, .{
+        .name = cte_name,
+        .left_table = cte_left_table,
+        .right_table = cte_right_table,
+        .join = join_request,
+    });
+    cte_name_transferred = true;
+    cte_left_table_transferred = true;
+    cte_right_table_transferred = true;
+    join_request = .{};
+
+    query_source_cte_transferred = true;
+    return .{
+        .plan = .{
+            .table_name = table_name,
+            .plan = .{ .query = .{
+                .source_cte = query_source_cte,
+                .select_all = true,
+            } },
+            .system_time_as_of_sequence = null,
+            .system_time_as_of_timestamp_ns = null,
+        },
+        .output_columns = output_columns,
+    };
+}
+
+fn setOperationRhsOutputCteSourcesAlloc(
+    alloc: std.mem.Allocator,
+    left_table_name: []const u8,
+    base_schema: runtime_schema.TableSchema,
+    right_schema: runtime_schema.TableSchema,
+    ctes: []const db_mod.types.RelationalRowsCte,
+) ![]const relational_rows.RowsCteJsonSource {
+    var sources = std.ArrayListUnmanaged(relational_rows.RowsCteJsonSource).empty;
+    errdefer sources.deinit(alloc);
+    for (ctes) |cte| {
+        try appendSetOperationRhsOutputCteSourceIfNeededAlloc(alloc, &sources, left_table_name, base_schema, right_schema, cte.left_table);
+        try appendSetOperationRhsOutputCteSourceIfNeededAlloc(alloc, &sources, left_table_name, base_schema, right_schema, cte.right_table);
+    }
+    return try sources.toOwnedSlice(alloc);
+}
+
+fn appendSetOperationRhsOutputCteSourceIfNeededAlloc(
+    alloc: std.mem.Allocator,
+    sources: *std.ArrayListUnmanaged(relational_rows.RowsCteJsonSource),
+    left_table_name: []const u8,
+    base_schema: runtime_schema.TableSchema,
+    right_schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+) !void {
+    if (table_name.len == 0) return;
+    for (sources.items) |source| {
+        if (std.mem.eql(u8, source.table_name, table_name)) return;
+    }
+    try sources.append(alloc, .{
+        .table_name = table_name,
+        .schema = if (std.mem.eql(u8, table_name, left_table_name)) base_schema else right_schema,
+        .rows = &.{},
+    });
+}
+
+fn failingGeneratedSetOperationMultiJoinParseHook(_: *anyopaque) anyerror!LoweredJoin {
+    return error.UnsupportedSqlShape;
+}
+
+fn loweredSetOperationSelectBranchAlloc(
+    alloc: std.mem.Allocator,
+    hooks: SetOperationParserHooks,
+    lowered: LoweredSelect,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    base_table_name: ?*?[]const u8,
+) !LoweredSetOperationBranch {
+    var select = lowered;
+    errdefer select.deinit(alloc);
+    if (base_table_name) |base| try resolveSetOperationSelectSourceForPlanAlloc(alloc, &select, ctes, base);
+    const output_columns = try hooks.select_output_columns(hooks.ptr, select);
+    errdefer freeSetOperationOutputColumns(alloc, output_columns);
+    const table_name = select.table_name;
+    select.table_name = "";
+    select.clearSelectOutputs(alloc);
+    var plan = LoweredQueryPlan{
+        .table_name = table_name,
+        .plan = .{ .query = select.query },
+        .system_time_as_of_sequence = select.system_time_as_of_sequence,
+        .system_time_as_of_timestamp_ns = select.system_time_as_of_timestamp_ns,
+    };
+    select.query = .{};
+    errdefer plan.deinit(alloc);
+    return .{
+        .plan = plan,
+        .output_columns = output_columns,
+    };
+}
+
+fn combineSetOperationPlanCtesAlloc(
+    alloc: std.mem.Allocator,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    extra_ctes: []const db_mod.types.RelationalRowsCte,
+) ![]const db_mod.types.RelationalRowsCte {
+    if (extra_ctes.len == 0) return &.{};
+    const out = try alloc.alloc(db_mod.types.RelationalRowsCte, ctes.len + extra_ctes.len);
+    @memcpy(out[0..ctes.len], ctes);
+    @memcpy(out[ctes.len..], extra_ctes);
+    if (ctes.len > 0) alloc.free(@constCast(ctes));
+    return out;
 }
 
 fn parseSetOperationSelectWithContext(
@@ -3204,9 +4611,11 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
     parsed_sql: *const tokenized.ParsedSql,
     hooks: RelationPopulationLoweringHooks,
 ) !LoweredRelationPopulationPlan {
-    var parsed = try grammar.parseRelationPopulationParsedSqlAlloc(alloc, parsed_sql);
+    var parsed = if (try relationPopulationSyntaxFromGeneratedDdl(parsed_sql)) |generated|
+        generated
+    else
+        try grammar.parseRelationPopulationParsedSqlAlloc(alloc, parsed_sql);
     defer parsed.deinit(alloc);
-    try validateGeneratedRelationPopulationMetadata(alloc, parsed_sql, parsed);
     var parsed_source = try relationPopulationSourceParsedSqlAlloc(alloc, parsed_sql, parsed);
     defer parsed_source.deinit(alloc);
     var source = try hooks.lower_read(hooks.ptr, &parsed_source.parsed);
@@ -3214,12 +4623,10 @@ pub fn lowerRelationPopulationPlanWithParsedSqlAlloc(
     return try relationPopulationPlanFromSyntaxAlloc(alloc, parsed, &source);
 }
 
-fn validateGeneratedRelationPopulationMetadata(
-    alloc: std.mem.Allocator,
+fn relationPopulationSyntaxFromGeneratedDdl(
     parsed_sql: *const tokenized.ParsedSql,
-    parsed: grammar.RelationPopulationSyntax,
-) !void {
-    if (parsed_sql.generatedStatementKind() != .ddl) return;
+) !?grammar.RelationPopulationSyntax {
+    if (parsed_sql.generatedStatementKind() != .ddl) return null;
     const generated_statement = parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
     const generated_ast = generated_statement.ast orelse return error.UnsupportedSqlShape;
     const ddl_ast = switch (generated_ast) {
@@ -3227,30 +4634,76 @@ fn validateGeneratedRelationPopulationMetadata(
         else => return error.UnsupportedSqlShape,
     };
     if (ddl_ast.kind != .relation_population or ddl_ast.relation_population_source_read == null) return error.UnsupportedSqlShape;
-    if (parsed.mode != .create_table_as) return;
-    if (ddl_ast.if_not_exists != parsed.if_not_exists) return error.UnsupportedSqlShape;
 
     const tokens = parsed_sql.items();
-    const target_range = ddl_ast.object_name_tokens orelse return error.UnsupportedSqlShape;
-    const generated_target = try generatedSqlObjectIdentifierAlloc(alloc, tokens, target_range);
-    defer alloc.free(generated_target);
-    const parsed_target = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, parsed.target_identifier);
-    defer alloc.free(parsed_target);
-    if (!std.ascii.eqlIgnoreCase(generated_target, parsed_target)) return error.UnsupportedSqlShape;
+    const raw = parsed_sql.raw_statement;
+    const statement_end = relationPopulationStatementTokenEndInRange(tokens, raw.token_start, raw.token_end);
+    if (raw.token_start >= statement_end) return error.UnsupportedSqlShape;
+    if (tokens[raw.token_start].matchesKeywordTag(.select)) {
+        return try selectIntoRelationPopulationSyntaxFromGeneratedDdl(tokens, raw.token_start, statement_end, ddl_ast);
+    }
+    if (tokens[raw.token_start].matchesKeywordTag(.create)) {
+        return try createTableAsRelationPopulationSyntaxFromGeneratedDdl(tokens, raw.token_start, statement_end, ddl_ast);
+    }
+    return error.UnsupportedSqlShape;
+}
 
-    const source_start = parsed.source_token_start orelse return error.UnsupportedSqlShape;
-    const source_end = parsed.source_token_end orelse return error.UnsupportedSqlShape;
+fn selectIntoRelationPopulationSyntaxFromGeneratedDdl(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) !grammar.RelationPopulationSyntax {
+    const target_range = ddl_ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    const target_identifier = try generatedSqlObjectIdentifierText(tokens, target_range);
+    const into_index = findTopLevelRelationPopulationKeyword(tokens, start + 1, end, .into) orelse return error.UnsupportedSqlShape;
+    if (into_index <= start + 1 or target_range.start <= into_index or target_range.end > end) return error.UnsupportedSqlShape;
+    var target_index = into_index + 1;
+    const target_lifetime = consumeRelationPopulationLifetime(tokens, &target_index, end);
+    if (target_index < end and tokens[target_index].matchesKeywordTag(.table)) target_index += 1;
+    if (target_index != target_range.start) return error.UnsupportedSqlShape;
+    if (target_range.end >= end or !tokens[target_range.end].matchesKeywordTag(.from)) return error.UnsupportedSqlShape;
+
+    return .{
+        .mode = .select_into,
+        .target_identifier = target_identifier,
+        .target_lifetime = target_lifetime,
+        .if_not_exists = false,
+        .populate = true,
+        .source_token_start = start,
+        .source_token_end = into_index,
+        .source_suffix_token_start = target_range.end,
+        .source_suffix_token_end = end,
+    };
+}
+
+fn createTableAsRelationPopulationSyntaxFromGeneratedDdl(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    ddl_ast: generated_parser.GeneratedSqlDdlAst,
+) !grammar.RelationPopulationSyntax {
+    const target_range = ddl_ast.object_name_tokens orelse return error.UnsupportedSqlShape;
+    const target_identifier = try generatedSqlObjectIdentifierText(tokens, target_range);
+    var target_index = start + 1;
+    const target_lifetime = consumeRelationPopulationLifetime(tokens, &target_index, end);
+    if (target_index >= end or !tokens[target_index].matchesKeywordTag(.table)) return error.UnsupportedSqlShape;
+    target_index += 1;
+    if (target_index < end and tokens[target_index].matchesKeywordTag(.only)) target_index += 1;
+    const if_not_exists = consumeRelationPopulationIfNotExists(tokens, &target_index, end);
+    if (ddl_ast.if_not_exists != if_not_exists) return error.UnsupportedSqlShape;
+    if (target_index != target_range.start or target_range.end >= end) return error.UnsupportedSqlShape;
+    if (!tokens[target_range.end].matchesKeywordTag(.as)) return error.UnsupportedSqlShape;
+
     const source_range = ddl_ast.relation_population_source_tokens orelse return error.UnsupportedSqlShape;
-    if (source_range.start != source_start or source_range.end != source_end or source_range.start >= source_range.end) {
+    if (source_range.start != target_range.end + 1 or source_range.end > end or source_range.start >= source_range.end) {
         return error.UnsupportedSqlShape;
     }
+    if (!tokens[source_range.start].matchesKeywordTag(.select)) return error.UnsupportedSqlShape;
 
     const populate = ddl_ast.relation_population_populate orelse return error.UnsupportedSqlShape;
-    if (populate != parsed.populate) return error.UnsupportedSqlShape;
-
-    const statement_end = relationPopulationStatementTokenEnd(tokens);
     if (ddl_ast.relation_population_data_clause_tokens) |data_clause| {
-        if (data_clause.start != source_end or data_clause.end != statement_end or data_clause.start >= data_clause.end) return error.UnsupportedSqlShape;
+        if (data_clause.start != source_range.end or data_clause.end != end or data_clause.start >= data_clause.end) return error.UnsupportedSqlShape;
         if (data_clause.start + 2 == data_clause.end and
             tokens[data_clause.start].matchesKeywordTag(.with) and
             tokens[data_clause.start + 1].matchesKeywordTag(.data))
@@ -3263,28 +4716,87 @@ fn validateGeneratedRelationPopulationMetadata(
         {
             if (populate) return error.UnsupportedSqlShape;
         } else return error.UnsupportedSqlShape;
-    } else if (source_end != statement_end) {
+    } else if (source_range.end != end) {
         return error.UnsupportedSqlShape;
     }
+
+    return .{
+        .mode = .create_table_as,
+        .target_identifier = target_identifier,
+        .target_lifetime = target_lifetime,
+        .if_not_exists = if_not_exists,
+        .populate = populate,
+        .source_token_start = source_range.start,
+        .source_token_end = source_range.end,
+    };
 }
 
 fn relationPopulationStatementTokenEnd(tokens: []const Token) usize {
-    var end = tokens.len;
-    while (end > 0 and tokens[end - 1].kind == .semicolon) end -= 1;
+    return relationPopulationStatementTokenEndInRange(tokens, 0, tokens.len);
+}
+
+fn relationPopulationStatementTokenEndInRange(tokens: []const Token, start: usize, token_end: usize) usize {
+    var end = token_end;
+    while (end > start and tokens[end - 1].kind == .semicolon) end -= 1;
     return end;
 }
 
-fn generatedSqlObjectIdentifierAlloc(
-    alloc: std.mem.Allocator,
+fn generatedSqlObjectIdentifierText(
     tokens: []const Token,
     range: generated_parser.GeneratedSqlTokenRange,
 ) ![]const u8 {
     if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
     if (range.end != range.start + 1) return error.UnsupportedSqlShape;
-    return try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[range.start].text);
+    return tokens[range.start].text;
 }
 
-test "sql adapter relation population validates retained generated ctas metadata" {
+fn findTopLevelRelationPopulationKeyword(
+    tokens: []const Token,
+    start: usize,
+    end: usize,
+    keyword: parser.TokenKeyword,
+) ?usize {
+    var depth: usize = 0;
+    var index = start;
+    while (index < end) : (index += 1) {
+        switch (tokens[index].kind) {
+            .lparen, .lbracket => depth += 1,
+            .rparen, .rbracket => {
+                if (depth == 0) return null;
+                depth -= 1;
+            },
+            else => if (depth == 0 and tokens[index].matchesKeywordTag(keyword)) return index,
+        }
+    }
+    return null;
+}
+
+fn consumeRelationPopulationLifetime(tokens: []const Token, index: *usize, end: usize) ?RelationLifetimeKind {
+    if (index.* >= end) return null;
+    if (tokens[index.*].matchesKeywordTag(.temp) or tokens[index.*].matchesKeywordTag(.temporary)) {
+        index.* += 1;
+        return .temporary;
+    }
+    if (tokens[index.*].matchesKeywordTag(.unlogged)) {
+        index.* += 1;
+        return .unlogged;
+    }
+    return null;
+}
+
+fn consumeRelationPopulationIfNotExists(tokens: []const Token, index: *usize, end: usize) bool {
+    if (index.* + 2 >= end) return false;
+    if (!tokens[index.*].matchesKeywordTag(.@"if") or
+        !tokens[index.* + 1].matchesKeywordTag(.not) or
+        !tokens[index.* + 2].matchesKeywordTag(.exists))
+    {
+        return false;
+    }
+    index.* += 3;
+    return true;
+}
+
+test "sql adapter relation population validates retained generated metadata" {
     const alloc = std.testing.allocator;
 
     const Hooks = struct {
@@ -3321,6 +4833,35 @@ test "sql adapter relation population validates retained generated ctas metadata
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &corrupt_populate, hooks));
+
+    var missing_select_source = try tokenized.ParsedSql.initAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10;");
+    defer missing_select_source.deinit(alloc);
+    if (missing_select_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| {
+                    const source_read = ddl.relation_population_source_read orelse return error.TestUnexpectedResult;
+                    source_read.deinit(alloc);
+                    alloc.destroy(source_read);
+                    ddl.relation_population_source_read = null;
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &missing_select_source, hooks));
+
+    var corrupt_select_target = try tokenized.ParsedSql.initAlloc(alloc, "SELECT account_id, total INTO usage_archive FROM usage_records WHERE total > 10;");
+    defer corrupt_select_target.deinit(alloc);
+    if (corrupt_select_target.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .ddl => |*ddl| ddl.object_name_tokens = .{ .start = 0, .end = 1 },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerRelationPopulationPlanWithParsedSqlAlloc(alloc, &corrupt_select_target, hooks));
 }
 
 fn relationPopulationSourceParsedSqlAlloc(
@@ -5482,6 +7023,19 @@ test "sql adapter plan consumes generated CTE prefix metadata before parsing bod
             _ = generated_cte;
             return error.TestUnexpectedResult;
         }
+
+        fn parseJoin(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            ctes: []const db_mod.types.RelationalRowsCte,
+            generated_cte: ?*const generated_parser.GeneratedSqlCteAst,
+        ) anyerror!LoweredJoin {
+            _ = ptr;
+            _ = tokens;
+            _ = ctes;
+            _ = generated_cte;
+            return error.TestUnexpectedResult;
+        }
     };
     var opaque_state: u8 = 0;
 
@@ -5503,6 +7057,7 @@ test "sql adapter plan consumes generated CTE prefix metadata before parsing bod
             .ptr = &opaque_state,
             .generated_read_ast = &stale_materialization,
             .parse_select = FailingParser.parseSelect,
+            .parse_join = FailingParser.parseJoin,
         },
     ));
 
@@ -5524,6 +7079,7 @@ test "sql adapter plan consumes generated CTE prefix metadata before parsing bod
             .ptr = &opaque_state,
             .generated_read_ast = &stale_column_aliases,
             .parse_select = FailingParser.parseSelect,
+            .parse_join = FailingParser.parseJoin,
         },
     ));
 }
@@ -5720,4 +7276,52 @@ test "sql adapter plan clones query check without catalog name" {
     try std.testing.expectEqual(@as(usize, 1), cloned.expression.?.rhs.len);
     try std.testing.expectEqualStrings("\"deleted\"", cloned.expression.?.rhs[0].value_json);
     try std.testing.expect(cloned.expression.?.rhs[0].value_json.ptr != source.expression.?.rhs[0].value_json.ptr);
+}
+
+test "document joined mutation request owns producers and source assignment data" {
+    const alloc = std.testing.allocator;
+
+    const target_ids = try alloc.alloc([]const u8, 1);
+    target_ids[0] = try alloc.dupe(u8, "doc:target");
+
+    const join_keys = try alloc.dupe(DocumentJoinedMutationJoinKey, &[_]DocumentJoinedMutationJoinKey{.{
+        .target_field = try alloc.dupe(u8, "_id"),
+        .source_field = try alloc.dupe(u8, "source_id"),
+    }});
+    const source_assignments = try alloc.dupe(DocumentJoinedMutationSourceAssignment, &[_]DocumentJoinedMutationSourceAssignment{.{
+        .target_path = try alloc.dupe(u8, "title"),
+        .source_field = try alloc.dupe(u8, "source_title"),
+        .field_type = .text,
+    }});
+    const transform_ops = try alloc.dupe(db_mod.types.TransformOp, &[_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = try alloc.dupe(u8, "updated_at"),
+        .value_json = try alloc.dupe(u8, "\"2026-01-01T00:00:00Z\""),
+    }});
+
+    var lowered = LoweredDocumentJoinedMutation{
+        .table_name = try alloc.dupe(u8, "docs"),
+        .source_table_name = try alloc.dupe(u8, "source_docs"),
+        .target_producer = .{ .id_lookup = .{
+            .ids = target_ids,
+            .residual_filter_json = try alloc.dupe(u8, "{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"}"),
+        } },
+        .source_producer = .{ .static = .{ .indexed_query = .{
+            .filter_query_json = try alloc.dupe(u8, "{\"field\":\"source_id\",\"op\":\"eq\",\"value\":\"doc:target\"}"),
+            .max_candidate_rows = 1,
+        } } },
+        .join_keys = join_keys,
+        .source_assignments = source_assignments,
+        .operation = .projection_write,
+        .template = .{ .transform = transform_ops },
+        .expected_version = 9,
+        .max_target_rows = 1,
+        .max_source_rows = 1,
+        .max_source_bytes = 4096,
+        .duplicate_source_policy = .reject,
+    };
+    try std.testing.expectEqual(db_mod.document_write.DocumentWriteOperation.projection_write, lowered.operation);
+    try std.testing.expectEqual(@as(usize, 1), lowered.join_keys.len);
+    try std.testing.expectEqual(@as(usize, 1), lowered.source_assignments.len);
+    lowered.deinit(alloc);
 }

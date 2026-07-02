@@ -131,6 +131,7 @@ fn appParityFixtureAppliedPlanMatchesDerived(
 fn appParityFixtureAllowsDocumentSourceSchema(entry: corpus.AppParityCorpusEntry) bool {
     return (entry.family == .read and corpus.corpusFixtureHasDocumentReadSummary(entry.summary)) or
         entry.family == .document_write or
+        entry.family == .truncate_source or
         ((entry.family == .unsupported_read or entry.family == .unsupported_write) and
             std.mem.startsWith(u8, entry.classification_reason, "document_sql_"));
 }

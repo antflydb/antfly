@@ -55,6 +55,7 @@ const table_catalog = @import("../metadata/catalog/routing.zig");
 const tables_api = @import("../metadata/catalog/table_ddl.zig");
 const catalog_resources = @import("catalog_resources.zig");
 const table_reads = @import("table_reads.zig");
+const table_read_document_sql = @import("table_reads/document_sql.zig");
 const table_router = @import("table_router.zig");
 const table_writes = @import("table_writes.zig");
 const serverless_artifacts = @import("../serverless/artifacts/mod.zig");
@@ -6042,6 +6043,30 @@ pub const ApiHttpServer = struct {
         return null;
     }
 
+    fn takePublicSqlRowsBatchFromDocumentBatch(document_batch: *sql_adapter.plan.OwnedDocumentBatchRequest) relational_rows_api.OwnedRowsBatchRequest {
+        const rows_batch = relational_rows_api.OwnedRowsBatchRequest{
+            .writes = document_batch.writes,
+            .deletes = document_batch.deletes,
+            .transforms = document_batch.transforms,
+            .predicates = document_batch.predicates,
+            .returning_rows = document_batch.returning_rows,
+            .req = document_batch.req,
+            .inserted = document_batch.inserted,
+            .deleted = document_batch.deleted,
+            .transformed = document_batch.transformed,
+        };
+        document_batch.writes = &.{};
+        document_batch.deletes = &.{};
+        document_batch.transforms = &.{};
+        document_batch.predicates = &.{};
+        document_batch.returning_rows = &.{};
+        document_batch.req = .{};
+        document_batch.inserted = 0;
+        document_batch.deleted = 0;
+        document_batch.transformed = 0;
+        return rows_batch;
+    }
+
     fn applyLoweredPublicSqlRowsBatchBeforeTriggers(
         self: *ApiHttpServer,
         table_name: []const u8,
@@ -7410,6 +7435,21 @@ pub const ApiHttpServer = struct {
                 return .{ .response = try self.publicSqlDiagnosticResponse(404, (sql_adapter.diagnostics.knownErrorDiagnostic(.bind, err) orelse .init(.bind, .invalid_sql_catalog))) };
             },
             error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.plan, .document_sql_write_unsupported)) },
+            error.DocumentSqlWriteJoinMissingCardinalityProof,
+            error.DocumentSqlWriteJoinMissingExactProducer,
+            error.DocumentSqlWriteJoinMissingIndexProof,
+            error.DocumentSqlWriteJoinOrderedIndexProof,
+            error.DocumentSqlWriteJoinPartialIndexProof,
+            error.DocumentSqlWriteJoinStaleIndexProof,
+            error.DocumentSqlWriteSourceAssignmentAlias,
+            error.DocumentSqlWriteSourceAssignmentAmbiguousReference,
+            error.DocumentSqlWriteSourceAssignmentGeneratedField,
+            error.DocumentSqlWriteSourceAssignmentMissingField,
+            error.DocumentSqlWriteSourceAssignmentReservedField,
+            error.DocumentSqlWriteSourceAssignmentTargetGeneratedField,
+            error.DocumentSqlWriteSourceAssignmentTargetReservedField,
+            error.DocumentSqlWriteSourceAssignmentTypeMismatch,
+            => return .{ .response = try self.publicSqlDiagnosticResponse(400, sql_adapter.diagnostics.knownErrorDiagnostic(.plan, err).?) },
             error.MissingSqlParameter => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_request)) },
             error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest, error.UnsupportedRowsSelector, error.RowSelectorNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.bind, .invalid_sql_write)) },
             error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.plan, .unsupported_sql_statement)) },
@@ -7622,6 +7662,81 @@ pub const ApiHttpServer = struct {
                 .result = .{ .rows_batch = .{
                     .result = merge_batch,
                     .columns = returning_columns,
+                } },
+            } };
+        }
+
+        if (lowered == .document_write or lowered == .document_producer_mutation or lowered == .document_joined_mutation) {
+            var document_batch = switch (lowered) {
+                .document_write => |*document_write| blk: {
+                    const batch = document_write.batch;
+                    document_write.batch = .{};
+                    break :blk batch;
+                },
+                .document_producer_mutation, .document_joined_mutation => blk: {
+                    const read_source = self.effectivePublicTableReads() orelse return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.bind, .table_not_found)) };
+                    const native_table_name = try catalog_resources.storageTableNameForTargetAlloc(self.alloc, .{
+                        .database_name = target.database_name,
+                        .namespace_name = target.namespace_name,
+                        .table_name = target.table_name,
+                    });
+                    defer self.alloc.free(native_table_name);
+                    var adapter = table_read_document_sql.RuntimeSourceAdapter{
+                        .source = read_source,
+                        .target = .{
+                            .database_name = target.database_name,
+                            .namespace_name = target.namespace_name,
+                            .table_name = target.table_name,
+                        },
+                        .native_table_name = native_table_name,
+                        .public_table_name = target.table_name,
+                    };
+                    break :blk switch (lowered) {
+                        .document_producer_mutation => |document_mutation| sql_adapter.document_runtime.materializeProducerMutationBatchAlloc(
+                            self.alloc,
+                            adapter.runtimeSource(),
+                            document_mutation,
+                            .read_index,
+                        ),
+                        .document_joined_mutation => |document_mutation| sql_adapter.document_runtime.materializeJoinedMutationBatchAlloc(
+                            self.alloc,
+                            adapter.runtimeSource(),
+                            document_mutation,
+                            .read_index,
+                        ),
+                        else => unreachable,
+                    } catch |err| switch (err) {
+                        error.DocumentSqlWriteDuplicateSource,
+                        error.DocumentSqlBoundedScanRowCapExceeded,
+                        error.DocumentSqlBoundedScanByteCapExceeded,
+                        error.DocumentSqlIndexUnavailable,
+                        => return .{ .response = try self.publicSqlDiagnosticResponse(400, (sql_adapter.diagnostics.knownErrorDiagnostic(.execute, err) orelse .init(.execute, .invalid_sql_request))) },
+                        error.DocumentSqlWriteUnsupported => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .document_sql_write_unsupported)) },
+                        error.InvalidRowsRequest, error.InvalidArgument, error.InvalidQueryRequest, error.UnsupportedQueryRequest => return .{ .response = try self.publicSqlDiagnosticResponse(400, .init(.execute, .invalid_sql_request)) },
+                        error.UnsupportedSqlShape, error.UnsupportedRowsQuery, error.UnsupportedOperation => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.execute, .unsupported_sql_statement)) },
+                        error.TableNotFound => return .{ .response = try self.publicSqlDiagnosticResponse(404, .init(.execute, .table_not_found)) },
+                        error.TopologyChanged => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .topology_changed)) },
+                        error.LeaderUnavailable, error.ReadUnavailable => return .{ .response = try self.publicSqlDiagnosticResponse(503, .init(.execute, .read_unavailable)) },
+                        else => return err,
+                    };
+                },
+                else => unreachable,
+            };
+            defer document_batch.deinit(self.alloc);
+
+            var rows_batch = takePublicSqlRowsBatchFromDocumentBatch(&document_batch);
+            var rows_batch_owned = true;
+            defer if (rows_batch_owned) rows_batch.deinit(self.alloc);
+            if (try self.applyLoweredPublicSqlRowsBatch(target_table, schema, &rows_batch, authenticated_identity)) |failure| return .{ .response = failure };
+            try self.enforceSqlStatementTimeout(statement_timeout_ns, statement_start_ns);
+
+            const owned_rows_batch = rows_batch;
+            rows_batch_owned = false;
+            return .{ .result = .{
+                .session_id = self.ensureSqlProtocolSessionId(session),
+                .statement_kind = @tagName(statement_kind),
+                .result = .{ .rows_batch = .{
+                    .result = owned_rows_batch,
                 } },
             } };
         }
@@ -8806,6 +8921,7 @@ pub const ApiHttpServer = struct {
         return switch (err) {
             error.DocumentSqlIndexUnavailable => "document_sql_index_unavailable",
             error.DocumentSqlRequiresBoundedScan => "document_sql_requires_bounded_scan",
+            error.DocumentSqlBoundedScanUnboundedSource => "document_sql_requires_bounded_scan",
             error.DocumentSqlBoundedScanRowCapExceeded => "document_sql_bounded_scan_row_cap_exceeded",
             error.DocumentSqlBoundedScanByteCapExceeded => "document_sql_bounded_scan_byte_cap_exceeded",
             error.DocumentSqlArrayRequiresUnnest => "document_sql_array_requires_unnest",
@@ -8855,6 +8971,22 @@ pub const ApiHttpServer = struct {
         diagnostic: sql_adapter.diagnostics.SqlDiagnosticEnvelope,
     ) !http_common.HttpResponse {
         return try self.publicSqlDiagnosticResponse(status, diagnostic.withSpan(parsed_sql.statement.raw().source_span));
+    }
+
+    fn publicSqlParseErrorDiagnosticResponse(self: *ApiHttpServer, status: u16, sql: []const u8) !http_common.HttpResponse {
+        var diagnostic = sql_adapter.diagnostics.SqlDiagnosticEnvelope.init(.parse, .invalid_sql_request);
+        var tokens = sql_adapter.lexer.tokenizeAlloc(self.alloc, sql) catch
+            return try self.publicSqlDiagnosticResponse(status, diagnostic);
+        defer sql_adapter.lexer.freeTokens(self.alloc, &tokens);
+        const maybe_generated_diagnostic = sql_adapter.generated_parser.diagnosticAlloc(self.alloc, tokens.items) catch null;
+        if (maybe_generated_diagnostic) |generated_diagnostic| {
+            defer self.alloc.free(generated_diagnostic.expected);
+            diagnostic = diagnostic.withSpan(.{
+                .start = generated_diagnostic.source_start,
+                .end = generated_diagnostic.source_end,
+            });
+        }
+        return try self.publicSqlDiagnosticResponse(status, diagnostic);
     }
 
     pub fn handlePublicSqlRequest(self: *ApiHttpServer, request: PublicSqlRequest, authenticated_identity: ?AuthenticatedIdentity) !http_common.HttpResponse {
@@ -10117,6 +10249,11 @@ pub const ApiHttpServer = struct {
                 try self.savePublicSqlSession(session);
                 return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.parse, .unsupported_sql_statement)) };
             },
+            error.UnexpectedToken => {
+                self.markPublicSqlTransactionFailedIfActive(&session);
+                try self.savePublicSqlSession(session);
+                return .{ .response = try self.publicSqlParseErrorDiagnosticResponse(400, request.sql) };
+            },
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
@@ -10767,6 +10904,7 @@ pub const ApiHttpServer = struct {
 
         var parsed_sql = sql_adapter.ParsedSql.initAlloc(self.alloc, request.sql) catch |err| switch (err) {
             error.UnsupportedSqlShape => return .{ .response = try self.publicSqlDiagnosticResponse(501, .init(.parse, .unsupported_sql_statement)) },
+            error.UnexpectedToken => return .{ .response = try self.publicSqlParseErrorDiagnosticResponse(400, request.sql) },
             else => return err,
         };
         defer parsed_sql.deinit(self.alloc);
@@ -30641,6 +30779,50 @@ fn expectPublicSqlDiagnosticMissingNativeModel(
     try std.testing.expectEqualStrings(expected_missing_native_model, err_obj.object.get("missing_native_model").?.string);
 }
 
+test "api http server surfaces public SQL parse diagnostics for generated malformed SQL" {
+    const alloc = std.testing.allocator;
+    const FakeSource = struct {
+        fn iface(self: *@This()) StatusSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{ .status = status },
+            };
+        }
+
+        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
+            return .{
+                .metadata_group_id = 77,
+                .metrics = .{},
+                .projected_stores = 1,
+            };
+        }
+    };
+
+    var source = FakeSource{};
+    var server = ApiHttpServer.init(alloc, .{}, source.iface(), null, null);
+    defer server.deinit();
+
+    var execute_resp = try server.handlePublicSql(
+        "{\"sql\":\"SELECT id FROM usage_records WHERE\"}",
+        null,
+    );
+    defer execute_resp.deinit(alloc);
+    try std.testing.expectEqual(@as(u16, 400), execute_resp.status);
+    try expectPublicSqlDiagnosticBody(alloc, execute_resp.body, "parse", "invalid_sql_request", "invalid sql request", 34, 34);
+
+    var describe_outcome = try server.handlePublicSqlDescribeRequestResult(.{
+        .sql = "SELECT id FROM usage_records WHERE",
+    }, null);
+    defer describe_outcome.deinit(alloc);
+    switch (describe_outcome) {
+        .response => |response| {
+            try std.testing.expectEqual(@as(u16, 400), response.status);
+            try expectPublicSqlDiagnosticBody(alloc, response.body, "parse", "invalid_sql_request", "invalid sql request", 34, 34);
+        },
+        .result => return error.TestUnexpectedResult,
+    }
+}
+
 test "api http server binds public sql authorization to resolved statement targets" {
     const alloc = std.testing.allocator;
     const schema_json =
@@ -32175,2040 +32357,6 @@ test "api http server executes Antfly SQL query functions through native query p
     try std.testing.expectEqualStrings("doc:semantic_projected", projected_semantic_row.get("_id").?.string);
     try std.testing.expectApproxEqAbs(@as(f64, 0.91), projected_semantic_row.get("_score").?.float, 0.0001);
     try std.testing.expect(projected_semantic_row.get("_source") == null);
-}
-
-test "api http server executes SQL reads through typed row plan ingress" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-sql-read", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-    try db.applyTableSchemaJson(alloc, schema_json, .{});
-
-    var read_source = table_reads.BoundTableReadSource.init("usage_records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
-    var write_source = table_writes.BoundTableWriteSource.init("usage_records", &db);
-
-    const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
-
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{
-                .status = try status(ptr),
-                .tables = self.tables[0..],
-                .ranges = &.{},
-                .stores = &.{},
-                .placement_intents = &.{},
-                .split_transitions = &.{},
-                .merge_transitions = &.{},
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = FakeSource{ .tables = .{.{
-        .table_id = 1,
-        .name = "usage_records",
-        .schema_json = schema_json,
-        .desired_replica_count = 1,
-    }} };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
-    defer server.deinit();
-
-    var insert_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/usage_records/rows/batch",
-        .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"status\":\"open\",\"amount\":10}},{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"status\":\"closed\",\"amount\":90}},{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"status\":\"open\",\"amount\":20}}]}",
-    });
-    defer insert_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
-
-    var query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, amount FROM usage_records WHERE status = 'open' ORDER BY amount DESC;\"}",
-    });
-    defer query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
-    try std.testing.expectEqualStrings("application/json", query_resp.content_type.?);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("read", parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", parsed.value.object.get("statement_kind").?.string);
-    try std.testing.expect(parsed.value.object.get("session_id").?.integer > 0);
-    const result = parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), result.get("total").?.integer);
-    const rows = result.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), rows.len);
-    try std.testing.expectEqualStrings("u3", rows[0].object.get("id").?.string);
-    try std.testing.expectEqual(@as(i64, 20), rows[0].object.get("amount").?.integer);
-    try std.testing.expectEqualStrings("u1", rows[1].object.get("id").?.string);
-    try std.testing.expectEqual(@as(i64, 10), rows[1].object.get("amount").?.integer);
-
-    var exists_subquery_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE status = 'open');\"}",
-    });
-    defer exists_subquery_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), exists_subquery_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, exists_subquery_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, exists_subquery_resp.body, "semijoin execution for EXISTS subquery predicate");
-
-    var quantified_subquery_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records);\"}",
-    });
-    defer quantified_subquery_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), quantified_subquery_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, quantified_subquery_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, quantified_subquery_resp.body, "quantified comparison execution for read-subquery predicate");
-
-    var describe_exists_subquery = try server.handlePublicSqlDescribeRequestResult(.{
-        .sql = "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE status = 'open');",
-    }, null);
-    defer describe_exists_subquery.deinit(alloc);
-    switch (describe_exists_subquery) {
-        .response => |response| {
-            try std.testing.expectEqual(@as(u16, 501), response.status);
-            try expectPublicSqlDiagnosticBody(alloc, response.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-            try expectPublicSqlDiagnosticMissingNativeModel(alloc, response.body, "semijoin execution for EXISTS subquery predicate");
-        },
-        .result => return error.TestUnexpectedResult,
-    }
-
-    var aggregate_claim_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT status, COUNT(*) AS count FROM usage_records GROUP BY status FOR UPDATE;\"}",
-    });
-    defer aggregate_claim_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), aggregate_claim_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, aggregate_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, aggregate_claim_resp.body, "lockable base-row source for aggregate row claim");
-
-    var describe_aggregate_claim = try server.handlePublicSqlDescribeRequestResult(.{
-        .sql = "SELECT status, COUNT(*) AS count FROM usage_records GROUP BY status FOR UPDATE;",
-    }, null);
-    defer describe_aggregate_claim.deinit(alloc);
-    switch (describe_aggregate_claim) {
-        .response => |response| {
-            try std.testing.expectEqual(@as(u16, 501), response.status);
-            try expectPublicSqlDiagnosticBody(alloc, response.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-            try expectPublicSqlDiagnosticMissingNativeModel(alloc, response.body, "lockable base-row source for aggregate row claim");
-        },
-        .result => return error.TestUnexpectedResult,
-    }
-
-    var join_claim_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT target.id FROM usage_records AS target JOIN usage_records AS source ON target.status = source.status FOR UPDATE;\"}",
-    });
-    defer join_claim_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), join_claim_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, join_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, join_claim_resp.body, "lockable base-row source for join row claim");
-
-    var window_claim_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, row_number() OVER (ORDER BY amount) AS rn FROM usage_records FOR UPDATE;\"}",
-    });
-    defer window_claim_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), window_claim_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, window_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, window_claim_resp.body, "lockable base-row source for window row claim");
-
-    var cte_claim_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"WITH locked_usage AS (SELECT id FROM usage_records FOR UPDATE) SELECT id FROM locked_usage;\"}",
-    });
-    defer cte_claim_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), cte_claim_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, cte_claim_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
-    try expectPublicSqlDiagnosticMissingNativeModel(alloc, cte_claim_resp.body, "lockable base-row source for materialized CTE row claim");
-}
-
-test "api http server executes domain SQL fixtures through typed row plan parity" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"kind":{"type":"keyword"},"tenant_id":{"type":"keyword"},"subject_id":{"type":"keyword"},"access_role":{"type":"keyword"},"resource_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"priority":{"type":"numeric"},"created_at":{"type":"numeric"},"migrated":{"type":"boolean"},"updated_at":{"type":"numeric"}},"required":["id","kind"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/domain-sql-typed-parity", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-    try db.applyTableSchemaJson(alloc, schema_json, .{});
-
-    var read_source = table_reads.BoundTableReadSource.init("domain_records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
-    var write_source = table_writes.BoundTableWriteSource.init("domain_records", &db);
-
-    const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
-
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{
-                .status = try status(ptr),
-                .tables = self.tables[0..],
-                .ranges = &.{},
-                .stores = &.{},
-                .placement_intents = &.{},
-                .split_transitions = &.{},
-                .merge_transitions = &.{},
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = FakeSource{ .tables = .{.{
-        .table_id = 1,
-        .name = "domain_records",
-        .schema_json = schema_json,
-        .desired_replica_count = 1,
-    }} };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
-    defer server.deinit();
-
-    var insert_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/domain_records/rows/batch",
-        .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"u1\",\"kind\":\"usage\",\"tenant_id\":\"t1\",\"status\":\"active\",\"amount\":10,\"created_at\":10}},{\"op\":\"insert\",\"row\":{\"id\":\"u2\",\"kind\":\"usage\",\"tenant_id\":\"t1\",\"status\":\"active\",\"amount\":25,\"created_at\":20}},{\"op\":\"insert\",\"row\":{\"id\":\"u3\",\"kind\":\"usage\",\"tenant_id\":\"t1\",\"status\":\"archived\",\"amount\":5,\"created_at\":30}},{\"op\":\"insert\",\"row\":{\"id\":\"u4\",\"kind\":\"usage\",\"tenant_id\":\"t2\",\"status\":\"active\",\"amount\":7,\"created_at\":40}},{\"op\":\"insert\",\"row\":{\"id\":\"m1\",\"kind\":\"membership\",\"tenant_id\":\"t1\",\"subject_id\":\"user:1\",\"access_role\":\"admin\",\"resource_id\":\"project:1\",\"status\":\"active\",\"migrated\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"m2\",\"kind\":\"membership\",\"tenant_id\":\"t1\",\"subject_id\":\"user:1\",\"access_role\":\"viewer\",\"resource_id\":\"project:2\",\"status\":\"active\",\"migrated\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"m3\",\"kind\":\"membership\",\"tenant_id\":\"t2\",\"subject_id\":\"user:1\",\"access_role\":\"admin\",\"resource_id\":\"project:9\",\"status\":\"active\",\"migrated\":true}},{\"op\":\"insert\",\"row\":{\"id\":\"w1\",\"kind\":\"wake_job\",\"tenant_id\":\"t1\",\"status\":\"queued\",\"priority\":5,\"created_at\":100}},{\"op\":\"insert\",\"row\":{\"id\":\"w2\",\"kind\":\"wake_job\",\"tenant_id\":\"t1\",\"status\":\"queued\",\"priority\":10,\"created_at\":90}},{\"op\":\"insert\",\"row\":{\"id\":\"w3\",\"kind\":\"wake_job\",\"tenant_id\":\"t1\",\"status\":\"running\",\"priority\":100,\"created_at\":80}},{\"op\":\"insert\",\"row\":{\"id\":\"b1\",\"kind\":\"backfill\",\"tenant_id\":\"t1\",\"status\":\"validated\",\"migrated\":true,\"updated_at\":1000}},{\"op\":\"insert\",\"row\":{\"id\":\"b2\",\"kind\":\"backfill\",\"tenant_id\":\"t1\",\"status\":\"pending\",\"migrated\":false,\"updated_at\":1001}}]}",
-    });
-    defer insert_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 201), insert_resp.status);
-
-    var sql_usage_resp = try server.handlePublicSql("{\"sql\":\"SELECT tenant_id, status, SUM(amount) AS amount_sum, COUNT(*) AS row_count FROM domain_records WHERE kind = 'usage' GROUP BY tenant_id, status ORDER BY tenant_id ASC, status ASC;\"}", null);
-    defer sql_usage_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_usage_resp.status);
-    var parsed_sql_usage = try std.json.parseFromSlice(std.json.Value, alloc, sql_usage_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_usage.deinit();
-    const sql_usage_rows = parsed_sql_usage.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), sql_usage_rows.len);
-    try std.testing.expectEqualStrings("t1", sql_usage_rows[0].object.get("tenant_id").?.string);
-    try std.testing.expectEqualStrings("active", sql_usage_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 35), sql_usage_rows[0].object.get("amount_sum").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), sql_usage_rows[0].object.get("row_count").?.integer);
-
-    var typed_usage_resp = try server.handlePublicTableRowsAggregate("domain_records", "{\"aggregate\":{\"source\":{\"where\":{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"usage\"}},\"group_by\":[\"tenant_id\",\"status\"],\"aggregations\":[{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"},{\"name\":\"row_count\",\"op\":\"count\"}],\"order_by\":[{\"field\":\"tenant_id\"},{\"field\":\"status\"}]}}", null);
-    defer typed_usage_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_usage_resp.status);
-    var parsed_typed_usage = try std.json.parseFromSlice(std.json.Value, alloc, typed_usage_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_usage.deinit();
-    const typed_usage_rows = parsed_typed_usage.value.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), typed_usage_rows.len);
-    try std.testing.expectEqualStrings("t1", typed_usage_rows[0].object.get("tenant_id").?.string);
-    try std.testing.expectEqualStrings("active", typed_usage_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 35), typed_usage_rows[0].object.get("amount_sum").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), typed_usage_rows[0].object.get("row_count").?.integer);
-
-    var sql_rbac_resp = try server.handlePublicSql("{\"sql\":\"SELECT resource_id, access_role FROM domain_records WHERE kind = 'membership' AND tenant_id = 't1' AND subject_id = 'user:1' AND status = 'active' ORDER BY resource_id ASC;\"}", null);
-    defer sql_rbac_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_rbac_resp.status);
-    var parsed_sql_rbac = try std.json.parseFromSlice(std.json.Value, alloc, sql_rbac_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_rbac.deinit();
-    const sql_rbac_rows = parsed_sql_rbac.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), sql_rbac_rows.len);
-    try std.testing.expectEqualStrings("project:1", sql_rbac_rows[0].object.get("resource_id").?.string);
-    try std.testing.expectEqualStrings("admin", sql_rbac_rows[0].object.get("access_role").?.string);
-
-    var typed_rbac_resp = try server.handlePublicTableRowsQuery("domain_records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"membership\"},{\"field\":\"tenant_id\",\"op\":\"eq\",\"value\":\"t1\"},{\"field\":\"subject_id\",\"op\":\"eq\",\"value\":\"user:1\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"active\"}]},\"select\":[\"resource_id\",\"access_role\"],\"order_by\":[{\"field\":\"resource_id\"}]}}", null);
-    defer typed_rbac_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_rbac_resp.status);
-    var parsed_typed_rbac = try std.json.parseFromSlice(std.json.Value, alloc, typed_rbac_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_rbac.deinit();
-    const typed_rbac_rows = parsed_typed_rbac.value.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), typed_rbac_rows.len);
-    try std.testing.expectEqualStrings("project:1", typed_rbac_rows[0].object.get("resource_id").?.string);
-    try std.testing.expectEqualStrings("admin", typed_rbac_rows[0].object.get("access_role").?.string);
-
-    var sql_wake_resp = try server.handlePublicSql("{\"sql\":\"SELECT id, priority FROM domain_records WHERE kind = 'wake_job' AND status = 'queued' ORDER BY priority DESC, created_at ASC LIMIT 1;\"}", null);
-    defer sql_wake_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_wake_resp.status);
-    var parsed_sql_wake = try std.json.parseFromSlice(std.json.Value, alloc, sql_wake_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_wake.deinit();
-    const sql_wake_rows = parsed_sql_wake.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), sql_wake_rows.len);
-    try std.testing.expectEqualStrings("w2", sql_wake_rows[0].object.get("id").?.string);
-    try std.testing.expectEqual(@as(i64, 10), sql_wake_rows[0].object.get("priority").?.integer);
-
-    var typed_wake_resp = try server.handlePublicTableRowsQuery("domain_records", "{\"query\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"wake_job\"},{\"field\":\"status\",\"op\":\"eq\",\"value\":\"queued\"}]},\"select\":[\"id\",\"priority\"],\"order_by\":[{\"field\":\"priority\",\"direction\":\"desc\"},{\"field\":\"created_at\",\"direction\":\"asc\"}],\"limit\":1}}", null);
-    defer typed_wake_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_wake_resp.status);
-    var parsed_typed_wake = try std.json.parseFromSlice(std.json.Value, alloc, typed_wake_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_wake.deinit();
-    const typed_wake_rows = parsed_typed_wake.value.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), typed_wake_rows.len);
-    try std.testing.expectEqualStrings("w2", typed_wake_rows[0].object.get("id").?.string);
-    try std.testing.expectEqual(@as(i64, 10), typed_wake_rows[0].object.get("priority").?.integer);
-
-    var sql_dashboard_resp = try server.handlePublicSql("{\"sql\":\"SELECT status, COUNT(*) AS row_count, SUM(amount) AS amount_sum FROM domain_records WHERE kind = 'usage' AND tenant_id = 't1' GROUP BY status ORDER BY status ASC;\"}", null);
-    defer sql_dashboard_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_dashboard_resp.status);
-    var parsed_sql_dashboard = try std.json.parseFromSlice(std.json.Value, alloc, sql_dashboard_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_dashboard.deinit();
-    const sql_dashboard_rows = parsed_sql_dashboard.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), sql_dashboard_rows.len);
-    try std.testing.expectEqualStrings("active", sql_dashboard_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 2), sql_dashboard_rows[0].object.get("row_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 35), sql_dashboard_rows[0].object.get("amount_sum").?.integer);
-
-    var typed_dashboard_resp = try server.handlePublicTableRowsAggregate("domain_records", "{\"aggregate\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"usage\"},{\"field\":\"tenant_id\",\"op\":\"eq\",\"value\":\"t1\"}]}},\"group_by\":[\"status\"],\"aggregations\":[{\"name\":\"row_count\",\"op\":\"count\"},{\"name\":\"amount_sum\",\"op\":\"sum\",\"field\":\"amount\"}],\"order_by\":[{\"field\":\"status\"}]}}", null);
-    defer typed_dashboard_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_dashboard_resp.status);
-    var parsed_typed_dashboard = try std.json.parseFromSlice(std.json.Value, alloc, typed_dashboard_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_dashboard.deinit();
-    const typed_dashboard_rows = parsed_typed_dashboard.value.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), typed_dashboard_rows.len);
-    try std.testing.expectEqualStrings("active", typed_dashboard_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 2), typed_dashboard_rows[0].object.get("row_count").?.integer);
-    try std.testing.expectEqual(@as(i64, 35), typed_dashboard_rows[0].object.get("amount_sum").?.integer);
-
-    var sql_backfill_resp = try server.handlePublicSql("{\"sql\":\"SELECT COUNT(*) AS missing_count FROM domain_records WHERE kind = 'backfill' AND migrated = false;\"}", null);
-    defer sql_backfill_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_backfill_resp.status);
-    var parsed_sql_backfill = try std.json.parseFromSlice(std.json.Value, alloc, sql_backfill_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_backfill.deinit();
-    const sql_backfill_rows = parsed_sql_backfill.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), sql_backfill_rows.len);
-    try std.testing.expectEqual(@as(i64, 1), sql_backfill_rows[0].object.get("missing_count").?.integer);
-
-    var typed_backfill_resp = try server.handlePublicTableRowsAggregate("domain_records", "{\"aggregate\":{\"source\":{\"where\":{\"all\":[{\"field\":\"kind\",\"op\":\"eq\",\"value\":\"backfill\"},{\"field\":\"migrated\",\"op\":\"eq\",\"value\":false}]}},\"aggregations\":[{\"name\":\"missing_count\",\"op\":\"count\"}]}}", null);
-    defer typed_backfill_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_backfill_resp.status);
-    var parsed_typed_backfill = try std.json.parseFromSlice(std.json.Value, alloc, typed_backfill_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_backfill.deinit();
-    const typed_backfill_rows = parsed_typed_backfill.value.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 1), typed_backfill_rows.len);
-    try std.testing.expectEqual(@as(i64, 1), typed_backfill_rows[0].object.get("missing_count").?.integer);
-}
-
-test "api http server executes document SQL reads through typed document plan ingress" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"title":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"note":{"type":"keyword"},"metadata":{"type":"json"},"tags":{"type":"array","items":{"type":"keyword"}}},"additionalProperties":true}}}}
-    ;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-document-sql-read", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-    try db.applyTableSchemaJson(alloc, schema_json, .{});
-    try db.addIndex(.{ .name = "full_text_index_v0", .kind = .full_text, .config_json = "{}" });
-    try db.batch(.{
-        .writes = &.{
-            .{ .key = "doc:a", .value = "{\"title\":\"alpha\",\"status\":\"active\",\"amount\":10,\"note\":null,\"metadata\":{\"plan\":\"pro\"},\"tags\":[\"urgent\",\"vip\"]}" },
-            .{ .key = "doc:b", .value = "{\"title\":\"beta\",\"status\":\"archived\",\"amount\":20,\"metadata\":{\"plan\":\"free\"},\"tags\":[\"stale\"]}" },
-        },
-        .sync_level = .full_index,
-    });
-
-    const native_table_name = try catalog_resources.defaultPublicTableResourceNameAlloc(alloc, "docs");
-    defer alloc.free(native_table_name);
-    const DualNameReads = struct {
-        public: table_reads.BoundTableReadSource,
-        native: table_reads.BoundTableReadSource,
-
-        fn source(self: *@This()) table_reads.TableReadSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .lookup = lookup,
-                    .scan = scan,
-                    .query = query,
-                },
-            };
-        }
-
-        fn route(self: *@This(), table_name: []const u8) table_reads.TableReadSource {
-            if (std.mem.eql(u8, table_name, "docs")) return self.public.source();
-            return self.native.source();
-        }
-
-        fn lookup(
-            ptr: *anyopaque,
-            inner_alloc: std.mem.Allocator,
-            table_name: []const u8,
-            key: []const u8,
-            opts: db_mod.types.LookupOptions,
-            consistency: raft_mod.ReadConsistency,
-        ) !?table_reads.LookupResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.route(table_name).lookup(inner_alloc, table_name, key, opts, consistency);
-        }
-
-        fn scan(
-            ptr: *anyopaque,
-            inner_alloc: std.mem.Allocator,
-            table_name: []const u8,
-            from_key: []const u8,
-            to_key: []const u8,
-            opts: db_mod.types.ScanOptions,
-            consistency: raft_mod.ReadConsistency,
-        ) !?table_reads.ScanResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.route(table_name).scan(inner_alloc, table_name, from_key, to_key, opts, consistency);
-        }
-
-        fn query(
-            ptr: *anyopaque,
-            inner_alloc: std.mem.Allocator,
-            table_name: []const u8,
-            req: db_mod.types.SearchRequest,
-            consistency: raft_mod.ReadConsistency,
-        ) !?query_api.QueryResponse {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return try self.route(table_name).query(inner_alloc, table_name, req, consistency);
-        }
-    };
-    var read_source = DualNameReads{
-        .public = table_reads.BoundTableReadSource.init("docs", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester()),
-        .native = table_reads.BoundTableReadSource.init(native_table_name, 1, &db, raft_mod.read_gate.noopReadableLeaseRequester()),
-    };
-
-    const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
-
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{
-                .status = try status(ptr),
-                .tables = self.tables[0..],
-                .ranges = &.{},
-                .stores = &.{},
-                .placement_intents = &.{},
-                .split_transitions = &.{},
-                .merge_transitions = &.{},
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = FakeSource{ .tables = .{.{
-        .table_id = 1,
-        .name = "docs",
-        .schema_json = schema_json,
-        .desired_replica_count = 1,
-    }} };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), null);
-    defer server.deinit();
-
-    var query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, _doc, title, metadata->>'plan' AS plan FROM docs WHERE _id = 'doc:a';\"}",
-    });
-    defer query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
-    try std.testing.expectEqualStrings("application/json", query_resp.content_type.?);
-
-    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed.deinit();
-    try std.testing.expectEqualStrings("read", parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", parsed.value.object.get("statement_kind").?.string);
-    const result = parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), result.get("total").?.integer);
-    const row = result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", row.get("_id").?.string);
-    try std.testing.expectEqualStrings("alpha", row.get("title").?.string);
-    try std.testing.expectEqualStrings("pro", row.get("plan").?.string);
-    const doc = row.get("_doc").?.object;
-    try std.testing.expectEqualStrings("active", doc.get("status").?.string);
-
-    var alias_star_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d.* FROM docs AS d WHERE d._id = 'doc:a';\"}",
-    });
-    defer alias_star_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), alias_star_resp.status);
-    try std.testing.expectEqualStrings("application/json", alias_star_resp.content_type.?);
-
-    var alias_star_parsed = try std.json.parseFromSlice(std.json.Value, alloc, alias_star_resp.body, .{ .allocate = .alloc_always });
-    defer alias_star_parsed.deinit();
-    try std.testing.expectEqualStrings("read", alias_star_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", alias_star_parsed.value.object.get("statement_kind").?.string);
-    const alias_star_result = alias_star_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), alias_star_result.get("total").?.integer);
-    const alias_star_row = alias_star_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", alias_star_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("alpha", alias_star_row.get("title").?.string);
-    try std.testing.expectEqualStrings("active", alias_star_row.get("status").?.string);
-    try std.testing.expectEqualStrings("pro", alias_star_row.get("metadata").?.object.get("plan").?.string);
-    try std.testing.expectEqualStrings("active", alias_star_row.get("_doc").?.object.get("status").?.string);
-
-    var alias_project_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, d.title, d.metadata->>'plan' AS plan FROM docs AS d WHERE d.status = 'active' LIMIT 10;\"}",
-    });
-    defer alias_project_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), alias_project_resp.status);
-    try std.testing.expectEqualStrings("application/json", alias_project_resp.content_type.?);
-
-    var alias_project_parsed = try std.json.parseFromSlice(std.json.Value, alloc, alias_project_resp.body, .{ .allocate = .alloc_always });
-    defer alias_project_parsed.deinit();
-    try std.testing.expectEqualStrings("read", alias_project_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", alias_project_parsed.value.object.get("statement_kind").?.string);
-    const alias_project_result = alias_project_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), alias_project_result.get("total").?.integer);
-    const alias_project_row = alias_project_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", alias_project_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("alpha", alias_project_row.get("title").?.string);
-    try std.testing.expectEqualStrings("pro", alias_project_row.get("plan").?.string);
-
-    var full_text_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, title FROM docs WHERE full_text_search('title:alpha') LIMIT 5;\"}",
-    });
-    defer full_text_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), full_text_resp.status);
-    try std.testing.expectEqualStrings("application/json", full_text_resp.content_type.?);
-
-    var full_text_parsed = try std.json.parseFromSlice(std.json.Value, alloc, full_text_resp.body, .{ .allocate = .alloc_always });
-    defer full_text_parsed.deinit();
-    try std.testing.expectEqualStrings("read", full_text_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", full_text_parsed.value.object.get("statement_kind").?.string);
-    const full_text_result = full_text_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), full_text_result.get("total").?.integer);
-    const full_text_row = full_text_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", full_text_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("alpha", full_text_row.get("title").?.string);
-
-    const native_query_body = try test_contract_helpers.encodeMatchQueryRequest(alloc, "title", "alpha", &.{ "title", "status" }, 5);
-    defer alloc.free(native_query_body);
-    var native_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/docs/query",
-        .content_type = "application/json",
-        .body = native_query_body,
-    });
-    defer native_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), native_query_resp.status);
-    try std.testing.expectEqualStrings("application/json", native_query_resp.content_type.?);
-    var native_query_parsed = try std.json.parseFromSlice(metadata_openapi.QueryResponses, alloc, native_query_resp.body, .{});
-    defer native_query_parsed.deinit();
-    try std.testing.expectEqual(@as(usize, 1), native_query_parsed.value.responses.?.len);
-    try std.testing.expectEqualStrings(full_text_row.get("_id").?.string, native_query_parsed.value.responses.?[0].hits.?.hits.?[0]._id);
-
-    var full_text_residual_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, status FROM docs WHERE full_text_search('title:alpha') AND status = 'active' LIMIT 5;\"}",
-    });
-    defer full_text_residual_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), full_text_residual_resp.status);
-    try std.testing.expectEqualStrings("application/json", full_text_residual_resp.content_type.?);
-
-    var full_text_residual_parsed = try std.json.parseFromSlice(std.json.Value, alloc, full_text_residual_resp.body, .{ .allocate = .alloc_always });
-    defer full_text_residual_parsed.deinit();
-    try std.testing.expectEqualStrings("read", full_text_residual_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", full_text_residual_parsed.value.object.get("statement_kind").?.string);
-    const full_text_residual_result = full_text_residual_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), full_text_residual_result.get("total").?.integer);
-    const full_text_residual_row = full_text_residual_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", full_text_residual_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("active", full_text_residual_row.get("status").?.string);
-
-    var bounded_scalar_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, status FROM docs WHERE status = 'active' LIMIT 10;\"}",
-    });
-    defer bounded_scalar_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), bounded_scalar_resp.status);
-    try std.testing.expectEqualStrings("application/json", bounded_scalar_resp.content_type.?);
-
-    var bounded_scalar_parsed = try std.json.parseFromSlice(std.json.Value, alloc, bounded_scalar_resp.body, .{ .allocate = .alloc_always });
-    defer bounded_scalar_parsed.deinit();
-    try std.testing.expectEqualStrings("read", bounded_scalar_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", bounded_scalar_parsed.value.object.get("statement_kind").?.string);
-    const bounded_scalar_result = bounded_scalar_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), bounded_scalar_result.get("total").?.integer);
-    const bounded_scalar_row = bounded_scalar_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", bounded_scalar_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("active", bounded_scalar_row.get("status").?.string);
-
-    var scalar_ops_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, amount FROM docs WHERE status IN ('active', 'pending') AND title LIKE 'alp%' AND amount BETWEEN 5 AND 15 LIMIT 10;\"}",
-    });
-    defer scalar_ops_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), scalar_ops_resp.status);
-    try std.testing.expectEqualStrings("application/json", scalar_ops_resp.content_type.?);
-
-    var scalar_ops_parsed = try std.json.parseFromSlice(std.json.Value, alloc, scalar_ops_resp.body, .{ .allocate = .alloc_always });
-    defer scalar_ops_parsed.deinit();
-    try std.testing.expectEqualStrings("read", scalar_ops_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", scalar_ops_parsed.value.object.get("statement_kind").?.string);
-    const scalar_ops_result = scalar_ops_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), scalar_ops_result.get("total").?.integer);
-    const scalar_ops_row = scalar_ops_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", scalar_ops_row.get("_id").?.string);
-    try std.testing.expectEqual(@as(i64, 10), scalar_ops_row.get("amount").?.integer);
-
-    var null_predicate_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WHERE note IS NULL ORDER BY _id ASC LIMIT 10;\"}",
-    });
-    defer null_predicate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), null_predicate_resp.status);
-    try std.testing.expectEqualStrings("application/json", null_predicate_resp.content_type.?);
-
-    var null_predicate_parsed = try std.json.parseFromSlice(std.json.Value, alloc, null_predicate_resp.body, .{ .allocate = .alloc_always });
-    defer null_predicate_parsed.deinit();
-    try std.testing.expectEqualStrings("read", null_predicate_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", null_predicate_parsed.value.object.get("statement_kind").?.string);
-    const null_predicate_rows = null_predicate_parsed.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), null_predicate_rows.len);
-    try std.testing.expectEqualStrings("doc:a", null_predicate_rows[0].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("doc:b", null_predicate_rows[1].object.get("_id").?.string);
-
-    var not_null_predicate_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WHERE status IS NOT NULL ORDER BY _id ASC LIMIT 10;\"}",
-    });
-    defer not_null_predicate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), not_null_predicate_resp.status);
-    try std.testing.expectEqualStrings("application/json", not_null_predicate_resp.content_type.?);
-
-    var not_null_predicate_parsed = try std.json.parseFromSlice(std.json.Value, alloc, not_null_predicate_resp.body, .{ .allocate = .alloc_always });
-    defer not_null_predicate_parsed.deinit();
-    try std.testing.expectEqualStrings("read", not_null_predicate_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", not_null_predicate_parsed.value.object.get("statement_kind").?.string);
-    const not_null_predicate_rows = not_null_predicate_parsed.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), not_null_predicate_rows.len);
-    try std.testing.expectEqualStrings("doc:a", not_null_predicate_rows[0].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("doc:b", not_null_predicate_rows[1].object.get("_id").?.string);
-
-    var json_path_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, metadata->>'plan' AS plan FROM docs WHERE metadata->>'plan' = 'pro' LIMIT 10;\"}",
-    });
-    defer json_path_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), json_path_resp.status);
-    try std.testing.expectEqualStrings("application/json", json_path_resp.content_type.?);
-
-    var json_path_parsed = try std.json.parseFromSlice(std.json.Value, alloc, json_path_resp.body, .{ .allocate = .alloc_always });
-    defer json_path_parsed.deinit();
-    try std.testing.expectEqualStrings("read", json_path_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", json_path_parsed.value.object.get("statement_kind").?.string);
-    const json_path_result = json_path_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), json_path_result.get("total").?.integer);
-    const json_path_row = json_path_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", json_path_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("pro", json_path_row.get("plan").?.string);
-
-    var unnest_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'urgent' LIMIT 10;\"}",
-    });
-    defer unnest_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), unnest_resp.status);
-    try std.testing.expectEqualStrings("application/json", unnest_resp.content_type.?);
-
-    var unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_resp.body, .{ .allocate = .alloc_always });
-    defer unnest_parsed.deinit();
-    try std.testing.expectEqualStrings("read", unnest_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", unnest_parsed.value.object.get("statement_kind").?.string);
-    const unnest_result = unnest_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), unnest_result.get("total").?.integer);
-    const unnest_row = unnest_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", unnest_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("urgent", unnest_row.get("tag").?.string);
-
-    var unnest_in_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag IN ('urgent', 'vip') LIMIT 10;\"}",
-    });
-    defer unnest_in_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), unnest_in_resp.status);
-    try std.testing.expectEqualStrings("application/json", unnest_in_resp.content_type.?);
-
-    var unnest_in_parsed = try std.json.parseFromSlice(std.json.Value, alloc, unnest_in_resp.body, .{ .allocate = .alloc_always });
-    defer unnest_in_parsed.deinit();
-    try std.testing.expectEqualStrings("read", unnest_in_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", unnest_in_parsed.value.object.get("statement_kind").?.string);
-    const unnest_in_result = unnest_in_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), unnest_in_result.get("total").?.integer);
-    const unnest_in_rows = unnest_in_result.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), unnest_in_rows.len);
-    try std.testing.expectEqualStrings("doc:a", unnest_in_rows[0].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("urgent", unnest_in_rows[0].object.get("tag").?.string);
-    try std.testing.expectEqualStrings("doc:a", unnest_in_rows[1].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("vip", unnest_in_rows[1].object.get("tag").?.string);
-
-    var indexed_unnest_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE full_text_search('title:alpha') AND tag = 'vip' LIMIT 10;\"}",
-    });
-    defer indexed_unnest_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), indexed_unnest_resp.status);
-    try std.testing.expectEqualStrings("application/json", indexed_unnest_resp.content_type.?);
-
-    var indexed_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, indexed_unnest_resp.body, .{ .allocate = .alloc_always });
-    defer indexed_unnest_parsed.deinit();
-    try std.testing.expectEqualStrings("read", indexed_unnest_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", indexed_unnest_parsed.value.object.get("statement_kind").?.string);
-    const indexed_unnest_result = indexed_unnest_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), indexed_unnest_result.get("total").?.integer);
-    const indexed_unnest_row = indexed_unnest_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", indexed_unnest_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("vip", indexed_unnest_row.get("tag").?.string);
-
-    var ordered_indexed_unnest_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE full_text_search('title:alpha') ORDER BY tag ASC LIMIT 2;\"}",
-    });
-    defer ordered_indexed_unnest_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), ordered_indexed_unnest_resp.status);
-    try std.testing.expectEqualStrings("application/json", ordered_indexed_unnest_resp.content_type.?);
-
-    var ordered_indexed_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered_indexed_unnest_resp.body, .{ .allocate = .alloc_always });
-    defer ordered_indexed_unnest_parsed.deinit();
-    const ordered_indexed_unnest_rows = ordered_indexed_unnest_parsed.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), ordered_indexed_unnest_rows.len);
-    try std.testing.expectEqualStrings("doc:a", ordered_indexed_unnest_rows[0].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("urgent", ordered_indexed_unnest_rows[0].object.get("tag").?.string);
-    try std.testing.expectEqualStrings("doc:a", ordered_indexed_unnest_rows[1].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("vip", ordered_indexed_unnest_rows[1].object.get("tag").?.string);
-
-    var ordered_unnest_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag ORDER BY tag ASC LIMIT 3;\"}",
-    });
-    defer ordered_unnest_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), ordered_unnest_resp.status);
-    try std.testing.expectEqualStrings("application/json", ordered_unnest_resp.content_type.?);
-
-    var ordered_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered_unnest_resp.body, .{ .allocate = .alloc_always });
-    defer ordered_unnest_parsed.deinit();
-    try std.testing.expectEqualStrings("read", ordered_unnest_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", ordered_unnest_parsed.value.object.get("statement_kind").?.string);
-    const ordered_unnest_rows = ordered_unnest_parsed.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), ordered_unnest_rows.len);
-    try std.testing.expectEqualStrings("doc:b", ordered_unnest_rows[0].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("stale", ordered_unnest_rows[0].object.get("tag").?.string);
-    try std.testing.expectEqualStrings("doc:a", ordered_unnest_rows[1].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("urgent", ordered_unnest_rows[1].object.get("tag").?.string);
-    try std.testing.expectEqualStrings("doc:a", ordered_unnest_rows[2].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("vip", ordered_unnest_rows[2].object.get("tag").?.string);
-
-    var ordered_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id, title FROM docs ORDER BY title DESC LIMIT 2;\"}",
-    });
-    defer ordered_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), ordered_resp.status);
-    try std.testing.expectEqualStrings("application/json", ordered_resp.content_type.?);
-
-    var ordered_parsed = try std.json.parseFromSlice(std.json.Value, alloc, ordered_resp.body, .{ .allocate = .alloc_always });
-    defer ordered_parsed.deinit();
-    try std.testing.expectEqualStrings("read", ordered_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("query", ordered_parsed.value.object.get("statement_kind").?.string);
-    const ordered_result = ordered_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), ordered_result.get("total").?.integer);
-    const ordered_rows = ordered_result.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), ordered_rows.len);
-    try std.testing.expectEqualStrings("doc:b", ordered_rows[0].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("beta", ordered_rows[0].object.get("title").?.string);
-    try std.testing.expectEqualStrings("doc:a", ordered_rows[1].object.get("_id").?.string);
-    try std.testing.expectEqualStrings("alpha", ordered_rows[1].object.get("title").?.string);
-
-    var count_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT count(*) AS row_count FROM docs;\"}",
-    });
-    defer count_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), count_resp.status);
-    try std.testing.expectEqualStrings("application/json", count_resp.content_type.?);
-
-    var count_parsed = try std.json.parseFromSlice(std.json.Value, alloc, count_resp.body, .{ .allocate = .alloc_always });
-    defer count_parsed.deinit();
-    try std.testing.expectEqualStrings("read", count_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("aggregate", count_parsed.value.object.get("statement_kind").?.string);
-    const count_result = count_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), count_result.get("total_groups").?.integer);
-    const count_row = count_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqual(@as(i64, 2), count_row.get("row_count").?.integer);
-
-    var grouped_count_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT count(*) AS row_count FROM docs GROUP BY status LIMIT 10;\"}",
-    });
-    defer grouped_count_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), grouped_count_resp.status);
-    try std.testing.expectEqualStrings("application/json", grouped_count_resp.content_type.?);
-
-    var grouped_count_parsed = try std.json.parseFromSlice(std.json.Value, alloc, grouped_count_resp.body, .{ .allocate = .alloc_always });
-    defer grouped_count_parsed.deinit();
-    try std.testing.expectEqualStrings("read", grouped_count_parsed.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("aggregate", grouped_count_parsed.value.object.get("statement_kind").?.string);
-    const grouped_count_result = grouped_count_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), grouped_count_result.get("total_groups").?.integer);
-    const grouped_count_rows = grouped_count_result.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), grouped_count_rows.len);
-    try std.testing.expectEqualStrings("active", grouped_count_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[0].object.get("row_count").?.integer);
-    try std.testing.expectEqualStrings("archived", grouped_count_rows[1].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 1), grouped_count_rows[1].object.get("row_count").?.integer);
-
-    var row_filters = try alloc.alloc(usermgr.RowFilterEntry, 1);
-    row_filters[0] = try usermgr.RowFilterEntry.initOwned(alloc, "docs", "{\"term\":{\"status\":\"active\"}}");
-    var identity = AuthenticatedIdentity{
-        .username = try alloc.dupe(u8, "document_sql_reader"),
-        .row_filter = row_filters,
-    };
-    defer identity.deinit(alloc);
-
-    var filtered_lookup_resp = try server.handlePublicSql("{\"sql\":\"SELECT _id, status FROM docs WHERE _id IN ('doc:a', 'doc:b') LIMIT 10;\"}", identity);
-    defer filtered_lookup_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_lookup_resp.status);
-    var filtered_lookup_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_lookup_resp.body, .{ .allocate = .alloc_always });
-    defer filtered_lookup_parsed.deinit();
-    const filtered_lookup_result = filtered_lookup_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), filtered_lookup_result.get("total").?.integer);
-    const filtered_lookup_row = filtered_lookup_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", filtered_lookup_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("active", filtered_lookup_row.get("status").?.string);
-
-    var filtered_ordered_resp = try server.handlePublicSql("{\"sql\":\"SELECT _id, title FROM docs ORDER BY title DESC LIMIT 10;\"}", identity);
-    defer filtered_ordered_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_ordered_resp.status);
-    var filtered_ordered_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_ordered_resp.body, .{ .allocate = .alloc_always });
-    defer filtered_ordered_parsed.deinit();
-    const filtered_ordered_result = filtered_ordered_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), filtered_ordered_result.get("total").?.integer);
-    const filtered_ordered_row = filtered_ordered_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("doc:a", filtered_ordered_row.get("_id").?.string);
-    try std.testing.expectEqualStrings("alpha", filtered_ordered_row.get("title").?.string);
-
-    var filtered_full_text_resp = try server.handlePublicSql("{\"sql\":\"SELECT _id, title FROM docs WHERE full_text_search('title:beta') LIMIT 10;\"}", identity);
-    defer filtered_full_text_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_full_text_resp.status);
-    var filtered_full_text_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_full_text_resp.body, .{ .allocate = .alloc_always });
-    defer filtered_full_text_parsed.deinit();
-    const filtered_full_text_result = filtered_full_text_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 0), filtered_full_text_result.get("total").?.integer);
-    try std.testing.expectEqual(@as(usize, 0), filtered_full_text_result.get("rows").?.array.items.len);
-
-    var filtered_count_resp = try server.handlePublicSql("{\"sql\":\"SELECT count(*) AS row_count FROM docs;\"}", identity);
-    defer filtered_count_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_count_resp.status);
-    var filtered_count_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_count_resp.body, .{ .allocate = .alloc_always });
-    defer filtered_count_parsed.deinit();
-    const filtered_count_result = filtered_count_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), filtered_count_result.get("total_groups").?.integer);
-    const filtered_count_row = filtered_count_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqual(@as(i64, 1), filtered_count_row.get("row_count").?.integer);
-
-    var filtered_unnest_resp = try server.handlePublicSql("{\"sql\":\"SELECT d._id, tag FROM docs AS d, UNNEST(d.tags) AS tag WHERE tag = 'stale' LIMIT 10;\"}", identity);
-    defer filtered_unnest_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), filtered_unnest_resp.status);
-    var filtered_unnest_parsed = try std.json.parseFromSlice(std.json.Value, alloc, filtered_unnest_resp.body, .{ .allocate = .alloc_always });
-    defer filtered_unnest_parsed.deinit();
-    const filtered_unnest_result = filtered_unnest_parsed.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 0), filtered_unnest_result.get("total").?.integer);
-    try std.testing.expectEqual(@as(usize, 0), filtered_unnest_result.get("rows").?.array.items.len);
-
-    var bounded_scan_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs;\"}",
-    });
-    defer bounded_scan_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), bounded_scan_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, bounded_scan_resp.body, "plan", "invalid_sql_request", "document_sql_requires_bounded_scan", 0, 0);
-
-    var array_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WHERE tags = 'urgent' LIMIT 10;\"}",
-    });
-    defer array_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), array_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, array_resp.body, "plan", "invalid_sql_request", "document_sql_array_requires_unnest", 0, 0);
-
-    var unsupported_unnest_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id, tag, label FROM docs AS d, UNNEST(d.tags) AS tag, UNNEST(d.labels) AS label LIMIT 10;\"}",
-    });
-    defer unsupported_unnest_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), unsupported_unnest_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, unsupported_unnest_resp.body, "plan", "invalid_sql_request", "document_sql_unnest_unsupported", 0, 0);
-
-    var join_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT d._id FROM docs AS d JOIN docs AS e ON d._id = e._id LIMIT 10;\"}",
-    });
-    defer join_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), join_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, join_resp.body, "plan", "invalid_sql_request", "document_sql_unsupported_join", 0, 0);
-
-    var distinct_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT DISTINCT _id FROM docs WHERE _id = 'doc:a';\"}",
-    });
-    defer distinct_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), distinct_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, distinct_resp.body, "plan", "invalid_sql_request", "document_sql_projection_modifier_unsupported", 0, 0);
-
-    var offset_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WHERE status = 'active' OFFSET 1;\"}",
-    });
-    defer offset_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), offset_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, offset_resp.body, "plan", "invalid_sql_request", "document_sql_pagination_unsupported", 0, 0);
-
-    var locking_tail_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WHERE _id = 'doc:a' FOR UPDATE;\"}",
-    });
-    defer locking_tail_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), locking_tail_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, locking_tail_resp.body, "plan", "invalid_sql_request", "document_sql_locking_unsupported", 0, 0);
-
-    var window_tail_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WINDOW w AS () LIMIT 10;\"}",
-    });
-    defer window_tail_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), window_tail_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, window_tail_resp.body, "plan", "invalid_sql_request", "document_sql_window_unsupported", 0, 0);
-
-    var aggregate_unsupported_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT count(*) AS row_count FROM docs HAVING count(*) > 0;\"}",
-    });
-    defer aggregate_unsupported_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), aggregate_unsupported_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, aggregate_unsupported_resp.body, "plan", "invalid_sql_request", "document_sql_aggregate_unsupported", 0, 0);
-
-    var aggregate_filter_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT count(*) FILTER (WHERE status = 'active') AS row_count FROM docs GROUP BY status LIMIT 10;\"}",
-    });
-    defer aggregate_filter_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), aggregate_filter_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, aggregate_filter_resp.body, "plan", "invalid_sql_request", "document_sql_aggregate_unsupported", 0, 0);
-
-    var native_search_predicate_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT _id FROM docs WHERE antfly.hybrid_search(table_name => 'docs', query => 'alpha', limit => 10) LIMIT 10;\"}",
-    });
-    defer native_search_predicate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), native_search_predicate_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, native_search_predicate_resp.body, "plan", "invalid_sql_request", "document_sql_native_search_requires_table_function", 0, 0);
-
-    var write_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO docs (_id, _doc) VALUES ('doc:c', '{\\\"title\\\":\\\"gamma\\\"}'::jsonb);\"}",
-    });
-    defer write_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), write_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, write_resp.body, "plan", "document_sql_write_unsupported", "document_sql_write_unsupported", 0, 0);
-
-    var view_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"CREATE VIEW docs_view(doc_id, title) AS SELECT _id, title FROM docs;\"}",
-    });
-    defer view_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), view_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, view_resp.body, "plan", "document_sql_view_mapping_unsupported", "document_sql_view_mapping_unsupported", 0, 67);
-}
-
-test "api http server executes SQL point writes through typed row batch ingress" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    const child_schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"parent_id":{"type":"keyword"},"status":{"type":"keyword"},"amount":{"type":"numeric"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]},"foreign_keys":[{"name":"usage_children_parent_fkey","columns":["parent_id"],"references":{"table":"usage_records","columns":["id"]},"on_delete":"restrict"}]}
-    ;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-sql-write", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-    try db.applyTableSchemaJson(alloc, schema_json, .{});
-
-    var read_source = table_reads.BoundTableReadSource.init("usage_records", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
-    var write_source = table_writes.BoundTableWriteSource.init("usage_records", &db);
-
-    const FakeSource = struct {
-        tables: [4]metadata_table_manager.TableRecord,
-        ranges: [4]metadata_table_manager.RangeRecord,
-        table_emptying_jobs: std.ArrayListUnmanaged(metadata_table_manager.TableEmptyingJobRecord) = .empty,
-
-        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            for (self.table_emptying_jobs.items) |record| metadata_table_manager.freeTableEmptyingJob(allocator, record);
-            self.table_emptying_jobs.deinit(allocator);
-        }
-
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                    .upsert_table_emptying_job = upsertTableEmptyingJob,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{
-                .status = try status(ptr),
-                .tables = self.tables[0..],
-                .ranges = self.ranges[0..],
-                .stores = &.{},
-                .placement_intents = &.{},
-                .split_transitions = &.{},
-                .merge_transitions = &.{},
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-
-        fn upsertTableEmptyingJob(ptr: *anyopaque, record: metadata_table_manager.TableEmptyingJobRecord) !void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            const owned = try metadata_table_manager.cloneTableEmptyingJob(std.testing.allocator, record);
-            errdefer metadata_table_manager.freeTableEmptyingJob(std.testing.allocator, owned);
-            for (self.table_emptying_jobs.items, 0..) |existing, i| {
-                if (existing.job_id != owned.job_id) continue;
-                metadata_table_manager.freeTableEmptyingJob(std.testing.allocator, self.table_emptying_jobs.items[i]);
-                self.table_emptying_jobs.items[i] = owned;
-                return;
-            }
-            try self.table_emptying_jobs.append(std.testing.allocator, owned);
-        }
-    };
-
-    var source = FakeSource{
-        .tables = .{
-            .{
-                .table_id = 1,
-                .name = "usage_records",
-                .schema_json = schema_json,
-                .desired_replica_count = 1,
-            },
-            .{
-                .table_id = 2,
-                .name = "usage_archive",
-                .schema_json = schema_json,
-                .desired_replica_count = 1,
-            },
-            .{
-                .table_id = 3,
-                .name = "usage_children",
-                .schema_json = child_schema_json,
-                .desired_replica_count = 1,
-            },
-            .{
-                .table_id = 4,
-                .name = "usage_records",
-                .namespace_name = "tenant",
-                .schema_json = schema_json,
-                .desired_replica_count = 1,
-            },
-        },
-        .ranges = .{
-            .{ .group_id = 11, .range_id = 101, .table_id = 1, .start_key = "", .end_key = null },
-            .{ .group_id = 12, .range_id = 102, .table_id = 2, .start_key = "", .end_key = null },
-            .{ .group_id = 13, .range_id = 103, .table_id = 3, .start_key = "", .end_key = null },
-            .{ .group_id = 14, .range_id = 104, .table_id = 4, .start_key = "", .end_key = null },
-        },
-    };
-    defer source.deinit(alloc);
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
-    defer server.deinit();
-
-    var insert_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('u1', 'open', 10) RETURNING id, status;\"}",
-    });
-    defer insert_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), insert_resp.status);
-    var parsed_insert = try std.json.parseFromSlice(std.json.Value, alloc, insert_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_insert.deinit();
-    try std.testing.expectEqualStrings("write", parsed_insert.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("insert", parsed_insert.value.object.get("statement_kind").?.string);
-    const insert_result = parsed_insert.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), insert_result.get("inserted").?.integer);
-    try std.testing.expectEqualStrings("u1", insert_result.get("returning").?.array.items[0].object.get("id").?.string);
-
-    var update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"UPDATE usage_records SET status = 'closed', amount = amount + 5 WHERE id = 'u1' RETURNING id, status, amount;\"}",
-    });
-    defer update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), update_resp.status);
-    var parsed_update = try std.json.parseFromSlice(std.json.Value, alloc, update_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_update.deinit();
-    try std.testing.expectEqualStrings("write", parsed_update.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("update", parsed_update.value.object.get("statement_kind").?.string);
-    const update_result = parsed_update.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), update_result.get("transformed").?.integer);
-    const update_row = update_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("u1", update_row.get("id").?.string);
-    try std.testing.expectEqualStrings("closed", update_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 15), update_row.get("amount").?.integer);
-
-    var insert_source_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) SELECT concat(id, '-copy') AS id, lower(status) AS status, amount + 1 AS amount FROM usage_records WHERE id = 'u1' RETURNING id, status, amount;\"}",
-    });
-    defer insert_source_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), insert_source_resp.status);
-    var parsed_insert_source = try std.json.parseFromSlice(std.json.Value, alloc, insert_source_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_insert_source.deinit();
-    try std.testing.expectEqualStrings("write", parsed_insert_source.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("insert_source", parsed_insert_source.value.object.get("statement_kind").?.string);
-    const insert_source_result = parsed_insert_source.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), insert_source_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), insert_source_result.get("staged").?.integer);
-    const insert_source_row = insert_source_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("u1-copy", insert_source_row.get("id").?.string);
-    try std.testing.expectEqualStrings("closed", insert_source_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 16), insert_source_row.get("amount").?.integer);
-
-    var delete_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"DELETE FROM usage_records WHERE id = 'u1' RETURNING id, status;\"}",
-    });
-    defer delete_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), delete_resp.status);
-    var parsed_delete = try std.json.parseFromSlice(std.json.Value, alloc, delete_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_delete.deinit();
-    try std.testing.expectEqualStrings("write", parsed_delete.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("delete", parsed_delete.value.object.get("statement_kind").?.string);
-    const delete_result = parsed_delete.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), delete_result.get("deleted").?.integer);
-    const delete_row = delete_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("u1", delete_row.get("id").?.string);
-    try std.testing.expectEqualStrings("closed", delete_row.get("status").?.string);
-
-    var sql_returning_insert_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-insert', 'ready', 21) RETURNING id, status, amount;\"}",
-    });
-    defer sql_returning_insert_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_returning_insert_resp.status);
-    var parsed_sql_returning_insert = try std.json.parseFromSlice(std.json.Value, alloc, sql_returning_insert_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_returning_insert.deinit();
-    const sql_returning_insert_row = parsed_sql_returning_insert.value.object.get("result").?.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("sql-returning-insert", sql_returning_insert_row.get("id").?.string);
-    try std.testing.expectEqualStrings("ready", sql_returning_insert_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 21), sql_returning_insert_row.get("amount").?.integer);
-
-    var typed_returning_insert_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/usage_records/rows/batch",
-        .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"typed-returning-insert\",\"status\":\"ready\",\"amount\":21},\"returning\":[\"id\",\"status\",\"amount\"]}]}",
-    });
-    defer typed_returning_insert_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 201), typed_returning_insert_resp.status);
-    var parsed_typed_returning_insert = try std.json.parseFromSlice(std.json.Value, alloc, typed_returning_insert_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_returning_insert.deinit();
-    const typed_returning_insert_row = parsed_typed_returning_insert.value.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("typed-returning-insert", typed_returning_insert_row.get("id").?.string);
-    try std.testing.expectEqualStrings(sql_returning_insert_row.get("status").?.string, typed_returning_insert_row.get("status").?.string);
-    try std.testing.expectEqual(sql_returning_insert_row.get("amount").?.integer, typed_returning_insert_row.get("amount").?.integer);
-
-    var sql_conflict_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-conflict', 'old', 1), ('typed-returning-conflict', 'old', 1), ('sql-returning-noop', 'old', 2), ('typed-returning-noop', 'old', 2);\"}",
-    });
-    defer sql_conflict_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_conflict_seed_resp.status);
-
-    var sql_conflict_update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-conflict', 'new', 5) ON CONFLICT (id) DO UPDATE SET status = excluded.status, amount = excluded.amount RETURNING id, status, amount;\"}",
-    });
-    defer sql_conflict_update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_conflict_update_resp.status);
-    var parsed_sql_conflict_update = try std.json.parseFromSlice(std.json.Value, alloc, sql_conflict_update_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_conflict_update.deinit();
-    const sql_conflict_update_row = parsed_sql_conflict_update.value.object.get("result").?.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("sql-returning-conflict", sql_conflict_update_row.get("id").?.string);
-    try std.testing.expectEqualStrings("new", sql_conflict_update_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 5), sql_conflict_update_row.get("amount").?.integer);
-
-    var typed_conflict_update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/usage_records/rows/batch",
-        .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"typed-returning-conflict\",\"status\":\"new\",\"amount\":5},\"on_conflict\":{\"target\":{\"primary\":true},\"action\":\"update\",\"patch\":{\"status\":\"new\",\"amount\":5}},\"returning\":[\"id\",\"status\",\"amount\"]}]}",
-    });
-    defer typed_conflict_update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 201), typed_conflict_update_resp.status);
-    var parsed_typed_conflict_update = try std.json.parseFromSlice(std.json.Value, alloc, typed_conflict_update_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_conflict_update.deinit();
-    const typed_conflict_update_row = parsed_typed_conflict_update.value.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("typed-returning-conflict", typed_conflict_update_row.get("id").?.string);
-    try std.testing.expectEqualStrings(sql_conflict_update_row.get("status").?.string, typed_conflict_update_row.get("status").?.string);
-    try std.testing.expectEqual(sql_conflict_update_row.get("amount").?.integer, typed_conflict_update_row.get("amount").?.integer);
-
-    var sql_conflict_noop_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-noop', 'ignored', 9) ON CONFLICT (id) DO NOTHING RETURNING id, status, amount;\"}",
-    });
-    defer sql_conflict_noop_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_conflict_noop_resp.status);
-    var parsed_sql_conflict_noop = try std.json.parseFromSlice(std.json.Value, alloc, sql_conflict_noop_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_conflict_noop.deinit();
-    const sql_conflict_noop_result = parsed_sql_conflict_noop.value.object.get("result").?.object;
-    try std.testing.expect(sql_conflict_noop_result.get("returning") == null or sql_conflict_noop_result.get("returning").?.array.items.len == 0);
-
-    var typed_conflict_noop_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/usage_records/rows/batch",
-        .content_type = "application/json",
-        .body = "{\"operations\":[{\"op\":\"insert\",\"row\":{\"id\":\"typed-returning-noop\",\"status\":\"ignored\",\"amount\":9},\"on_conflict\":{\"target\":{\"primary\":true},\"action\":\"nothing\"},\"returning\":[\"id\",\"status\",\"amount\"]}]}",
-    });
-    defer typed_conflict_noop_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 201), typed_conflict_noop_resp.status);
-    var parsed_typed_conflict_noop = try std.json.parseFromSlice(std.json.Value, alloc, typed_conflict_noop_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_conflict_noop.deinit();
-    try std.testing.expect(parsed_typed_conflict_noop.value.object.get("returning") == null or parsed_typed_conflict_noop.value.object.get("returning").?.array.items.len == 0);
-
-    var sql_claim_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('sql-returning-claim', 'queued', 3), ('typed-returning-claim', 'queued', 3), ('sql-returning-delete', 'done', 4), ('typed-returning-delete', 'done', 4);\"}",
-    });
-    defer sql_claim_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_claim_seed_resp.status);
-
-    var sql_claim_update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"UPDATE usage_records SET status = 'claimed', amount = amount + 1 WHERE id = 'sql-returning-claim' FOR UPDATE RETURNING id, status, amount;\"}",
-    });
-    defer sql_claim_update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_claim_update_resp.status);
-    var parsed_sql_claim_update = try std.json.parseFromSlice(std.json.Value, alloc, sql_claim_update_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_claim_update.deinit();
-    const sql_claim_update_row = parsed_sql_claim_update.value.object.get("result").?.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("sql-returning-claim", sql_claim_update_row.get("id").?.string);
-    try std.testing.expectEqualStrings("claimed", sql_claim_update_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 4), sql_claim_update_row.get("amount").?.integer);
-
-    const typed_claim_update_txn_hex = "11112233445566778899aabbccddeeff";
-    const typed_claim_update_txn_id = try distributed_txn.parseTxnIdHex(typed_claim_update_txn_hex);
-    _ = try db.beginTransactionWithId(typed_claim_update_txn_id, 1_100);
-    var typed_claim_update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/usage_records/rows/mutation-source",
-        .content_type = "application/json",
-        .body = "{\"op\":\"update\",\"source\":{\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"typed-returning-claim\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"typed:returning-update\",\"transaction_id\":\"11112233445566778899aabbccddeeff\"}},\"patch\":{\"status\":\"claimed\"},\"increment\":{\"amount\":1},\"returning\":[\"id\",\"status\",\"amount\"]}",
-    });
-    defer typed_claim_update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_claim_update_resp.status);
-    var parsed_typed_claim_update = try std.json.parseFromSlice(std.json.Value, alloc, typed_claim_update_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_claim_update.deinit();
-    const typed_claim_update_row = parsed_typed_claim_update.value.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("typed-returning-claim", typed_claim_update_row.get("id").?.string);
-    try std.testing.expectEqualStrings(sql_claim_update_row.get("status").?.string, typed_claim_update_row.get("status").?.string);
-    try std.testing.expectEqual(sql_claim_update_row.get("amount").?.integer, typed_claim_update_row.get("amount").?.integer);
-    try db.commitTransaction(typed_claim_update_txn_id, 1_101);
-
-    var sql_claim_delete_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"DELETE FROM usage_records WHERE id = 'sql-returning-delete' FOR UPDATE RETURNING id, status, amount;\"}",
-    });
-    defer sql_claim_delete_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), sql_claim_delete_resp.status);
-    var parsed_sql_claim_delete = try std.json.parseFromSlice(std.json.Value, alloc, sql_claim_delete_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_sql_claim_delete.deinit();
-    const sql_claim_delete_row = parsed_sql_claim_delete.value.object.get("result").?.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("sql-returning-delete", sql_claim_delete_row.get("id").?.string);
-    try std.testing.expectEqualStrings("done", sql_claim_delete_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 4), sql_claim_delete_row.get("amount").?.integer);
-
-    const typed_claim_delete_txn_hex = "22112233445566778899aabbccddeeff";
-    const typed_claim_delete_txn_id = try distributed_txn.parseTxnIdHex(typed_claim_delete_txn_hex);
-    _ = try db.beginTransactionWithId(typed_claim_delete_txn_id, 1_200);
-    var typed_claim_delete_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/tables/usage_records/rows/mutation-source",
-        .content_type = "application/json",
-        .body = "{\"op\":\"delete\",\"source\":{\"where\":{\"field\":\"id\",\"op\":\"eq\",\"value\":\"typed-returning-delete\"},\"row_claim\":{\"mode\":\"for_update\",\"owner_id\":\"typed:returning-delete\",\"transaction_id\":\"22112233445566778899aabbccddeeff\"}},\"returning\":[\"id\",\"status\",\"amount\"]}",
-    });
-    defer typed_claim_delete_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), typed_claim_delete_resp.status);
-    var parsed_typed_claim_delete = try std.json.parseFromSlice(std.json.Value, alloc, typed_claim_delete_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_typed_claim_delete.deinit();
-    const typed_claim_delete_row = parsed_typed_claim_delete.value.object.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("typed-returning-delete", typed_claim_delete_row.get("id").?.string);
-    try std.testing.expectEqualStrings(sql_claim_delete_row.get("status").?.string, typed_claim_delete_row.get("status").?.string);
-    try std.testing.expectEqual(sql_claim_delete_row.get("amount").?.integer, typed_claim_delete_row.get("amount").?.integer);
-    try db.commitTransaction(typed_claim_delete_txn_id, 1_201);
-
-    var query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE id = 'u1';\"}",
-    });
-    defer query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_query.deinit();
-    try std.testing.expectEqual(@as(i64, 0), parsed_query.value.object.get("result").?.object.get("total").?.integer);
-
-    var copied_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records WHERE id = 'u1-copy';\"}",
-    });
-    defer copied_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), copied_query_resp.status);
-    var parsed_copied_query = try std.json.parseFromSlice(std.json.Value, alloc, copied_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_copied_query.deinit();
-    const copied_result = parsed_copied_query.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), copied_result.get("total").?.integer);
-    const copied_row = copied_result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("u1-copy", copied_row.get("id").?.string);
-    try std.testing.expectEqualStrings("closed", copied_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 16), copied_row.get("amount").?.integer);
-
-    var update_source_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"UPDATE usage_records SET status = 'processed', amount = amount + 2 WHERE status = 'closed' ORDER BY id ASC LIMIT 1 FOR UPDATE SKIP LOCKED RETURNING id, status, amount;\"}",
-    });
-    defer update_source_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), update_source_resp.status);
-    var parsed_update_source = try std.json.parseFromSlice(std.json.Value, alloc, update_source_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_update_source.deinit();
-    try std.testing.expectEqualStrings("write", parsed_update_source.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("update_source", parsed_update_source.value.object.get("statement_kind").?.string);
-    const update_source_result = parsed_update_source.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), update_source_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), update_source_result.get("staged").?.integer);
-    const update_source_row = update_source_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("u1-copy", update_source_row.get("id").?.string);
-    try std.testing.expectEqualStrings("processed", update_source_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 18), update_source_row.get("amount").?.integer);
-
-    var delete_source_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"DELETE FROM usage_records WHERE status = 'processed' FOR UPDATE RETURNING id, status;\"}",
-    });
-    defer delete_source_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), delete_source_resp.status);
-    var parsed_delete_source = try std.json.parseFromSlice(std.json.Value, alloc, delete_source_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_delete_source.deinit();
-    try std.testing.expectEqualStrings("write", parsed_delete_source.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("delete_source", parsed_delete_source.value.object.get("statement_kind").?.string);
-    const delete_source_result = parsed_delete_source.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), delete_source_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), delete_source_result.get("staged").?.integer);
-    const delete_source_row = delete_source_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("u1-copy", delete_source_row.get("id").?.string);
-    try std.testing.expectEqualStrings("processed", delete_source_row.get("status").?.string);
-
-    var deleted_source_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE id = 'u1-copy';\"}",
-    });
-    defer deleted_source_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), deleted_source_query_resp.status);
-    var parsed_deleted_source_query = try std.json.parseFromSlice(std.json.Value, alloc, deleted_source_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_deleted_source_query.deinit();
-    try std.testing.expectEqual(@as(i64, 0), parsed_deleted_source_query.value.object.get("result").?.object.get("total").?.integer);
-
-    var joined_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('joined-target', 'join-key', 1), ('joined-source', 'join-key', 33);\"}",
-    });
-    defer joined_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), joined_seed_resp.status);
-
-    var update_joined_source_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"UPDATE usage_records AS target SET status = 'joined', amount = source.amount FROM usage_records AS source WHERE target.status = source.status AND target.id = 'joined-target' AND source.id = 'joined-source' FOR UPDATE OF target RETURNING target.id, target.status, target.amount;\"}",
-    });
-    defer update_joined_source_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), update_joined_source_resp.status);
-    var parsed_update_joined_source = try std.json.parseFromSlice(std.json.Value, alloc, update_joined_source_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_update_joined_source.deinit();
-    try std.testing.expectEqualStrings("write", parsed_update_joined_source.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("update_joined_source", parsed_update_joined_source.value.object.get("statement_kind").?.string);
-    const update_joined_source_result = parsed_update_joined_source.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), update_joined_source_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), update_joined_source_result.get("staged").?.integer);
-    const update_joined_source_row = update_joined_source_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("joined-target", update_joined_source_row.get("id").?.string);
-    try std.testing.expectEqualStrings("joined", update_joined_source_row.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 33), update_joined_source_row.get("amount").?.integer);
-
-    var delete_joined_source_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"DELETE FROM usage_records AS target USING usage_records AS source WHERE target.amount = source.amount AND target.id = 'joined-target' AND source.id = 'joined-source' FOR UPDATE OF target RETURNING target.id, target.status;\"}",
-    });
-    defer delete_joined_source_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), delete_joined_source_resp.status);
-    var parsed_delete_joined_source = try std.json.parseFromSlice(std.json.Value, alloc, delete_joined_source_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_delete_joined_source.deinit();
-    try std.testing.expectEqualStrings("write", parsed_delete_joined_source.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("delete_joined_source", parsed_delete_joined_source.value.object.get("statement_kind").?.string);
-    const delete_joined_source_result = parsed_delete_joined_source.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), delete_joined_source_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), delete_joined_source_result.get("staged").?.integer);
-    const delete_joined_source_row = delete_joined_source_result.get("returning").?.array.items[0].object;
-    try std.testing.expectEqualStrings("joined-target", delete_joined_source_row.get("id").?.string);
-    try std.testing.expectEqualStrings("joined", delete_joined_source_row.get("status").?.string);
-
-    var deleted_joined_source_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id FROM usage_records WHERE id = 'joined-target';\"}",
-    });
-    defer deleted_joined_source_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), deleted_joined_source_query_resp.status);
-    var parsed_deleted_joined_source_query = try std.json.parseFromSlice(std.json.Value, alloc, deleted_joined_source_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_deleted_joined_source_query.deinit();
-    try std.testing.expectEqual(@as(i64, 0), parsed_deleted_joined_source_query.value.object.get("result").?.object.get("total").?.integer);
-
-    var recursive_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('recursive-a', 'root', 1), ('recursive-b', 'recursive-a', 2), ('recursive-c', 'other', 3);\"}",
-    });
-    defer recursive_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), recursive_seed_resp.status);
-
-    var recursive_update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"WITH RECURSIVE source_rows AS (SELECT id FROM usage_records WHERE status = 'root' UNION ALL SELECT child.id FROM usage_records AS child JOIN source_rows AS parent ON child.status = parent.id) UPDATE usage_records SET status = 'done' WHERE id IN (SELECT id FROM source_rows) RETURNING id, status;\"}",
-    });
-    defer recursive_update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), recursive_update_resp.status);
-    var parsed_recursive_update = try std.json.parseFromSlice(std.json.Value, alloc, recursive_update_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_recursive_update.deinit();
-    try std.testing.expectEqualStrings("write", parsed_recursive_update.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("update_joined_source", parsed_recursive_update.value.object.get("statement_kind").?.string);
-    const recursive_update_result = parsed_recursive_update.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), recursive_update_result.get("matched").?.integer);
-    try std.testing.expectEqual(@as(i64, 2), recursive_update_result.get("staged").?.integer);
-    const recursive_returning = recursive_update_result.get("returning").?.array;
-    try std.testing.expectEqual(@as(usize, 2), recursive_returning.items.len);
-
-    var recursive_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, status FROM usage_records WHERE id IN ('recursive-a', 'recursive-b', 'recursive-c') ORDER BY id ASC;\"}",
-    });
-    defer recursive_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), recursive_query_resp.status);
-    var parsed_recursive_query = try std.json.parseFromSlice(std.json.Value, alloc, recursive_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_recursive_query.deinit();
-    const recursive_rows = parsed_recursive_query.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), recursive_rows.len);
-    try std.testing.expectEqualStrings("recursive-a", recursive_rows[0].object.get("id").?.string);
-    try std.testing.expectEqualStrings("done", recursive_rows[0].object.get("status").?.string);
-    try std.testing.expectEqualStrings("recursive-b", recursive_rows[1].object.get("id").?.string);
-    try std.testing.expectEqualStrings("done", recursive_rows[1].object.get("status").?.string);
-    try std.testing.expectEqualStrings("recursive-c", recursive_rows[2].object.get("id").?.string);
-    try std.testing.expectEqualStrings("other", recursive_rows[2].object.get("status").?.string);
-
-    var merge_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('merge-target', 'old', 1), ('merge-source-update', 'merge-target', 44), ('merge-source-insert', 'merge-inserted', 55);\"}",
-    });
-    defer merge_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), merge_seed_resp.status);
-
-    var merge_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"MERGE INTO usage_records AS target USING usage_records AS source ON target.id = source.status WHEN MATCHED AND source.id = 'merge-source-update' THEN UPDATE SET status = 'merged', amount = source.amount WHEN NOT MATCHED AND source.id = 'merge-source-insert' THEN INSERT (id, status, amount) VALUES (source.status, 'inserted', source.amount) RETURNING target.id, target.status, target.amount;\"}",
-    });
-    defer merge_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), merge_resp.status);
-    var parsed_merge = try std.json.parseFromSlice(std.json.Value, alloc, merge_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_merge.deinit();
-    try std.testing.expectEqualStrings("write", parsed_merge.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("merge", parsed_merge.value.object.get("statement_kind").?.string);
-    const merge_result = parsed_merge.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), merge_result.get("inserted").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), merge_result.get("transformed").?.integer);
-    try std.testing.expectEqual(@as(usize, 2), merge_result.get("returning").?.array.items.len);
-
-    var merge_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records WHERE id IN ('merge-inserted', 'merge-target') ORDER BY id ASC;\"}",
-    });
-    defer merge_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), merge_query_resp.status);
-    var parsed_merge_query = try std.json.parseFromSlice(std.json.Value, alloc, merge_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_merge_query.deinit();
-    const merge_rows = parsed_merge_query.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), merge_rows.len);
-    try std.testing.expectEqualStrings("merge-inserted", merge_rows[0].object.get("id").?.string);
-    try std.testing.expectEqualStrings("inserted", merge_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 55), merge_rows[0].object.get("amount").?.integer);
-    try std.testing.expectEqualStrings("merge-target", merge_rows[1].object.get("id").?.string);
-    try std.testing.expectEqualStrings("merged", merge_rows[1].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 44), merge_rows[1].object.get("amount").?.integer);
-
-    var cte_merge_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('cte-merge-target', 'old', 1), ('cte-merge-source-update', 'cte-merge-target', 64), ('cte-merge-source-insert', 'cte-merge-inserted', 65);\"}",
-    });
-    defer cte_merge_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), cte_merge_seed_resp.status);
-
-    var cte_merge_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"WITH source_rows AS (SELECT id, status, amount FROM usage_records WHERE id IN ('cte-merge-source-update', 'cte-merge-source-insert')) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.status WHEN MATCHED THEN UPDATE SET status = 'cte-merged', amount = source.amount WHEN NOT MATCHED AND source.id = 'cte-merge-source-insert' THEN INSERT (id, status, amount) VALUES (source.status, 'cte-inserted', source.amount) RETURNING target.id, target.status, target.amount;\"}",
-    });
-    defer cte_merge_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), cte_merge_resp.status);
-    var parsed_cte_merge = try std.json.parseFromSlice(std.json.Value, alloc, cte_merge_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_cte_merge.deinit();
-    try std.testing.expectEqualStrings("write", parsed_cte_merge.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("merge", parsed_cte_merge.value.object.get("statement_kind").?.string);
-    const cte_merge_result = parsed_cte_merge.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), cte_merge_result.get("inserted").?.integer);
-    try std.testing.expectEqual(@as(i64, 1), cte_merge_result.get("transformed").?.integer);
-    try std.testing.expectEqual(@as(usize, 2), cte_merge_result.get("returning").?.array.items.len);
-
-    var cte_merge_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, status, amount FROM usage_records WHERE id IN ('cte-merge-inserted', 'cte-merge-target') ORDER BY id ASC;\"}",
-    });
-    defer cte_merge_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), cte_merge_query_resp.status);
-    var parsed_cte_merge_query = try std.json.parseFromSlice(std.json.Value, alloc, cte_merge_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_cte_merge_query.deinit();
-    const cte_merge_rows = parsed_cte_merge_query.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 2), cte_merge_rows.len);
-    try std.testing.expectEqualStrings("cte-merge-inserted", cte_merge_rows[0].object.get("id").?.string);
-    try std.testing.expectEqualStrings("cte-inserted", cte_merge_rows[0].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 65), cte_merge_rows[0].object.get("amount").?.integer);
-    try std.testing.expectEqualStrings("cte-merge-target", cte_merge_rows[1].object.get("id").?.string);
-    try std.testing.expectEqualStrings("cte-merged", cte_merge_rows[1].object.get("status").?.string);
-    try std.testing.expectEqual(@as(i64, 64), cte_merge_rows[1].object.get("amount").?.integer);
-
-    var recursive_merge_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('recursive-merge-a', 'merge-root', 7), ('recursive-merge-b', 'recursive-merge-a', 8), ('recursive-merge-c', 'merge-other', 9);\"}",
-    });
-    defer recursive_merge_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), recursive_merge_seed_resp.status);
-
-    var recursive_merge_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"WITH RECURSIVE source_rows AS (SELECT id, status FROM usage_records WHERE status = 'merge-root' UNION ALL SELECT child.id, child.status FROM usage_records AS child JOIN source_rows AS parent ON child.status = parent.id) MERGE INTO usage_records AS target USING source_rows AS source ON target.id = source.id WHEN MATCHED THEN UPDATE SET status = lower(source.status) RETURNING target.id, target.status;\"}",
-    });
-    defer recursive_merge_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), recursive_merge_resp.status);
-    var parsed_recursive_merge = try std.json.parseFromSlice(std.json.Value, alloc, recursive_merge_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_recursive_merge.deinit();
-    try std.testing.expectEqualStrings("write", parsed_recursive_merge.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("merge", parsed_recursive_merge.value.object.get("statement_kind").?.string);
-    const recursive_merge_result = parsed_recursive_merge.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 2), recursive_merge_result.get("transformed").?.integer);
-    try std.testing.expectEqual(@as(usize, 2), recursive_merge_result.get("returning").?.array.items.len);
-
-    var recursive_merge_query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, status FROM usage_records WHERE id IN ('recursive-merge-a', 'recursive-merge-b', 'recursive-merge-c') ORDER BY id ASC;\"}",
-    });
-    defer recursive_merge_query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), recursive_merge_query_resp.status);
-    var parsed_recursive_merge_query = try std.json.parseFromSlice(std.json.Value, alloc, recursive_merge_query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_recursive_merge_query.deinit();
-    const recursive_merge_rows = parsed_recursive_merge_query.value.object.get("result").?.object.get("rows").?.array.items;
-    try std.testing.expectEqual(@as(usize, 3), recursive_merge_rows.len);
-    try std.testing.expectEqualStrings("recursive-merge-a", recursive_merge_rows[0].object.get("id").?.string);
-    try std.testing.expectEqualStrings("merge-root", recursive_merge_rows[0].object.get("status").?.string);
-    try std.testing.expectEqualStrings("recursive-merge-b", recursive_merge_rows[1].object.get("id").?.string);
-    try std.testing.expectEqualStrings("recursive-merge-a", recursive_merge_rows[1].object.get("status").?.string);
-    try std.testing.expectEqualStrings("recursive-merge-c", recursive_merge_rows[2].object.get("id").?.string);
-    try std.testing.expectEqualStrings("merge-other", recursive_merge_rows[2].object.get("status").?.string);
-
-    var truncate_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('truncate-a', 'drop', 1), ('truncate-b', 'drop', 2);\"}",
-    });
-    defer truncate_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_seed_resp.status);
-
-    var truncate_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"TRUNCATE usage_records;\"}",
-    });
-    defer truncate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_resp.status);
-    var parsed_truncate = try std.json.parseFromSlice(std.json.Value, alloc, truncate_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_truncate.deinit();
-    try std.testing.expectEqualStrings("ddl", parsed_truncate.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("truncate", parsed_truncate.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[0].group_id);
-    try std.testing.expect(!source.table_emptying_jobs.items[0].restart_identity);
-    try std.testing.expect(!source.table_emptying_jobs.items[0].cascade);
-    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[0].affected_table_ids.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].affected_table_ids[0]);
-
-    var truncate_continue_seed_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO usage_records (id, status, amount) VALUES ('truncate-continue-a', 'drop', 1), ('truncate-continue-b', 'drop', 2);\"}",
-    });
-    defer truncate_continue_seed_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_continue_seed_resp.status);
-
-    var truncate_continue_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"TRUNCATE TABLE ONLY public.usage_records CONTINUE IDENTITY RESTRICT;\"}",
-    });
-    defer truncate_continue_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_continue_resp.status);
-    var parsed_truncate_continue = try std.json.parseFromSlice(std.json.Value, alloc, truncate_continue_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_truncate_continue.deinit();
-    try std.testing.expectEqualStrings("ddl", parsed_truncate_continue.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("truncate", parsed_truncate_continue.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].table_id);
-    try std.testing.expect(!source.table_emptying_jobs.items[0].restart_identity);
-    try std.testing.expect(!source.table_emptying_jobs.items[0].cascade);
-    try std.testing.expectEqual(@as(usize, 1), source.table_emptying_jobs.items[0].affected_table_ids.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[0].affected_table_ids[0]);
-
-    var truncate_cascade_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"TRUNCATE usage_records CASCADE;\"}",
-    });
-    defer truncate_cascade_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_cascade_resp.status);
-    var parsed_truncate_cascade = try std.json.parseFromSlice(std.json.Value, alloc, truncate_cascade_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_truncate_cascade.deinit();
-    try std.testing.expectEqualStrings("ddl", parsed_truncate_cascade.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("truncate", parsed_truncate_cascade.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 3), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[1].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[1].group_id);
-    try std.testing.expectEqual(@as(u64, 3), source.table_emptying_jobs.items[2].table_id);
-    try std.testing.expectEqual(@as(u64, 13), source.table_emptying_jobs.items[2].group_id);
-    for (source.table_emptying_jobs.items[1..3]) |job| {
-        try std.testing.expect(!job.restart_identity);
-        try std.testing.expect(job.cascade);
-        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
-        try std.testing.expectEqual(@as(u64, 1), job.affected_table_ids[0]);
-        try std.testing.expectEqual(@as(u64, 3), job.affected_table_ids[1]);
-    }
-
-    var truncate_restart_identity_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"TRUNCATE usage_records RESTART IDENTITY;\"}",
-    });
-    defer truncate_restart_identity_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), truncate_restart_identity_resp.status);
-    try std.testing.expectEqual(@as(usize, 3), source.table_emptying_jobs.items.len);
-
-    var truncate_multi_table_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"TRUNCATE usage_records, usage_archive;\"}",
-    });
-    defer truncate_multi_table_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), truncate_multi_table_resp.status);
-    var parsed_truncate_multi_table = try std.json.parseFromSlice(std.json.Value, alloc, truncate_multi_table_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_truncate_multi_table.deinit();
-    try std.testing.expectEqualStrings("ddl", parsed_truncate_multi_table.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("truncate", parsed_truncate_multi_table.value.object.get("statement_kind").?.string);
-    try std.testing.expectEqual(@as(usize, 5), source.table_emptying_jobs.items.len);
-    try std.testing.expectEqual(@as(u64, 1), source.table_emptying_jobs.items[3].table_id);
-    try std.testing.expectEqual(@as(u64, 11), source.table_emptying_jobs.items[3].group_id);
-    try std.testing.expectEqual(@as(u64, 2), source.table_emptying_jobs.items[4].table_id);
-    try std.testing.expectEqual(@as(u64, 12), source.table_emptying_jobs.items[4].group_id);
-    for (source.table_emptying_jobs.items[3..5]) |job| {
-        try std.testing.expect(!job.restart_identity);
-        try std.testing.expect(!job.cascade);
-        try std.testing.expectEqual(@as(usize, 2), job.affected_table_ids.len);
-        try std.testing.expectEqual(@as(u64, 1), job.affected_table_ids[0]);
-        try std.testing.expectEqual(@as(u64, 2), job.affected_table_ids[1]);
-    }
-
-    var tenant_truncate_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"namespace\":\"tenant\",\"sql\":\"TRUNCATE usage_records RESTART IDENTITY;\"}",
-    });
-    defer tenant_truncate_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), tenant_truncate_resp.status);
-    try std.testing.expectEqual(@as(usize, 5), source.table_emptying_jobs.items.len);
-}
-
-test "api http server applies SQL row triggers to public SQL writes" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-
-    const path = try std.fmt.allocPrint(alloc, ".zig-cache/tmp/{s}/public-sql-write-triggers", .{tmp.sub_path});
-    defer alloc.free(path);
-
-    var db = try db_mod.DB.open(alloc, path, .{});
-    defer db.close();
-    try db.applyTableSchemaJson(alloc, schema_json, .{});
-
-    var read_source = table_reads.BoundTableReadSource.init("events", 1, &db, raft_mod.read_gate.noopReadableLeaseRequester());
-    var write_source = table_writes.BoundTableWriteSource.init("events", &db);
-
-    const FakeSource = struct {
-        tables: [1]metadata_table_manager.TableRecord,
-
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{ .metadata_group_id = 1, .metrics = .{}, .projected_stores = 1 };
-        }
-
-        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            return .{
-                .status = try status(ptr),
-                .tables = self.tables[0..],
-                .ranges = &.{},
-                .stores = &.{},
-                .placement_intents = &.{},
-                .split_transitions = &.{},
-                .merge_transitions = &.{},
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-
-    var source = FakeSource{ .tables = .{.{
-        .table_id = 1,
-        .name = "events",
-        .schema_json = schema_json,
-        .desired_replica_count = 1,
-    }} };
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), read_source.source(), write_source.source());
-    defer server.deinit();
-    var session = try sql_adapter.OwnedSqlCatalogSession.fromSessionAlloc(alloc, catalog_resources.SqlCatalogSession.default());
-    defer session.deinit(alloc);
-
-    var baseline_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO events (id, status) VALUES ('evt-existing', 'open') RETURNING id;\"}",
-    });
-    defer baseline_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), baseline_resp.status);
-
-    var created_insert_function = try server.applyRelationalSqlDdlWithSession(
-        "CREATE FUNCTION skip_event_insert() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
-        &session,
-    );
-    defer created_insert_function.deinit(alloc);
-    var created_insert_trigger = try server.applyRelationalSqlDdlWithSession(
-        "CREATE TRIGGER skip_event_insert BEFORE INSERT ON events FOR EACH ROW EXECUTE FUNCTION skip_event_insert();",
-        &session,
-    );
-    defer created_insert_trigger.deinit(alloc);
-
-    var skipped_insert_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"INSERT INTO events (id, status) VALUES ('evt-skipped', 'new') RETURNING id;\"}",
-    });
-    defer skipped_insert_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), skipped_insert_resp.status);
-    var parsed_skipped_insert = try std.json.parseFromSlice(std.json.Value, alloc, skipped_insert_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_skipped_insert.deinit();
-    const skipped_result = parsed_skipped_insert.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 0), skipped_result.get("inserted").?.integer);
-    if (skipped_result.get("returning")) |returning| {
-        try std.testing.expectEqual(@as(usize, 0), returning.array.items.len);
-    }
-
-    var created_update_function = try server.applyRelationalSqlDdlWithSession(
-        "CREATE FUNCTION keep_event_update_old() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN OLD; END';",
-        &session,
-    );
-    defer created_update_function.deinit(alloc);
-    var created_update_trigger = try server.applyRelationalSqlDdlWithSession(
-        "CREATE TRIGGER keep_event_update_old BEFORE UPDATE ON events FOR EACH ROW EXECUTE FUNCTION keep_event_update_old();",
-        &session,
-    );
-    defer created_update_trigger.deinit(alloc);
-
-    var update_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"UPDATE events SET status = 'closed' WHERE id = 'evt-existing' RETURNING id, status;\"}",
-    });
-    defer update_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), update_resp.status);
-
-    var created_delete_function = try server.applyRelationalSqlDdlWithSession(
-        "CREATE FUNCTION skip_event_delete() RETURNS trigger LANGUAGE plpgsql AS 'BEGIN RETURN NULL; END';",
-        &session,
-    );
-    defer created_delete_function.deinit(alloc);
-    var created_delete_trigger = try server.applyRelationalSqlDdlWithSession(
-        "CREATE TRIGGER skip_event_delete BEFORE DELETE ON events FOR EACH ROW EXECUTE FUNCTION skip_event_delete();",
-        &session,
-    );
-    defer created_delete_trigger.deinit(alloc);
-
-    var delete_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"DELETE FROM events WHERE id = 'evt-existing' RETURNING id;\"}",
-    });
-    defer delete_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), delete_resp.status);
-
-    var query_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body = "{\"sql\":\"SELECT id, status FROM events ORDER BY id ASC;\"}",
-    });
-    defer query_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), query_resp.status);
-    var parsed_query = try std.json.parseFromSlice(std.json.Value, alloc, query_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_query.deinit();
-    const result = parsed_query.value.object.get("result").?.object;
-    try std.testing.expectEqual(@as(i64, 1), result.get("total").?.integer);
-    const row = result.get("rows").?.array.items[0].object;
-    try std.testing.expectEqualStrings("evt-existing", row.get("id").?.string);
-    try std.testing.expectEqualStrings("open", row.get("status").?.string);
 }
 
 test "api http server executes SQL notification channel plans through native runtime" {
@@ -36225,217 +34373,6 @@ test "api http server executes SQL COPY FROM STDIN through catalog rows batch" {
     try std.testing.expectEqualStrings("write_only_bulk", audit.events[14].authenticated_subject orelse return error.TestUnexpectedResult);
     try std.testing.expectEqualStrings("PermissionDenied", audit.events[14].error_name orelse return error.TestUnexpectedResult);
     try std.testing.expectEqual(@as(usize, 0), audit.events[14].row_count);
-}
-
-test "api http server executes public SQL COPY FROM STDIN payload" {
-    const alloc = std.testing.allocator;
-    const schema_json =
-        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"},"status_key":{"type":"keyword","generated":{"op":"lower","field":"status"}}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
-    ;
-    const FakeSource = struct {
-        fn iface(self: *@This()) StatusSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .status = status,
-                    .admin_snapshot = adminSnapshot,
-                    .free_admin_snapshot = freeAdminSnapshot,
-                },
-            };
-        }
-
-        fn status(_: *anyopaque) !metadata_api.MetadataStatus {
-            return .{
-                .metadata_group_id = 91,
-                .metrics = .{},
-                .projected_stores = 1,
-            };
-        }
-
-        fn adminSnapshot(_: *anyopaque) !metadata_api.AdminSnapshot {
-            return .{
-                .status = .{ .metadata_group_id = 91, .metrics = .{} },
-                .tables = @constCast((&[_]metadata_table_manager.TableRecord{.{
-                    .table_id = 17,
-                    .name = "events",
-                    .database_name = "tenant_ops",
-                    .namespace_name = "analytics",
-                    .schema_json = schema_json,
-                    .indexes_json = tables_api.default_indexes_json,
-                    .placement_role = "data",
-                }})[0..]),
-                .ranges = &.{},
-                .stores = &.{},
-                .placement_intents = &.{},
-                .split_transitions = &.{},
-                .merge_transitions = &.{},
-            };
-        }
-
-        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
-    };
-    const FakeWrites = struct {
-        calls: usize = 0,
-        first_row_json: []u8 = &.{},
-
-        fn deinit(self: *@This(), allocator: std.mem.Allocator) void {
-            if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
-        }
-
-        fn source(self: *@This()) table_writes.TableWriteSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .batch = batch,
-                    .batch_catalog = batchCatalog,
-                },
-            };
-        }
-
-        fn batch(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.BatchRequest) anyerror!?void {
-            return error.UnsupportedOperation;
-        }
-
-        fn batchCatalog(ptr: *anyopaque, allocator: std.mem.Allocator, target: catalog_resources.TableTarget, req: db_mod.types.BatchRequest) anyerror!?void {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
-            try std.testing.expectEqualStrings("analytics", target.namespace_name);
-            try std.testing.expectEqualStrings("events", target.table_name);
-            try std.testing.expectEqual(@as(usize, 1), req.writes.len);
-            if (self.first_row_json.len > 0) allocator.free(self.first_row_json);
-            self.first_row_json = try allocator.dupe(u8, req.writes[0].value);
-            self.calls += 1;
-            return {};
-        }
-    };
-    const FakeReads = struct {
-        calls: usize = 0,
-
-        fn source(self: *@This()) table_reads.TableReadSource {
-            return .{
-                .ptr = self,
-                .vtable = &.{
-                    .lookup = lookup,
-                    .scan = scan,
-                    .query = query,
-                    .rows_query_plan_catalog = rowsQueryPlanCatalog,
-                },
-            };
-        }
-
-        fn lookup(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: db_mod.types.LookupOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.LookupResponse {
-            return error.UnsupportedOperation;
-        }
-
-        fn scan(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: []const u8, _: []const u8, _: db_mod.types.ScanOptions, _: raft_mod.ReadConsistency) anyerror!?table_reads.ScanResponse {
-            return error.UnsupportedOperation;
-        }
-
-        fn query(_: *anyopaque, _: std.mem.Allocator, _: []const u8, _: db_mod.types.SearchRequest, _: raft_mod.ReadConsistency) anyerror!?query_api.QueryResponse {
-            return error.UnsupportedOperation;
-        }
-
-        fn rowsQueryPlanCatalog(
-            ptr: *anyopaque,
-            allocator: std.mem.Allocator,
-            target: catalog_resources.TableTarget,
-            runtime_schema: runtime_schema_mod.TableSchema,
-            plan: db_mod.types.RelationalRowsQueryPlan,
-            consistency: raft_mod.ReadConsistency,
-        ) anyerror!?db_mod.types.RelationalRowsQueryResult {
-            const self: *@This() = @ptrCast(@alignCast(ptr));
-            try std.testing.expectEqual(raft_mod.ReadConsistency.read_index, consistency);
-            try std.testing.expectEqualStrings("tenant_ops", target.database_name);
-            try std.testing.expectEqualStrings("analytics", target.namespace_name);
-            try std.testing.expectEqualStrings("events", target.table_name);
-            try std.testing.expectEqual(@as(usize, 3), runtime_schema.relational_columns.len);
-            try std.testing.expect(!plan.query.select_all);
-            try std.testing.expectEqual(@as(usize, 2), plan.query.select.len);
-            try std.testing.expectEqualStrings("id", plan.query.select[0]);
-            try std.testing.expectEqualStrings("status", plan.query.select[1]);
-            self.calls += 1;
-
-            const rows = try allocator.alloc([]const u8, 1);
-            errdefer allocator.free(rows);
-            rows[0] = try allocator.dupe(u8, "{\"id\":\"u_export\",\"status\":\"Ready\"}");
-            return .{ .rows = rows, .total = 1 };
-        }
-    };
-
-    var source = FakeSource{};
-    var reads = FakeReads{};
-    var writes = FakeWrites{};
-    defer writes.deinit(alloc);
-    var server = ApiHttpServer.init(alloc, .{}, source.iface(), reads.source(), writes.source());
-    defer server.deinit();
-
-    var resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body =
-        \\{"database":"tenant_ops","namespace":"analytics","sql":"COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);","stdin_payload":"id,status\nu_public,Ready\n"}
-        ,
-    });
-    defer resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), resp.status);
-    try std.testing.expectEqual(@as(usize, 1), writes.calls);
-
-    var parsed_body = try std.json.parseFromSlice(std.json.Value, alloc, resp.body, .{ .allocate = .alloc_always });
-    defer parsed_body.deinit();
-    try std.testing.expectEqualStrings("write", parsed_body.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("bulk_io", parsed_body.value.object.get("statement_kind").?.string);
-
-    var first_row = try std.json.parseFromSlice(std.json.Value, alloc, writes.first_row_json, .{});
-    defer first_row.deinit();
-    try std.testing.expectEqualStrings("u_public", first_row.value.object.get("id").?.string);
-    try std.testing.expectEqualStrings("Ready", first_row.value.object.get("status").?.string);
-    try std.testing.expectEqualStrings("ready", first_row.value.object.get("status_key").?.string);
-
-    var copy_to_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body =
-        \\{"database":"tenant_ops","namespace":"analytics","read_only":true,"sql":"COPY events (id, status) TO STDOUT WITH (FORMAT csv, HEADER true);"}
-        ,
-    });
-    defer copy_to_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 200), copy_to_resp.status);
-    try std.testing.expectEqual(@as(usize, 1), reads.calls);
-    var parsed_copy_to = try std.json.parseFromSlice(std.json.Value, alloc, copy_to_resp.body, .{ .allocate = .alloc_always });
-    defer parsed_copy_to.deinit();
-    try std.testing.expectEqualStrings("bulk_io", parsed_copy_to.value.object.get("kind").?.string);
-    try std.testing.expectEqualStrings("bulk_io", parsed_copy_to.value.object.get("statement_kind").?.string);
-    const copy_to_result = parsed_copy_to.value.object.get("result").?.object;
-    try std.testing.expectEqualStrings("export_rows", copy_to_result.get("operation").?.string);
-    try std.testing.expectEqualStrings("stdout", copy_to_result.get("stream").?.string);
-    try std.testing.expectEqual(@as(i64, 1), copy_to_result.get("row_count").?.integer);
-    try std.testing.expectEqualStrings("id,status\nu_export,Ready\n", copy_to_result.get("payload").?.string);
-
-    var missing_payload_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body =
-        \\{"database":"tenant_ops","namespace":"analytics","sql":"COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);"}
-        ,
-    });
-    defer missing_payload_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 400), missing_payload_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, missing_payload_resp.body, "bind", "invalid_sql_request", "invalid sql request", null, null);
-
-    var prepare_copy_resp = try server.handle(.{
-        .method = .POST,
-        .uri = "/db/v1/sql",
-        .content_type = "application/json",
-        .body =
-        \\{"database":"tenant_ops","namespace":"analytics","sql":"PREPARE copy_plan AS COPY events (id, status) FROM STDIN WITH (FORMAT csv, HEADER true);"}
-        ,
-    });
-    defer prepare_copy_resp.deinit(alloc);
-    try std.testing.expectEqual(@as(u16, 501), prepare_copy_resp.status);
-    try expectPublicSqlDiagnosticBody(alloc, prepare_copy_resp.body, "plan", "unsupported_sql_statement", "unsupported sql statement", null, null);
 }
 
 test "api http server serves api key and row filter routes" {

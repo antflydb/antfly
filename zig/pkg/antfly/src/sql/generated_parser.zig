@@ -2138,9 +2138,18 @@ pub fn cloneGeneratedReadAstPtrAlloc(
     read: *const GeneratedSqlReadAst,
     token_count: usize,
 ) anyerror!*GeneratedSqlReadAst {
+    return try cloneRebasedGeneratedReadAstPtrAlloc(alloc, read, 0, token_count);
+}
+
+pub fn cloneRebasedGeneratedReadAstPtrAlloc(
+    alloc: std.mem.Allocator,
+    read: *const GeneratedSqlReadAst,
+    base: usize,
+    end: usize,
+) anyerror!*GeneratedSqlReadAst {
     const cloned = try alloc.create(GeneratedSqlReadAst);
     errdefer alloc.destroy(cloned);
-    cloned.* = try cloneRebasedGeneratedReadAstAlloc(alloc, read.*, 0, token_count);
+    cloned.* = try cloneRebasedGeneratedReadAstAlloc(alloc, read.*, base, end);
     return cloned;
 }
 
@@ -2529,6 +2538,17 @@ pub const GeneratedSqlGraphAst = struct {
     extraction_weight_tokens: ?GeneratedSqlTokenRange = null,
 };
 
+pub const GeneratedSqlGraphPathKind = enum {
+    node,
+    outgoing,
+    incoming,
+};
+
+pub const GeneratedSqlGraphPathAliasRole = enum {
+    source,
+    target,
+};
+
 pub const GeneratedSqlUnsupportedAst = struct {
     kind: GeneratedSqlUnsupportedKind,
     reason: GeneratedSqlUnsupportedReason,
@@ -2540,6 +2560,31 @@ pub const GeneratedSqlUnsupportedAst = struct {
     routine_metadata: ?*GeneratedSqlRoutineAst = null,
     alter_table_name_tokens: ?GeneratedSqlTokenRange = null,
     alter_table_operation_tokens: ?GeneratedSqlTokenRange = null,
+    graph_path_tokens: ?GeneratedSqlTokenRange = null,
+    graph_where_tokens: ?GeneratedSqlTokenRange = null,
+    graph_where_expression: GeneratedSqlExpressionAst = .{},
+    graph_return_tokens: ?GeneratedSqlTokenRange = null,
+    graph_return_tail_tokens: ?GeneratedSqlTokenRange = null,
+    graph_return_projection_tokens: ?GeneratedSqlTokenRange = null,
+    graph_order_tokens: ?GeneratedSqlTokenRange = null,
+    graph_limit_tokens: ?GeneratedSqlTokenRange = null,
+    graph_offset_tokens: ?GeneratedSqlTokenRange = null,
+    graph_return_projection_items: GeneratedSqlListAst = .{},
+    graph_order_items: GeneratedSqlListAst = .{},
+    graph_limit_expression: GeneratedSqlExpressionAst = .{},
+    graph_offset_expression: GeneratedSqlExpressionAst = .{},
+    graph_return_path_alias_projection_roles: []?GeneratedSqlGraphPathAliasRole = &.{},
+    graph_return_path_alias_projection_count: usize = 0,
+    graph_path_kind: ?GeneratedSqlGraphPathKind = null,
+    graph_source_binding_tokens: ?GeneratedSqlTokenRange = null,
+    graph_source_graph_tokens: ?GeneratedSqlTokenRange = null,
+    graph_source_index_tokens: ?GeneratedSqlTokenRange = null,
+    graph_source_table_tokens: ?GeneratedSqlTokenRange = null,
+    graph_source_start_tokens: ?GeneratedSqlTokenRange = null,
+    graph_source_alias_tokens: ?GeneratedSqlTokenRange = null,
+    graph_relationship_tokens: ?GeneratedSqlTokenRange = null,
+    graph_relationship_label_tokens: ?GeneratedSqlTokenRange = null,
+    graph_target_alias_tokens: ?GeneratedSqlTokenRange = null,
     explain_subject_read_ast: ?*GeneratedSqlReadAst = null,
     explain_subject_dml_ast: ?*GeneratedSqlDmlAst = null,
     explain_options_tokens: ?GeneratedSqlTokenRange = null,
@@ -2555,6 +2600,12 @@ pub const GeneratedSqlUnsupportedAst = struct {
     explain_wal: bool = false,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.graph_return_projection_items.deinit(alloc);
+        self.graph_order_items.deinit(alloc);
+        self.graph_where_expression.deinit(alloc);
+        self.graph_limit_expression.deinit(alloc);
+        self.graph_offset_expression.deinit(alloc);
+        if (self.graph_return_path_alias_projection_roles.len > 0) alloc.free(self.graph_return_path_alias_projection_roles);
         if (self.routine_metadata) |metadata| {
             metadata.deinit(alloc);
             alloc.destroy(metadata);
@@ -3053,9 +3104,10 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records", .kind = .unsupported },
     .{ .sql = "CREATE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE OR REPLACE TRIGGER usage_audit BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
+    .{ .sql = "CREATE TRIGGER usage_when BEFORE UPDATE ON usage_records FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM OLD.status) EXECUTE FUNCTION audit_usage()", .kind = .unsupported },
     .{ .sql = "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)", .kind = .unsupported },
     .{ .sql = "CREATE TEXT SEARCH DICTIONARY usage_dict (TEMPLATE = simple)", .kind = .unsupported },
-    .{ .sql = "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)", .kind = .unsupported },
+    .{ .sql = "CREATE TEXT SEARCH PARSER usage_parser (HEADLINE = prsd_headline)", .kind = .unsupported },
     .{ .sql = "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)", .kind = .unsupported },
     .{ .sql = "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)", .kind = .unsupported },
     .{ .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')", .kind = .unsupported },
@@ -3101,6 +3153,11 @@ pub const unsupported_corpus = [_]GeneratedSqlCorpusCase{
     .{ .sql = "LOAD 'auto_explain'", .kind = .unsupported },
     .{ .sql = "LOCK TABLE usage_records IN SHARE MODE", .kind = .unsupported },
     .{ .sql = "MATCH (doc) RETURN doc", .kind = .unsupported },
+    .{ .sql = "MATCH (doc)-[:cites]->(target) RETURN target", .kind = .unsupported },
+    .{ .sql = "MATCH (target)<-[:cites]-(doc) RETURN target", .kind = .unsupported },
+    .{ .sql = "MATCH (doc)-[:cites]->(target) RETURN doc, target", .kind = .unsupported },
+    .{ .sql = "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published' RETURN target", .kind = .unsupported },
+    .{ .sql = "MATCH (doc)-[:cites]->(target) RETURN doc, target ORDER BY target.rank DESC LIMIT 5", .kind = .unsupported },
     .{ .sql = "NOTIFY usage_events, 'changed'", .kind = .unsupported },
     .{ .sql = "VACUUM (FULL, VERBOSE, ANALYZE) public.usage_records", .kind = .unsupported },
     .{ .sql = "REINDEX INDEX CONCURRENTLY public.usage_status_idx", .kind = .unsupported },
@@ -3539,7 +3596,7 @@ fn appendTokenIds(
 ) !void {
     switch (tok.kind) {
         .identifier => {
-            if (try contextualKeywordSymbolId(tokens, index, tok, prev)) |id| {
+            if (try contextualKeywordSymbolId(tokens, index, tok, prev, next)) |id| {
                 try ids.append(id);
                 return;
             }
@@ -3568,6 +3625,7 @@ fn appendTokenIds(
         .minus => try ids.appendToken(.MINUS),
         .slash => try ids.appendToken(.SLASH),
         .percent => try ids.appendToken(.PERCENT),
+        .colon => try ids.appendToken(.COLON),
         .pipe_concat => try ids.appendToken(.PIPE_CONCAT),
         .at_contains => try ids.appendToken(.AT_CONTAINS),
         .range_overlap => try ids.appendToken(.RANGE_OVERLAP),
@@ -3590,8 +3648,7 @@ fn appendTokenIds(
     }
 }
 
-fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token) !?u16 {
-    _ = prev;
+fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) !?u16 {
     if (generatedSessionAuthorizationKeywordContext(tokens, index)) {
         if (tok.matchesKeyword("authorization")) return generated.tokenId(.AUTHORIZATION);
         if (tok.matchesKeyword("session")) return generated.tokenId(.SESSION);
@@ -3619,6 +3676,11 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
     {
         return generated.tokenId(.IDENT);
     }
+    if (generatedCreateTriggerDiagnosticIdentifierContext(tokens, index) and generatedCreateTriggerDiagnosticKeywordAsIdentifier(tok)) {
+        return generated.tokenId(.IDENT);
+    }
+    if (generatedFunctionArgumentNameIdentifierContext(tokens, index, tok, next)) return generated.tokenId(.IDENT);
+    if (generatedMatchKeywordAliasContext(tokens, index, tok, prev, next)) return generated.tokenId(.IDENT);
     if (generatedCreateTableMissingAsSelectContext(tokens, index) and tok.matchesKeywordTag(.table)) return generated.tokenId(.IDENT);
     if (generatedSystemTimeForKeywordContext(tokens, index) and tok.matchesKeywordTag(.@"for")) return generated.tokenId(.SYSTEM_TIME_FOR);
     if (generatedAnalyzeKeywordContext(tokens, index) and tok.matchesKeyword("verbose")) return generated.tokenId(.ANALYZE_VERBOSE);
@@ -3645,6 +3707,77 @@ fn contextualKeywordSymbolId(tokens: []const token_mod.Token, index: usize, tok:
     if (tok.matchesKeyword("work")) return generated.tokenId(.WORK);
     if (tok.matchesKeyword("write")) return generated.tokenId(.WRITE);
     return null;
+}
+
+fn generatedFunctionArgumentNameIdentifierContext(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, next: ?token_mod.Token) bool {
+    if (!tok.matchesKeywordTag(.@"return")) return false;
+    const next_token = next orelse return false;
+    if (next_token.kind != .eq) return false;
+    if (index == 0) return false;
+    var depth: usize = 0;
+    var cursor = index;
+    while (cursor > 0) {
+        cursor -= 1;
+        switch (tokens[cursor].kind) {
+            .rparen, .rbracket => depth += 1,
+            .lparen, .lbracket => {
+                if (depth == 0) return cursor > 0 and tokens[cursor - 1].kind == .identifier;
+                depth -= 1;
+            },
+            .comma => if (depth == 0) return true,
+            else => {},
+        }
+    }
+    return false;
+}
+
+fn generatedMatchKeywordAliasContext(tokens: []const token_mod.Token, index: usize, tok: token_mod.Token, prev: ?token_mod.Token, next: ?token_mod.Token) bool {
+    if (!tok.matchesKeywordTag(.match) or prev == null) return false;
+    if (prev.?.matchesKeywordTag(.as)) return true;
+    if (!generatedTokenIsInSelectProjectionList(tokens, index)) return false;
+    const next_token = next orelse return true;
+    return next_token.matchesKeywordTag(.from) or
+        next_token.matchesKeywordTag(.order) or
+        next_token.matchesKeywordTag(.group) or
+        next_token.matchesKeywordTag(.having) or
+        next_token.matchesKeywordTag(.limit) or
+        next_token.kind == .comma or
+        next_token.kind == .semicolon;
+}
+
+fn generatedTokenIsInSelectProjectionList(tokens: []const token_mod.Token, index: usize) bool {
+    var target_depth: usize = 0;
+    for (tokens[0..index]) |token| {
+        switch (token.kind) {
+            .lparen => target_depth += 1,
+            .rparen => {
+                if (target_depth > 0) target_depth -= 1;
+            },
+            else => {},
+        }
+    }
+
+    var depth: usize = 0;
+    var saw_select = false;
+    var saw_from = false;
+    for (tokens[0..index]) |token| {
+        if (depth == target_depth) {
+            if (token.matchesKeywordTag(.select)) {
+                saw_select = true;
+                saw_from = false;
+            } else if (saw_select and token.matchesKeywordTag(.from)) {
+                saw_from = true;
+            }
+        }
+        switch (token.kind) {
+            .lparen => depth += 1,
+            .rparen => {
+                if (depth > 0) depth -= 1;
+            },
+            else => {},
+        }
+    }
+    return saw_select and !saw_from;
 }
 
 fn generatedSessionKeywordContext(tokens: []const token_mod.Token, index: usize) bool {
@@ -3720,6 +3853,43 @@ fn generatedCreateRoutineDiagnosticIdentifierContext(tokens: []const token_mod.T
     return index > close;
 }
 
+fn generatedCreateTriggerDiagnosticIdentifierContext(tokens: []const token_mod.Token, index: usize) bool {
+    if (tokens.len < 3 or index < 2 or !tokens[0].matchesKeywordTag(.create)) return false;
+    if (tokens[1].matchesKeywordTag(.trigger)) return index >= 2;
+    return index >= 4 and
+        tokens.len >= 5 and
+        tokens[1].matchesKeywordTag(.@"or") and
+        tokens[2].matchesKeywordTag(.replace) and
+        tokens[3].matchesKeywordTag(.trigger);
+}
+
+fn generatedCreateTriggerDiagnosticKeywordAsIdentifier(tok: token_mod.Token) bool {
+    return tok.matchesKeywordTag(.@"and") or
+        tok.matchesKeywordTag(.any) or
+        tok.matchesKeywordTag(.array) or
+        tok.matchesKeywordTag(.between) or
+        tok.matchesKeywordTag(.case) or
+        tok.matchesKeywordTag(.cast) or
+        tok.matchesKeywordTag(.current) or
+        tok.matchesKeywordTag(.current_date) or
+        tok.matchesKeywordTag(.current_timestamp) or
+        tok.matchesKeywordTag(.distinct) or
+        tok.matchesKeywordTag(.@"else") or
+        tok.matchesKeywordTag(.end) or
+        tok.matchesKeywordTag(.escape) or
+        tok.matchesKeywordTag(.extract) or
+        tok.matchesKeywordTag(.filter) or
+        tok.matchesKeywordTag(.ilike) or
+        tok.matchesKeywordTag(.interval) or
+        tok.matchesKeywordTag(.like) or
+        tok.matchesKeywordTag(.@"or") or
+        tok.matchesKeywordTag(.position) or
+        tok.matchesKeywordTag(.some) or
+        tok.matchesKeywordTag(.then) or
+        tok.matchesKeywordTag(.unknown) or
+        tok.matchesKeywordTag(.when);
+}
+
 fn generatedCreateTableMissingAsSelectContext(tokens: []const token_mod.Token, index: usize) bool {
     return index == 1 and generatedCreateTableMissingAsSelect(tokens);
 }
@@ -3777,6 +3947,7 @@ fn generatedParserTreatsKeywordAsIdentifier(tokens: []const token_mod.Token, ind
     }
     if (tok.matchesKeywordTag(.offset)) return next != null and next.?.matchesKeywordTag(.limit);
     if (tok.matchesKeywordTag(.fetch)) return prev != null and prev.?.matchesKeywordTag(.as);
+    if (tok.matchesKeywordTag(.start)) return next != null and next.?.kind == .eq;
     if (tok.matchesKeywordTag(.rows)) {
         if (generatedRowsKeywordStartsWindowFrame(tokens, index)) return false;
         return prev != null and prev.?.kind == .identifier and next != null and next.?.kind == .number;
@@ -5578,9 +5749,262 @@ fn buildUnsupportedAst(
             try populateGeneratedUnsupportedAlterRoutineAst(alloc, tokens, end, &ast);
         } else if (generatedUnsupportedAlterTableOperationKind(kind)) {
             populateGeneratedUnsupportedAlterTableAst(tokens, end, &ast);
+        } else if (kind == .graph_query) {
+            try populateGeneratedUnsupportedGraphQueryAst(alloc, tokens, end, &ast);
         }
     }
     return ast;
+}
+
+fn populateGeneratedUnsupportedGraphQueryAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    end: usize,
+    ast: *GeneratedSqlUnsupportedAst,
+) !void {
+    const subject = ast.subject_tokens orelse return;
+    if (subject.start != 1 or subject.end != end) return;
+    const return_index = findTopLevelKeyword(tokens, subject.start, subject.end, .@"return") orelse return;
+    if (return_index + 1 >= subject.end) return;
+
+    const where_index = findTopLevelKeyword(tokens, subject.start, return_index, .where);
+    const source_tail_end = where_index orelse return_index;
+    const source_with_index = findTopLevelKeyword(tokens, subject.start, source_tail_end, .with);
+    const path_end = source_with_index orelse source_tail_end;
+    const path_metadata = generatedGraphPathMetadata(tokens, .{ .start = subject.start, .end = path_end }) orelse return;
+
+    ast.graph_path_tokens = .{ .start = subject.start, .end = path_end };
+    ast.graph_path_kind = path_metadata.kind;
+    ast.graph_source_alias_tokens = path_metadata.source_alias_tokens;
+    ast.graph_relationship_tokens = path_metadata.relationship_tokens;
+    ast.graph_relationship_label_tokens = path_metadata.relationship_label_tokens;
+    ast.graph_target_alias_tokens = path_metadata.target_alias_tokens;
+    if (source_with_index) |with| {
+        const source_metadata = generatedGraphSourceBindingMetadata(tokens, .{ .start = with, .end = source_tail_end }) orelse return;
+        ast.graph_source_binding_tokens = .{ .start = with, .end = source_tail_end };
+        ast.graph_source_graph_tokens = source_metadata.graph_tokens;
+        ast.graph_source_index_tokens = source_metadata.index_tokens;
+        ast.graph_source_table_tokens = source_metadata.table_tokens;
+        ast.graph_source_start_tokens = source_metadata.start_tokens;
+    }
+    if (where_index) |where| {
+        if (where < path_end or where + 1 >= return_index) return;
+        ast.graph_where_tokens = .{ .start = where, .end = return_index };
+        try buildGeneratedExpressionAstInto(alloc, tokens, .{ .start = where + 1, .end = return_index }, &ast.graph_where_expression);
+    }
+    ast.graph_return_tokens = .{ .start = return_index, .end = return_index + 1 };
+    ast.graph_return_tail_tokens = .{ .start = return_index + 1, .end = subject.end };
+    try populateGeneratedUnsupportedGraphReturnTailAst(alloc, tokens, ast.graph_return_tail_tokens.?, path_metadata, ast);
+}
+
+fn populateGeneratedUnsupportedGraphReturnTailAst(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    tail: GeneratedSqlTokenRange,
+    path_metadata: GeneratedGraphPathMetadata,
+    ast: *GeneratedSqlUnsupportedAst,
+) !void {
+    const order_index = findTopLevelKeyword(tokens, tail.start, tail.end, .order);
+    const limit_index = findTopLevelKeyword(tokens, tail.start, tail.end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, tail.start, tail.end, .offset);
+    const projection_end = firstOptionalIndex(&[_]?usize{ order_index, limit_index, offset_index }) orelse tail.end;
+    if (tail.start < projection_end) {
+        const projection_tokens = GeneratedSqlTokenRange{ .start = tail.start, .end = projection_end };
+        ast.graph_return_projection_tokens = projection_tokens;
+        ast.graph_return_projection_items = try buildTopLevelListAst(alloc, tokens, projection_tokens, .{});
+        ast.graph_return_path_alias_projection_roles = try buildGeneratedGraphReturnPathAliasProjectionRolesAlloc(alloc, tokens, ast.graph_return_projection_items, path_metadata);
+        ast.graph_return_path_alias_projection_count = generatedGraphReturnPathAliasProjectionCount(ast.graph_return_path_alias_projection_roles);
+    }
+    if (order_index) |idx| {
+        const order_start = if (idx + 1 < tail.end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const order_end = firstOptionalIndex(&[_]?usize{ limit_index, offset_index }) orelse tail.end;
+        if (order_start < order_end) {
+            const order_tokens = GeneratedSqlTokenRange{ .start = order_start, .end = order_end };
+            ast.graph_order_tokens = order_tokens;
+            ast.graph_order_items = try buildTopLevelListAst(alloc, tokens, order_tokens, .{ .order_modifiers = true });
+        }
+    }
+    if (limit_index) |idx| {
+        const limit_end = firstOptionalIndex(&[_]?usize{offset_index}) orelse tail.end;
+        if (idx + 1 < limit_end) {
+            const limit_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = limit_end };
+            ast.graph_limit_tokens = limit_tokens;
+            try buildGeneratedExpressionAstInto(alloc, tokens, limit_tokens, &ast.graph_limit_expression);
+        }
+    }
+    if (offset_index) |idx| {
+        if (idx + 1 < tail.end) {
+            const offset_tokens = GeneratedSqlTokenRange{ .start = idx + 1, .end = tail.end };
+            ast.graph_offset_tokens = offset_tokens;
+            try buildGeneratedExpressionAstInto(alloc, tokens, offset_tokens, &ast.graph_offset_expression);
+        }
+    }
+}
+
+fn generatedGraphReturnPathAliasProjectionCount(
+    roles: []const ?GeneratedSqlGraphPathAliasRole,
+) usize {
+    var count: usize = 0;
+    for (roles) |role| {
+        if (role != null) count += 1;
+    }
+    return count;
+}
+
+fn buildGeneratedGraphReturnPathAliasProjectionRolesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    projection_items: GeneratedSqlListAst,
+    path_metadata: GeneratedGraphPathMetadata,
+) ![]?GeneratedSqlGraphPathAliasRole {
+    if (projection_items.count == 0) return &.{};
+    const roles = try alloc.alloc(?GeneratedSqlGraphPathAliasRole, projection_items.count);
+    errdefer alloc.free(roles);
+    for (projection_items.expression_items, 0..) |expression, index| {
+        roles[index] = generatedGraphExpressionPathAliasRole(tokens, expression, path_metadata);
+    }
+    return roles;
+}
+
+fn generatedGraphExpressionPathAliasRole(
+    tokens: []const token_mod.Token,
+    expression: GeneratedSqlTokenRange,
+    path_metadata: GeneratedGraphPathMetadata,
+) ?GeneratedSqlGraphPathAliasRole {
+    if (expression.end != expression.start + 1 or expression.end > tokens.len) return null;
+    if (generatedGraphTokenTextMatchesAlias(tokens, expression.start, path_metadata.source_alias_tokens)) return .source;
+    if (path_metadata.target_alias_tokens) |target| {
+        if (generatedGraphTokenTextMatchesAlias(tokens, expression.start, target)) return .target;
+    }
+    return null;
+}
+
+fn generatedGraphTokenTextMatchesAlias(
+    tokens: []const token_mod.Token,
+    token_index: usize,
+    alias: GeneratedSqlTokenRange,
+) bool {
+    if (alias.end != alias.start + 1 or alias.end > tokens.len) return false;
+    if (tokens[token_index].kind != .identifier or tokens[alias.start].kind != .identifier) return false;
+    return std.mem.eql(u8, tokens[token_index].text, tokens[alias.start].text);
+}
+
+const GeneratedGraphPathMetadata = struct {
+    kind: GeneratedSqlGraphPathKind,
+    source_alias_tokens: GeneratedSqlTokenRange,
+    relationship_tokens: ?GeneratedSqlTokenRange = null,
+    relationship_label_tokens: ?GeneratedSqlTokenRange = null,
+    target_alias_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+const GeneratedGraphSourceBindingMetadata = struct {
+    graph_tokens: GeneratedSqlTokenRange,
+    index_tokens: GeneratedSqlTokenRange,
+    table_tokens: GeneratedSqlTokenRange,
+    start_tokens: GeneratedSqlTokenRange,
+};
+
+const GeneratedGraphRelationshipMetadata = struct {
+    label_tokens: ?GeneratedSqlTokenRange = null,
+};
+
+fn generatedGraphPathTokensAreValid(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) bool {
+    return generatedGraphPathMetadata(tokens, range) != null;
+}
+
+fn generatedGraphSourceBindingMetadata(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedGraphSourceBindingMetadata {
+    if (range.end != range.start + 7 or range.end > tokens.len) return null;
+    if (!tokens[range.start].matchesKeywordTag(.with)) return null;
+    if (!tokens[range.start + 1].matchesKeywordTag(.graph)) return null;
+    if (!generatedGraphBindingValueToken(tokens[range.start + 2])) return null;
+    if (!tokens[range.start + 3].matchesKeywordTag(.on)) return null;
+    if (!generatedGraphBindingValueToken(tokens[range.start + 4])) return null;
+    if (!tokens[range.start + 5].matchesKeywordTag(.start)) return null;
+    if (!generatedGraphBindingValueToken(tokens[range.start + 6])) return null;
+    return .{
+        .graph_tokens = .{ .start = range.start + 1, .end = range.start + 2 },
+        .index_tokens = .{ .start = range.start + 2, .end = range.start + 3 },
+        .table_tokens = .{ .start = range.start + 4, .end = range.start + 5 },
+        .start_tokens = .{ .start = range.start + 6, .end = range.start + 7 },
+    };
+}
+
+fn generatedGraphBindingValueToken(token: token_mod.Token) bool {
+    return token.kind == .identifier or token.kind == .string;
+}
+
+fn generatedGraphPathMetadata(tokens: []const token_mod.Token, range: GeneratedSqlTokenRange) ?GeneratedGraphPathMetadata {
+    var index = range.start;
+    const source_alias = consumeGeneratedGraphNode(tokens, &index, range.end) orelse return null;
+    if (index == range.end) {
+        return .{
+            .kind = .node,
+            .source_alias_tokens = source_alias,
+        };
+    }
+    const relationship_start = index;
+    var direction: GeneratedSqlGraphPathKind = undefined;
+    var label: ?GeneratedSqlTokenRange = null;
+    if (consumeGeneratedGraphOutRelationship(tokens, &index, range.end)) |relationship| {
+        direction = .outgoing;
+        label = relationship.label_tokens;
+    } else if (consumeGeneratedGraphInRelationship(tokens, &index, range.end)) |relationship| {
+        direction = .incoming;
+        label = relationship.label_tokens;
+    } else {
+        return null;
+    }
+    const target_alias = consumeGeneratedGraphNode(tokens, &index, range.end) orelse return null;
+    if (index != range.end) return null;
+    return .{
+        .kind = direction,
+        .source_alias_tokens = source_alias,
+        .relationship_tokens = .{ .start = relationship_start, .end = target_alias.start - 1 },
+        .relationship_label_tokens = label,
+        .target_alias_tokens = target_alias,
+    };
+}
+
+fn consumeGeneratedGraphNode(tokens: []const token_mod.Token, index: *usize, end: usize) ?GeneratedSqlTokenRange {
+    if (index.* + 2 >= end) return null;
+    if (tokens[index.*].kind != .lparen) return null;
+    if (tokens[index.* + 1].kind != .identifier) return null;
+    if (tokens[index.* + 2].kind != .rparen) return null;
+    const alias = GeneratedSqlTokenRange{ .start = index.* + 1, .end = index.* + 2 };
+    index.* += 3;
+    return alias;
+}
+
+fn consumeGeneratedGraphOutRelationship(tokens: []const token_mod.Token, index: *usize, end: usize) ?GeneratedGraphRelationshipMetadata {
+    if (index.* + 2 >= end) return null;
+    if (tokens[index.*].kind != .minus or tokens[index.* + 1].kind != .lbracket) return null;
+    index.* += 2;
+    const label = consumeGeneratedGraphRelationshipLabelOpt(tokens, index, end) orelse return null;
+    if (index.* + 1 >= end) return null;
+    if (tokens[index.*].kind != .rbracket or tokens[index.* + 1].kind != .arrow_json) return null;
+    index.* += 2;
+    return .{ .label_tokens = if (label.start < label.end) label else null };
+}
+
+fn consumeGeneratedGraphInRelationship(tokens: []const token_mod.Token, index: *usize, end: usize) ?GeneratedGraphRelationshipMetadata {
+    if (index.* + 3 >= end) return null;
+    if (tokens[index.*].kind != .lt or tokens[index.* + 1].kind != .minus or tokens[index.* + 2].kind != .lbracket) return null;
+    index.* += 3;
+    const label = consumeGeneratedGraphRelationshipLabelOpt(tokens, index, end) orelse return null;
+    if (index.* + 1 >= end) return null;
+    if (tokens[index.*].kind != .rbracket or tokens[index.* + 1].kind != .minus) return null;
+    index.* += 2;
+    return .{ .label_tokens = if (label.start < label.end) label else null };
+}
+
+fn consumeGeneratedGraphRelationshipLabelOpt(tokens: []const token_mod.Token, index: *usize, end: usize) ?GeneratedSqlTokenRange {
+    if (index.* < end and tokens[index.*].kind == .colon) {
+        if (index.* + 1 >= end or tokens[index.* + 1].kind != .identifier) return null;
+        const label = GeneratedSqlTokenRange{ .start = index.* + 1, .end = index.* + 2 };
+        index.* += 2;
+        return label;
+    }
+    return .{ .start = index.*, .end = index.* };
 }
 
 fn generatedUnsupportedAlterTableOperationKind(kind: GeneratedSqlUnsupportedKind) bool {
@@ -12985,12 +13409,14 @@ test "generated SQL parser facade exposes typed read and unsupported statement n
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .load }, (try parseSqlAlloc(alloc, "LOAD 'auto_explain'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .lock }, (try parseSqlAlloc(alloc, "LOCK TABLE usage_records IN SHARE MODE")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .graph_query }, (try parseSqlAlloc(alloc, "MATCH (doc) RETURN doc")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id AS match FROM usage_records")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .read = .query }, (try parseSqlAlloc(alloc, "SELECT id match FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .cursor = .move }, (try parseSqlAlloc(alloc, "MOVE FROM usage_cursor")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .notify }, (try parseSqlAlloc(alloc, "NOTIFY usage_events, 'changed'")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_statistics }, (try parseSqlAlloc(alloc, "CREATE STATISTICS usage_stats ON tenant_id, status FROM usage_records")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_configuration }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH CONFIGURATION usage_search (COPY = pg_catalog.english)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_dictionary }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH DICTIONARY usage_dict (TEMPLATE = simple)")).statement);
-    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_parser }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)")).statement);
+    try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_parser }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH PARSER usage_parser (HEADLINE = prsd_headline)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_text_search_template }, (try parseSqlAlloc(alloc, "CREATE TEXT SEARCH TEMPLATE usage_template (LEXIZE = dsimple_lexize)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .create_transform }, (try parseSqlAlloc(alloc, "CREATE TRANSFORM FOR jsonb LANGUAGE plpgsql FROM SQL WITH FUNCTION jsonb_to_plpgsql(internal)")).statement);
     try std.testing.expectEqual(GeneratedSqlStatement{ .unsupported = .alter_transform }, (try parseSqlAlloc(alloc, "ALTER TRANSFORM FOR jsonb LANGUAGE plpgsql OWNER TO app_role")).statement);
@@ -16682,6 +17108,54 @@ test "generated SQL parser facade builds quantified predicate AST spans" {
         else => return error.TestUnexpectedResult,
     }
 
+    const scalar_projection_subquery_read_sql = "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records";
+    const scalar_projection_subquery_read_result = try parseSqlAlloc(alloc, scalar_projection_subquery_read_sql);
+    switch (scalar_projection_subquery_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 13 }, read.projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), read.projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 13 }, read.projection_items.items[0]);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 1, .end = 11 }, read.projection_items.expression_items[0]);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, read.projection_items.expressions[0].kind);
+            const subquery = &read.projection_items.expressions[0];
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 10 }, subquery.inner_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, subquery.subquery_read_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 2, .end = 3 }, subquery.subquery_select_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 3, .end = 4 }, subquery.subquery_projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), subquery.subquery_projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, subquery.subquery_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 10 }, subquery.subquery_where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, subquery.subquery_where_expression_kind.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const scalar_predicate_subquery_read_sql = "SELECT id FROM usage_records WHERE status = (SELECT status FROM usage_records WHERE id = 'u1')";
+    const scalar_predicate_subquery_read_result = try parseSqlAlloc(alloc, scalar_predicate_subquery_read_sql);
+    switch (scalar_predicate_subquery_read_result.ast.?) {
+        .read => |read| {
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, read.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 17 }, read.where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, read.where_expression.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 5, .end = 6 }, read.where_expression.left_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 6, .end = 7 }, read.where_expression.operator_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 7, .end = 17 }, read.where_expression.right_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, read.where_expression.right_expression_kind.?);
+            const subquery = read.where_expression.right_expression orelse return error.TestUnexpectedResult;
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.subquery, subquery.kind);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 16 }, subquery.inner_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlReadKind.query, subquery.subquery_read_kind.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 8, .end = 9 }, subquery.subquery_select_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 9, .end = 10 }, subquery.subquery_projection_tokens.?);
+            try std.testing.expectEqual(@as(usize, 1), subquery.subquery_projection_items.count);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 11, .end = 12 }, subquery.subquery_source_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlTokenRange{ .start = 13, .end = 16 }, subquery.subquery_where_tokens.?);
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, subquery.subquery_where_expression_kind.?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
     const array_contains_read_sql = "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']";
     const array_contains_read_result = try parseSqlAlloc(alloc, array_contains_read_sql);
     switch (array_contains_read_result.ast.?) {
@@ -19271,7 +19745,7 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 10 },
         },
         .{
-            .sql = "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)",
+            .sql = "CREATE TEXT SEARCH PARSER usage_parser (HEADLINE = prsd_headline)",
             .kind = .create_text_search_parser,
             .reason = .create_text_search_parser_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 1, .end = 10 },
@@ -19299,6 +19773,12 @@ test "generated SQL parser facade builds extended read AST spans" {
             .kind = .create_trigger,
             .reason = .create_trigger_not_planned_by_generated_parser,
             .subject_tokens = .{ .start = 4, .end = 17 },
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_when BEFORE UPDATE ON usage_records FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM OLD.status) EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+            .reason = .create_trigger_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 2, .end = 27 },
         },
         .{
             .sql = "CREATE USER MAPPING FOR usage_user SERVER usage_server OPTIONS (user 'remote')",
@@ -19517,6 +19997,24 @@ test "generated SQL parser facade builds extended read AST spans" {
             .subject_tokens = .{ .start = 1, .end = 6 },
         },
         .{
+            .sql = "MATCH (doc)-[:cites]->(target) RETURN target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 16 },
+        },
+        .{
+            .sql = "MATCH (target)<-[:cites]-(doc) RETURN target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 16 },
+        },
+        .{
+            .sql = "MATCH (doc)-[:cites]->(target) RETURN doc, target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+            .subject_tokens = .{ .start = 1, .end = 18 },
+        },
+        .{
             .sql = "NOTIFY usage_events, 'changed'",
             .kind = .notify,
             .reason = .notify_not_planned_by_generated_parser,
@@ -19582,6 +20080,138 @@ test "generated SQL parser facade builds extended read AST spans" {
             },
             else => return error.TestUnexpectedResult,
         }
+    }
+
+    const graph_where_sql = "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published' RETURN target";
+    var graph_where_tokens = try lexer.tokenizeAlloc(alloc, graph_where_sql);
+    defer lexer.freeTokens(alloc, &graph_where_tokens);
+    var graph_where_result = try parseTokensAlloc(alloc, graph_where_tokens.items);
+    defer graph_where_result.deinit(alloc);
+    switch (graph_where_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.graph_query, unsupported.kind);
+            try std.testing.expectEqual(GeneratedSqlUnsupportedReason.graph_query_not_planned_by_generated_parser, unsupported.reason);
+            try std.testing.expectEqual(GeneratedSqlGraphPathKind.outgoing, unsupported.graph_path_kind.?);
+            try std.testing.expectEqualStrings("(doc)-[:cites]->(target)", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_path_tokens.?));
+            try std.testing.expectEqualStrings("doc", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_source_alias_tokens.?));
+            try std.testing.expectEqualStrings("-[:cites]->", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_relationship_tokens.?));
+            try std.testing.expectEqualStrings("cites", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_relationship_label_tokens.?));
+            try std.testing.expectEqualStrings("target", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_target_alias_tokens.?));
+            try std.testing.expectEqualStrings("WHERE target.status = 'published'", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_where_tokens.?));
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.comparison, unsupported.graph_where_expression.kind);
+            try std.testing.expectEqualStrings("target.status = 'published'", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_where_expression.tokens.?));
+            try std.testing.expectEqualStrings("target.status", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_where_expression.left_tokens.?));
+            try std.testing.expectEqualStrings("=", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_where_expression.operator_tokens.?));
+            try std.testing.expectEqualStrings("'published'", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_where_expression.right_tokens.?));
+            try std.testing.expectEqualStrings("RETURN", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_return_tokens.?));
+            try std.testing.expectEqualStrings("target", tokenRangeText(graph_where_sql, graph_where_tokens.items, unsupported.graph_return_tail_tokens.?));
+            try std.testing.expectEqual(@as(usize, 1), unsupported.graph_return_path_alias_projection_count);
+            try std.testing.expectEqual(@as(usize, 1), unsupported.graph_return_path_alias_projection_roles.len);
+            try std.testing.expectEqual(GeneratedSqlGraphPathAliasRole.target, unsupported.graph_return_path_alias_projection_roles[0].?);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_source_sql = "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' WHERE target.status = 'published' RETURN target";
+    var graph_source_tokens = try lexer.tokenizeAlloc(alloc, graph_source_sql);
+    defer lexer.freeTokens(alloc, &graph_source_tokens);
+    var graph_source_result = try parseTokensAlloc(alloc, graph_source_tokens.items);
+    defer graph_source_result.deinit(alloc);
+    switch (graph_source_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.graph_query, unsupported.kind);
+            try std.testing.expectEqualStrings("(doc)-[:cites]->(target)", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_path_tokens.?));
+            try std.testing.expectEqualStrings("WITH GRAPH docs_edge_graph ON usage_records START 'doc:root'", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_source_binding_tokens.?));
+            try std.testing.expectEqualStrings("GRAPH", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_source_graph_tokens.?));
+            try std.testing.expectEqualStrings("docs_edge_graph", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_source_index_tokens.?));
+            try std.testing.expectEqualStrings("usage_records", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_source_table_tokens.?));
+            try std.testing.expectEqualStrings("'doc:root'", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_source_start_tokens.?));
+            try std.testing.expectEqualStrings("WHERE target.status = 'published'", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_where_tokens.?));
+            try std.testing.expectEqualStrings("target", tokenRangeText(graph_source_sql, graph_source_tokens.items, unsupported.graph_return_projection_tokens.?));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_alias_projection_sql = "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id, target.key AS target_id ORDER BY target.depth ASC LIMIT 5";
+    var graph_alias_projection_tokens = try lexer.tokenizeAlloc(alloc, graph_alias_projection_sql);
+    defer lexer.freeTokens(alloc, &graph_alias_projection_tokens);
+    var graph_alias_projection_result = try parseTokensAlloc(alloc, graph_alias_projection_tokens.items);
+    defer graph_alias_projection_result.deinit(alloc);
+    switch (graph_alias_projection_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlUnsupportedKind.graph_query, unsupported.kind);
+            try std.testing.expectEqualStrings("(doc)-[:cites]->(target)", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_path_tokens.?));
+            try std.testing.expectEqualStrings("WITH GRAPH docs_edge_graph ON usage_records START 'doc:root'", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_source_binding_tokens.?));
+            try std.testing.expectEqualStrings("doc.key AS source_id, target.key AS target_id", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_return_projection_tokens.?));
+            try std.testing.expectEqual(@as(usize, 2), unsupported.graph_return_projection_items.count);
+            try std.testing.expectEqualStrings("doc.key AS source_id", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_return_projection_items.items[0]));
+            try std.testing.expectEqualStrings("target.key AS target_id", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_return_projection_items.items[1]));
+            try std.testing.expectEqualStrings("target.depth ASC", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_order_tokens.?));
+            try std.testing.expectEqual(@as(usize, 1), unsupported.graph_order_items.count);
+            try std.testing.expectEqualStrings("target.depth ASC", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_order_items.items[0]));
+            try std.testing.expectEqualStrings("5", tokenRangeText(graph_alias_projection_sql, graph_alias_projection_tokens.items, unsupported.graph_limit_tokens.?));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_incoming_sql = "MATCH (target)<-[:cites]-(doc) RETURN target";
+    var graph_incoming_tokens = try lexer.tokenizeAlloc(alloc, graph_incoming_sql);
+    defer lexer.freeTokens(alloc, &graph_incoming_tokens);
+    var graph_incoming_result = try parseTokensAlloc(alloc, graph_incoming_tokens.items);
+    defer graph_incoming_result.deinit(alloc);
+    switch (graph_incoming_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlGraphPathKind.incoming, unsupported.graph_path_kind.?);
+            try std.testing.expectEqualStrings("target", tokenRangeText(graph_incoming_sql, graph_incoming_tokens.items, unsupported.graph_source_alias_tokens.?));
+            try std.testing.expectEqualStrings("<-[:cites]-", tokenRangeText(graph_incoming_sql, graph_incoming_tokens.items, unsupported.graph_relationship_tokens.?));
+            try std.testing.expectEqualStrings("cites", tokenRangeText(graph_incoming_sql, graph_incoming_tokens.items, unsupported.graph_relationship_label_tokens.?));
+            try std.testing.expectEqualStrings("doc", tokenRangeText(graph_incoming_sql, graph_incoming_tokens.items, unsupported.graph_target_alias_tokens.?));
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_node_sql = "MATCH (doc) RETURN doc";
+    var graph_node_tokens = try lexer.tokenizeAlloc(alloc, graph_node_sql);
+    defer lexer.freeTokens(alloc, &graph_node_tokens);
+    var graph_node_result = try parseTokensAlloc(alloc, graph_node_tokens.items);
+    defer graph_node_result.deinit(alloc);
+    switch (graph_node_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqual(GeneratedSqlGraphPathKind.node, unsupported.graph_path_kind.?);
+            try std.testing.expectEqualStrings("doc", tokenRangeText(graph_node_sql, graph_node_tokens.items, unsupported.graph_source_alias_tokens.?));
+            try std.testing.expect(unsupported.graph_relationship_tokens == null);
+            try std.testing.expect(unsupported.graph_relationship_label_tokens == null);
+            try std.testing.expect(unsupported.graph_target_alias_tokens == null);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const graph_tail_sql = "MATCH (doc)-[:cites]->(target) RETURN doc, target ORDER BY target.rank DESC LIMIT 5 OFFSET 2";
+    var graph_tail_tokens = try lexer.tokenizeAlloc(alloc, graph_tail_sql);
+    defer lexer.freeTokens(alloc, &graph_tail_tokens);
+    var graph_tail_result = try parseTokensAlloc(alloc, graph_tail_tokens.items);
+    defer graph_tail_result.deinit(alloc);
+    switch (graph_tail_result.ast.?) {
+        .unsupported => |unsupported| {
+            try std.testing.expectEqualStrings("doc, target", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_return_projection_tokens.?));
+            try std.testing.expectEqual(@as(usize, 2), unsupported.graph_return_projection_items.count);
+            try std.testing.expectEqual(@as(usize, 2), unsupported.graph_return_path_alias_projection_count);
+            try std.testing.expectEqual(@as(usize, 2), unsupported.graph_return_path_alias_projection_roles.len);
+            try std.testing.expectEqual(GeneratedSqlGraphPathAliasRole.source, unsupported.graph_return_path_alias_projection_roles[0].?);
+            try std.testing.expectEqual(GeneratedSqlGraphPathAliasRole.target, unsupported.graph_return_path_alias_projection_roles[1].?);
+            try std.testing.expectEqualStrings("doc", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_return_projection_items.items[0]));
+            try std.testing.expectEqualStrings("target", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_return_projection_items.items[1]));
+            try std.testing.expectEqualStrings("target.rank DESC", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_order_tokens.?));
+            try std.testing.expectEqual(@as(usize, 1), unsupported.graph_order_items.count);
+            try std.testing.expectEqualStrings("target.rank DESC", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_order_items.items[0]));
+            try std.testing.expectEqualStrings("5", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_limit_tokens.?));
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, unsupported.graph_limit_expression.kind);
+            try std.testing.expectEqualStrings("5", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_limit_expression.tokens.?));
+            try std.testing.expectEqualStrings("2", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_offset_tokens.?));
+            try std.testing.expectEqual(GeneratedSqlExpressionKind.token_range, unsupported.graph_offset_expression.kind);
+            try std.testing.expectEqualStrings("2", tokenRangeText(graph_tail_sql, graph_tail_tokens.items, unsupported.graph_offset_expression.tokens.?));
+        },
+        else => return error.TestUnexpectedResult,
     }
 
     const explain_sql = "EXPLAIN SELECT id FROM usage_records";
@@ -20110,6 +20740,11 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
         "SELECT id FROM usage_records WHERE",
         "WITH source_rows AS (SELECT id FROM usage_records SELECT id FROM source_rows",
         "CREATE TABLE usage_records (id text",
+        "DROP TRIGGER IF EXISTS",
+        "DROP TRIGGER usage_audit ON",
+        "MATCH (doc) RETURN",
+        "MATCH () RETURN doc",
+        "MATCH foo RETURN bar",
         "INSERT INTO usage_records (id VALUES ('u1')",
         "EXPLAIN (FORMAT",
     };
@@ -20121,6 +20756,28 @@ test "generated SQL parser reports bounded diagnostics for malformed corpus" {
         defer std.testing.allocator.free(diagnostic.expected);
         try std.testing.expect(diagnostic.token_index <= tokens.items.len);
         try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+        try std.testing.expect(diagnostic.expected.len > 0);
+    }
+}
+
+test "generated SQL parser reports malformed unsupported trigger diagnostics" {
+    const cases = [_]struct {
+        sql: []const u8,
+        actual: []const u8,
+    }{
+        .{ .sql = "DROP TRIGGER IF EXISTS", .actual = "$end" },
+        .{ .sql = "DROP TRIGGER usage_audit ON", .actual = "$end" },
+    };
+
+    for (cases) |case| {
+        var tokens = try lexer.tokenizeAlloc(std.testing.allocator, case.sql);
+        defer lexer.freeTokens(std.testing.allocator, &tokens);
+        const diagnostic = try diagnosticAlloc(std.testing.allocator, tokens.items) orelse return error.ExpectedDiagnostic;
+        defer std.testing.allocator.free(diagnostic.expected);
+        try std.testing.expectEqualStrings(case.actual, diagnostic.actual);
+        try std.testing.expect(diagnostic.token_index <= tokens.items.len);
+        try std.testing.expect(diagnostic.source_end >= diagnostic.source_start);
+        try std.testing.expect(diagnostic.source_end <= case.sql.len);
         try std.testing.expect(diagnostic.expected.len > 0);
     }
 }

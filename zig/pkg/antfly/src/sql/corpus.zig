@@ -424,6 +424,7 @@ pub const AppParityParserFixtureSummary = struct {
     starts_with_create: bool = false,
     starts_with_delete: bool = false,
     starts_with_drop: bool = false,
+    starts_with_match: bool = false,
     starts_with_merge: bool = false,
     starts_with_truncate: bool = false,
     starts_with_update: bool = false,
@@ -483,6 +484,7 @@ pub const AppParityParserFixtureSummary = struct {
     tenant_id_identifier: bool = false,
     organization_id_identifier: bool = false,
     plan_identifier: bool = false,
+    category_identifier: bool = false,
     metadata_plan_identifier: bool = false,
     score_identifier: bool = false,
     support_view_identifier: bool = false,
@@ -586,6 +588,7 @@ pub const AppParityParserFixtureSummary = struct {
     vector_search_function: bool = false,
     hybrid_search_function: bool = false,
     graph_traverse_function: bool = false,
+    graph_neighbors_function: bool = false,
     graph_shortest_path_function: bool = false,
     graph_k_shortest_paths_function: bool = false,
     graph_metric_function: bool = false,
@@ -606,10 +609,14 @@ pub const AppParityParserFixtureSummary = struct {
     boolean_is_not_true_or_false: bool = false,
     boolean_unknown_or_not_unknown: bool = false,
     false_keyword: bool = false,
+    full_keyword: bool = false,
+    join_keyword: bool = false,
     not_keyword: bool = false,
     or_keyword: bool = false,
+    outer_keyword: bool = false,
     set_keyword: bool = false,
     select_keyword: bool = false,
+    return_identifier: bool = false,
     returning_keyword: bool = false,
     in_keyword: bool = false,
     where_keyword: bool = false,
@@ -684,6 +691,14 @@ pub const AppParityParserFixtureSummary = struct {
     statistics_catalog: bool = false,
     text_search_catalog: bool = false,
     transform_catalog: bool = false,
+    trigger_catalog: bool = false,
+    trigger_arguments: bool = false,
+    trigger_constraint: bool = false,
+    trigger_instead_of: bool = false,
+    trigger_referencing: bool = false,
+    trigger_truncate: bool = false,
+    trigger_update_of: bool = false,
+    trigger_when: bool = false,
     user_mapping: bool = false,
     graph_match_table_function: bool = false,
     join_graph_match_table_function: bool = false,
@@ -837,6 +852,7 @@ pub fn appParityStructuredFixtureSummary(
             .starts_with_create = appParityTokensStartWithKeyword(sql_tokens, .create),
             .starts_with_delete = appParityTokensStartWithKeyword(sql_tokens, .delete),
             .starts_with_drop = appParityTokensStartWithKeyword(sql_tokens, .drop),
+            .starts_with_match = appParityTokensStartWithKeyword(sql_tokens, .match),
             .starts_with_merge = appParityTokensStartWithKeyword(sql_tokens, .merge),
             .starts_with_truncate = appParityTokensStartWithKeyword(sql_tokens, .truncate),
             .starts_with_update = appParityTokensStartWithKeyword(sql_tokens, .update),
@@ -892,7 +908,7 @@ pub fn appParityStructuredFixtureSummary(
             .excluded_next_status_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.next_status"),
             .excluded_status_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.status"),
             .excluded_enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "excluded.enabled"),
-            .status_identifier = appParityTokensHaveIdentifier(sql_tokens, "status"),
+            .status_identifier = appParityTokensHaveIdentifierOrQualifiedField(sql_tokens, "status"),
             .quantity_identifier = appParityTokensHaveIdentifier(sql_tokens, "quantity"),
             .enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "enabled"),
             .usage_records_enabled_identifier = appParityTokensHaveIdentifier(sql_tokens, "usage_records.enabled"),
@@ -901,6 +917,7 @@ pub fn appParityStructuredFixtureSummary(
             .tenant_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "tenant_id"),
             .organization_id_identifier = appParityTokensHaveIdentifier(sql_tokens, "organization_id"),
             .plan_identifier = appParityTokensHaveIdentifier(sql_tokens, "plan"),
+            .category_identifier = appParityTokensHaveIdentifierOrQualifiedField(sql_tokens, "category"),
             .metadata_plan_identifier = appParityTokensHaveIdentifier(sql_tokens, "metadata_plan"),
             .score_identifier = appParityTokensHaveIdentifier(sql_tokens, "score"),
             .support_view_identifier = appParityTokensHaveIdentifier(sql_tokens, "support_view"),
@@ -1005,6 +1022,7 @@ pub fn appParityStructuredFixtureSummary(
             .vector_search_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.vector_search"),
             .hybrid_search_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.hybrid_search"),
             .graph_traverse_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_traverse"),
+            .graph_neighbors_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_neighbors"),
             .graph_shortest_path_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_shortest_path"),
             .graph_k_shortest_paths_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_k_shortest_paths"),
             .graph_metric_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_metric"),
@@ -1028,10 +1046,14 @@ pub fn appParityStructuredFixtureSummary(
             .boolean_unknown_or_not_unknown = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .unknown }) or
                 appParityTokensHaveKeywordSequence(sql_tokens, &.{ .is, .not, .unknown }),
             .false_keyword = appParityTokensHaveKeyword(sql_tokens, .false),
+            .full_keyword = appParityTokensHaveKeyword(sql_tokens, .full),
+            .join_keyword = appParityTokensHaveKeyword(sql_tokens, .join),
             .not_keyword = appParityTokensHaveKeyword(sql_tokens, .not),
             .or_keyword = appParityTokensHaveKeyword(sql_tokens, .@"or"),
+            .outer_keyword = appParityTokensHaveKeyword(sql_tokens, .outer),
             .set_keyword = appParityTokensHaveKeyword(sql_tokens, .set),
             .select_keyword = appParityTokensHaveKeyword(sql_tokens, .select),
+            .return_identifier = appParityTokensHaveIdentifier(sql_tokens, "return"),
             .returning_keyword = appParityTokensHaveKeyword(sql_tokens, .returning),
             .in_keyword = appParityTokensHaveKeyword(sql_tokens, .in),
             .where_keyword = appParityTokensHaveKeyword(sql_tokens, .where),
@@ -1127,6 +1149,16 @@ pub fn appParityStructuredFixtureSummary(
             .text_search_catalog = appParityTokensHaveKeyword(sql_tokens, .text) and
                 appParityTokensHaveIdentifier(sql_tokens, "search"),
             .transform_catalog = appParityTokensHaveIdentifier(sql_tokens, "transform"),
+            .trigger_catalog = appParityTokensHaveKeyword(sql_tokens, .trigger),
+            .trigger_arguments = appParityTokensHaveIdentifier(sql_tokens, "audit_usage") and
+                appParityTokensHaveStringLiteral(sql_tokens, "audit-context"),
+            .trigger_constraint = appParityTokensHaveKeyword(sql_tokens, .constraint),
+            .trigger_instead_of = appParityTokensHaveIdentifier(sql_tokens, "instead") and
+                appParityTokensHaveKeywordSequence(sql_tokens, &.{ .of, .insert }),
+            .trigger_referencing = appParityTokensHaveIdentifier(sql_tokens, "referencing"),
+            .trigger_truncate = appParityTokensHaveKeyword(sql_tokens, .truncate),
+            .trigger_update_of = appParityTokensHaveKeywordSequence(sql_tokens, &.{ .update, .of }),
+            .trigger_when = appParityTokensHaveKeyword(sql_tokens, .when),
             .user_mapping = appParityTokensHaveKeyword(sql_tokens, .user) and
                 appParityTokensHaveIdentifier(sql_tokens, "mapping"),
             .graph_match_table_function = appParityTokensHaveIdentifier(sql_tokens, "antfly.graph_match"),
@@ -1467,16 +1499,24 @@ fn appParityBindingCoverageCatalogForEntryParsedSqlAlloc(
             try appendAppParityBindingCoverageCatalogTable(alloc, &catalog_tables, entry, source);
         }
     }
+    for (table_names.extra_sources) |source| {
+        if (!std.mem.eql(u8, table_names.target, source)) {
+            try appendAppParityBindingCoverageCatalogTable(alloc, &catalog_tables, entry, source);
+        }
+    }
     return try AppParitySourceSchemaCatalog.initCatalogTablesAlloc(alloc, catalog_tables.items);
 }
 
 const AppParityBindingCoverageTableNames = struct {
     target: []const u8,
     source: ?[]const u8 = null,
+    extra_sources: []const []const u8 = &.{},
 
     fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
         alloc.free(@constCast(self.target));
         if (self.source) |source| alloc.free(@constCast(source));
+        for (self.extra_sources) |source| alloc.free(@constCast(source));
+        if (self.extra_sources.len > 0) alloc.free(self.extra_sources);
         self.* = undefined;
     }
 };
@@ -1494,12 +1534,26 @@ fn appParityBindingCoverageTableNamesAlloc(
 
     switch (entry.family) {
         .read, .query, .aggregate, .join, .lateral, .window => {
-            const resolved = (try binder.readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql)) orelse return null;
+            const resolved = (binder.readSourceTableNamesFromParsedSqlAlloc(alloc, parsed_sql) catch |err| switch (err) {
+                error.UnsupportedSqlShape => return null,
+                else => return err,
+            }) orelse return null;
             var tables = resolved;
             defer tables.deinit(alloc);
+            const extra_sources = try alloc.alloc([]const u8, tables.extra_sources.len);
+            var initialized: usize = 0;
+            errdefer {
+                for (extra_sources[0..initialized]) |source| alloc.free(@constCast(source));
+                if (extra_sources.len > 0) alloc.free(extra_sources);
+            }
+            for (tables.extra_sources, 0..) |source, index| {
+                extra_sources[index] = try alloc.dupe(u8, source);
+                initialized += 1;
+            }
             return .{
                 .target = try alloc.dupe(u8, tables.left),
                 .source = try alloc.dupe(u8, tables.source),
+                .extra_sources = extra_sources,
             };
         },
         .insert,
@@ -1552,6 +1606,7 @@ fn appParityBindingCoverageWriteSourceTableNameAlloc(
     switch (entry.family) {
         .insert,
         .document_write,
+        .truncate_source,
         .unsupported_write,
         => return try binder.writeTargetTableNameFromParsedSqlAlloc(alloc, parsed_sql),
         .insert_source => {
@@ -1633,6 +1688,10 @@ pub fn appParitySourceTableNameParsedSqlAlloc(
             defer tables.deinit(alloc);
             return try alloc.dupe(u8, tables.source);
         },
+        .truncate_source => {
+            const table_name = entry.summary.table_name orelse return error.InvalidSqlCatalog;
+            return try alloc.dupe(u8, table_name);
+        },
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
@@ -1687,6 +1746,8 @@ pub const relational_sql_api_coverage_inventory_format: u64 = 1;
 pub const relational_sql_adapter_removal_inventory_format: u64 = 1;
 pub const sql_compatibility_wrapper_inventory_format: u64 = 1;
 pub const sql_parser_migration_table_format: u64 = 1;
+pub const sql_production_ingress_cutover_format: u64 = 1;
+pub const sql_production_terminal_bridge_fixture_format: u64 = 1;
 pub const sql_adapter_edge_case_fixture_format: u64 = 1;
 pub const sql_adapter_edge_coverage_fixture_format: u64 = 1;
 
@@ -1839,6 +1900,9 @@ pub const SqlParserMigrationTableEntry = struct {
     family: []const u8,
     compatibility_entry_point: []const u8,
     generated_ast_entry_point: []const u8,
+    entrypoints: []const []const u8,
+    parser_status: []const u8,
+    retained_ast_corruption_test: []const u8,
     coverage_file: []const u8,
     removal_gate: []const u8,
 };
@@ -1853,7 +1917,75 @@ pub const SqlParserMigrationTable = struct {
     root: SqlParserMigrationTableRoot,
 
     pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
-        if (self.root.families.len > 0) alloc.free(self.root.families);
+        freeSqlParserMigrationTableRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const SqlProductionIngressCutoverGate = struct {
+    id: []const u8,
+    grammar_slices_bullet: []const u8,
+    status: []const u8,
+    evidence_file: []const u8,
+    evidence_symbol: []const u8,
+    completion_condition: []const u8,
+};
+
+pub const SqlProductionIngressCutoverWrapper = struct {
+    wrapper_id: []const u8,
+    family: []const u8,
+    requirement_id: []const u8,
+    legacy_admission: []const u8,
+    public_boundary_corruption_required: bool,
+};
+
+pub const SqlProductionIngressCutoverFamily = struct {
+    family: []const u8,
+    required_entrypoint: []const u8,
+    corruption_gate: []const u8,
+};
+
+pub const SqlProductionIngressCutoverRoot = struct {
+    cutover_format: u64,
+    gates: []const SqlProductionIngressCutoverGate,
+    wrappers: []const SqlProductionIngressCutoverWrapper,
+    families: []const SqlProductionIngressCutoverFamily,
+};
+
+pub const SqlProductionIngressCutover = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: SqlProductionIngressCutoverRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeSqlProductionIngressCutoverRoot(alloc, self.root);
+        self.parsed.deinit();
+    }
+};
+
+pub const SqlProductionTerminalBridgeEntry = struct {
+    id: []const u8,
+    family: []const u8,
+    category: []const u8,
+    token_kinds: []const []const u8,
+    token_keywords: []const []const u8,
+    lexer_test: []const u8,
+    tokenized_test: []const u8,
+    valid_sql: []const u8,
+    malformed_sql: []const u8,
+    contextual_identifier_sql: []const u8,
+};
+
+pub const SqlProductionTerminalBridgeRoot = struct {
+    fixture_format: u64,
+    entries: []const SqlProductionTerminalBridgeEntry,
+};
+
+pub const SqlProductionTerminalBridgeFixtures = struct {
+    parsed: std.json.Parsed(std.json.Value),
+    root: SqlProductionTerminalBridgeRoot,
+
+    pub fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        freeSqlProductionTerminalBridgeRoot(alloc, self.root);
         self.parsed.deinit();
     }
 };
@@ -2687,8 +2819,53 @@ const sql_parser_migration_table_families = [_][]const u8{
     "roles",
 };
 
+const sql_parser_migration_table_entrypoints = [_][]const u8{
+    "binder",
+    "document_sql",
+    "durable_executor",
+    "http",
+    "lite",
+    "pgwire",
+    "sql_adapter",
+    "tokenized",
+};
+
+const sql_parser_migration_table_parser_statuses = [_][]const u8{
+    "generated_gated_unsupported",
+    "generated_owned",
+    "legacy_only",
+    "mixed_generated_plus_legacy_probes",
+};
+
+const sql_production_terminal_bridge_categories = [_][]const u8{
+    "contextual_keyword",
+    "operator",
+    "punctuation",
+};
+
 fn sqlParserMigrationFamilyKnown(name: []const u8) bool {
     for (sql_parser_migration_table_families) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn sqlParserMigrationEntrypointKnown(name: []const u8) bool {
+    for (sql_parser_migration_table_entrypoints) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn sqlParserMigrationParserStatusKnown(name: []const u8) bool {
+    for (sql_parser_migration_table_parser_statuses) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn sqlProductionTerminalBridgeCategoryKnown(name: []const u8) bool {
+    for (sql_production_terminal_bridge_categories) |known| {
         if (std.mem.eql(u8, name, known)) return true;
     }
     return false;
@@ -2925,7 +3102,12 @@ pub fn parseSqlParserMigrationTableRootAlloc(
     if (family_values.items.len != sql_parser_migration_table_families.len) return error.TestUnexpectedResult;
 
     var families = std.ArrayListUnmanaged(SqlParserMigrationTableEntry).empty;
-    errdefer families.deinit(alloc);
+    errdefer {
+        for (families.items) |family| {
+            if (family.entrypoints.len > 0) alloc.free(family.entrypoints);
+        }
+        families.deinit(alloc);
+    }
     var seen = std.StringHashMapUnmanaged(void){};
     defer seen.deinit(alloc);
 
@@ -2935,17 +3117,26 @@ pub fn parseSqlParserMigrationTableRootAlloc(
             "family",
             "compatibility_entry_point",
             "generated_ast_entry_point",
+            "entrypoints",
+            "parser_status",
+            "retained_ast_corruption_test",
             "coverage_file",
             "removal_gate",
         });
         const family = try fixtureJsonOptionalString(item, "family", "");
         const compatibility_entry_point = try fixtureJsonOptionalString(item, "compatibility_entry_point", "");
         const generated_ast_entry_point = try fixtureJsonOptionalString(item, "generated_ast_entry_point", "");
+        const entrypoints = try parseSqlParserMigrationEntrypointsAlloc(alloc, item.get("entrypoints") orelse return error.TestUnexpectedResult);
+        errdefer if (entrypoints.len > 0) alloc.free(entrypoints);
+        const parser_status = try parseSqlParserMigrationParserStatus(item.get("parser_status") orelse return error.TestUnexpectedResult);
+        const retained_ast_corruption_test = try fixtureJsonOptionalString(item, "retained_ast_corruption_test", "");
         const coverage_file = try fixtureJsonOptionalString(item, "coverage_file", "");
         const removal_gate = try fixtureJsonOptionalString(item, "removal_gate", "");
         if (family.len == 0 or
             compatibility_entry_point.len == 0 or
             generated_ast_entry_point.len == 0 or
+            entrypoints.len == 0 or
+            retained_ast_corruption_test.len == 0 or
             coverage_file.len == 0 or
             removal_gate.len == 0 or
             seen.contains(family) or
@@ -2959,6 +3150,9 @@ pub fn parseSqlParserMigrationTableRootAlloc(
             .family = family,
             .compatibility_entry_point = compatibility_entry_point,
             .generated_ast_entry_point = generated_ast_entry_point,
+            .entrypoints = entrypoints,
+            .parser_status = parser_status,
+            .retained_ast_corruption_test = retained_ast_corruption_test,
             .coverage_file = coverage_file,
             .removal_gate = removal_gate,
         });
@@ -2973,10 +3167,45 @@ pub fn parseSqlParserMigrationTableRootAlloc(
     };
 }
 
+fn parseSqlParserMigrationEntrypointsAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const []const u8 {
+    const entrypoint_values = switch (value) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entrypoint_values.items.len == 0) return error.TestUnexpectedResult;
+    const entrypoints = try alloc.alloc([]const u8, entrypoint_values.items.len);
+    errdefer alloc.free(entrypoints);
+    for (entrypoint_values.items, 0..) |entrypoint_value, i| {
+        const entrypoint = switch (entrypoint_value) {
+            .string => |text| text,
+            else => return error.TestUnexpectedResult,
+        };
+        if (entrypoint.len == 0 or !sqlParserMigrationEntrypointKnown(entrypoint)) return error.TestUnexpectedResult;
+        if (i > 0 and !std.mem.lessThan(u8, entrypoints[i - 1], entrypoint)) return error.TestUnexpectedResult;
+        entrypoints[i] = entrypoint;
+    }
+    return entrypoints;
+}
+
+fn parseSqlParserMigrationParserStatus(value: std.json.Value) ![]const u8 {
+    const parser_status = switch (value) {
+        .string => |text| text,
+        else => return error.TestUnexpectedResult,
+    };
+    if (parser_status.len == 0 or !sqlParserMigrationParserStatusKnown(parser_status)) return error.TestUnexpectedResult;
+    return parser_status;
+}
+
 pub fn freeSqlParserMigrationTableRoot(
     alloc: std.mem.Allocator,
     root: SqlParserMigrationTableRoot,
 ) void {
+    for (root.families) |family| {
+        if (family.entrypoints.len > 0) alloc.free(family.entrypoints);
+    }
     if (root.families.len > 0) alloc.free(root.families);
 }
 
@@ -2992,6 +3221,443 @@ pub fn parseSqlParserMigrationTableAlloc(alloc: std.mem.Allocator) !SqlParserMig
         .parsed = parsed,
         .root = root,
     };
+}
+
+const sql_production_ingress_cutover_gate_ids = [_][]const u8{
+    "generated-ast-dispatch",
+    "retained-ast-corruption-boundary",
+    "token-lexer-bridge-fixtures",
+};
+
+fn sqlProductionIngressCutoverGateKnown(name: []const u8) bool {
+    for (sql_production_ingress_cutover_gate_ids) |known| {
+        if (std.mem.eql(u8, name, known)) return true;
+    }
+    return false;
+}
+
+fn sqlProductionIngressCutoverStatusKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "complete") or
+        std.mem.eql(u8, name, "fixture_enforced") or
+        std.mem.eql(u8, name, "gap_tracked");
+}
+
+fn sqlProductionIngressCutoverLegacyAdmissionKnown(name: []const u8) bool {
+    return std.mem.eql(u8, name, "compatibility_contract") or
+        std.mem.eql(u8, name, "migration_blocker") or
+        std.mem.eql(u8, name, "removable_dead_path");
+}
+
+pub fn parseSqlProductionIngressCutoverRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlProductionIngressCutoverRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "cutover_format", "gates", "wrappers", "families" });
+    const cutover_format = try fixtureJsonOptionalU64(root, "cutover_format", 0);
+    if (cutover_format != sql_production_ingress_cutover_format) return error.TestUnexpectedResult;
+
+    const gates = try parseSqlProductionIngressCutoverGatesAlloc(alloc, root.get("gates") orelse return error.TestUnexpectedResult);
+    errdefer if (gates.len > 0) alloc.free(gates);
+    const wrappers = try parseSqlProductionIngressCutoverWrappersAlloc(alloc, root.get("wrappers") orelse return error.TestUnexpectedResult);
+    errdefer if (wrappers.len > 0) alloc.free(wrappers);
+    const families = try parseSqlProductionIngressCutoverFamiliesAlloc(alloc, root.get("families") orelse return error.TestUnexpectedResult);
+    errdefer if (families.len > 0) alloc.free(families);
+
+    return .{
+        .cutover_format = cutover_format,
+        .gates = gates,
+        .wrappers = wrappers,
+        .families = families,
+    };
+}
+
+fn parseSqlProductionIngressCutoverGatesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const SqlProductionIngressCutoverGate {
+    const gate_values = switch (value) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (gate_values.items.len != sql_production_ingress_cutover_gate_ids.len) return error.TestUnexpectedResult;
+    var gates = std.ArrayListUnmanaged(SqlProductionIngressCutoverGate).empty;
+    errdefer gates.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (gate_values.items, 0..) |gate_value, i| {
+        const item = try fixtureJsonObject(gate_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "grammar_slices_bullet",
+            "status",
+            "evidence_file",
+            "evidence_symbol",
+            "completion_condition",
+        });
+        const id = try fixtureJsonOptionalString(item, "id", "");
+        const grammar_slices_bullet = try fixtureJsonOptionalString(item, "grammar_slices_bullet", "");
+        const status = try fixtureJsonOptionalString(item, "status", "");
+        const evidence_file = try fixtureJsonOptionalString(item, "evidence_file", "");
+        const evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", "");
+        const completion_condition = try fixtureJsonOptionalString(item, "completion_condition", "");
+        if (id.len == 0 or
+            grammar_slices_bullet.len == 0 or
+            status.len == 0 or
+            evidence_file.len == 0 or
+            evidence_symbol.len == 0 or
+            completion_condition.len == 0 or
+            seen.contains(id) or
+            !sqlProductionIngressCutoverGateKnown(id) or
+            !sqlProductionIngressCutoverStatusKnown(status))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, gates.items[i - 1].id, id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, id, {});
+        try gates.append(alloc, .{
+            .id = id,
+            .grammar_slices_bullet = grammar_slices_bullet,
+            .status = status,
+            .evidence_file = evidence_file,
+            .evidence_symbol = evidence_symbol,
+            .completion_condition = completion_condition,
+        });
+    }
+    for (sql_production_ingress_cutover_gate_ids) |known| {
+        if (!seen.contains(known)) return error.TestUnexpectedResult;
+    }
+    return try gates.toOwnedSlice(alloc);
+}
+
+fn parseSqlProductionIngressCutoverWrappersAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const SqlProductionIngressCutoverWrapper {
+    const wrapper_values = switch (value) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (wrapper_values.items.len == 0) return error.TestUnexpectedResult;
+    var wrappers = std.ArrayListUnmanaged(SqlProductionIngressCutoverWrapper).empty;
+    errdefer wrappers.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (wrapper_values.items, 0..) |wrapper_value, i| {
+        const item = try fixtureJsonObject(wrapper_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "wrapper_id",
+            "family",
+            "requirement_id",
+            "legacy_admission",
+            "public_boundary_corruption_required",
+        });
+        const wrapper_id = try fixtureJsonOptionalString(item, "wrapper_id", "");
+        const family = try fixtureJsonOptionalString(item, "family", "");
+        const requirement_id = try fixtureJsonOptionalString(item, "requirement_id", "");
+        const legacy_admission = try fixtureJsonOptionalString(item, "legacy_admission", "");
+        const public_boundary_corruption_required = try fixtureJsonOptionalBool(item, "public_boundary_corruption_required") orelse return error.TestUnexpectedResult;
+        if (wrapper_id.len == 0 or
+            family.len == 0 or
+            requirement_id.len == 0 or
+            legacy_admission.len == 0 or
+            seen.contains(wrapper_id) or
+            !sqlParserMigrationFamilyKnown(family) or
+            !sqlProductionIngressCutoverGateKnown(requirement_id) or
+            !sqlProductionIngressCutoverLegacyAdmissionKnown(legacy_admission))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, legacy_admission, "migration_blocker") and !public_boundary_corruption_required) {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, legacy_admission, "compatibility_contract") and public_boundary_corruption_required) {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, wrappers.items[i - 1].wrapper_id, wrapper_id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, wrapper_id, {});
+        try wrappers.append(alloc, .{
+            .wrapper_id = wrapper_id,
+            .family = family,
+            .requirement_id = requirement_id,
+            .legacy_admission = legacy_admission,
+            .public_boundary_corruption_required = public_boundary_corruption_required,
+        });
+    }
+    return try wrappers.toOwnedSlice(alloc);
+}
+
+fn parseSqlProductionIngressCutoverFamiliesAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const SqlProductionIngressCutoverFamily {
+    const family_values = switch (value) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (family_values.items.len != sql_parser_migration_table_families.len) return error.TestUnexpectedResult;
+    var families = std.ArrayListUnmanaged(SqlProductionIngressCutoverFamily).empty;
+    errdefer families.deinit(alloc);
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (family_values.items, 0..) |family_value, i| {
+        const item = try fixtureJsonObject(family_value);
+        try fixtureRequireOnlyKeys(item, &.{ "family", "required_entrypoint", "corruption_gate" });
+        const family = try fixtureJsonOptionalString(item, "family", "");
+        const required_entrypoint = try fixtureJsonOptionalString(item, "required_entrypoint", "");
+        const corruption_gate = try fixtureJsonOptionalString(item, "corruption_gate", "");
+        if (family.len == 0 or
+            required_entrypoint.len == 0 or
+            corruption_gate.len == 0 or
+            seen.contains(family) or
+            !sqlParserMigrationFamilyKnown(family) or
+            !sqlParserMigrationEntrypointKnown(required_entrypoint) or
+            !std.mem.eql(u8, corruption_gate, "retained-ast-corruption-boundary"))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, families.items[i - 1].family, family)) return error.TestUnexpectedResult;
+        try seen.put(alloc, family, {});
+        try families.append(alloc, .{
+            .family = family,
+            .required_entrypoint = required_entrypoint,
+            .corruption_gate = corruption_gate,
+        });
+    }
+    for (sql_parser_migration_table_families) |known| {
+        if (!seen.contains(known)) return error.TestUnexpectedResult;
+    }
+    return try families.toOwnedSlice(alloc);
+}
+
+pub fn freeSqlProductionIngressCutoverRoot(
+    alloc: std.mem.Allocator,
+    root: SqlProductionIngressCutoverRoot,
+) void {
+    if (root.gates.len > 0) alloc.free(root.gates);
+    if (root.wrappers.len > 0) alloc.free(root.wrappers);
+    if (root.families.len > 0) alloc.free(root.families);
+}
+
+pub fn parseSqlProductionIngressCutoverAlloc(alloc: std.mem.Allocator) !SqlProductionIngressCutover {
+    const cutover_json = @embedFile("fixtures/sql_production_ingress_cutover.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, cutover_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSqlProductionIngressCutoverRootAlloc(alloc, parsed.value);
+    errdefer freeSqlProductionIngressCutoverRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+pub fn parseSqlProductionTerminalBridgeRootAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) !SqlProductionTerminalBridgeRoot {
+    const root = try fixtureJsonObject(value);
+    try fixtureRequireOnlyKeys(root, &.{ "fixture_format", "entries" });
+    const fixture_format = try fixtureJsonOptionalU64(root, "fixture_format", 0);
+    if (fixture_format != sql_production_terminal_bridge_fixture_format) return error.TestUnexpectedResult;
+    const entry_values = switch (root.get("entries") orelse return error.TestUnexpectedResult) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    if (entry_values.items.len == 0) return error.TestUnexpectedResult;
+
+    var entries = std.ArrayListUnmanaged(SqlProductionTerminalBridgeEntry).empty;
+    errdefer {
+        for (entries.items) |entry| {
+            if (entry.token_kinds.len > 0) alloc.free(entry.token_kinds);
+            if (entry.token_keywords.len > 0) alloc.free(entry.token_keywords);
+        }
+        entries.deinit(alloc);
+    }
+    var seen = std.StringHashMapUnmanaged(void){};
+    defer seen.deinit(alloc);
+
+    for (entry_values.items, 0..) |entry_value, i| {
+        const item = try fixtureJsonObject(entry_value);
+        try fixtureRequireOnlyKeys(item, &.{
+            "id",
+            "family",
+            "category",
+            "token_kinds",
+            "token_keywords",
+            "lexer_test",
+            "tokenized_test",
+            "valid_sql",
+            "malformed_sql",
+            "contextual_identifier_sql",
+        });
+        const id = try fixtureJsonOptionalString(item, "id", "");
+        const family = try fixtureJsonOptionalString(item, "family", "");
+        const category = try fixtureJsonOptionalString(item, "category", "");
+        const token_kinds = try parseSqlProductionTerminalStringArrayAlloc(alloc, item.get("token_kinds") orelse return error.TestUnexpectedResult);
+        errdefer if (token_kinds.len > 0) alloc.free(token_kinds);
+        const token_keywords = try parseSqlProductionTerminalStringArrayAlloc(alloc, item.get("token_keywords") orelse return error.TestUnexpectedResult);
+        errdefer if (token_keywords.len > 0) alloc.free(token_keywords);
+        const lexer_test = try fixtureJsonOptionalString(item, "lexer_test", "");
+        const tokenized_test = try fixtureJsonOptionalString(item, "tokenized_test", "");
+        const valid_sql = try fixtureJsonOptionalString(item, "valid_sql", "");
+        const malformed_sql = try fixtureJsonOptionalString(item, "malformed_sql", "");
+        const contextual_identifier_sql = try fixtureJsonOptionalString(item, "contextual_identifier_sql", "");
+        if (id.len == 0 or
+            family.len == 0 or
+            category.len == 0 or
+            (token_kinds.len == 0 and token_keywords.len == 0) or
+            lexer_test.len == 0 or
+            tokenized_test.len == 0 or
+            valid_sql.len == 0 or
+            malformed_sql.len == 0 or
+            seen.contains(id) or
+            !sqlParserMigrationFamilyKnown(family) or
+            !sqlProductionTerminalBridgeCategoryKnown(category))
+        {
+            return error.TestUnexpectedResult;
+        }
+        if (std.mem.eql(u8, category, "contextual_keyword") and contextual_identifier_sql.len == 0) {
+            return error.TestUnexpectedResult;
+        }
+        for (token_kinds) |kind_name| {
+            if (std.meta.stringToEnum(token_mod.TokenKind, kind_name) == null) return error.TestUnexpectedResult;
+        }
+        for (token_keywords) |keyword_name| {
+            if (std.meta.stringToEnum(token_mod.TokenKeyword, keyword_name) == null) return error.TestUnexpectedResult;
+        }
+        if (i > 0 and !std.mem.lessThan(u8, entries.items[i - 1].id, id)) return error.TestUnexpectedResult;
+        try seen.put(alloc, id, {});
+        try entries.append(alloc, .{
+            .id = id,
+            .family = family,
+            .category = category,
+            .token_kinds = token_kinds,
+            .token_keywords = token_keywords,
+            .lexer_test = lexer_test,
+            .tokenized_test = tokenized_test,
+            .valid_sql = valid_sql,
+            .malformed_sql = malformed_sql,
+            .contextual_identifier_sql = contextual_identifier_sql,
+        });
+    }
+
+    return .{
+        .fixture_format = fixture_format,
+        .entries = try entries.toOwnedSlice(alloc),
+    };
+}
+
+fn parseSqlProductionTerminalStringArrayAlloc(
+    alloc: std.mem.Allocator,
+    value: std.json.Value,
+) ![]const []const u8 {
+    const array = switch (value) {
+        .array => |items| items,
+        else => return error.TestUnexpectedResult,
+    };
+    const out = try alloc.alloc([]const u8, array.items.len);
+    errdefer alloc.free(out);
+    for (array.items, 0..) |item, i| {
+        const text = switch (item) {
+            .string => |string| string,
+            else => return error.TestUnexpectedResult,
+        };
+        if (text.len == 0) return error.TestUnexpectedResult;
+        if (i > 0 and !std.mem.lessThan(u8, out[i - 1], text)) return error.TestUnexpectedResult;
+        out[i] = text;
+    }
+    return out;
+}
+
+pub fn freeSqlProductionTerminalBridgeRoot(
+    alloc: std.mem.Allocator,
+    root: SqlProductionTerminalBridgeRoot,
+) void {
+    for (root.entries) |entry| {
+        if (entry.token_kinds.len > 0) alloc.free(entry.token_kinds);
+        if (entry.token_keywords.len > 0) alloc.free(entry.token_keywords);
+    }
+    if (root.entries.len > 0) alloc.free(root.entries);
+}
+
+pub fn parseSqlProductionTerminalBridgeAlloc(alloc: std.mem.Allocator) !SqlProductionTerminalBridgeFixtures {
+    const terminal_json = @embedFile("fixtures/sql_production_terminal_bridge.json");
+    var parsed = try std.json.parseFromSlice(std.json.Value, alloc, terminal_json, .{});
+    errdefer parsed.deinit();
+
+    const root = try parseSqlProductionTerminalBridgeRootAlloc(alloc, parsed.value);
+    errdefer freeSqlProductionTerminalBridgeRoot(alloc, root);
+
+    return .{
+        .parsed = parsed,
+        .root = root,
+    };
+}
+
+fn sqlProductionIngressCutoverWrapperForId(
+    root: SqlProductionIngressCutoverRoot,
+    id: []const u8,
+) ?SqlProductionIngressCutoverWrapper {
+    for (root.wrappers) |wrapper| {
+        if (std.mem.eql(u8, wrapper.wrapper_id, id)) return wrapper;
+    }
+    return null;
+}
+
+fn sqlProductionIngressCutoverFamilyForName(
+    root: SqlProductionIngressCutoverRoot,
+    name: []const u8,
+) ?SqlProductionIngressCutoverFamily {
+    for (root.families) |family| {
+        if (std.mem.eql(u8, family.family, name)) return family;
+    }
+    return null;
+}
+
+fn sqlParserMigrationEntrypointsContain(entrypoints: []const []const u8, name: []const u8) bool {
+    for (entrypoints) |entrypoint| {
+        if (std.mem.eql(u8, entrypoint, name)) return true;
+    }
+    return false;
+}
+
+fn validateProductionTerminalBridgeEntryAlloc(
+    alloc: std.mem.Allocator,
+    entry: SqlProductionTerminalBridgeEntry,
+) !void {
+    var valid = try tokenized.ParsedSql.initAlloc(alloc, entry.valid_sql);
+    defer valid.deinit(alloc);
+    if (valid.generatedStatementKind() == null) return error.TestUnexpectedResult;
+    if (std.meta.activeTag(valid.statement) == .unknown) return error.TestUnexpectedResult;
+    for (entry.token_kinds) |kind_name| {
+        const kind = std.meta.stringToEnum(token_mod.TokenKind, kind_name) orelse return error.TestUnexpectedResult;
+        if (!appParityTokensHaveKind(valid.items(), kind)) return error.TestUnexpectedResult;
+    }
+    for (entry.token_keywords) |keyword_name| {
+        const keyword = std.meta.stringToEnum(token_mod.TokenKeyword, keyword_name) orelse return error.TestUnexpectedResult;
+        if (!appParityTokensHaveKeyword(valid.items(), keyword)) return error.TestUnexpectedResult;
+    }
+
+    if (tokenized.ParsedSql.initAlloc(alloc, entry.malformed_sql)) |*malformed| {
+        defer malformed.deinit(alloc);
+        if (malformed.generatedStatementKind() != null and std.meta.activeTag(malformed.statement) != .unknown) {
+            return error.TestUnexpectedResult;
+        }
+    } else |err| switch (err) {
+        error.UnsupportedSqlShape => {},
+        else => return err,
+    }
+
+    if (entry.contextual_identifier_sql.len != 0) {
+        var contextual = try tokenized.ParsedSql.initAlloc(alloc, entry.contextual_identifier_sql);
+        defer contextual.deinit(alloc);
+        if (std.meta.activeTag(contextual.statement) == .unknown) return error.TestUnexpectedResult;
+    }
 }
 
 const document_sql_dependency_guard_ids = [_][]const u8{
@@ -3845,7 +4511,8 @@ fn relationalExpressionCompletionSurfaceKnown(name: []const u8) bool {
 
 fn relationalExpressionCompletionStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalExpressionCompletionInventoryRootAlloc(
@@ -3891,6 +4558,7 @@ pub fn parseRelationalExpressionCompletionInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalExpressionCompletionInventoryIdKnown(entry.id) or
@@ -3898,7 +4566,7 @@ pub fn parseRelationalExpressionCompletionInventoryRootAlloc(
             !relationalExpressionCompletionSurfaceKnown(entry.surface) or
             !relationalExpressionCompletionStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -4580,7 +5248,8 @@ fn relationalJsonArraySurfaceKnown(name: []const u8) bool {
 
 fn relationalJsonArrayStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalJsonArrayInventoryRootAlloc(
@@ -4626,6 +5295,7 @@ pub fn parseRelationalJsonArrayInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalJsonArrayInventoryIdKnown(entry.id) or
@@ -4633,7 +5303,7 @@ pub fn parseRelationalJsonArrayInventoryRootAlloc(
             !relationalJsonArraySurfaceKnown(entry.surface) or
             !relationalJsonArrayStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -4698,7 +5368,8 @@ fn relationalRoutedExecutionSurfaceKnown(name: []const u8) bool {
 
 fn relationalRoutedExecutionStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalRoutedExecutionInventoryRootAlloc(
@@ -4744,6 +5415,7 @@ pub fn parseRelationalRoutedExecutionInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalRoutedExecutionInventoryIdKnown(entry.id) or
@@ -4751,7 +5423,7 @@ pub fn parseRelationalRoutedExecutionInventoryRootAlloc(
             !relationalRoutedExecutionSurfaceKnown(entry.surface) or
             !relationalRoutedExecutionStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -4814,7 +5486,8 @@ fn relationalProductionChaosScopeKnown(name: []const u8) bool {
 
 fn relationalProductionChaosStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "missing_native_harness") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalProductionChaosInventoryRootAlloc(
@@ -4862,6 +5535,7 @@ pub fn parseRelationalProductionChaosInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalProductionChaosInventoryIdKnown(entry.id) or
@@ -4870,7 +5544,7 @@ pub fn parseRelationalProductionChaosInventoryRootAlloc(
             !relationalProductionChaosStatusKnown(entry.status) or
             entry.required_behavior.len == 0 or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -5071,7 +5745,8 @@ fn relationalSqlAdapterRemovalSurfaceKnown(name: []const u8) bool {
 
 fn relationalSqlAdapterRemovalStatusKnown(name: []const u8) bool {
     return std.mem.eql(u8, name, "gap_tracked") or
-        std.mem.eql(u8, name, "partial_release_gated");
+        std.mem.eql(u8, name, "partial_release_gated") or
+        std.mem.eql(u8, name, "release_evidence");
 }
 
 pub fn parseRelationalSqlAdapterRemovalInventoryRootAlloc(
@@ -5117,6 +5792,7 @@ pub fn parseRelationalSqlAdapterRemovalInventoryRootAlloc(
             .evidence_symbol = try fixtureJsonOptionalString(item, "evidence_symbol", ""),
             .release_gate = try fixtureJsonOptionalString(item, "release_gate", ""),
         };
+        const is_release_evidence = std.mem.eql(u8, entry.status, "release_evidence");
         if (entry.id.len == 0 or
             seen.contains(entry.id) or
             !relationalSqlAdapterRemovalInventoryIdKnown(entry.id) or
@@ -5124,7 +5800,7 @@ pub fn parseRelationalSqlAdapterRemovalInventoryRootAlloc(
             !relationalSqlAdapterRemovalSurfaceKnown(entry.surface) or
             !relationalSqlAdapterRemovalStatusKnown(entry.status) or
             entry.current_evidence.len == 0 or
-            entry.missing_evidence.len == 0 or
+            (!is_release_evidence and entry.missing_evidence.len == 0) or
             !std.mem.startsWith(u8, entry.evidence_file, "zig/") or
             entry.evidence_symbol.len == 0 or
             !std.mem.eql(u8, entry.release_gate, "relational-release-gate"))
@@ -5737,12 +6413,31 @@ fn sourceCorpusEntryHasClassificationReason(entry: AppParityCorpusEntry, reason:
         std.mem.indexOf(u8, entry.plan, reason) != null;
 }
 
+fn sourceCorpusEntryHasSubqueryPredicateReason(entry: AppParityCorpusEntry) bool {
+    return sourceCorpusEntryHasClassificationReason(entry, "subquery_scalar_plan") or
+        sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") or
+        sourceCorpusEntryHasClassificationReason(entry, "subquery_quantified_plan");
+}
+
+fn sourceCorpusEntryHasMatchingSubqueryReason(entry: AppParityCorpusEntry, reason: []const u8) bool {
+    return sourceCorpusEntryHasClassificationReason(entry, reason) and
+        corpusPlanMatchesReason(entry.family, entry.plan, reason);
+}
+
 fn validateSourceCorpusGeneratedParseFailureEntryAlloc(
     _: std.mem.Allocator,
-    _: AppParityCorpusEntry,
-    _: anyerror,
+    entry: AppParityCorpusEntry,
+    err: anyerror,
 ) !bool {
-    return false;
+    switch (err) {
+        error.UnexpectedToken, error.UnsupportedSqlShape => {},
+        else => return false,
+    }
+    return entry.family == .unsupported_read and
+        (sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_expression_plan") or
+            sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_scalar_plan") or
+            sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_semijoin_plan") or
+            sourceCorpusEntryHasMatchingSubqueryReason(entry, "subquery_quantified_plan"));
 }
 
 pub fn sourceCorpusGeneratedParseFailureEntryAlloc(
@@ -7011,6 +7706,7 @@ pub fn corpusPlanMatchesFamily(family: AppParityCorpusPlanFamily, plan: []const 
         return unsupportedPlanMatchesFamily(plan, unsupported_family);
     }
     if (family == .read and documentQueryPlanMatchesReadFamily(plan)) return true;
+    if (family == .document_write and std.mem.startsWith(u8, plan, "document_joined_write:")) return true;
 
     const prefix = switch (family) {
         .ddl => "ddl:",
@@ -7124,6 +7820,7 @@ pub fn corpusFixtureFamilyAllowsSourceSchema(family: AppParityCorpusPlanFamily) 
         .insert,
         .insert_source,
         .recursive_insert_source,
+        .truncate_source,
         .update_joined_source,
         .delete_joined_source,
         .merge_mutation,
@@ -7316,7 +8013,8 @@ pub fn corpusFixturePlanMatchesSourceTable(entry: AppParityCorpusEntry, source_t
             planHasExactStringToken(entry.plan, ":right=", source_table_name),
         .join,
         .lateral,
-        => planHasExactStringToken(entry.plan, ":right=", source_table_name),
+        => planHasExactStringToken(entry.plan, ":left=", source_table_name) or
+            planHasExactStringToken(entry.plan, ":right=", source_table_name),
         else => false,
     };
 }
@@ -7726,6 +8424,7 @@ fn corpusFixtureCatalogTablesAreValid(entry: AppParityCorpusEntry) bool {
         if (!corpusFixturePlanMatchesSourceTable(entry, table.name) and
             !(entry.family == .ddl and table.indexes_json.len > 0) and
             !corpusFixtureReadSetOperationCatalogTableIsTarget(entry, table.name) and
+            !corpusFixtureReadSetOperationCatalogTableIsSqlSource(entry, table.name) and
             !corpusFixtureDocumentViewMappingCatalogTableIsTarget(entry, table.name, table.indexes_json) and
             !corpusFixtureDdlCatalogTablesAreSchemaWide(entry))
         {
@@ -7770,6 +8469,12 @@ fn corpusFixtureReadSetOperationCatalogTableIsTarget(entry: AppParityCorpusEntry
     if (entry.family != .read or !readPlanHasKind(entry.plan, "set_operation")) return false;
     const target_table = entry.summary.table_name orelse return false;
     return std.mem.eql(u8, table_name, target_table);
+}
+
+fn corpusFixtureReadSetOperationCatalogTableIsSqlSource(entry: AppParityCorpusEntry, table_name: []const u8) bool {
+    if (entry.family != .read or !readPlanHasKind(entry.plan, "set_operation")) return false;
+    if (table_name.len == 0) return false;
+    return std.mem.indexOf(u8, entry.sql, table_name) != null;
 }
 
 fn corpusFixtureDdlCatalogTablesAreSchemaWide(entry: AppParityCorpusEntry) bool {
@@ -8006,6 +8711,7 @@ pub fn corpusFixtureAllowsMutationTransformSummary(entry: AppParityCorpusEntry) 
 pub fn corpusFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) bool {
     return switch (entry.family) {
         .update_joined_source => true,
+        .document_write => std.mem.startsWith(u8, entry.plan, "document_joined_write:"),
         .explain => corpusExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:"),
         else => false,
     };
@@ -8013,6 +8719,10 @@ pub fn corpusFixtureAllowsSourceAssignmentsSummary(entry: AppParityCorpusEntry) 
 
 pub fn corpusFixtureSourceAssignmentsSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
     return switch (entry.family) {
+        .document_write => if (std.mem.startsWith(u8, entry.plan, "document_joined_write:"))
+            planHasExactUsizeToken(entry.plan, ":source_assignments=", expected)
+        else
+            false,
         .update_joined_source,
         .explain,
         => planHasExactUsizeToken(entry.plan, ":source_assignments=", expected),
@@ -8398,6 +9108,7 @@ pub fn corpusFixtureAllowsJoinOnSummary(entry: AppParityCorpusEntry) bool {
         .delete_joined_source,
         .merge_mutation,
         => true,
+        .document_write => std.mem.startsWith(u8, entry.plan, "document_joined_write:"),
         .read => corpusReadPlanHasPrefix(entry, "read:join:"),
         .explain => corpusReadPlanHasPrefix(entry, "read:join:") or
             corpusExplainWriteInnerHasPrefix(entry, ":inner=update_joined_source:") or
@@ -8410,6 +9121,10 @@ pub fn corpusFixtureAllowsJoinOnSummary(entry: AppParityCorpusEntry) bool {
 pub fn corpusFixtureJoinOnSummaryMatchesPlan(entry: AppParityCorpusEntry, expected: usize) bool {
     return switch (entry.family) {
         .merge_mutation => planHasExactUsizeToken(entry.plan, ":match=", expected),
+        .document_write => if (std.mem.startsWith(u8, entry.plan, "document_joined_write:"))
+            planHasExactUsizeToken(entry.plan, ":join_keys=", expected)
+        else
+            false,
         .join,
         .update_joined_source,
         .delete_joined_source,
@@ -8753,6 +9468,7 @@ pub fn sqlJoinTypeFingerprintName(join_type: db_mod.types.RelationalRowsJoinType
     return switch (join_type) {
         .inner => "inner",
         .left => "left",
+        .full => "full",
     };
 }
 
@@ -8991,6 +9707,7 @@ pub fn appendQueryAccessPathFingerprintAlloc(
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "array_eq", query.array_eq.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "access_or", query.access_or_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "access_not", query.access_not_predicates.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "subquery_pred", query.subquery_predicates.len);
     return fingerprint;
 }
 
@@ -9014,6 +9731,7 @@ pub fn appendSourceQueryAccessPathFingerprintAlloc(
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_or", query.expression_or_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_not", query.expression_not_predicates.len);
     fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_expr_array", query.expression_array_contains.len);
+    fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_subquery_pred", query.subquery_predicates.len);
     return fingerprint;
 }
 
@@ -9074,6 +9792,7 @@ pub fn appendCteAccessPathFingerprintAlloc(
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_or", cte.query.expression_or_predicates.len);
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_not", cte.query.expression_not_predicates.len);
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "expr_array", cte.query.expression_array_contains.len);
+        fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "subquery_pred", cte.query.subquery_predicates.len);
         fingerprint = try appendNamedNonZeroUsizeFingerprintAlloc(alloc, fingerprint, prefix, "alias", cte.query.field_aliases.len);
     }
     return fingerprint;
@@ -10647,14 +11366,14 @@ test "sql adapter corpus validates compatibility wrapper inventory" {
     defer inventory.deinit(alloc);
     try std.testing.expectEqual(sql_compatibility_wrapper_inventory_format, inventory.root.inventory_format);
     try std.testing.expect(inventory.root.wrappers.len > 0);
-    try std.testing.expectEqualStrings("binder-dml-source-token-scanners", inventory.root.wrappers[0].id);
-    try std.testing.expectEqualStrings("write-statement-kind-classifier", inventory.root.wrappers[inventory.root.wrappers.len - 1].id);
+    try std.testing.expectEqualStrings("document-query-bounded-scan-runtime", inventory.root.wrappers[0].id);
+    try std.testing.expectEqualStrings("grammar-maintenance-tail-token-parsers", inventory.root.wrappers[inventory.root.wrappers.len - 1].id);
     try std.testing.expectEqualStrings(
-        "GeneratedSqlDmlAst target/source ranges for INSERT source, recursive INSERT source, UPDATE FROM, DELETE USING, and MERGE.",
+        "Generated read ASTs identify document source, projection, predicate, ordering, aggregate, and UNNEST shapes.",
         inventory.root.wrappers[0].deletion_evidence.typed_parser,
     );
-    try std.testing.expectEqualStrings("unproven_migration_blocker", inventory.root.wrappers[0].state_safety.durable_row);
-    try std.testing.expectEqualStrings("bounded_document_query_scan", inventory.root.wrappers[3].contract_reason);
+    try std.testing.expectEqualStrings("none", inventory.root.wrappers[0].state_safety.durable_catalog);
+    try std.testing.expectEqualStrings("bounded_document_query_scan", inventory.root.wrappers[0].contract_reason);
 
     const unknown_class_json =
         \\{
@@ -10937,6 +11656,11 @@ test "sql adapter corpus validates parser migration table manifest" {
     try std.testing.expectEqual(sql_parser_migration_table_families.len, table.root.families.len);
     try std.testing.expectEqualStrings("backups", table.root.families[0].family);
     try std.testing.expectEqualStrings("roles", table.root.families[table.root.families.len - 1].family);
+    try std.testing.expectEqualStrings("http", table.root.families[0].entrypoints[0]);
+    try std.testing.expectEqualStrings("document_sql", table.root.families[7].entrypoints[1]);
+    try std.testing.expectEqualStrings("durable_executor", table.root.families[7].entrypoints[2]);
+    try std.testing.expectEqualStrings("generated_gated_unsupported", table.root.families[0].parser_status);
+    try std.testing.expectEqualStrings("tokenized parsed sql retained AST corruption rejects generated unsupported DDL", table.root.families[0].retained_ast_corruption_test);
 
     const unknown_json =
         \\{
@@ -10946,6 +11670,9 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "family": "unknown",
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
+        \\      "entrypoints": ["tokenized"],
+        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
         \\    }
@@ -10964,6 +11691,9 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "family": "ddl",
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
+        \\      "entrypoints": ["tokenized"],
+        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
         \\    },
@@ -10971,6 +11701,9 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "family": "backups",
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
+        \\      "entrypoints": ["tokenized"],
+        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
         \\    }
@@ -10989,6 +11722,9 @@ test "sql adapter corpus validates parser migration table manifest" {
         \\      "family": "backups",
         \\      "compatibility_entry_point": "compat",
         \\      "generated_ast_entry_point": "generated",
+        \\      "entrypoints": ["tokenized"],
+        \\      "parser_status": "mixed_generated_plus_legacy_probes",
+        \\      "retained_ast_corruption_test": "test",
         \\      "coverage_file": "coverage.json",
         \\      "removal_gate": "gate"
         \\    }
@@ -10998,6 +11734,172 @@ test "sql adapter corpus validates parser migration table manifest" {
     var parsed_incomplete = try std.json.parseFromSlice(std.json.Value, alloc, incomplete_json, .{});
     defer parsed_incomplete.deinit();
     try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationTableRootAlloc(alloc, parsed_incomplete.value));
+
+    const unknown_entrypoint_json =
+        \\["raw_sql"]
+    ;
+    var parsed_unknown_entrypoint = try std.json.parseFromSlice(std.json.Value, alloc, unknown_entrypoint_json, .{});
+    defer parsed_unknown_entrypoint.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationEntrypointsAlloc(alloc, parsed_unknown_entrypoint.value));
+
+    const unknown_parser_status_json =
+        \\"raw_sql_probe"
+    ;
+    var parsed_unknown_parser_status = try std.json.parseFromSlice(std.json.Value, alloc, unknown_parser_status_json, .{});
+    defer parsed_unknown_parser_status.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlParserMigrationParserStatus(parsed_unknown_parser_status.value));
+}
+
+test "sql adapter corpus validates production ingress cutover manifest" {
+    const alloc = std.testing.allocator;
+    var cutover = try parseSqlProductionIngressCutoverAlloc(alloc);
+    defer cutover.deinit(alloc);
+    try std.testing.expectEqual(sql_production_ingress_cutover_format, cutover.root.cutover_format);
+    try std.testing.expectEqual(sql_production_ingress_cutover_gate_ids.len, cutover.root.gates.len);
+    try std.testing.expectEqualStrings("generated-ast-dispatch", cutover.root.gates[0].id);
+    try std.testing.expectEqualStrings("fixture_enforced", cutover.root.gates[0].status);
+    try std.testing.expectEqualStrings("complete", cutover.root.gates[1].status);
+    try std.testing.expectEqualStrings("complete", cutover.root.gates[2].status);
+    try std.testing.expectEqualStrings("grammar-maintenance-tail-token-parsers", cutover.root.wrappers[cutover.root.wrappers.len - 1].wrapper_id);
+    try std.testing.expectEqualStrings("roles", cutover.root.families[cutover.root.families.len - 1].family);
+
+    var wrappers = try parseSqlCompatibilityWrapperInventoryAlloc(alloc);
+    defer wrappers.deinit(alloc);
+    try std.testing.expectEqual(wrappers.root.wrappers.len, cutover.root.wrappers.len);
+    for (wrappers.root.wrappers) |wrapper| {
+        const cutover_wrapper = sqlProductionIngressCutoverWrapperForId(cutover.root, wrapper.id) orelse return error.TestUnexpectedResult;
+        try std.testing.expectEqualStrings(wrapper.family, cutover_wrapper.family);
+        try std.testing.expectEqualStrings(wrapper.classification, cutover_wrapper.legacy_admission);
+        if (std.mem.eql(u8, wrapper.classification, "migration_blocker")) {
+            try std.testing.expect(cutover_wrapper.public_boundary_corruption_required);
+        } else if (std.mem.eql(u8, wrapper.classification, "compatibility_contract")) {
+            try std.testing.expect(!cutover_wrapper.public_boundary_corruption_required);
+            try std.testing.expect(sqlCompatibilityWrapperStateEffectIsSafe(wrapper.state_safety.durable_catalog));
+            try std.testing.expect(sqlCompatibilityWrapperStateEffectIsSafe(wrapper.state_safety.durable_document));
+            try std.testing.expect(sqlCompatibilityWrapperStateEffectIsSafe(wrapper.state_safety.durable_row));
+        }
+    }
+
+    var migration = try parseSqlParserMigrationTableAlloc(alloc);
+    defer migration.deinit(alloc);
+    try std.testing.expectEqual(migration.root.families.len, cutover.root.families.len);
+    for (migration.root.families) |family| {
+        const cutover_family = sqlProductionIngressCutoverFamilyForName(cutover.root, family.family) orelse return error.TestUnexpectedResult;
+        try std.testing.expect(sqlParserMigrationEntrypointsContain(family.entrypoints, cutover_family.required_entrypoint));
+        try std.testing.expectEqualStrings("retained-ast-corruption-boundary", cutover_family.corruption_gate);
+        try std.testing.expect(family.retained_ast_corruption_test.len != 0);
+        try std.testing.expect(!std.mem.eql(u8, family.parser_status, "mixed_generated_plus_legacy_probes"));
+    }
+
+    var terminal_bridge = try parseSqlProductionTerminalBridgeAlloc(alloc);
+    defer terminal_bridge.deinit(alloc);
+    try std.testing.expectEqual(sql_production_terminal_bridge_fixture_format, terminal_bridge.root.fixture_format);
+    try std.testing.expect(terminal_bridge.root.entries.len > 0);
+    for (terminal_bridge.root.entries) |entry| {
+        try validateProductionTerminalBridgeEntryAlloc(alloc, entry);
+    }
+
+    const unknown_status_json =
+        \\{
+        \\  "cutover_format": 1,
+        \\  "gates": [
+        \\    {
+        \\      "id": "generated-ast-dispatch",
+        \\      "grammar_slices_bullet": "bullet",
+        \\      "status": "unchecked",
+        \\      "evidence_file": "file",
+        \\      "evidence_symbol": "symbol",
+        \\      "completion_condition": "condition"
+        \\    },
+        \\    {
+        \\      "id": "retained-ast-corruption-boundary",
+        \\      "grammar_slices_bullet": "bullet",
+        \\      "status": "gap_tracked",
+        \\      "evidence_file": "file",
+        \\      "evidence_symbol": "symbol",
+        \\      "completion_condition": "condition"
+        \\    },
+        \\    {
+        \\      "id": "token-lexer-bridge-fixtures",
+        \\      "grammar_slices_bullet": "bullet",
+        \\      "status": "gap_tracked",
+        \\      "evidence_file": "file",
+        \\      "evidence_symbol": "symbol",
+        \\      "completion_condition": "condition"
+        \\    }
+        \\  ],
+        \\  "wrappers": [
+        \\    {
+        \\      "wrapper_id": "read-statement-kind-classifier",
+        \\      "family": "query",
+        \\      "requirement_id": "generated-ast-dispatch",
+        \\      "legacy_admission": "migration_blocker",
+        \\      "public_boundary_corruption_required": true
+        \\    }
+        \\  ],
+        \\  "families": [
+        \\    {
+        \\      "family": "backups",
+        \\      "required_entrypoint": "tokenized",
+        \\      "corruption_gate": "retained-ast-corruption-boundary"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unknown_status = try std.json.parseFromSlice(std.json.Value, alloc, unknown_status_json, .{});
+    defer parsed_unknown_status.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlProductionIngressCutoverRootAlloc(alloc, parsed_unknown_status.value));
+
+    const unsafe_blocker_json =
+        \\{
+        \\  "cutover_format": 1,
+        \\  "gates": [
+        \\    {
+        \\      "id": "generated-ast-dispatch",
+        \\      "grammar_slices_bullet": "bullet",
+        \\      "status": "gap_tracked",
+        \\      "evidence_file": "file",
+        \\      "evidence_symbol": "symbol",
+        \\      "completion_condition": "condition"
+        \\    },
+        \\    {
+        \\      "id": "retained-ast-corruption-boundary",
+        \\      "grammar_slices_bullet": "bullet",
+        \\      "status": "gap_tracked",
+        \\      "evidence_file": "file",
+        \\      "evidence_symbol": "symbol",
+        \\      "completion_condition": "condition"
+        \\    },
+        \\    {
+        \\      "id": "token-lexer-bridge-fixtures",
+        \\      "grammar_slices_bullet": "bullet",
+        \\      "status": "gap_tracked",
+        \\      "evidence_file": "file",
+        \\      "evidence_symbol": "symbol",
+        \\      "completion_condition": "condition"
+        \\    }
+        \\  ],
+        \\  "wrappers": [
+        \\    {
+        \\      "wrapper_id": "read-statement-kind-classifier",
+        \\      "family": "query",
+        \\      "requirement_id": "generated-ast-dispatch",
+        \\      "legacy_admission": "migration_blocker",
+        \\      "public_boundary_corruption_required": false
+        \\    }
+        \\  ],
+        \\  "families": [
+        \\    {
+        \\      "family": "backups",
+        \\      "required_entrypoint": "tokenized",
+        \\      "corruption_gate": "retained-ast-corruption-boundary"
+        \\    }
+        \\  ]
+        \\}
+    ;
+    var parsed_unsafe_blocker = try std.json.parseFromSlice(std.json.Value, alloc, unsafe_blocker_json, .{});
+    defer parsed_unsafe_blocker.deinit();
+    try std.testing.expectError(error.TestUnexpectedResult, parseSqlProductionIngressCutoverRootAlloc(alloc, parsed_unsafe_blocker.value));
 }
 
 test "sql adapter corpus validates document sql dependency guard manifest" {
@@ -11009,6 +11911,7 @@ test "sql adapter corpus validates document sql dependency guard manifest" {
     try std.testing.expectEqualStrings("document-query-read", guard.root.entries[0].id);
     try std.testing.expectEqualStrings("admitted_read_only", guard.root.entries[0].admission);
     try std.testing.expectEqualStrings("read_only", guard.root.entries[0].durable_document);
+    try std.testing.expect(std.mem.indexOf(u8, guard.root.entries[0].evidence_symbol, "native graph") != null);
     try std.testing.expectEqualStrings("document-table-ddl", guard.root.entries[1].id);
     try std.testing.expectEqualStrings("blocked_until_native_parity", guard.root.entries[1].admission);
     try std.testing.expectEqualStrings("native_document_schema_required", guard.root.entries[1].durable_storage_guard);
@@ -11937,6 +12840,8 @@ test "sql adapter corpus validates relational routed execution inventory manifes
     try std.testing.expectEqualStrings("gap_tracked", inventory.root.entries[1].status);
     try std.testing.expectEqualStrings("owner-stream-join-strategy-planning", inventory.root.entries[2].id);
     try std.testing.expectEqualStrings("routed-merge-join-order-proof", inventory.root.entries[3].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[3].status);
+    try std.testing.expectEqualStrings("", inventory.root.entries[3].missing_evidence);
 
     const unknown_surface_json =
         \\{
@@ -12259,6 +13164,7 @@ test "sql adapter corpus validates relational production chaos inventory manifes
     try std.testing.expectEqualStrings("insert-source-upsert-owner-chaos", inventory.root.entries[1].id);
     try std.testing.expectEqualStrings("missing_native_harness", inventory.root.entries[1].status);
     try std.testing.expectEqualStrings("table-emptying-secondary-index-chaos", inventory.root.entries[2].id);
+    try std.testing.expectEqualStrings("release_evidence", inventory.root.entries[2].status);
 
     const unknown_status_json =
         \\{
@@ -12987,6 +13893,7 @@ test "sql adapter corpus owns fixture family policies" {
     try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query"));
     try std.testing.expect(corpusPlanMatchesFamily(.read, "document_query:table=docs:producer=bounded_scan"));
     try std.testing.expect(!corpusPlanMatchesFamily(.query, "document_query"));
+    try std.testing.expect(corpusPlanMatchesFamily(.document_write, "document_joined_write:table=docs:source_table=docs"));
 
     try std.testing.expect(corpusFixtureFamilyNeedsTableSummary(.update_source));
     try std.testing.expect(!corpusFixtureFamilyNeedsTableSummary(.ddl));
@@ -13779,6 +14686,20 @@ test "sql adapter corpus validates adapter edge case coverage requirements" {
 fn appParityTokensHaveIdentifier(tokens: []const tokenized.Token, identifier: []const u8) bool {
     for (tokens) |token| {
         if (token.kind == .identifier and std.ascii.eqlIgnoreCase(token.text, identifier)) return true;
+    }
+    return false;
+}
+
+fn appParityTokensHaveIdentifierOrQualifiedField(tokens: []const tokenized.Token, field: []const u8) bool {
+    for (tokens) |token| {
+        if (token.kind != .identifier) continue;
+        if (std.ascii.eqlIgnoreCase(token.text, field)) return true;
+        if (token.text.len > field.len + 1 and
+            token.text[token.text.len - field.len - 1] == '.' and
+            std.ascii.endsWithIgnoreCase(token.text, field))
+        {
+            return true;
+        }
     }
     return false;
 }
@@ -14667,6 +15588,15 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_ddl_transform_alter: bool = false,
     unsupported_ddl_transform_create: bool = false,
     unsupported_ddl_transform_drop: bool = false,
+    unsupported_ddl_trigger_alter: bool = false,
+    unsupported_ddl_trigger_create: bool = false,
+    unsupported_ddl_trigger_create_arguments: bool = false,
+    unsupported_ddl_trigger_create_constraint: bool = false,
+    unsupported_ddl_trigger_create_instead_of: bool = false,
+    unsupported_ddl_trigger_create_referencing: bool = false,
+    unsupported_ddl_trigger_create_truncate: bool = false,
+    unsupported_ddl_trigger_create_update_of: bool = false,
+    unsupported_ddl_trigger_create_when: bool = false,
     unsupported_read_document_view_mapping_function_predicate: bool = false,
     unsupported_read_document_view_mapping_ilike_predicate: bool = false,
     unsupported_read_document_view_mapping_not_in_predicate: bool = false,
@@ -14689,6 +15619,14 @@ pub const AppParityCorpusCoverage = struct {
     document_write_document_sql_json_patch_reversed_version_predicate: bool = false,
     document_write_document_sql_json_patch_schema_type: bool = false,
     document_write_document_sql_json_patch_version_predicate: bool = false,
+    document_write_document_sql_bounded_delete: bool = false,
+    document_write_document_sql_bounded_projection_update: bool = false,
+    document_write_document_sql_indexed_delete: bool = false,
+    document_write_document_sql_indexed_null_delete: bool = false,
+    document_write_document_sql_indexed_projection_boolean_update: bool = false,
+    document_write_document_sql_indexed_projection_in_update: bool = false,
+    document_write_document_sql_indexed_projection_nested_alias_update: bool = false,
+    document_write_document_sql_indexed_projection_range_update: bool = false,
     document_write_document_sql_indexed_projection_update: bool = false,
     document_write_document_sql_projection_array_insert: bool = false,
     document_write_document_sql_projection_create_only_insert: bool = false,
@@ -14697,6 +15635,11 @@ pub const AppParityCorpusCoverage = struct {
     document_write_document_sql_projection_generated_id_insert: bool = false,
     document_write_document_sql_projection_in_update: bool = false,
     document_write_document_sql_projection_insert: bool = false,
+    document_write_document_sql_joined_bounded_target_delete: bool = false,
+    document_write_document_sql_joined_bounded_target_projection_update: bool = false,
+    document_write_document_sql_joined_delete: bool = false,
+    document_write_document_sql_joined_projection_update: bool = false,
+    document_write_document_sql_joined_source_assignment_update: bool = false,
     document_write_document_sql_projection_array_update: bool = false,
     document_write_document_sql_projection_nested_alias_insert: bool = false,
     document_write_document_sql_projection_nested_alias_update: bool = false,
@@ -14707,6 +15650,10 @@ pub const AppParityCorpusCoverage = struct {
     document_write_document_sql_projection_version_update: bool = false,
     unsupported_write_document_sql_broad_delete: bool = false,
     unsupported_write_document_sql_doc_update: bool = false,
+    unsupported_write_document_sql_indexed_delete_version_predicate: bool = false,
+    unsupported_write_document_sql_indexed_projection_version_predicate: bool = false,
+    unsupported_write_document_sql_joined_delete: bool = false,
+    unsupported_write_document_sql_joined_projection_update: bool = false,
     unsupported_write_document_sql_json_path_delete: bool = false,
     unsupported_write_document_sql_json_patch_boolean_predicate: bool = false,
     unsupported_write_document_sql_json_patch_invalid_shape: bool = false,
@@ -14721,11 +15668,11 @@ pub const AppParityCorpusCoverage = struct {
     unsupported_write_document_sql_projection_on_conflict_do_nothing: bool = false,
     unsupported_write_document_sql_projection_on_conflict: bool = false,
     unsupported_write_document_sql_projection_returning: bool = false,
+    unsupported_write_document_sql_projection_source_assignment_update: bool = false,
     unsupported_write_document_sql_projection_source_insert: bool = false,
     unsupported_write_document_sql_projection_transient_alias_insert: bool = false,
     unsupported_write_document_sql_versioned_projection_insert: bool = false,
     unsupported_write_document_sql_range_delete: bool = false,
-    unsupported_write_document_sql_truncate_table: bool = false,
     unsupported_write_document_sql_write_unsupported: bool = false,
     ddl_temporal_fk_delete_set_null_action: bool = false,
     ddl_temporal_fk_delete_cascade_action: bool = false,
@@ -14737,6 +15684,7 @@ pub const AppParityCorpusCoverage = struct {
     query_function_vector: bool = false,
     query_function_graph_search: bool = false,
     query_function_graph_traverse: bool = false,
+    query_function_graph_neighbors: bool = false,
     query_function_graph_shortest_path: bool = false,
     query_function_graph_k_shortest_paths: bool = false,
     query_function_graph_metric: bool = false,
@@ -14744,6 +15692,12 @@ pub const AppParityCorpusCoverage = struct {
     query_function_hybrid: bool = false,
     query_function_hybrid_sources_json: bool = false,
     query_function_hybrid_source_helpers: bool = false,
+    unsupported_graph_query: bool = false,
+    unsupported_graph_query_filtered_return: bool = false,
+    unsupported_graph_query_incoming_path_return: bool = false,
+    unsupported_graph_query_multi_return: bool = false,
+    unsupported_graph_query_ordered_limited_return: bool = false,
+    unsupported_graph_query_path_return: bool = false,
     invalid_insert: bool = false,
     invalid_duplicate_row_batch_target: bool = false,
     invalid_duplicate_conflict_update_target: bool = false,
@@ -14764,7 +15718,25 @@ pub const AppParityCorpusCoverage = struct {
     invalid_update_source_row_lock_target: bool = false,
     invalid_update_joined_source_row_lock_target: bool = false,
     query_calendar_interval_expression: bool = false,
+    read_cte_body_join: bool = false,
+    read_cte_body_multi_join: bool = false,
+    read_top_level_multi_join: bool = false,
+    read_set_operation_right_join: bool = false,
+    read_set_operation_right_cross_table_join: bool = false,
+    read_set_operation_right_cross_table_multi_join: bool = false,
+    read_set_operation_right_lateral_join: bool = false,
+    read_set_operation_right_multi_join: bool = false,
+    unsupported_read_cte_contained_subquery_predicate: bool = false,
+    unsupported_read_correlated_subquery_predicate: bool = false,
+    unsupported_read_in_subquery_predicate: bool = false,
+    unsupported_read_nested_subquery_predicate: bool = false,
+    unsupported_read_not_exists_subquery_predicate: bool = false,
+    unsupported_read_not_in_subquery_predicate: bool = false,
+    unsupported_read_scalar_subquery_predicate: bool = false,
+    unsupported_read_scalar_subquery_projection: bool = false,
     unsupported_read_set_operation_output_shape: bool = false,
+    unsupported_read_subquery_predicate: bool = false,
+    unsupported_read_quantified_subquery_predicate: bool = false,
     read_row_lock_nowait: bool = false,
     read_row_lock_share: bool = false,
     read_row_lock_key_share: bool = false,
@@ -15117,6 +16089,12 @@ pub const AppParityCorpusCoverage = struct {
     aggregate_distinct_json_array_expression: bool = false,
     aggregate_distinct_group_projection: bool = false,
     aggregate_cte_expression_access: bool = false,
+    join_right: bool = false,
+    join_right_cross_table_source_schema: bool = false,
+    join_full: bool = false,
+    join_full_outer: bool = false,
+    join_cross: bool = false,
+    join_using_column: bool = false,
     join_structured_side_access: bool = false,
     join_on_side_predicate: bool = false,
     join_on_preserved_side_predicate: bool = false,
@@ -15193,13 +16171,43 @@ pub const AppParityCorpusCoverage = struct {
     }
 
     fn observeGeneratedParseFailureEntryAlloc(
-        _: *@This(),
+        self: *@This(),
         alloc: std.mem.Allocator,
         entry: AppParityCorpusEntry,
         err: anyerror,
     ) !bool {
         if (!(try validateSourceCorpusGeneratedParseFailureEntryAlloc(alloc, entry, err))) return false;
-        return false;
+        self.unsupported_read_subquery_predicate = self.unsupported_read_subquery_predicate or
+            sourceCorpusEntryHasSubqueryPredicateReason(entry);
+        self.unsupported_read_correlated_subquery_predicate = self.unsupported_read_correlated_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
+                std.mem.eql(u8, entry.name, "read correlated subquery predicate"));
+        self.unsupported_read_nested_subquery_predicate = self.unsupported_read_nested_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
+                std.mem.eql(u8, entry.name, "read nested subquery predicate"));
+        self.unsupported_read_cte_contained_subquery_predicate = self.unsupported_read_cte_contained_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
+                std.mem.eql(u8, entry.name, "read cte contained subquery predicate"));
+        self.unsupported_read_quantified_subquery_predicate = self.unsupported_read_quantified_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_quantified_plan") and
+                std.mem.indexOf(u8, entry.sql, " ANY ") != null);
+        self.unsupported_read_in_subquery_predicate = self.unsupported_read_in_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
+                std.mem.indexOf(u8, entry.sql, " IN (SELECT ") != null and
+                std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") == null);
+        self.unsupported_read_not_exists_subquery_predicate = self.unsupported_read_not_exists_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
+                std.mem.indexOf(u8, entry.sql, " NOT EXISTS (SELECT ") != null);
+        self.unsupported_read_not_in_subquery_predicate = self.unsupported_read_not_in_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_semijoin_plan") and
+                std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") != null);
+        self.unsupported_read_scalar_subquery_predicate = self.unsupported_read_scalar_subquery_predicate or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_scalar_plan") and
+                std.mem.indexOf(u8, entry.sql, " = (SELECT ") != null);
+        self.unsupported_read_scalar_subquery_projection = self.unsupported_read_scalar_subquery_projection or
+            (sourceCorpusEntryHasClassificationReason(entry, "subquery_expression_plan") and
+                std.mem.indexOf(u8, entry.sql, "SELECT (SELECT ") != null);
+        return true;
     }
 
     pub fn observe(self: *@This(), alloc: std.mem.Allocator, entry: AppParityCorpusEntry) !void {
@@ -15264,6 +16272,9 @@ pub const AppParityCorpusCoverage = struct {
                 sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search=");
             self.query_function_graph_traverse = self.query_function_graph_traverse or
                 (structured_summary.parser.graph_traverse_function and
+                    sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
+            self.query_function_graph_neighbors = self.query_function_graph_neighbors or
+                (structured_summary.parser.graph_neighbors_function and
                     sql_adapter.planHasNonZeroToken(entry.plan, ":graph_search="));
             self.query_function_graph_shortest_path = self.query_function_graph_shortest_path or
                 (structured_summary.parser.graph_shortest_path_function and
@@ -16093,6 +17104,14 @@ pub const AppParityCorpusCoverage = struct {
             },
             .join => {
                 self.join = true;
+                self.join_right = self.join_right or std.mem.indexOf(u8, entry.sql, " RIGHT JOIN ") != null;
+                self.join_right_cross_table_source_schema = self.join_right_cross_table_source_schema or
+                    (std.mem.indexOf(u8, entry.sql, " RIGHT JOIN ") != null and
+                        appParityEntryHasCatalogSchemas(entry) and
+                        sql_adapter.planHasExactStringToken(entry.plan, ":left=", "customer_records") and
+                        sql_adapter.planHasExactStringToken(entry.plan, ":right=", "usage_records"));
+                self.join_cross = self.join_cross or std.mem.indexOf(u8, entry.sql, " CROSS JOIN ") != null;
+                self.join_using_column = self.join_using_column or std.mem.indexOf(u8, entry.sql, " USING (") != null;
                 self.join_structured_side_access = self.join_structured_side_access or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":left_json_contains=") or
                     sql_adapter.planHasNonZeroToken(entry.plan, ":right_json_exists=");
@@ -16478,6 +17497,139 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.title_identifier and
                         structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_joined_projection_update = self.document_write_document_sql_joined_projection_update or
+                    (std.mem.eql(u8, entry.name, "document sql joined projection update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_joined_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":source_table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":target_producer=", "id_lookup") and
+                        planHasExactStringToken(entry.plan, ":source_producer=", "id_lookup") and
+                        planHasExactUsizeToken(entry.plan, ":join_keys=", 1) and
+                        planHasExactStringToken(entry.plan, ":template=", "transform") and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword);
+                self.document_write_document_sql_joined_source_assignment_update = self.document_write_document_sql_joined_source_assignment_update or
+                    (std.mem.eql(u8, entry.name, "document sql joined source assignment update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_joined_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":source_table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":target_producer=", "id_lookup") and
+                        planHasExactStringToken(entry.plan, ":source_producer=", "id_lookup") and
+                        planHasExactUsizeToken(entry.plan, ":join_keys=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":source_assignments=", 1) and
+                        planHasExactStringToken(entry.plan, ":template=", "transform") and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword);
+                self.document_write_document_sql_joined_delete = self.document_write_document_sql_joined_delete or
+                    (std.mem.eql(u8, entry.name, "document sql joined delete") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_joined_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":source_table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "non_identity_delete") and
+                        planHasExactStringToken(entry.plan, ":target_producer=", "id_lookup") and
+                        planHasExactStringToken(entry.plan, ":source_producer=", "id_lookup") and
+                        planHasExactUsizeToken(entry.plan, ":join_keys=", 1) and
+                        planHasExactStringToken(entry.plan, ":template=", "delete") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword);
+                self.document_write_document_sql_joined_bounded_target_projection_update = self.document_write_document_sql_joined_bounded_target_projection_update or
+                    (std.mem.eql(u8, entry.name, "document sql joined bounded target projection update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_joined_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":source_table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":target_producer=", "bounded_scan") and
+                        planHasExactStringToken(entry.plan, ":source_producer=", "join_key_indexed_lookup") and
+                        planHasExactUsizeToken(entry.plan, ":join_keys=", 1) and
+                        planHasExactStringToken(entry.plan, ":template=", "transform") and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        planHasExactUsizeToken(entry.plan, ":max_target_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":max_source_rows=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.status_identifier and
+                        structured_summary.parser.category_identifier);
+                self.document_write_document_sql_joined_bounded_target_delete = self.document_write_document_sql_joined_bounded_target_delete or
+                    (std.mem.eql(u8, entry.name, "document sql joined bounded target delete") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_joined_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":source_table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "non_identity_delete") and
+                        planHasExactStringToken(entry.plan, ":target_producer=", "bounded_scan") and
+                        planHasExactStringToken(entry.plan, ":source_producer=", "join_key_indexed_lookup") and
+                        planHasExactUsizeToken(entry.plan, ":join_keys=", 1) and
+                        planHasExactStringToken(entry.plan, ":template=", "delete") and
+                        planHasExactUsizeToken(entry.plan, ":max_target_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":max_source_rows=", 1) and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.status_identifier and
+                        structured_summary.parser.category_identifier);
+                self.document_write_document_sql_bounded_projection_update = self.document_write_document_sql_bounded_projection_update or
+                    (std.mem.eql(u8, entry.name, "document sql bounded projection update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":producer=", "bounded_scan") and
+                        planHasExactUsizeToken(entry.plan, ":producer_scan_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":producer_scan_bytes=", @intCast(source_binding.default_document_sql_bounded_scan_bytes)) and
+                        planHasExactStringToken(entry.plan, ":producer_residual=", "1") and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.category_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_indexed_delete = self.document_write_document_sql_indexed_delete or
+                    (std.mem.eql(u8, entry.name, "document sql indexed delete") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "non_identity_delete") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactStringToken(entry.plan, ":template=", "delete") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.status_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_indexed_null_delete = self.document_write_document_sql_indexed_null_delete or
+                    (std.mem.eql(u8, entry.name, "document sql indexed null delete") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "non_identity_delete") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactStringToken(entry.plan, ":template=", "delete") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.is_null_predicate and
+                        structured_summary.parser.status_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_bounded_delete = self.document_write_document_sql_bounded_delete or
+                    (std.mem.eql(u8, entry.name, "document sql bounded delete") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "non_identity_delete") and
+                        planHasExactStringToken(entry.plan, ":producer=", "bounded_scan") and
+                        planHasExactUsizeToken(entry.plan, ":producer_scan_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":producer_scan_bytes=", @intCast(source_binding.default_document_sql_bounded_scan_bytes)) and
+                        planHasExactStringToken(entry.plan, ":producer_residual=", "1") and
+                        planHasExactStringToken(entry.plan, ":template=", "delete") and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.category_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
                 self.document_write_document_sql_indexed_projection_update = self.document_write_document_sql_indexed_projection_update or
                     (std.mem.eql(u8, entry.name, "document sql indexed projection update") and
                         corpusPlanMatchesFamily(.document_write, entry.plan) and
@@ -16491,6 +17643,67 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.where_keyword and
                         structured_summary.parser.title_identifier and
                         structured_summary.parser.status_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_indexed_projection_in_update = self.document_write_document_sql_indexed_projection_in_update or
+                    (std.mem.eql(u8, entry.name, "document sql indexed projection in update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.in_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.status_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_indexed_projection_range_update = self.document_write_document_sql_indexed_projection_range_update or
+                    (std.mem.eql(u8, entry.name, "document sql indexed projection range update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.amount_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_indexed_projection_boolean_update = self.document_write_document_sql_indexed_projection_boolean_update or
+                    (std.mem.eql(u8, entry.name, "document sql indexed projection boolean update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.enabled_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.document_write_document_sql_indexed_projection_nested_alias_update = self.document_write_document_sql_indexed_projection_nested_alias_update or
+                    (std.mem.eql(u8, entry.name, "document sql indexed projection nested alias update") and
+                        corpusPlanMatchesFamily(.document_write, entry.plan) and
+                        planHasExactStringToken(entry.plan, "document_write:table=", "docs") and
+                        planHasExactStringToken(entry.plan, ":operation=", "projection_write") and
+                        planHasExactStringToken(entry.plan, ":producer=", "indexed_query") and
+                        planHasExactUsizeToken(entry.plan, ":producer_candidate_rows=", source_binding.default_document_sql_bounded_scan_rows) and
+                        planHasExactUsizeToken(entry.plan, ":ops=", 1) and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.metadata_plan_identifier and
                         !structured_summary.parser.underscore_id_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
                 self.document_write_document_sql_projection_in_update = self.document_write_document_sql_projection_in_update or
@@ -16608,6 +17821,55 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.underscore_doc_identifier and
                         structured_summary.parser.antfly_json_patch_function and
                         structured_summary.parser.json_patch_set_operation);
+                self.unsupported_write_document_sql_indexed_projection_version_predicate = self.unsupported_write_document_sql_indexed_projection_version_predicate or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql indexed projection version predicate") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.status_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_indexed_delete_version_predicate = self.unsupported_write_document_sql_indexed_delete_version_predicate or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql indexed delete version predicate") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.status_identifier and
+                        structured_summary.parser.underscore_version_identifier and
+                        !structured_summary.parser.underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_joined_projection_update = self.unsupported_write_document_sql_joined_projection_update or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql joined projection update") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.docs_underscore_id_identifier and
+                        structured_summary.parser.source_underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_projection_source_assignment_update = self.unsupported_write_document_sql_projection_source_assignment_update or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql projection source assignment update") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_update and
+                        structured_summary.parser.set_keyword and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.title_identifier and
+                        structured_summary.parser.source_identifier_prefix and
+                        structured_summary.parser.docs_underscore_id_identifier and
+                        structured_summary.parser.source_underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
+                self.unsupported_write_document_sql_joined_delete = self.unsupported_write_document_sql_joined_delete or
+                    (std.mem.eql(u8, entry.name, "unsupported document sql joined delete") and
+                        is_document_sql_write_unsupported and
+                        structured_summary.parser.starts_with_delete and
+                        structured_summary.parser.where_keyword and
+                        structured_summary.parser.docs_underscore_id_identifier and
+                        structured_summary.parser.source_underscore_id_identifier and
+                        !structured_summary.parser.underscore_doc_identifier);
                 self.unsupported_write_document_sql_json_path_delete = self.unsupported_write_document_sql_json_path_delete or
                     std.mem.eql(u8, entry.name, "unsupported document sql json path delete") or
                     (structured_summary.hasReason("document_sql_write_unsupported") and
@@ -16714,9 +17976,6 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.underscore_id_identifier and
                         structured_summary.parser.underscore_version_identifier and
                         !structured_summary.parser.underscore_doc_identifier);
-                self.unsupported_write_document_sql_truncate_table = self.unsupported_write_document_sql_truncate_table or
-                    (is_document_sql_write_unsupported and
-                        structured_summary.parser.starts_with_truncate);
                 self.unsupported_write_document_sql_write_unsupported = self.unsupported_write_document_sql_write_unsupported or
                     is_document_sql_write_unsupported;
             },
@@ -16749,6 +18008,16 @@ pub const AppParityCorpusCoverage = struct {
                 self.read_recursive_cte_stream_plan = self.read_recursive_cte_stream_plan or is_read_recursive_cte;
                 self.read_aggregate = self.read_aggregate or is_read_aggregate;
                 self.read_join = self.read_join or is_read_join;
+                self.join_full = self.join_full or
+                    (is_read_join and
+                        sql_adapter.planHasExactStringToken(entry.plan, "join:type=", "full") and
+                        structured_summary.parser.full_keyword and
+                        !structured_summary.parser.outer_keyword);
+                self.join_full_outer = self.join_full_outer or
+                    (is_read_join and
+                        sql_adapter.planHasExactStringToken(entry.plan, "join:type=", "full") and
+                        structured_summary.parser.full_keyword and
+                        structured_summary.parser.outer_keyword);
                 self.read_lateral = self.read_lateral or is_read_lateral;
                 self.read_window = self.read_window or is_read_window;
                 self.read_window_duplicate_output_label = self.read_window_duplicate_output_label or
@@ -16773,6 +18042,59 @@ pub const AppParityCorpusCoverage = struct {
                         structured_summary.parser.join_graph_match_table_function and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
                         sql_adapter.planHasNonZeroToken(entry.plan, ":right_source_cte="));
+                self.read_cte_body_join = self.read_cte_body_join or
+                    (is_read_query and
+                        structured_summary.parser.starts_with_with and
+                        std.mem.eql(u8, entry.name, "read cte body join") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte="));
+                self.read_cte_body_multi_join = self.read_cte_body_multi_join or
+                    (is_read_query and
+                        structured_summary.parser.starts_with_with and
+                        std.mem.eql(u8, entry.name, "read cte body multi join") and
+                        structured_summary.parser.join_keyword and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":source_cte="));
+                self.read_top_level_multi_join = self.read_top_level_multi_join or
+                    (is_read_join and
+                        !structured_summary.parser.starts_with_with and
+                        std.mem.eql(u8, entry.name, "read top level multi join") and
+                        structured_summary.parser.join_keyword and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":ctes=") and
+                        sql_adapter.planHasNonZeroToken(entry.plan, ":left_source_cte="));
+                self.read_set_operation_right_join = self.read_set_operation_right_join or
+                    (is_read_set_operation and
+                        std.mem.eql(u8, entry.name, "read set operation right join") and
+                        structured_summary.parser.join_keyword and
+                        std.mem.indexOf(u8, entry.plan, ":source_cte=1:pred=") != null and
+                        std.mem.indexOf(u8, entry.plan, ":ctes=1:result_output=") != null);
+                self.read_set_operation_right_cross_table_join = self.read_set_operation_right_cross_table_join or
+                    (is_read_set_operation and
+                        std.mem.eql(u8, entry.name, "read set operation right cross table join") and
+                        appParityEntryHasCatalogSchemas(entry) and
+                        structured_summary.parser.join_keyword and
+                        std.mem.indexOf(u8, entry.plan, ":source_cte=1:pred=") != null and
+                        std.mem.indexOf(u8, entry.plan, ":ctes=1:result_output=") != null);
+                self.read_set_operation_right_cross_table_multi_join = self.read_set_operation_right_cross_table_multi_join or
+                    (is_read_set_operation and
+                        std.mem.eql(u8, entry.name, "read set operation right cross table multi join") and
+                        entry.catalog_tables.len >= 3 and
+                        structured_summary.parser.join_keyword and
+                        std.mem.indexOf(u8, entry.plan, ":source_cte=1:pred=") != null and
+                        std.mem.indexOf(u8, entry.plan, ":ctes=2:result_output=") != null);
+                self.read_set_operation_right_lateral_join = self.read_set_operation_right_lateral_join or
+                    (is_read_set_operation and
+                        std.mem.eql(u8, entry.name, "read set operation right lateral join") and
+                        structured_summary.parser.join_keyword and
+                        std.mem.indexOf(u8, entry.sql, "LATERAL") != null and
+                        std.mem.indexOf(u8, entry.plan, ":source_cte=1:pred=") != null and
+                        std.mem.indexOf(u8, entry.plan, ":ctes=1:result_output=") != null);
+                self.read_set_operation_right_multi_join = self.read_set_operation_right_multi_join or
+                    (is_read_set_operation and
+                        std.mem.eql(u8, entry.name, "read set operation right multi join") and
+                        structured_summary.parser.join_keyword and
+                        std.mem.indexOf(u8, entry.plan, ":source_cte=1:pred=") != null and
+                        std.mem.indexOf(u8, entry.plan, ":ctes=2:result_output=") != null);
                 self.read_lateral_cross_table_source_schema_classifier = self.read_lateral_cross_table_source_schema_classifier or
                     (is_read_lateral and
                         appParityEntryHasCatalogSchemas(entry) and
@@ -16803,6 +18125,39 @@ pub const AppParityCorpusCoverage = struct {
             self.unsupported_read_set_operation_output_shape = self.unsupported_read_set_operation_output_shape or
                 (structured_summary.hasReason("set_operation_output_shape") and
                     structured_summary.parser.intersect);
+            self.unsupported_read_subquery_predicate = self.unsupported_read_subquery_predicate or
+                structured_summary.hasReason("subquery_scalar_plan") or
+                structured_summary.hasReason("subquery_semijoin_plan") or
+                structured_summary.hasReason("subquery_quantified_plan");
+            self.unsupported_read_correlated_subquery_predicate = self.unsupported_read_correlated_subquery_predicate or
+                (structured_summary.hasReason("subquery_semijoin_plan") and
+                    std.mem.eql(u8, entry.name, "read correlated subquery predicate"));
+            self.unsupported_read_nested_subquery_predicate = self.unsupported_read_nested_subquery_predicate or
+                (structured_summary.hasReason("subquery_semijoin_plan") and
+                    std.mem.eql(u8, entry.name, "read nested subquery predicate"));
+            self.unsupported_read_cte_contained_subquery_predicate = self.unsupported_read_cte_contained_subquery_predicate or
+                (structured_summary.hasReason("subquery_semijoin_plan") and
+                    std.mem.eql(u8, entry.name, "read cte contained subquery predicate") and
+                    structured_summary.parser.starts_with_with);
+            self.unsupported_read_quantified_subquery_predicate = self.unsupported_read_quantified_subquery_predicate or
+                (structured_summary.hasReason("subquery_quantified_plan") and
+                    std.mem.indexOf(u8, entry.sql, " = ANY (SELECT ") != null);
+            self.unsupported_read_in_subquery_predicate = self.unsupported_read_in_subquery_predicate or
+                (structured_summary.hasReason("subquery_semijoin_plan") and
+                    std.mem.indexOf(u8, entry.sql, " IN (SELECT ") != null and
+                    std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") == null);
+            self.unsupported_read_not_exists_subquery_predicate = self.unsupported_read_not_exists_subquery_predicate or
+                (structured_summary.hasReason("subquery_semijoin_plan") and
+                    std.mem.indexOf(u8, entry.sql, " NOT EXISTS (SELECT ") != null);
+            self.unsupported_read_not_in_subquery_predicate = self.unsupported_read_not_in_subquery_predicate or
+                (structured_summary.hasReason("subquery_semijoin_plan") and
+                    std.mem.indexOf(u8, entry.sql, " NOT IN (SELECT ") != null);
+            self.unsupported_read_scalar_subquery_predicate = self.unsupported_read_scalar_subquery_predicate or
+                (structured_summary.hasReason("subquery_scalar_plan") and
+                    std.mem.indexOf(u8, entry.sql, " = (SELECT ") != null);
+            self.unsupported_read_scalar_subquery_projection = self.unsupported_read_scalar_subquery_projection or
+                (structured_summary.hasReason("subquery_expression_plan") and
+                    std.mem.indexOf(u8, entry.sql, "SELECT (SELECT ") != null);
             self.unsupported_read_document_view_mapping_projection_expression = self.unsupported_read_document_view_mapping_projection_expression or
                 (structured_summary.hasReason("document_sql_view_mapping_unsupported") and
                     structured_summary.parser.support_view_identifier and
@@ -16874,6 +18229,37 @@ pub const AppParityCorpusCoverage = struct {
             self.truncate_cascade_generation_barrier = self.truncate_cascade_generation_barrier or
                 (structured_summary.parser.truncate_cascade and
                     sql_adapter.planHasExactUsizeToken(entry.plan, ":cascade=", 1));
+        } else if (entry.family == .unsupported) {
+            self.unsupported_graph_query = self.unsupported_graph_query or
+                (structured_summary.hasReason("graph_query_plan") and
+                    structured_summary.parser.starts_with_match and
+                    structured_summary.parser.return_identifier);
+            self.unsupported_graph_query_filtered_return = self.unsupported_graph_query_filtered_return or
+                (structured_summary.hasReason("graph_query_plan") and
+                    structured_summary.parser.starts_with_match and
+                    structured_summary.parser.return_identifier and
+                    std.mem.indexOf(u8, entry.sql, " WHERE ") != null);
+            self.unsupported_graph_query_incoming_path_return = self.unsupported_graph_query_incoming_path_return or
+                (structured_summary.hasReason("graph_query_plan") and
+                    structured_summary.parser.starts_with_match and
+                    structured_summary.parser.return_identifier and
+                    std.mem.indexOf(u8, entry.sql, "<-[:") != null);
+            self.unsupported_graph_query_multi_return = self.unsupported_graph_query_multi_return or
+                (structured_summary.hasReason("graph_query_plan") and
+                    structured_summary.parser.starts_with_match and
+                    structured_summary.parser.return_identifier and
+                    std.mem.indexOf(u8, entry.sql, "RETURN doc, target") != null);
+            self.unsupported_graph_query_ordered_limited_return = self.unsupported_graph_query_ordered_limited_return or
+                (structured_summary.hasReason("graph_query_plan") and
+                    structured_summary.parser.starts_with_match and
+                    structured_summary.parser.return_identifier and
+                    std.mem.indexOf(u8, entry.sql, " ORDER BY ") != null and
+                    std.mem.indexOf(u8, entry.sql, " LIMIT ") != null);
+            self.unsupported_graph_query_path_return = self.unsupported_graph_query_path_return or
+                (structured_summary.hasReason("graph_query_plan") and
+                    structured_summary.parser.starts_with_match and
+                    structured_summary.parser.return_identifier and
+                    std.mem.indexOf(u8, entry.sql, "-[:") != null);
         } else if (entry.family == .unsupported_ddl) {
             self.unsupported_ddl_copy_wrong_stream_endpoint = self.unsupported_ddl_copy_wrong_stream_endpoint or
                 (structured_summary.hasReason("bulk_io_plan") and
@@ -17030,6 +18416,49 @@ pub const AppParityCorpusCoverage = struct {
                 (structured_summary.hasReason("transform_catalog_plan") and
                     structured_summary.parser.starts_with_drop and
                     structured_summary.parser.transform_catalog);
+            self.unsupported_ddl_trigger_alter = self.unsupported_ddl_trigger_alter or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_alter and
+                    structured_summary.parser.trigger_catalog);
+            self.unsupported_ddl_trigger_create = self.unsupported_ddl_trigger_create or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog);
+            self.unsupported_ddl_trigger_create_arguments = self.unsupported_ddl_trigger_create_arguments or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_arguments);
+            self.unsupported_ddl_trigger_create_constraint = self.unsupported_ddl_trigger_create_constraint or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_constraint);
+            self.unsupported_ddl_trigger_create_instead_of = self.unsupported_ddl_trigger_create_instead_of or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_instead_of);
+            self.unsupported_ddl_trigger_create_referencing = self.unsupported_ddl_trigger_create_referencing or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_referencing);
+            self.unsupported_ddl_trigger_create_truncate = self.unsupported_ddl_trigger_create_truncate or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_truncate);
+            self.unsupported_ddl_trigger_create_update_of = self.unsupported_ddl_trigger_create_update_of or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_update_of);
+            self.unsupported_ddl_trigger_create_when = self.unsupported_ddl_trigger_create_when or
+                (structured_summary.hasReason("trigger_catalog_plan") and
+                    structured_summary.parser.starts_with_create and
+                    structured_summary.parser.trigger_catalog and
+                    structured_summary.parser.trigger_when);
         }
         if (entry.family == .ddl) {
             switch (entry.summary.ddl_tag orelse return error.TestUnexpectedResult) {
@@ -19639,17 +21068,19 @@ test "sql adapter corpus emits structured fixture summaries" {
     try std.testing.expect(query_function_search.parser.vector_search_function);
     try std.testing.expect(!query_function_search.parser.hybrid_search_function);
     try std.testing.expect(!query_function_search.parser.graph_traverse_function);
+    try std.testing.expect(!query_function_search.parser.graph_neighbors_function);
     try std.testing.expect(!query_function_search.parser.sources_json_identifier);
 
-    var query_function_graph_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT * FROM antfly.graph_traverse(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_shortest_path(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric_rerank(table_name => 'usage_records')");
+    var query_function_graph_sql = try tokenized.ParsedSql.initAlloc(alloc, "SELECT * FROM antfly.graph_traverse(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_neighbors(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_shortest_path(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric_rerank(table_name => 'usage_records')");
     defer query_function_graph_sql.deinit(alloc);
     const query_function_graph = appParityStructuredFixtureSummary(.{
         .name = "query function graph summary",
-        .sql = "SELECT * FROM antfly.graph_traverse(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_shortest_path(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric_rerank(table_name => 'usage_records')",
+        .sql = "SELECT * FROM antfly.graph_traverse(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_neighbors(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_shortest_path(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_k_shortest_paths(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric(table_name => 'usage_records') UNION ALL SELECT * FROM antfly.graph_metric_rerank(table_name => 'usage_records')",
         .family = .query_function,
         .plan = "query_function:table=usage_records:graph_search=1",
     }, &query_function_graph_sql);
     try std.testing.expect(query_function_graph.parser.graph_traverse_function);
+    try std.testing.expect(query_function_graph.parser.graph_neighbors_function);
     try std.testing.expect(query_function_graph.parser.graph_shortest_path_function);
     try std.testing.expect(query_function_graph.parser.graph_k_shortest_paths_function);
     try std.testing.expect(query_function_graph.parser.graph_metric_function);

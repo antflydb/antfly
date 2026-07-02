@@ -63,6 +63,20 @@ pub fn expectFailClosedUnsupported(result: anytype) !void {
         error.DocumentSqlBoundedScanUnboundedSource,
         error.DocumentSqlBoundedScanUnsupportedResidual,
         error.DocumentSqlIndexUnavailable,
+        error.DocumentSqlWriteJoinMissingExactProducer,
+        error.DocumentSqlWriteJoinMissingCardinalityProof,
+        error.DocumentSqlWriteJoinMissingIndexProof,
+        error.DocumentSqlWriteJoinOrderedIndexProof,
+        error.DocumentSqlWriteJoinPartialIndexProof,
+        error.DocumentSqlWriteJoinStaleIndexProof,
+        error.DocumentSqlWriteSourceAssignmentAlias,
+        error.DocumentSqlWriteSourceAssignmentAmbiguousReference,
+        error.DocumentSqlWriteSourceAssignmentGeneratedField,
+        error.DocumentSqlWriteSourceAssignmentMissingField,
+        error.DocumentSqlWriteSourceAssignmentReservedField,
+        error.DocumentSqlWriteSourceAssignmentTargetGeneratedField,
+        error.DocumentSqlWriteSourceAssignmentTargetReservedField,
+        error.DocumentSqlWriteSourceAssignmentTypeMismatch,
         => return,
         else => return err,
     }
@@ -334,6 +348,17 @@ pub fn expectAppParityWriteSummary(summary: corpus.AppParityPlanSummary, lowered
             };
             try expectOptionalUsize(summary.operations, operation_count);
             try expectOptionalUsize(summary.predicates, if (document_mutation.expected_version != null) 1 else 0);
+        },
+        .document_joined_mutation => |document_mutation| {
+            try expectOptionalTableName(summary.table_name, document_mutation.table_name);
+            const operation_count: usize = switch (document_mutation.template) {
+                .delete => 0,
+                .transform => |operations| operations.len,
+            };
+            try expectOptionalUsize(summary.operations, operation_count);
+            try expectOptionalUsize(summary.source_assignments, document_mutation.source_assignments.len);
+            try expectOptionalUsize(summary.predicates, if (document_mutation.expected_version != null) 1 else 0);
+            try expectOptionalUsize(summary.join_on, document_mutation.join_keys.len);
         },
         .insert_source => |insert_source| {
             try expectOptionalTableName(summary.table_name, insert_source.table_name);

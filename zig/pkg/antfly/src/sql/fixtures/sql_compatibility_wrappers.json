@@ -2,78 +2,6 @@
   "inventory_format": 1,
   "wrappers": [
     {
-      "id": "binder-dml-source-token-scanners",
-      "family": "dml",
-      "wrapper_class": "binder",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/binder.zig",
-      "symbol": "insertSourceTableNamesFromParsedSqlAlloc / joinedWriteSourceTableNamesFromParsedSqlAlloc",
-      "compatibility_reason": "DML source binding still has token-scanner entry points for source and target discovery when generated DML metadata is incomplete.",
-      "typed_replacement": "GeneratedSqlDmlAst source and target bindings consumed directly by binder logical write plans.",
-      "deletion_gate": "All INSERT source, recursive INSERT source, UPDATE FROM, DELETE USING, and MERGE corpus fixtures prove generated-AST binding parity and stale-AST fail-closed diagnostics.",
-      "deletion_evidence": {
-        "typed_parser": "GeneratedSqlDmlAst target/source ranges for INSERT source, recursive INSERT source, UPDATE FROM, DELETE USING, and MERGE.",
-        "typed_binder": "Binder APIs consume generated DML target/source metadata without token scanner fallback.",
-        "typed_plan": "Logical write plans preserve target, insert source, joined source, and merge source roles from generated metadata.",
-        "typed_runtime": "Mutation-source runtime executes the generated-bound source roles through typed relational write requests.",
-        "parity": "Source corpus fixtures compare generated-bound write plans with compatibility-bound plans and API runtime results."
-      },
-      "state_safety": {
-        "durable_catalog": "none",
-        "durable_document": "none",
-        "durable_row": "unproven_migration_blocker",
-        "proof": "DML source binding can feed row-write plans, so row-state safety remains unproven until generated binding parity deletes the scanner path."
-      }
-    },
-    {
-      "id": "binder-read-source-token-scanners",
-      "family": "query",
-      "wrapper_class": "binder",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/binder.zig",
-      "symbol": "readSourceTableNamesFromParsedSqlAlloc",
-      "compatibility_reason": "Read source binding still exposes a token-scanner path for table discovery while generated read source metadata is being adopted.",
-      "typed_replacement": "GeneratedSqlReadAst source bindings consumed directly by read binding and source catalog prebinding.",
-      "deletion_gate": "Query, aggregate, join, lateral, window, recursive CTE, and set-operation fixtures prove generated-AST binding parity and stale-source diagnostics.",
-      "deletion_evidence": {
-        "typed_parser": "GeneratedSqlReadAst source, CTE, join, lateral, window, and set-operation ranges cover every read source shape.",
-        "typed_binder": "Read binder resolves generated source metadata without readSourceTableNamesFromParsedSqlAlloc.",
-        "typed_plan": "Logical read plans preserve generated source identities, CTE roles, and joined source roles.",
-        "typed_runtime": "Typed read runtime executes generated-bound source plans through relational row or document query requests.",
-        "parity": "Read source corpus fixtures compare generated-bound plans, compatibility-bound plans, and API runtime output."
-      },
-      "state_safety": {
-        "durable_catalog": "none",
-        "durable_document": "read_only",
-        "durable_row": "read_only",
-        "proof": "Read source scanners only bind read plans; they do not emit catalog, document write, or row write mutations."
-      }
-    },
-    {
-      "id": "ddl-logical-token-planner",
-      "family": "ddl",
-      "wrapper_class": "planner",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/ddl_plan.zig",
-      "symbol": "parseLogicalDdlPlanTokensAlloc",
-      "compatibility_reason": "Rich DDL subshapes still retain token-tail planning for variants whose generated metadata is not fully typed.",
-      "typed_replacement": "planGeneratedLogicalDdlAstAlloc and generated DDL subfamily planners with validated source spans.",
-      "deletion_gate": "Every supported DDL subfamily has raw generated-AST fixtures, generated-AST-to-plan parity, stable unsupported diagnostics, and no token-tail fallback.",
-      "deletion_evidence": {
-        "typed_parser": "Generated DDL ASTs carry subfamily, command, object, option, expression, and rename/drop ranges.",
-        "typed_binder": "DDL catalog binding resolves generated object identities without token-tail object reparsing.",
-        "typed_plan": "Generated DDL subfamily planners emit the same catalog plan variants as parseLogicalDdlPlanTokensAlloc.",
-        "typed_runtime": "Catalog apply/runtime paths consume generated DDL plans through typed schema/catalog mutation requests.",
-        "parity": "DDL parity fixtures compare generated DDL plans, compatibility DDL plans, native catalog mutations, and unsupported diagnostics."
-      },
-      "state_safety": {
-        "durable_catalog": "unproven_migration_blocker",
-        "durable_document": "none",
-        "durable_row": "none",
-        "proof": "DDL token-tail planning can produce catalog mutations, so catalog-state safety remains unproven until generated DDL plan parity deletes the wrapper."
-      }
-    },
-    {
       "id": "document-query-bounded-scan-runtime",
       "family": "query",
       "wrapper_class": "runtime",
@@ -99,30 +27,6 @@
       }
     },
     {
-      "id": "dml-generated-ast-optional-token-lowerers",
-      "family": "dml",
-      "wrapper_class": "planner",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/lower_dml.zig",
-      "symbol": "generated_dml_ast nullable parser options",
-      "compatibility_reason": "DML lowerers still accept null generated AST metadata for token-first compatibility paths while individual write shapes migrate.",
-      "typed_replacement": "Required GeneratedSqlDmlAst entry points for every admitted DML lowerer and generated stale-metadata diagnostics.",
-      "deletion_gate": "INSERT, UPDATE, DELETE, TRUNCATE, MERGE, mutation-source, returning, conflict, and CTE write fixtures all prove generated-AST lowering parity.",
-      "deletion_evidence": {
-        "typed_parser": "Generated DML ASTs carry command, target, assignment, conflict, returning, CTE, source, and merge-arm ranges.",
-        "typed_binder": "Write binder receives required generated DML metadata for target and source catalog identities.",
-        "typed_plan": "DML lowerers require generated metadata and fail closed on stale or missing generated ranges.",
-        "typed_runtime": "Relational mutation runtime consumes typed row batch, mutation-source, and returning plans from generated DML lowerers.",
-        "parity": "DML corpus and API fixtures compare generated lowerer plans, compatibility lowerer plans, runtime mutations, and stale-AST diagnostics."
-      },
-      "state_safety": {
-        "durable_catalog": "none",
-        "durable_document": "none",
-        "durable_row": "unproven_migration_blocker",
-        "proof": "Optional generated DML metadata can feed row mutation lowerers, so row-state safety remains unproven until generated metadata is required."
-      }
-    },
-    {
       "id": "grammar-maintenance-tail-token-parsers",
       "family": "maintenance",
       "wrapper_class": "parser",
@@ -145,78 +49,6 @@
         "durable_document": "none",
         "durable_row": "read_only",
         "proof": "Maintenance tail parsers currently admit no-op, unsupported, or read-only maintenance plans; durable mutations remain gated by typed maintenance planning."
-      }
-    },
-    {
-      "id": "read-statement-kind-classifier",
-      "family": "query",
-      "wrapper_class": "parser",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
-      "symbol": "readStatementKindIncludingGeneratedAst",
-      "compatibility_reason": "Read statement classification can still fall back to token heads when generated read metadata is absent.",
-      "typed_replacement": "GeneratedSqlReadAst family tags and generated-first read dispatch with token fallback only for explicit compatibility contracts.",
-      "deletion_gate": "All generated-covered read families reject missing generated AST metadata before token classification and retain positive parity fixtures.",
-      "deletion_evidence": {
-        "typed_parser": "Generated read parser publishes family tags for query, aggregate, join, lateral, window, recursive CTE, and set operation.",
-        "typed_binder": "Read binder dispatches from generated read family tags rather than token-head classification.",
-        "typed_plan": "Generated-first read lowerers reject missing generated AST metadata for generated-covered families.",
-        "typed_runtime": "Read runtime receives the same typed read plans produced by generated-first dispatch.",
-        "parity": "Read family fixtures prove generated-first classification, compatibility parity, and missing-AST fail-closed diagnostics."
-      },
-      "state_safety": {
-        "durable_catalog": "none",
-        "durable_document": "read_only",
-        "durable_row": "read_only",
-        "proof": "Read statement classification can only route read plans and cannot produce write or catalog mutation plans."
-      }
-    },
-    {
-      "id": "relation-population-token-parser",
-      "family": "query",
-      "wrapper_class": "parser",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/grammar.zig",
-      "symbol": "parseRelationPopulationTokensAlloc",
-      "compatibility_reason": "Relation population and CTE source parsing still uses token-oriented parsing for some generated read and source bodies.",
-      "typed_replacement": "Generated read/source body ASTs with validated CTE, source, join, and relation-population spans.",
-      "deletion_gate": "Read source, CTE, join, lateral, set-operation, and graph table-function fixtures prove generated source-body lowering without token reparse.",
-      "deletion_evidence": {
-        "typed_parser": "Generated relation-population ASTs carry source body, CTE, join, lateral, graph table-function, and set-operation spans.",
-        "typed_binder": "Source prebinding consumes generated relation-population metadata without reparsing relation body tokens.",
-        "typed_plan": "Read/source lowerers use generated source body metadata for relation population and CTE materialization.",
-        "typed_runtime": "Runtime executes generated source-body plans through typed read, materialization, or graph table-function requests.",
-        "parity": "Relation population fixtures compare generated source-body plans, compatibility source-body plans, and runtime materialization results."
-      },
-      "state_safety": {
-        "durable_catalog": "none",
-        "durable_document": "read_only",
-        "durable_row": "read_only",
-        "proof": "Relation population parsing routes read and materialization sources; row mutation admission is tracked through DML wrappers instead."
-      }
-    },
-    {
-      "id": "write-statement-kind-classifier",
-      "family": "dml",
-      "wrapper_class": "parser",
-      "classification": "migration_blocker",
-      "file": "zig/pkg/antfly/src/sql/tokenized.zig",
-      "symbol": "writeStatementKindIncludingGeneratedAst",
-      "compatibility_reason": "Write statement classification can still fall back to token heads when generated DML metadata is absent.",
-      "typed_replacement": "GeneratedSqlDmlAst family tags and generated-first write dispatch with token fallback only for explicit compatibility contracts.",
-      "deletion_gate": "All generated-covered write families reject missing generated AST metadata before token classification and retain positive parity fixtures.",
-      "deletion_evidence": {
-        "typed_parser": "Generated DML parser publishes family tags for insert, insert-source, update, delete, truncate, merge, and mutation-source shapes.",
-        "typed_binder": "Write binder dispatches from generated DML family tags rather than token-head classification.",
-        "typed_plan": "Generated-first write lowerers reject missing generated AST metadata for generated-covered families.",
-        "typed_runtime": "Write runtime receives the same typed write plans produced by generated-first dispatch.",
-        "parity": "Write family fixtures prove generated-first classification, compatibility parity, runtime parity, and missing-AST fail-closed diagnostics."
-      },
-      "state_safety": {
-        "durable_catalog": "none",
-        "durable_document": "none",
-        "durable_row": "unproven_migration_blocker",
-        "proof": "Write statement classification can route row mutation plans, so row-state safety remains unproven until generated-first DML dispatch is mandatory."
       }
     }
   ]

@@ -1,8 +1,8 @@
 {
   "fixture_format": 1,
-  "source_sha256": "d999ef3e2a53bb2f67661eae692f552ee477d466978f711f75a6ce9803ae77a8",
-  "source_entry_count": 1212,
-  "entry_count": 1212,
+  "source_sha256": "028f26e682576532ee99c35119166d05d7f0d9ee4b7216823edc36aec4a698bb",
+  "source_entry_count": 1405,
+  "entry_count": 1405,
   "skipped_entries": [
   ],
   "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"cloud_instance_id\":{\"type\":\"keyword\"},\"user_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\",\"default\":\"active\"},\"metric_type\":{\"type\":\"keyword\"},\"email\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"},\"rating_status\":{\"type\":\"keyword\"},\"product_family\":{\"type\":\"keyword\"},\"enabled\":{\"type\":\"boolean\"},\"amount\":{\"type\":\"numeric\"},\"quantity\":{\"type\":\"numeric\"},\"rated_quantity\":{\"type\":\"numeric\"},\"priority\":{\"type\":\"numeric\"},\"created_at\":{\"type\":\"numeric\"},\"updated_at_ns\":{\"type\":\"numeric\"},\"recorded_at\":{\"type\":\"numeric\"},\"expires_at\":{\"type\":\"numeric\"},\"billing_cycle_start\":{\"type\":\"numeric\"},\"bucket_start\":{\"type\":\"numeric\"},\"metadata\":{\"type\":\"json\"},\"tags\":{\"type\":\"array\",\"items\":{\"type\":\"keyword\"}}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
@@ -250,6 +250,12 @@
       "family": "query_function",
       "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=1:graph_metric=0:fields=0:limit=11",
       "sql": "SELECT * FROM antfly.graph_traverse(table_name => 'docs', name => 'citation_walk', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', edge_types => 'cites, references', max_depth => 2, max_results => 11, metrics => 'pagerank', freshness => 'fresh', include_metric_status => true, include_paths => true, limit => 11)"
+    },
+    {
+      "name": "query function graph neighbors request",
+      "family": "query_function",
+      "plan": "query_function:text=0:full_text_queries=0:dense=0:sparse=0:graph_search=1:graph_metric=0:fields=0:limit=8",
+      "sql": "SELECT * FROM antfly.graph_neighbors(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', direction => 'out', max_results => 8, limit => 8)"
     },
     {
       "name": "query function graph shortest path request",
@@ -4990,6 +4996,24 @@
       "sql": "SELECT u.id FROM usage_records AS u WHERE u.status = 'queued' FOR UPDATE OF archived_records"
     },
     {
+      "name": "read contextual match alias",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id AS match FROM usage_records"
+    },
+    {
+      "name": "read contextual implicit match alias",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=0:pred=0:expr_pred=0:json_eq=0:or=0:not=0:select=0:expr=1:alias=0:order=0:order_expr=0:limit=none:claim=none",
+      "sql": "SELECT id match FROM usage_records"
+    },
+    {
       "name": "read union all boolean set operation",
       "family": "read",
       "summary": {
@@ -6150,6 +6174,64 @@
       },
       "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:result_output=1:result_order=1:result_limit=5:result_offset=1",
       "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT id FROM usage_records WHERE enabled IS TRUE ORDER BY id DESC LIMIT 5 OFFSET 1"
+    },
+    {
+      "name": "read set operation right join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none:ctes=1:result_output=1:result_order=1:result_limit=5",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT c.id FROM usage_records AS c JOIN usage_records AS p ON c.customer_id = p.id WHERE p.enabled IS TRUE ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "read set operation right cross table join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none:ctes=1:result_output=1:result_order=1:result_limit=5",
+      "catalog_tables": [{"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT u.id FROM usage_records AS u JOIN archived_records AS a ON u.id = a.id WHERE a.status = 'deleted' ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "read set operation right cross table multi join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none:ctes=2:result_output=1:result_order=1:result_limit=5",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}, {"name": "archived_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}, {"name": "tenant_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT u.id FROM usage_records AS u JOIN archived_records AS a ON u.id = a.id JOIN tenant_records AS t ON a.tenant_id = t.tenant_id WHERE t.status = 'active' ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "read set operation right lateral join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none:ctes=1:result_output=1:result_order=1:result_limit=5",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"organization_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"number\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
+      "sql": "SELECT id FROM usage_records WHERE kind = 'organization' UNION ALL SELECT org.id FROM usage_records AS org LEFT JOIN LATERAL (SELECT amount FROM usage_records AS bal WHERE bal.organization_id = org.id AND bal.kind = 'balance' ORDER BY amount DESC LIMIT 1) AS latest ON true WHERE org.kind = 'organization' ORDER BY id ASC LIMIT 5"
+    },
+    {
+      "name": "read set operation right multi join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records",
+        "order_by": 1,
+        "limit": 5
+      },
+      "plan": "read:set_operation:set_operation:op=union_all:left=left:table=usage_records:ctes=0:pred=1:expr_pred=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=0:order_expr=0:limit=none:claim=none:right=right:table=usage_records:ctes=0:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=0:expr=0:alias=0:order=0:order_expr=0:limit=-1:claim=none:ctes=2:result_output=1:result_order=1:result_limit=5",
+      "sql": "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT c.id FROM usage_records AS c JOIN usage_records AS p ON c.customer_id = p.id JOIN usage_records AS t ON p.tenant_id = t.id WHERE t.status = 'open' ORDER BY id ASC LIMIT 5"
     },
     {
       "name": "read except mixed scalar expression predicate set operation",
@@ -9350,8 +9432,8 @@
       },
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
-      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "DELETE FROM docs WHERE title = 'Launch'"
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE status = 'draft' AND lower(title) = 'launch'"
     },
     {
       "name": "unsupported document sql json path delete",
@@ -9384,7 +9466,7 @@
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "DELETE FROM docs WHERE title > 'Launch'"
+      "sql": "DELETE FROM docs WHERE missing_score > 10"
     },
     {
       "name": "unsupported document sql ordered delete",
@@ -9552,6 +9634,28 @@
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
       "sql": "UPDATE docs SET _doc = antfly.json_patch(_doc, '{\"ops\":[{\"op\":\"set\",\"path\":\"title\",\"value\":\"Launch\"}]}') WHERE _id = 'doc:a' OR _version = 42"
+    },
+    {
+      "name": "unsupported document sql indexed projection version predicate",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft' AND _version = 42"
+    },
+    {
+      "name": "unsupported document sql indexed delete version predicate",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE status = 'draft' AND _version = 42"
     },
     {
       "name": "document sql json patch schema type",
@@ -9754,6 +9858,1442 @@
       "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a'"
     },
     {
+      "name": "document sql joined projection update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=id_lookup:source_producer=id_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "document sql joined source assignment update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=id_lookup:source_producer=id_lookup:join_keys=1:source_assignments=1:template=transform:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql joined projection update",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs._id = source._id"
+    },
+    {
+      "name": "unsupported document sql projection source assignment update",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs._id = source._id"
+    },
+    {
+      "name": "unsupported document sql joined projection update without cardinality proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_cardinality_proof",
+      "classification_reason": "document_sql_write_join_missing_cardinality_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "unsupported document sql joined source assignment update without cardinality proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_cardinality_proof",
+      "classification_reason": "document_sql_write_join_missing_cardinality_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "document sql joined projection update with cardinality proof and indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "document sql joined bounded target projection update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=bounded_scan:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=10000:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.category = 'release'"
+    },
+    {
+      "name": "document sql joined projection update with derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
+    },
+    {
+      "name": "document sql joined projection update with concat derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat_ws\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(docs.status, ':', docs.title) = 'draft:Launch'"
+    },
+    {
+      "name": "document sql joined projection update with concat_ws derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat_ws\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat_ws(':', docs.status, docs.title) = 'draft:Launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source concat missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_title_key\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}},\"status_title_ws\":{\"type\":\"keyword\",\"generated\":{\"op\":\"concat_ws\",\"fields\":[\"status\",\"title\"],\"separator\":\":\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND concat(source.status, ':', source.title) = 'draft:Launch'"
+    },
+    {
+      "name": "document sql joined projection update with expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_slug\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"replace\",\"args\":[{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},{\"value\":\" \"},{\"value\":\"-\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_slug\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"replace\",\"args\":[{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},{\"value\":\" \"},{\"value\":\"-\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(source.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_slug\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"replace\",\"args\":[{\"op\":\"lower\",\"args\":[{\"field\":\"title\"}]},{\"value\":\" \"},{\"value\":\"-\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_slug\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"replace\",\"args\":[{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},{\"value\":\" \"},{\"value\":\"-\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_slug\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"replace\",\"args\":[{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},{\"value\":\" \"},{\"value\":\"-\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"status_slug\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_slug\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"replace\",\"args\":[{\"op\":\"lower\",\"args\":[{\"field\":\"status\"}]},{\"value\":\" \"},{\"value\":\"-\"}]}},\"x-antfly-index-name\":\"status_slug_idx\",\"x-antfly-index-keys\":[{\"column\":\"status_slug\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND replace(lower(docs.status), ' ', '-') = 'draft-launch'"
+    },
+    {
+      "name": "document sql joined projection update with numeric expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}}},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source numeric expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}}},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(source.amount) = 12"
+    },
+    {
+      "name": "unsupported document sql joined projection update numeric expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"fee\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"fee\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12"
+    },
+    {
+      "name": "document sql joined projection update with binary numeric expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_mod\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"mod\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source binary numeric expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_mod\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"mod\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(source.amount, source.amount) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing binary numeric expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update binary numeric expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"fee\":{\"type\":\"numeric\"},\"amount_mod\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"mod\",\"args\":[{\"field\":\"amount\"},{\"field\":\"fee\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND mod(docs.amount, docs.amount) = 2"
+    },
+    {
+      "name": "document sql joined projection update with additive expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_sum\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24"
+    },
+    {
+      "name": "document sql joined projection update with subtractive expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_delta\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"sub\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount - docs.amount = 0"
+    },
+    {
+      "name": "document sql joined projection update with multiplicative expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_product\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"mul\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount * docs.amount = 144"
+    },
+    {
+      "name": "document sql joined projection update with divisive expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_ratio\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"div\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount / docs.amount = 1"
+    },
+    {
+      "name": "document sql joined projection update with power expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_power\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"power\",\"args\":[{\"field\":\"amount\"},{\"value\":2}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source arithmetic expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_sum\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.amount + source.amount = 24"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source power expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_power\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"power\",\"args\":[{\"field\":\"amount\"},{\"value\":2}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(source.amount, 2) = 144"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing arithmetic expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24"
+    },
+    {
+      "name": "unsupported document sql joined projection update arithmetic expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"fee\":{\"type\":\"numeric\"},\"amount_sum\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"fee\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale arithmetic expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_sum\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial arithmetic expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_sum\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"amount_sum\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered arithmetic expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_sum\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"add\",\"args\":[{\"field\":\"amount\"},{\"field\":\"amount\"}]}},\"x-antfly-index-name\":\"amount_sum_idx\",\"x-antfly-index-keys\":[{\"column\":\"amount_sum\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount + docs.amount = 24"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing power expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144"
+    },
+    {
+      "name": "unsupported document sql joined projection update power expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"fee\":{\"type\":\"numeric\"},\"amount_power\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"power\",\"args\":[{\"field\":\"fee\"},{\"value\":2}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale power expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_power\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"power\",\"args\":[{\"field\":\"amount\"},{\"value\":2}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial power expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_power\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"power\",\"args\":[{\"field\":\"amount\"},{\"value\":2}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"amount_power\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered power expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_power\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"power\",\"args\":[{\"field\":\"amount\"},{\"value\":2}]}},\"x-antfly-index-name\":\"amount_power_idx\",\"x-antfly-index-keys\":[{\"column\":\"amount_power\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND power(docs.amount, 2) = 144"
+    },
+    {
+      "name": "document sql joined projection update with cast expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'"
+    },
+    {
+      "name": "document sql joined projection update with postfix cast expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source cast expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(source.amount AS text) = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source postfix cast expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.amount::text = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update cast expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"fee\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"fee\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"amount_text\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-name\":\"amount_text_idx\",\"x-antfly-index-keys\":[{\"column\":\"amount_text\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND CAST(docs.amount AS text) = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing postfix cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update postfix cast expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"fee\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"fee\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale postfix cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial postfix cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"amount_text\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered postfix cast expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_text\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"cast\",\"to\":\"text\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-name\":\"amount_text_idx\",\"x-antfly-index-keys\":[{\"column\":\"amount_text\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.amount::text = '12'"
+    },
+    {
+      "name": "document sql joined projection update with json extract expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "document sql joined projection update with json typeof expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_type\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_typeof\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'"
+    },
+    {
+      "name": "document sql joined projection update with nested json array length expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flag_count\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_array_length\",\"args\":[{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing json extract expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update json extract expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"payload\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"payload\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale json extract expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial json extract expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"metadata_source\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered json extract expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-name\":\"metadata_source_idx\",\"x-antfly-index-keys\":[{\"column\":\"metadata_source\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(docs.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing json typeof expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'"
+    },
+    {
+      "name": "unsupported document sql joined projection update json typeof expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"payload\":{\"type\":\"json\"},\"metadata_type\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_typeof\",\"args\":[{\"field\":\"payload\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale json typeof expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_type\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_typeof\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial json typeof expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_type\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_typeof\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"metadata_type\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered json typeof expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_type\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_typeof\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-name\":\"metadata_type_idx\",\"x-antfly-index-keys\":[{\"column\":\"metadata_type\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(docs.metadata) = 'object'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing json array length expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update json array length expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"payload\":{\"type\":\"json\"},\"metadata_flag_count\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_array_length\",\"args\":[{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"payload\"}]}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale json array length expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flag_count\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_array_length\",\"args\":[{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial json array length expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flag_count\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_array_length\",\"args\":[{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"metadata_flag_count\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered json array length expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flag_count\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_array_length\",\"args\":[{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}]}},\"x-antfly-index-name\":\"metadata_flag_count_idx\",\"x-antfly-index-keys\":[{\"column\":\"metadata_flag_count\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(docs.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source json expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_extract_path_text(source.metadata, 'source') = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source json typeof expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_type\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_typeof\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_typeof(source.metadata) = 'object'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source json array length expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flag_count\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_array_length\",\"args\":[{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND jsonb_array_length(jsonb_extract_path(source.metadata, 'flags')) = 2"
+    },
+    {
+      "name": "document sql joined projection update with json text access expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "document sql joined projection update with json path text access expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_billing_plan\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"billing.plan\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "document sql joined projection update with json path access expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flags\":{\"type\":\"json\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing json text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update json text operator expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"payload\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"payload\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale json text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial json text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"metadata_source\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered json text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-name\":\"metadata_source_idx\",\"x-antfly-index-keys\":[{\"column\":\"metadata_source\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing json path text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "unsupported document sql joined projection update json path text operator expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"payload\":{\"type\":\"json\"},\"metadata_billing_plan\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"billing.plan\",\"args\":[{\"field\":\"payload\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale json path text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_billing_plan\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"billing.plan\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial json path text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_billing_plan\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"billing.plan\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"metadata_billing_plan\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered json path text operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_billing_plan\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"billing.plan\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-name\":\"metadata_billing_plan_idx\",\"x-antfly-index-keys\":[{\"column\":\"metadata_billing_plan\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing json path operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "unsupported document sql joined projection update json path operator expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"payload\":{\"type\":\"json\"},\"metadata_flags\":{\"type\":\"json\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"payload\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale json path operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flags\":{\"type\":\"json\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial json path operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flags\":{\"type\":\"json\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"metadata_flags\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered json path operator expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flags\":{\"type\":\"json\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}},\"x-antfly-index-name\":\"metadata_flags_idx\",\"x-antfly-index-keys\":[{\"column\":\"metadata_flags\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source json text access expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_source\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"source\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata->>'source' = 'api'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source json path text access expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_billing_plan\":{\"type\":\"keyword\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"as_text\":true,\"path\":\"billing.plan\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata#>>'{billing,plan}' = 'pro'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source json path access expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"metadata\":{\"type\":\"json\"},\"metadata_flags\":{\"type\":\"json\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"json_extract\",\"path\":\"flags\",\"args\":[{\"field\":\"metadata\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.metadata#>'{flags}' = '[\"rated\"]'"
+    },
+    {
+      "name": "document sql joined projection update with binary text expression derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}}},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing binary text expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update binary text expression target dependency mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"title\"},{\"value\":\"a\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale binary text expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial binary text expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"status_pos\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered binary text expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}},\"x-antfly-index-name\":\"status_pos_idx\",\"x-antfly-index-keys\":[{\"column\":\"status_pos\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(docs.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source binary text expression missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}}},\"status_pos\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"strpos\",\"args\":[{\"field\":\"status\"},{\"value\":\"a\"}]}}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND strpos(source.status, 'a') = 2"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing derived target index",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
+    },
+    {
+      "name": "unsupported document sql joined projection update with source-side constant missing exact producer",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_exact_producer",
+      "classification_reason": "document_sql_write_join_missing_exact_producer",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND source.status = 'draft'"
+    },
+    {
+      "name": "document sql joined projection update with cardinality proof and parameterized source lookup",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=id_lookup:source_producer=join_key_indexed_lookup:join_keys=1:template=transform:ops=1:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "document sql joined source assignment update with cardinality proof and indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:source_assignments=1:template=transform:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "document sql joined source assignment update with derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:source_assignments=1:template=transform:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
+    },
+    {
+      "name": "document sql joined source assignment update with cardinality proof and parameterized source lookup",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "source_assignments": 1,
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=projection_write:target_producer=id_lookup:source_producer=join_key_indexed_lookup:join_keys=1:source_assignments=1:template=transform:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.title FROM docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index-where\":{\"all\":[{\"field\":\"status\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-index-name\":\"status_idx\",\"x-antfly-index-keys\":[{\"column\":\"status\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "unsupported document sql joined projection update missing numeric expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_index_proof",
+      "classification_reason": "document_sql_write_join_missing_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12"
+    },
+    {
+      "name": "unsupported document sql joined projection update stale numeric expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_stale_index_proof",
+      "classification_reason": "document_sql_write_join_stale_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-lifecycle\":\"building\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12"
+    },
+    {
+      "name": "unsupported document sql joined projection update partial numeric expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_partial_index_proof",
+      "classification_reason": "document_sql_write_join_partial_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-where\":{\"all\":[{\"field\":\"amount_abs\",\"op\":\"is_not_null\"}]}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12"
+    },
+    {
+      "name": "unsupported document sql joined projection update ordered numeric expression target index proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_ordered_index_proof",
+      "classification_reason": "document_sql_write_join_ordered_index_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"amount\":{\"type\":\"numeric\"},\"amount_abs\":{\"type\":\"numeric\",\"generated\":{\"op\":\"expression\",\"expression\":{\"op\":\"abs\",\"args\":[{\"field\":\"amount\"}]}},\"x-antfly-index-name\":\"amount_abs_idx\",\"x-antfly-index-keys\":[{\"column\":\"amount_abs\",\"direction\":\"desc\"}]}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Joined' FROM docs AS source WHERE docs.status = source.status AND abs(docs.amount) = 12"
+    },
+    {
+      "name": "unsupported document sql source assignment wrong alias",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_alias",
+      "classification_reason": "document_sql_write_source_assignment_alias",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = other.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment missing field",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_missing_field",
+      "classification_reason": "document_sql_write_source_assignment_missing_field",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.missing FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment reserved field",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_reserved_field",
+      "classification_reason": "document_sql_write_source_assignment_reserved_field",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source._id FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment type mismatch",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_type_mismatch",
+      "classification_reason": "document_sql_write_source_assignment_type_mismatch",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\",\"x-antfly-column-name\":\"title\"},\"score\":{\"type\":\"numeric\",\"x-antfly-column-name\":\"score\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = source.score FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment generated field",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_generated_field",
+      "classification_reason": "document_sql_write_source_assignment_generated_field",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET status = source.status_lower FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment target reserved field",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_target_reserved_field",
+      "classification_reason": "document_sql_write_source_assignment_target_reserved_field",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET _id = source.title FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment target generated field",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_target_generated_field",
+      "classification_reason": "document_sql_write_source_assignment_target_generated_field",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET status_lower = source.status FROM docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql source assignment ambiguous reference",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_source_assignment_ambiguous_reference",
+      "classification_reason": "document_sql_write_source_assignment_ambiguous_reference",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs AS source SET title = source.title FROM docs AS source WHERE source._id = source._id AND source._id = 'doc:a'"
+    },
+    {
       "name": "document sql projection residual id update",
       "family": "document_write",
       "summary": {
@@ -9855,6 +11395,168 @@
       "sql": "UPDATE docs SET title = 'Launch' WHERE status = 'draft'"
     },
     {
+      "name": "document sql indexed projection in update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE status IN ('draft', 'ready')"
+    },
+    {
+      "name": "document sql indexed projection range update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"amount\":{\"type\":\"numeric\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE amount >= 10"
+    },
+    {
+      "name": "document sql indexed projection boolean update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"enabled\":{\"type\":\"boolean\"}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE enabled IS TRUE"
+    },
+    {
+      "name": "document sql indexed projection nested alias update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"metadata\":{\"type\":\"object\",\"properties\":{\"plan\":{\"type\":\"keyword\",\"x-antfly-column-name\":\"metadata_plan\"}},\"additionalProperties\":false}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE metadata_plan = 'pro'"
+    },
+    {
+      "name": "document sql bounded projection update",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "operations": 1
+      },
+      "plan": "document_write:table=docs:operation=projection_write:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=transform:ops=1",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "UPDATE docs SET title = 'Launch' WHERE category = 'release'"
+    },
+    {
+      "name": "document sql indexed delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "document_write:table=docs:operation=non_identity_delete:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=delete",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE status = 'draft'"
+    },
+    {
+      "name": "document sql indexed null delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "document_write:table=docs:operation=non_identity_delete:producer=indexed_query:producer_filter=1:producer_candidate_rows=10000:template=delete",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE status IS NULL"
+    },
+    {
+      "name": "document sql joined delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=id_lookup:source_producer=id_lookup:join_keys=1:template=delete:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs._id = source._id AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "unsupported document sql joined delete",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs._id = source._id"
+    },
+    {
+      "name": "unsupported document sql joined delete without cardinality proof",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_join_missing_cardinality_proof",
+      "classification_reason": "document_sql_write_join_missing_cardinality_proof",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "document sql joined delete with cardinality proof and indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=delete:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.status = 'draft'"
+    },
+    {
+      "name": "document sql joined bounded target delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=bounded_scan:source_producer=join_key_indexed_lookup:join_keys=1:template=delete:max_target_rows=10000:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs.category = 'release'"
+    },
+    {
+      "name": "document sql joined delete with derived indexed target producer",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=indexed_query:source_producer=join_key_indexed_lookup:join_keys=1:template=delete:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"},\"status_lower\":{\"type\":\"keyword\",\"generated\":{\"op\":\"lower\",\"field\":\"status\"}}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND lower(docs.status) = 'draft'"
+    },
+    {
+      "name": "document sql joined delete with cardinality proof and parameterized source lookup",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs",
+        "join_on": 1
+      },
+      "plan": "document_joined_write:table=docs:source_table=docs:operation=non_identity_delete:target_producer=id_lookup:source_producer=join_key_indexed_lookup:join_keys=1:template=delete:max_target_rows=1:max_source_rows=1:duplicate_source=reject",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"status\":{\"type\":\"keyword\",\"x-antfly-cardinality-proof\":\"unique\"}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs USING docs AS source WHERE docs.status = source.status AND docs._id = 'doc:a'"
+    },
+    {
+      "name": "document sql bounded delete",
+      "family": "document_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "document_write:table=docs:operation=non_identity_delete:producer=bounded_scan:producer_scan_rows=10000:producer_scan_bytes=8388608:producer_residual=1:template=delete",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"},\"category\":{\"type\":\"keyword\",\"x-antfly-index\":false}},\"additionalProperties\":true}}}}",
+      "sql": "DELETE FROM docs WHERE category = 'release'"
+    },
+    {
       "name": "unsupported document sql projection returning",
       "family": "unsupported_write",
       "summary": {
@@ -9866,7 +11568,17 @@
       "sql": "UPDATE docs SET title = 'Launch' WHERE _id = 'doc:a' RETURNING _id, title"
     },
     {
-      "name": "unsupported document sql truncate table",
+      "name": "document sql truncate table",
+      "family": "truncate_source",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "truncate_source:table=docs:source_pred=0:source_order=0:source_limit=-1:claim=locked:returning=0:returning_expr=0:returning_all=0",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "TRUNCATE docs"
+    },
+    {
+      "name": "unsupported document sql truncate multi table",
       "family": "unsupported_write",
       "summary": {
         "table_name": "docs"
@@ -9874,7 +11586,29 @@
       "plan": "unsupported:write:requires=document_sql_write_unsupported",
       "classification_reason": "document_sql_write_unsupported",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
-      "sql": "TRUNCATE docs"
+      "sql": "TRUNCATE docs, docs_archive"
+    },
+    {
+      "name": "unsupported document sql truncate restart identity",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "TRUNCATE docs RESTART IDENTITY"
+    },
+    {
+      "name": "unsupported document sql truncate cascade",
+      "family": "unsupported_write",
+      "summary": {
+        "table_name": "docs"
+      },
+      "plan": "unsupported:write:requires=document_sql_write_unsupported",
+      "classification_reason": "document_sql_write_unsupported",
+      "source_schema_json": "{\"version\":1,\"storage_mode\":\"document\",\"default_type\":\"doc\",\"document_schemas\":{\"doc\":{\"schema\":{\"type\":\"object\",\"properties\":{\"title\":{\"type\":\"text\"}},\"additionalProperties\":true}}}}",
+      "sql": "TRUNCATE docs CASCADE"
     },
     {
       "name": "unsupported document sql merge matched delete",
@@ -9949,6 +11683,69 @@
       "plan": "unsupported:ddl:requires=transform_catalog_plan",
       "classification_reason": "transform_catalog_plan",
       "sql": "DROP TRANSFORM FOR jsonb LANGUAGE plpgsql"
+    },
+    {
+      "name": "unsupported create trigger variant",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_audit AFTER INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create constraint trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE CONSTRAINT TRIGGER usage_audit AFTER INSERT ON usage_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create instead of trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_view_insert INSTEAD OF INSERT ON usage_view FOR EACH ROW EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create truncate trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_truncate BEFORE TRUNCATE ON usage_records EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create update of trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_update BEFORE UPDATE OF status ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create trigger when predicate",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_when BEFORE UPDATE ON usage_records FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM OLD.status) EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create trigger with referencing",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_ref AFTER INSERT ON usage_records REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION audit_usage()"
+    },
+    {
+      "name": "unsupported create trigger arguments",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "CREATE TRIGGER usage_args BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage('audit-context')"
+    },
+    {
+      "name": "unsupported alter trigger",
+      "family": "unsupported_ddl",
+      "plan": "unsupported:ddl:requires=trigger_catalog_plan",
+      "classification_reason": "trigger_catalog_plan",
+      "sql": "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2"
     },
     {
       "name": "unsupported create foreign data wrapper",
@@ -10081,7 +11878,7 @@
       "family": "unsupported_ddl",
       "plan": "unsupported:ddl:requires=text_search_catalog_plan",
       "classification_reason": "text_search_catalog_plan",
-      "sql": "CREATE TEXT SEARCH PARSER usage_parser (START = prsd_start)"
+      "sql": "CREATE TEXT SEARCH PARSER usage_parser (HEADLINE = prsd_headline)"
     },
     {
       "name": "unsupported alter text search parser",
@@ -10281,6 +12078,54 @@
       "family": "read",
       "plan": "read:join:join:type=inner:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5:ctes=1:right_source_cte=1",
       "sql": "SELECT d.id AS doc_id, gm.score AS graph_score FROM usage_records AS d JOIN antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm ON d.id = gm.id WHERE gm.graph_name = 'graph_match' ORDER BY graph_score DESC LIMIT 5"
+    },
+    {
+      "name": "read classifier native graph alias projection",
+      "family": "read",
+      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=0:expr=2:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id, target.key AS target_id ORDER BY target.depth ASC LIMIT 5"
+    },
+    {
+      "name": "unsupported graph match return query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=graph_query_plan",
+      "classification_reason": "graph_query_plan",
+      "sql": "MATCH (doc) RETURN doc"
+    },
+    {
+      "name": "unsupported graph path return query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=graph_query_plan",
+      "classification_reason": "graph_query_plan",
+      "sql": "MATCH (doc)-[:cites]->(target) RETURN target"
+    },
+    {
+      "name": "unsupported graph incoming path return query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=graph_query_plan",
+      "classification_reason": "graph_query_plan",
+      "sql": "MATCH (target)<-[:cites]-(doc) RETURN target"
+    },
+    {
+      "name": "unsupported graph multi return query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=graph_query_plan",
+      "classification_reason": "graph_query_plan",
+      "sql": "MATCH (doc)-[:cites]->(target) RETURN doc, target"
+    },
+    {
+      "name": "unsupported graph filtered return query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=graph_query_plan",
+      "classification_reason": "graph_query_plan",
+      "sql": "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published' RETURN target"
+    },
+    {
+      "name": "unsupported graph ordered limited return query",
+      "family": "unsupported",
+      "plan": "unsupported:query:requires=graph_query_plan",
+      "classification_reason": "graph_query_plan",
+      "sql": "MATCH (doc)-[:cites]->(target) RETURN doc, target ORDER BY target.rank DESC LIMIT 5"
     },
     {
       "name": "read classifier catalog-backed equality join",
@@ -10926,6 +12771,171 @@
       "sql": "WITH open_usage AS (SELECT id, status, created_at FROM usage_records WHERE status = 'open') SELECT id FROM open_usage WHERE lower(status) IS NOT DISTINCT FROM 'open' ORDER BY created_at DESC LIMIT 5"
     },
     {
+      "name": "read cte body join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=1:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "WITH joined_rows AS (SELECT o.id, o.created_at FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order') SELECT id FROM joined_rows ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "read cte body multi join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:query:query:table=usage_records:ctes=2:source_cte=1:pred=0:array_any=0:expr_pred=0:expr_or=0:expr_not=0:expr_array=0:json_eq=0:or=0:not=0:select=1:expr=0:alias=0:order=1:order_expr=0:limit=5:claim=none",
+      "sql": "WITH joined_rows AS (SELECT o.id, o.created_at FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id JOIN usage_records AS t ON c.tenant_id = t.id WHERE o.kind = 'order') SELECT id FROM joined_rows ORDER BY created_at DESC LIMIT 5"
+    },
+    {
+      "name": "read top level multi join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:join:join:type=inner:left=usage_records:right=usage_records:left_pred=0:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=1:order=2:order_expr=2:limit=5:ctes=1:left_source_cte=1",
+      "sql": "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id JOIN usage_records AS s ON c.tenant_id = s.id ORDER BY (order_id) DESC NULLS LAST LIMIT 5"
+    },
+    {
+      "name": "read full outer join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:join:join:type=full:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.id AS customer_id FROM usage_records AS o FULL OUTER JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
+      "name": "read full join",
+      "family": "read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "read:join:join:type=full:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.id AS customer_id FROM usage_records AS o FULL JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
+      "name": "read scalar subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_scalar_plan",
+      "classification_reason": "subquery_scalar_plan",
+      "sql": "SELECT id FROM usage_records WHERE status = (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read scalar subquery projection",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_expression_plan",
+      "classification_reason": "subquery_expression_plan",
+      "sql": "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS first_status FROM usage_records"
+    },
+    {
+      "name": "read exists subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "SELECT id FROM usage_records WHERE EXISTS (SELECT 1 FROM usage_records WHERE enabled IS TRUE)"
+    },
+    {
+      "name": "read not exists subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "SELECT id FROM usage_records WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE enabled IS TRUE)"
+    },
+    {
+      "name": "read in subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read not in subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "SELECT id FROM usage_records WHERE status NOT IN (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read quantified subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_quantified_plan",
+      "classification_reason": "subquery_quantified_plan",
+      "sql": "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read like any subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_quantified_plan",
+      "classification_reason": "subquery_quantified_plan",
+      "sql": "SELECT id FROM usage_records WHERE status LIKE ANY (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read not ilike all subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_quantified_plan",
+      "classification_reason": "subquery_quantified_plan",
+      "sql": "SELECT id FROM usage_records WHERE status NOT ILIKE ALL (SELECT status FROM usage_records)"
+    },
+    {
+      "name": "read correlated subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.customer_id = outer_usage.customer_id)"
+    },
+    {
+      "name": "read nested subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records WHERE customer_id IN (SELECT customer_id FROM usage_records WHERE enabled IS TRUE))"
+    },
+    {
+      "name": "read cte contained subquery predicate",
+      "family": "unsupported_read",
+      "summary": {
+        "table_name": "usage_records"
+      },
+      "plan": "unsupported:read:requires=subquery_semijoin_plan",
+      "classification_reason": "subquery_semijoin_plan",
+      "sql": "WITH open_usage AS (SELECT id, status FROM usage_records WHERE status = 'open') SELECT id FROM usage_records WHERE status IN (SELECT status FROM open_usage)"
+    },
+    {
       "name": "equality join",
       "family": "join",
       "summary": {
@@ -10941,6 +12951,20 @@
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
     },
     {
+      "name": "right equality join",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 2,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 1,
+        "join_select": 2
+      },
+      "plan": "join:type=left:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
       "name": "inner equality join",
       "family": "join",
       "summary": {
@@ -10953,6 +12977,34 @@
       },
       "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o INNER JOIN usage_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
+      "name": "cross join",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 0,
+        "join_select": 2
+      },
+      "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=0:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o CROSS JOIN usage_records AS c WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
+    },
+    {
+      "name": "join using column",
+      "family": "join",
+      "summary": {
+        "table_name": "usage_records",
+        "predicates": 1,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 1,
+        "join_select": 2
+      },
+      "plan": "join:type=inner:left=usage_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=0:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=1:select=2:order=1:order_expr=0:limit=5",
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o JOIN usage_records AS c USING (tenant_id) WHERE o.kind = 'order' ORDER BY order_id ASC LIMIT 5"
     },
     {
       "name": "natural equality join",
@@ -11037,6 +13089,21 @@
       "plan": "join:type=left:left=usage_records:right=customer_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=3:order=2:order_expr=0:limit=5:offset=4",
       "source_schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}",
       "sql": "SELECT o.id AS order_id, c.name AS customer_name, o.amount AS amount FROM usage_records AS o LEFT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY 3 DESC NULLS FIRST LIMIT 5 OFFSET 4"
+    },
+    {
+      "name": "catalog-backed right equality join",
+      "family": "join",
+      "summary": {
+        "table_name": "customer_records",
+        "predicates": 2,
+        "order_by": 1,
+        "limit": 5,
+        "join_on": 2,
+        "join_select": 2
+      },
+      "plan": "join:type=left:left=customer_records:right=usage_records:left_pred=1:left_array_any=0:left_expr_pred=0:left_expr_or=0:left_expr_not=0:left_expr_array=0:left_json_eq=0:left_text=0:right_pred=1:right_array_any=0:right_expr_pred=0:right_expr_or=0:right_expr_not=0:right_expr_array=0:right_json_eq=0:right_text=0:on=2:select=2:order=1:order_expr=0:limit=5",
+      "catalog_tables": [{"name": "usage_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"customer_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"status\":{\"type\":\"keyword\"},\"amount\":{\"type\":\"numeric\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}, {"name": "customer_records", "schema_json": "{\"version\":1,\"storage_mode\":\"relational\",\"default_type\":\"row\",\"enforce_types\":true,\"document_schemas\":{\"row\":{\"schema\":{\"type\":\"object\",\"properties\":{\"id\":{\"type\":\"keyword\"},\"tenant_id\":{\"type\":\"keyword\"},\"kind\":{\"type\":\"keyword\"},\"name\":{\"type\":\"keyword\"}},\"required\":[\"id\"],\"additionalProperties\":false}}},\"primary_key\":{\"columns\":[\"id\"]}}"}],
+      "sql": "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN customer_records AS c ON o.tenant_id = c.tenant_id AND o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer' ORDER BY order_id ASC LIMIT 5"
     },
     {
       "name": "schema-qualified equality join",

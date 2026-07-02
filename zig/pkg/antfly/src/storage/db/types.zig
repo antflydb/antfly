@@ -1034,6 +1034,40 @@ pub const RelationalRowsInPredicate = struct {
     collation: ?[]const u8 = null,
 };
 
+pub const RelationalRowsSubqueryPredicateKind = enum {
+    exists,
+    scalar,
+    in,
+    quantified,
+};
+
+pub const RelationalRowsSubqueryQuantifier = enum {
+    any,
+    all,
+};
+
+pub const RelationalRowsSubqueryPredicateOp = enum {
+    eq,
+    ne,
+    gt,
+    gte,
+    lt,
+    lte,
+    like,
+    ilike,
+};
+
+pub const RelationalRowsSubqueryPredicate = struct {
+    kind: RelationalRowsSubqueryPredicateKind,
+    lhs: ?RelationalRowsExpression = null,
+    op: RelationalRowsSubqueryPredicateOp = .eq,
+    negated: bool = false,
+    quantifier: ?RelationalRowsSubqueryQuantifier = null,
+    query: RelationalRowsQueryRequest = .{},
+    output_field: []const u8 = "",
+    collation: ?[]const u8 = null,
+};
+
 pub const RelationalRowsJsonContainsPredicate = struct {
     field: []const u8,
     value_json: []const u8,
@@ -1118,6 +1152,14 @@ fn freeRelationalRowsRequestPredicate(alloc: Allocator, predicate: schema_mod.Re
     if (predicate.value_json) |value_json| alloc.free(value_json);
     if (predicate.collation) |collation| alloc.free(collation);
     if (predicate.expression) |expression| freeRelationalRowsExpressionCondition(alloc, expression);
+}
+
+fn freeRelationalRowsSubqueryPredicate(alloc: Allocator, predicate: RelationalRowsSubqueryPredicate) void {
+    if (predicate.lhs) |lhs| freeRelationalRowsExpression(alloc, lhs);
+    var query = predicate.query;
+    query.deinit(alloc);
+    if (predicate.output_field.len > 0) alloc.free(predicate.output_field);
+    if (predicate.collation) |collation| alloc.free(collation);
 }
 
 fn freeRelationalRowsQueryOrder(alloc: Allocator, order: RelationalRowsQueryOrder) void {
@@ -1226,6 +1268,7 @@ pub const RelationalRowsQueryRequest = struct {
     expression_or_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     expression_not_predicates: []const RelationalRowsExpressionPredicateGroup = &.{},
     expression_array_contains: []const RelationalRowsExpressionArrayContainsPredicate = &.{},
+    subquery_predicates: []const RelationalRowsSubqueryPredicate = &.{},
     select: []const []const u8 = &.{},
     json_extract: []const RelationalRowsJsonExtractProjection = &.{},
     array_length: []const RelationalRowsArrayLengthProjection = &.{},
@@ -1318,6 +1361,8 @@ pub const RelationalRowsQueryRequest = struct {
             alloc.free(predicate.value_json);
         }
         if (self.expression_array_contains.len > 0) alloc.free(self.expression_array_contains);
+        for (self.subquery_predicates) |predicate| freeRelationalRowsSubqueryPredicate(alloc, predicate);
+        if (self.subquery_predicates.len > 0) alloc.free(self.subquery_predicates);
         for (self.select) |field| alloc.free(field);
         if (self.select.len > 0) alloc.free(self.select);
         for (self.distinct_on) |field| alloc.free(field);
@@ -1439,7 +1484,11 @@ fn freeRelationalRowsOnConflict(alloc: Allocator, conflict: RelationalRowsOnConf
 
 pub const RelationalRowsCte = struct {
     name: []const u8,
+    left_table: []const u8 = "",
+    right_table: []const u8 = "",
     query: RelationalRowsQueryRequest = .{},
+    join: ?RelationalRowsJoinRequest = null,
+    lateral: ?RelationalRowsLateralRequest = null,
     table_function: ?RelationalRowsTableFunction = null,
     max_rows: ?u32 = null,
     max_bytes: ?u64 = null,
@@ -1447,7 +1496,11 @@ pub const RelationalRowsCte = struct {
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(self.name);
+        if (self.left_table.len > 0) alloc.free(@constCast(self.left_table));
+        if (self.right_table.len > 0) alloc.free(@constCast(self.right_table));
         self.query.deinit(alloc);
+        if (self.join) |*join| join.deinit(alloc);
+        if (self.lateral) |*lateral| lateral.deinit(alloc);
         if (self.table_function) |*table_function| table_function.deinit(alloc);
         self.* = undefined;
     }
@@ -1477,11 +1530,26 @@ pub const RelationalRowsTableFunction = union(RelationalRowsTableFunctionKind) {
 pub const RelationalRowsGraphTableFunction = struct {
     table_name: []const u8,
     query: NamedGraphQuery,
+    alias_projections: []const RelationalRowsGraphAliasProjection = &.{},
 
     pub fn deinit(self: *@This(), alloc: Allocator) void {
         alloc.free(@constCast(self.table_name));
         freeNamedGraphQuery(alloc, &self.query);
+        for (self.alias_projections) |projection| projection.deinit(alloc);
+        if (self.alias_projections.len > 0) alloc.free(self.alias_projections);
         self.* = undefined;
+    }
+};
+
+pub const RelationalRowsGraphAliasProjection = struct {
+    alias: []const u8,
+    field: []const u8,
+    output: []const u8,
+
+    pub fn deinit(self: @This(), alloc: Allocator) void {
+        alloc.free(@constCast(self.alias));
+        alloc.free(@constCast(self.field));
+        alloc.free(@constCast(self.output));
     }
 };
 
@@ -2266,6 +2334,7 @@ pub const RelationalRowsAggregateResult = struct {
 pub const RelationalRowsJoinType = enum {
     inner,
     left,
+    full,
 };
 
 pub const RelationalRowsJoinStrategy = enum {
@@ -2395,8 +2464,8 @@ pub fn relationalRowsSelectJoinStrategy(
     const selected: RelationalRowsJoinStrategy = switch (req.strategy) {
         .lookup => .lookup,
         .hash => .hash,
-        .merge => if (inputs_sorted_on_join_keys) .merge else return null,
-        .auto => if (inputs_sorted_on_join_keys and left_rows > default_relational_rows_lookup_join_max_build_rows and right_rows > default_relational_rows_lookup_join_max_build_rows)
+        .merge => if (req.join_type != .full and inputs_sorted_on_join_keys) .merge else return null,
+        .auto => if (req.join_type != .full and inputs_sorted_on_join_keys and left_rows > default_relational_rows_lookup_join_max_build_rows and right_rows > default_relational_rows_lookup_join_max_build_rows)
             .merge
         else if (right_rows <= default_relational_rows_lookup_join_max_build_rows)
             .lookup
@@ -2495,6 +2564,28 @@ test "relational rows join sorted input proof requires leading ascending join ke
         .on = join_on[0..],
     };
     try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(descending));
+
+    const expression_left_order = [_]RelationalRowsQueryOrder{.{
+        .field = "customer_id",
+        .expression = .{ .kind = .field, .field = "customer_id" },
+    }};
+    const expression_order = RelationalRowsJoinRequest{
+        .left = .{ .order_by = expression_left_order[0..] },
+        .right = .{ .order_by = right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(expression_order));
+
+    const null_test_left_order = [_]RelationalRowsQueryOrder{.{
+        .field = "customer_id",
+        .null_test = .is_not_null,
+    }};
+    const null_test_order = RelationalRowsJoinRequest{
+        .left = .{ .order_by = null_test_left_order[0..] },
+        .right = .{ .order_by = right_order[0..] },
+        .on = join_on[0..],
+    };
+    try std.testing.expect(!relationalRowsJoinInputsSortedOnJoinKeys(null_test_order));
 }
 
 pub const RelationalRowsJoinedMutationSourceRequest = struct {

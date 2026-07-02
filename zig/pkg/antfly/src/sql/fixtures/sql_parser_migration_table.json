@@ -5,6 +5,9 @@
       "family": "backups",
       "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_gated_unsupported",
+      "retained_ast_corruption_test": "tokenized parsed sql retained AST corruption rejects generated unsupported DDL",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Add raw generated-AST fixtures, binder/lowering diagnostics, and API parity for BACKUP/RESTORE before deleting token-tail fallback."
     },
@@ -12,6 +15,9 @@
       "family": "ddl",
       "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "entrypoints": ["durable_executor", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter ddl plan rejects stale generated DDL AST metadata before logical planning",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Every supported DDL subfamily has raw generated-AST fixtures, generated-AST-to-plan parity, app-parity corpus coverage, and stale-AST fail-closed tests."
     },
@@ -19,6 +25,9 @@
       "family": "dml",
       "compatibility_entry_point": "lower_dml token parser paths without generated_dml_ast options",
       "generated_ast_entry_point": "tokenized.ParsedSql.writeStatementKindIncludingGeneratedAst plus lower_dml generated_dml_ast parser options",
+      "entrypoints": ["durable_executor", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter DML lowerer rejects missing and malformed retained generated AST metadata",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "INSERT, UPDATE, DELETE, TRUNCATE, MERGE, and mutation-source writes have raw generated-AST fixtures, binder/lowering parity, runtime parity, and stale-AST diagnostics."
     },
@@ -26,6 +35,9 @@
       "family": "extensions",
       "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "entrypoints": ["http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter ddl plan rejects stale generated extension AST metadata before logical planning",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Extension DDL and extension-index DDL have generated-AST coverage, unsupported-shape diagnostics, and native/API parity."
     },
@@ -33,6 +45,9 @@
       "family": "functions",
       "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "entrypoints": ["http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter ddl plan rejects stale generated routine and type-system AST metadata",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Function, procedure, trigger, aggregate, operator, and cast catalog plans have generated-AST fixtures, binder/lowering parity, and stable unsupported diagnostics."
     },
@@ -40,6 +55,9 @@
       "family": "lakes",
       "compatibility_entry_point": "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst",
       "generated_ast_entry_point": "generated_parser.GeneratedSqlReadAst",
+      "entrypoints": ["binder", "document_sql", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter parsed sql rejects malformed generated graph and antfly source metadata",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "External lake reads and query functions have raw generated-read fixtures, bound source parity, runtime parity, and explicit unsupported diagnostics."
     },
@@ -47,6 +65,9 @@
       "family": "maintenance",
       "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "entrypoints": ["http", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_gated_unsupported",
+      "retained_ast_corruption_test": "sql adapter logical ddl plan rejects generated unsupported maintenance before legacy reparsing",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "VACUUM, ANALYZE, REINDEX, CLUSTER, cursor, prepared statement, and transaction maintenance commands have generated-AST fixtures and app-parity coverage."
     },
@@ -54,6 +75,9 @@
       "family": "query",
       "compatibility_entry_point": "tokenized.ParsedSql.readStatementKindIncludingGeneratedAst",
       "generated_ast_entry_point": "generated_parser.GeneratedSqlReadAst",
+      "entrypoints": ["binder", "document_sql", "durable_executor", "http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter parsed sql rejects malformed generated classification payloads",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Query, aggregate, join, lateral, window, recursive CTE, and set-operation plans have raw generated-read fixtures, binder/lowering parity, runtime parity, and stale-AST diagnostics."
     },
@@ -61,6 +85,9 @@
       "family": "roles",
       "compatibility_entry_point": "ddl_plan.parseLogicalDdlPlanTokensAlloc",
       "generated_ast_entry_point": "ddl_plan.planGeneratedLogicalDdlAstAlloc",
+      "entrypoints": ["http", "lite", "pgwire", "sql_adapter", "tokenized"],
+      "parser_status": "generated_owned",
+      "retained_ast_corruption_test": "sql adapter generated utility unsupported AST rejects stale role privilege and policy metadata",
       "coverage_file": "zig/pkg/antfly/src/sql/fixtures/sql_api_parity_source_corpus.json",
       "removal_gate": "Role, privilege, row-security, schema-namespace, and session-setting commands have generated-AST fixtures, native/API parity, and explicit no-op or unsupported classifications."
     }

@@ -408,6 +408,34 @@ pub fn lowerDocumentMutationProducerFromWhereAlloc(
     };
 }
 
+pub fn lowerDocumentMutationBoundedScanProducerFromClauseAlloc(
+    alloc: std.mem.Allocator,
+    clause_tokens: []const Token,
+    schema: runtime_schema.TableSchema,
+    table_name: []const u8,
+    alias: []const u8,
+    bounded_scan_policy: source_binding.BoundedScanPolicy,
+) !DocumentProducer {
+    if (schema.storage_mode != .document) return error.InvalidSqlCatalog;
+    if (clause_tokens.len == 0) return error.UnsupportedSqlShape;
+    const source_ref = DocumentSourceRef{
+        .table_name = table_name,
+        .alias = if (std.ascii.eqlIgnoreCase(table_name, alias)) null else alias,
+    };
+    const residual_filter_json = (try parseScalarFilterClauseWithIndexRequirementAlloc(
+        alloc,
+        clause_tokens,
+        schema,
+        .{},
+        source_ref,
+        false,
+    )) orelse return error.UnsupportedSqlShape;
+    errdefer alloc.free(@constCast(residual_filter_json));
+    var scan = try boundedDocumentScanFromPolicy(bounded_scan_policy);
+    scan.residual_filter_json = residual_filter_json;
+    return .{ .bounded_scan = scan };
+}
+
 pub const DocumentReadPlan = struct {
     table_name: []const u8,
     view_mapping: ?DocumentReadViewMapping = null,
@@ -3729,8 +3757,25 @@ fn buildConjunctiveFilterJsonAlloc(alloc: std.mem.Allocator, clauses: []const []
 
 fn documentFilterPathAlloc(alloc: std.mem.Allocator, path: []const u8) ![]u8 {
     if (path.len == 0) return error.InvalidSqlCatalog;
-    if (path[0] == '/') return try alloc.dupe(u8, path);
-    return try std.fmt.allocPrint(alloc, "/{s}", .{path});
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.append(alloc, '/');
+    var pos: usize = if (path[0] == '/') 1 else 0;
+    if (pos >= path.len) return error.InvalidSqlCatalog;
+    var previous_was_separator = false;
+    while (pos < path.len) : (pos += 1) {
+        const c = path[pos];
+        if (c == '/' or c == '.') {
+            if (previous_was_separator) return error.InvalidSqlCatalog;
+            previous_was_separator = true;
+            try out.append(alloc, '/');
+            continue;
+        }
+        previous_was_separator = false;
+        try out.append(alloc, c);
+    }
+    if (previous_was_separator) return error.InvalidSqlCatalog;
+    return try out.toOwnedSlice(alloc);
 }
 
 fn parseLimit(tokens: []const Token, limit_index: usize) !u32 {

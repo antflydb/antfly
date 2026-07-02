@@ -651,6 +651,19 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         } else if (lowered.right.system_time_as_of_timestamp_ns != null) {
             return error.UnsupportedRowsQuery;
         }
+        if (lowered.ctes.len != 0) {
+            return try executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
+                alloc,
+                source,
+                catalog,
+                default_table_name,
+                default_schema,
+                left_schema,
+                lowered,
+                operation,
+                consistency,
+            );
+        }
         return try source.rowsSetOperationPlanCatalog(alloc, target, left_schema, .{
             .operation = operation,
             .ctes = lowered.ctes,
@@ -715,6 +728,19 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         }, left.rows, right.rows);
     }
     if (lowered.right.system_time_as_of_sequence != null or lowered.right.system_time_as_of_timestamp_ns != null) return error.UnsupportedRowsQuery;
+    if (lowered.ctes.len != 0) {
+        return try executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
+            alloc,
+            source,
+            catalog,
+            default_table_name,
+            default_schema,
+            left_schema,
+            lowered,
+            operation,
+            consistency,
+        );
+    }
 
     var left = (try source.rowsQueryPlanCatalog(alloc, left_target, left_schema, left_plan, consistency)) orelse return null;
     defer left.deinit(alloc);
@@ -731,6 +757,131 @@ fn executeLoweredSqlSetOperationPlanAlloc(
         .max_bytes = lowered.max_bytes,
         .spill_after_bytes = lowered.spill_after_bytes,
     }, left.rows, right.rows);
+}
+
+fn executeLoweredSqlSetOperationPlanWithRoutedCtesAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    left_schema: storage_schema.TableSchema,
+    lowered: sql_adapter.LoweredSetOperationPlan,
+    operation: db_mod.types.RelationalRowsSetOperation,
+    consistency: raft_mod.ReadConsistency,
+) !?db_mod.types.RelationalRowsQueryResult {
+    if (lowered.left.system_time_as_of_sequence != null or
+        lowered.left.system_time_as_of_timestamp_ns != null or
+        lowered.right.system_time_as_of_sequence != null or
+        lowered.right.system_time_as_of_timestamp_ns != null)
+    {
+        return error.UnsupportedRowsQuery;
+    }
+    if (lowered.left.plan.ctes.len != 0 or lowered.right.plan.ctes.len != 0) return error.InvalidRowsRequest;
+    if (!scanPayloadCanStripSyntheticKey(left_schema)) return error.UnsupportedRowsQuery;
+
+    var base_rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, lowered.left.table_name, left_schema, &.{}, consistency)) orelse return null;
+    defer base_rows.deinit(alloc);
+
+    var cte_sources = std.ArrayListUnmanaged(relational_rows_api.RowsCteJsonSource).empty;
+    defer cte_sources.deinit(alloc);
+    try cte_sources.append(alloc, .{
+        .table_name = lowered.left.table_name,
+        .schema = left_schema,
+        .rows = base_rows.rows,
+    });
+
+    var owned_schemas = std.ArrayListUnmanaged(storage_schema.TableSchema).empty;
+    defer {
+        for (owned_schemas.items) |schema| storage_schema.freeSchema(alloc, schema);
+        owned_schemas.deinit(alloc);
+    }
+    var source_rows = std.ArrayListUnmanaged(RoutedRows).empty;
+    defer {
+        for (source_rows.items) |*rows| rows.deinit(alloc);
+        source_rows.deinit(alloc);
+    }
+
+    for (lowered.ctes) |cte| {
+        try appendRoutedSetOperationCteSourceIfNeededAlloc(
+            alloc,
+            source,
+            catalog,
+            default_table_name,
+            default_schema,
+            cte.left_table,
+            consistency,
+            &owned_schemas,
+            &source_rows,
+            &cte_sources,
+        );
+        try appendRoutedSetOperationCteSourceIfNeededAlloc(
+            alloc,
+            source,
+            catalog,
+            default_table_name,
+            default_schema,
+            cte.right_table,
+            consistency,
+            &owned_schemas,
+            &source_rows,
+            &cte_sources,
+        );
+    }
+
+    return try relational_rows_api.executeRowsSetOperationPlanOnJsonRowsWithSourcesAlloc(alloc, left_schema, .{
+        .operation = operation,
+        .ctes = lowered.ctes,
+        .left = lowered.left.plan,
+        .right = lowered.right.plan,
+        .order_by = lowered.order_by,
+        .limit = lowered.limit,
+        .offset = lowered.offset,
+        .max_rows = lowered.max_rows,
+        .max_bytes = lowered.max_bytes,
+        .spill_after_bytes = lowered.spill_after_bytes,
+    }, base_rows.rows, cte_sources.items);
+}
+
+fn appendRoutedSetOperationCteSourceIfNeededAlloc(
+    alloc: std.mem.Allocator,
+    source: core.TableReadSource,
+    catalog: table_catalog.CatalogSource,
+    default_table_name: []const u8,
+    default_schema: storage_schema.TableSchema,
+    table_name: []const u8,
+    consistency: raft_mod.ReadConsistency,
+    owned_schemas: *std.ArrayListUnmanaged(storage_schema.TableSchema),
+    source_rows: *std.ArrayListUnmanaged(RoutedRows),
+    cte_sources: *std.ArrayListUnmanaged(relational_rows_api.RowsCteJsonSource),
+) !void {
+    if (table_name.len == 0) return;
+    for (cte_sources.items) |cte_source| {
+        if (std.mem.eql(u8, cte_source.table_name, table_name)) return;
+    }
+
+    const owned_schema = try catalogRuntimeSchemaUnlessDefaultAlloc(alloc, catalog, default_table_name, table_name);
+    var owned_schema_transferred = false;
+    errdefer if (!owned_schema_transferred) {
+        if (owned_schema) |schema| storage_schema.freeSchema(alloc, schema);
+    };
+    const runtime_schema = owned_schema orelse default_schema;
+    if (!scanPayloadCanStripSyntheticKey(runtime_schema)) return error.UnsupportedRowsQuery;
+
+    var rows = (try collectStableRowsFromRoutedScansAlloc(alloc, source, table_name, runtime_schema, &.{}, consistency)) orelse return error.TableNotFound;
+    errdefer rows.deinit(alloc);
+
+    if (owned_schema) |schema| {
+        try owned_schemas.append(alloc, schema);
+        owned_schema_transferred = true;
+    }
+    try source_rows.append(alloc, rows);
+    rows = undefined;
+    try cte_sources.append(alloc, .{
+        .table_name = table_name,
+        .schema = runtime_schema,
+        .rows = source_rows.items[source_rows.items.len - 1].rows,
+    });
 }
 
 test "lowered sql insert source plans build batches from routed scans" {
@@ -6435,6 +6586,309 @@ test "lowered sql set operation plans route cross table branches through catalog
             try std.testing.expectEqual(@as(u32, 1), query_result.total);
             try std.testing.expectEqual(@as(usize, 1), query_result.rows.len);
             try std.testing.expectEqualStrings("{\"id\":\"u2\"}", query_result.rows[0]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+}
+
+test "lowered sql set operation RHS multi-join CTEs route incompatible side schemas" {
+    const alloc = std.testing.allocator;
+    const usage_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"status":{"type":"keyword"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const archived_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"tenant_ref":{"type":"keyword"},"archived":{"type":"boolean"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const tenant_schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"tenant_ref":{"type":"keyword"},"active":{"type":"boolean"}},"required":["tenant_ref"],"additionalProperties":false}}},"primary_key":{"columns":["tenant_ref"]}}
+    ;
+
+    var parsed_usage = try schema_api.parseValidatedTableSchema(alloc, usage_schema_json);
+    defer parsed_usage.deinit(alloc);
+    const usage_schema = try schema_api.deriveRuntimeTableSchema(alloc, parsed_usage);
+    defer storage_schema.freeSchema(alloc, usage_schema);
+
+    const FakeCatalog = struct {
+        tables: [3]metadata_table_manager.TableRecord = .{
+            .{ .table_id = 41, .name = "usage_records", .schema_json = usage_schema_json, .placement_role = "data" },
+            .{ .table_id = 42, .name = "archived_records", .schema_json = archived_schema_json, .placement_role = "data" },
+            .{ .table_id = 43, .name = "tenant_records", .schema_json = tenant_schema_json, .placement_role = "data" },
+        },
+
+        fn iface(self: *@This()) table_catalog.CatalogSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .admin_snapshot = adminSnapshot,
+                    .free_admin_snapshot = freeAdminSnapshot,
+                },
+            };
+        }
+
+        fn adminSnapshot(ptr: *anyopaque) !metadata_api.AdminSnapshot {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            return .{
+                .status = .{ .metadata_group_id = 1, .metrics = .{} },
+                .tables = self.tables[0..],
+                .ranges = @constCast((&[_]metadata_table_manager.RangeRecord{})[0..]),
+                .stores = @constCast((&[_]metadata_table_manager.StoreRecord{})[0..]),
+                .placement_intents = @constCast((&[_]raft_reconciler.PlacementIntent{})[0..]),
+                .split_transitions = @constCast((&[_]metadata_transition_state.SplitTransitionRecord{})[0..]),
+                .merge_transitions = @constCast((&[_]metadata_transition_state.MergeTransitionRecord{})[0..]),
+            };
+        }
+
+        fn freeAdminSnapshot(_: *anyopaque, _: *metadata_api.AdminSnapshot) void {}
+    };
+
+    const FakeSource = struct {
+        usage_scans: usize = 0,
+        archived_scans: usize = 0,
+        tenant_scans: usize = 0,
+
+        fn source(self: *@This()) TableReadSource {
+            return .{
+                .ptr = self,
+                .vtable = &.{
+                    .lookup = lookup,
+                    .scan = scan,
+                    .query = query,
+                },
+            };
+        }
+
+        fn lookup(
+            _: *anyopaque,
+            lookup_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            key: []const u8,
+            _: db_mod.types.LookupOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?LookupResponse {
+            const json = if (std.mem.eql(u8, table_name, "usage_records"))
+                if (std.mem.eql(u8, key, "u1"))
+                    "{\"id\":\"u1\",\"status\":\"open\"}"
+                else if (std.mem.eql(u8, key, "u2"))
+                    "{\"id\":\"u2\",\"status\":\"closed\"}"
+                else if (std.mem.eql(u8, key, "u3"))
+                    "{\"id\":\"u3\",\"status\":\"open\"}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "archived_records"))
+                if (std.mem.eql(u8, key, "u2"))
+                    "{\"id\":\"u2\",\"tenant_ref\":\"t1\",\"archived\":true}"
+                else if (std.mem.eql(u8, key, "u4"))
+                    "{\"id\":\"u4\",\"tenant_ref\":\"t2\",\"archived\":true}"
+                else
+                    return null
+            else if (std.mem.eql(u8, table_name, "tenant_records"))
+                if (std.mem.eql(u8, key, "t1"))
+                    "{\"tenant_ref\":\"t1\",\"active\":true}"
+                else if (std.mem.eql(u8, key, "t2"))
+                    "{\"tenant_ref\":\"t2\",\"active\":false}"
+                else
+                    return null
+            else
+                return error.TableNotFound;
+            return .{ .json = try lookup_alloc.dupe(u8, json), .version = 1 };
+        }
+
+        fn query(
+            _: *anyopaque,
+            _: std.mem.Allocator,
+            _: []const u8,
+            _: db_mod.types.SearchRequest,
+            _: raft_mod.ReadConsistency,
+        ) !?query_api.QueryResponse {
+            return null;
+        }
+
+        fn scan(
+            ptr: *anyopaque,
+            scan_alloc: std.mem.Allocator,
+            table_name: []const u8,
+            from_key: []const u8,
+            to_key: []const u8,
+            opts: db_mod.types.ScanOptions,
+            _: raft_mod.ReadConsistency,
+        ) !?ScanResponse {
+            const self: *@This() = @ptrCast(@alignCast(ptr));
+            try std.testing.expect(opts.include_documents);
+            try std.testing.expect(opts.include_all_fields);
+            try std.testing.expectEqualStrings("", from_key);
+            try std.testing.expectEqualStrings("", to_key);
+            if (std.mem.eql(u8, table_name, "usage_records")) {
+                self.usage_scans += 1;
+                return .{ .ndjson = try scan_alloc.dupe(
+                    u8,
+                    "{\"key\":\"u1\",\"version\":1,\"id\":\"u1\",\"status\":\"open\"}\n" ++
+                        "{\"key\":\"u2\",\"version\":1,\"id\":\"u2\",\"status\":\"closed\"}\n" ++
+                        "{\"key\":\"u3\",\"version\":1,\"id\":\"u3\",\"status\":\"open\"}\n",
+                ) };
+            }
+            if (std.mem.eql(u8, table_name, "archived_records")) {
+                self.archived_scans += 1;
+                return .{ .ndjson = try scan_alloc.dupe(
+                    u8,
+                    "{\"key\":\"u2\",\"version\":1,\"id\":\"u2\",\"tenant_ref\":\"t1\",\"archived\":true}\n" ++
+                        "{\"key\":\"u4\",\"version\":1,\"id\":\"u4\",\"tenant_ref\":\"t2\",\"archived\":true}\n",
+                ) };
+            }
+            if (std.mem.eql(u8, table_name, "tenant_records")) {
+                self.tenant_scans += 1;
+                return .{ .ndjson = try scan_alloc.dupe(
+                    u8,
+                    "{\"key\":\"t1\",\"version\":1,\"tenant_ref\":\"t1\",\"active\":true}\n" ++
+                        "{\"key\":\"t2\",\"version\":1,\"tenant_ref\":\"t2\",\"active\":false}\n",
+                ) };
+            }
+            return error.TableNotFound;
+        }
+    };
+
+    const left_predicates = [_]storage_schema.RelationalCheck{.{
+        .name = "usage_records_status_eq",
+        .field = "status",
+        .op = .eq,
+        .value_json = "\"open\"",
+    }};
+    const left_select = [_][]const u8{"id"};
+    const cte0_on = [_]db_mod.types.RelationalRowsJoinOn{.{ .left_field = "id", .right_field = "id" }};
+    const cte0_select = [_]db_mod.types.RelationalRowsJoinProjection{.{
+        .output = "a_tenant_ref",
+        .side = .right,
+        .field = "tenant_ref",
+    }};
+    const cte1_on = [_]db_mod.types.RelationalRowsJoinOn{.{ .left_field = "a_tenant_ref", .right_field = "tenant_ref" }};
+    const cte1_select = [_]db_mod.types.RelationalRowsJoinProjection{.{
+        .output = "id",
+        .side = .right,
+        .field = "tenant_ref",
+    }};
+    const ctes = [_]db_mod.types.RelationalRowsCte{
+        .{
+            .name = "__antfly_read_join_0",
+            .left_table = "usage_records",
+            .right_table = "archived_records",
+            .join = .{
+                .left = .{ .select_all = true },
+                .right = .{ .select_all = true },
+                .on = cte0_on[0..],
+                .select = cte0_select[0..],
+            },
+        },
+        .{
+            .name = "__antfly_set_right_join_1",
+            .left_table = "usage_records",
+            .right_table = "tenant_records",
+            .join = .{
+                .left = .{ .source_cte = "__antfly_read_join_0", .select_all = true },
+                .right = .{ .select_all = true },
+                .on = cte1_on[0..],
+                .select = cte1_select[0..],
+            },
+        },
+    };
+    const lowered = sql_adapter.LoweredReadPlan{ .set_operation = .{
+        .operation = .union_all,
+        .ctes = ctes[0..],
+        .left = .{
+            .table_name = "usage_records",
+            .plan = .{ .query = .{
+                .predicates = left_predicates[0..],
+                .select = left_select[0..],
+                .select_all = false,
+            } },
+        },
+        .right = .{
+            .table_name = "tenant_records",
+            .plan = .{ .query = .{
+                .source_cte = "__antfly_set_right_join_1",
+                .select_all = true,
+            } },
+        },
+    } };
+    switch (lowered) {
+        .set_operation => |set_operation| {
+            try std.testing.expectEqual(@as(usize, 2), set_operation.ctes.len);
+            try std.testing.expectEqualStrings("usage_records", set_operation.ctes[0].left_table);
+            try std.testing.expectEqualStrings("archived_records", set_operation.ctes[0].right_table);
+            try std.testing.expectEqualStrings("usage_records", set_operation.ctes[1].left_table);
+            try std.testing.expectEqualStrings("tenant_records", set_operation.ctes[1].right_table);
+            try std.testing.expectEqualStrings(set_operation.ctes[1].name, set_operation.right.plan.query.source_cte);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var catalog = FakeCatalog{};
+    var lowered_generated = try sql_adapter.lower_select.lowerReadPlanWithCatalogAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT tenant_records.tenant_ref AS id FROM usage_records JOIN archived_records ON usage_records.id = archived_records.id JOIN tenant_records ON archived_records.tenant_ref = tenant_records.tenant_ref",
+        usage_schema,
+        &.{},
+        catalog.iface(),
+    );
+    defer lowered_generated.deinit(alloc);
+    switch (lowered_generated) {
+        .set_operation => |set_operation| {
+            try std.testing.expectEqual(@as(usize, 2), set_operation.ctes.len);
+            try std.testing.expectEqualStrings("usage_records", set_operation.ctes[0].left_table);
+            try std.testing.expectEqualStrings("archived_records", set_operation.ctes[0].right_table);
+            try std.testing.expectEqualStrings("usage_records", set_operation.ctes[1].left_table);
+            try std.testing.expectEqualStrings("tenant_records", set_operation.ctes[1].right_table);
+            try std.testing.expectEqualStrings(set_operation.ctes[1].name, set_operation.right.plan.query.source_cte);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var generated_fake = FakeSource{};
+    var generated_result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        generated_fake.source(),
+        catalog.iface(),
+        "usage_records",
+        usage_schema,
+        lowered_generated,
+        .read_index,
+    )).?;
+    defer generated_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), generated_fake.usage_scans);
+    try std.testing.expectEqual(@as(usize, 1), generated_fake.archived_scans);
+    try std.testing.expectEqual(@as(usize, 1), generated_fake.tenant_scans);
+    switch (generated_result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 3), query_result.total);
+            try std.testing.expectEqual(@as(usize, 3), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u3\"}", query_result.rows[1]);
+            try std.testing.expectEqualStrings("{\"id\":\"t1\"}", query_result.rows[2]);
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var fake = FakeSource{};
+    var result = (try executeLoweredSqlReadPlanAlloc(
+        alloc,
+        fake.source(),
+        catalog.iface(),
+        "usage_records",
+        usage_schema,
+        lowered,
+        .read_index,
+    )).?;
+    defer result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(usize, 1), fake.usage_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake.archived_scans);
+    try std.testing.expectEqual(@as(usize, 1), fake.tenant_scans);
+    switch (result) {
+        .set_operation => |query_result| {
+            try std.testing.expectEqual(@as(u32, 3), query_result.total);
+            try std.testing.expectEqual(@as(usize, 3), query_result.rows.len);
+            try std.testing.expectEqualStrings("{\"id\":\"u1\"}", query_result.rows[0]);
+            try std.testing.expectEqualStrings("{\"id\":\"u3\"}", query_result.rows[1]);
+            try std.testing.expectEqualStrings("{\"id\":\"t1\"}", query_result.rows[2]);
         },
         else => return error.TestUnexpectedResult,
     }

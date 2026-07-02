@@ -67,6 +67,17 @@ pub const QueryPlanParserHooks = struct {
     parse_select: *const fn (*anyopaque) anyerror!plan_mod.LoweredSelect,
 };
 
+const ParsedGeneratedSubqueryRequest = struct {
+    query: db_mod.types.RelationalRowsQueryRequest,
+    output_field: []const u8 = "",
+
+    fn deinit(self: *@This(), alloc: std.mem.Allocator) void {
+        self.query.deinit(alloc);
+        if (self.output_field.len > 0) alloc.free(self.output_field);
+        self.* = undefined;
+    }
+};
+
 pub const NamedWindowSpecsContextHooks = struct {
     ptr: *anyopaque,
     get_specs: *const fn (*anyopaque) []const plan_mod.NamedWindowSpec,
@@ -126,6 +137,7 @@ pub const JoinParserOptions = struct {
     params: []const value_mod.SqlValue = &.{},
     available_ctes: []const db_mod.types.RelationalRowsCte = &.{},
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst = null,
+    allow_select_set_result_tail_boundary: bool = false,
     context_hooks: JoinParserContextHooks,
     expression_where_options: JoinedMutationExpressionWhereConditionParserOptions,
     output_order_expression_options: expr_order.OutputExpressionParserOptions,
@@ -225,6 +237,33 @@ const freePredicateGroups = plan_mod.freePredicateGroups;
 const freeRelationalChecks = plan_mod.freeRelationalChecks;
 const freeTextPatterns = plan_mod.freeTextPatterns;
 const cloneExpressionAlloc = plan_mod.cloneExpressionAlloc;
+
+fn joinKindPhysicalType(kind: generated_parser.GeneratedSqlJoinKind) !db_mod.types.RelationalRowsJoinType {
+    return switch (kind) {
+        .inner, .cross, .natural => .inner,
+        .left, .right => .left,
+        .full => .full,
+    };
+}
+
+fn oppositeJoinProjectionSide(side: db_mod.types.RelationalRowsJoinProjectionSide) db_mod.types.RelationalRowsJoinProjectionSide {
+    return switch (side) {
+        .left => .right,
+        .right => .left,
+    };
+}
+
+fn normalizeRightJoinRequest(req: *db_mod.types.RelationalRowsJoinRequest) void {
+    std.mem.swap(db_mod.types.RelationalRowsQueryRequest, &req.left, &req.right);
+    for (@constCast(req.on)) |*join_on| {
+        const left_field = join_on.left_field;
+        join_on.left_field = join_on.right_field;
+        join_on.right_field = left_field;
+    }
+    for (@constCast(req.select)) |*projection| {
+        projection.side = oppositeJoinProjectionSide(projection.side);
+    }
+}
 
 pub const JoinOnPredicateTargets = struct {
     on: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn),
@@ -390,6 +429,428 @@ fn parseBulkIoWhereExpressionConditionAlloc(
     };
 }
 
+fn freeSubqueryPredicates(alloc: std.mem.Allocator, values: []const db_mod.types.RelationalRowsSubqueryPredicate) void {
+    for (values) |value| {
+        if (value.lhs) |lhs| freeExpression(alloc, lhs);
+        var query = value.query;
+        query.deinit(alloc);
+        if (value.output_field.len > 0) alloc.free(value.output_field);
+        if (value.collation) |collation| alloc.free(collation);
+    }
+}
+
+fn generatedSubqueryPredicateAt(
+    tokens: []const Token,
+    pos: usize,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !?*const generated_parser.GeneratedSqlExpressionAst {
+    const expression = generated_expression_ast orelse return null;
+    const range = expression.tokens orelse return null;
+    if (range.start != pos) return null;
+    switch (expression.kind) {
+        .exists_subquery,
+        .not_exists_subquery,
+        => {
+            try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, expression.*);
+            return expression;
+        },
+        .comparison,
+        .in_list,
+        .not_in_list,
+        .quantified_comparison,
+        .like,
+        .ilike,
+        .not_like,
+        .not_ilike,
+        => {
+            if (expression.right_expression_kind != .subquery) return null;
+            try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, expression.*);
+            return expression;
+        },
+        else => return null,
+    }
+}
+
+fn generatedSubqueryComparisonOp(
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+) !db_mod.types.RelationalRowsSubqueryPredicateOp {
+    return switch (expression.kind) {
+        .comparison => blk: {
+            const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.end != operator_tokens.start + 1) return error.UnsupportedSqlShape;
+            var pos = operator_tokens.start;
+            const op = try expr_operator.parseComparisonOp(tokens, &pos);
+            if (pos != operator_tokens.end) return error.UnsupportedSqlShape;
+            break :blk switch (op) {
+                .eq => .eq,
+                .ne => .ne,
+                .gt => .gt,
+                .gte => .gte,
+                .lt => .lt,
+                .lte => .lte,
+                .is_null, .is_not_null, .is_distinct, .is_not_distinct => error.UnsupportedSqlShape,
+            };
+        },
+        .like, .not_like => .like,
+        .ilike, .not_ilike => .ilike,
+        .quantified_comparison => blk: {
+            const operator_tokens = expression.operator_tokens orelse return error.UnsupportedSqlShape;
+            if (operator_tokens.end != operator_tokens.start + 1) return error.UnsupportedSqlShape;
+            var pos = operator_tokens.start;
+            const op = try expr_operator.parseComparisonOp(tokens, &pos);
+            if (pos != operator_tokens.end) return error.UnsupportedSqlShape;
+            break :blk switch (op) {
+                .eq => .eq,
+                .ne => .ne,
+                .gt => .gt,
+                .gte => .gte,
+                .lt => .lt,
+                .lte => .lte,
+                .is_null, .is_not_null, .is_distinct, .is_not_distinct => error.UnsupportedSqlShape,
+            };
+        },
+        else => error.UnsupportedSqlShape,
+    };
+}
+
+fn generatedSubqueryLhsExpressionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    type_context: expr_type.RowExpressionTypeContext,
+    hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) !?db_mod.types.RelationalRowsExpression {
+    const lhs_tokens = expression.left_tokens orelse return null;
+    var pos = lhs_tokens.start;
+    const lhs = try expr_row_parse.parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        &pos,
+        type_context,
+        hooks.row_expression_hooks,
+        hooks.arithmetic_hooks,
+        hooks.variadic_hooks,
+    );
+    errdefer freeExpression(alloc, lhs);
+    if (pos != lhs_tokens.end) return error.UnsupportedSqlShape;
+    return lhs;
+}
+
+fn parseGeneratedSubqueryProjectionAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    type_context: expr_type.RowExpressionTypeContext,
+    hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    query: *db_mod.types.RelationalRowsQueryRequest,
+) ![]const u8 {
+    const projection_tokens = expression.subquery_projection_tokens orelse return error.UnsupportedSqlShape;
+    if (expression.subquery_projection_items.count != 1 or expression.subquery_projection_items.expression_items.len != 1) return error.UnsupportedSqlShape;
+    const item_tokens = expression.subquery_projection_items.expression_items[0];
+    if (item_tokens.start < projection_tokens.start or item_tokens.end > projection_tokens.end) return error.UnsupportedSqlShape;
+    var pos = item_tokens.start;
+    const projected = try expr_row_parse.parseRowExpressionAlloc(
+        alloc,
+        tokens,
+        &pos,
+        type_context,
+        hooks.row_expression_hooks,
+        hooks.arithmetic_hooks,
+        hooks.variadic_hooks,
+    );
+    errdefer freeExpression(alloc, projected);
+    if (pos != item_tokens.end) return error.UnsupportedSqlShape;
+
+    const alias_tokens = if (expression.subquery_projection_items.alias_name_items.len == 1)
+        expression.subquery_projection_items.alias_name_items[0]
+    else
+        null;
+    const output = if (alias_tokens) |alias_range| blk: {
+        if (alias_range.end != alias_range.start + 1 or alias_range.end > tokens.len) return error.UnsupportedSqlShape;
+        break :blk try alloc.dupe(u8, tokens[alias_range.start].text);
+    } else if (projected.kind == .field and projected.field.len != 0)
+        try alloc.dupe(u8, projected.field)
+    else
+        try alloc.dupe(u8, expr_type.rowExpressionDefaultOutputName(projected.kind));
+    errdefer alloc.free(output);
+
+    query.select_all = false;
+    if (projected.kind == .field and std.mem.eql(u8, output, projected.field)) {
+        const select = try alloc.alloc([]const u8, 1);
+        errdefer alloc.free(select);
+        select[0] = try alloc.dupe(u8, projected.field);
+        query.select = select;
+        freeExpression(alloc, projected);
+    } else {
+        const projections = try alloc.alloc(db_mod.types.RelationalRowsExpressionProjection, 1);
+        errdefer alloc.free(projections);
+        projections[0] = .{
+            .output = try alloc.dupe(u8, output),
+            .expression = projected,
+        };
+        query.expressions = projections;
+    }
+    return output;
+}
+
+fn parseGeneratedSubqueryRequestAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    expression: *const generated_parser.GeneratedSqlExpressionAst,
+    need_output: bool,
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+) anyerror!ParsedGeneratedSubqueryRequest {
+    if (expression.subquery_read_kind != .query or expression.subquery_set_operation_tokens != null or expression.subquery_tail != null) return error.UnsupportedSqlShape;
+    _ = expression.subquery_select_tokens orelse return error.UnsupportedSqlShape;
+    _ = expression.subquery_source_tokens orelse return error.UnsupportedSqlShape;
+
+    var query = db_mod.types.RelationalRowsQueryRequest{ .select_all = true };
+    errdefer query.deinit(alloc);
+    const output_field = if (need_output)
+        try parseGeneratedSubqueryProjectionAlloc(alloc, tokens, expression, type_context, expression_condition_hooks, &query)
+    else
+        "";
+    errdefer if (output_field.len > 0) alloc.free(output_field);
+
+    if (expression.subquery_where_tokens) |where_tokens| {
+        var predicates = std.ArrayListUnmanaged(runtime_schema.RelationalCheck).empty;
+        errdefer {
+            freeRelationalChecks(alloc, predicates.items);
+            predicates.deinit(alloc);
+        }
+        var json_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonContainsPredicate).empty;
+        errdefer {
+            freeJsonContains(alloc, json_contains.items);
+            json_contains.deinit(alloc);
+        }
+        var json_path_eq = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathEqPredicate).empty;
+        errdefer {
+            freeJsonPathEq(alloc, json_path_eq.items);
+            json_path_eq.deinit(alloc);
+        }
+        var json_path_exists = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJsonPathExistsPredicate).empty;
+        errdefer {
+            freeJsonPathExists(alloc, json_path_exists.items);
+            json_path_exists.deinit(alloc);
+        }
+        var array_any = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayAnyPredicate).empty;
+        errdefer {
+            freeArrayAny(alloc, array_any.items);
+            array_any.deinit(alloc);
+        }
+        var array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayContainsPredicate).empty;
+        errdefer {
+            freeArrayContains(alloc, array_contains.items);
+            array_contains.deinit(alloc);
+        }
+        var array_eq = std.ArrayListUnmanaged(db_mod.types.RelationalRowsArrayEqPredicate).empty;
+        errdefer {
+            freeArrayEq(alloc, array_eq.items);
+            array_eq.deinit(alloc);
+        }
+        var in_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsInPredicate).empty;
+        errdefer {
+            freeInPredicates(alloc, in_predicates.items);
+            in_predicates.deinit(alloc);
+        }
+        var text_patterns = std.ArrayListUnmanaged(db_mod.types.RelationalRowsTextPatternPredicate).empty;
+        errdefer {
+            freeTextPatterns(alloc, text_patterns.items);
+            text_patterns.deinit(alloc);
+        }
+        var or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+        errdefer {
+            freePredicateGroups(alloc, or_predicates.items);
+            or_predicates.deinit(alloc);
+        }
+        var not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsPredicateGroup).empty;
+        errdefer {
+            freePredicateGroups(alloc, not_predicates.items);
+            not_predicates.deinit(alloc);
+        }
+        var access_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup).empty;
+        errdefer {
+            freeAccessPredicateGroups(alloc, access_or_predicates.items);
+            access_or_predicates.deinit(alloc);
+        }
+        var access_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsAccessPredicateGroup).empty;
+        errdefer {
+            freeAccessPredicateGroups(alloc, access_not_predicates.items);
+            access_not_predicates.deinit(alloc);
+        }
+        var expression_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionCondition).empty;
+        errdefer {
+            freeExpressionConditions(alloc, expression_predicates.items);
+            expression_predicates.deinit(alloc);
+        }
+        var expression_or_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(alloc, expression_or_predicates.items);
+            expression_or_predicates.deinit(alloc);
+        }
+        var expression_not_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup).empty;
+        errdefer {
+            freeExpressionPredicateGroups(alloc, expression_not_predicates.items);
+            expression_not_predicates.deinit(alloc);
+        }
+        var expression_array_contains = std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate).empty;
+        errdefer {
+            freeExpressionArrayContains(alloc, expression_array_contains.items);
+            expression_array_contains.deinit(alloc);
+        }
+        var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+        errdefer {
+            freeSubqueryPredicates(alloc, subquery_predicates.items);
+            subquery_predicates.deinit(alloc);
+        }
+
+        var where_pos = where_tokens.start;
+        try parseWhereAlloc(
+            alloc,
+            tokens,
+            &where_pos,
+            params,
+            schema,
+            type_context,
+            &.{},
+            &.{},
+            false,
+            &predicates,
+            &json_contains,
+            &json_path_eq,
+            &json_path_exists,
+            &array_any,
+            &array_contains,
+            &array_eq,
+            &in_predicates,
+            &text_patterns,
+            &or_predicates,
+            &not_predicates,
+            &access_or_predicates,
+            &access_not_predicates,
+            &expression_predicates,
+            &expression_or_predicates,
+            &expression_not_predicates,
+            &expression_array_contains,
+            &subquery_predicates,
+            realtime_ns,
+            fixed_binary_hooks,
+            bare_boolean_hooks,
+            expression_alternatives_hooks,
+            expression_condition_hooks,
+            expression.subquery_where_expression,
+        );
+        if (where_pos != where_tokens.end) return error.UnsupportedSqlShape;
+        query.predicates = try predicates.toOwnedSlice(alloc);
+        query.json_contains = try json_contains.toOwnedSlice(alloc);
+        query.json_path_eq = try json_path_eq.toOwnedSlice(alloc);
+        query.json_path_exists = try json_path_exists.toOwnedSlice(alloc);
+        query.array_any = try array_any.toOwnedSlice(alloc);
+        query.array_contains = try array_contains.toOwnedSlice(alloc);
+        query.array_eq = try array_eq.toOwnedSlice(alloc);
+        query.in_predicates = try in_predicates.toOwnedSlice(alloc);
+        query.text_patterns = try text_patterns.toOwnedSlice(alloc);
+        query.or_predicates = try or_predicates.toOwnedSlice(alloc);
+        query.not_predicates = try not_predicates.toOwnedSlice(alloc);
+        query.access_or_predicates = try access_or_predicates.toOwnedSlice(alloc);
+        query.access_not_predicates = try access_not_predicates.toOwnedSlice(alloc);
+        query.expression_predicates = try expression_predicates.toOwnedSlice(alloc);
+        query.expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc);
+        query.expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc);
+        query.expression_array_contains = try expression_array_contains.toOwnedSlice(alloc);
+        query.subquery_predicates = try subquery_predicates.toOwnedSlice(alloc);
+    }
+
+    const out = ParsedGeneratedSubqueryRequest{
+        .query = query,
+        .output_field = output_field,
+    };
+    query = .{};
+    return out;
+}
+
+fn parseGeneratedSubqueryWherePredicateAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    params: []const value_mod.SqlValue,
+    schema: runtime_schema.TableSchema,
+    type_context: expr_type.RowExpressionTypeContext,
+    subquery_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate),
+    realtime_ns: u64,
+    fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
+    bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
+    expression_alternatives_hooks: expr_where_condition.ExpressionWhereConditionAlternativesParserOptions,
+    expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
+    generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
+) !bool {
+    const expression = (try generatedSubqueryPredicateAt(tokens, pos.*, generated_expression_ast)) orelse return false;
+    const expression_tokens = expression.tokens orelse return error.UnsupportedSqlShape;
+    const need_output = switch (expression.kind) {
+        .exists_subquery, .not_exists_subquery => false,
+        else => true,
+    };
+    const right_expression = switch (expression.kind) {
+        .exists_subquery, .not_exists_subquery => expression,
+        else => expression.right_expression orelse return error.UnsupportedSqlShape,
+    };
+    var subquery = try parseGeneratedSubqueryRequestAlloc(
+        alloc,
+        tokens,
+        params,
+        schema,
+        type_context,
+        right_expression,
+        need_output,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+    );
+    errdefer subquery.deinit(alloc);
+    const lhs = try generatedSubqueryLhsExpressionAlloc(alloc, tokens, expression, type_context, expression_condition_hooks);
+    var lhs_transferred = false;
+    errdefer if (!lhs_transferred) if (lhs) |value| freeExpression(alloc, value);
+    const predicate = db_mod.types.RelationalRowsSubqueryPredicate{
+        .kind = switch (expression.kind) {
+            .exists_subquery, .not_exists_subquery => .exists,
+            .comparison => .scalar,
+            .in_list, .not_in_list => .in,
+            .quantified_comparison, .like, .ilike, .not_like, .not_ilike => .quantified,
+            else => return error.UnsupportedSqlShape,
+        },
+        .lhs = lhs,
+        .op = if (expression.kind == .in_list or expression.kind == .not_in_list) .eq else try generatedSubqueryComparisonOp(tokens, expression),
+        .negated = switch (expression.kind) {
+            .not_exists_subquery, .not_in_list, .not_like, .not_ilike => true,
+            else => false,
+        },
+        .quantifier = if (expression.kind == .quantified_comparison or expression.kind == .like or expression.kind == .ilike or expression.kind == .not_like or expression.kind == .not_ilike) blk: {
+            const quantifier_tokens = expression.quantifier_tokens orelse return error.UnsupportedSqlShape;
+            if (quantifier_tokens.end != quantifier_tokens.start + 1) return error.UnsupportedSqlShape;
+            break :blk if (tokens[quantifier_tokens.start].matchesKeywordTag(.all)) .all else .any;
+        } else null,
+        .query = subquery.query,
+        .output_field = subquery.output_field,
+        .collation = null,
+    };
+    lhs_transferred = true;
+    subquery.query = .{};
+    subquery.output_field = "";
+    try subquery_predicates.append(alloc, predicate);
+    pos.* = expression_tokens.end;
+    return true;
+}
+
 pub fn parseWhereAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -417,6 +878,7 @@ pub fn parseWhereAlloc(
     expression_or_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_not_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionPredicateGroup),
     expression_array_contains: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsExpressionArrayContainsPredicate),
+    subquery_predicates: *std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate),
     realtime_ns: u64,
     fixed_binary_hooks: expr_row_parse.FixedBinaryRowExpressionParserOptions,
     bare_boolean_hooks: expr_predicate.BareBooleanWhereExpressionParserOptions,
@@ -424,6 +886,21 @@ pub fn parseWhereAlloc(
     expression_condition_hooks: expr_where_condition.ExpressionWhereConditionsParserOptions,
     generated_expression_ast: ?*const generated_parser.GeneratedSqlExpressionAst,
 ) !void {
+    if (try parseGeneratedSubqueryWherePredicateAlloc(
+        alloc,
+        tokens,
+        pos,
+        params,
+        schema,
+        type_context,
+        subquery_predicates,
+        realtime_ns,
+        fixed_binary_hooks,
+        bare_boolean_hooks,
+        expression_alternatives_hooks,
+        expression_condition_hooks,
+        generated_expression_ast,
+    )) return;
     if (expr_predicate.canParseBareBooleanWhereExpression(tokens, pos.*, schema)) {
         var generated_bare_boolean_hooks = bare_boolean_hooks;
         generated_bare_boolean_hooks.generated_expression_ast = generated_expression_ast;
@@ -948,20 +1425,8 @@ fn parseGraphTableFunctionSourceAtAlloc(
 
     if (plan_mod.findCteByName(available_ctes, alias_source) != null) return error.UnsupportedSqlShape;
 
-    const generated_source = generatedGraphTableFunctionSourceAt(generated_read_ast, function_start);
-    if (generated_read_ast != null and generated_source == null) return error.UnsupportedSqlShape;
-
-    const table_function = if (generated_source) |source|
-        try query_function.lowerAntflyGraphTableFunctionGeneratedAstAlloc(alloc, tokens, source.antfly_item, source.graph_item)
-    else table_function: {
-        var wrapped = std.ArrayListUnmanaged(Token).empty;
-        defer wrapped.deinit(alloc);
-        try wrapped.append(alloc, .{ .kind = .identifier, .text = "select" });
-        try wrapped.append(alloc, .{ .kind = .star, .text = "*" });
-        try wrapped.append(alloc, .{ .kind = .identifier, .text = "from" });
-        try wrapped.appendSlice(alloc, tokens[function_start..function_end]);
-        break :table_function try query_function.lowerAntflyGraphTableFunctionTokensAlloc(alloc, wrapped.items);
-    };
+    const generated_source = generatedGraphTableFunctionSourceAt(generated_read_ast, function_start) orelse return error.UnsupportedSqlShape;
+    const table_function = try query_function.lowerAntflyGraphTableFunctionGeneratedAstAlloc(alloc, tokens, generated_source.antfly_item, generated_source.graph_item);
     var table_function_transferred = false;
     errdefer if (!table_function_transferred) {
         var owned = table_function;
@@ -1007,6 +1472,74 @@ fn parseDirectGraphTableFunctionSourceAlloc(
     return try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, from_index + 1, "__antfly_graph_table_function", available_ctes, generated_read_ast);
 }
 
+fn appendGeneratedQualifierIfMissingAlloc(
+    alloc: std.mem.Allocator,
+    qualifiers: *std.ArrayListUnmanaged([]const u8),
+    qualifier: []const u8,
+) !void {
+    if (qualifier.len == 0) return;
+    for (qualifiers.items) |existing| {
+        if (std.mem.eql(u8, existing, qualifier)) return;
+    }
+    const owned = try alloc.dupe(u8, qualifier);
+    errdefer alloc.free(owned);
+    try qualifiers.append(alloc, owned);
+}
+
+fn appendGeneratedSourceAliasQualifiersAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    qualifiers: *std.ArrayListUnmanaged([]const u8),
+    source_tokens: generated_parser.GeneratedSqlTokenRange,
+    table_tokens: ?generated_parser.GeneratedSqlTokenRange,
+    alias_name_tokens: ?generated_parser.GeneratedSqlTokenRange,
+) !void {
+    const table = table_tokens orelse return error.UnsupportedSqlShape;
+    if (source_tokens.start >= source_tokens.end or source_tokens.end > tokens.len) return error.UnsupportedSqlShape;
+    if (table.end != table.start + 1 or table.end > source_tokens.end) return error.UnsupportedSqlShape;
+    if (tokens[table.start].kind != .identifier) return error.UnsupportedSqlShape;
+    const table_name = try grammar.normalizeSqlObjectIdentifierAlloc(alloc, tokens[table.start].text);
+    defer alloc.free(table_name);
+    try appendGeneratedQualifierIfMissingAlloc(alloc, qualifiers, table_name);
+
+    if (alias_name_tokens) |alias| {
+        if (alias.end != alias.start + 1 or alias.end > source_tokens.end) return error.UnsupportedSqlShape;
+        if (tokens[alias.start].kind != .identifier) return error.UnsupportedSqlShape;
+        try appendGeneratedQualifierIfMissingAlloc(alloc, qualifiers, tokens[alias.start].text);
+    }
+}
+
+fn appendGeneratedSetOperationRightJoinQualifiersAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    qualifiers: *std.ArrayListUnmanaged([]const u8),
+    read: *const generated_parser.GeneratedSqlReadAst,
+) !bool {
+    if (read.kind != .set_operation or read.set_operation.right_join_items.len == 0) return false;
+    const set_operation = read.set_operation;
+    if (set_operation.right_source_table_tokens == null) return false;
+    const right_source = set_operation.right_source_tokens orelse return error.UnsupportedSqlShape;
+    try appendGeneratedSourceAliasQualifiersAlloc(
+        alloc,
+        tokens,
+        qualifiers,
+        right_source,
+        set_operation.right_source_table_tokens,
+        set_operation.right_source_alias_name_tokens,
+    );
+    for (set_operation.right_join_items, 0..) |join, index| {
+        if (index == 0) {
+            try appendGeneratedSourceAliasQualifiersAlloc(alloc, tokens, qualifiers, join.left_tokens, join.left_table_tokens, join.left_alias_name_tokens);
+        }
+        try appendGeneratedSourceAliasQualifiersAlloc(alloc, tokens, qualifiers, join.right_tokens, join.right_table_tokens, join.right_alias_name_tokens);
+    }
+    return qualifiers.items.len != 0;
+}
+
+fn freeGeneratedQualifiers(alloc: std.mem.Allocator, qualifiers: []const []const u8) void {
+    for (qualifiers) |qualifier| alloc.free(@constCast(qualifier));
+}
+
 pub fn parseSelectAlloc(
     alloc: std.mem.Allocator,
     tokens: []const Token,
@@ -1034,11 +1567,25 @@ pub fn parseSelectAlloc(
         try plan_mod.inferSelectSourceAliasAlloc(alloc, tokens, pos.*);
     defer if (inferred_table_ref) |value| plan_mod.freeTableAlias(alloc, value);
     var inferred_qualifiers: [2][]const u8 = undefined;
+    var generated_join_qualifiers = std.ArrayListUnmanaged([]const u8).empty;
+    defer {
+        freeGeneratedQualifiers(alloc, generated_join_qualifiers.items);
+        generated_join_qualifiers.deinit(alloc);
+    }
     var planned_ctes: []relational_rows.RowsPlannedCte = &.{};
     defer relational_rows.freeRowsPlannedCtes(alloc, planned_ctes);
     if (inferred_table_ref) |value| {
         inferred_qualifiers = .{ value.name, value.alias };
-        current_context.field_expression_qualifiers = inferred_qualifiers[0..];
+        if (if (options.allow_select_set_result_tail_boundary) if (options.generated_read_ast) |read|
+            try appendGeneratedSetOperationRightJoinQualifiersAlloc(alloc, tokens, &generated_join_qualifiers, read)
+        else
+            false else false)
+        {
+            current_context.field_expression_qualifiers = generated_join_qualifiers.items;
+            if (initial_context.joined_source_schema) |source_schema| current_context.schema = source_schema;
+        } else {
+            current_context.field_expression_qualifiers = inferred_qualifiers[0..];
+        }
         if (direct_graph_source != null or plan_mod.findCteByName(options.available_ctes, value.name) != null) {
             const ctes = if (direct_graph_source) |*source| source_ctes: {
                 const implicit_ctes = [_]db_mod.types.RelationalRowsCte{source.cte};
@@ -1214,6 +1761,11 @@ pub fn parseSelectAlloc(
         freeExpressionArrayContains(alloc, expression_array_contains.items);
         expression_array_contains.deinit(alloc);
     }
+    var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+    errdefer {
+        freeSubqueryPredicates(alloc, subquery_predicates.items);
+        subquery_predicates.deinit(alloc);
+    }
     var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
     errdefer {
         freeOrderBy(alloc, order_by.items);
@@ -1257,6 +1809,7 @@ pub fn parseSelectAlloc(
                 &expression_or_predicates,
                 &expression_not_predicates,
                 &expression_array_contains,
+                &subquery_predicates,
                 options.realtime_ns,
                 options.fixed_binary_hooks,
                 options.bare_boolean_hooks,
@@ -1267,6 +1820,8 @@ pub fn parseSelectAlloc(
             if (generated_where_end) |end| {
                 if (pos.* != end) return error.UnsupportedSqlShape;
             }
+        } else if (options.allow_select_set_result_tail_boundary and grammar.nextIsSelectSetResultTailKeyword(tokens, pos.*)) {
+            break;
         } else if (options.allow_select_set_result_tail_boundary and grammar.nextIsSelectSetResultTailKeyword(tokens, pos.*)) {
             break;
         } else if (parser.matchKeyword(tokens, pos, "order")) {
@@ -1359,6 +1914,7 @@ pub fn parseSelectAlloc(
             .expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc),
             .expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc),
             .expression_array_contains = try expression_array_contains.toOwnedSlice(alloc),
+            .subquery_predicates = try subquery_predicates.toOwnedSlice(alloc),
             .select = select.fields,
             .json_extract = select.json_extract,
             .array_length = select.array_length,
@@ -1579,6 +2135,11 @@ pub fn parseAggregateAlloc(
         freeExpressionArrayContains(alloc, expression_array_contains.items);
         expression_array_contains.deinit(alloc);
     }
+    var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+    errdefer {
+        freeSubqueryPredicates(alloc, subquery_predicates.items);
+        subquery_predicates.deinit(alloc);
+    }
     var group_by = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (group_by.items) |field| alloc.free(field);
@@ -1650,6 +2211,7 @@ pub fn parseAggregateAlloc(
                 &expression_or_predicates,
                 &expression_not_predicates,
                 &expression_array_contains,
+                &subquery_predicates,
                 options.realtime_ns,
                 options.fixed_binary_hooks,
                 options.bare_boolean_hooks,
@@ -1802,6 +2364,7 @@ pub fn parseAggregateAlloc(
             .expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc),
             .expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc),
             .expression_array_contains = try expression_array_contains.toOwnedSlice(alloc),
+            .subquery_predicates = try subquery_predicates.toOwnedSlice(alloc),
             .select_all = true,
         },
         .group_by = owned_group_by,
@@ -2048,6 +2611,11 @@ pub fn parseWindowSelectAlloc(
         freeExpressionArrayContains(alloc, expression_array_contains.items);
         expression_array_contains.deinit(alloc);
     }
+    var subquery_predicates = std.ArrayListUnmanaged(db_mod.types.RelationalRowsSubqueryPredicate).empty;
+    errdefer {
+        freeSubqueryPredicates(alloc, subquery_predicates.items);
+        subquery_predicates.deinit(alloc);
+    }
     var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
     errdefer {
         freeOrderBy(alloc, order_by.items);
@@ -2089,6 +2657,7 @@ pub fn parseWindowSelectAlloc(
                 &expression_or_predicates,
                 &expression_not_predicates,
                 &expression_array_contains,
+                &subquery_predicates,
                 options.realtime_ns,
                 options.fixed_binary_hooks,
                 options.bare_boolean_hooks,
@@ -2202,6 +2771,7 @@ pub fn parseWindowSelectAlloc(
                     .expression_or_predicates = try expression_or_predicates.toOwnedSlice(alloc),
                     .expression_not_predicates = try expression_not_predicates.toOwnedSlice(alloc),
                     .expression_array_contains = try expression_array_contains.toOwnedSlice(alloc),
+                    .subquery_predicates = try subquery_predicates.toOwnedSlice(alloc),
                     .select_all = true,
                 },
                 .windows = select.windows,
@@ -2254,7 +2824,7 @@ pub fn parseJoinAlloc(
 
     const natural_join = parser.matchKeyword(tokens, pos, "natural");
     const cross_join = if (natural_join) false else parser.matchKeyword(tokens, pos, "cross");
-    const join_type: db_mod.types.RelationalRowsJoinType = if (natural_join) blk: {
+    const logical_join_kind: generated_parser.GeneratedSqlJoinKind = if (natural_join) blk: {
         try parser.expectKeyword(tokens, pos, "join");
         break :blk .inner;
     } else if (cross_join) blk: {
@@ -2264,11 +2834,21 @@ pub fn parseJoinAlloc(
         _ = parser.matchKeyword(tokens, pos, "outer");
         try parser.expectKeyword(tokens, pos, "join");
         break :blk .left;
+    } else if (parser.matchKeyword(tokens, pos, "right")) blk: {
+        _ = parser.matchKeyword(tokens, pos, "outer");
+        try parser.expectKeyword(tokens, pos, "join");
+        break :blk .right;
+    } else if (parser.matchKeyword(tokens, pos, "full")) blk: {
+        _ = parser.matchKeyword(tokens, pos, "outer");
+        try parser.expectKeyword(tokens, pos, "join");
+        break :blk .full;
     } else blk: {
         _ = parser.matchKeyword(tokens, pos, "inner");
         try parser.expectKeyword(tokens, pos, "join");
         break :blk .inner;
     };
+    const join_type = try joinKindPhysicalType(logical_join_kind);
+    const normalize_right_join = logical_join_kind == .right;
     const right_tokens_start = pos.*;
 
     var right_graph_source = try parseGraphTableFunctionSourceAtAlloc(alloc, tokens, pos.*, "__antfly_graph_join", options.available_ctes, options.generated_read_ast);
@@ -2335,8 +2915,13 @@ pub fn parseJoinAlloc(
         const cte_base_schema = initial_context.joined_source_schema orelse initial_context.schema;
         planned_ctes = try relational_rows.planRowsCteOutputsAlloc(alloc, cte_base_schema, available_ctes);
     }
-    current_context.schema = relational_rows.rowsPlannedCteSchema(planned_ctes, left_table.name) orelse initial_context.schema;
-    current_context.joined_source_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, right_table.name) orelse initial_context.joined_source_schema orelse initial_context.schema;
+    const left_cte_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, left_table.name);
+    const right_cte_schema = relational_rows.rowsPlannedCteSchema(planned_ctes, right_table.name);
+    current_context.schema = left_cte_schema orelse initial_context.schema;
+    current_context.joined_source_schema = right_cte_schema orelse initial_context.joined_source_schema orelse initial_context.schema;
+    const right_join_parse_schema_swap = normalize_right_join and left_cte_schema == null and right_cte_schema == null;
+    const join_parse_left_schema = if (right_join_parse_schema_swap) current_context.joined_source_schema orelse current_context.schema else current_context.schema;
+    const join_parse_right_schema: ?runtime_schema.TableSchema = if (right_join_parse_schema_swap) current_context.schema else current_context.joined_source_schema;
     options.context_hooks.set_context(options.context_hooks.ptr, current_context);
 
     var on = std.ArrayListUnmanaged(db_mod.types.RelationalRowsJoinOn).empty;
@@ -2506,7 +3091,7 @@ pub fn parseJoinAlloc(
             .{ .start = right_tokens_start, .end = condition_tokens_start },
         );
     } else if (natural_join) {
-        try appendNaturalJoinColumnsAlloc(alloc, current_context.schema, current_context.joined_source_schema, &on);
+        try appendNaturalJoinColumnsAlloc(alloc, join_parse_left_schema, join_parse_right_schema, &on);
         try generated_read_validate.validateGeneratedSingleConditionlessJoinForClause(
             options.generated_read_ast,
             .join,
@@ -2533,8 +3118,8 @@ pub fn parseJoinAlloc(
             tokens,
             pos,
             options.params,
-            current_context.schema,
-            current_context.joined_source_schema,
+            join_parse_left_schema,
+            join_parse_right_schema,
             join_type,
             left_table.alias,
             right_table.alias,
@@ -2544,13 +3129,13 @@ pub fn parseJoinAlloc(
             options.realtime_ns,
             generated_on_expression,
         );
-        try generated_read_validate.validateGeneratedSingleJoinForClause(
+        try generated_read_validate.validateGeneratedSingleJoinForClauseKind(
             options.generated_read_ast,
             .join,
             tokens,
             .{ .start = left_tokens_start, .end = operator_tokens_start },
             .{ .start = operator_tokens_start, .end = right_tokens_start },
-            join_type,
+            logical_join_kind,
             .{ .start = right_tokens_start, .end = condition_tokens_start },
             .{ .start = condition_tokens_start, .end = pos.* },
             .{ .start = predicate_tokens_start, .end = pos.* },
@@ -2565,14 +3150,14 @@ pub fn parseJoinAlloc(
         defer strings.freeStringSlice(alloc, using_columns);
         const column_tokens_end = pos.*;
         try parser.expectToken(tokens, pos, .rparen);
-        try appendJoinUsingColumnsAlloc(alloc, using_columns, current_context.schema, current_context.joined_source_schema, &on);
-        try generated_read_validate.validateGeneratedSingleJoinUsingForClause(
+        try appendJoinUsingColumnsAlloc(alloc, using_columns, join_parse_left_schema, join_parse_right_schema, &on);
+        try generated_read_validate.validateGeneratedSingleJoinUsingForClauseKind(
             options.generated_read_ast,
             .join,
             tokens,
             .{ .start = left_tokens_start, .end = operator_tokens_start },
             .{ .start = operator_tokens_start, .end = right_tokens_start },
-            join_type,
+            logical_join_kind,
             .{ .start = right_tokens_start, .end = condition_tokens_start },
             .{ .start = condition_tokens_start, .end = pos.* },
             .{ .start = column_tokens_start, .end = column_tokens_end },
@@ -2586,7 +3171,7 @@ pub fn parseJoinAlloc(
         plan_mod.freeJoinProjections(alloc, select.items);
         select.deinit(alloc);
     }
-    try binder.resolveJoinProjectionsAlloc(alloc, current_context.schema, current_context.joined_source_schema, raw_select, left_table.alias, right_table.alias, &select);
+    try binder.resolveJoinProjectionsAlloc(alloc, join_parse_left_schema, join_parse_right_schema, raw_select, left_table.alias, right_table.alias, &select);
 
     var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
     errdefer {
@@ -2634,8 +3219,8 @@ pub fn parseJoinAlloc(
                 tokens,
                 pos,
                 options.params,
-                current_context.schema,
-                current_context.joined_source_schema,
+                join_parse_left_schema,
+                join_parse_right_schema,
                 left_table.alias,
                 right_table.alias,
                 options.string_to_array_predicate_is_containment,
@@ -2685,10 +3270,23 @@ pub fn parseJoinAlloc(
         }
     }
 
-    const left_table_name = try alloc.dupe(u8, left_table_name_source);
+    if (normalize_right_join and
+        (on_expression_predicates.items.len != 0 or
+            on_expression_or_predicates.items.len != 0 or
+            on_expression_not_predicates.items.len != 0 or
+            on_expression_array_contains.items.len != 0 or
+            match_expression_predicates.items.len != 0 or
+            match_expression_or_predicates.items.len != 0 or
+            match_expression_not_predicates.items.len != 0 or
+            match_expression_array_contains.items.len != 0))
+    {
+        return error.UnsupportedSqlShape;
+    }
+
+    var left_table_name = try alloc.dupe(u8, left_table_name_source);
     var left_table_name_transferred = false;
     errdefer if (!left_table_name_transferred) alloc.free(left_table_name);
-    const right_table_name = try alloc.dupe(u8, right_table_name_source);
+    var right_table_name = try alloc.dupe(u8, right_table_name_source);
     var right_table_name_transferred = false;
     errdefer if (!right_table_name_transferred) alloc.free(right_table_name);
     const left_source_cte = if (left_graph_source) |source| try alloc.dupe(u8, source.cte.name) else "";
@@ -2698,7 +3296,7 @@ pub fn parseJoinAlloc(
     var right_source_cte_transferred = false;
     errdefer if (!right_source_cte_transferred and right_source_cte.len > 0) alloc.free(right_source_cte);
 
-    const join_request = db_mod.types.RelationalRowsJoinRequest{
+    var join_request = db_mod.types.RelationalRowsJoinRequest{
         .left = .{
             .source_cte = left_source_cte,
             .predicates = try left_predicates.toOwnedSlice(alloc),
@@ -2744,6 +3342,12 @@ pub fn parseJoinAlloc(
         .limit = limit,
         .offset = offset,
     };
+    if (normalize_right_join) {
+        normalizeRightJoinRequest(&join_request);
+        const physical_right_table_name = left_table_name;
+        left_table_name = right_table_name;
+        right_table_name = physical_right_table_name;
+    }
     left_table_name_transferred = true;
     right_table_name_transferred = true;
     left_source_cte_transferred = true;
@@ -13273,6 +13877,38 @@ test "sql adapter lower expr treats direct graph table functions as relation sou
         .{},
     ));
 
+    var missing_generated_graph_source = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id, score FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors WHERE graph_name = 'neighbors' ORDER BY score DESC LIMIT 5",
+    );
+    defer missing_generated_graph_source.deinit(alloc);
+    var missing_generated_graph_read_ast: ?*generated_parser.GeneratedSqlReadAst = null;
+    var original_graph_function_items: []generated_parser.GeneratedSqlGraphTableFunctionAst = &.{};
+    var original_graph_function_count: usize = 0;
+    if (missing_generated_graph_source.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                original_graph_function_items = read.source_graph_function_items;
+                original_graph_function_count = read.source_graph_function_count;
+                read.source_graph_function_items = &.{};
+                read.source_graph_function_count = 0;
+                missing_generated_graph_read_ast = read;
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    defer if (missing_generated_graph_read_ast) |read| {
+        read.source_graph_function_items = original_graph_function_items;
+        read.source_graph_function_count = original_graph_function_count;
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &missing_generated_graph_source,
+        schema,
+        &.{},
+        .{},
+    ));
+
     var malformed_graph_source_argument_gap = try tokenized.ParsedSql.initAlloc(
         alloc,
         "SELECT id, score FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors WHERE graph_name = 'neighbors' ORDER BY score DESC LIMIT 5",
@@ -19032,36 +19668,95 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqualStrings("\"order\"", natural_join.join.left.predicates[0].value_json.?);
     try std.testing.expectEqual(@as(u32, 2), natural_join.join.limit.?);
 
-    const unsupported_generated_join_kinds = [_]struct {
-        sql: []const u8,
-        kind: generated_parser.GeneratedSqlJoinKind,
-    }{
-        .{
-            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN usage_records AS c ON o.customer_id = c.id",
-            .kind = .right,
-        },
-        .{
-            .sql = "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o FULL OUTER JOIN usage_records AS c ON o.customer_id = c.id",
-            .kind = .full,
-        },
-    };
-    for (unsupported_generated_join_kinds) |case| {
-        var parsed = try tokenized.ParsedSql.initAlloc(alloc, case.sql);
-        defer parsed.deinit(alloc);
-        const read_ast = if (parsed.generated_statement) |generated_statement| switch (generated_statement.ast.?) {
-            .read => |read| read,
-            else => return error.TestUnexpectedResult,
-        } else return error.TestUnexpectedResult;
-        try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.join, read_ast.kind);
-        try std.testing.expectEqual(case.kind, read_ast.join_kind.?);
-        try std.testing.expectEqual(case.kind, read_ast.join_items[0].kind);
-        try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedJoinForLowerExprTestAlloc(
-            alloc,
-            &parsed,
-            schema,
-            &.{},
-        ));
-    }
+    var right_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN usage_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer'",
+        schema,
+        &.{},
+    );
+    defer right_join.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.left, right_join.join.join_type);
+    try std.testing.expectEqual(@as(usize, 1), right_join.join.on.len);
+    try std.testing.expectEqualStrings("id", right_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("customer_id", right_join.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), right_join.join.left.predicates.len);
+    try std.testing.expectEqualStrings("kind", right_join.join.left.predicates[0].field);
+    try std.testing.expectEqualStrings("\"customer\"", right_join.join.left.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 1), right_join.join.right.predicates.len);
+    try std.testing.expectEqualStrings("kind", right_join.join.right.predicates[0].field);
+    try std.testing.expectEqualStrings("\"order\"", right_join.join.right.predicates[0].value_json.?);
+    try std.testing.expectEqual(@as(usize, 2), right_join.join.select.len);
+    try std.testing.expectEqualStrings("order_id", right_join.join.select[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, right_join.join.select[0].side);
+    try std.testing.expectEqualStrings("id", right_join.join.select[0].field);
+    try std.testing.expectEqualStrings("customer_name", right_join.join.select[1].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, right_join.join.select[1].side);
+    try std.testing.expectEqualStrings("name", right_join.join.select[1].field);
+
+    var cross_table_right_join = try lowerJoinForLowerExprTestAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o RIGHT JOIN customer_records AS c ON o.customer_id = c.id WHERE o.kind = 'order' AND c.kind = 'customer'",
+        schema,
+        &.{},
+    );
+    defer cross_table_right_join.deinit(alloc);
+    try std.testing.expectEqualStrings("customer_records", cross_table_right_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", cross_table_right_join.right_table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.left, cross_table_right_join.join.join_type);
+    try std.testing.expectEqualStrings("id", cross_table_right_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("customer_id", cross_table_right_join.join.on[0].right_field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, cross_table_right_join.join.select[0].side);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, cross_table_right_join.join.select[1].side);
+
+    var parsed_full_join = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o FULL OUTER JOIN usage_records AS c ON o.customer_id = c.id",
+    );
+    defer parsed_full_join.deinit(alloc);
+    const full_read_ast = if (parsed_full_join.generated_statement) |generated_statement| switch (generated_statement.ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.join, full_read_ast.kind);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlJoinKind.full, full_read_ast.join_kind.?);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlJoinKind.full, full_read_ast.join_items[0].kind);
+    var full_join = try lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &parsed_full_join,
+        schema,
+        &.{},
+    );
+    defer full_join.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.full, full_join.join.join_type);
+    try std.testing.expectEqual(@as(usize, 1), full_join.join.on.len);
+    try std.testing.expectEqualStrings("customer_id", full_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("id", full_join.join.on[0].right_field);
+    try std.testing.expectEqualStrings("usage_records", full_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", full_join.right_table_name);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, full_join.join.select[0].side);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.right, full_join.join.select[1].side);
+
+    var parsed_full_join_without_outer = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT o.id AS order_id, c.name AS customer_name FROM usage_records AS o FULL JOIN usage_records AS c ON o.customer_id = c.id",
+    );
+    defer parsed_full_join_without_outer.deinit(alloc);
+    const full_without_outer_read_ast = if (parsed_full_join_without_outer.generated_statement) |generated_statement| switch (generated_statement.ast.?) {
+        .read => |read| read,
+        else => return error.TestUnexpectedResult,
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectEqual(generated_parser.GeneratedSqlReadKind.join, full_without_outer_read_ast.kind);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlJoinKind.full, full_without_outer_read_ast.join_kind.?);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlJoinKind.full, full_without_outer_read_ast.join_items[0].kind);
+    var full_join_without_outer = try lowerParsedJoinForLowerExprTestAlloc(
+        alloc,
+        &parsed_full_join_without_outer,
+        schema,
+        &.{},
+    );
+    defer full_join_without_outer.deinit(alloc);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinType.full, full_join_without_outer.join.join_type);
+    try std.testing.expectEqual(@as(usize, 1), full_join_without_outer.join.on.len);
 
     var cross_join = try lowerJoinForLowerExprTestAlloc(
         alloc,
@@ -19268,12 +19963,37 @@ test "sql adapter lower expr lowers equality join queries" {
         &.{},
     ));
 
-    try std.testing.expectError(error.UnsupportedSqlShape, lowerJoinForLowerExprTestAlloc(
+    var top_level_multi_join = try lowerJoinForLowerExprTestAlloc(
         alloc,
-        "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id JOIN usage_records AS s ON c.scope = s.scope",
+        "SELECT o.id AS order_id FROM usage_records AS o JOIN usage_records AS c ON o.customer_id = c.id JOIN usage_records AS s ON c.scope = s.scope ORDER BY (order_id) DESC NULLS LAST LIMIT $1",
         schema,
-        &.{},
-    ));
+        &.{.{ .integer = 4 }},
+    );
+    defer top_level_multi_join.deinit(alloc);
+    try std.testing.expectEqualStrings("usage_records", top_level_multi_join.left_table_name);
+    try std.testing.expectEqualStrings("usage_records", top_level_multi_join.right_table_name);
+    try std.testing.expectEqual(@as(usize, 1), top_level_multi_join.ctes.len);
+    try std.testing.expectEqualStrings("__antfly_read_join_0", top_level_multi_join.ctes[0].name);
+    try std.testing.expectEqualStrings("__antfly_read_join_0", top_level_multi_join.join.left.source_cte);
+    try std.testing.expectEqual(@as(usize, 1), top_level_multi_join.join.on.len);
+    try std.testing.expectEqualStrings("c__scope", top_level_multi_join.join.on[0].left_field);
+    try std.testing.expectEqualStrings("scope", top_level_multi_join.join.on[0].right_field);
+    try std.testing.expectEqual(@as(usize, 1), top_level_multi_join.join.select.len);
+    try std.testing.expectEqualStrings("order_id", top_level_multi_join.join.select[0].output);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsJoinProjectionSide.left, top_level_multi_join.join.select[0].side);
+    try std.testing.expectEqualStrings("o__id", top_level_multi_join.join.select[0].field);
+    try std.testing.expectEqual(@as(usize, 2), top_level_multi_join.join.order_by.len);
+    try std.testing.expectEqualStrings("", top_level_multi_join.join.order_by[0].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, top_level_multi_join.join.order_by[0].expression.?.kind);
+    try std.testing.expectEqualStrings("order_id", top_level_multi_join.join.order_by[0].expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.asc, top_level_multi_join.join.order_by[0].direction);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderNullTest.is_null, top_level_multi_join.join.order_by[0].null_test.?);
+    try std.testing.expectEqualStrings("", top_level_multi_join.join.order_by[1].field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsExpressionKind.field, top_level_multi_join.join.order_by[1].expression.?.kind);
+    try std.testing.expectEqualStrings("order_id", top_level_multi_join.join.order_by[1].expression.?.field);
+    try std.testing.expectEqual(db_mod.types.RelationalRowsQueryOrderDirection.desc, top_level_multi_join.join.order_by[1].direction);
+    try std.testing.expect(top_level_multi_join.join.order_by[1].null_test == null);
+    try std.testing.expectEqual(@as(?u32, 4), top_level_multi_join.join.limit);
 
     var using_join = try lowerJoinForLowerExprTestAlloc(
         alloc,
@@ -19382,6 +20102,39 @@ test "sql adapter lower expr lowers equality join queries" {
     try std.testing.expectEqualStrings("\"graph_match\"", graph_cte_read.plan.query.predicates[0].value_json.?);
     try std.testing.expectEqual(@as(usize, 1), graph_cte_read.plan.query.order_by.len);
     try std.testing.expectEqualStrings("score", graph_cte_read.plan.query.order_by[0].field);
+
+    var missing_graph_cte_metadata = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH gm AS (SELECT * FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b')) SELECT id, score FROM gm WHERE graph_name = 'graph_match' ORDER BY score DESC LIMIT 5",
+    );
+    defer missing_graph_cte_metadata.deinit(alloc);
+    var missing_graph_cte_ast: ?*generated_parser.GeneratedSqlCteAst = null;
+    var original_cte_graph_function_items: []generated_parser.GeneratedSqlGraphTableFunctionAst = &.{};
+    var original_cte_graph_function_count: usize = 0;
+    if (missing_graph_cte_metadata.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| switch (generated_ast.*) {
+            .read => |read| {
+                if (read.cte_items.len == 0) return error.TestUnexpectedResult;
+                original_cte_graph_function_items = read.cte_items[0].body_source_graph_function_items;
+                original_cte_graph_function_count = read.cte_items[0].body_source_graph_function_count;
+                read.cte_items[0].body_source_graph_function_items = &.{};
+                read.cte_items[0].body_source_graph_function_count = 0;
+                missing_graph_cte_ast = &read.cte_items[0];
+            },
+            else => return error.TestUnexpectedResult,
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    defer if (missing_graph_cte_ast) |cte| {
+        cte.body_source_graph_function_items = original_cte_graph_function_items;
+        cte.body_source_graph_function_count = original_cte_graph_function_count;
+    };
+    try std.testing.expectError(error.UnsupportedSqlShape, lowerParsedQueryPlanWithFunctionBindingsForLowerExprTestAlloc(
+        alloc,
+        &missing_graph_cte_metadata,
+        schema,
+        &.{},
+        .{},
+    ));
 
     var graph_direct_read = try lowerQueryPlanForLowerExprTestAlloc(
         alloc,

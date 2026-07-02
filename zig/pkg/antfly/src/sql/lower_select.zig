@@ -239,7 +239,21 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
     params: []const SqlValue,
     function_bindings: SqlFunctionBindings,
 ) !LoweredQueryPlan {
+    return try lowerQueryPlanWithOptionalSourceSchemaParsedSqlAlloc(alloc, parsed_sql, schema, null, params, function_bindings);
+}
+
+pub fn lowerQueryPlanWithOptionalSourceSchemaParsedSqlAlloc(
+    alloc: std.mem.Allocator,
+    parsed_sql: *const sql_adapter.ParsedSql,
+    schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
+    params: []const SqlValue,
+    function_bindings: SqlFunctionBindings,
+) !LoweredQueryPlan {
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
+    if (source_schema) |joined_source_schema| {
+        if (joined_source_schema.storage_mode != .relational or joined_source_schema.primary_key == null) return error.InvalidSqlCatalog;
+    }
     const tokens = parsed_sql.items();
     const cte_adapter_shape = sql_adapter.tokensStartWithKeywordTag(tokens, .with);
     const generated_read_ast = if (cte_adapter_shape)
@@ -251,6 +265,7 @@ pub fn lowerQueryPlanWithFunctionBindingsParsedSqlAlloc(
         .alloc = alloc,
         .tokens = tokens,
         .schema = schema,
+        .joined_source_schema = source_schema,
         .params = params,
         .function_bindings = function_bindings,
         .generated_read_ast = generated_read_ast,
@@ -405,7 +420,7 @@ pub fn lowerReadPlanWithOptionalSourceSchemaParsedSqlAlloc(
             .lower_aggregate_plan = lowerAggregatePlanParsedSqlAlloc,
             .lower_recursive_cte_plan = lowerRecursiveCtePlanParsedSqlAlloc,
             .lower_join_with_schemas = lowerJoinWithSchemasParsedSqlAlloc,
-            .lower_query_plan = lowerQueryPlanWithFunctionBindingsParsedSqlAlloc,
+            .lower_query_plan = lowerQueryPlanWithOptionalSourceSchemaParsedSqlAlloc,
             .lower_set_operation_optional_source_schema = lowerSetOperationPlanWithOptionalSourceSchemaParsedSqlAlloc,
         },
     };

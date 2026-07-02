@@ -776,6 +776,7 @@ pub fn graphTableFunctionSyntheticRowJsonAlloc(
     alloc: Allocator,
     graph_name: []const u8,
     match_json: []const u8,
+    alias_projections: []const types.RelationalRowsGraphAliasProjection,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -784,7 +785,9 @@ pub fn graphTableFunctionSyntheticRowJsonAlloc(
     try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
     try writer.writeAll(",\"node_key\":null,\"depth\":null,\"distance\":null,\"path_json\":null,\"match_json\":");
     try writer.writeAll(match_json);
-    try writer.writeAll(",\"stored_json\":null}");
+    try writer.writeAll(",\"stored_json\":null");
+    try appendGraphAliasProjectionFieldsJson(writer, alias_projections, null);
+    try writer.writeAll("}");
     return try out.toOwnedSlice();
 }
 
@@ -794,6 +797,7 @@ pub fn graphTableFunctionHitRowJsonAlloc(
     hit: types.SearchHit,
     node: ?graph_query_mod.GraphResultNode,
     match_json: ?[]const u8,
+    alias_projections: []const types.RelationalRowsGraphAliasProjection,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -806,7 +810,7 @@ pub fn graphTableFunctionHitRowJsonAlloc(
     } else {
         try writer.writeAll("null");
     }
-    try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, hit.stored_data);
+    try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, hit.stored_data, alias_projections, null);
     return try out.toOwnedSlice();
 }
 
@@ -815,6 +819,7 @@ pub fn graphTableFunctionNodeRowJsonAlloc(
     graph_name: []const u8,
     node: graph_query_mod.GraphResultNode,
     match_json: ?[]const u8,
+    alias_projections: []const types.RelationalRowsGraphAliasProjection,
 ) ![]const u8 {
     var out: std.Io.Writer.Allocating = .init(alloc);
     errdefer out.deinit();
@@ -822,7 +827,29 @@ pub fn graphTableFunctionNodeRowJsonAlloc(
     try writer.writeAll("{\"id\":");
     try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
     try writer.writeAll(",\"score\":null");
-    try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null);
+    try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null, alias_projections, null);
+    return try out.toOwnedSlice();
+}
+
+pub fn graphTableFunctionPatternMatchRowJsonAlloc(
+    alloc: Allocator,
+    graph_name: []const u8,
+    match: types.GraphPatternMatch,
+    match_json: []const u8,
+    alias_projections: []const types.RelationalRowsGraphAliasProjection,
+) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    const writer = &out.writer;
+    const node = if (match.bindings.len > 0) match.bindings[0].node else null;
+    try writer.writeAll("{\"id\":");
+    if (node) |value| {
+        try std.json.Stringify.value(.{ .string = value.key }, .{}, writer);
+    } else {
+        try std.json.Stringify.value(.{ .string = "" }, .{}, writer);
+    }
+    try writer.writeAll(",\"score\":null");
+    try appendGraphTableFunctionTailJson(writer, graph_name, node, match_json, null, alias_projections, match);
     return try out.toOwnedSlice();
 }
 
@@ -852,6 +879,8 @@ fn appendGraphTableFunctionTailJson(
     node: ?graph_query_mod.GraphResultNode,
     match_json: ?[]const u8,
     stored_json: ?[]const u8,
+    alias_projections: []const types.RelationalRowsGraphAliasProjection,
+    match: ?types.GraphPatternMatch,
 ) !void {
     try writer.writeAll(",\"graph_name\":");
     try std.json.Stringify.value(.{ .string = graph_name }, .{}, writer);
@@ -883,7 +912,52 @@ fn appendGraphTableFunctionTailJson(
     if (match_json) |json| try writer.writeAll(json) else try writer.writeAll("null");
     try writer.writeAll(",\"stored_json\":");
     if (stored_json) |json| try writer.writeAll(json) else try writer.writeAll("null");
+    try appendGraphAliasProjectionFieldsJson(writer, alias_projections, match);
     try writer.writeAll("}");
+}
+
+fn appendGraphAliasProjectionFieldsJson(
+    writer: *std.Io.Writer,
+    alias_projections: []const types.RelationalRowsGraphAliasProjection,
+    match: ?types.GraphPatternMatch,
+) !void {
+    for (alias_projections) |projection| {
+        try writer.writeAll(",");
+        try std.json.Stringify.value(.{ .string = projection.output }, .{}, writer);
+        try writer.writeAll(":");
+        const binding = if (match) |value| graphPatternBindingForAlias(value, projection.alias) else null;
+        if (binding) |value| {
+            try writeGraphAliasProjectionValueJson(writer, projection.field, value.node);
+        } else {
+            try writer.writeAll("null");
+        }
+    }
+}
+
+fn graphPatternBindingForAlias(
+    match: types.GraphPatternMatch,
+    alias: []const u8,
+) ?types.GraphPatternBinding {
+    for (match.bindings) |binding| {
+        if (std.mem.eql(u8, binding.alias, alias)) return binding;
+    }
+    return null;
+}
+
+fn writeGraphAliasProjectionValueJson(
+    writer: *std.Io.Writer,
+    field: []const u8,
+    node: graph_query_mod.GraphResultNode,
+) !void {
+    if (std.mem.eql(u8, field, "key")) {
+        try std.json.Stringify.value(.{ .string = node.key }, .{}, writer);
+    } else if (std.mem.eql(u8, field, "depth")) {
+        try writer.print("{d}", .{node.depth});
+    } else if (std.mem.eql(u8, field, "distance")) {
+        try writer.print("{d}", .{node.distance});
+    } else {
+        try writer.writeAll("null");
+    }
 }
 
 fn graphPathJson(
@@ -962,6 +1036,52 @@ fn graphNodeJson(node: graph_query_mod.GraphResultNode, writer: *std.Io.Writer) 
     try writer.writeAll(",\"path\":");
     try graphPathJson(node.path, node.path_edges, writer);
     try writer.writeAll("}");
+}
+
+test "relational graph table function match rows expose alias projection fields" {
+    const alloc = std.testing.allocator;
+
+    var bindings = try alloc.alloc(types.GraphPatternBinding, 2);
+    var match = types.GraphPatternMatch{
+        .bindings = bindings,
+        .path = &.{},
+    };
+    defer match.deinit(alloc);
+    bindings[0] = .{
+        .alias = try alloc.dupe(u8, "doc"),
+        .node = .{
+            .key = try alloc.dupe(u8, "doc:root"),
+            .depth = 0,
+            .distance = 0.0,
+            .path = null,
+            .path_edges = null,
+        },
+    };
+    bindings[1] = .{
+        .alias = try alloc.dupe(u8, "target"),
+        .node = .{
+            .key = try alloc.dupe(u8, "doc:leaf"),
+            .depth = 1,
+            .distance = 1.0,
+            .path = null,
+            .path_edges = null,
+        },
+    };
+
+    const alias_projections = [_]types.RelationalRowsGraphAliasProjection{
+        .{ .alias = "doc", .field = "key", .output = "doc_key" },
+        .{ .alias = "target", .field = "key", .output = "target_key" },
+        .{ .alias = "target", .field = "depth", .output = "target_depth" },
+    };
+    const match_json = try graphPatternMatchJsonAlloc(alloc, match);
+    defer alloc.free(match_json);
+    const row = try graphTableFunctionPatternMatchRowJsonAlloc(alloc, "graph_match", match, match_json, alias_projections[0..]);
+    defer alloc.free(row);
+
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"doc_key\":\"doc:root\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"target_key\":\"doc:leaf\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"target_depth\":1") != null);
+    try std.testing.expect(std.mem.indexOf(u8, row, "\"match_json\":") != null);
 }
 
 pub const system_versioned_history_prefix = "\x00\x00__metadata__:relational-system-history:v1:";
@@ -1377,6 +1497,7 @@ pub fn queryJsonMatchesRequestWithColumns(
     source_columns: []const schema_mod.RelationalColumn,
     now_ns: u64,
 ) !bool {
+    if (req.subquery_predicates.len != 0) return error.UnsupportedQueryRequest;
     if (req.predicates.len == 0 and req.array_any.len == 0 and req.array_contains.len == 0 and req.array_eq.len == 0 and req.in_predicates.len == 0 and req.json_contains.len == 0 and req.json_path_eq.len == 0 and req.json_path_exists.len == 0 and req.text_patterns.len == 0 and req.or_predicates.len == 0 and req.not_predicates.len == 0 and req.access_or_predicates.len == 0 and req.access_not_predicates.len == 0 and req.expression_predicates.len == 0 and req.expression_or_predicates.len == 0 and req.expression_not_predicates.len == 0 and req.expression_array_contains.len == 0) return true;
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
     defer parsed.deinit();
@@ -1521,6 +1642,59 @@ pub fn queryTextPatternPredicatePasses(
     if (actual.* != .string) return predicate.negated;
     const matched = sqlLikePatternMatches(actual.string, predicate.pattern, predicate.case_insensitive);
     return if (predicate.negated) !matched else matched;
+}
+
+fn queryTextPatternValueMatches(value: std.json.Value, pattern: std.json.Value, case_insensitive: bool) !bool {
+    if (value != .string or pattern != .string) return error.InvalidQueryRequest;
+    return sqlLikePatternMatches(value.string, pattern.string, case_insensitive);
+}
+
+fn subqueryProjectedValueAlloc(
+    alloc: Allocator,
+    row_json: []const u8,
+    output_field: []const u8,
+) !std.json.Parsed(std.json.Value) {
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidQueryRequest;
+    const value = parsed.value.object.get(output_field) orelse return error.InvalidQueryRequest;
+    const value_json = try jsonValueStringAlloc(alloc, value);
+    defer alloc.free(value_json);
+    return std.json.parseFromSlice(std.json.Value, alloc, value_json, .{}) catch return error.InvalidQueryRequest;
+}
+
+fn jsonValueStringAlloc(alloc: Allocator, value: std.json.Value) ![]const u8 {
+    var out: std.Io.Writer.Allocating = .init(alloc);
+    errdefer out.deinit();
+    try std.json.Stringify.value(value, .{}, &out.writer);
+    return try out.toOwnedSlice();
+}
+
+fn compareSubqueryPredicateValues(
+    lhs: std.json.Value,
+    rhs: std.json.Value,
+    op: types.RelationalRowsSubqueryPredicateOp,
+    collation: ?[]const u8,
+    negated_pattern: bool,
+) !bool {
+    if (lhs == .null or rhs == .null) return false;
+    const matched = switch (op) {
+        .eq => expressionJsonValuesEqualWithCollation(lhs, rhs, collation),
+        .ne => !expressionJsonValuesEqualWithCollation(lhs, rhs, collation),
+        .gt, .gte, .lt, .lte => blk: {
+            const comparison = compareJsonScalarsWithCollation(lhs, rhs, collation) orelse return error.InvalidQueryRequest;
+            break :blk switch (op) {
+                .gt => comparison == .gt,
+                .gte => comparison == .gt or comparison == .eq,
+                .lt => comparison == .lt,
+                .lte => comparison == .lt or comparison == .eq,
+                else => unreachable,
+            };
+        },
+        .like => try queryTextPatternValueMatches(lhs, rhs, false),
+        .ilike => try queryTextPatternValueMatches(lhs, rhs, true),
+    };
+    return if (negated_pattern) !matched else matched;
 }
 
 pub fn sqlLikePatternMatches(text: []const u8, pattern: []const u8, case_insensitive: bool) bool {
@@ -4508,6 +4682,8 @@ pub fn validateMaterializedCtes(
     for (ctes, 0..) |cte, idx| {
         if (cte.name.len == 0) return error.InvalidQueryRequest;
         if (findMaterializedCte(materialized_ctes, cte.name) != null) return error.InvalidQueryRequest;
+        if (cte.table_function != null and cte.join != null) return error.InvalidQueryRequest;
+        if (cte.join != null and (cte.query.source_cte.len != 0 or cte.query.row_claim != null or cte.query.doc_key_range != null)) return error.InvalidQueryRequest;
         for (ctes[0..idx]) |prior| {
             if (std.mem.eql(u8, prior.name, cte.name)) return error.InvalidQueryRequest;
         }
@@ -4519,7 +4695,28 @@ pub fn validateMaterializedCtes(
         }
         if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
         if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.UnsupportedQueryRequest;
+        if (cte.join) |join| try validateCteJoinReferences(ctes[0..idx], materialized_ctes, join);
     }
+}
+
+fn validateCteJoinReferences(
+    prior_ctes: []const types.RelationalRowsCte,
+    materialized_ctes: []MaterializedCte,
+    join: types.RelationalRowsJoinRequest,
+) !void {
+    try validateCteJoinSideReference(prior_ctes, materialized_ctes, join.left);
+    try validateCteJoinSideReference(prior_ctes, materialized_ctes, join.right);
+}
+
+fn validateCteJoinSideReference(
+    prior_ctes: []const types.RelationalRowsCte,
+    materialized_ctes: []MaterializedCte,
+    source: types.RelationalRowsQueryRequest,
+) !void {
+    if (source.source_cte.len == 0) return;
+    if (findMaterializedCte(materialized_ctes, source.source_cte) != null) return;
+    if (cteNameExists(prior_ctes, source.source_cte)) return;
+    return error.InvalidQueryRequest;
 }
 
 pub fn validateQueryPlanCteReferences(plan: types.RelationalRowsQueryPlan) !void {
@@ -5729,7 +5926,6 @@ pub fn tableFunctionOutputFieldsAlloc(
     table_function: types.RelationalRowsTableFunction,
     req: types.RelationalRowsQueryRequest,
 ) ![]const []const u8 {
-    _ = table_function;
     var fields = std.ArrayListUnmanaged([]const u8).empty;
     errdefer {
         for (fields.items) |field| alloc.free(@constCast(field));
@@ -5738,14 +5934,37 @@ pub fn tableFunctionOutputFieldsAlloc(
     const source_fields = types.relational_rows_graph_table_function_fields[0..];
     if (req.select_all) {
         for (source_fields) |field| try appendOutputFieldAlloc(alloc, &fields, field);
+        switch (table_function) {
+            .graph_query => |graph_query| {
+                for (graph_query.alias_projections) |projection| try appendOutputFieldAlloc(alloc, &fields, projection.output);
+            },
+            else => {},
+        }
     } else {
         for (req.select) |field| {
-            if (!outputFieldExists(source_fields, field)) return error.InvalidQueryRequest;
+            if (!outputFieldExists(source_fields, field) and !tableFunctionAliasOutputFieldExists(table_function, field)) {
+                return error.InvalidQueryRequest;
+            }
             try appendOutputFieldAlloc(alloc, &fields, field);
         }
     }
     try appendQueryProjectionOutputFieldsAlloc(alloc, &fields, req);
     return try fields.toOwnedSlice(alloc);
+}
+
+fn tableFunctionAliasOutputFieldExists(
+    table_function: types.RelationalRowsTableFunction,
+    field: []const u8,
+) bool {
+    return switch (table_function) {
+        .graph_query => |graph_query| blk: {
+            for (graph_query.alias_projections) |projection| {
+                if (std.mem.eql(u8, projection.output, field)) break :blk true;
+            }
+            break :blk false;
+        },
+        else => false,
+    };
 }
 
 pub fn plannedQueryOutputFieldsAlloc(
@@ -5786,9 +6005,15 @@ pub fn planCteOutputsAlloc(
     }
     for (ctes) |cte| {
         if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidQueryRequest;
-        try validateQueryAgainstPlannedCteOutput(planned.items, cte.query);
+        if (cte.join) |join| {
+            try validateJoinAgainstPlannedCteOutput(planned.items, join);
+        } else {
+            try validateQueryAgainstPlannedCteOutput(planned.items, cte.query);
+        }
         const output_fields = if (cte.table_function) |table_function|
             try tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+        else if (cte.join) |join|
+            try joinOutputFieldsAlloc(alloc, join.select)
         else
             try plannedQueryOutputFieldsAlloc(alloc, runtime_schema, planned.items, cte.query);
         errdefer freeOwnedConstStringSlice(alloc, output_fields);
@@ -6069,6 +6294,31 @@ fn queryOutputColumnsAlloc(
         try appendOutputColumnForExpressionProjectionAlloc(alloc, &columns, source_columns, projection);
     }
 
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn joinOutputColumnsAlloc(
+    alloc: Allocator,
+    runtime_schema: schema_mod.TableSchema,
+    materialized_ctes: []MaterializedCte,
+    req: types.RelationalRowsJoinRequest,
+) ![]schema_mod.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(schema_mod.RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |column| freeOwnedOutputColumn(alloc, column);
+        columns.deinit(alloc);
+    }
+
+    if (req.select.len == 0) return try columns.toOwnedSlice(alloc);
+    const left_columns = joinSideSourceColumns(runtime_schema, materialized_ctes, req.left);
+    const right_columns = joinSideSourceColumns(runtime_schema, materialized_ctes, req.right);
+    for (req.select) |projection| {
+        const source_columns = switch (projection.side) {
+            .left => left_columns,
+            .right => right_columns,
+        };
+        try appendOutputColumnForFieldAlloc(alloc, &columns, source_columns, projection.field, projection.output);
+    }
     return try columns.toOwnedSlice(alloc);
 }
 
@@ -6828,6 +7078,13 @@ fn joinFromSourceRowsHashAlloc(
     strategy_selection: types.RelationalRowsJoinStrategySelection,
     now_ns: u64,
 ) !types.RelationalRowsJoinResult {
+    var right_matched: []bool = &.{};
+    if (req.join_type == .full) {
+        right_matched = try alloc.alloc(bool, right_rows.len);
+        @memset(right_matched, false);
+    }
+    defer if (right_matched.len > 0) alloc.free(right_matched);
+
     var right_index = std.StringArrayHashMapUnmanaged(JoinRightList).empty;
     defer deinitJoinRightIndex(alloc, &right_index);
     for (right_rows, 0..) |right_row, right_index_id| {
@@ -6863,14 +7120,21 @@ fn joinFromSourceRowsHashAlloc(
                     const right_row = right_rows[right_index_id];
                     if (!(try joinOnExpressionPredicatesPass(alloc, parsed_left.value, left_columns, right_row, right_columns, req, now_ns))) continue;
                     on_matched = true;
+                    if (req.join_type == .full) right_matched[right_index_id] = true;
                     if (!(try joinMatchPredicatesPass(alloc, parsed_left.value, left_columns, right_row, right_columns, req, now_ns))) continue;
                     try joined.appendJoinedRowAlloc(alloc, left_row, right_row, req.select);
                 }
-                if (on_matched or req.join_type != .left or joinHasMatchPredicates(req)) continue;
+                if (on_matched or (req.join_type != .left and req.join_type != .full) or joinHasMatchPredicates(req)) continue;
             }
         }
-        if (req.join_type == .left and !joinHasMatchPredicates(req)) {
+        if ((req.join_type == .left or req.join_type == .full) and !joinHasMatchPredicates(req)) {
             try joined.appendJoinedRowAlloc(alloc, left_row, null, req.select);
+        }
+    }
+    if (req.join_type == .full and !joinHasMatchPredicates(req)) {
+        for (right_rows, 0..) |right_row, right_index_id| {
+            if (right_matched[right_index_id]) continue;
+            try joined.appendJoinedRowAlloc(alloc, null, right_row, req.select);
         }
     }
 
@@ -7063,7 +7327,7 @@ const JoinRowsAccumulator = struct {
     fn appendJoinedRowAlloc(
         self: *JoinRowsAccumulator,
         alloc: Allocator,
-        left_row: []const u8,
+        left_row: ?[]const u8,
         right_row: ?[]const u8,
         select: []const types.RelationalRowsJoinProjection,
     ) !void {
@@ -7217,13 +7481,16 @@ pub fn joinKeyJsonAlloc(
 
 pub fn joinedRowJsonAlloc(
     alloc: Allocator,
-    left_row_json: []const u8,
+    left_row_json: ?[]const u8,
     right_row_json: ?[]const u8,
     select: []const types.RelationalRowsJoinProjection,
 ) ![]u8 {
-    var parsed_left = std.json.parseFromSlice(std.json.Value, alloc, left_row_json, .{}) catch return error.InvalidQueryRequest;
-    defer parsed_left.deinit();
-    if (parsed_left.value != .object) return error.InvalidQueryRequest;
+    var parsed_left = if (left_row_json) |json|
+        std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidQueryRequest
+    else
+        null;
+    defer if (parsed_left) |*parsed| parsed.deinit();
+    if (parsed_left != null and parsed_left.?.value != .object) return error.InvalidQueryRequest;
     var parsed_right = if (right_row_json) |json|
         std.json.parseFromSlice(std.json.Value, alloc, json, .{}) catch return error.InvalidQueryRequest
     else
@@ -7236,7 +7503,11 @@ pub fn joinedRowJsonAlloc(
         errdefer out.deinit();
         const writer = &out.writer;
         try writer.writeAll("{\"left\":");
-        try std.json.Stringify.value(parsed_left.value, .{}, writer);
+        if (parsed_left) |parsed| {
+            try std.json.Stringify.value(parsed.value, .{}, writer);
+        } else {
+            try writer.writeAll("null");
+        }
         try writer.writeAll(",\"right\":");
         if (parsed_right) |parsed| {
             try std.json.Stringify.value(parsed.value, .{}, writer);
@@ -7256,7 +7527,7 @@ pub fn joinedRowJsonAlloc(
         if (i != 0) try writer.writeByte(',');
         try writer.print("{f}:", .{std.json.fmt(projection.output, .{})});
         const value = switch (projection.side) {
-            .left => jsonValueAtPath(parsed_left.value, projection.field),
+            .left => if (parsed_left) |parsed| jsonValueAtPath(parsed.value, projection.field) else null,
             .right => if (parsed_right) |parsed| jsonValueAtPath(parsed.value, projection.field) else null,
         };
         if (value) |selected| {
@@ -8286,6 +8557,10 @@ pub fn validateQueryAgainstSchema(
         for (group.conditions) |condition| try validateExpressionConditionAgainstSchema(runtime_schema, condition);
     }
     for (req.expression_array_contains) |predicate| try validateExpressionAgainstSchema(runtime_schema, predicate.expression);
+    for (req.subquery_predicates) |predicate| {
+        if (predicate.lhs) |lhs| try validateExpressionAgainstSchema(runtime_schema, lhs);
+        try validateQueryAgainstSchema(runtime_schema, predicate.query);
+    }
     if (!req.select_all) {
         for (req.select) |field| try validateSchemaField(runtime_schema, field);
     }
@@ -13467,6 +13742,97 @@ pub fn Impl(comptime DB: type) type {
             }
         }
 
+        fn relationalRowsSubqueryPredicatesPassAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            row_json: []const u8,
+            predicates: []const types.RelationalRowsSubqueryPredicate,
+            now_ns: u64,
+        ) !bool {
+            if (predicates.len == 0) return true;
+            var parsed = std.json.parseFromSlice(std.json.Value, alloc, row_json, .{}) catch return error.InvalidQueryRequest;
+            defer parsed.deinit();
+            if (parsed.value != .object) return error.InvalidQueryRequest;
+            for (predicates) |predicate| {
+                if (!(try @This().relationalRowsSubqueryPredicatePassesAlloc(self, alloc, runtime_schema, parsed.value, predicate, now_ns))) return false;
+            }
+            return true;
+        }
+
+        fn relationalRowsSubqueryPredicatePassesAlloc(
+            self: *DB,
+            alloc: Allocator,
+            runtime_schema: schema_mod.TableSchema,
+            outer_row: std.json.Value,
+            predicate: types.RelationalRowsSubqueryPredicate,
+            now_ns: u64,
+        ) anyerror!bool {
+            if (predicate.query.source_cte.len != 0 or predicate.query.subquery_predicates.len != 0) return error.UnsupportedQueryRequest;
+            var nested_rows = std.ArrayListUnmanaged(QueryCandidate).empty;
+            defer {
+                for (nested_rows.items) |*row| row.deinit(alloc);
+                nested_rows.deinit(alloc);
+            }
+            try @This().appendRelationalRowsQueryCandidatesForRequestAlloc(self, alloc, runtime_schema, predicate.query, null, &nested_rows);
+            var result = try @This().buildRelationalRowsQueryResultFromCandidatesAlloc(self, alloc, runtime_schema, predicate.query, nested_rows.items);
+            defer result.deinit(alloc);
+
+            switch (predicate.kind) {
+                .exists => return if (predicate.negated) result.rows.len == 0 else result.rows.len != 0,
+                .scalar => {
+                    if (predicate.lhs == null or predicate.output_field.len == 0) return error.InvalidQueryRequest;
+                    if (result.rows.len > 1) return error.InvalidQueryRequest;
+                    if (result.rows.len == 0) return false;
+                    const lhs_json = try expressionValueJsonWithSourcesAndColumnSetsAlloc(alloc, outer_row, null, null, predicate.lhs.?, runtime_schema.relational_columns, runtime_schema.relational_columns, now_ns);
+                    defer alloc.free(lhs_json);
+                    var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
+                    defer lhs.deinit();
+                    var rhs = try subqueryProjectedValueAlloc(alloc, result.rows[0], predicate.output_field);
+                    defer rhs.deinit();
+                    return try compareSubqueryPredicateValues(lhs.value, rhs.value, predicate.op, predicate.collation, false);
+                },
+                .in, .quantified => {
+                    if (predicate.lhs == null or predicate.output_field.len == 0) return error.InvalidQueryRequest;
+                    const lhs_json = try expressionValueJsonWithSourcesAndColumnSetsAlloc(alloc, outer_row, null, null, predicate.lhs.?, runtime_schema.relational_columns, runtime_schema.relational_columns, now_ns);
+                    defer alloc.free(lhs_json);
+                    var lhs = std.json.parseFromSlice(std.json.Value, alloc, lhs_json, .{}) catch return error.InvalidQueryRequest;
+                    defer lhs.deinit();
+                    if (predicate.kind == .in) {
+                        var found = false;
+                        for (result.rows) |row| {
+                            var rhs = try subqueryProjectedValueAlloc(alloc, row, predicate.output_field);
+                            defer rhs.deinit();
+                            if (try compareSubqueryPredicateValues(lhs.value, rhs.value, .eq, predicate.collation, false)) {
+                                found = true;
+                                break;
+                            }
+                        }
+                        return if (predicate.negated) !found else found;
+                    }
+                    const quantifier = predicate.quantifier orelse return error.InvalidQueryRequest;
+                    switch (quantifier) {
+                        .any => {
+                            for (result.rows) |row| {
+                                var rhs = try subqueryProjectedValueAlloc(alloc, row, predicate.output_field);
+                                defer rhs.deinit();
+                                if (try compareSubqueryPredicateValues(lhs.value, rhs.value, predicate.op, predicate.collation, predicate.negated)) return true;
+                            }
+                            return false;
+                        },
+                        .all => {
+                            for (result.rows) |row| {
+                                var rhs = try subqueryProjectedValueAlloc(alloc, row, predicate.output_field);
+                                defer rhs.deinit();
+                                if (!(try compareSubqueryPredicateValues(lhs.value, rhs.value, predicate.op, predicate.collation, predicate.negated))) return false;
+                            }
+                            return true;
+                        },
+                    }
+                },
+            }
+        }
+
         pub fn appendRelationalRowsQueryCandidateAlloc(
             self: *DB,
             alloc: Allocator,
@@ -13494,8 +13860,11 @@ pub fn Impl(comptime DB: type) type {
             if (try @This().isExpiredDocumentKey(self, alloc, doc_key)) return;
             const materialized = try mapper.materializeRelationalRowValueAlloc(alloc, raw_row);
             defer alloc.free(materialized);
+            if (!(try @This().relationalRowsSubqueryPredicatesPassAlloc(self, alloc, runtime_schema, materialized, req.subquery_predicates, currentTimeNs()))) return;
             const version = try self.getTimestamp(alloc, doc_key);
-            try @This().appendRelationalRowsQueryCandidateFromJsonWithColumnsAlloc(alloc, req, rows, doc_key, materialized, version, runtime_schema.relational_columns);
+            var local_req = req;
+            local_req.subquery_predicates = &.{};
+            try @This().appendRelationalRowsQueryCandidateFromJsonWithColumnsAlloc(alloc, local_req, rows, doc_key, materialized, version, runtime_schema.relational_columns);
         }
 
         pub fn appendRelationalRowsQueryCandidateFromJsonAlloc(
@@ -14192,8 +14561,17 @@ pub fn Impl(comptime DB: type) type {
 
                 const result = if (cte.table_function) |table_function|
                     try @This().queryRelationalRowsTableFunctionCteAlloc(self, alloc, cte.name, table_function, cte.query)
-                else
-                    try @This().queryRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes.items, ranges, cte.query);
+                else if (cte.join) |join| blk: {
+                    var joined = try @This().joinRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes.items, ranges, ranges, join);
+                    errdefer joined.deinit(alloc);
+                    const materialized = types.RelationalRowsQueryResult{
+                        .rows = joined.rows,
+                        .total = joined.total_rows,
+                    };
+                    joined.rows = &.{};
+                    joined.total_rows = 0;
+                    break :blk materialized;
+                } else try @This().queryRelationalRowsWithMaterializedCtesAndRangesAlloc(self, alloc, runtime_schema, materialized_ctes.items, ranges, cte.query);
                 var result_transferred = false;
                 errdefer {
                     if (!result_transferred) {
@@ -14206,12 +14584,16 @@ pub fn Impl(comptime DB: type) type {
                 if (materialization_decision == .reject) return error.RelationalRowsCteMaterializationRejected;
                 const output_fields = if (cte.table_function) |table_function|
                     try tableFunctionOutputFieldsAlloc(alloc, table_function, cte.query)
+                else if (cte.join) |join|
+                    try joinOutputFieldsAlloc(alloc, join.select)
                 else
                     try queryOutputFieldsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
                 var output_fields_transferred = false;
                 errdefer if (!output_fields_transferred) freeOwnedConstStringSlice(alloc, output_fields);
                 const output_columns: []schema_mod.RelationalColumn = if (cte.table_function != null)
                     &.{}
+                else if (cte.join) |join|
+                    try joinOutputColumnsAlloc(alloc, runtime_schema, materialized_ctes.items, join)
                 else
                     try queryOutputColumnsAlloc(alloc, runtime_schema, materialized_ctes.items, cte.query);
                 var output_columns_transferred = false;
@@ -14401,25 +14783,29 @@ pub fn Impl(comptime DB: type) type {
             errdefer freeOwnedConstStringArrayList(alloc, &rows);
 
             for (search_result.hits) |hit| {
-                try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_query.name, hit, null, null));
+                try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_query.name, hit, null, null, graph_table_function.alias_projections));
             }
             for (search_result.graph_results) |graph_result| {
                 for (graph_result.nodes) |node| {
-                    try rows.append(alloc, try graphTableFunctionNodeRowJsonAlloc(alloc, graph_result.name, node, null));
+                    try rows.append(alloc, try graphTableFunctionNodeRowJsonAlloc(alloc, graph_result.name, node, null, graph_table_function.alias_projections));
                 }
                 for (graph_result.matches) |match| {
                     const match_json = try graphPatternMatchJsonAlloc(alloc, match);
                     defer alloc.free(match_json);
+                    if (graph_table_function.alias_projections.len > 0) {
+                        try rows.append(alloc, try graphTableFunctionPatternMatchRowJsonAlloc(alloc, graph_result.name, match, match_json, graph_table_function.alias_projections));
+                        continue;
+                    }
                     if (match.bindings.len == 0) {
-                        try rows.append(alloc, try graphTableFunctionSyntheticRowJsonAlloc(alloc, graph_result.name, match_json));
+                        try rows.append(alloc, try graphTableFunctionSyntheticRowJsonAlloc(alloc, graph_result.name, match_json, graph_table_function.alias_projections));
                         continue;
                     }
                     for (match.bindings) |binding| {
-                        try rows.append(alloc, try graphTableFunctionNodeRowJsonAlloc(alloc, graph_result.name, binding.node, match_json));
+                        try rows.append(alloc, try graphTableFunctionNodeRowJsonAlloc(alloc, graph_result.name, binding.node, match_json, graph_table_function.alias_projections));
                     }
                 }
                 for (graph_result.hits) |hit| {
-                    try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_result.name, hit, null, null));
+                    try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, graph_result.name, hit, null, null, graph_table_function.alias_projections));
                 }
             }
             return try rows.toOwnedSlice(alloc);
@@ -14461,7 +14847,7 @@ pub fn Impl(comptime DB: type) type {
             errdefer freeOwnedConstStringArrayList(alloc, &rows);
 
             for (search_result.hits) |hit| {
-                try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, "graph_metric_rerank", hit, null, null));
+                try rows.append(alloc, try graphTableFunctionHitRowJsonAlloc(alloc, "graph_metric_rerank", hit, null, null, &.{}));
             }
             return try rows.toOwnedSlice(alloc);
         }
@@ -18254,6 +18640,22 @@ test "relational rows join composes typed row-query streams" {
     try std.testing.expectEqual(@as(u32, 3), paged_without_output_order.total_rows);
     try std.testing.expectEqual(@as(usize, 1), paged_without_output_order.rows.len);
     try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", paged_without_output_order.rows[0]);
+
+    var full_result = try db.joinRelationalRows(alloc, runtime_schema, .{
+        .left = .{ .predicates = left_predicates[0..], .order_by = left_order[0..] },
+        .right = .{ .predicates = right_predicates[0..] },
+        .on = on[0..],
+        .join_type = .full,
+        .select = select[0..],
+    });
+    defer full_result.deinit(alloc);
+
+    try std.testing.expectEqual(@as(u32, 4), full_result.total_rows);
+    try std.testing.expectEqual(@as(usize, 4), full_result.rows.len);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o1\",\"customer_name\":\"Alice\",\"amount\":10}", full_result.rows[0]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o2\",\"customer_name\":null,\"amount\":5}", full_result.rows[1]);
+    try std.testing.expectEqualStrings("{\"order_id\":\"o3\",\"customer_name\":null,\"amount\":7}", full_result.rows[2]);
+    try std.testing.expectEqualStrings("{\"order_id\":null,\"customer_name\":\"Bob\",\"amount\":null}", full_result.rows[3]);
 
     const left_ranges = [_]types.RelationalRowsDocKeyRange{
         .{ .start = "row:o1", .end = "row:o3" },

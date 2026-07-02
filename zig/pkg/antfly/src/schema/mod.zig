@@ -307,6 +307,7 @@ fn appendRuntimeRelationalColumnForProperty(
         .indexed = if (property.antfly_index) |indexed| indexed else true,
         .index_lifecycle = runtimeRelationalIndexLifecycle(property.index_lifecycle),
         .index_generation = property.index_generation orelse 0,
+        .cardinality_proof = property.cardinality_proof,
     };
     name_owned = false;
     path_owned = false;
@@ -1649,6 +1650,45 @@ test "deriveRuntimeTableSchema carries nested document SQL column aliases" {
     try std.testing.expectEqual(storage_schema.AntflyType.keyword, plan.field_type);
     try std.testing.expect(!plan.nullable);
     try std.testing.expect(findRuntimeColumn(runtime, "plan") == null);
+}
+
+test "deriveRuntimeTableSchema carries document join cardinality proof metadata" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"account_id":{"type":"keyword","x-antfly-cardinality-proof":"unique"},"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-column-name":"metadata_plan","x-antfly-cardinality-proof":"unique"}}}}}}}}
+    ;
+
+    var parsed = try parseValidatedTableSchema(alloc, schema_json);
+    defer parsed.deinit(alloc);
+    const runtime = try deriveRuntimeTableSchema(alloc, parsed);
+    defer storage_schema.freeSchema(alloc, runtime);
+
+    const account_id = findRuntimeColumn(runtime, "account_id") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqual(storage_schema.RelationalColumnCardinalityProof.unique, account_id.cardinality_proof);
+    const metadata_plan = findRuntimeColumn(runtime, "metadata_plan") orelse return error.TestExpectedEqual;
+    try std.testing.expectEqualStrings("metadata.plan", metadata_plan.path);
+    try std.testing.expectEqual(storage_schema.RelationalColumnCardinalityProof.unique, metadata_plan.cardinality_proof);
+}
+
+test "deriveRuntimeTableSchema rejects invalid document join cardinality proofs" {
+    const alloc = std.testing.allocator;
+
+    const invalid_schemas = [_][]const u8{
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"payload":{"type":"json","x-antfly-cardinality-proof":"unique"}}}}}}
+        ,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"account_id":{"type":"keyword","x-antfly-index":false,"x-antfly-cardinality-proof":"unique"}}}}}}
+        ,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"account_id":{"type":"keyword","x-antfly-index-where":{"all":[{"field":"account_id","op":"is_not_null"}]},"x-antfly-cardinality-proof":"unique"}}}}}}
+        ,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"account_id":{"type":"keyword","x-antfly-index-name":"account_id_idx","x-antfly-index-keys":[{"column":"account_id","direction":"desc"}],"x-antfly-cardinality-proof":"unique"}}}}}}
+        ,
+        \\{"version":1,"storage_mode":"document","default_type":"doc","document_schemas":{"doc":{"schema":{"type":"object","properties":{"metadata":{"type":"object","properties":{"plan":{"type":"keyword","x-antfly-cardinality-proof":"unique"}}}}}}}}
+        ,
+    };
+
+    for (invalid_schemas) |schema_json| {
+        try std.testing.expectError(error.InvalidSchemaUpdateRequest, parseValidatedTableSchema(alloc, schema_json));
+    }
 }
 
 test "deriveRuntimeTableSchema rejects invalid or duplicate document SQL column aliases" {

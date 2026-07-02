@@ -27,9 +27,9 @@
       "id": "mutation-source-range-movement-chaos",
       "relational_slices_section": "Multi-row DML and queue claims",
       "surface": "mutation_source_range_movement",
-      "status": "partial_release_gated",
-      "current_evidence": "Hosted mutation-source routing retries remote collect after topology change and gates stale topology epoch rejection before local owner calls.",
-      "missing_evidence": "Release-gated range-movement chaos still needs real hosted/provisioned owner changes between collect, plan, owner-local stage, claim renewal, commit/abort, and claim resolution for update and delete.",
+      "status": "release_evidence",
+      "current_evidence": "Hosted/provisioned mutation-source coverage now exercises stale topology epoch rejection before owner-local collect/stage, remote collect retry after topology movement, planned staging across remote owners for update and delete, partial-stage retry/fail-closed behavior, autocommit prepare topology-change abort without replay, expired claim reopen recovery, and skip-locked ordering across range-boundary movement plus leader handoff with participant predicates.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/api/table_writes/sources.zig",
       "evidence_symbol": "hosted mutation source retries remote collect after topology change",
       "release_gate": "relational-release-gate"

@@ -130,6 +130,7 @@ pub fn schemaJsonPropertyFromColumnAlloc(alloc: std.mem.Allocator, column: runti
     if (column.index_name) |index_name| try putJsonString(alloc, &object, "x-antfly-index-name", index_name);
     if (column.index_include_columns.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-include"), try schemaJsonStringArrayAlloc(alloc, column.index_include_columns));
     if (column.index_keys.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-keys"), try schemaJsonRelationalIndexKeysAlloc(alloc, column.index_keys));
+    if (column.cardinality_proof == .unique) try putJsonString(alloc, &object, "x-antfly-cardinality-proof", "unique");
     if (column.collation) |collation| try putJsonString(alloc, &object, "collation", collation);
     if (column.index_where.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where"), try schemaJsonUniquePredicateDefinitionAlloc(alloc, column.index_where));
     if (column.index_where_expressions.len > 0) try object.put(alloc, try alloc.dupe(u8, "x-antfly-index-where-expressions"), try schemaJsonExpressionConditionsAlloc(alloc, column.index_where_expressions));

@@ -9,6 +9,7 @@
     "document_table_ddl_mixed_relational_shape",
     "document_table_ddl_multi_document_type_unsupported",
     "document_table_ddl_shorthand",
-    "document_table_ddl_unknown_default_type"
+    "document_table_ddl_unknown_default_type",
+    "graph_query_plan"
   ]
 }

@@ -38,9 +38,9 @@
       "id": "routed-merge-join-order-proof",
       "relational_slices_section": "Routed reads, joins, CTEs, and streaming",
       "surface": "routed_merge_join_order_proof",
-      "status": "partial_release_gated",
-      "current_evidence": "Sorted input proof requires leading ascending join-key order, and routed merge joins currently reject range fanout, input filters, and limit/offset pagination before scanning.",
-      "missing_evidence": "Routed merge joins must remain fail-closed until every non-materialized routed source shape has durable proof of global leading ascending join-key order after owner scans, topology retry, filtering, and pagination.",
+      "status": "release_evidence",
+      "current_evidence": "Routed merge joins are release-gated as deterministic fail-closed for unproven routed source shapes. Typed sorted-input proof accepts only leading ascending field orders on the join keys and rejects wrong fields, descending order, expression order keys, and null-test order keys. Routed read preflight rejects merge joins with range fanout, filters, limit, or offset before scanning, while locally materialized sorted inputs can still execute merge strategy with explicit strategy selection.",
+      "missing_evidence": "",
       "evidence_file": "zig/pkg/antfly/src/storage/db/types.zig",
       "evidence_symbol": "relational rows join sorted input proof requires leading ascending join key order",
       "release_gate": "relational-release-gate"

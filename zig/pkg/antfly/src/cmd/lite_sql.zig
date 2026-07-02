@@ -866,6 +866,13 @@ test "lite sql detects generated Antfly query function reads before source bindi
     );
     defer query_function_read.deinit(allocator);
     try std.testing.expect(sql_adapter.parsedSqlHasGeneratedAntflyReadSource(&query_function_read));
+
+    var graph_query_function_read = try sql_adapter.ParsedSql.initAlloc(
+        allocator,
+        "SELECT * FROM antfly.graph_match(table_name => 'docs', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b', max_results => 5, limit => 5);",
+    );
+    defer graph_query_function_read.deinit(allocator);
+    try std.testing.expect(sql_adapter.parsedSqlHasGeneratedAntflyReadSource(&graph_query_function_read));
 }
 
 test "lite sql reads legacy local schema metadata without table record" {

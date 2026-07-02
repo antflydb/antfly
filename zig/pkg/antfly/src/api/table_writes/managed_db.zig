@@ -601,6 +601,7 @@ const SchemaValidationWriteState = struct {
 
 fn resolveWritesForSchemaValidation(
     alloc: std.mem.Allocator,
+    schema: anytype,
     db: *db_mod.DB,
     base_writes: []const db_mod.types.BatchWrite,
     deletes: []const []const u8,
@@ -627,14 +628,72 @@ fn resolveWritesForSchemaValidation(
             error.InvalidArgument => return error.InvalidBatchRequest,
             else => return err,
         } orelse continue;
+        var resolved_owned = true;
+        errdefer if (resolved_owned) alloc.free(resolved);
 
-        state.applyOwnedWrite(alloc, transform.key, resolved) catch |err| {
+        const resolved_for_validation = if (!has_request_state) blk: {
+            const stripped = stripGeneratedDocumentFieldsForValidationAlloc(alloc, schema, resolved) catch |err| {
+                return err;
+            };
+            resolved_owned = false;
             alloc.free(resolved);
-            return err;
-        };
+            break :blk stripped;
+        } else resolved;
+        var validation_owned = true;
+        if (has_request_state) resolved_owned = false;
+        errdefer if (validation_owned) alloc.free(resolved_for_validation);
+
+        try state.applyOwnedWrite(alloc, transform.key, resolved_for_validation);
+        validation_owned = false;
+        resolved_owned = false;
     }
 
     return try state.toOwnedWrites(alloc);
+}
+
+fn documentSchemaHasGeneratedField(schema: anytype, field_name: []const u8) bool {
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            if (property.generated == null) continue;
+            if (std.mem.eql(u8, property.name, field_name)) return true;
+        }
+    }
+    return false;
+}
+
+fn transformPathTopLevelField(path: []const u8) []const u8 {
+    if (std.mem.indexOfAny(u8, path, "./")) |idx| return path[0..idx];
+    return path;
+}
+
+fn rejectGeneratedDocumentTransformTargets(schema: anytype, transforms: []const db_mod.types.DocumentTransform) !void {
+    if (schema.storage_mode != .document) return;
+    for (transforms) |transform| {
+        for (transform.operations) |operation| {
+            if (documentSchemaHasGeneratedField(schema, transformPathTopLevelField(operation.path))) return error.InvalidBatchRequest;
+        }
+    }
+}
+
+fn stripGeneratedDocumentFieldsForValidationAlloc(
+    alloc: std.mem.Allocator,
+    schema: anytype,
+    value_json: []const u8,
+) ![]u8 {
+    if (schema.storage_mode != .document) return try alloc.dupe(u8, value_json);
+    var parsed = std.json.parseFromSlice(std.json.Value, alloc, value_json, .{ .allocate = .alloc_always }) catch return error.InvalidBatchRequest;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.InvalidBatchRequest;
+
+    var removed = false;
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            if (property.generated == null) continue;
+            if (parsed.value.object.fetchSwapRemove(property.name)) |_| removed = true;
+        }
+    }
+    if (!removed) return try alloc.dupe(u8, value_json);
+    return try std.json.Stringify.valueAlloc(alloc, parsed.value, .{});
 }
 
 fn transactionWritesToBatchWrites(
@@ -670,8 +729,9 @@ pub fn validateTableBatchAgainstLocalSchema(
         .deletes = deletes,
         .transforms = transforms,
     });
+    try rejectGeneratedDocumentTransformTargets(parsed_schema, transforms);
 
-    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+    const effective_writes = try resolveWritesForSchemaValidation(alloc, parsed_schema, db, writes, deletes, transforms);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 
@@ -741,8 +801,9 @@ pub fn validateTableBatchAgainstSchemaJson(
         .deletes = deletes,
         .transforms = transforms,
     });
+    try rejectGeneratedDocumentTransformTargets(parsed_schema, transforms);
 
-    const effective_writes = try resolveWritesForSchemaValidation(alloc, db, writes, deletes, transforms);
+    const effective_writes = try resolveWritesForSchemaValidation(alloc, parsed_schema, db, writes, deletes, transforms);
     defer freeOwnedBatchWrites(alloc, effective_writes);
     if (effective_writes.len == 0) return;
 

@@ -24,6 +24,7 @@ pub const relational_rows = @import("relational_rows.zig");
 pub const catalog_resources = @import("catalog_resources.zig");
 pub const sql_adapter = @import("../sql/mod.zig");
 const sql_adapter_integration = @import("sql_adapter_integration.zig");
+const public_sql_endpoint_parity = @import("public_sql_endpoint_parity.zig");
 pub const catalog_jobs = @import("../metadata/catalog/jobs.zig");
 pub const query = @import("query.zig");
 pub const query_contract = @import("query_contract.zig");
@@ -226,6 +227,7 @@ test "api module compiles" {
     _ = backups;
     _ = relational_rows;
     _ = sql_adapter_integration;
+    _ = public_sql_endpoint_parity;
     _ = query;
     _ = query_contract;
     _ = cluster_api_http;

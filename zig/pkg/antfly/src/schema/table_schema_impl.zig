@@ -588,6 +588,7 @@ pub const DocumentProperty = struct {
     index_name: ?[]const u8 = null,
     index_include_columns: [][]const u8 = &.{},
     index_keys: []storage_schema.RelationalIndexKey = &.{},
+    cardinality_proof: storage_schema.RelationalColumnCardinalityProof = .none,
     integer_only: bool = false,
     format: ?[]const u8 = null,
     allows_null: bool = false,
@@ -866,6 +867,7 @@ pub fn parseSchemaUpdateRequest(alloc: std.mem.Allocator, body: []const u8) ![]u
     var schema = try parseTableSchemaValue(alloc, parsed.value);
     defer schema.deinit(alloc);
     try validateParsedTtlSchema(schema);
+    try validateParsedDocumentJoinCardinalityProofs(schema);
     try validateParsedRelationalSchema(schema);
     return try stringifyJsonValue(alloc, parsed.value);
 }
@@ -887,6 +889,7 @@ pub fn parseSchema(alloc: std.mem.Allocator, schema_json: []const u8) !TableSche
         owned.deinit(alloc);
     }
     try validateParsedTtlSchema(schema);
+    try validateParsedDocumentJoinCardinalityProofs(schema);
     try validateParsedRelationalSchema(schema);
     return schema;
 }
@@ -1847,6 +1850,10 @@ fn validatePropertySchemaKeywords(context: SchemaContext, object: std.json.Objec
     if (object.get("x-antfly-index-keys")) |index_keys| {
         if (index_keys != .null) try validateRelationalIndexKeysJson(index_keys);
     }
+    if (object.get("x-antfly-cardinality-proof")) |cardinality_proof| {
+        if (cardinality_proof != .null and cardinality_proof != .string) return error.InvalidSchemaUpdateRequest;
+        if (cardinality_proof == .string and storage_schema.RelationalColumnCardinalityProof.fromString(cardinality_proof.string) == null) return error.InvalidSchemaUpdateRequest;
+    }
     if (object.get("x-antfly-index-where")) |index_where| {
         if (index_where != .null) try validateUniquePredicateDefinition(index_where);
     }
@@ -2441,6 +2448,77 @@ fn validateParsedTtlSchema(schema: TableSchema) !void {
             }
         }
     }
+}
+
+fn validateParsedDocumentJoinCardinalityProofs(schema: TableSchema) !void {
+    for (schema.document_schemas) |document_schema| {
+        for (document_schema.properties) |property| {
+            try validateDocumentJoinCardinalityProofProperty(property, true);
+        }
+    }
+}
+
+fn validateDocumentJoinCardinalityProofProperty(
+    property: DocumentProperty,
+    materializes_runtime_column: bool,
+) !void {
+    if (property.cardinality_proof != .none) {
+        if (!materializes_runtime_column) return error.InvalidSchemaUpdateRequest;
+        if (!isDocumentJoinCardinalityProofScalar(property)) return error.InvalidSchemaUpdateRequest;
+        if (isReservedDocumentSqlField(property.name)) return error.InvalidSchemaUpdateRequest;
+        if (property.sql_column_name) |column_name| {
+            if (isReservedDocumentSqlField(column_name)) return error.InvalidSchemaUpdateRequest;
+        }
+        if (property.generated != null) return error.InvalidSchemaUpdateRequest;
+        if (property.antfly_index != null and !property.antfly_index.?) return error.InvalidSchemaUpdateRequest;
+        if (property.index_lifecycle != null and property.index_lifecycle.? != .ready) return error.InvalidSchemaUpdateRequest;
+        if (property.index_where.len != 0 or property.index_where_expressions.len != 0) return error.InvalidSchemaUpdateRequest;
+        if (property.index_keys.len > 1) return error.InvalidSchemaUpdateRequest;
+        if (property.index_keys.len == 1) {
+            const key = property.index_keys[0];
+            const column_name = property.sql_column_name orelse property.name;
+            if (!std.mem.eql(u8, key.column, column_name)) return error.InvalidSchemaUpdateRequest;
+            if (key.direction != .asc or key.nulls != .default) return error.InvalidSchemaUpdateRequest;
+        }
+    }
+
+    for (property.properties) |child| {
+        try validateDocumentJoinCardinalityProofProperty(child, child.sql_column_name != null);
+    }
+    if (property.item) |item| try validateDocumentJoinCardinalityProofProperty(item.*, false);
+    if (property.additional_properties_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    if (property.unevaluated_properties_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    if (property.unevaluated_items_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    for (property.prefix_items) |child| try validateDocumentJoinCardinalityProofProperty(child, false);
+    for (property.pattern_properties) |child| try validateDocumentJoinCardinalityProofProperty(child.property.*, false);
+    for (property.dependent_schemas) |dependency| try validateDocumentJoinCardinalityProofProperty(dependency.schema.*, false);
+    for (property.any_of) |child| try validateDocumentJoinCardinalityProofProperty(child, false);
+    for (property.one_of) |child| try validateDocumentJoinCardinalityProofProperty(child, false);
+    for (property.all_of) |child| try validateDocumentJoinCardinalityProofProperty(child, false);
+    if (property.not_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    if (property.if_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    if (property.then_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    if (property.else_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+    if (property.contains_schema) |child| try validateDocumentJoinCardinalityProofProperty(child.*, false);
+}
+
+fn isReservedDocumentSqlField(name: []const u8) bool {
+    return std.ascii.eqlIgnoreCase(name, "_id") or
+        std.ascii.eqlIgnoreCase(name, "_doc") or
+        std.ascii.eqlIgnoreCase(name, "_version");
+}
+
+fn isDocumentJoinCardinalityProofScalar(property: DocumentProperty) bool {
+    const field_type = property.field_type orelse return false;
+    return std.mem.eql(u8, field_type, "keyword") or
+        std.mem.eql(u8, field_type, "link") or
+        std.mem.eql(u8, field_type, "string") or
+        std.mem.eql(u8, field_type, "text") or
+        std.mem.eql(u8, field_type, "boolean") or
+        std.mem.eql(u8, field_type, "datetime") or
+        std.mem.eql(u8, field_type, "integer") or
+        std.mem.eql(u8, field_type, "numeric") or
+        std.mem.eql(u8, field_type, "number");
 }
 
 fn validateParsedRelationalSchema(schema: TableSchema) !void {
@@ -3804,6 +3882,14 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
     else
         &.{};
     errdefer freeRelationalIndexKeys(alloc, index_keys);
+    const cardinality_proof = if (object.get("x-antfly-cardinality-proof")) |proof_value|
+        switch (proof_value) {
+            .string => |value| storage_schema.RelationalColumnCardinalityProof.fromString(value) orelse return error.InvalidSchemaUpdateRequest,
+            .null => storage_schema.RelationalColumnCardinalityProof.none,
+            else => return error.InvalidSchemaUpdateRequest,
+        }
+    else
+        storage_schema.RelationalColumnCardinalityProof.none;
     const include_in_all_fields: [][]const u8 = if (object.get("x-antfly-include-in-all")) |include_value|
         if (include_value == .array) try parseRequiredFields(alloc, include_value.array) else &[_][]const u8{}
     else
@@ -4115,6 +4201,7 @@ fn parseAnonymousPropertyKeywords(alloc: std.mem.Allocator, context: SchemaConte
         .index_name = index_name,
         .index_include_columns = index_include_columns,
         .index_keys = index_keys,
+        .cardinality_proof = cardinality_proof,
         .integer_only = type_spec.integer_only,
         .format = format,
         .allows_null = allows_null,

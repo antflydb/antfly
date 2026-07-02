@@ -27,11 +27,11 @@
       "id": "rest-sdk-expression-exposure",
       "relational_slices_section": "Shared scalar expression AST completion",
       "surface": "rest_sdk_expression_exposure",
-      "status": "partial_release_gated",
-      "current_evidence": "Typed row query execution projects generic expression outputs, and baseline coverage includes typed casts across REST/SDK-style row plans and SQL lowering.",
-      "missing_evidence": "Every promoted typed expression node still needs REST/SDK row-plan exposure proving SQL and non-SQL callers execute the same expression contract.",
-      "evidence_file": "zig/pkg/antfly/src/storage/db/relational_rows.zig",
-      "evidence_symbol": "relational rows query projects typed expression outputs",
+      "status": "release_evidence",
+      "current_evidence": "The row-query contract parses every public RelationalRowsExpressionKind through REST/SDK-style expression JSON and fails if any promoted non-leaf expression lacks request exposure. Runtime row-query tests execute typed expression outputs across generic AST, string, numeric, boolean, date/time, interval, regexp, JSON, and array operator families, while the SQL/API required coverage corpus pins the SQL lowering side of the same expression contract.",
+      "missing_evidence": "",
+      "evidence_file": "zig/pkg/antfly/src/sql/relational_rows.zig",
+      "evidence_symbol": "relational rows query contract parses public expression operator surface",
       "release_gate": "relational-release-gate"
     }
   ]

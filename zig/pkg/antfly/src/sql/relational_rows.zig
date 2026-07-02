@@ -666,12 +666,24 @@ pub fn executeRowsSetOperationPlanOnJsonRowsAlloc(
     plan: db_mod.types.RelationalRowsSetOperationPlan,
     base_rows: []const []const u8,
 ) !OwnedRowsQueryResult {
+    return try executeRowsSetOperationPlanOnJsonRowsWithSourcesAlloc(alloc, base_schema, plan, base_rows, &.{});
+}
+
+pub fn executeRowsSetOperationPlanOnJsonRowsWithSourcesAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    plan: db_mod.types.RelationalRowsSetOperationPlan,
+    base_rows: []const []const u8,
+    cte_sources: []const RowsCteJsonSource,
+) !OwnedRowsQueryResult {
     if (base_schema.storage_mode != .relational) return error.InvalidRowsRequest;
     if (plan.left.ctes.len != 0 or plan.right.ctes.len != 0) return error.InvalidRowsRequest;
     try validateRowsPlanRanges(plan.left.ranges);
     try validateRowsPlanRanges(plan.right.ranges);
 
-    var materialized_ctes = try materializeRowsJsonPlanCtesAlloc(alloc, base_schema, base_rows, &.{}, plan.ctes);
+    const cte_ranges = try rowsPlanRangesForSetOperationAlloc(alloc, plan.left.ranges, plan.right.ranges);
+    defer if (cte_ranges.len > 0) alloc.free(cte_ranges);
+    var materialized_ctes = try materializeRowsJsonPlanCtesWithSourcesAlloc(alloc, base_schema, base_rows, cte_ranges, plan.ctes, cte_sources);
     defer materialized_ctes.deinit(alloc);
     try validateRowsQueryAgainstPlannedCteOutput(materialized_ctes.planned, plan.left.query);
     try validateRowsQueryAgainstPlannedCteOutput(materialized_ctes.planned, plan.right.query);
@@ -1068,6 +1080,12 @@ const RowsJsonMaterializedCtes = struct {
     }
 };
 
+pub const RowsCteJsonSource = struct {
+    table_name: []const u8,
+    schema: runtime_schema.TableSchema,
+    rows: []const []const u8,
+};
+
 fn materializeRowsJsonPlanCtesAlloc(
     alloc: std.mem.Allocator,
     base_schema: runtime_schema.TableSchema,
@@ -1075,7 +1093,18 @@ fn materializeRowsJsonPlanCtesAlloc(
     ranges: []const db_mod.types.RelationalRowsDocKeyRange,
     ctes: []const db_mod.types.RelationalRowsCte,
 ) !RowsJsonMaterializedCtes {
-    const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, ctes);
+    return try materializeRowsJsonPlanCtesWithSourcesAlloc(alloc, base_schema, base_rows, ranges, ctes, &.{});
+}
+
+fn materializeRowsJsonPlanCtesWithSourcesAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    base_rows: []const []const u8,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    cte_sources: []const RowsCteJsonSource,
+) !RowsJsonMaterializedCtes {
+    const planned_ctes = try planRowsCteOutputsWithJsonSourcesAlloc(alloc, base_schema, ctes, cte_sources);
     var planned_ctes_transferred = false;
     errdefer if (!planned_ctes_transferred) freeRowsPlannedCtes(alloc, planned_ctes);
 
@@ -1084,7 +1113,7 @@ fn materializeRowsJsonPlanCtesAlloc(
         for (materialized_ctes.items) |*cte| cte.deinit(alloc);
         materialized_ctes.deinit(alloc);
     }
-    try materializeRowsJsonCtesAlloc(alloc, base_schema, base_rows, ranges, ctes, planned_ctes, &materialized_ctes);
+    try materializeRowsJsonCtesWithSourcesAlloc(alloc, base_schema, base_rows, ranges, ctes, cte_sources, planned_ctes, &materialized_ctes);
     planned_ctes_transferred = true;
     return .{
         .planned = planned_ctes,
@@ -1199,6 +1228,43 @@ fn rowsPlanRangesForJoinAlloc(
     return try out.toOwnedSlice(alloc);
 }
 
+fn rowsPlanRangesForSetOperationAlloc(
+    alloc: std.mem.Allocator,
+    left_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const db_mod.types.RelationalRowsDocKeyRange {
+    if (left_ranges.len == 0 or right_ranges.len == 0) return &.{};
+    return try rowsPlanRangesUnionAlloc(alloc, left_ranges, right_ranges);
+}
+
+fn rowsPlanRangesUnionAlloc(
+    alloc: std.mem.Allocator,
+    left_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    right_ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+) ![]const db_mod.types.RelationalRowsDocKeyRange {
+    const sorted = try alloc.alloc(db_mod.types.RelationalRowsDocKeyRange, left_ranges.len + right_ranges.len);
+    defer alloc.free(sorted);
+    @memcpy(sorted[0..left_ranges.len], left_ranges);
+    @memcpy(sorted[left_ranges.len..], right_ranges);
+    std.sort.pdq(db_mod.types.RelationalRowsDocKeyRange, sorted, {}, rowsDocKeyRangeLessThan);
+
+    var out = std.ArrayListUnmanaged(db_mod.types.RelationalRowsDocKeyRange).empty;
+    errdefer out.deinit(alloc);
+    for (sorted) |range| {
+        if (out.items.len == 0) {
+            try out.append(alloc, range);
+            continue;
+        }
+        const last = &out.items[out.items.len - 1];
+        if (rowsDocKeyRangesOverlapOrTouch(last.*, range)) {
+            last.end = rowsDocKeyRangeMaxEnd(last.end, range.end);
+        } else {
+            try out.append(alloc, range);
+        }
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
 fn rowsDocKeyRangesOverlapOrTouch(lhs: db_mod.types.RelationalRowsDocKeyRange, rhs: db_mod.types.RelationalRowsDocKeyRange) bool {
     if (lhs.end.len == 0) return true;
     if (rhs.start.len == 0) return true;
@@ -1229,17 +1295,115 @@ fn materializeRowsJsonCtesAlloc(
     planned_ctes: []const RowsPlannedCte,
     materialized_ctes: *std.ArrayListUnmanaged(RowsJsonMaterializedCte),
 ) !void {
+    return try materializeRowsJsonCtesWithSourcesAlloc(alloc, base_schema, base_rows, ranges, ctes, &.{}, planned_ctes, materialized_ctes);
+}
+
+fn rowsJsonSourceForCteSideAlloc(
+    alloc: std.mem.Allocator,
+    materialized_ctes: []RowsJsonMaterializedCte,
+    base_name: []const u8,
+    base_schema: runtime_schema.TableSchema,
+    base_rows: []const []const u8,
+    source_cte: []const u8,
+    table_name: []const u8,
+    cte_sources: []const RowsCteJsonSource,
+) !?RowsJsonSource {
+    if (source_cte.len != 0) return try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes, base_name, base_schema, base_rows, source_cte);
+    if (table_name.len == 0 or cte_sources.len == 0) return .{ .name = base_name, .schema = base_schema, .rows = base_rows };
+    for (cte_sources) |source| {
+        if (std.mem.eql(u8, source.table_name, table_name)) {
+            return .{ .name = table_name, .schema = source.schema, .rows = source.rows };
+        }
+    }
+    return null;
+}
+
+fn materializeRowsJsonCtesWithSourcesAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    base_rows: []const []const u8,
+    ranges: []const db_mod.types.RelationalRowsDocKeyRange,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    cte_sources: []const RowsCteJsonSource,
+    planned_ctes: []const RowsPlannedCte,
+    materialized_ctes: *std.ArrayListUnmanaged(RowsJsonMaterializedCte),
+) !void {
     if (ctes.len != planned_ctes.len) return error.InvalidRowsRequest;
     for (ctes, 0..) |cte, cte_index| {
-        if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.InvalidRowsRequest;
-        const source_schema = rowsPlannedQuerySourceSchema(base_schema, planned_ctes[0..cte_index], cte.query) orelse return error.InvalidRowsRequest;
-        var source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.items, "cte_source", base_schema, base_rows, cte.query.source_cte)) orelse return error.InvalidRowsRequest;
-        defer source.deinit(alloc);
+        var result: OwnedRowsQueryResult = if (cte.join) |join| blk: {
+            const left_schema = rowsReadCteSideOutputSchema(base_schema, planned_ctes[0..cte_index], join.left, cte.left_table, cte_sources) orelse return error.InvalidRowsRequest;
+            const right_schema = rowsReadCteSideOutputSchema(base_schema, planned_ctes[0..cte_index], join.right, cte.right_table, cte_sources) orelse return error.InvalidRowsRequest;
+            var left_source = (try rowsJsonSourceForCteSideAlloc(alloc, materialized_ctes.items, "cte_join_left", left_schema, base_rows, join.left.source_cte, cte.left_table, cte_sources)) orelse return error.InvalidRowsRequest;
+            defer left_source.deinit(alloc);
+            var left_query = rowsJoinSideSourceQuery(join.left);
+            left_query.source_cte = "";
+            const left_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (join.left.source_cte.len == 0) ranges else &.{};
+            var left_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, left_source.schema, left_query, left_source.rows, left_ranges);
+            defer left_result.deinit(alloc);
 
-        var query = cte.query;
-        query.source_cte = "";
-        const source_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (cte.query.source_cte.len == 0) ranges else &.{};
-        var result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source_schema, query, source.rows, source_ranges);
+            var right_source = (try rowsJsonSourceForCteSideAlloc(alloc, materialized_ctes.items, "cte_join_right", right_schema, base_rows, join.right.source_cte, cte.right_table, cte_sources)) orelse return error.InvalidRowsRequest;
+            defer right_source.deinit(alloc);
+            var right_query = rowsJoinSideSourceQuery(join.right);
+            right_query.source_cte = "";
+            const right_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (join.right.source_cte.len == 0) ranges else &.{};
+            var right_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, right_source.schema, right_query, right_source.rows, right_ranges);
+            defer right_result.deinit(alloc);
+
+            var cte_join = join;
+            _ = db_mod.types.relationalRowsSelectJoinStrategy(cte_join, left_result.rows.len, right_result.rows.len, db_mod.types.relationalRowsJoinInputsSortedOnJoinKeys(cte_join)) orelse return error.UnsupportedRowsQuery;
+            cte_join.left.source_cte = "";
+            cte_join.right.source_cte = "";
+            cte_join.left.doc_key_range = null;
+            cte_join.right.doc_key_range = null;
+            var join_result = try db_mod.DB.joinRelationalRowsFromSourceRowsAlloc(alloc, cte_join, left_result.rows, right_result.rows);
+            const rows = join_result.rows;
+            join_result.rows = &.{};
+            break :blk .{ .rows = rows, .total = join_result.total_rows };
+        } else if (cte.lateral) |lateral_req| blk: {
+            const left_schema = rowsReadCteSideOutputSchema(base_schema, planned_ctes[0..cte_index], lateral_req.left, cte.left_table, cte_sources) orelse return error.InvalidRowsRequest;
+            const right_schema = rowsReadCteSideOutputSchema(base_schema, planned_ctes[0..cte_index], lateral_req.right, cte.right_table, cte_sources) orelse return error.InvalidRowsRequest;
+            var left_source = (try rowsJsonSourceForCteSideAlloc(alloc, materialized_ctes.items, "cte_lateral_left", left_schema, base_rows, lateral_req.left.source_cte, cte.left_table, cte_sources)) orelse return error.InvalidRowsRequest;
+            defer left_source.deinit(alloc);
+            var left_query = rowsLateralLeftSourceQuery(lateral_req.left);
+            left_query.source_cte = "";
+            const left_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (lateral_req.left.source_cte.len == 0) ranges else &.{};
+            var left_result = try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, left_source.schema, left_query, left_source.rows, left_ranges);
+            defer left_result.deinit(alloc);
+
+            var right_source = (try rowsJsonSourceForCteSideAlloc(alloc, materialized_ctes.items, "cte_lateral_right", right_schema, base_rows, lateral_req.right.source_cte, cte.right_table, cte_sources)) orelse return error.InvalidRowsRequest;
+            defer right_source.deinit(alloc);
+            var lateral = lateral_req;
+            lateral.left.source_cte = "";
+            lateral.right.source_cte = "";
+            const right_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (lateral_req.right.source_cte.len == 0) ranges else &.{};
+            if (right_ranges.len > 0 and lateral.right.doc_key_range != null) return error.InvalidRowsRequest;
+            var range_filtered_right_rows = std.ArrayListUnmanaged([]const u8).empty;
+            defer range_filtered_right_rows.deinit(alloc);
+            const ranged_right_rows = try rowsJsonSourceRowsForRangesAlloc(alloc, right_source.schema, right_source.rows, right_ranges, &range_filtered_right_rows);
+
+            var doc_range_filtered_right_rows = std.ArrayListUnmanaged([]const u8).empty;
+            defer doc_range_filtered_right_rows.deinit(alloc);
+            const right_rows = if (lateral.right.doc_key_range) |_|
+                try rowsJsonSourceRowsForDocKeyRangeAlloc(alloc, right_source.schema, ranged_right_rows, lateral.right.doc_key_range, &doc_range_filtered_right_rows)
+            else
+                ranged_right_rows;
+            lateral.left.doc_key_range = null;
+            lateral.right.doc_key_range = null;
+            var lateral_result = try db_mod.DB.lateralRelationalRowsFromSourceRowsStaticAlloc(alloc, lateral, left_result.rows, right_rows);
+            const rows = lateral_result.rows;
+            lateral_result.rows = &.{};
+            break :blk .{ .rows = rows, .total = lateral_result.total_rows };
+        } else blk: {
+            if (cte.query.row_claim != null or cte.query.doc_key_range != null) return error.InvalidRowsRequest;
+            const source_schema = rowsPlannedQuerySourceSchema(base_schema, planned_ctes[0..cte_index], cte.query) orelse return error.InvalidRowsRequest;
+            var source = (try rowsJsonSourceForQueryAlloc(alloc, materialized_ctes.items, "cte_source", base_schema, base_rows, cte.query.source_cte)) orelse return error.InvalidRowsRequest;
+            defer source.deinit(alloc);
+
+            var query = cte.query;
+            query.source_cte = "";
+            const source_ranges: []const db_mod.types.RelationalRowsDocKeyRange = if (cte.query.source_cte.len == 0) ranges else &.{};
+            break :blk try executeRowsQueryOnJsonRowsAcrossRangesAlloc(alloc, source_schema, query, source.rows, source_ranges);
+        };
         var result_transferred = false;
         errdefer if (!result_transferred) result.deinit(alloc);
         const materialized_bytes = db_mod.types.relationalRowsCteMaterializedJsonBytes(result.rows) orelse return error.UnsupportedRowsQuery;
@@ -9852,6 +10016,7 @@ fn parseRowsJoinType(maybe_type: ?std.json.Value) !db_mod.types.RelationalRowsJo
     if (type_value != .string) return error.InvalidRowsRequest;
     if (std.mem.eql(u8, type_value.string, "inner")) return .inner;
     if (std.mem.eql(u8, type_value.string, "left")) return .left;
+    if (std.mem.eql(u8, type_value.string, "full")) return .full;
     return error.InvalidRowsRequest;
 }
 
@@ -10276,9 +10441,13 @@ fn parseRowsCtesAlloc(
 
     for (ctes_value.array.items) |item| {
         if (item != .object) return error.InvalidRowsRequest;
-        try requireJsonObjectOnlyKeys(item.object, &.{ "name", "query", "max_rows", "max_bytes", "spill_after_bytes" });
+        try requireJsonObjectOnlyKeys(item.object, &.{ "name", "query", "join", "lateral", "max_rows", "max_bytes", "spill_after_bytes" });
         const name_value = item.object.get("name") orelse return error.InvalidRowsRequest;
-        const query_value = item.object.get("query") orelse return error.InvalidRowsRequest;
+        const query_value = item.object.get("query");
+        const join_value = item.object.get("join");
+        const lateral_value = item.object.get("lateral");
+        const body_count: usize = @intFromBool(query_value != null) + @intFromBool(join_value != null) + @intFromBool(lateral_value != null);
+        if (body_count != 1) return error.InvalidRowsRequest;
         if (name_value != .string or name_value.string.len == 0) return error.InvalidRowsRequest;
         if (rowsCteNameExists(out[0..initialized], name_value.string)) return error.InvalidRowsRequest;
         const max_rows = try parseOptionalU32(item.object.get("max_rows"));
@@ -10288,29 +10457,64 @@ fn parseRowsCtesAlloc(
         const name = try alloc.dupe(u8, name_value.string);
         var name_transferred = false;
         errdefer if (!name_transferred) alloc.free(name);
-        const query_schema = try rowsSchemaForQueryValue(schema, planned.items, query_value);
-        var query = try parseRowsQueryRequestFromValue(alloc, query_schema, query_value);
-        errdefer query.deinit(alloc);
-        if (query.row_claim != null or query.doc_key_range != null) return error.InvalidRowsRequest;
-        if (query.source_cte.len != 0 and !rowsCteNameExists(out[0..initialized], query.source_cte)) return error.InvalidRowsRequest;
-        try validateRowsQueryAgainstPlannedCteOutput(planned.items, query);
-
-        const output_columns = try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, planned.items, query);
+        var query: OwnedRowsQueryRequest = .{};
+        var query_initialized = false;
+        errdefer if (query_initialized) query.deinit(alloc);
+        var join: ?OwnedRowsJoinRequest = null;
+        errdefer if (join) |*owned_join| owned_join.deinit(alloc);
+        var lateral: ?OwnedRowsLateralRequest = null;
+        errdefer if (lateral) |*owned_lateral| owned_lateral.deinit(alloc);
+        const output_columns = if (query_value) |value| blk: {
+            const query_schema = try rowsSchemaForQueryValue(schema, planned.items, value);
+            query = try parseRowsQueryRequestFromValue(alloc, query_schema, value);
+            query_initialized = true;
+            if (query.row_claim != null or query.doc_key_range != null) return error.InvalidRowsRequest;
+            if (query.source_cte.len != 0 and !rowsCteNameExists(out[0..initialized], query.source_cte)) return error.InvalidRowsRequest;
+            try validateRowsQueryAgainstPlannedCteOutput(planned.items, query);
+            break :blk try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, planned.items, query);
+        } else if (join_value) |value| blk: {
+            const left_schema = try rowsSchemaForJoinSideValue(schema, planned.items, value, "left");
+            const right_schema = try rowsSchemaForJoinSideValue(schema, planned.items, value, "right");
+            join = try parseRowsJoinRequestFromValueWithSchemas(alloc, left_schema, right_schema, value);
+            try validateRowsJoinAgainstPlannedCteOutput(planned.items, join.?);
+            const borrowed = try rowsJoinOutputColumnsAlloc(alloc, left_schema, right_schema, join.?.select, join.?.join_type == .left or join.?.join_type == .full);
+            defer if (borrowed.len > 0) alloc.free(borrowed);
+            break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
+        } else blk: {
+            const value = lateral_value orelse unreachable;
+            const left_schema = try rowsSchemaForJoinSideValue(schema, planned.items, value, "left");
+            const right_schema = try rowsSchemaForJoinSideValue(schema, planned.items, value, "right");
+            lateral = try parseRowsLateralRequestFromValueWithSchemas(alloc, left_schema, right_schema, value);
+            try validateRowsLateralAgainstPlannedCteOutput(planned.items, lateral.?);
+            const borrowed = try rowsJoinOutputColumnsAlloc(alloc, left_schema, right_schema, lateral.?.select, true);
+            defer if (borrowed.len > 0) alloc.free(borrowed);
+            break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
+        };
         var output_columns_transferred = false;
         errdefer if (!output_columns_transferred) freeRowsOutputColumns(alloc, output_columns);
         const output_fields = try rowsOutputColumnFieldsAlloc(alloc, output_columns);
         var output_fields_transferred = false;
         errdefer if (!output_fields_transferred) freeStringSlice(alloc, output_fields);
-        const source_schema = try rowsSchemaForQueryValue(schema, planned.items, query_value);
+        const source_schema = if (query_value) |value|
+            try rowsSchemaForQueryValue(schema, planned.items, value)
+        else if (lateral != null)
+            runtime_schema.TableSchema{ .storage_mode = .relational, .relational_columns = output_columns, .primary_key = null }
+        else
+            runtime_schema.TableSchema{ .storage_mode = .relational, .relational_columns = output_columns, .primary_key = null };
 
         out[initialized] = .{
             .name = name,
             .query = query,
+            .join = join,
+            .lateral = lateral,
             .max_rows = max_rows,
             .max_bytes = max_bytes,
             .spill_after_bytes = spill_after_bytes,
         };
         name_transferred = true;
+        query_initialized = false;
+        join = null;
+        lateral = null;
         try planned.append(alloc, .{
             .name = name,
             .output_fields = output_fields,
@@ -10378,14 +10582,25 @@ pub fn rowsReadPlanOutputColumnsWithSchemasAlloc(
     right_schema: runtime_schema.TableSchema,
     plan: OwnedRowsPlan,
 ) ![]const runtime_schema.RelationalColumn {
+    return try rowsReadPlanOutputColumnsWithSchemasAndJsonSourcesAlloc(alloc, base_schema, left_schema, right_schema, plan, &.{});
+}
+
+pub fn rowsReadPlanOutputColumnsWithSchemasAndJsonSourcesAlloc(
+    alloc: std.mem.Allocator,
+    base_schema: runtime_schema.TableSchema,
+    left_schema: runtime_schema.TableSchema,
+    right_schema: runtime_schema.TableSchema,
+    plan: OwnedRowsPlan,
+    cte_sources: []const RowsCteJsonSource,
+) ![]const runtime_schema.RelationalColumn {
     return switch (plan) {
         .query => |query_plan| blk: {
-            const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, query_plan.ctes);
+            const planned_ctes = try planRowsCteOutputsWithJsonSourcesAlloc(alloc, base_schema, query_plan.ctes, cte_sources);
             defer freeRowsPlannedCtes(alloc, planned_ctes);
             break :blk try rowsPlannedQueryOutputColumnsAlloc(alloc, base_schema, planned_ctes, query_plan.query);
         },
         .aggregate => |aggregate_plan| blk: {
-            const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, aggregate_plan.ctes);
+            const planned_ctes = try planRowsCteOutputsWithJsonSourcesAlloc(alloc, base_schema, aggregate_plan.ctes, cte_sources);
             defer freeRowsPlannedCtes(alloc, planned_ctes);
             const source_schema = rowsPlannedQuerySourceSchema(base_schema, planned_ctes, aggregate_plan.aggregate.source) orelse return error.InvalidRowsRequest;
             const borrowed = try rowsAggregateOutputColumnsAlloc(
@@ -10399,7 +10614,7 @@ pub fn rowsReadPlanOutputColumnsWithSchemasAlloc(
             break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
         },
         .window => |window_plan| blk: {
-            const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, window_plan.ctes);
+            const planned_ctes = try planRowsCteOutputsWithJsonSourcesAlloc(alloc, base_schema, window_plan.ctes, cte_sources);
             defer freeRowsPlannedCtes(alloc, planned_ctes);
             const source_schema = rowsPlannedQuerySourceSchema(base_schema, planned_ctes, window_plan.window.source) orelse return error.InvalidRowsRequest;
             const borrowed = try rowsWindowOutputColumnsAlloc(
@@ -10413,7 +10628,7 @@ pub fn rowsReadPlanOutputColumnsWithSchemasAlloc(
             break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
         },
         .join => |join_plan| blk: {
-            const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, join_plan.ctes);
+            const planned_ctes = try planRowsCteOutputsWithJsonSourcesAlloc(alloc, base_schema, join_plan.ctes, cte_sources);
             defer freeRowsPlannedCtes(alloc, planned_ctes);
             const left_output_schema = rowsReadSideOutputSchema(base_schema, left_schema, planned_ctes, join_plan.join.left) orelse return error.InvalidRowsRequest;
             const right_output_schema = rowsReadSideOutputSchema(base_schema, right_schema, planned_ctes, join_plan.join.right) orelse return error.InvalidRowsRequest;
@@ -10428,7 +10643,7 @@ pub fn rowsReadPlanOutputColumnsWithSchemasAlloc(
             break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
         },
         .lateral => |lateral_plan| blk: {
-            const planned_ctes = try planRowsCteOutputsAlloc(alloc, base_schema, lateral_plan.ctes);
+            const planned_ctes = try planRowsCteOutputsWithJsonSourcesAlloc(alloc, base_schema, lateral_plan.ctes, cte_sources);
             defer freeRowsPlannedCtes(alloc, planned_ctes);
             const left_output_schema = rowsReadSideOutputSchema(base_schema, left_schema, planned_ctes, lateral_plan.lateral.left) orelse return error.InvalidRowsRequest;
             const right_output_schema = rowsReadSideOutputSchema(base_schema, right_schema, planned_ctes, lateral_plan.lateral.right) orelse return error.InvalidRowsRequest;
@@ -10455,6 +10670,22 @@ fn rowsReadSideOutputSchema(
     return rowsPlannedQuerySourceSchema(base_schema, planned_ctes, req);
 }
 
+fn rowsReadCteSideOutputSchema(
+    base_schema: runtime_schema.TableSchema,
+    planned_ctes: []const RowsPlannedCte,
+    req: OwnedRowsQueryRequest,
+    table_name: []const u8,
+    cte_sources: []const RowsCteJsonSource,
+) ?runtime_schema.TableSchema {
+    if (req.source_cte.len != 0) return rowsPlannedQuerySourceSchema(base_schema, planned_ctes, req);
+    if (table_name.len == 0) return base_schema;
+    if (cte_sources.len == 0) return base_schema;
+    for (cte_sources) |source| {
+        if (std.mem.eql(u8, source.table_name, table_name)) return source.schema;
+    }
+    return null;
+}
+
 fn duplicateRowsOutputColumnsAlloc(
     alloc: std.mem.Allocator,
     columns: []const runtime_schema.RelationalColumn,
@@ -10479,6 +10710,15 @@ pub fn planRowsCteOutputsAlloc(
     schema: runtime_schema.TableSchema,
     ctes: []const db_mod.types.RelationalRowsCte,
 ) ![]RowsPlannedCte {
+    return try planRowsCteOutputsWithJsonSourcesAlloc(alloc, schema, ctes, &.{});
+}
+
+pub fn planRowsCteOutputsWithJsonSourcesAlloc(
+    alloc: std.mem.Allocator,
+    schema: runtime_schema.TableSchema,
+    ctes: []const db_mod.types.RelationalRowsCte,
+    cte_sources: []const RowsCteJsonSource,
+) ![]RowsPlannedCte {
     var planned = std.ArrayListUnmanaged(RowsPlannedCte).empty;
     errdefer {
         for (planned.items) |cte| {
@@ -10488,17 +10728,37 @@ pub fn planRowsCteOutputsAlloc(
         planned.deinit(alloc);
     }
     for (ctes) |cte| {
+        if (cte.table_function != null and (cte.join != null or cte.lateral != null)) return error.InvalidRowsRequest;
+        if (cte.join != null and cte.lateral != null) return error.InvalidRowsRequest;
         if (cte.table_function != null and cte.query.source_cte.len != 0) return error.InvalidRowsRequest;
-        try validateRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
-        const output_columns = if (cte.table_function) |table_function|
-            try rowsTableFunctionOutputColumnsAlloc(alloc, table_function, cte.query)
-        else
-            try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, planned.items, cte.query);
+        const output_columns = if (cte.table_function) |table_function| blk: {
+            try validateRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
+            break :blk try rowsTableFunctionOutputColumnsAlloc(alloc, table_function, cte.query);
+        } else if (cte.join) |join| blk: {
+            try validateRowsJoinAgainstPlannedCteOutput(planned.items, join);
+            const left_schema = rowsReadCteSideOutputSchema(schema, planned.items, join.left, cte.left_table, cte_sources) orelse return error.InvalidRowsRequest;
+            const right_schema = rowsReadCteSideOutputSchema(schema, planned.items, join.right, cte.right_table, cte_sources) orelse return error.InvalidRowsRequest;
+            const borrowed = try rowsJoinOutputColumnsAlloc(alloc, left_schema, right_schema, join.select, join.join_type == .left or join.join_type == .full);
+            defer if (borrowed.len > 0) alloc.free(borrowed);
+            break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
+        } else if (cte.lateral) |lateral| blk: {
+            try validateRowsLateralAgainstPlannedCteOutput(planned.items, lateral);
+            const left_schema = rowsReadCteSideOutputSchema(schema, planned.items, lateral.left, cte.left_table, cte_sources) orelse return error.InvalidRowsRequest;
+            const right_schema = rowsReadCteSideOutputSchema(schema, planned.items, lateral.right, cte.right_table, cte_sources) orelse return error.InvalidRowsRequest;
+            const borrowed = try rowsJoinOutputColumnsAlloc(alloc, left_schema, right_schema, lateral.select, true);
+            defer if (borrowed.len > 0) alloc.free(borrowed);
+            break :blk try duplicateRowsOutputColumnsAlloc(alloc, borrowed);
+        } else blk: {
+            try validateRowsQueryAgainstPlannedCteOutput(planned.items, cte.query);
+            break :blk try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, planned.items, cte.query);
+        };
         errdefer freeRowsOutputColumns(alloc, output_columns);
         const output_fields = try rowsOutputColumnFieldsAlloc(alloc, output_columns);
         errdefer freeStringSlice(alloc, output_fields);
         const source_schema = if (cte.table_function) |table_function|
             rowsTableFunctionSchema(table_function)
+        else if (cte.join != null or cte.lateral != null)
+            runtime_schema.TableSchema{ .storage_mode = .relational, .relational_columns = output_columns, .primary_key = null }
         else
             rowsPlannedQuerySourceSchema(schema, planned.items, cte.query) orelse return error.InvalidRowsRequest;
         try planned.append(alloc, .{
@@ -10539,8 +10799,55 @@ fn rowsTableFunctionOutputColumnsAlloc(
     table_function: db_mod.types.RelationalRowsTableFunction,
     req: OwnedRowsQueryRequest,
 ) ![]const runtime_schema.RelationalColumn {
-    const schema = rowsTableFunctionSchema(table_function);
+    const columns = try rowsGraphTableFunctionColumnsAlloc(alloc, table_function);
+    defer freeRowsOutputColumns(alloc, columns);
+    const schema = runtime_schema.TableSchema{
+        .storage_mode = .relational,
+        .relational_columns = columns,
+        .primary_key = null,
+    };
     return try rowsPlannedQueryOutputColumnsAlloc(alloc, schema, &.{}, req);
+}
+
+fn rowsGraphTableFunctionColumnsAlloc(
+    alloc: std.mem.Allocator,
+    table_function: db_mod.types.RelationalRowsTableFunction,
+) ![]const runtime_schema.RelationalColumn {
+    var columns = std.ArrayListUnmanaged(runtime_schema.RelationalColumn).empty;
+    errdefer {
+        for (columns.items) |column| {
+            alloc.free(column.name);
+            alloc.free(column.path);
+            if (column.collation) |collation| alloc.free(collation);
+        }
+        columns.deinit(alloc);
+    }
+    for (rowsGraphTableFunctionColumns()) |column| {
+        try appendRowsOutputColumnAlloc(alloc, &columns, column.name, column.path, column.field_type, column.array_item_type, column.collation, column.nullable);
+    }
+    switch (table_function) {
+        .graph_query => |graph_query| {
+            for (graph_query.alias_projections) |projection| {
+                try appendRowsOutputColumnAlloc(
+                    alloc,
+                    &columns,
+                    projection.output,
+                    projection.output,
+                    rowsGraphAliasProjectionFieldType(projection.field),
+                    null,
+                    null,
+                    true,
+                );
+            }
+        },
+        else => {},
+    }
+    return try columns.toOwnedSlice(alloc);
+}
+
+fn rowsGraphAliasProjectionFieldType(field: []const u8) runtime_schema.AntflyType {
+    if (std.mem.eql(u8, field, "key")) return .keyword;
+    return .numeric;
 }
 
 fn rowsPlannedQueryOutputColumnsAlloc(

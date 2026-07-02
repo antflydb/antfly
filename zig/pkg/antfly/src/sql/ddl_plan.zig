@@ -4413,11 +4413,11 @@ pub fn ddlPlanFromGeneratedAstAlloc(
         .alter_subscription,
         .drop_subscription,
         => try logicalReplicationCatalogPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
-        .comment => try parseGeneratedLegacyDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .comment_metadata }),
+        .comment => try commentMetadataPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .security_label => try securityLabelPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .grant,
         .revoke,
-        => try parseGeneratedLegacyDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .authorization_catalog }),
+        => try privilegeChangePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options),
         .alter_default_privileges => .{ .authorization_catalog = .{ .alter_default_privileges = try defaultPrivilegeChangePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
         .create_policy,
         .alter_policy,
@@ -4467,271 +4467,54 @@ pub fn logicalDdlPlanFromGeneratedAstAlloc(
     ast: generated_parser.GeneratedSqlDdlAst,
     options: DdlPlanParserOptions,
 ) !binder.LogicalSqlPlan {
-    try validateGeneratedDdlAstSpans(tokens, ast);
-    const tail = generatedStatementTail(tokens, ast.statement_span) orelse return error.UnsupportedSqlShape;
-    var pos: usize = 0;
-    return switch (ast.kind) {
-        .create_table => blk: {
-            if (generatedCreateTableUsesRelationLifetime(tokens, ast)) {
-                var lifetime_pos: usize = 1;
-                break :blk .{ .table_ddl = .{ .relation_lifetime = try parseGeneratedRelationLifetimePlanAlloc(alloc, tokens, &lifetime_pos, ast, options.column_definition_options) } };
-            }
-            if (generatedCreateTableMayUseIdentityAllocator(tokens, ast)) {
-                break :blk .{ .catalog_ddl = .{ .identity_allocator_catalog = try identityAllocatorPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast, options.column_definition_options) } };
-            }
-            var clone_pos: usize = 0;
-            if (parseCreateTableClonePlanTailAlloc(alloc, tail, &clone_pos)) |parsed_table_clone| {
-                var table_clone = parsed_table_clone;
-                errdefer table_clone.deinit(alloc);
-                try validateGeneratedCreateTableCloneMetadata(alloc, tokens, ast, table_clone);
-                break :blk .{ .table_ddl = .{ .table_clone = table_clone } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
-            }
-            var create_partition_pos: usize = 0;
-            if (parseGeneratedCreateTablePartitionTailPlanAlloc(alloc, tokens, ast, tail, &create_partition_pos)) |partition| {
-                break :blk .{ .table_ddl = .{ .table_partition_catalog = .{ .create_partition = partition } } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
-            }
-            var partitioned_pos: usize = 0;
-            if (parseGeneratedCreatePartitionedTableTailPlanAlloc(alloc, tokens, ast, tail, &partitioned_pos, options.column_definition_options)) |partitioned| {
-                break :blk .{ .table_ddl = .{ .table_partition_catalog = .{ .create_partitioned = partitioned } } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
-            }
-            if (generatedCreateTableAstHasDocumentTableMetadata(tokens, ast)) {
-                break :blk .{ .table_ddl = .{ .create_table = try createTablePlanFromGeneratedDocumentAstAlloc(alloc, tokens, ast) } };
-            }
-            break :blk .{ .table_ddl = .{ .create_table = try parseGeneratedCreateTableTailPlanAlloc(alloc, tail, &pos, options.column_definition_options) } };
-        },
-        .create_view,
-        .alter_view,
-        .drop_view,
-        => blk: {
-            try validateGeneratedViewDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .table = .view_catalog });
-        },
-        .create_materialized_view,
-        .drop_materialized_view,
-        .refresh_materialized_view,
-        => blk: {
-            try validateGeneratedMaterializedViewDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .table = .materialized_view_catalog });
-        },
-        .create_domain,
-        .alter_domain,
-        .drop_domain,
-        => blk: {
-            try validateGeneratedDomainDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .domain_catalog });
-        },
-        .create_sequence,
-        .alter_sequence,
-        .drop_sequence,
-        => blk: {
-            try validateGeneratedSequenceDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .sequence_catalog });
-        },
-        .create_enum_type,
-        .alter_enum_type,
-        .drop_enum_type,
-        => blk: {
-            try validateGeneratedEnumTypeDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .enum_type_catalog });
-        },
-        .create_tablespace,
-        .alter_tablespace,
-        .drop_tablespace,
-        => blk: {
-            try validateGeneratedTablespaceDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .tablespace_catalog });
-        },
-        .create_publication,
-        .alter_publication,
-        .drop_publication,
-        .create_subscription,
-        .alter_subscription,
-        .drop_subscription,
-        => blk: {
-            try validateGeneratedLogicalReplicationDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .logical_replication });
-        },
-        .comment => blk: {
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .comment_metadata });
-        },
-        .security_label => .{ .catalog_ddl = .{ .security_label = try securityLabelPayloadFromGeneratedDdlAstAlloc(alloc, tokens, ast, options) } },
-        .grant,
-        .revoke,
-        => blk: {
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .authorization_catalog });
-        },
-        .create_policy,
-        .alter_policy,
-        .drop_policy,
-        => blk: {
-            try validateGeneratedRowSecurityPolicyDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .row_security_catalog });
-        },
-        .create_function,
-        .create_procedure,
-        .drop_function,
-        .drop_procedure,
-        => blk: {
-            try validateGeneratedRoutineDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .routine = .function_catalog });
-        },
-        .create_role,
-        .alter_role,
-        .drop_role,
-        => blk: {
-            try validateGeneratedRoleDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .auth = .authorization_catalog });
-        },
-        .create_collation,
-        .alter_collation,
-        .drop_collation,
-        .create_operator,
-        .drop_operator,
-        .create_aggregate,
-        .drop_aggregate,
-        .create_cast,
-        .drop_cast,
-        => blk: {
-            try validateGeneratedTypeSystemDdlAst(tokens, ast);
-            break :blk try parseGeneratedLogicalDdlPlanExpectAlloc(alloc, tokens, options, .{ .catalog = .type_system_catalog });
-        },
-        .create_index => .{ .table_ddl = .{ .create_index = try createIndexPlanFromGeneratedAstAlloc(alloc, tokens, ast, options.create_index_options) } },
-        .alter_default_privileges => .{ .auth = .{ .authorization_catalog = .{ .alter_default_privileges = try defaultPrivilegeChangePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } },
-        .alter_table => blk: {
-            if (generatedAlterTableUsesRowSecurityRuntimeBoundary(tokens, ast)) {
-                break :blk .{ .auth = .{ .row_security_catalog = .{ .alter_table = try rowSecurityAlterTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } } };
-            }
-            if (tablePartitionPlanFromGeneratedAlterTableAstAlloc(alloc, tokens, ast)) |partition| {
-                break :blk .{ .table_ddl = .{ .table_partition_catalog = partition } };
-            } else |err| switch (err) {
-                error.UnsupportedSqlShape => {},
-                else => return err,
-            }
-            break :blk .{ .table_ddl = .{ .alter_table = try alterTablePlanFromGeneratedAstAlloc(alloc, tokens, ast, options.column_definition_options) } };
-        },
-        .drop_table => .{ .table_ddl = .{ .drop_table = try dropTablePlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
-        .drop_index => .{ .table_ddl = .{ .drop_index = try dropIndexPlanFromGeneratedDdlAstAlloc(alloc, tokens, ast) } },
-        .create_database,
-        .create_schema,
-        .create_extension,
-        .alter_database,
-        .alter_extension,
-        .alter_schema,
-        .drop_database,
-        .drop_schema,
-        .drop_extension,
-        => try simpleLogicalDdlPlanFromGeneratedAstAlloc(alloc, tokens, ast),
-        else => error.UnsupportedSqlShape,
+    var generated_plan = try ddlPlanFromGeneratedAstAlloc(alloc, tokens, ast, options);
+    errdefer generated_plan.deinit(alloc);
+    return logicalPlanFromLegacyDdlParserPlan(&generated_plan);
+}
+
+fn logicalPlanFromLegacyDdlParserPlan(plan: *LegacyDdlParserPlan) !binder.LogicalSqlPlan {
+    const logical: binder.LogicalSqlPlan = switch (plan.*) {
+        .adapter_noop => |payload| .{ .other_ddl = .{ .adapter_noop = payload } },
+        .session_catalog => |payload| .{ .session = payload },
+        .create_table => |payload| .{ .table_ddl = .{ .create_table = payload } },
+        .table_clone => |payload| .{ .table_ddl = .{ .table_clone = payload } },
+        .view_catalog => |payload| .{ .table_ddl = .{ .view_catalog = payload } },
+        .materialized_view_catalog => |payload| .{ .table_ddl = .{ .materialized_view_catalog = payload } },
+        .relation_lifetime => |payload| .{ .table_ddl = .{ .relation_lifetime = payload } },
+        .enum_type_catalog => |payload| .{ .catalog_ddl = .{ .enum_type_catalog = payload } },
+        .domain_catalog => |payload| .{ .catalog_ddl = .{ .domain_catalog = payload } },
+        .sequence_catalog => |payload| .{ .catalog_ddl = .{ .sequence_catalog = payload } },
+        .identity_allocator_catalog => |payload| .{ .catalog_ddl = .{ .identity_allocator_catalog = payload } },
+        .schema_namespace_catalog => |payload| .{ .catalog_ddl = .{ .schema_namespace_catalog = payload } },
+        .extension_catalog => |payload| .{ .extension = payload },
+        .function_catalog => |payload| .{ .routine = .{ .function_catalog = payload } },
+        .trigger_catalog => |payload| .{ .routine = .{ .trigger_catalog = payload } },
+        .procedure_call => |payload| .{ .routine = .{ .procedure_call = payload } },
+        .authorization_catalog => |payload| .{ .auth = .{ .authorization_catalog = payload } },
+        .bulk_io => |payload| .{ .bulk_io = payload },
+        .table_partition_catalog => |payload| .{ .table_ddl = .{ .table_partition_catalog = payload } },
+        .row_security_catalog => |payload| .{ .auth = .{ .row_security_catalog = payload } },
+        .database_catalog => |payload| .{ .catalog_ddl = .{ .database_catalog = payload } },
+        .tablespace_catalog => |payload| .{ .catalog_ddl = .{ .tablespace_catalog = payload } },
+        .notification_channel => |payload| .{ .notification = payload },
+        .logical_replication => |payload| .{ .catalog_ddl = .{ .logical_replication = payload } },
+        .type_system_catalog => |payload| .{ .catalog_ddl = .{ .type_system_catalog = payload } },
+        .maintenance_job => |payload| .{ .maintenance = payload },
+        .prepared_statement => |payload| .{ .prepared_statement = payload },
+        .prepared_transaction => |payload| .{ .transaction = .{ .prepared = payload } },
+        .cursor_portal => |payload| .{ .cursor = payload },
+        .savepoint_transaction => |payload| .{ .transaction = .{ .savepoint = payload } },
+        .comment_metadata => |payload| .{ .catalog_ddl = .{ .comment_metadata = payload } },
+        .security_label => |payload| .{ .catalog_ddl = .{ .security_label = payload } },
+        .transaction_control => |payload| .{ .transaction = .{ .control = payload } },
+        .create_index => |payload| .{ .table_ddl = .{ .create_index = payload } },
+        .drop_index => |payload| .{ .table_ddl = .{ .drop_index = payload } },
+        .drop_table => |payload| .{ .table_ddl = .{ .drop_table = payload } },
+        .alter_table => |payload| .{ .table_ddl = .{ .alter_table = payload } },
+        .create_update_policy => |payload| .{ .table_ddl = .{ .create_update_policy = payload } },
     };
-}
-
-const GeneratedLogicalPlanExpectation = union(enum) {
-    table: std.meta.Tag(binder.TableDdlLogicalPlan),
-    catalog: std.meta.Tag(binder.CatalogDdlLogicalPlan),
-    routine: std.meta.Tag(binder.RoutineLogicalPlan),
-    auth: std.meta.Tag(binder.AuthorizationLogicalPlan),
-    transaction: std.meta.Tag(binder.TransactionLogicalPlan),
-    maintenance: std.meta.Tag(MaintenanceJobPlan),
-    notification: std.meta.Tag(NotificationChannelPlan),
-    bulk_io,
-    other: std.meta.Tag(binder.OtherDdlLogicalPlan),
-    extension,
-};
-
-fn parseGeneratedLogicalDdlPlanExpectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    options: DdlPlanParserOptions,
-    expectation: GeneratedLogicalPlanExpectation,
-) !binder.LogicalSqlPlan {
-    var pos: usize = 0;
-    var plan = try parseLogicalDdlPlanTokensAlloc(alloc, tokens, &pos, options);
-    errdefer plan.deinit(alloc);
-    if (pos != tokens.len) return error.UnsupportedSqlShape;
-    try validateGeneratedLogicalPlanExpectation(plan, expectation);
-    return plan;
-}
-
-fn parseGeneratedLegacyDdlPlanExpectAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    options: DdlPlanParserOptions,
-    expectation: GeneratedLogicalPlanExpectation,
-) !LegacyDdlParserPlan {
-    var pos: usize = 0;
-    var plan = try parseLegacyDdlParserPlanAlloc(alloc, tokens, &pos, options);
-    errdefer plan.deinit(alloc);
-    if (pos != tokens.len) return error.UnsupportedSqlShape;
-    switch (expectation) {
-        .catalog => |tag| switch (plan) {
-            .comment_metadata => if (tag != .comment_metadata) return error.UnsupportedSqlShape,
-            .security_label => if (tag != .security_label) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .auth => |tag| switch (plan) {
-            .authorization_catalog => if (tag != .authorization_catalog) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        else => return error.UnsupportedSqlShape,
-    }
-    return plan;
-}
-
-fn validateGeneratedLogicalPlanExpectation(
-    plan: binder.LogicalSqlPlan,
-    expectation: GeneratedLogicalPlanExpectation,
-) !void {
-    switch (expectation) {
-        .table => |tag| switch (plan) {
-            .table_ddl => |table| if (std.meta.activeTag(table) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .catalog => |tag| switch (plan) {
-            .catalog_ddl => |catalog| if (std.meta.activeTag(catalog) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .routine => |tag| switch (plan) {
-            .routine => |routine| if (std.meta.activeTag(routine) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .auth => |tag| switch (plan) {
-            .auth => |auth| if (std.meta.activeTag(auth) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .transaction => |tag| switch (plan) {
-            .transaction => |transaction| if (std.meta.activeTag(transaction) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .maintenance => |tag| switch (plan) {
-            .maintenance => |maintenance| if (std.meta.activeTag(maintenance) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .notification => |tag| switch (plan) {
-            .notification => |notification| if (std.meta.activeTag(notification) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .bulk_io => switch (plan) {
-            .bulk_io => {},
-            else => return error.UnsupportedSqlShape,
-        },
-        .other => |tag| switch (plan) {
-            .other_ddl => |other| if (std.meta.activeTag(other) != tag) return error.UnsupportedSqlShape,
-            else => return error.UnsupportedSqlShape,
-        },
-        .extension => switch (plan) {
-            .extension => {},
-            else => return error.UnsupportedSqlShape,
-        },
-    }
+    plan.* = undefined;
+    return logical;
 }
 
 fn simpleLogicalDdlPlanFromGeneratedAstAlloc(
@@ -5778,6 +5561,23 @@ fn validateGeneratedIdentifierRangeMatches(
     if (!std.ascii.eqlIgnoreCase(generated_name, expected_name)) return error.UnsupportedSqlShape;
 }
 
+fn validateGeneratedIdentifierRangeMatchesQualifiedTail(
+    alloc: std.mem.Allocator,
+    tokens: []const grammar.Token,
+    maybe_range: ?generated_parser.GeneratedSqlTokenRange,
+    start: usize,
+    expected_name: []const u8,
+) !void {
+    const range = try requireGeneratedTokenRangeAt(maybe_range, start, tokens.len);
+    const generated_name = try generatedIdentifierAlloc(alloc, tokens, range);
+    defer alloc.free(@constCast(generated_name));
+    if (std.ascii.eqlIgnoreCase(generated_name, expected_name)) return;
+    if (std.mem.lastIndexOfScalar(u8, generated_name, '.')) |dot| {
+        if (dot + 1 < generated_name.len and std.ascii.eqlIgnoreCase(generated_name[dot + 1 ..], expected_name)) return;
+    }
+    return error.UnsupportedSqlShape;
+}
+
 fn validateGeneratedCreateAggregatePlan(
     alloc: std.mem.Allocator,
     tokens: []const grammar.Token,
@@ -6376,9 +6176,14 @@ fn validateGeneratedCreateDomainPlan(
     const operation = ast.alter_table_operation_tokens orelse return error.UnsupportedSqlShape;
     if (operation.start + 2 > operation.end or !tokens[operation.start].matchesKeyword("as")) return error.UnsupportedSqlShape;
     const type_range = try requireGeneratedTokenRangeAt(ast.domain_type_tokens, operation.start + 1, operation.end);
-    const generated_type = try generatedIdentifierAlloc(alloc, tokens, type_range);
-    defer alloc.free(@constCast(generated_type));
-    if (!std.ascii.eqlIgnoreCase(generated_type, antflyTypeSchemaName(create.field_type))) return error.UnsupportedSqlShape;
+    var type_pos = type_range.start;
+    const generated_type = try grammar.parseDdlType(tokens, &type_pos);
+    if (type_pos != type_range.end or
+        generated_type.field_type != create.field_type or
+        generated_type.array_item_type != create.array_item_type)
+    {
+        return error.UnsupportedSqlShape;
+    }
 }
 
 fn validateGeneratedDropDomainPlan(
@@ -6567,7 +6372,7 @@ fn validateGeneratedCreateSequencePlan(
 ) !void {
     if (create.if_not_exists != ast.if_not_exists) return error.UnsupportedSqlShape;
     const name_range = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedIdentifierRangeMatches(alloc, tokens, ast.object_name_tokens, name_range.start, create.sequence_name);
+    try validateGeneratedIdentifierRangeMatchesQualifiedTail(alloc, tokens, ast.object_name_tokens, name_range.start, create.sequence_name);
     const expected_count = generatedSequenceOptionsCount(create.options);
     const operation = ast.alter_table_operation_tokens orelse {
         if (expected_count != 0) return error.UnsupportedSqlShape;
@@ -6589,7 +6394,7 @@ fn validateGeneratedDropSequencePlan(
 ) !void {
     if (drop.if_exists != ast.if_exists or drop.cascade != ast.cascade) return error.UnsupportedSqlShape;
     const name_range = ast.object_name_tokens orelse return error.UnsupportedSqlShape;
-    try validateGeneratedIdentifierRangeMatches(alloc, tokens, ast.object_name_tokens, name_range.start, drop.sequence_name);
+    try validateGeneratedIdentifierRangeMatchesQualifiedTail(alloc, tokens, ast.object_name_tokens, name_range.start, drop.sequence_name);
 }
 
 fn generatedSequenceOptionsCount(options: SequenceOptions) usize {
@@ -16759,7 +16564,7 @@ fn generatedUnsupportedCatalogBoundary(
             .listen, .notify, .unlisten => .{ .family = .notification, .kind = kind },
             .call => .{ .family = .procedure_call, .kind = kind },
             .lock => .{ .family = .transaction_control, .kind = kind },
-            .create_trigger, .drop_trigger => .{ .family = .update_policy_trigger, .kind = kind },
+            .alter_trigger, .create_trigger, .drop_trigger => .{ .family = .update_policy_trigger, .kind = kind },
             else => null,
         },
         else => null,
@@ -16924,6 +16729,9 @@ fn validateGeneratedUnsupportedCatalogAst(
     if (!std.meta.eql(subject_tokens, generatedUnsupportedCatalogSubjectRange(tokens, boundary, end) orelse return error.UnsupportedSqlShape)) {
         return error.UnsupportedSqlShape;
     }
+    if (ast.explain_options_tokens != null or ast.explain_subject_read_ast != null or ast.explain_subject_dml_ast != null) {
+        return error.UnsupportedSqlShape;
+    }
     switch (boundary.family) {
         .authorization => switch (boundary.kind) {
             .grant => {
@@ -17045,7 +16853,14 @@ fn validateGeneratedUnsupportedCatalogAst(
             else => return error.UnsupportedSqlShape,
         },
         .update_policy_trigger => switch (boundary.kind) {
+            .alter_trigger => {
+                try validateGeneratedUnsupportedTriggerAstPayload(ast);
+                if (end < 2 or !tokens[0].matchesKeyword("alter") or !tokens[1].matchesKeyword("trigger")) {
+                    return error.UnsupportedSqlShape;
+                }
+            },
             .create_trigger => {
+                try validateGeneratedUnsupportedTriggerAstPayload(ast);
                 if (end >= 4 and
                     tokens[0].matchesKeyword("create") and
                     tokens[1].matchesKeyword("or") and
@@ -17059,12 +16874,24 @@ fn validateGeneratedUnsupportedCatalogAst(
                 }
             },
             .drop_trigger => {
+                try validateGeneratedUnsupportedTriggerAstPayload(ast);
                 if (end < 2 or !tokens[0].matchesKeyword("drop") or !tokens[1].matchesKeyword("trigger")) {
                     return error.UnsupportedSqlShape;
                 }
             },
             else => return error.UnsupportedSqlShape,
         },
+    }
+}
+
+fn validateGeneratedUnsupportedTriggerAstPayload(ast: generated_parser.GeneratedSqlUnsupportedAst) !void {
+    if (ast.routine_name_tokens != null or
+        ast.routine_operation_tokens != null or
+        ast.routine_metadata != null or
+        ast.alter_table_name_tokens != null or
+        ast.alter_table_operation_tokens != null)
+    {
+        return error.UnsupportedSqlShape;
     }
 }
 
@@ -17075,6 +16902,7 @@ fn generatedUnsupportedCatalogSubjectRange(
 ) ?generated_parser.GeneratedSqlTokenRange {
     const start: usize = switch (boundary.family) {
         .update_policy_trigger => switch (boundary.kind) {
+            .alter_trigger => 2,
             .create_trigger => if (end > 3 and
                 tokens[1].matchesKeyword("or") and
                 tokens[2].matchesKeyword("replace") and
@@ -17277,6 +17105,9 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
             else => return error.UnsupportedSqlShape,
         },
         .update_policy_trigger => switch (boundary.kind) {
+            .alter_trigger => switch (plan) {
+                else => return error.UnsupportedSqlShape,
+            },
             .create_trigger => switch (plan) {
                 .create_update_policy => {},
                 .trigger_catalog => |trigger| switch (trigger) {
@@ -17303,203 +17134,6 @@ fn catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
         },
     }
     return plan;
-}
-
-fn logicalDdlPlanFromGeneratedUnsupportedAstAlloc(
-    alloc: std.mem.Allocator,
-    tokens: []const grammar.Token,
-    pos: *usize,
-    ast: generated_parser.GeneratedSqlUnsupportedAst,
-    boundary: GeneratedUnsupportedCatalogBoundary,
-    options: DdlPlanParserOptions,
-) !binder.LogicalSqlPlan {
-    try validateGeneratedUnsupportedCatalogAst(tokens, ast, boundary);
-    const start_pos = pos.*;
-    var plan = parseLogicalDdlPlanTokensAlloc(alloc, tokens, pos, options) catch |err| {
-        pos.* = start_pos;
-        return err;
-    };
-    errdefer {
-        plan.deinit(alloc);
-        pos.* = start_pos;
-    }
-    if (pos.* != tokens.len) return error.UnsupportedSqlShape;
-    try validateGeneratedUnsupportedLogicalPlan(plan, boundary);
-    return plan;
-}
-
-fn validateGeneratedUnsupportedLogicalPlan(
-    plan: binder.LogicalSqlPlan,
-    boundary: GeneratedUnsupportedCatalogBoundary,
-) !void {
-    switch (boundary.family) {
-        .authorization => switch (boundary.kind) {
-            .grant => switch (plan) {
-                .auth => |auth| switch (auth) {
-                    .authorization_catalog => |catalog| switch (catalog) {
-                        .grant_privilege => {},
-                        else => return error.UnsupportedSqlShape,
-                    },
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .revoke => switch (plan) {
-                .auth => |auth| switch (auth) {
-                    .authorization_catalog => |catalog| switch (catalog) {
-                        .revoke_privilege => {},
-                        else => return error.UnsupportedSqlShape,
-                    },
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .bulk_io => switch (boundary.kind) {
-            .copy => switch (plan) {
-                .bulk_io => {},
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .comment => switch (boundary.kind) {
-            .comment => switch (plan) {
-                .catalog_ddl => |catalog| switch (catalog) {
-                    .comment_metadata => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .logical_replication => switch (boundary.kind) {
-            .alter_publication => try validateLogicalReplicationPlanKind(plan, .publication, .alter),
-            .alter_subscription => try validateLogicalReplicationPlanKind(plan, .subscription, .alter),
-            .create_publication => try validateLogicalReplicationPlanKind(plan, .publication, .create),
-            .create_subscription => try validateLogicalReplicationPlanKind(plan, .subscription, .create),
-            .drop_publication => try validateLogicalReplicationPlanKind(plan, .publication, .drop),
-            .drop_subscription => try validateLogicalReplicationPlanKind(plan, .subscription, .drop),
-            else => return error.UnsupportedSqlShape,
-        },
-        .maintenance => switch (boundary.kind) {
-            .analyze => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .analyze }),
-            .cluster => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .cluster }),
-            .reindex => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .reindex }),
-            .vacuum => try validateGeneratedLogicalPlanExpectation(plan, .{ .maintenance = .vacuum }),
-            else => return error.UnsupportedSqlShape,
-        },
-        .notification => switch (boundary.kind) {
-            .listen => try validateGeneratedLogicalPlanExpectation(plan, .{ .notification = .listen }),
-            .notify => try validateGeneratedLogicalPlanExpectation(plan, .{ .notification = .notify }),
-            .unlisten => try validateGeneratedLogicalPlanExpectation(plan, .{ .notification = .unlisten }),
-            else => return error.UnsupportedSqlShape,
-        },
-        .procedure_call => switch (boundary.kind) {
-            .call => try validateGeneratedLogicalPlanExpectation(plan, .{ .routine = .procedure_call }),
-            else => return error.UnsupportedSqlShape,
-        },
-        .transaction_control => switch (boundary.kind) {
-            .lock => switch (plan) {
-                .transaction => |transaction| switch (transaction) {
-                    .control => |control| switch (control) {
-                        .table_lock => {},
-                        else => return error.UnsupportedSqlShape,
-                    },
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .update_policy_trigger => switch (boundary.kind) {
-            .create_trigger => switch (plan) {
-                .table_ddl => |table| switch (table) {
-                    .create_update_policy => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                .routine => |routine| switch (routine) {
-                    .trigger_catalog => |trigger| switch (trigger) {
-                        .create => {},
-                        else => return error.UnsupportedSqlShape,
-                    },
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            .drop_trigger => switch (plan) {
-                .table_ddl => |table| switch (table) {
-                    .alter_table => |alter| {
-                        if (alter.operations.len != 1) return error.UnsupportedSqlShape;
-                        switch (alter.operations[0]) {
-                            .drop_update_policy => {},
-                            else => return error.UnsupportedSqlShape,
-                        }
-                    },
-                    else => return error.UnsupportedSqlShape,
-                },
-                .routine => |routine| switch (routine) {
-                    .trigger_catalog => |trigger| switch (trigger) {
-                        .drop => {},
-                        else => return error.UnsupportedSqlShape,
-                    },
-                    else => return error.UnsupportedSqlShape,
-                },
-                else => return error.UnsupportedSqlShape,
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-    }
-}
-
-fn validateLogicalReplicationPlanKind(
-    plan: binder.LogicalSqlPlan,
-    expected_family: enum { publication, subscription },
-    expected_action: enum { create, alter, drop },
-) !void {
-    const logical_replication = switch (plan) {
-        .catalog_ddl => |catalog| switch (catalog) {
-            .logical_replication => |logical| logical,
-            else => return error.UnsupportedSqlShape,
-        },
-        else => return error.UnsupportedSqlShape,
-    };
-    switch (expected_family) {
-        .publication => switch (logical_replication) {
-            .publication => |publication| switch (expected_action) {
-                .create => switch (publication) {
-                    .create => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                .alter => switch (publication) {
-                    .alter => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                .drop => switch (publication) {
-                    .drop => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-        .subscription => switch (logical_replication) {
-            .subscription => |subscription| switch (expected_action) {
-                .create => switch (subscription) {
-                    .create => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                .alter => switch (subscription) {
-                    .alter => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-                .drop => switch (subscription) {
-                    .drop => {},
-                    else => return error.UnsupportedSqlShape,
-                },
-            },
-            else => return error.UnsupportedSqlShape,
-        },
-    }
 }
 
 fn legacyDdlParserPlanAlloc(
@@ -17604,10 +17238,16 @@ pub fn planGeneratedLogicalDdlAstAlloc(
         .graph => |graph_ast| return try graphLogicalDdlPlanFromGeneratedAstAlloc(alloc, tokens, graph_ast),
         .unsupported => |unsupported_ast| {
             if (generatedUnsupportedCatalogBoundary(generated_statement.statement)) |boundary| {
-                return logicalDdlPlanFromGeneratedUnsupportedAstAlloc(alloc, tokens, &state.pos, unsupported_ast, boundary, options) catch |err| switch (err) {
-                    error.UnsupportedSqlShape => return err,
-                    else => return err,
-                };
+                var legacy_plan = try catalogDdlPlanFromGeneratedUnsupportedAstAlloc(
+                    alloc,
+                    tokens,
+                    &state.pos,
+                    unsupported_ast,
+                    boundary,
+                    options,
+                );
+                errdefer legacy_plan.deinit(alloc);
+                return try logicalPlanFromLegacyDdlParserPlan(&legacy_plan);
             }
         },
         .read => |read_ast| {
@@ -25136,6 +24776,74 @@ test "sql adapter parsed DDL lowerer dispatches generated AST families first" {
     try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &missing_ast_session, .{}));
 }
 
+test "sql adapter generated unsupported trigger diagnostics reject corrupted parsed AST payloads" {
+    const alloc = std.testing.allocator;
+
+    const trigger_cases = [_]struct {
+        sql: []const u8,
+        kind: generated_parser.GeneratedSqlUnsupportedKind,
+    }{
+        .{
+            .sql = "CREATE TRIGGER usage_audit AFTER INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE CONSTRAINT TRIGGER usage_audit AFTER INSERT ON usage_records DEFERRABLE INITIALLY DEFERRED FOR EACH ROW EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_view_insert INSTEAD OF INSERT ON usage_view FOR EACH ROW EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_truncate BEFORE TRUNCATE ON usage_records EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_update BEFORE UPDATE OF status ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_when BEFORE UPDATE ON usage_records FOR EACH ROW WHEN (NEW.status IS DISTINCT FROM OLD.status) EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_ref AFTER INSERT ON usage_records REFERENCING NEW TABLE AS new_rows FOR EACH STATEMENT EXECUTE FUNCTION audit_usage()",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "CREATE TRIGGER usage_args BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage('audit-context')",
+            .kind = .create_trigger,
+        },
+        .{
+            .sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2",
+            .kind = .alter_trigger,
+        },
+    };
+
+    for (trigger_cases) |case| {
+        try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, case.sql, case.kind, .subject_start);
+    }
+
+    const create_sql = "CREATE TRIGGER usage_args BEFORE INSERT ON usage_records FOR EACH ROW EXECUTE FUNCTION audit_usage('audit-context')";
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .kind);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .reason);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .command_span);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .missing_subject);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .subject_end);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .explain_options);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, create_sql, .create_trigger, .stale_trigger_payload);
+
+    const alter_sql = "ALTER TRIGGER usage_audit ON usage_records RENAME TO usage_audit_v2";
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .kind);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .reason);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .command_span);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .missing_subject);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .subject_end);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .explain_options);
+    try expectGeneratedUnsupportedTriggerAstMutationFails(alloc, alter_sql, .alter_trigger, .stale_trigger_payload);
+}
+
 test "sql adapter generated create table and index AST lowers to DDL plans" {
     const alloc = std.testing.allocator;
 
@@ -26066,6 +25774,60 @@ fn generatedDdlCompatibleAst(ast: generated_parser.GeneratedSqlAst) !generated_p
         .extension_index => |ddl| ddl,
         else => error.UnsupportedSqlShape,
     };
+}
+
+const GeneratedUnsupportedTriggerAstMutation = enum {
+    kind,
+    reason,
+    command_span,
+    missing_subject,
+    subject_start,
+    subject_end,
+    explain_options,
+    stale_trigger_payload,
+};
+
+fn expectGeneratedUnsupportedTriggerAstMutationFails(
+    alloc: std.mem.Allocator,
+    sql: []const u8,
+    expected_kind: generated_parser.GeneratedSqlUnsupportedKind,
+    mutation: GeneratedUnsupportedTriggerAstMutation,
+) !void {
+    var parsed = try tokenized.ParsedSql.initAlloc(alloc, sql);
+    defer parsed.deinit(alloc);
+
+    if (parsed.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| {
+                    try std.testing.expectEqual(expected_kind, unsupported.kind);
+                    try std.testing.expectEqual(generatedUnsupportedExpectedReason(expected_kind), unsupported.reason);
+                    const subject = unsupported.subject_tokens orelse return error.TestUnexpectedResult;
+                    switch (mutation) {
+                        .kind => unsupported.kind = switch (expected_kind) {
+                            .create_trigger => .alter_trigger,
+                            .alter_trigger => .create_trigger,
+                            else => return error.TestUnexpectedResult,
+                        },
+                        .reason => unsupported.reason = switch (expected_kind) {
+                            .create_trigger => .alter_trigger_not_planned_by_generated_parser,
+                            .alter_trigger => .create_trigger_not_planned_by_generated_parser,
+                            else => return error.TestUnexpectedResult,
+                        },
+                        .command_span => unsupported.command_span.start += 1,
+                        .missing_subject => unsupported.subject_tokens = null,
+                        .subject_start => unsupported.subject_tokens = .{ .start = subject.start + 1, .end = subject.end },
+                        .subject_end => unsupported.subject_tokens = .{ .start = subject.start, .end = subject.end - 1 },
+                        .explain_options => unsupported.explain_options_tokens = subject,
+                        .stale_trigger_payload => unsupported.routine_name_tokens = subject,
+                    }
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &parsed, .{}));
 }
 
 const GeneratedIndexAstMutation = enum {
@@ -28134,6 +27896,62 @@ test "sql adapter generated maintenance unsupported AST lowers to catalog plans"
         } else return error.TestUnexpectedResult;
     } else return error.TestUnexpectedResult;
     try std.testing.expectError(error.UnsupportedSqlShape, legacyDdlParserPlanParsedSqlAlloc(alloc, &malformed_subject));
+}
+
+test "sql adapter logical ddl plan accepts validated generated unsupported maintenance through legacy bridge" {
+    const alloc = std.testing.allocator;
+
+    var parsed = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "VACUUM usage_records;",
+    );
+    defer parsed.deinit(alloc);
+
+    var legacy_plan = try legacyDdlParserPlanParsedSqlAlloc(alloc, &parsed);
+    defer legacy_plan.deinit(alloc);
+    switch (legacy_plan) {
+        .maintenance_job => |maintenance| switch (maintenance) {
+            .vacuum => {},
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    const generated_raw = parsed.generated_statement orelse return error.TestUnexpectedResult;
+    switch (generated_raw.ast orelse return error.TestUnexpectedResult) {
+        .unsupported => |unsupported| try std.testing.expectEqual(generated_parser.GeneratedSqlUnsupportedKind.vacuum, unsupported.kind),
+        else => return error.TestUnexpectedResult,
+    }
+    var logical_plan = try parseLogicalDdlPlanAlloc(alloc, &parsed, .{});
+    defer logical_plan.deinit(alloc);
+    switch (logical_plan) {
+        .maintenance => |maintenance| switch (maintenance) {
+            .vacuum => |vacuum| {
+                try std.testing.expectEqualStrings("usage_records", vacuum.table_name);
+                try std.testing.expect(!vacuum.full);
+                try std.testing.expect(!vacuum.freeze);
+                try std.testing.expect(!vacuum.verbose);
+                try std.testing.expect(!vacuum.analyze);
+            },
+            else => return error.TestUnexpectedResult,
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var corrupt_subject = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "VACUUM usage_records;",
+    );
+    defer corrupt_subject.deinit(alloc);
+    if (corrupt_subject.generated_statement) |*generated_statement| {
+        if (generated_statement.ast) |*generated_ast| {
+            switch (generated_ast.*) {
+                .unsupported => |*unsupported| unsupported.subject_tokens = .{ .start = 0, .end = corrupt_subject.items().len },
+                else => return error.TestUnexpectedResult,
+            }
+        } else return error.TestUnexpectedResult;
+    } else return error.TestUnexpectedResult;
+    try std.testing.expectError(error.UnsupportedSqlShape, parseLogicalDdlPlanAlloc(alloc, &corrupt_subject, .{}));
 }
 
 test "sql adapter generated cursor and savepoint transaction AST lowers to catalog plans" {

@@ -14,6 +14,7 @@
 
 const std = @import("std");
 
+const binder = @import("binder.zig");
 const ddl_plan = @import("ddl_plan.zig");
 const expr_aggregate = @import("expr/aggregate.zig");
 const expr_order = @import("expr/order.zig");
@@ -174,6 +175,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .ptr = ptr,
                 .generated_read_ast = ptr.generated_read_ast,
                 .parse_select = Accessors.parseCteSelectHook,
+                .parse_join = Accessors.parseCteJoinHook,
             };
         }
 
@@ -182,6 +184,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .ptr = ptr,
                 .generated_read_ast = ptr.generated_read_ast,
                 .parse_select = Accessors.parseJoinCteSelectHook,
+                .parse_join = Accessors.parseJoinCteJoinHook,
             };
         }
 
@@ -212,8 +215,11 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn joinPlanParserHooks(ptr: *ParserType) plan.JoinPlanParserHooks {
             return .{
                 .ptr = ptr,
+                .params = ptr.params,
+                .generated_read_ast = ptr.generated_read_ast,
                 .context_hooks = Accessors.readPlanParserContextHooks(ptr),
                 .parse_join = Accessors.parseJoinPlanHook,
+                .parse_top_level_multi_join_order_by = Accessors.parseTopLevelMultiJoinOrderByHook,
             };
         }
 
@@ -247,9 +253,12 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn setOperationParserHooks(ptr: *ParserType) plan.SetOperationParserHooks {
             return .{
                 .ptr = ptr,
+                .params = ptr.params,
                 .cte_hooks = Accessors.cteSelectParserHooks(ptr),
                 .context_hooks = Accessors.readPlanParserContextHooks(ptr),
                 .parse_select = Accessors.parseSetOperationSelectHook,
+                .parse_join = Accessors.parseSetOperationJoinHook,
+                .parse_lateral = Accessors.parseSetOperationLateralHook,
                 .select_output_columns = Accessors.selectOutputColumnsHook,
                 .parse_result_tail = Accessors.parseSetOperationResultTailHook,
             };
@@ -753,6 +762,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
                 .params = ptr.params,
                 .available_ctes = ptr.available_ctes,
                 .generated_read_ast = ptr.generated_read_ast,
+                .allow_select_set_result_tail_boundary = ptr.allow_select_set_result_tail_boundary,
                 .context_hooks = Accessors.joinParserContextHooks(ptr),
                 .expression_where_options = Accessors.joinedMutationExpressionWhereOptions(ptr),
                 .output_order_expression_options = Accessors.outputOrderExpressionParserOptions(ptr),
@@ -1452,6 +1462,56 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return try Accessors.parseSelect(&sub);
         }
 
+        pub fn parseCteJoinHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            available_ctes: []const db_mod.types.RelationalRowsCte,
+            generated_cte: ?*const generated_parser.GeneratedSqlCteAst,
+        ) anyerror!plan.LoweredJoin {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_body_ast = if (generated_cte) |cte|
+                try Accessors.generatedCteBodyReadAstForCteAlloc(self, tokens, cte)
+            else
+                try Accessors.generatedChildReadAstForTokensAlloc(self, tokens);
+            defer if (generated_body_ast) |*ast| ast.deinit(self.alloc);
+            var sub = ParserType{
+                .alloc = self.alloc,
+                .tokens = tokens,
+                .schema = self.schema,
+                .params = self.params,
+                .function_bindings = self.function_bindings,
+                .unique_resolver = self.unique_resolver,
+                .available_ctes = available_ctes,
+                .generated_read_ast = if (generated_body_ast) |*ast| ast else null,
+            };
+            return try Accessors.parseJoin(&sub);
+        }
+
+        pub fn parseJoinCteJoinHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            available_ctes: []const db_mod.types.RelationalRowsCte,
+            generated_cte: ?*const generated_parser.GeneratedSqlCteAst,
+        ) anyerror!plan.LoweredJoin {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            var generated_body_ast = if (generated_cte) |cte|
+                try Accessors.generatedCteBodyReadAstForCteAlloc(self, tokens, cte)
+            else
+                try Accessors.generatedChildReadAstForTokensAlloc(self, tokens);
+            defer if (generated_body_ast) |*ast| ast.deinit(self.alloc);
+            var sub = ParserType{
+                .alloc = self.alloc,
+                .tokens = tokens,
+                .schema = self.joined_source_schema orelse self.schema,
+                .params = self.params,
+                .function_bindings = self.function_bindings,
+                .unique_resolver = self.unique_resolver,
+                .available_ctes = available_ctes,
+                .generated_read_ast = if (generated_body_ast) |*ast| ast else null,
+            };
+            return try Accessors.parseJoin(&sub);
+        }
+
         pub fn parseWindowPlanHook(ptr: *anyopaque) anyerror!plan.LoweredWindowPlan {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             return try Accessors.parseWindowSelect(self);
@@ -1465,6 +1525,98 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn parseJoinPlanHook(ptr: *anyopaque) anyerror!plan.LoweredJoin {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             return try Accessors.parseJoin(self);
+        }
+
+        fn generatedTopLevelMultiJoinProjectionSourceField(field: []const u8) []const u8 {
+            if (std.mem.lastIndexOf(u8, field, "__")) |index| {
+                if (index + 2 < field.len) return field[index + 2 ..];
+            }
+            return field;
+        }
+
+        fn generatedTopLevelMultiJoinOrderSchemaAlloc(
+            alloc: std.mem.Allocator,
+            schema: runtime_schema.TableSchema,
+            select: []const db_mod.types.RelationalRowsJoinProjection,
+        ) ![]runtime_schema.RelationalColumn {
+            if (select.len == 0) return &.{};
+            const columns = try alloc.alloc(runtime_schema.RelationalColumn, select.len);
+            var initialized: usize = 0;
+            errdefer {
+                ddl_plan.clearDdlRelationalColumns(alloc, columns[0..initialized]);
+                alloc.free(columns);
+            }
+            for (select) |projection| {
+                const source_field = generatedTopLevelMultiJoinProjectionSourceField(projection.field);
+                const source_column = binder.relationalColumnForField(schema, source_field, null) orelse return error.UnsupportedSqlShape;
+                columns[initialized] = .{
+                    .name = try alloc.dupe(u8, projection.output),
+                    .path = try alloc.dupe(u8, projection.output),
+                    .field_type = source_column.field_type,
+                    .array_item_type = source_column.array_item_type,
+                    .nullable = true,
+                    .collation = if (source_column.collation) |collation| try alloc.dupe(u8, collation) else null,
+                };
+                initialized += 1;
+            }
+            return columns;
+        }
+
+        pub fn parseTopLevelMultiJoinOrderByHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            pos: *usize,
+            select: []const db_mod.types.RelationalRowsJoinProjection,
+            generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+        ) anyerror![]const db_mod.types.RelationalRowsQueryOrder {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            const order_columns = try generatedTopLevelMultiJoinOrderSchemaAlloc(self.alloc, self.schema, select);
+            defer ddl_plan.freeDdlRelationalColumns(self.alloc, order_columns);
+            const order_schema: runtime_schema.TableSchema = .{
+                .storage_mode = .relational,
+                .relational_columns = order_columns,
+            };
+            const adjusted_select = try self.alloc.alloc(db_mod.types.RelationalRowsJoinProjection, select.len);
+            defer self.alloc.free(adjusted_select);
+            for (select, 0..) |projection, index| {
+                adjusted_select[index] = .{
+                    .output = projection.output,
+                    .side = projection.side,
+                    .field = projection.output,
+                };
+            }
+            var sub = ParserType{
+                .alloc = self.alloc,
+                .tokens = tokens,
+                .pos = pos.*,
+                .schema = order_schema,
+                .params = self.params,
+                .function_bindings = self.function_bindings,
+                .unique_resolver = self.unique_resolver,
+                .available_ctes = self.available_ctes,
+                .generated_read_ast = generated_read_ast,
+            };
+
+            var order_by = std.ArrayListUnmanaged(db_mod.types.RelationalRowsQueryOrder).empty;
+            errdefer {
+                plan.freeOrderBy(self.alloc, order_by.items);
+                order_by.deinit(self.alloc);
+            }
+            var options = Accessors.outputOrderExpressionParserOptions(&sub);
+            options.generated_read_ast = generated_read_ast;
+            try expr_order.parseJoinByAlloc(
+                self.alloc,
+                tokens,
+                &sub.pos,
+                order_schema,
+                &order_by,
+                adjusted_select,
+                options,
+            );
+            pos.* = sub.pos;
+            const owned_order_by = try order_by.toOwnedSlice(self.alloc);
+            order_by = .empty;
+            return owned_order_by;
         }
 
         pub fn parseLateralPlanHook(ptr: *anyopaque) anyerror!plan.LoweredLateralPlan {
@@ -1625,6 +1777,72 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             return try Accessors.parseSelect(self);
         }
 
+        pub fn parseSetOperationJoinHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            pos: *usize,
+            left_schema: runtime_schema.TableSchema,
+            right_schema: runtime_schema.TableSchema,
+            generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+        ) anyerror!plan.LoweredJoin {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            const previous_tokens = self.tokens;
+            const previous_pos = self.pos;
+            const previous_ast = self.generated_read_ast;
+            const previous_schema = self.schema;
+            const previous_joined_schema = self.joined_source_schema;
+            const previous_tail_boundary = self.allow_select_set_result_tail_boundary;
+            self.tokens = tokens;
+            self.pos = pos.*;
+            self.schema = left_schema;
+            self.joined_source_schema = right_schema;
+            self.generated_read_ast = generated_read_ast;
+            self.allow_select_set_result_tail_boundary = true;
+            defer {
+                pos.* = self.pos;
+                self.tokens = previous_tokens;
+                self.pos = previous_pos;
+                self.generated_read_ast = previous_ast;
+                self.schema = previous_schema;
+                self.joined_source_schema = previous_joined_schema;
+                self.allow_select_set_result_tail_boundary = previous_tail_boundary;
+            }
+            return try Accessors.parseJoin(self);
+        }
+
+        pub fn parseSetOperationLateralHook(
+            ptr: *anyopaque,
+            tokens: []const Token,
+            pos: *usize,
+            left_schema: runtime_schema.TableSchema,
+            right_schema: runtime_schema.TableSchema,
+            generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
+        ) anyerror!plan.LoweredLateralPlan {
+            const self: *ParserType = @ptrCast(@alignCast(ptr));
+            const previous_tokens = self.tokens;
+            const previous_pos = self.pos;
+            const previous_ast = self.generated_read_ast;
+            const previous_schema = self.schema;
+            const previous_joined_schema = self.joined_source_schema;
+            const previous_tail_boundary = self.allow_select_set_result_tail_boundary;
+            self.tokens = tokens;
+            self.pos = pos.*;
+            self.schema = left_schema;
+            self.joined_source_schema = right_schema;
+            self.generated_read_ast = generated_read_ast;
+            self.allow_select_set_result_tail_boundary = true;
+            defer {
+                pos.* = self.pos;
+                self.tokens = previous_tokens;
+                self.pos = previous_pos;
+                self.generated_read_ast = previous_ast;
+                self.schema = previous_schema;
+                self.joined_source_schema = previous_joined_schema;
+                self.allow_select_set_result_tail_boundary = previous_tail_boundary;
+            }
+            return try Accessors.parseLateral(self);
+        }
+
         pub fn parseSetOperationResultTailHook(
             ptr: *anyopaque,
             lowered: plan.LoweredSelect,
@@ -1755,6 +1973,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             return .{
                 .schema = self.schema,
+                .joined_source_schema = self.joined_source_schema,
                 .field_expression_qualifiers = self.field_expression_qualifiers,
                 .returning_expression_qualifiers = self.returning_expression_qualifiers,
                 .defer_row_expression_field_validation = self.defer_row_expression_field_validation,
@@ -1764,6 +1983,7 @@ pub fn ParserContextAccessors(comptime ParserType: type) type {
         pub fn setSelectParserContextHook(ptr: *anyopaque, context: expr_row_parse.SelectParserContext) void {
             const self: *ParserType = @ptrCast(@alignCast(ptr));
             self.schema = context.schema;
+            self.joined_source_schema = context.joined_source_schema;
             self.field_expression_qualifiers = context.field_expression_qualifiers;
             self.returning_expression_qualifiers = context.returning_expression_qualifiers;
             self.defer_row_expression_field_validation = context.defer_row_expression_field_validation;

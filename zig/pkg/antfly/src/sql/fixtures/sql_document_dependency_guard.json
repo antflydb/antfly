@@ -16,7 +16,7 @@
       "durable_document": "read_only",
       "durable_row": "none",
       "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
-      "evidence_symbol": "document SQL query, aggregate, bounded-scan, residual, and UNNEST corpus fixtures",
+      "evidence_symbol": "document SQL query, aggregate, bounded-scan, residual, UNNEST, and native graph corpus fixtures",
       "release_gate": "relational-release-gate"
     },
     {
@@ -51,8 +51,8 @@
       "durable_catalog": "none",
       "durable_document": "unproven_migration_blocker",
       "durable_row": "none",
-      "evidence_file": "zig/pkg/antfly/src/sql/lower_dml.zig",
-      "evidence_symbol": "sql adapter lower dml rejects catalog writes to document tables",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/document_sql_corpus.json",
+      "evidence_symbol": "document SQL write plan corpus cases",
       "release_gate": "relational-release-gate"
     },
     {

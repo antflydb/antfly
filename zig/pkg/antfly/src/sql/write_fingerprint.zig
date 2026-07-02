@@ -483,6 +483,27 @@ fn documentProducerMutationTemplateName(template: plan_mod.DocumentProducerMutat
     };
 }
 
+fn documentProducerName(producer: document_plan.DocumentProducer) []const u8 {
+    return switch (producer) {
+        .id_lookup => "id_lookup",
+        .indexed_query => "indexed_query",
+        .bounded_scan => "bounded_scan",
+    };
+}
+
+fn documentJoinedSourceProducerName(producer: plan_mod.DocumentJoinedMutationSourceProducer) []const u8 {
+    return switch (producer) {
+        .static => |static_producer| documentProducerName(static_producer),
+        .join_key_indexed_lookup => "join_key_indexed_lookup",
+    };
+}
+
+fn documentJoinedMutationDuplicateSourcePolicyName(policy: plan_mod.DocumentJoinedMutationDuplicateSourcePolicy) []const u8 {
+    return switch (policy) {
+        .reject => "reject",
+    };
+}
+
 fn appendNonZeroU64FingerprintAlloc(
     alloc: std.mem.Allocator,
     owned_base: []u8,
@@ -581,6 +602,7 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
                 else => {},
             }
             fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "predicates", document_write.batch.predicates.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "returning_rows", document_write.batch.returning_rows.len);
             break :blk fingerprint;
         },
         .document_producer_mutation => |document_mutation| blk: {
@@ -604,6 +626,48 @@ pub fn writePlanFingerprintAlloc(alloc: std.mem.Allocator, lowered: LoweredWrite
                 .transform => |operations| fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ops", operations.len),
             }
             fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "version_predicate", document_mutation.expected_version != null);
+            break :blk fingerprint;
+        },
+        .document_joined_mutation => |document_mutation| blk: {
+            var fingerprint = try std.fmt.allocPrint(
+                alloc,
+                "document_joined_write:table={s}:source_table={s}:operation={s}",
+                .{
+                    document_mutation.table_name,
+                    document_mutation.source_table_name,
+                    @tagName(document_mutation.operation),
+                },
+            );
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "target_producer", documentProducerName(document_mutation.target_producer));
+            fingerprint = try appendStringFingerprintAlloc(alloc, fingerprint, "source_producer", documentJoinedSourceProducerName(document_mutation.source_producer));
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "join_keys", document_mutation.join_keys.len);
+            fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "source_assignments", document_mutation.source_assignments.len);
+            fingerprint = try appendStringFingerprintAlloc(
+                alloc,
+                fingerprint,
+                "template",
+                documentProducerMutationTemplateName(document_mutation.template),
+            );
+            switch (document_mutation.template) {
+                .delete => {},
+                .transform => |operations| fingerprint = try appendNonZeroUsizeFingerprintAlloc(alloc, fingerprint, "ops", operations.len),
+            }
+            fingerprint = try appendTrueBoolFingerprintAlloc(alloc, fingerprint, "version_predicate", document_mutation.expected_version != null);
+            if (document_mutation.max_target_rows) |max_target_rows| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "max_target_rows", max_target_rows);
+            }
+            if (document_mutation.max_source_rows) |max_source_rows| {
+                fingerprint = try appendNonZeroU32FingerprintAlloc(alloc, fingerprint, "max_source_rows", max_source_rows);
+            }
+            if (document_mutation.max_source_bytes) |max_source_bytes| {
+                fingerprint = try appendNonZeroU64FingerprintAlloc(alloc, fingerprint, "max_source_bytes", max_source_bytes);
+            }
+            fingerprint = try appendStringFingerprintAlloc(
+                alloc,
+                fingerprint,
+                "duplicate_source",
+                documentJoinedMutationDuplicateSourcePolicyName(document_mutation.duplicate_source_policy),
+            );
             break :blk fingerprint;
         },
         .insert_source => |insert_source| blk: {
@@ -750,6 +814,50 @@ test "document producer mutation fingerprint pins producer and template shape" {
     defer alloc.free(fingerprint);
     try std.testing.expectEqualStrings(
         "document_write:table=docs:operation=projection_write:producer=id_lookup:producer_ids=2:producer_residual=1:template=transform:ops=1:version_predicate=1",
+        fingerprint,
+    );
+}
+
+test "document joined mutation fingerprint pins producers join shape and bounds" {
+    const alloc = std.testing.allocator;
+    const ids = [_][]const u8{"doc:target"};
+    var join_keys = [_]plan_mod.DocumentJoinedMutationJoinKey{.{
+        .target_field = "_id",
+        .source_field = "source_id",
+    }};
+    var source_assignments = [_]plan_mod.DocumentJoinedMutationSourceAssignment{.{
+        .target_path = "title",
+        .source_field = "source_title",
+        .field_type = .text,
+    }};
+    var operations = [_]db_mod.types.TransformOp{.{
+        .op = .set,
+        .path = "updated_at",
+        .value_json = "\"2026-01-01T00:00:00Z\"",
+    }};
+    const lowered = LoweredWritePlan{ .document_joined_mutation = .{
+        .table_name = "docs",
+        .source_table_name = "source_docs",
+        .target_producer = .{ .id_lookup = .{ .ids = ids[0..] } },
+        .source_producer = .{ .static = .{ .indexed_query = .{
+            .filter_query_json = "{\"field\":\"source_id\",\"op\":\"eq\",\"value\":\"doc:target\"}",
+            .max_candidate_rows = 1,
+        } } },
+        .join_keys = join_keys[0..],
+        .source_assignments = source_assignments[0..],
+        .operation = .projection_write,
+        .template = .{ .transform = operations[0..] },
+        .expected_version = 9,
+        .max_target_rows = 1,
+        .max_source_rows = 1,
+        .max_source_bytes = 4096,
+        .duplicate_source_policy = .reject,
+    } };
+
+    const fingerprint = try writePlanFingerprintAlloc(alloc, lowered);
+    defer alloc.free(fingerprint);
+    try std.testing.expectEqualStrings(
+        "document_joined_write:table=docs:source_table=source_docs:operation=projection_write:target_producer=id_lookup:source_producer=indexed_query:join_keys=1:source_assignments=1:template=transform:ops=1:version_predicate=1:max_target_rows=1:max_source_rows=1:max_source_bytes=4096:duplicate_source=reject",
         fingerprint,
     );
 }

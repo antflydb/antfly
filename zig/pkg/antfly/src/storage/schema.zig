@@ -180,6 +180,18 @@ pub const RelationalColumn = struct {
     generated: ?RelationalGeneratedValue = null,
     index_where: []const UniquePredicate = &.{},
     index_where_expressions: []const RelationalRowsExpressionCondition = &.{},
+    cardinality_proof: RelationalColumnCardinalityProof = .none,
+};
+
+pub const RelationalColumnCardinalityProof = enum(u8) {
+    none = 0,
+    unique = 1,
+
+    pub fn fromString(text: []const u8) ?RelationalColumnCardinalityProof {
+        if (std.mem.eql(u8, text, "none")) return .none;
+        if (std.mem.eql(u8, text, "unique")) return .unique;
+        return null;
+    }
 };
 
 pub const RelationalIndexLifecycle = enum(u8) {
@@ -545,6 +557,7 @@ pub fn relationalColumnDefinitionsEqual(a: RelationalColumn, b: RelationalColumn
     if (!relationalGeneratedValuesEqual(a.generated, b.generated)) return false;
     if (!uniquePredicateSlicesEqual(a.index_where, b.index_where)) return false;
     if (!relationalRowsExpressionConditionSlicesEqual(a.index_where_expressions, b.index_where_expressions)) return false;
+    if (a.cardinality_proof != b.cardinality_proof) return false;
     return true;
 }
 
@@ -792,7 +805,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
 
     // Header
     try buf.appendSlice(alloc, "ASCH"); // magic
-    try appendU32(&buf, alloc, 45); // format version
+    try appendU32(&buf, alloc, 46); // format version
     try appendU32(&buf, alloc, schema.version);
     try appendStr(&buf, alloc, schema.default_type);
     try appendU64(&buf, alloc, schema.ttl_duration_ns);
@@ -902,6 +915,7 @@ pub fn serializeSchema(alloc: Allocator, schema: TableSchema) ![]u8 {
             try appendOptStr(&buf, alloc, predicate.value_json);
         }
         try appendRelationalRowsExpressionConditionSlice(&buf, alloc, column.index_where_expressions);
+        try buf.append(alloc, @intFromEnum(column.cardinality_proof));
     }
 
     // Foreign-key catalog (format version 11+).
@@ -1049,7 +1063,7 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
 
     var pos: usize = 4;
     const fmt_version = readU32(data, &pos);
-    if (fmt_version < 1 or fmt_version > 45) return error.UnsupportedVersion;
+    if (fmt_version < 1 or fmt_version > 46) return error.UnsupportedVersion;
 
     const version = readU32(data, &pos);
     const default_type = try alloc.dupe(u8, readStr(data, &pos));
@@ -1408,7 +1422,12 @@ pub fn deserializeSchema(alloc: Allocator, data: []const u8) !TableSchema {
             errdefer freeUniquePredicateSlice(alloc, index_where);
             const index_where_expressions = if (fmt_version >= 31) try readRelationalRowsExpressionConditionSliceAlloc(alloc, data, &pos) else &.{};
             errdefer freeRelationalRowsExpressionConditionSlice(alloc, index_where_expressions);
-            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .collation = collation, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .index_name = index_name, .index_include_columns = index_include_columns, .index_keys = index_keys, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where, .index_where_expressions = index_where_expressions };
+            const cardinality_proof: RelationalColumnCardinalityProof = if (fmt_version >= 46) proof_blk: {
+                const value: RelationalColumnCardinalityProof = @enumFromInt(data[pos]);
+                pos += 1;
+                break :proof_blk value;
+            } else .none;
+            column.* = .{ .name = name, .path = path, .field_type = field_type, .array_item_type = array_item_type, .nullable = nullable, .collation = collation, .indexed = indexed, .index_lifecycle = index_lifecycle, .index_generation = index_generation, .index_name = index_name, .index_include_columns = index_include_columns, .index_keys = index_keys, .default_value = default_value, .on_update_value = on_update_value, .generated = generated, .index_where = index_where, .index_where_expressions = index_where_expressions, .cardinality_proof = cardinality_proof };
             columns_initialized += 1;
         }
         break :blk columns;
@@ -2887,7 +2906,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
         .storage_mode = .relational,
         .relational_columns = &.{
             .{ .name = "id", .path = "id", .field_type = .keyword, .collation = "C", .nullable = false },
-            .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false },
+            .{ .name = "tenant_id", .path = "tenant_id", .field_type = .keyword, .nullable = false, .cardinality_proof = .unique },
             .{
                 .name = "amount",
                 .path = "amount",
@@ -3044,6 +3063,7 @@ test "schema serialize/deserialize round-trips relational storage mode and colum
     try std.testing.expect(!loaded.relational_columns[0].nullable);
     try std.testing.expectEqual(AntflyType.keyword, loaded.relational_columns[1].field_type);
     try std.testing.expect(!loaded.relational_columns[1].nullable);
+    try std.testing.expectEqual(RelationalColumnCardinalityProof.unique, loaded.relational_columns[1].cardinality_proof);
     try std.testing.expect(loaded.primary_key != null);
     try std.testing.expectEqualStrings("orders_pkey", loaded.primary_key.?.name.?);
     try std.testing.expectEqual(@as(usize, 2), loaded.primary_key.?.columns.len);

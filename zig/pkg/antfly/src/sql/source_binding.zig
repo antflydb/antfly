@@ -35,6 +35,7 @@ pub const BoundedScanPolicy = struct {
 };
 
 pub const default_document_sql_bounded_scan_rows: u32 = 10_000;
+pub const default_document_sql_bounded_scan_bytes: u64 = 8 * 1024 * 1024;
 
 pub const RelationalBinding = struct {
     target: CatalogTableRef,

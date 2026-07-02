@@ -48,6 +48,21 @@ pub const SqlDiagnosticCode = enum {
     document_sql_requires_bounded_scan,
     document_sql_unnest_requires_array,
     document_sql_unnest_unsupported,
+    document_sql_write_duplicate_source,
+    document_sql_write_join_missing_cardinality_proof,
+    document_sql_write_join_missing_exact_producer,
+    document_sql_write_join_missing_index_proof,
+    document_sql_write_join_ordered_index_proof,
+    document_sql_write_join_partial_index_proof,
+    document_sql_write_join_stale_index_proof,
+    document_sql_write_source_assignment_alias,
+    document_sql_write_source_assignment_ambiguous_reference,
+    document_sql_write_source_assignment_generated_field,
+    document_sql_write_source_assignment_missing_field,
+    document_sql_write_source_assignment_reserved_field,
+    document_sql_write_source_assignment_target_generated_field,
+    document_sql_write_source_assignment_target_reserved_field,
+    document_sql_write_source_assignment_type_mismatch,
     document_sql_write_unsupported,
     document_sql_view_mapping_unsupported,
     invalid_role_setting,
@@ -135,6 +150,21 @@ pub fn diagnosticCodeDefaultMessage(code: SqlDiagnosticCode) []const u8 {
         .document_sql_requires_bounded_scan => "document SQL requires an explicit bounded scan policy",
         .document_sql_unnest_requires_array => "document SQL UNNEST requires an array field",
         .document_sql_unnest_unsupported => "document SQL UNNEST shape is unsupported",
+        .document_sql_write_duplicate_source => "document SQL joined write source produced duplicate join keys",
+        .document_sql_write_join_missing_cardinality_proof => "document SQL joined write lacks a document cardinality proof",
+        .document_sql_write_join_missing_exact_producer => "document SQL joined writes require exact target and source producers",
+        .document_sql_write_join_missing_index_proof => "document SQL joined write requires indexed join fields",
+        .document_sql_write_join_ordered_index_proof => "document SQL joined write cannot use ordered or composite join indexes",
+        .document_sql_write_join_partial_index_proof => "document SQL joined write cannot use partial join indexes",
+        .document_sql_write_join_stale_index_proof => "document SQL joined write cannot use stale or rebuilding join indexes",
+        .document_sql_write_source_assignment_alias => "document SQL source assignment requires the joined source alias",
+        .document_sql_write_source_assignment_ambiguous_reference => "document SQL source assignment has an ambiguous target/source reference",
+        .document_sql_write_source_assignment_generated_field => "document SQL source assignment cannot read a generated source field",
+        .document_sql_write_source_assignment_missing_field => "document SQL source assignment references an unmapped source field",
+        .document_sql_write_source_assignment_reserved_field => "document SQL source assignment cannot read reserved document fields",
+        .document_sql_write_source_assignment_target_generated_field => "document SQL source assignment cannot write a generated target field",
+        .document_sql_write_source_assignment_target_reserved_field => "document SQL source assignment cannot write reserved document fields",
+        .document_sql_write_source_assignment_type_mismatch => "document SQL source assignment source and target types differ",
         .document_sql_write_unsupported => "document_sql_write_unsupported",
         .document_sql_view_mapping_unsupported => "document_sql_view_mapping_unsupported",
         .invalid_role_setting => "invalid sql setting",
@@ -174,7 +204,23 @@ pub fn diagnosticCodeMissingNativeModel(code: SqlDiagnosticCode) ?[]const u8 {
         .document_sql_bounded_scan_unsupported_residual,
         .document_sql_requires_bounded_scan,
         => "document SQL bounded-scan execution proof",
-        .document_sql_write_unsupported => "document SQL write execution",
+        .document_sql_write_source_assignment_alias,
+        .document_sql_write_source_assignment_ambiguous_reference,
+        .document_sql_write_source_assignment_generated_field,
+        .document_sql_write_source_assignment_missing_field,
+        .document_sql_write_source_assignment_reserved_field,
+        .document_sql_write_source_assignment_target_generated_field,
+        .document_sql_write_source_assignment_target_reserved_field,
+        .document_sql_write_source_assignment_type_mismatch,
+        .document_sql_write_duplicate_source,
+        .document_sql_write_join_missing_cardinality_proof,
+        .document_sql_write_join_missing_exact_producer,
+        .document_sql_write_join_missing_index_proof,
+        .document_sql_write_join_ordered_index_proof,
+        .document_sql_write_join_partial_index_proof,
+        .document_sql_write_join_stale_index_proof,
+        .document_sql_write_unsupported,
+        => "document SQL write execution",
         .document_sql_view_mapping_unsupported => "document-to-SQL view mapping execution",
         .unsupported_sql_statement => "typed Antfly logical plan for this SQL shape",
         else => null,
@@ -195,6 +241,21 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         error.DocumentSqlRequiresBoundedScan => .document_sql_requires_bounded_scan,
         error.DocumentSqlUnnestRequiresArray => .document_sql_unnest_requires_array,
         error.DocumentSqlUnnestUnsupported => .document_sql_unnest_unsupported,
+        error.DocumentSqlWriteDuplicateSource => .document_sql_write_duplicate_source,
+        error.DocumentSqlWriteJoinMissingCardinalityProof => .document_sql_write_join_missing_cardinality_proof,
+        error.DocumentSqlWriteJoinMissingExactProducer => .document_sql_write_join_missing_exact_producer,
+        error.DocumentSqlWriteJoinMissingIndexProof => .document_sql_write_join_missing_index_proof,
+        error.DocumentSqlWriteJoinOrderedIndexProof => .document_sql_write_join_ordered_index_proof,
+        error.DocumentSqlWriteJoinPartialIndexProof => .document_sql_write_join_partial_index_proof,
+        error.DocumentSqlWriteJoinStaleIndexProof => .document_sql_write_join_stale_index_proof,
+        error.DocumentSqlWriteSourceAssignmentAlias => .document_sql_write_source_assignment_alias,
+        error.DocumentSqlWriteSourceAssignmentAmbiguousReference => .document_sql_write_source_assignment_ambiguous_reference,
+        error.DocumentSqlWriteSourceAssignmentGeneratedField => .document_sql_write_source_assignment_generated_field,
+        error.DocumentSqlWriteSourceAssignmentMissingField => .document_sql_write_source_assignment_missing_field,
+        error.DocumentSqlWriteSourceAssignmentReservedField => .document_sql_write_source_assignment_reserved_field,
+        error.DocumentSqlWriteSourceAssignmentTargetGeneratedField => .document_sql_write_source_assignment_target_generated_field,
+        error.DocumentSqlWriteSourceAssignmentTargetReservedField => .document_sql_write_source_assignment_target_reserved_field,
+        error.DocumentSqlWriteSourceAssignmentTypeMismatch => .document_sql_write_source_assignment_type_mismatch,
         error.DocumentSqlWriteUnsupported => .document_sql_write_unsupported,
         error.DocumentSqlViewMappingUnsupported => .document_sql_view_mapping_unsupported,
         error.InvalidRoleSetting => .invalid_role_setting,
@@ -236,6 +297,13 @@ pub fn knownErrorDiagnostic(phase: SqlDiagnosticPhase, err: anyerror) ?SqlDiagno
         .document_sql_requires_bounded_scan => diagnostic.withHint("Provide an explicit document SQL bounded-scan policy or add an exact indexed/native producer."),
         .document_sql_unnest_requires_array => diagnostic.withHint("Use UNNEST only on fields declared with array type metadata."),
         .document_sql_unnest_unsupported => diagnostic.withHint("Use a single top-level UNNEST over one array field with a bounded document producer."),
+        .document_sql_write_duplicate_source => diagnostic.withHint("Constrain the source producer so each target join key matches at most one source document."),
+        .document_sql_write_join_missing_cardinality_proof => diagnostic.withHint("Add a document-native cardinality proof before admitting this non-identity joined write."),
+        .document_sql_write_join_missing_exact_producer => diagnostic.withHint("Use an exact _id join, or add a native producer proof for both joined document inputs."),
+        .document_sql_write_join_missing_index_proof => diagnostic.withHint("Add ready single-field indexes for both document join fields before admitting this joined write."),
+        .document_sql_write_join_ordered_index_proof => diagnostic.withHint("Use an unordered single-field equality index for each document join field."),
+        .document_sql_write_join_partial_index_proof => diagnostic.withHint("Use full join-field indexes or prove the partial predicates cover the joined write."),
+        .document_sql_write_join_stale_index_proof => diagnostic.withHint("Wait for join-field indexes to become ready before admitting this joined write."),
         else => diagnostic,
     };
 }
@@ -244,6 +312,7 @@ pub const SqlAdapterClassificationReason = enum {
     aggregate_duplicate_output_name,
     bulk_io_plan,
     conversion_catalog_plan,
+    cte_body_join_plan,
     cte_mutation_source_plan,
     document_sql_bounded_scan_incomplete_topk,
     document_sql_bounded_scan_missing_exact_producer,
@@ -251,6 +320,20 @@ pub const SqlAdapterClassificationReason = enum {
     document_sql_bounded_scan_unsupported_residual,
     document_sql_view_mapping_catalog,
     document_sql_view_mapping_unsupported,
+    document_sql_write_join_missing_cardinality_proof,
+    document_sql_write_join_missing_exact_producer,
+    document_sql_write_join_missing_index_proof,
+    document_sql_write_join_ordered_index_proof,
+    document_sql_write_join_partial_index_proof,
+    document_sql_write_join_stale_index_proof,
+    document_sql_write_source_assignment_alias,
+    document_sql_write_source_assignment_ambiguous_reference,
+    document_sql_write_source_assignment_generated_field,
+    document_sql_write_source_assignment_missing_field,
+    document_sql_write_source_assignment_reserved_field,
+    document_sql_write_source_assignment_target_generated_field,
+    document_sql_write_source_assignment_target_reserved_field,
+    document_sql_write_source_assignment_type_mismatch,
     document_sql_write_unsupported,
     document_table_ddl_duplicate_schema_name,
     document_table_ddl_invalid_antfly_extension,
@@ -269,6 +352,7 @@ pub const SqlAdapterClassificationReason = enum {
     event_trigger_catalog_plan,
     extension,
     foreign_data_catalog_plan,
+    graph_query_plan,
     insert_overriding_value_plan,
     invalid_expression_conflict_target,
     invalid_named_conflict_target,
@@ -290,6 +374,10 @@ pub const SqlAdapterClassificationReason = enum {
     set_operation_source_schema,
     set_operation_plan,
     statistics_catalog_plan,
+    subquery_expression_plan,
+    subquery_quantified_plan,
+    subquery_scalar_plan,
+    subquery_semijoin_plan,
     system_time_temporal_table,
     table_access_method_plan,
     table_cluster_plan,
@@ -299,6 +387,7 @@ pub const SqlAdapterClassificationReason = enum {
     table_persistence_plan,
     table_storage_parameters_plan,
     table_tablespace_plan,
+    trigger_catalog_plan,
     table_trigger_state_plan,
     temporal_fk_action,
     text_search_catalog_plan,
@@ -367,13 +456,28 @@ pub const NativeExecutionRequirement = struct {
 pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) NativeExecutionRequirement {
     return switch (reason) {
         .bulk_io_plan => .{ .category = .bulk_io_route, .auth_and_audit = true },
-        .cte_mutation_source_plan => .{ .category = .stream_materialization, .materialization = true },
+        .cte_body_join_plan, .cte_mutation_source_plan => .{ .category = .stream_materialization, .materialization = true },
         .document_sql_bounded_scan_incomplete_topk => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_missing_exact_producer => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_unbounded_source => .{ .category = .stream_materialization },
         .document_sql_bounded_scan_unsupported_residual => .{ .category = .stream_materialization },
         .document_sql_view_mapping_catalog => .{ .category = .catalog_lifecycle, .durable_metadata = true },
         .document_sql_view_mapping_unsupported => .{ .category = .stream_materialization },
+        .document_sql_write_join_missing_cardinality_proof, .document_sql_write_join_missing_exact_producer => .{ .category = .stream_materialization },
+        .document_sql_write_join_missing_index_proof,
+        .document_sql_write_join_ordered_index_proof,
+        .document_sql_write_join_partial_index_proof,
+        .document_sql_write_join_stale_index_proof,
+        => .{ .category = .stream_materialization },
+        .document_sql_write_source_assignment_alias,
+        .document_sql_write_source_assignment_ambiguous_reference,
+        .document_sql_write_source_assignment_generated_field,
+        .document_sql_write_source_assignment_missing_field,
+        .document_sql_write_source_assignment_reserved_field,
+        .document_sql_write_source_assignment_target_generated_field,
+        .document_sql_write_source_assignment_target_reserved_field,
+        .document_sql_write_source_assignment_type_mismatch,
+        => .{ .category = .auth_row_filter, .auth_and_audit = true },
         .document_sql_write_unsupported => .{ .category = .auth_row_filter, .auth_and_audit = true },
         .document_table_ddl_duplicate_schema_name,
         .document_table_ddl_invalid_antfly_extension,
@@ -402,6 +506,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         => .{ .category = .output_shape_validation },
         .extension,
         .event_trigger_catalog_plan,
+        .graph_query_plan,
         .schema_namespace,
         .foreign_data_catalog_plan,
         .operator_catalog_plan,
@@ -416,6 +521,7 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .table_persistence_plan,
         .table_storage_parameters_plan,
         .table_tablespace_plan,
+        .trigger_catalog_plan,
         .table_trigger_state_plan,
         .text_search_catalog_plan,
         .transform_catalog_plan,
@@ -424,6 +530,10 @@ pub fn nativeExecutionRequirement(reason: SqlAdapterClassificationReason) Native
         .prepared_transaction_plan => .{ .category = .prepared_transaction_recovery, .coordinator_recovery = true },
         .recursive_cte_stream_plan,
         .set_operation_plan,
+        .subquery_expression_plan,
+        .subquery_quantified_plan,
+        .subquery_scalar_plan,
+        .subquery_semijoin_plan,
         => .{
             .category = .stream_materialization,
             .materialization = true,
@@ -452,6 +562,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expect(classificationReasonTokenIsKnown("set_operation_source_schema"));
     try std.testing.expect(classificationReasonTokenIsKnown("bulk_io_plan"));
     try std.testing.expectEqual(SqlAdapterClassificationReason.conversion_catalog_plan, classificationReasonFromToken("conversion_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.cte_body_join_plan, classificationReasonFromToken("cte_body_join_plan").?);
     try std.testing.expect(classificationReasonTokenIsKnown("cte_mutation_source_plan"));
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_incomplete_topk, classificationReasonFromToken("document_sql_bounded_scan_incomplete_topk").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_missing_exact_producer, classificationReasonFromToken("document_sql_bounded_scan_missing_exact_producer").?);
@@ -459,6 +570,20 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_bounded_scan_unsupported_residual, classificationReasonFromToken("document_sql_bounded_scan_unsupported_residual").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_catalog, classificationReasonFromToken("document_sql_view_mapping_catalog").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_view_mapping_unsupported, classificationReasonFromToken("document_sql_view_mapping_unsupported").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_missing_cardinality_proof, classificationReasonFromToken("document_sql_write_join_missing_cardinality_proof").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_missing_exact_producer, classificationReasonFromToken("document_sql_write_join_missing_exact_producer").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_missing_index_proof, classificationReasonFromToken("document_sql_write_join_missing_index_proof").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_ordered_index_proof, classificationReasonFromToken("document_sql_write_join_ordered_index_proof").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_partial_index_proof, classificationReasonFromToken("document_sql_write_join_partial_index_proof").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_join_stale_index_proof, classificationReasonFromToken("document_sql_write_join_stale_index_proof").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_alias, classificationReasonFromToken("document_sql_write_source_assignment_alias").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_ambiguous_reference, classificationReasonFromToken("document_sql_write_source_assignment_ambiguous_reference").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_generated_field, classificationReasonFromToken("document_sql_write_source_assignment_generated_field").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_missing_field, classificationReasonFromToken("document_sql_write_source_assignment_missing_field").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_reserved_field, classificationReasonFromToken("document_sql_write_source_assignment_reserved_field").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_target_generated_field, classificationReasonFromToken("document_sql_write_source_assignment_target_generated_field").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_target_reserved_field, classificationReasonFromToken("document_sql_write_source_assignment_target_reserved_field").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_source_assignment_type_mismatch, classificationReasonFromToken("document_sql_write_source_assignment_type_mismatch").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_sql_write_unsupported, classificationReasonFromToken("document_sql_write_unsupported").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_duplicate_schema_name, classificationReasonFromToken("document_table_ddl_duplicate_schema_name").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_invalid_antfly_extension, classificationReasonFromToken("document_table_ddl_invalid_antfly_extension").?);
@@ -471,6 +596,7 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.document_table_ddl_unknown_default_type, classificationReasonFromToken("document_table_ddl_unknown_default_type").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.event_trigger_catalog_plan, classificationReasonFromToken("event_trigger_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.foreign_data_catalog_plan, classificationReasonFromToken("foreign_data_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.graph_query_plan, classificationReasonFromToken("graph_query_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.operator_catalog_plan, classificationReasonFromToken("operator_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.prepared_transaction_plan, classificationReasonFromToken("prepared_transaction_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.role_setting_plan, classificationReasonFromToken("role_setting_plan").?);
@@ -480,7 +606,12 @@ test "sql adapter diagnostics accept only stable known classification reasons" {
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_lock_mode_plan, classificationReasonFromToken("row_lock_mode_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.row_rewrite_expression_plan, classificationReasonFromToken("row_rewrite_expression_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.statistics_catalog_plan, classificationReasonFromToken("statistics_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.subquery_expression_plan, classificationReasonFromToken("subquery_expression_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.subquery_quantified_plan, classificationReasonFromToken("subquery_quantified_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.subquery_scalar_plan, classificationReasonFromToken("subquery_scalar_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.subquery_semijoin_plan, classificationReasonFromToken("subquery_semijoin_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.text_search_catalog_plan, classificationReasonFromToken("text_search_catalog_plan").?);
+    try std.testing.expectEqual(SqlAdapterClassificationReason.trigger_catalog_plan, classificationReasonFromToken("trigger_catalog_plan").?);
     try std.testing.expectEqual(SqlAdapterClassificationReason.transform_catalog_plan, classificationReasonFromToken("transform_catalog_plan").?);
     try std.testing.expectEqualStrings("multi_table_generation_barrier", classificationReasonToken(.multi_table_generation_barrier));
     try std.testing.expect(classificationReasonIsAdapterNoop(.session_setting));
@@ -620,6 +751,32 @@ test "sql diagnostics expose stable phase code and native model fields" {
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_row_cap_exceeded, row_cap.code);
     try std.testing.expectEqualStrings("document SQL bounded scan row cap exceeded", row_cap.message);
     try std.testing.expectEqualStrings("Increase the document SQL bounded-scan row cap or use an indexed/native producer.", row_cap.hint.?);
+
+    const duplicate_source = knownErrorDiagnostic(.execute, error.DocumentSqlWriteDuplicateSource) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_duplicate_source, duplicate_source.code);
+    try std.testing.expectEqualStrings("document SQL joined write source produced duplicate join keys", duplicate_source.message);
+    try std.testing.expectEqualStrings("Constrain the source producer so each target join key matches at most one source document.", duplicate_source.hint.?);
+
+    const join_missing_cardinality = knownErrorDiagnostic(.plan, error.DocumentSqlWriteJoinMissingCardinalityProof) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_join_missing_cardinality_proof, join_missing_cardinality.code);
+    try std.testing.expectEqualStrings("document SQL joined write lacks a document cardinality proof", join_missing_cardinality.message);
+    try std.testing.expectEqualStrings("Add a document-native cardinality proof before admitting this non-identity joined write.", join_missing_cardinality.hint.?);
+
+    const join_missing_index = knownErrorDiagnostic(.plan, error.DocumentSqlWriteJoinMissingIndexProof) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_join_missing_index_proof, join_missing_index.code);
+    try std.testing.expectEqualStrings("document SQL joined write requires indexed join fields", join_missing_index.message);
+
+    const join_stale_index = knownErrorDiagnostic(.plan, error.DocumentSqlWriteJoinStaleIndexProof) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_join_stale_index_proof, join_stale_index.code);
+    try std.testing.expectEqualStrings("document SQL joined write cannot use stale or rebuilding join indexes", join_stale_index.message);
+
+    const join_partial_index = knownErrorDiagnostic(.plan, error.DocumentSqlWriteJoinPartialIndexProof) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_join_partial_index_proof, join_partial_index.code);
+    try std.testing.expectEqualStrings("document SQL joined write cannot use partial join indexes", join_partial_index.message);
+
+    const join_ordered_index = knownErrorDiagnostic(.plan, error.DocumentSqlWriteJoinOrderedIndexProof) orelse return error.TestUnexpectedResult;
+    try std.testing.expectEqual(SqlDiagnosticCode.document_sql_write_join_ordered_index_proof, join_ordered_index.code);
+    try std.testing.expectEqualStrings("document SQL joined write cannot use ordered or composite join indexes", join_ordered_index.message);
 
     const byte_cap = knownErrorDiagnostic(.execute, error.DocumentSqlBoundedScanByteCapExceeded) orelse return error.TestUnexpectedResult;
     try std.testing.expectEqual(SqlDiagnosticCode.document_sql_bounded_scan_byte_cap_exceeded, byte_cap.code);

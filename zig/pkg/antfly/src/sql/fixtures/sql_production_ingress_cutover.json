@@ -1,0 +1,92 @@
+{
+  "cutover_format": 1,
+  "gates": [
+    {
+      "id": "generated-ast-dispatch",
+      "grammar_slices_bullet": "Replace generated-covered token scans/string probes with generated AST dispatch or generated unsupported diagnostics.",
+      "status": "fixture_enforced",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_compatibility_wrappers.json",
+      "evidence_symbol": "sql_compatibility_wrappers",
+      "completion_condition": "Every generated-covered wrapper is removed or reclassified as an explicit compatibility contract outside generated grammar coverage."
+    },
+    {
+      "id": "retained-ast-corruption-boundary",
+      "grammar_slices_bullet": "Add retained-AST corruption tests at the tokenized public boundary before removing a matching legacy fallback path.",
+      "status": "complete",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_parser_migration_table.json",
+      "evidence_symbol": "sql_parser_migration_table",
+      "completion_condition": "Each generated-owned public statement family has fail-closed malformed or stale retained-AST coverage at the tokenized public boundary."
+    },
+    {
+      "id": "token-lexer-bridge-fixtures",
+      "grammar_slices_bullet": "Update TokenKind/TokenKeyword, lexer recognition, generated-token bridge mapping, and focused lexer/parser fixtures in the same patch as newly admitted grammar terminals.",
+      "status": "complete",
+      "evidence_file": "zig/pkg/antfly/src/sql/fixtures/sql_production_terminal_bridge.json",
+      "evidence_symbol": "sql_production_terminal_bridge",
+      "completion_condition": "New grammar terminal patches carry lexer, generated-token bridge, valid syntax, malformed syntax, and contextual identifier fixtures together."
+    }
+  ],
+  "wrappers": [
+    {
+      "wrapper_id": "document-query-bounded-scan-runtime",
+      "family": "query",
+      "requirement_id": "generated-ast-dispatch",
+      "legacy_admission": "compatibility_contract",
+      "public_boundary_corruption_required": false
+    },
+    {
+      "wrapper_id": "grammar-maintenance-tail-token-parsers",
+      "family": "maintenance",
+      "requirement_id": "generated-ast-dispatch",
+      "legacy_admission": "compatibility_contract",
+      "public_boundary_corruption_required": false
+    }
+  ],
+  "families": [
+    {
+      "family": "backups",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "ddl",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "dml",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "extensions",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "functions",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "lakes",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "maintenance",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "query",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    },
+    {
+      "family": "roles",
+      "required_entrypoint": "tokenized",
+      "corruption_gate": "retained-ast-corruption-boundary"
+    }
+  ]
+}

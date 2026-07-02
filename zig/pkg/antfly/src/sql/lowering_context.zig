@@ -78,6 +78,7 @@ pub const ReadPlanLoweringCallbacks = struct {
         std.mem.Allocator,
         *const tokenized.ParsedSql,
         runtime_schema.TableSchema,
+        ?runtime_schema.TableSchema,
         []const value_mod.SqlValue,
         expr_row_parse.SqlFunctionBindings,
     ) anyerror!plan.LoweredQueryPlan,
@@ -109,12 +110,30 @@ pub const ReadPlanLoweringContext = struct {
     }
 
     pub fn lowerParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
+        if (try self.lowerNativeGraphParsed(parsed_sql)) |lowered| return lowered;
         if (parsed_sql.generatedStatementKind() == .read) {
             const read_ast = (try generatedReadAstForParsedSql(parsed_sql)) orelse return error.UnsupportedSqlShape;
             try validateGeneratedReadPublishedKind(parsed_sql);
             return try lowerReadPlanFromGeneratedReadAstAlloc(self, parsed_sql, read_ast);
         }
         return try self.lowerParsedWithClassifier(parsed_sql);
+    }
+
+    fn lowerNativeGraphParsed(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !?plan.LoweredReadPlan {
+        const unsupported = nativeGraphUnsupportedAst(parsed_sql) orelse return null;
+        if (unsupported.graph_source_binding_tokens == null) return null;
+        const synthetic_sql = try nativeGraphSyntheticSelectSqlAlloc(self.alloc, parsed_sql.sql(), parsed_sql.items(), unsupported);
+        defer self.alloc.free(synthetic_sql);
+        var synthetic = try tokenized.ParsedSql.initAlloc(self.alloc, synthetic_sql);
+        defer synthetic.deinit(self.alloc);
+        return .{ .query = try self.callbacks.lower_query_plan(
+            self.alloc,
+            &synthetic,
+            self.schema,
+            self.source_schema,
+            self.params,
+            self.function_bindings,
+        ) };
     }
 
     fn lowerParsedWithClassifier(self: *@This(), parsed_sql: *const tokenized.ParsedSql) !plan.LoweredReadPlan {
@@ -172,7 +191,7 @@ pub const ReadPlanLoweringContext = struct {
 
     fn lowerQueryHook(ptr: *anyopaque) anyerror!plan.LoweredQueryPlan {
         const self: *@This() = @ptrCast(@alignCast(ptr));
-        return try self.callbacks.lower_query_plan(self.alloc, self.parsed_sql.?, self.schema, self.params, self.function_bindings);
+        return try self.callbacks.lower_query_plan(self.alloc, self.parsed_sql.?, self.schema, self.source_schema, self.params, self.function_bindings);
     }
 
     fn lowerSetOperationHook(ptr: *anyopaque) anyerror!plan.LoweredSetOperationPlan {
@@ -180,6 +199,267 @@ pub const ReadPlanLoweringContext = struct {
         return try self.callbacks.lower_set_operation_optional_source_schema(self.alloc, self.parsed_sql.?, self.schema, self.source_schema, self.params, self.function_bindings);
     }
 };
+
+fn nativeGraphUnsupportedAst(parsed_sql: *const tokenized.ParsedSql) ?generated_parser.GeneratedSqlUnsupportedAst {
+    const generated_statement = parsed_sql.generated_statement orelse return null;
+    if (generated_statement.statement != .unsupported) return null;
+    if (generated_statement.statement.unsupported != .graph_query) return null;
+    const generated_ast = generated_statement.ast orelse return null;
+    return switch (generated_ast) {
+        .unsupported => |unsupported| if (unsupported.kind == .graph_query) unsupported else null,
+        else => null,
+    };
+}
+
+fn nativeGraphSyntheticSelectSqlAlloc(
+    alloc: std.mem.Allocator,
+    source_sql: []const u8,
+    tokens: []const token_mod.Token,
+    unsupported: generated_parser.GeneratedSqlUnsupportedAst,
+) ![]const u8 {
+    const projection = unsupported.graph_return_projection_tokens orelse return error.UnsupportedSqlShape;
+    const path = unsupported.graph_path_tokens orelse return error.UnsupportedSqlShape;
+    const table = unsupported.graph_source_table_tokens orelse return error.UnsupportedSqlShape;
+    const index = unsupported.graph_source_index_tokens orelse return error.UnsupportedSqlShape;
+    const start = unsupported.graph_source_start_tokens orelse return error.UnsupportedSqlShape;
+
+    const alias_context = try makeNativeGraphAliasContext(tokens, unsupported);
+    var alias_fields = std.ArrayListUnmanaged(NativeGraphAliasField).empty;
+    defer alias_fields.deinit(alloc);
+
+    const projection_sql = try nativeGraphRewriteAliasFieldsAlloc(alloc, source_sql, tokens, projection, alias_context, &alias_fields);
+    defer alloc.free(projection_sql);
+    const order_sql = if (unsupported.graph_order_tokens) |order|
+        try nativeGraphRewriteAliasFieldsAlloc(alloc, source_sql, tokens, order, alias_context, &alias_fields)
+    else
+        null;
+    defer if (order_sql) |sql| alloc.free(sql);
+
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    try out.appendSlice(alloc, "SELECT ");
+    try out.appendSlice(alloc, projection_sql);
+    try out.appendSlice(alloc, " FROM antfly.graph_match(table_name => ");
+    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSingleTokenValue(tokens, table));
+    try out.appendSlice(alloc, ", index => ");
+    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSingleTokenValue(tokens, index));
+    try out.appendSlice(alloc, ", start => ");
+    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSingleTokenValue(tokens, start));
+    try out.appendSlice(alloc, ", pattern => ");
+    try appendNativeGraphSqlStringLiteral(alloc, &out, nativeGraphSourceText(source_sql, tokens, path));
+    try out.appendSlice(alloc, ", return => ");
+    const aliases = try nativeGraphReturnAliasesAlloc(alloc, tokens, unsupported);
+    defer alloc.free(aliases);
+    try appendNativeGraphSqlStringLiteral(alloc, &out, aliases);
+    if (alias_fields.items.len > 0) {
+        try out.appendSlice(alloc, ", alias_fields => ");
+        try appendNativeGraphAliasFieldsLiteral(alloc, &out, alias_fields.items);
+    }
+    try out.appendSlice(alloc, ") AS __antfly_native_graph");
+    if (unsupported.graph_where_tokens) |where| {
+        try out.appendSlice(alloc, " WHERE ");
+        try appendNativeGraphSourceRange(alloc, &out, source_sql, tokens, .{ .start = where.start + 1, .end = where.end });
+    }
+    if (order_sql) |order| {
+        try out.appendSlice(alloc, " ORDER BY ");
+        try out.appendSlice(alloc, order);
+    }
+    if (unsupported.graph_limit_tokens) |limit| {
+        try out.appendSlice(alloc, " LIMIT ");
+        try appendNativeGraphSourceRange(alloc, &out, source_sql, tokens, limit);
+    }
+    if (unsupported.graph_offset_tokens) |offset| {
+        try out.appendSlice(alloc, " OFFSET ");
+        try appendNativeGraphSourceRange(alloc, &out, source_sql, tokens, offset);
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+fn nativeGraphReturnAliasesAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const token_mod.Token,
+    unsupported: generated_parser.GeneratedSqlUnsupportedAst,
+) ![]const u8 {
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    const source_alias = unsupported.graph_source_alias_tokens orelse return error.UnsupportedSqlShape;
+    try out.appendSlice(alloc, nativeGraphSingleTokenValue(tokens, source_alias));
+    if (unsupported.graph_target_alias_tokens) |target_alias| {
+        try out.append(alloc, ',');
+        try out.appendSlice(alloc, nativeGraphSingleTokenValue(tokens, target_alias));
+    }
+    return try out.toOwnedSlice(alloc);
+}
+
+const NativeGraphAliasContext = struct {
+    source_alias: []const u8,
+    target_alias: ?[]const u8,
+
+    fn contains(self: @This(), alias: []const u8) bool {
+        if (std.mem.eql(u8, self.source_alias, alias)) return true;
+        if (self.target_alias) |target| return std.mem.eql(u8, target, alias);
+        return false;
+    }
+};
+
+const NativeGraphAliasField = struct {
+    alias: []const u8,
+    field: []const u8,
+};
+
+fn makeNativeGraphAliasContext(
+    tokens: []const token_mod.Token,
+    unsupported: generated_parser.GeneratedSqlUnsupportedAst,
+) !NativeGraphAliasContext {
+    const source_alias_range = unsupported.graph_source_alias_tokens orelse return error.UnsupportedSqlShape;
+    const source_alias = nativeGraphSingleTokenValue(tokens, source_alias_range);
+    if (!nativeGraphIdentifierIsValid(source_alias)) return error.UnsupportedSqlShape;
+    const target_alias = if (unsupported.graph_target_alias_tokens) |target_alias_range| blk: {
+        const alias = nativeGraphSingleTokenValue(tokens, target_alias_range);
+        if (!nativeGraphIdentifierIsValid(alias)) return error.UnsupportedSqlShape;
+        if (std.mem.eql(u8, source_alias, alias)) return error.UnsupportedSqlShape;
+        break :blk alias;
+    } else null;
+    return .{
+        .source_alias = source_alias,
+        .target_alias = target_alias,
+    };
+}
+
+fn nativeGraphRewriteAliasFieldsAlloc(
+    alloc: std.mem.Allocator,
+    source_sql: []const u8,
+    tokens: []const token_mod.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    alias_context: NativeGraphAliasContext,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+) ![]const u8 {
+    if (range.start >= range.end or range.end > tokens.len) return error.UnsupportedSqlShape;
+    var out = std.ArrayListUnmanaged(u8).empty;
+    errdefer out.deinit(alloc);
+    var cursor = tokens[range.start].source_start;
+    for (tokens[range.start..range.end]) |token| {
+        const alias_field = try nativeGraphAliasFieldForToken(alias_context, token) orelse continue;
+        if (cursor > token.source_start or token.source_end > source_sql.len) return error.UnsupportedSqlShape;
+        try out.appendSlice(alloc, source_sql[cursor..token.source_start]);
+        try nativeGraphAppendAliasFieldOutput(alloc, &out, alias_field);
+        try nativeGraphRecordAliasField(alloc, alias_fields, alias_field);
+        cursor = token.source_end;
+    }
+    const end = tokens[range.end - 1].source_end;
+    if (cursor > end or end > source_sql.len) return error.UnsupportedSqlShape;
+    try out.appendSlice(alloc, source_sql[cursor..end]);
+    return try out.toOwnedSlice(alloc);
+}
+
+fn nativeGraphAliasFieldForToken(
+    alias_context: NativeGraphAliasContext,
+    token: token_mod.Token,
+) !?NativeGraphAliasField {
+    if (token.kind != .identifier) return null;
+    const dot = std.mem.indexOfScalar(u8, token.text, '.') orelse return null;
+    if (std.mem.indexOfScalar(u8, token.text[dot + 1 ..], '.') != null) return error.UnsupportedSqlShape;
+    const alias = token.text[0..dot];
+    const field = token.text[dot + 1 ..];
+    if (!alias_context.contains(alias)) return null;
+    if (!nativeGraphAliasFieldIsValid(field)) return error.UnsupportedSqlShape;
+    return .{ .alias = alias, .field = field };
+}
+
+fn nativeGraphRecordAliasField(
+    alloc: std.mem.Allocator,
+    alias_fields: *std.ArrayListUnmanaged(NativeGraphAliasField),
+    alias_field: NativeGraphAliasField,
+) !void {
+    for (alias_fields.items) |existing| {
+        if (std.mem.eql(u8, existing.alias, alias_field.alias) and
+            std.mem.eql(u8, existing.field, alias_field.field))
+        {
+            return;
+        }
+    }
+    try alias_fields.append(alloc, alias_field);
+}
+
+fn nativeGraphAppendAliasFieldOutput(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    alias_field: NativeGraphAliasField,
+) !void {
+    try out.appendSlice(alloc, alias_field.alias);
+    try out.append(alloc, '_');
+    try out.appendSlice(alloc, alias_field.field);
+}
+
+fn appendNativeGraphAliasFieldsLiteral(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    alias_fields: []const NativeGraphAliasField,
+) !void {
+    var literal = std.ArrayListUnmanaged(u8).empty;
+    defer literal.deinit(alloc);
+    for (alias_fields, 0..) |alias_field, index| {
+        if (index > 0) try literal.append(alloc, ',');
+        try literal.appendSlice(alloc, alias_field.alias);
+        try literal.append(alloc, '.');
+        try literal.appendSlice(alloc, alias_field.field);
+    }
+    try appendNativeGraphSqlStringLiteral(alloc, out, literal.items);
+}
+
+fn nativeGraphIdentifierIsValid(value: []const u8) bool {
+    if (value.len == 0) return false;
+    for (value, 0..) |ch, index| {
+        if (index == 0) {
+            if (!(std.ascii.isAlphabetic(ch) or ch == '_')) return false;
+        } else if (!(std.ascii.isAlphanumeric(ch) or ch == '_')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn nativeGraphAliasFieldIsValid(value: []const u8) bool {
+    return std.mem.eql(u8, value, "key") or
+        std.mem.eql(u8, value, "depth") or
+        std.mem.eql(u8, value, "distance");
+}
+
+fn appendNativeGraphSourceRange(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    source_sql: []const u8,
+    tokens: []const token_mod.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) !void {
+    try out.appendSlice(alloc, nativeGraphSourceText(source_sql, tokens, range));
+}
+
+fn nativeGraphSourceText(
+    source_sql: []const u8,
+    tokens: []const token_mod.Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+) []const u8 {
+    return source_sql[tokens[range.start].source_start..tokens[range.end - 1].source_end];
+}
+
+fn nativeGraphSingleTokenValue(tokens: []const token_mod.Token, range: generated_parser.GeneratedSqlTokenRange) []const u8 {
+    if (range.end != range.start + 1 or range.end > tokens.len) return "";
+    return tokens[range.start].text;
+}
+
+fn appendNativeGraphSqlStringLiteral(
+    alloc: std.mem.Allocator,
+    out: *std.ArrayListUnmanaged(u8),
+    value: []const u8,
+) !void {
+    try out.append(alloc, '\'');
+    for (value) |ch| {
+        if (ch == '\'') try out.append(alloc, '\'');
+        try out.append(alloc, ch);
+    }
+    try out.append(alloc, '\'');
+}
 
 fn generatedReadAstForParsedSql(parsed_sql: *const tokenized.ParsedSql) !?*const generated_parser.GeneratedSqlReadAst {
     if (parsed_sql.generatedStatementKind() != .read) return null;
@@ -219,6 +499,7 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
             context.alloc,
             parsed_sql,
             context.schema,
+            context.source_schema,
             context.params,
             context.function_bindings,
         ) },
@@ -254,10 +535,12 @@ pub fn lowerReadPlanFromGeneratedReadAstAlloc(
                     context.alloc,
                     parsed_sql,
                     context.schema,
+                    context.source_schema,
                     context.params,
                     context.function_bindings,
                 ) catch |err| switch (err) {
                     error.UnsupportedSqlShape => null,
+                    error.InvalidSqlCatalog => null,
                     else => return err,
                 };
                 if (lowered_query) |lowered| {
@@ -1671,6 +1954,7 @@ fn lowerGeneratedCteReadPlanAlloc(
             context.alloc,
             parsed_sql,
             context.schema,
+            context.source_schema,
             context.params,
             context.function_bindings,
         ) },
@@ -5083,9 +5367,11 @@ fn lowerQueryParsedSqlForLoweringContextTestAlloc(
     alloc: std.mem.Allocator,
     parsed_sql: *const tokenized.ParsedSql,
     schema: runtime_schema.TableSchema,
+    source_schema: ?runtime_schema.TableSchema,
     params: []const value_mod.SqlValue,
     function_bindings: expr_row_parse.SqlFunctionBindings,
 ) !plan.LoweredQueryPlan {
+    _ = source_schema;
     if (schema.storage_mode != .relational or schema.primary_key == null) return error.InvalidSqlCatalog;
     const tokens = parsed_sql.items();
     const cte_adapter_shape = parser_mod.tokensStartWithKeywordTag(tokens, .with);
@@ -5444,6 +5730,87 @@ test "sql adapter lowering context requires generated read publication before ge
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&stale_context, &stale_published_read, stale_read_ast),
     );
+}
+
+test "sql adapter lowering context lowers native graph match through graph table function" {
+    const alloc = std.testing.allocator;
+    const schema_json =
+        \\{"version":1,"storage_mode":"relational","default_type":"row","enforce_types":true,"document_schemas":{"row":{"schema":{"type":"object","properties":{"id":{"type":"keyword"},"body":{"type":"text"},"status":{"type":"keyword"},"amount":{"type":"numeric"},"created_at":{"type":"datetime"}},"required":["id"],"additionalProperties":false}}},"primary_key":{"columns":["id"]}}
+    ;
+    const schema = try runtimeSchemaFromJsonForLoweringContextTestAlloc(alloc, schema_json);
+    defer runtime_schema.freeSchema(alloc, schema);
+
+    var native_graph = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' WHERE graph_name = 'graph_match' RETURN id ORDER BY score DESC LIMIT 5 OFFSET 1",
+    );
+    defer native_graph.deinit(alloc);
+
+    var lowered = try lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &native_graph, schema, &.{}, .{});
+    defer lowered.deinit(alloc);
+    switch (lowered) {
+        .query => |query| {
+            try std.testing.expectEqualStrings("usage_records", query.table_name);
+            try std.testing.expectEqual(@as(usize, 1), query.plan.ctes.len);
+            try std.testing.expectEqualStrings("__antfly_native_graph", query.plan.ctes[0].name);
+            try std.testing.expectEqualStrings("__antfly_native_graph", query.plan.query.source_cte);
+            try std.testing.expectEqual(@as(usize, 1), query.plan.query.predicates.len);
+            try std.testing.expectEqualStrings("graph_name", query.plan.query.predicates[0].field);
+            try std.testing.expectEqual(@as(usize, 1), query.plan.query.order_by.len);
+            try std.testing.expectEqual(@as(?u32, 5), query.plan.query.limit);
+            try std.testing.expectEqual(@as(u32, 1), query.plan.query.offset);
+            switch (query.plan.ctes[0].table_function orelse return error.TestUnexpectedResult) {
+                .graph_query => |graph_query| {
+                    try std.testing.expectEqualStrings("usage_records", graph_query.table_name);
+                    try std.testing.expectEqualStrings("graph_match", graph_query.query.name);
+                    try std.testing.expectEqual(@as(@TypeOf(graph_query.query.query.query_type), .pattern), graph_query.query.query.query_type);
+                    try std.testing.expectEqualStrings("docs_edge_graph", graph_query.query.query.index_name);
+                    try std.testing.expectEqual(@as(usize, 2), graph_query.query.query.return_aliases.len);
+                    try std.testing.expectEqualStrings("doc", graph_query.query.query.return_aliases[0]);
+                    try std.testing.expectEqualStrings("target", graph_query.query.query.return_aliases[1]);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
+
+    var native_graph_alias_fields = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id, target.key AS target_id ORDER BY target.depth ASC LIMIT 5",
+    );
+    defer native_graph_alias_fields.deinit(alloc);
+
+    var alias_lowered = try lowerReadPlanParsedSqlForLoweringContextTestAlloc(alloc, &native_graph_alias_fields, schema, &.{}, .{});
+    defer alias_lowered.deinit(alloc);
+    switch (alias_lowered) {
+        .query => |query| {
+            try std.testing.expectEqualStrings("usage_records", query.table_name);
+            try std.testing.expectEqual(@as(usize, 1), query.plan.ctes.len);
+            try std.testing.expectEqualStrings("__antfly_native_graph", query.plan.query.source_cte);
+            try std.testing.expectEqual(@as(usize, 2), query.plan.query.select.len);
+            try std.testing.expectEqualStrings("doc_key", query.plan.query.select[0]);
+            try std.testing.expectEqualStrings("target_key", query.plan.query.select[1]);
+            try std.testing.expectEqual(@as(usize, 1), query.plan.query.order_by.len);
+            try std.testing.expectEqualStrings("target_depth", query.plan.query.order_by[0].field);
+            switch (query.plan.ctes[0].table_function orelse return error.TestUnexpectedResult) {
+                .graph_query => |graph_query| {
+                    try std.testing.expectEqual(@as(usize, 3), graph_query.alias_projections.len);
+                    try std.testing.expectEqualStrings("doc", graph_query.alias_projections[0].alias);
+                    try std.testing.expectEqualStrings("key", graph_query.alias_projections[0].field);
+                    try std.testing.expectEqualStrings("doc_key", graph_query.alias_projections[0].output);
+                    try std.testing.expectEqualStrings("target", graph_query.alias_projections[1].alias);
+                    try std.testing.expectEqualStrings("key", graph_query.alias_projections[1].field);
+                    try std.testing.expectEqualStrings("target_key", graph_query.alias_projections[1].output);
+                    try std.testing.expectEqualStrings("target", graph_query.alias_projections[2].alias);
+                    try std.testing.expectEqualStrings("depth", graph_query.alias_projections[2].field);
+                    try std.testing.expectEqualStrings("target_depth", graph_query.alias_projections[2].output);
+                },
+                else => return error.TestUnexpectedResult,
+            }
+        },
+        else => return error.TestUnexpectedResult,
+    }
 }
 
 test "sql adapter lowering context rejects malformed generated read AST ranges" {
@@ -6997,6 +7364,120 @@ test "sql adapter lowering context rejects malformed generated read AST ranges" 
     try std.testing.expectError(
         error.UnsupportedSqlShape,
         lowerReadPlanFromGeneratedReadAstAlloc(&context, &malformed_like_any_subquery_parsed_sql, malformed_like_any_subquery_read_ast),
+    );
+
+    var malformed_scalar_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT (SELECT status FROM usage_records WHERE id = 'u1') AS status_scalar FROM usage_records",
+    );
+    defer malformed_scalar_subquery_parsed_sql.deinit(alloc);
+    const malformed_scalar_subquery_generated_raw = malformed_scalar_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_scalar_subquery_read_ast = switch (malformed_scalar_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_scalar_subquery_read_ast.projection_items.expressions[0].subquery_where_tokens =
+        malformed_scalar_subquery_read_ast.projection_items.expressions[0].subquery_source_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_scalar_subquery_parsed_sql.items(), malformed_scalar_subquery_read_ast),
+    );
+
+    var malformed_not_exists_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE NOT EXISTS (SELECT 1 FROM usage_records WHERE status = 'archived')",
+    );
+    defer malformed_not_exists_subquery_parsed_sql.deinit(alloc);
+    const malformed_not_exists_subquery_generated_raw = malformed_not_exists_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_not_exists_subquery_read_ast = switch (malformed_not_exists_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_not_exists_subquery_read_ast.where_expression.negation_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_not_exists_subquery_parsed_sql.items(), malformed_not_exists_subquery_read_ast),
+    );
+
+    var malformed_not_in_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status NOT IN (SELECT status FROM usage_records WHERE kind = 'archived')",
+    );
+    defer malformed_not_in_subquery_parsed_sql.deinit(alloc);
+    const malformed_not_in_subquery_generated_raw = malformed_not_in_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_not_in_subquery_read_ast = switch (malformed_not_in_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_not_in_subquery_read_ast.where_expression.negation_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_not_in_subquery_parsed_sql.items(), malformed_not_in_subquery_read_ast),
+    );
+
+    var malformed_quantified_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status = ANY (SELECT status FROM usage_records WHERE kind = 'active')",
+    );
+    defer malformed_quantified_subquery_parsed_sql.deinit(alloc);
+    const malformed_quantified_subquery_generated_raw = malformed_quantified_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_quantified_subquery_read_ast = switch (malformed_quantified_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_quantified_subquery_read_ast.where_expression.quantifier_tokens = null;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_quantified_subquery_parsed_sql.items(), malformed_quantified_subquery_read_ast),
+    );
+
+    var malformed_correlated_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT outer_usage.id FROM usage_records AS outer_usage WHERE EXISTS (SELECT 1 FROM usage_records WHERE usage_records.tenant = outer_usage.tenant)",
+    );
+    defer malformed_correlated_subquery_parsed_sql.deinit(alloc);
+    const malformed_correlated_subquery_generated_raw = malformed_correlated_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_correlated_subquery_read_ast = switch (malformed_correlated_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_correlated_subquery_read_ast.where_expression.right_expression.?.subquery_where_expression_kind = .token_range;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_correlated_subquery_parsed_sql.items(), malformed_correlated_subquery_read_ast),
+    );
+
+    var malformed_nested_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "SELECT id FROM usage_records WHERE status IN (SELECT status FROM usage_records WHERE tenant IN (SELECT tenant FROM usage_records WHERE kind = 'active'))",
+    );
+    defer malformed_nested_subquery_parsed_sql.deinit(alloc);
+    const malformed_nested_subquery_generated_raw = malformed_nested_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_nested_subquery_read_ast = switch (malformed_nested_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_nested_subquery_read_ast.where_expression.right_expression.?.subquery_where_expression.?.right_expression_kind = .token_range;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_nested_subquery_parsed_sql.items(), malformed_nested_subquery_read_ast),
+    );
+
+    var malformed_cte_contained_subquery_parsed_sql = try tokenized.ParsedSql.initAlloc(
+        alloc,
+        "WITH open_usage AS (SELECT id, status FROM usage_records WHERE status = 'open') SELECT id FROM usage_records WHERE status IN (SELECT status FROM open_usage)",
+    );
+    defer malformed_cte_contained_subquery_parsed_sql.deinit(alloc);
+    const malformed_cte_contained_subquery_generated_raw = malformed_cte_contained_subquery_parsed_sql.generated_statement orelse return error.UnsupportedSqlShape;
+    var malformed_cte_contained_subquery_read_ast = switch (malformed_cte_contained_subquery_generated_raw.ast orelse return error.UnsupportedSqlShape) {
+        .read => |ast| ast,
+        else => return error.UnsupportedSqlShape,
+    };
+    malformed_cte_contained_subquery_read_ast.where_expression.right_expression.?.subquery_source_tokens =
+        malformed_cte_contained_subquery_read_ast.where_expression.right_expression.?.subquery_projection_tokens;
+    try std.testing.expectError(
+        error.UnsupportedSqlShape,
+        validateGeneratedReadAstForStatement(malformed_cte_contained_subquery_parsed_sql.items(), malformed_cte_contained_subquery_read_ast),
     );
 
     var malformed_distinct_keyword_parsed_sql = try tokenized.ParsedSql.initAlloc(

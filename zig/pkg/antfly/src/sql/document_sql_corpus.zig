@@ -55,10 +55,43 @@ pub const DocumentSqlReadPlanCaseJson = struct {
     expected: DocumentSqlReadPlanExpectationJson,
 };
 
+pub const DocumentSqlWritePlanExpectationJson = struct {
+    plan: ?[]const u8 = null,
+    operation: ?[]const u8 = null,
+    table_name: ?[]const u8 = null,
+    producer: ?[]const u8 = null,
+    target_producer: ?[]const u8 = null,
+    source_producer: ?[]const u8 = null,
+    template: ?[]const u8 = null,
+    writes: ?usize = null,
+    transforms: ?usize = null,
+    deletes: ?usize = null,
+    ops: ?usize = null,
+    join_keys: ?usize = null,
+    source_assignments: ?usize = null,
+    max_candidate_rows: ?u32 = null,
+    max_scan_rows: ?u32 = null,
+    max_scan_bytes: ?u64 = null,
+    max_target_rows: ?u32 = null,
+    max_source_rows: ?u32 = null,
+    filter_query_json: ?[]const u8 = null,
+    residual_filter_json: ?[]const u8 = null,
+    no_residual_filter: bool = false,
+    expected_error: ?[]const u8 = null,
+};
+
+pub const DocumentSqlWritePlanCaseJson = struct {
+    name: []const u8,
+    schema: []const u8,
+    sql: []const u8,
+    expected: DocumentSqlWritePlanExpectationJson,
+};
+
 pub const DocumentSqlCorpusRootJson = struct {
     fixture_format: u32,
     residual_filter_cases: []const DocumentSqlResidualCaseJson = &.{},
     unsupported_residual_expression_cases: []const DocumentSqlUnsupportedExpressionCaseJson = &.{},
+    document_write_plan_cases: []const DocumentSqlWritePlanCaseJson = &.{},
     document_read_plan_cases: []const DocumentSqlReadPlanCaseJson = &.{},
 };
 
@@ -78,6 +111,13 @@ pub const ExpectedError = enum {
     UnsupportedSqlShape,
     InvalidRowsRequest,
     InvalidSqlCatalog,
+    DocumentSqlWriteJoinMissingCardinalityProof,
+    DocumentSqlWriteJoinMissingExactProducer,
+    DocumentSqlWriteJoinMissingIndexProof,
+    DocumentSqlWriteJoinOrderedIndexProof,
+    DocumentSqlWriteJoinPartialIndexProof,
+    DocumentSqlWriteJoinStaleIndexProof,
+    DocumentSqlWriteUnsupported,
 };
 
 pub fn errorFromName(name: []const u8) !ExpectedError {
@@ -89,6 +129,13 @@ pub fn errorFromName(name: []const u8) !ExpectedError {
     if (std.mem.eql(u8, name, "UnsupportedSqlShape")) return .UnsupportedSqlShape;
     if (std.mem.eql(u8, name, "InvalidRowsRequest")) return .InvalidRowsRequest;
     if (std.mem.eql(u8, name, "InvalidSqlCatalog")) return .InvalidSqlCatalog;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteJoinMissingCardinalityProof")) return .DocumentSqlWriteJoinMissingCardinalityProof;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteJoinMissingExactProducer")) return .DocumentSqlWriteJoinMissingExactProducer;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteJoinMissingIndexProof")) return .DocumentSqlWriteJoinMissingIndexProof;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteJoinOrderedIndexProof")) return .DocumentSqlWriteJoinOrderedIndexProof;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteJoinPartialIndexProof")) return .DocumentSqlWriteJoinPartialIndexProof;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteJoinStaleIndexProof")) return .DocumentSqlWriteJoinStaleIndexProof;
+    if (std.mem.eql(u8, name, "DocumentSqlWriteUnsupported")) return .DocumentSqlWriteUnsupported;
     return error.InvalidSqlCorpusFixture;
 }
 
@@ -102,6 +149,13 @@ pub fn errorValue(expected: ExpectedError) anyerror {
         .UnsupportedSqlShape => error.UnsupportedSqlShape,
         .InvalidRowsRequest => error.InvalidRowsRequest,
         .InvalidSqlCatalog => error.InvalidSqlCatalog,
+        .DocumentSqlWriteJoinMissingCardinalityProof => error.DocumentSqlWriteJoinMissingCardinalityProof,
+        .DocumentSqlWriteJoinMissingExactProducer => error.DocumentSqlWriteJoinMissingExactProducer,
+        .DocumentSqlWriteJoinMissingIndexProof => error.DocumentSqlWriteJoinMissingIndexProof,
+        .DocumentSqlWriteJoinOrderedIndexProof => error.DocumentSqlWriteJoinOrderedIndexProof,
+        .DocumentSqlWriteJoinPartialIndexProof => error.DocumentSqlWriteJoinPartialIndexProof,
+        .DocumentSqlWriteJoinStaleIndexProof => error.DocumentSqlWriteJoinStaleIndexProof,
+        .DocumentSqlWriteUnsupported => error.DocumentSqlWriteUnsupported,
     };
 }
 
@@ -110,5 +164,6 @@ test "document SQL corpus fixture parses" {
     defer parsed.deinit();
     try std.testing.expect(parsed.value.residual_filter_cases.len > 0);
     try std.testing.expect(parsed.value.unsupported_residual_expression_cases.len > 0);
+    try std.testing.expect(parsed.value.document_write_plan_cases.len > 0);
     try std.testing.expect(parsed.value.document_read_plan_cases.len > 0);
 }

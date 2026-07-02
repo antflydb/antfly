@@ -25562,6 +25562,7 @@ test "hosted mutation source retries remote collect after topology change" {
             if (std.mem.endsWith(u8, request.uri, "/rows/mutation-source/stage")) {
                 self.stage_calls += 1;
                 const StageWire = struct {
+                    request_body: []const u8,
                     planned_stage: []const u8,
                     topology_epoch: u64,
                 };
@@ -25576,6 +25577,20 @@ test "hosted mutation source retries remote collect after topology change" {
                 try std.testing.expectEqual(@as(u32, 1), planned.matched);
                 try std.testing.expectEqual(@as(usize, 1), planned.candidates.len);
                 try std.testing.expectEqual(@as(u64, 7002), planned.candidates[0].group_id);
+                var parsed_request = try std.json.parseFromSlice(std.json.Value, alloc_inner, parsed.value.request_body, .{});
+                defer parsed_request.deinit();
+                const request_obj = switch (parsed_request.value) {
+                    .object => |object| object,
+                    else => return error.TestUnexpectedResult,
+                };
+                const request_op = switch ((request_obj.get("op") orelse return error.TestUnexpectedResult)) {
+                    .string => |text| text,
+                    else => return error.TestUnexpectedResult,
+                };
+                if (std.mem.eql(u8, request_op, "delete")) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":1,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"ready\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+                }
+                try std.testing.expectEqualStrings("update", request_op);
                 return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":1,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
             }
             return error.TestUnexpectedResult;
@@ -25627,6 +25642,32 @@ test "hosted mutation source retries remote collect after topology change" {
     try std.testing.expectEqual(@as(usize, 2), wrong_group_catalog.snapshot_calls);
     try std.testing.expectEqual(@as(usize, 2), wrong_group_executor.collect_calls);
     try std.testing.expectEqual(@as(usize, 0), wrong_group_executor.stage_calls);
+
+    const delete_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-delete-topology-retry");
+    defer alloc.free(delete_replica_root_dir);
+    var delete_catalog = Catalog{};
+    var delete_executor = ExecutorState{};
+    var delete_source = HostedProvisionedTableWriteSource.init(delete_replica_root_dir, delete_catalog.iface(), RemoteRouter.iface(), delete_executor.iface());
+    defer delete_source.invalidateManagedCache("docs");
+
+    var delete_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"delete\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:topology-delete-retry\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer delete_request.deinit(alloc);
+
+    var delete_result = (try delete_source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, delete_request.req)).?;
+    defer delete_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 1), delete_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), delete_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), delete_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"ready\"}", delete_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), delete_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:z", delete_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 2), delete_catalog.snapshot_calls);
+    try std.testing.expectEqual(@as(usize, 3), delete_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 1), delete_executor.stage_calls);
 
     const PartialStageExecutorState = struct {
         collect_calls: usize = 0,
@@ -26024,6 +26065,10 @@ test "hosted mutation source stages global planned candidates across remote owne
                     .object => |object| object,
                     else => return error.TestUnexpectedResult,
                 };
+                const request_op = switch ((request_obj.get("op") orelse return error.TestUnexpectedResult)) {
+                    .string => |text| text,
+                    else => return error.TestUnexpectedResult,
+                };
                 const source_obj = switch ((request_obj.get("source") orelse return error.TestUnexpectedResult)) {
                     .object => |object| object,
                     else => return error.TestUnexpectedResult,
@@ -26041,8 +26086,13 @@ test "hosted mutation source stages global planned candidates across remote owne
                     if (self.stage_calls == 1) {
                         return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":0}") };
                     }
+                    try std.testing.expectEqualStrings("update", request_op);
                     return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"a\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:a\",\"expected_version\":9}]}") };
                 }
+                if (std.mem.eql(u8, request_op, "delete")) {
+                    return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"ready\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
+                }
+                try std.testing.expectEqualStrings("update", request_op);
                 return .{ .status = 200, .body = try alloc_inner.dupe(u8, "{\"matched\":2,\"staged\":1,\"returning\":[{\"id\":\"z\",\"status\":\"claimed\"}],\"participant_predicates\":[{\"key\":\"row:z\",\"expected_version\":11}]}") };
             }
             return error.TestUnexpectedResult;
@@ -26081,6 +26131,30 @@ test "hosted mutation source stages global planned candidates across remote owne
     try std.testing.expectEqualStrings("row:a", retry_result.participant_predicates[0].key);
     try std.testing.expectEqual(@as(usize, 4), executor.collect_calls);
     try std.testing.expectEqual(@as(usize, 3), executor.stage_calls);
+
+    const delete_replica_root_dir = try uniqueTestTmpPathAlloc(alloc, "antfly-api-hosted-mutation-remote-planned-delete");
+    defer alloc.free(delete_replica_root_dir);
+    var delete_executor = ExecutorState{};
+    var delete_source = HostedProvisionedTableWriteSource.init(delete_replica_root_dir, Catalog.iface(), RemoteRouter.iface(), delete_executor.iface());
+    defer delete_source.invalidateManagedCache("docs");
+
+    var delete_request = try relational_rows_api.parseRowsMutationSourceRequest(
+        alloc,
+        "{\"op\":\"delete\",\"source\":{\"where\":{\"field\":\"status\",\"op\":\"eq\",\"value\":\"ready\"},\"row_claim\":{\"mode\":\"for_update\",\"wait_policy\":\"skip_locked\",\"owner_id\":\"session:remote-planned-delete\",\"transaction_id\":\"00112233445566778899aabbccddeeff\",\"lease_ms\":60000},\"order_by\":[{\"field\":\"id\"}],\"limit\":1},\"returning\":[\"id\",\"status\"]}",
+        runtime_schema,
+    );
+    defer delete_request.deinit(alloc);
+
+    var delete_result = (try delete_source.source().mutateRowsFromSource(alloc, "docs", runtime_schema, delete_request.req)).?;
+    defer delete_result.deinit(alloc);
+    try std.testing.expectEqual(@as(u32, 2), delete_result.matched);
+    try std.testing.expectEqual(@as(u32, 1), delete_result.staged);
+    try std.testing.expectEqual(@as(usize, 1), delete_result.returning_rows.len);
+    try std.testing.expectEqualStrings("{\"id\":\"z\",\"status\":\"ready\"}", delete_result.returning_rows[0]);
+    try std.testing.expectEqual(@as(usize, 1), delete_result.participant_predicates.len);
+    try std.testing.expectEqualStrings("row:z", delete_result.participant_predicates[0].key);
+    try std.testing.expectEqual(@as(usize, 2), delete_executor.collect_calls);
+    try std.testing.expectEqual(@as(usize, 2), delete_executor.stage_calls);
 }
 
 test "hosted mutation source skip locked preserves order across topology retry and leader handoff" {

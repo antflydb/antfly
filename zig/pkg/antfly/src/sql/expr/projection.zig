@@ -1821,19 +1821,29 @@ fn generatedProjectionItemAtStart(
     generated_read_ast: ?*const generated_parser.GeneratedSqlReadAst,
 ) !?GeneratedExpressionItem {
     const read = generated_read_ast orelse return null;
-    if (read.projection_items.items.len != read.projection_items.count or read.projection_items.expressions.len != read.projection_items.count) return error.UnsupportedSqlShape;
+    if (read.projection_items.items.len != read.projection_items.count or
+        read.projection_items.expressions.len != read.projection_items.count or
+        read.projection_items.alias_items.len != read.projection_items.count or
+        read.projection_items.alias_name_items.len != read.projection_items.count)
+    {
+        return error.UnsupportedSqlShape;
+    }
     for (read.projection_items.items, 0..) |item, index| {
         if (item.start == pos) {
             try expr_generated_validate.validateGeneratedExpressionPayloads(tokens, read.projection_items.expressions[index]);
             return .{
                 .tokens = item,
                 .expression = &read.projection_items.expressions[index],
+                .alias_tokens = read.projection_items.alias_items[index],
+                .alias_name_tokens = read.projection_items.alias_name_items[index],
             };
         }
     }
     if (read.set_operation_tokens != null) {
         if (read.set_operation.right_projection_items.items.len != read.set_operation.right_projection_items.count or
-            read.set_operation.right_projection_items.expressions.len != read.set_operation.right_projection_items.count)
+            read.set_operation.right_projection_items.expressions.len != read.set_operation.right_projection_items.count or
+            read.set_operation.right_projection_items.alias_items.len != read.set_operation.right_projection_items.count or
+            read.set_operation.right_projection_items.alias_name_items.len != read.set_operation.right_projection_items.count)
         {
             return error.UnsupportedSqlShape;
         }
@@ -1843,6 +1853,8 @@ fn generatedProjectionItemAtStart(
                 return .{
                     .tokens = item,
                     .expression = &read.set_operation.right_projection_items.expressions[index],
+                    .alias_tokens = read.set_operation.right_projection_items.alias_items[index],
+                    .alias_name_tokens = read.set_operation.right_projection_items.alias_name_items[index],
                 };
             }
         }
@@ -1876,6 +1888,79 @@ fn validateGeneratedExpressionItemEnd(generated_item: ?GeneratedExpressionItem, 
     if (generated_item) |item| {
         if (pos != item.tokens.end) return error.UnsupportedSqlShape;
     }
+}
+
+fn consumeGeneratedProjectionAliasAlloc(
+    alloc: std.mem.Allocator,
+    tokens: []const Token,
+    pos: *usize,
+    generated_item: ?GeneratedExpressionItem,
+    item: *plan_mod.SelectItem,
+) !void {
+    const generated = generated_item orelse return;
+    const alias = generated.alias_tokens orelse return;
+    const alias_name = generated.alias_name_tokens orelse return error.UnsupportedSqlShape;
+    if (alias.end > tokens.len) return error.UnsupportedSqlShape;
+    if (alias.start < pos.*) {
+        if (pos.* != alias.end) return error.UnsupportedSqlShape;
+        return;
+    }
+    if (alias.start != pos.*) return error.UnsupportedSqlShape;
+    if (alias_name.start < alias.start or alias_name.end != alias.end or alias_name.start >= alias_name.end) return error.UnsupportedSqlShape;
+    if (tokens[alias.start].matchesKeywordTag(.as)) {
+        if (alias_name.start != alias.start + 1) return error.UnsupportedSqlShape;
+    } else if (alias_name.start != alias.start) {
+        return error.UnsupportedSqlShape;
+    }
+    if (alias_name.end != alias_name.start + 1) return error.UnsupportedSqlShape;
+
+    const output = try alloc.dupe(u8, tokens[alias_name.start].text);
+    var output_owned = true;
+    errdefer if (output_owned) alloc.free(output);
+
+    switch (item.*) {
+        .field => |field| {
+            if (std.mem.eql(u8, output, field)) {
+                alloc.free(output);
+                output_owned = false;
+            } else {
+                item.* = .{ .expression = .{
+                    .output = output,
+                    .expression = .{
+                        .kind = .field,
+                        .field = field,
+                    },
+                } };
+                output_owned = false;
+            }
+        },
+        .json_extract => |*projection| {
+            alloc.free(projection.output);
+            projection.output = output;
+            output_owned = false;
+        },
+        .array_length => |*projection| {
+            alloc.free(projection.output);
+            projection.output = output;
+            output_owned = false;
+        },
+        .coalesce => |*projection| {
+            alloc.free(projection.output);
+            projection.output = output;
+            output_owned = false;
+        },
+        .expression => |*projection| {
+            alloc.free(projection.output);
+            projection.output = output;
+            output_owned = false;
+        },
+        .field_alias => |*projection| {
+            alloc.free(projection.output);
+            projection.output = output;
+            output_owned = false;
+        },
+    }
+    pos.* = alias.end;
 }
 
 fn generatedSelectItemStartAllowsExpressionKind(
@@ -2653,7 +2738,7 @@ pub fn parseSelectListAlloc(
         const generated_expression = if (generated_item) |item| item.expression else null;
         var select_item_options = options.select_item_options;
         select_item_options.generated_expression_ast = generated_expression;
-        const item = try parseSelectItemAlloc(
+        var item = try parseSelectItemAlloc(
             alloc,
             tokens,
             pos,
@@ -2667,6 +2752,7 @@ pub fn parseSelectListAlloc(
             options.type_context,
             select_item_options,
         );
+        try consumeGeneratedProjectionAliasAlloc(alloc, tokens, pos, generated_item, &item);
         var item_transferred = false;
         errdefer if (!item_transferred) plan_mod.freeSelectItem(alloc, item);
         switch (item) {

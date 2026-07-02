@@ -2819,11 +2819,375 @@ fn generatedGraphQueryUnsupportedPayloadIsValid(
     if (end < 4 or !tokens[0].matchesKeywordTag(.match)) return false;
     const subject = unsupported_ast.subject_tokens orelse return false;
     if (subject.start != 1 or subject.end != end) return false;
-    var index = subject.start;
-    while (index < subject.end) : (index += 1) {
-        if (tokens[index].matchesKeyword("return")) return true;
+    const return_index = findTopLevelKeyword(tokens, subject.start, subject.end, .@"return") orelse return false;
+    const path = unsupported_ast.graph_path_tokens orelse return false;
+    const return_token = unsupported_ast.graph_return_tokens orelse return false;
+    const return_tail = unsupported_ast.graph_return_tail_tokens orelse return false;
+    if (return_token.start != return_index or return_token.end != return_index + 1) return false;
+    if (return_tail.start != return_token.end or return_tail.end != subject.end) return false;
+    if (return_tail.start >= return_tail.end) return false;
+    const return_tail_metadata = generatedGraphReturnTailMetadata(tokens, return_tail) orelse return false;
+    if (!std.meta.eql(unsupported_ast.graph_return_projection_tokens orelse return false, return_tail_metadata.projection_tokens)) return false;
+    if (!generatedGraphListPayloadIsValid(tokens, return_tail_metadata.projection_tokens, unsupported_ast.graph_return_projection_items)) return false;
+    const projection_path_metadata = generatedGraphPathMetadata(tokens, path) orelse return false;
+    if (!generatedGraphReturnPathAliasProjectionRolesMatch(tokens, unsupported_ast.graph_return_projection_items, projection_path_metadata, unsupported_ast.graph_return_path_alias_projection_roles)) return false;
+    if (unsupported_ast.graph_return_path_alias_projection_count != generatedGraphReturnPathAliasProjectionCount(unsupported_ast.graph_return_path_alias_projection_roles)) return false;
+    if (!generatedOptionalGraphRangeMatches(unsupported_ast.graph_order_tokens, return_tail_metadata.order_tokens)) return false;
+    if (!generatedOptionalGraphListPayloadIsValid(tokens, unsupported_ast.graph_order_tokens, unsupported_ast.graph_order_items)) return false;
+    if (!generatedOptionalGraphRangeMatches(unsupported_ast.graph_limit_tokens, return_tail_metadata.limit_tokens)) return false;
+    if (!generatedOptionalGraphRangeMatches(unsupported_ast.graph_offset_tokens, return_tail_metadata.offset_tokens)) return false;
+    if (!generatedOptionalGraphExpressionPayloadIsValid(tokens, end, unsupported_ast.graph_limit_tokens, unsupported_ast.graph_limit_expression)) return false;
+    if (!generatedOptionalGraphExpressionPayloadIsValid(tokens, end, unsupported_ast.graph_offset_tokens, unsupported_ast.graph_offset_expression)) return false;
+    if (path.start != subject.start or path.end > return_token.start) return false;
+    const path_metadata = generatedGraphPathMetadata(tokens, path) orelse return false;
+    if (unsupported_ast.graph_path_kind == null or unsupported_ast.graph_path_kind.? != path_metadata.kind) return false;
+    const source_alias = unsupported_ast.graph_source_alias_tokens orelse return false;
+    if (!std.meta.eql(source_alias, path_metadata.source_alias_tokens)) return false;
+    if (!generatedOptionalGraphRangeMatches(unsupported_ast.graph_relationship_tokens, path_metadata.relationship_tokens)) return false;
+    if (!generatedOptionalGraphRangeMatches(unsupported_ast.graph_relationship_label_tokens, path_metadata.relationship_label_tokens)) return false;
+    if (!generatedOptionalGraphRangeMatches(unsupported_ast.graph_target_alias_tokens, path_metadata.target_alias_tokens)) return false;
+
+    const source_tail_end = if (unsupported_ast.graph_where_tokens) |where| where.start else return_token.start;
+    if (unsupported_ast.graph_source_binding_tokens) |source_binding| {
+        if (source_binding.start != path.end or source_binding.end != source_tail_end) return false;
+        const source_metadata = generatedGraphSourceBindingMetadata(tokens, source_binding) orelse return false;
+        if (!std.meta.eql(unsupported_ast.graph_source_graph_tokens orelse return false, source_metadata.graph_tokens)) return false;
+        if (!std.meta.eql(unsupported_ast.graph_source_index_tokens orelse return false, source_metadata.index_tokens)) return false;
+        if (!std.meta.eql(unsupported_ast.graph_source_table_tokens orelse return false, source_metadata.table_tokens)) return false;
+        if (!std.meta.eql(unsupported_ast.graph_source_start_tokens orelse return false, source_metadata.start_tokens)) return false;
+    } else {
+        if (path.end != source_tail_end) return false;
+        if (unsupported_ast.graph_source_graph_tokens != null or
+            unsupported_ast.graph_source_index_tokens != null or
+            unsupported_ast.graph_source_table_tokens != null or
+            unsupported_ast.graph_source_start_tokens != null)
+        {
+            return false;
+        }
     }
-    return false;
+
+    if (unsupported_ast.graph_where_tokens) |where| {
+        if (where.start != source_tail_end or where.end != return_token.start) return false;
+        if (where.start + 1 >= where.end) return false;
+        if (!tokens[where.start].matchesKeywordTag(.where)) return false;
+        if (!generatedReadExpressionPayloadMatchesRange(tokens, end, unsupported_ast.graph_where_expression, .{ .start = where.start + 1, .end = where.end })) return false;
+    } else if (source_tail_end != return_token.start) {
+        return false;
+    } else if (!generatedReadExpressionPayloadIsEmpty(unsupported_ast.graph_where_expression)) {
+        return false;
+    }
+    return true;
+}
+
+fn generatedGraphReturnPathAliasProjectionCount(
+    roles: []const ?generated_parser.GeneratedSqlGraphPathAliasRole,
+) usize {
+    var count: usize = 0;
+    for (roles) |role| {
+        if (role != null) count += 1;
+    }
+    return count;
+}
+
+fn generatedGraphReturnPathAliasProjectionRolesMatch(
+    tokens: []const Token,
+    projection_items: generated_parser.GeneratedSqlListAst,
+    path_metadata: GeneratedGraphPathMetadata,
+    roles: []const ?generated_parser.GeneratedSqlGraphPathAliasRole,
+) bool {
+    if (roles.len != projection_items.count or roles.len != projection_items.expression_items.len) return false;
+    for (projection_items.expression_items, 0..) |expression, index| {
+        if (roles[index] != generatedGraphExpressionPathAliasRole(tokens, expression, path_metadata)) return false;
+    }
+    return true;
+}
+
+fn generatedGraphExpressionPathAliasRole(
+    tokens: []const Token,
+    expression: generated_parser.GeneratedSqlTokenRange,
+    path_metadata: GeneratedGraphPathMetadata,
+) ?generated_parser.GeneratedSqlGraphPathAliasRole {
+    if (expression.end != expression.start + 1 or expression.end > tokens.len) return null;
+    if (generatedGraphTokenTextMatchesAlias(tokens, expression.start, path_metadata.source_alias_tokens)) return .source;
+    if (path_metadata.target_alias_tokens) |target| {
+        if (generatedGraphTokenTextMatchesAlias(tokens, expression.start, target)) return .target;
+    }
+    return null;
+}
+
+fn generatedGraphTokenTextMatchesAlias(
+    tokens: []const Token,
+    token_index: usize,
+    alias: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (alias.end != alias.start + 1 or alias.end > tokens.len) return false;
+    if (tokens[token_index].kind != .identifier or tokens[alias.start].kind != .identifier) return false;
+    return std.mem.eql(u8, tokens[token_index].text, tokens[alias.start].text);
+}
+
+fn generatedOptionalGraphExpressionPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    if (range) |value| return generatedReadExpressionPayloadMatchesRange(tokens, end, expression, value);
+    return generatedReadExpressionPayloadIsEmpty(expression);
+}
+
+fn generatedOptionalGraphListPayloadIsValid(
+    tokens: []const Token,
+    range: ?generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) bool {
+    if (range) |value| return generatedGraphListPayloadIsValid(tokens, value, list);
+    return !generatedGraphListPayloadHasMetadata(list);
+}
+
+fn generatedGraphListPayloadHasMetadata(list: generated_parser.GeneratedSqlListAst) bool {
+    return list.first_tokens != null or
+        list.last_tokens != null or
+        list.items.len != 0 or
+        list.expression_items.len != 0 or
+        list.alias_items.len != 0 or
+        list.alias_name_items.len != 0 or
+        list.direction_items.len != 0 or
+        list.directions.len != 0 or
+        list.order_using_operator_items.len != 0 or
+        list.nulls_order_items.len != 0 or
+        list.nulls_orders.len != 0 or
+        list.expressions.len != 0 or
+        list.count != 0;
+}
+
+fn generatedGraphListPayloadIsValid(
+    tokens: []const Token,
+    range: generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+) bool {
+    if (range.start >= range.end or range.end > tokens.len) return false;
+    if (list.count == 0) return false;
+    if (list.items.len != list.count or
+        list.expression_items.len != list.count or
+        list.alias_items.len != list.count or
+        list.alias_name_items.len != list.count or
+        list.direction_items.len != list.count or
+        list.directions.len != list.count or
+        list.order_using_operator_items.len != list.count or
+        list.nulls_order_items.len != list.count or
+        list.nulls_orders.len != list.count or
+        list.expressions.len != list.count)
+    {
+        return false;
+    }
+    if (list.first_tokens == null or list.last_tokens == null) return false;
+    if (!std.meta.eql(list.first_tokens.?, list.items[0])) return false;
+    if (!std.meta.eql(list.last_tokens.?, list.items[list.items.len - 1])) return false;
+
+    var expected_start = range.start;
+    for (list.items, 0..) |item, index| {
+        if (item.start != expected_start or item.start >= item.end or item.end > range.end) return false;
+        if (!generatedGraphListSubrangeIsContained(item, range)) return false;
+        if (!generatedGraphListSubrangeIsContained(list.expression_items[index], item)) return false;
+        if (!generatedGraphOptionalListSubrangeIsContained(list.alias_items[index], item)) return false;
+        if (!generatedGraphOptionalListSubrangeIsContained(list.alias_name_items[index], item)) return false;
+        if (!generatedGraphOptionalListSubrangeIsContained(list.direction_items[index], item)) return false;
+        if (!generatedGraphOptionalListSubrangeIsContained(list.order_using_operator_items[index], item)) return false;
+        if (!generatedGraphOptionalListSubrangeIsContained(list.nulls_order_items[index], item)) return false;
+        if (index + 1 < list.items.len) {
+            if (item.end >= range.end or item.end >= tokens.len or tokens[item.end].kind != .comma) return false;
+            expected_start = item.end + 1;
+        } else if (item.end != range.end) {
+            return false;
+        }
+    }
+    return true;
+}
+
+fn generatedGraphListSubrangeIsContained(
+    value: generated_parser.GeneratedSqlTokenRange,
+    container: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    return value.start >= container.start and value.start < value.end and value.end <= container.end;
+}
+
+fn generatedGraphOptionalListSubrangeIsContained(
+    value: ?generated_parser.GeneratedSqlTokenRange,
+    container: generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (value) |actual| return generatedGraphListSubrangeIsContained(actual, container);
+    return true;
+}
+
+fn generatedOptionalGraphRangeMatches(
+    actual: ?generated_parser.GeneratedSqlTokenRange,
+    expected: ?generated_parser.GeneratedSqlTokenRange,
+) bool {
+    if (actual) |actual_value| {
+        const expected_value = expected orelse return false;
+        return std.meta.eql(actual_value, expected_value);
+    }
+    return expected == null;
+}
+
+const GeneratedGraphPathMetadata = struct {
+    kind: generated_parser.GeneratedSqlGraphPathKind,
+    source_alias_tokens: generated_parser.GeneratedSqlTokenRange,
+    relationship_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    relationship_label_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    target_alias_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+};
+
+const GeneratedGraphSourceBindingMetadata = struct {
+    graph_tokens: generated_parser.GeneratedSqlTokenRange,
+    index_tokens: generated_parser.GeneratedSqlTokenRange,
+    table_tokens: generated_parser.GeneratedSqlTokenRange,
+    start_tokens: generated_parser.GeneratedSqlTokenRange,
+};
+
+const GeneratedGraphRelationshipMetadata = struct {
+    label_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+};
+
+const GeneratedGraphReturnTailMetadata = struct {
+    projection_tokens: generated_parser.GeneratedSqlTokenRange,
+    order_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    limit_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+    offset_tokens: ?generated_parser.GeneratedSqlTokenRange = null,
+};
+
+fn generatedGraphReturnTailMetadata(tokens: []const Token, tail: generated_parser.GeneratedSqlTokenRange) ?GeneratedGraphReturnTailMetadata {
+    const order_index = findTopLevelKeyword(tokens, tail.start, tail.end, .order);
+    const limit_index = findTopLevelKeyword(tokens, tail.start, tail.end, .limit);
+    const offset_index = findTopLevelKeyword(tokens, tail.start, tail.end, .offset);
+    const projection_end = generatedGraphMinOptionalIndex(generatedGraphMinOptionalIndex(order_index, limit_index), offset_index) orelse tail.end;
+    if (tail.start >= projection_end) return null;
+    var metadata = GeneratedGraphReturnTailMetadata{
+        .projection_tokens = .{ .start = tail.start, .end = projection_end },
+    };
+    if (order_index) |idx| {
+        const order_start = if (idx + 1 < tail.end and tokens[idx + 1].matchesKeywordTag(.by)) idx + 2 else idx + 1;
+        const order_end = generatedGraphMinOptionalIndex(limit_index, offset_index) orelse tail.end;
+        if (order_start >= order_end) return null;
+        metadata.order_tokens = .{ .start = order_start, .end = order_end };
+    }
+    if (limit_index) |idx| {
+        const limit_end = offset_index orelse tail.end;
+        if (idx + 1 >= limit_end) return null;
+        metadata.limit_tokens = .{ .start = idx + 1, .end = limit_end };
+    }
+    if (offset_index) |idx| {
+        if (idx + 1 >= tail.end) return null;
+        metadata.offset_tokens = .{ .start = idx + 1, .end = tail.end };
+    }
+    return metadata;
+}
+
+fn generatedGraphMinOptionalIndex(a: ?usize, b: ?usize) ?usize {
+    if (a) |av| {
+        if (b) |bv| return @min(av, bv);
+        return av;
+    }
+    return b;
+}
+
+fn generatedGraphPathTokensAreValid(tokens: []const Token, range: generated_parser.GeneratedSqlTokenRange) bool {
+    return generatedGraphPathMetadata(tokens, range) != null;
+}
+
+fn generatedGraphSourceBindingMetadata(tokens: []const Token, range: generated_parser.GeneratedSqlTokenRange) ?GeneratedGraphSourceBindingMetadata {
+    if (range.end != range.start + 7 or range.end > tokens.len) return null;
+    if (!tokens[range.start].matchesKeywordTag(.with)) return null;
+    if (!tokens[range.start + 1].matchesKeywordTag(.graph)) return null;
+    if (!generatedGraphBindingValueToken(tokens[range.start + 2])) return null;
+    if (!tokens[range.start + 3].matchesKeywordTag(.on)) return null;
+    if (!generatedGraphBindingValueToken(tokens[range.start + 4])) return null;
+    if (!tokens[range.start + 5].matchesKeywordTag(.start)) return null;
+    if (!generatedGraphBindingValueToken(tokens[range.start + 6])) return null;
+    return .{
+        .graph_tokens = .{ .start = range.start + 1, .end = range.start + 2 },
+        .index_tokens = .{ .start = range.start + 2, .end = range.start + 3 },
+        .table_tokens = .{ .start = range.start + 4, .end = range.start + 5 },
+        .start_tokens = .{ .start = range.start + 6, .end = range.start + 7 },
+    };
+}
+
+fn generatedGraphBindingValueToken(token: Token) bool {
+    return token.kind == .identifier or token.kind == .string;
+}
+
+fn generatedGraphPathMetadata(tokens: []const Token, range: generated_parser.GeneratedSqlTokenRange) ?GeneratedGraphPathMetadata {
+    var index = range.start;
+    const source_alias = consumeGeneratedGraphNode(tokens, &index, range.end) orelse return null;
+    if (index == range.end) {
+        return .{
+            .kind = .node,
+            .source_alias_tokens = source_alias,
+        };
+    }
+    const relationship_start = index;
+    var direction: generated_parser.GeneratedSqlGraphPathKind = undefined;
+    var label: ?generated_parser.GeneratedSqlTokenRange = null;
+    if (consumeGeneratedGraphOutRelationship(tokens, &index, range.end)) |relationship| {
+        direction = .outgoing;
+        label = relationship.label_tokens;
+    } else if (consumeGeneratedGraphInRelationship(tokens, &index, range.end)) |relationship| {
+        direction = .incoming;
+        label = relationship.label_tokens;
+    } else {
+        return null;
+    }
+    const target_alias = consumeGeneratedGraphNode(tokens, &index, range.end) orelse return null;
+    if (index != range.end) return null;
+    return .{
+        .kind = direction,
+        .source_alias_tokens = source_alias,
+        .relationship_tokens = .{ .start = relationship_start, .end = target_alias.start - 1 },
+        .relationship_label_tokens = label,
+        .target_alias_tokens = target_alias,
+    };
+}
+
+fn consumeGeneratedGraphNode(tokens: []const Token, index: *usize, end: usize) ?generated_parser.GeneratedSqlTokenRange {
+    if (index.* + 2 >= end) return null;
+    if (tokens[index.*].kind != .lparen) return null;
+    if (tokens[index.* + 1].kind != .identifier) return null;
+    if (tokens[index.* + 2].kind != .rparen) return null;
+    const alias = generated_parser.GeneratedSqlTokenRange{ .start = index.* + 1, .end = index.* + 2 };
+    index.* += 3;
+    return alias;
+}
+
+fn consumeGeneratedGraphOutRelationship(tokens: []const Token, index: *usize, end: usize) ?GeneratedGraphRelationshipMetadata {
+    if (index.* + 2 >= end) return null;
+    if (tokens[index.*].kind != .minus or tokens[index.* + 1].kind != .lbracket) return null;
+    index.* += 2;
+    const label = consumeGeneratedGraphRelationshipLabelOpt(tokens, index, end) orelse return null;
+    if (index.* + 1 >= end) return null;
+    if (tokens[index.*].kind != .rbracket or tokens[index.* + 1].kind != .arrow_json) return null;
+    index.* += 2;
+    return .{ .label_tokens = if (label.start < label.end) label else null };
+}
+
+fn consumeGeneratedGraphInRelationship(tokens: []const Token, index: *usize, end: usize) ?GeneratedGraphRelationshipMetadata {
+    if (index.* + 3 >= end) return null;
+    if (tokens[index.*].kind != .lt or tokens[index.* + 1].kind != .minus or tokens[index.* + 2].kind != .lbracket) return null;
+    index.* += 3;
+    const label = consumeGeneratedGraphRelationshipLabelOpt(tokens, index, end) orelse return null;
+    if (index.* + 1 >= end) return null;
+    if (tokens[index.*].kind != .rbracket or tokens[index.* + 1].kind != .minus) return null;
+    index.* += 2;
+    return .{ .label_tokens = if (label.start < label.end) label else null };
+}
+
+fn consumeGeneratedGraphRelationshipLabelOpt(tokens: []const Token, index: *usize, end: usize) ?generated_parser.GeneratedSqlTokenRange {
+    if (index.* < end and tokens[index.*].kind == .colon) {
+        if (index.* + 1 >= end or tokens[index.* + 1].kind != .identifier) return null;
+        const label = generated_parser.GeneratedSqlTokenRange{ .start = index.* + 1, .end = index.* + 2 };
+        index.* += 2;
+        return label;
+    }
+    return .{ .start = index.*, .end = index.* };
 }
 
 fn generatedUnsupportedStatementEnd(tokens: []const Token, statement_span: SourceSpan) ?usize {
@@ -4865,7 +5229,7 @@ fn generatedReadJoinPayloadIsValid(
             maybe_left_tokens == null and
             maybe_right_tokens == null and
             maybe_predicate_tokens == null and
-            predicate_expression.tokens == null and
+            generatedReadExpressionPayloadIsEmpty(predicate_expression) and
             maybe_root_index == null and
             tree_depth == 0;
     }
@@ -4925,7 +5289,7 @@ fn generatedReadJoinItemIsValid(
             item.condition_tokens.end == item.condition_tokens.start and
             (item.kind == .cross or item.kind == .natural) and
             item.predicate_tokens == null and
-            item.predicate_expression.tokens == null and
+            generatedReadExpressionPayloadIsEmpty(item.predicate_expression) and
             item.using_tokens == null and
             item.using_column_tokens == null and
             item.using_columns.count == 0,
@@ -4948,7 +5312,7 @@ fn generatedReadJoinItemIsValid(
             const column_tokens = item.using_column_tokens orelse break :blk false;
             if (!generatedReadNestedRangeIsValid(tokens, end, item.condition_tokens, column_tokens)) break :blk false;
             if (!generatedReadJoinUsingColumnListIsValid(tokens, item.condition_tokens, column_tokens, item.using_columns)) break :blk false;
-            if (item.predicate_tokens != null or item.predicate_expression.tokens != null) break :blk false;
+            if (item.predicate_tokens != null or !generatedReadExpressionPayloadIsEmpty(item.predicate_expression)) break :blk false;
             break :blk true;
         },
     };
@@ -5124,7 +5488,7 @@ fn generatedReadSetOperationPayloadIsValid(
     if (!generatedReadOptionalNestedRangeIsValid(tokens, end, right_query, set_operation.right_source_system_time_sequence_tokens)) return false;
     if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, set_operation.right_source_tokens, .from)) return false;
     if (!generatedReadSystemTimePayloadIsValid(tokens, end, set_operation.right_source_tokens, set_operation.right_source_system_time_tokens, set_operation.right_source_system_time_sequence_tokens)) return false;
-    if (!generatedReadSetOperationRightSingleSourcePayloadIsValid(tokens, end, set_operation)) return false;
+    if (!generatedReadSetOperationRightSourcePayloadIsValid(tokens, end, set_operation)) return false;
     if (!generatedReadOptionalNestedRangeIsValid(tokens, end, right_query, set_operation.right_where_tokens)) return false;
     if (!generatedReadOptionalRangeIsPrecededByKeyword(tokens, set_operation.right_where_tokens, .where)) return false;
     if (!generatedReadOptionalExpressionTokensMatchMaybeRange(tokens, end, set_operation.right_where_expression, set_operation.right_where_tokens)) return false;
@@ -5177,8 +5541,48 @@ fn generatedReadSetOperationPayloadIsEmpty(set_operation: generated_parser.Gener
         set_operation.right_source_alias_name_tokens == null and
         set_operation.right_source_system_time_tokens == null and
         set_operation.right_source_system_time_sequence_tokens == null and
+        set_operation.right_join_items.len == 0 and
+        set_operation.right_join_tree_root_index == null and
+        set_operation.right_join_tree_depth == 0 and
         set_operation.right_where_tokens == null and
-        set_operation.right_where_expression.tokens == null;
+        generatedReadExpressionPayloadIsEmpty(set_operation.right_where_expression);
+}
+
+fn generatedReadSetOperationRightSourcePayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    set_operation: generated_parser.GeneratedSqlSetOperationAst,
+) bool {
+    if (set_operation.right_join_items.len != 0 or
+        set_operation.right_join_tree_root_index != null or
+        set_operation.right_join_tree_depth != 0)
+    {
+        if (set_operation.right_source_table_tokens != null or
+            set_operation.right_source_alias_tokens != null or
+            set_operation.right_source_alias_name_tokens != null or
+            set_operation.right_source_system_time_tokens != null or
+            set_operation.right_source_system_time_sequence_tokens != null)
+        {
+            return false;
+        }
+        const first = if (set_operation.right_join_items.len > 0) set_operation.right_join_items[0] else return false;
+        return generatedReadJoinPayloadIsValid(
+            tokens,
+            end,
+            set_operation.right_source_tokens,
+            set_operation.right_source_tokens,
+            first.operator_tokens,
+            first.kind,
+            first.left_tokens,
+            first.right_tokens,
+            first.predicate_tokens,
+            first.predicate_expression,
+            set_operation.right_join_items,
+            set_operation.right_join_tree_root_index,
+            set_operation.right_join_tree_depth,
+        );
+    }
+    return generatedReadSetOperationRightSingleSourcePayloadIsValid(tokens, end, set_operation);
 }
 
 fn generatedReadSetOperationRightSingleSourcePayloadIsValid(
@@ -5452,8 +5856,8 @@ fn generatedReadListPayloadIsEmpty(
         list.expressions.len == 0 and
         list.first_tokens == null and
         list.last_tokens == null and
-        first_expression.tokens == null and
-        last_expression.tokens == null;
+        generatedReadExpressionPayloadIsEmpty(first_expression) and
+        generatedReadExpressionPayloadIsEmpty(last_expression);
 }
 
 fn generatedReadDistinctPayloadIsValid(
@@ -5631,7 +6035,11 @@ fn generatedReadOptionalExpressionTokensMatchMaybeRange(
     maybe_range: ?generated_parser.GeneratedSqlTokenRange,
 ) bool {
     if (maybe_range) |range| return generatedReadExpressionPayloadMatchesRange(tokens, end, expression, range);
-    return expression.tokens == null;
+    return generatedReadExpressionPayloadIsEmpty(expression);
+}
+
+fn generatedReadExpressionPayloadIsEmpty(expression: generated_parser.GeneratedSqlExpressionAst) bool {
+    return std.meta.eql(expression, generated_parser.GeneratedSqlExpressionAst{});
 }
 
 fn generatedReadExpressionPayloadMatchesRange(
@@ -5695,6 +6103,78 @@ fn generatedReadExpressionChildPayloadsAreValid(
     if (!generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.between_lower_expression_kind, expression.between_lower_tokens, expression.between_lower_expression)) return false;
     if (!generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.between_upper_expression_kind, expression.between_upper_tokens, expression.between_upper_expression)) return false;
     if (!generatedReadExpressionOptionalChildPayloadIsValid(tokens, end, expression.right_expression_kind, expression.right_tokens, expression.right_expression)) return false;
+    if (!generatedReadExpressionArgumentPayloadIsValid(tokens, end, expression)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.within_group_order_tokens, expression.within_group_order_items, null)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.over_partition_tokens, expression.over_partition_items, null)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.over_order_tokens, expression.over_order_items, null)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.array_tokens, expression.array_items, null)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.tokens, expression.case_condition_items, expression.case_branch_count)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.tokens, expression.case_result_items, expression.case_branch_count)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.tokens, expression.boolean_condition_items, expression.boolean_condition_count)) return false;
+    return true;
+}
+
+fn generatedReadExpressionArgumentPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    expression: generated_parser.GeneratedSqlExpressionAst,
+) bool {
+    const argument_tokens = expression.argument_tokens orelse {
+        return expression.argument_distinct_tokens == null and
+            expression.argument_value_tokens == null and
+            expression.argument_order_tokens == null and
+            generatedReadListPayloadIsEmpty(expression.argument_items, .{}, .{}) and
+            generatedReadListPayloadIsEmpty(expression.argument_order_items, .{}, .{});
+    };
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, argument_tokens)) return false;
+    if (!generatedReadOptionalNestedRangeIsValid(tokens, end, argument_tokens, expression.argument_distinct_tokens)) return false;
+    if (!generatedReadOptionalNestedRangeIsValid(tokens, end, argument_tokens, expression.argument_value_tokens)) return false;
+    if (!generatedReadOptionalNestedRangeIsValid(tokens, end, argument_tokens, expression.argument_order_tokens)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.argument_value_tokens orelse expression.argument_tokens, expression.argument_items, null)) return false;
+    if (!generatedReadExpressionOwnedListPayloadIsValid(tokens, end, expression.argument_order_tokens, expression.argument_order_items, null)) return false;
+    return true;
+}
+
+fn generatedReadExpressionOwnedListPayloadIsValid(
+    tokens: []const Token,
+    end: usize,
+    maybe_owner_range: ?generated_parser.GeneratedSqlTokenRange,
+    list: generated_parser.GeneratedSqlListAst,
+    maybe_expected_count: ?usize,
+) bool {
+    const expected_count = maybe_expected_count orelse list.count;
+    if (expected_count == 0) return generatedReadListPayloadIsEmpty(list, .{}, .{});
+    const owner_range = maybe_owner_range orelse return false;
+    if (!generatedReadTokenRangeIsValidThrough(tokens, end, owner_range)) return false;
+    if (list.count != expected_count or
+        list.items.len != list.count or
+        list.expressions.len != list.count)
+    {
+        return false;
+    }
+    if (list.expression_items.len != 0 and list.expression_items.len != list.count) return false;
+    if (list.alias_items.len != 0 and list.alias_items.len != list.count) return false;
+    if (list.alias_name_items.len != 0 and list.alias_name_items.len != list.count) return false;
+    if (list.direction_items.len != 0 and list.direction_items.len != list.count) return false;
+    if (list.directions.len != 0 and list.directions.len != list.count) return false;
+    if (list.order_using_operator_items.len != 0 and list.order_using_operator_items.len != list.count) return false;
+    if (list.nulls_order_items.len != 0 and list.nulls_order_items.len != list.count) return false;
+    if (list.nulls_orders.len != 0 and list.nulls_orders.len != list.count) return false;
+    if (list.first_tokens) |first_tokens| {
+        if (!std.meta.eql(first_tokens, list.items[0])) return false;
+    }
+    if (list.last_tokens) |last_tokens| {
+        if (!std.meta.eql(last_tokens, list.items[list.items.len - 1])) return false;
+    }
+    for (list.items, 0..) |item, index| {
+        if (!generatedReadNestedRangeIsValid(tokens, end, owner_range, item)) return false;
+        if (item.start >= item.end) return false;
+        const expression_range = if (list.expression_items.len != 0) blk: {
+            if (!generatedReadNestedRangeIsValid(tokens, end, item, list.expression_items[index])) return false;
+            break :blk list.expression_items[index];
+        } else item;
+        if (!generatedReadExpressionPayloadMatchesRange(tokens, end, list.expressions[index], expression_range)) return false;
+    }
     return true;
 }
 
@@ -5720,7 +6200,7 @@ fn generatedReadExpressionOptionalChildPayloadIsValid(
     maybe_range: ?generated_parser.GeneratedSqlTokenRange,
     maybe_expression: ?*generated_parser.GeneratedSqlExpressionAst,
 ) bool {
-    const expression = maybe_expression orelse return true;
+    const expression = maybe_expression orelse return maybe_kind == null and maybe_range == null;
     if (maybe_kind) |kind| {
         if (expression.kind != kind) return false;
     }
@@ -7068,6 +7548,26 @@ test "sql adapter parsed sql keeps generated DDL outside read parity" {
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, select.readStatementKind().?);
 }
 
+fn expectGeneratedGateUnexpectedToken(alloc: std.mem.Allocator, sql: []const u8) !void {
+    var tokenized_sql = try TokenizedSql.initAlloc(alloc, sql);
+    defer tokenized_sql.deinit(alloc);
+    try std.testing.expect(generated_parser.isGeneratedGateTokens(tokenized_sql.items()));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, sql));
+}
+
+test "sql adapter parsed sql blocks generated-gated malformed statements from legacy recovery" {
+    const alloc = std.testing.allocator;
+
+    try expectGeneratedGateUnexpectedToken(alloc, "SELECT id FROM usage_records WHERE");
+    try expectGeneratedGateUnexpectedToken(alloc, "INSERT INTO usage_records VALUES");
+    try expectGeneratedGateUnexpectedToken(alloc, "UPDATE usage_records SET");
+    try expectGeneratedGateUnexpectedToken(alloc, "DELETE FROM usage_records WHERE");
+    try expectGeneratedGateUnexpectedToken(alloc, "MERGE INTO usage_records USING source_rows ON");
+    try expectGeneratedGateUnexpectedToken(alloc, "CREATE TABLE usage_records (");
+    try expectGeneratedGateUnexpectedToken(alloc, "ALTER TABLE usage_records ADD");
+    try expectGeneratedGateUnexpectedToken(alloc, "DROP TABLE IF EXISTS");
+}
+
 test "sql adapter parsed sql requires generated grammar for first migrated control family" {
     const alloc = std.testing.allocator;
 
@@ -7095,6 +7595,8 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE INDEX docs_body_fts ON docs USING antfly_full_text (body) WITH ("));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER TABLE usage_records ADD"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TABLE IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TRIGGER IF EXISTS"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP TRIGGER usage_audit ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE EXTENSION vector FROM unpackaged"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER DATABASE tenant_ops SET"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER EXTENSION vector UPDATE TO"));
@@ -7104,6 +7606,12 @@ test "sql adapter parsed sql requires generated grammar for first migrated contr
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "DROP DATABASE tenant_ops WITH (OWNER)"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "ALTER GRAPH INDEX docs_edge_graph ADD"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published'"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH (doc RETURN doc"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH () RETURN doc"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH foo RETURN bar"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH (doc) RETURN"));
+    try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "MATCH (return) doc"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "CALL"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "COPY"));
     try std.testing.expectError(error.UnexpectedToken, ParsedSql.initAlloc(alloc, "GRANT"));
@@ -8245,6 +8753,31 @@ test "sql adapter parsed sql owns typed statement variants" {
             .reason = .graph_query_not_planned_by_generated_parser,
         },
         .{
+            .sql = "MATCH (doc)-[:cites]->(target) RETURN target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "MATCH (target)<-[:cites]-(doc) RETURN target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "MATCH (doc)-[:cites]->(target) RETURN doc, target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published' RETURN target",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+        },
+        .{
+            .sql = "MATCH (doc)-[:cites]->(target) RETURN doc, target ORDER BY target.rank DESC LIMIT 5",
+            .kind = .graph_query,
+            .reason = .graph_query_not_planned_by_generated_parser,
+        },
+        .{
             .sql = "NOTIFY usage_events, 'changed'",
             .kind = .notify,
             .reason = .notify_not_planned_by_generated_parser,
@@ -8388,6 +8921,16 @@ test "sql adapter parsed sql owns typed statement variants" {
             try std.testing.expect(parsed.writeStatementKind() == null);
         }
     }
+
+    var match_alias_read = try ParsedSql.initAlloc(alloc, "SELECT id AS match FROM usage_records");
+    defer match_alias_read.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, match_alias_read.generatedStatementKind().?);
+    try std.testing.expect(match_alias_read.readStatementKind() != null);
+
+    var implicit_match_alias_read = try ParsedSql.initAlloc(alloc, "SELECT id match FROM usage_records");
+    defer implicit_match_alias_read.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, implicit_match_alias_read.generatedStatementKind().?);
+    try std.testing.expect(implicit_match_alias_read.readStatementKind() != null);
 
     var overriding_tokens = try lexer.tokenizeAlloc(alloc, "INSERT INTO usage_records OVERRIDING SYSTEM VALUE VALUES ('u1')");
     defer lexer.freeTokens(alloc, &overriding_tokens);
@@ -9465,6 +10008,25 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(cte_missing_where_read.raw_statement, cte_missing_where_generated, &cte_missing_where_read.tokenized_sql)),
     );
 
+    var stale_absent_where_expression_list_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records");
+    defer stale_absent_where_expression_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, stale_absent_where_expression_list_read.readStatementKindIncludingGeneratedAst().?);
+    var stale_absent_where_expression_list_generated = stale_absent_where_expression_list_read.generated_statement.?;
+    if (stale_absent_where_expression_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expect(read_ast.where_tokens == null);
+                try std.testing.expect(read_ast.where_expression.argument_items.count == 0);
+                read_ast.where_expression.argument_items.items = read_ast.projection_items.items;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(stale_absent_where_expression_list_read.raw_statement, stale_absent_where_expression_list_generated, &stale_absent_where_expression_list_read.tokenized_sql)),
+    );
+
     var missing_set_operation_right_where_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records UNION SELECT id FROM usage_archive WHERE status = 'open'");
     defer missing_set_operation_right_where_read.deinit(alloc);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.set_operation, missing_set_operation_right_where_read.readStatementKindIncludingGeneratedAst().?);
@@ -9549,6 +10111,239 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(cte_missing_subquery_where_read.raw_statement, cte_missing_subquery_where_generated, &cte_missing_subquery_where_read.tokenized_sql)),
     );
 
+    var malformed_subquery_projection_list_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE id IN (SELECT id, status FROM usage_archive)");
+    defer malformed_subquery_projection_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, malformed_subquery_projection_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_subquery_projection_list_generated = malformed_subquery_projection_list_read.generated_statement.?;
+    if (malformed_subquery_projection_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                const subquery = read_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.subquery, subquery.kind);
+                try std.testing.expect(subquery.subquery_projection_items.count > 1);
+                subquery.subquery_projection_items.count = 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_subquery_projection_list_read.raw_statement, malformed_subquery_projection_list_generated, &malformed_subquery_projection_list_read.tokenized_sql)),
+    );
+
+    var malformed_case_condition_list_read = try ParsedSql.initAlloc(alloc, "SELECT CASE WHEN status IS NULL THEN 'missing' ELSE status END AS status_key FROM usage_records WHERE kind = 'order'");
+    defer malformed_case_condition_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, malformed_case_condition_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_case_condition_list_generated = malformed_case_condition_list_read.generated_statement.?;
+    if (malformed_case_condition_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.case_expression, read_ast.projection_items.expressions[0].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[0].case_condition_items.count != 0);
+                read_ast.projection_items.expressions[0].case_condition_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_case_condition_list_read.raw_statement, malformed_case_condition_list_generated, &malformed_case_condition_list_read.tokenized_sql)),
+    );
+
+    var malformed_function_argument_list_read = try ParsedSql.initAlloc(alloc, "SELECT COALESCE(status, 'missing') AS status_key FROM usage_records WHERE kind = 'order'");
+    defer malformed_function_argument_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, malformed_function_argument_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_function_argument_list_generated = malformed_function_argument_list_read.generated_statement.?;
+    if (malformed_function_argument_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[0].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[0].argument_items.count != 0);
+                read_ast.projection_items.expressions[0].argument_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_function_argument_list_read.raw_statement, malformed_function_argument_list_generated, &malformed_function_argument_list_read.tokenized_sql)),
+    );
+
+    var malformed_array_item_list_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE tags @> ARRAY['hot','new']");
+    defer malformed_array_item_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, malformed_array_item_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_array_item_list_generated = malformed_array_item_list_read.generated_statement.?;
+    if (malformed_array_item_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                const right_expression = read_ast.where_expression.right_expression orelse return error.TestUnexpectedResult;
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.array_constructor, right_expression.kind);
+                try std.testing.expect(right_expression.array_items.count != 0);
+                right_expression.array_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_array_item_list_read.raw_statement, malformed_array_item_list_generated, &malformed_array_item_list_read.tokenized_sql)),
+    );
+
+    var malformed_aggregate_argument_order_list_read = try ParsedSql.initAlloc(alloc, "SELECT customer, ARRAY_AGG(DISTINCT status ORDER BY amount DESC) AS statuses FROM usage_records GROUP BY customer");
+    defer malformed_aggregate_argument_order_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.aggregate, malformed_aggregate_argument_order_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_aggregate_argument_order_list_generated = malformed_aggregate_argument_order_list_read.generated_statement.?;
+    if (malformed_aggregate_argument_order_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[1].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[1].argument_order_items.count != 0);
+                read_ast.projection_items.expressions[1].argument_order_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_aggregate_argument_order_list_read.raw_statement, malformed_aggregate_argument_order_list_generated, &malformed_aggregate_argument_order_list_read.tokenized_sql)),
+    );
+
+    var malformed_within_group_order_list_read = try ParsedSql.initAlloc(alloc, "SELECT customer, percentile_cont(0.5) WITHIN GROUP (ORDER BY amount DESC) AS median_amount FROM usage_records GROUP BY customer");
+    defer malformed_within_group_order_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.aggregate, malformed_within_group_order_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_within_group_order_list_generated = malformed_within_group_order_list_read.generated_statement.?;
+    if (malformed_within_group_order_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[1].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[1].within_group_order_items.count != 0);
+                read_ast.projection_items.expressions[1].within_group_order_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_within_group_order_list_read.raw_statement, malformed_within_group_order_list_generated, &malformed_within_group_order_list_read.tokenized_sql)),
+    );
+
+    var malformed_inline_window_order_list_read = try ParsedSql.initAlloc(alloc, "SELECT id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC) AS rn FROM usage_records");
+    defer malformed_inline_window_order_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.window, malformed_inline_window_order_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_inline_window_order_list_generated = malformed_inline_window_order_list_read.generated_statement.?;
+    if (malformed_inline_window_order_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[1].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[1].over_order_items.count != 0);
+                read_ast.projection_items.expressions[1].over_order_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_inline_window_order_list_read.raw_statement, malformed_inline_window_order_list_generated, &malformed_inline_window_order_list_read.tokenized_sql)),
+    );
+
+    var malformed_inline_window_partition_list_read = try ParsedSql.initAlloc(alloc, "SELECT id, row_number() OVER (PARTITION BY tenant ORDER BY amount DESC) AS rn FROM usage_records");
+    defer malformed_inline_window_partition_list_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.window, malformed_inline_window_partition_list_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_inline_window_partition_list_generated = malformed_inline_window_partition_list_read.generated_statement.?;
+    if (malformed_inline_window_partition_list_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlExpressionKind.function_call, read_ast.projection_items.expressions[1].kind);
+                try std.testing.expect(read_ast.projection_items.expressions[1].over_partition_items.count != 0);
+                read_ast.projection_items.expressions[1].over_partition_items.count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_inline_window_partition_list_read.raw_statement, malformed_inline_window_partition_list_generated, &malformed_inline_window_partition_list_read.tokenized_sql)),
+    );
+
+    var malformed_named_window_list_count_read = try ParsedSql.initAlloc(alloc, "SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)");
+    defer malformed_named_window_list_count_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.window, malformed_named_window_list_count_read.readStatementKindIncludingGeneratedAst().?);
+    var malformed_named_window_list_count_generated = malformed_named_window_list_count_read.generated_statement.?;
+    if (malformed_named_window_list_count_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expect(read_ast.window_count != 0);
+                try std.testing.expect(read_ast.window_items.len != 0);
+                read_ast.window_count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_named_window_list_count_read.raw_statement, malformed_named_window_list_count_generated, &malformed_named_window_list_count_read.tokenized_sql)),
+    );
+
+    var malformed_cte_body_window_list_count_read = try ParsedSql.initAlloc(alloc, "WITH ranked AS (SELECT id, row_number() OVER usage_window AS rn FROM usage_records WINDOW usage_window AS (ORDER BY id)) SELECT rn FROM ranked");
+    defer malformed_cte_body_window_list_count_read.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, malformed_cte_body_window_list_count_read.generatedStatementKind().?);
+    var malformed_cte_body_window_list_count_generated = malformed_cte_body_window_list_count_read.generated_statement.?;
+    if (malformed_cte_body_window_list_count_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expect(read_ast.cte_items.len != 0);
+                try std.testing.expect(read_ast.cte_items[0].body_window_count != 0);
+                try std.testing.expect(read_ast.cte_items[0].body_window_items.len != 0);
+                read_ast.cte_items[0].body_window_count = 0;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(malformed_cte_body_window_list_count_read.raw_statement, malformed_cte_body_window_list_count_generated, &malformed_cte_body_window_list_count_read.tokenized_sql)),
+    );
+
+    var missing_cast_child_expression_read = try ParsedSql.initAlloc(alloc, "SELECT CAST(id AS text) AS id_text FROM usage_records WHERE kind = 'order'");
+    defer missing_cast_child_expression_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, missing_cast_child_expression_read.readStatementKindIncludingGeneratedAst().?);
+    var missing_cast_child_expression_generated = missing_cast_child_expression_read.generated_statement.?;
+    if (missing_cast_child_expression_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                _ = read_ast.projection_items.expressions[0].cast_expression_kind orelse return error.TestUnexpectedResult;
+                _ = read_ast.projection_items.expressions[0].cast_expression_tokens orelse return error.TestUnexpectedResult;
+                _ = read_ast.projection_items.expressions[0].cast_expression orelse return error.TestUnexpectedResult;
+                read_ast.projection_items.expressions[0].cast_expression = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(missing_cast_child_expression_read.raw_statement, missing_cast_child_expression_generated, &missing_cast_child_expression_read.tokenized_sql)),
+    );
+
+    var missing_extract_source_expression_read = try ParsedSql.initAlloc(alloc, "SELECT EXTRACT(dow FROM amount) AS amount_dow FROM usage_records WHERE id = 'u1'");
+    defer missing_extract_source_expression_read.deinit(alloc);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, missing_extract_source_expression_read.readStatementKindIncludingGeneratedAst().?);
+    var missing_extract_source_expression_generated = missing_extract_source_expression_read.generated_statement.?;
+    if (missing_extract_source_expression_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                _ = read_ast.projection_items.expressions[0].extract_source_expression_kind orelse return error.TestUnexpectedResult;
+                _ = read_ast.projection_items.expressions[0].extract_source_tokens orelse return error.TestUnexpectedResult;
+                _ = read_ast.projection_items.expressions[0].extract_source_expression orelse return error.TestUnexpectedResult;
+                read_ast.projection_items.expressions[0].extract_source_expression = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(missing_extract_source_expression_read.raw_statement, missing_extract_source_expression_generated, &missing_extract_source_expression_read.tokenized_sql)),
+    );
+
     var missing_set_operation_subquery_right_where_read = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE EXISTS (SELECT id FROM thresholds UNION SELECT id FROM archived_thresholds WHERE active IS TRUE)");
     defer missing_set_operation_subquery_right_where_read.deinit(alloc);
     try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.query, missing_set_operation_subquery_right_where_read.readStatementKindIncludingGeneratedAst().?);
@@ -9611,6 +10406,20 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(prepared.raw_statement, missing_prepared_inner, &prepared.tokenized_sql)),
+    );
+
+    var prepared_transaction = try ParsedSql.initAlloc(alloc, "PREPARE TRANSACTION 'usage_batch'");
+    defer prepared_transaction.deinit(alloc);
+    var missing_prepared_transaction_gid = prepared_transaction.generated_statement.?;
+    if (missing_prepared_transaction_gid.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .prepared_transaction => |*prepared_transaction_ast| prepared_transaction_ast.gid_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(prepared_transaction.raw_statement, missing_prepared_transaction_gid, &prepared_transaction.tokenized_sql)),
     );
 
     var cursor = try ParsedSql.initAlloc(alloc, "FETCH FROM usage_cursor");
@@ -9735,6 +10544,77 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
         std.meta.activeTag(parseStatement(graph_index.raw_statement, mismatched_graph_kind, &graph_index.tokenized_sql)),
     );
 
+    var graph_index_edge = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges EDGE (source_doc -> target_doc)");
+    defer graph_index_edge.deinit(alloc);
+    var missing_graph_edge_target = graph_index_edge.generated_statement.?;
+    if (missing_graph_edge_target.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| {
+                _ = graph_ast.edge_tokens orelse return error.TestUnexpectedResult;
+                _ = graph_ast.edge_source_tokens orelse return error.TestUnexpectedResult;
+                _ = graph_ast.edge_target_tokens orelse return error.TestUnexpectedResult;
+                graph_ast.edge_target_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_index_edge.raw_statement, missing_graph_edge_target, &graph_index_edge.tokenized_sql)),
+    );
+
+    var graph_index_edge_typed = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_edge_graph ON doc_edges EDGE (source_doc -> target_doc) TYPE edge_type WEIGHT confidence");
+    defer graph_index_edge_typed.deinit(alloc);
+    var malformed_graph_edge_type = graph_index_edge_typed.generated_statement.?;
+    if (malformed_graph_edge_type.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| {
+                _ = graph_ast.edge_tokens orelse return error.TestUnexpectedResult;
+                _ = graph_ast.edge_type_tokens orelse return error.TestUnexpectedResult;
+                graph_ast.edge_type_tokens.?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_index_edge_typed.raw_statement, malformed_graph_edge_type, &graph_index_edge_typed.tokenized_sql)),
+    );
+
+    var graph_index_extraction = try ParsedSql.initAlloc(alloc, "CREATE GRAPH INDEX docs_rel_graph ON docs SOURCE ENRICHMENT relations_v1 FROM body USING extractor MODEL 'relations' EDGES JSON_PATH '$.relations[*]' SOURCE _id TARGET target.document_id TYPE type WEIGHT confidence WITH (edge_policy = 'all')");
+    defer graph_index_extraction.deinit(alloc);
+    var missing_graph_extraction_target = graph_index_extraction.generated_statement.?;
+    if (missing_graph_extraction_target.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| {
+                _ = graph_ast.extraction_enrichment_tokens orelse return error.TestUnexpectedResult;
+                _ = graph_ast.extraction_target_tokens orelse return error.TestUnexpectedResult;
+                graph_ast.extraction_target_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_index_extraction.raw_statement, missing_graph_extraction_target, &graph_index_extraction.tokenized_sql)),
+    );
+
+    var malformed_graph_extraction_weight = graph_index_extraction.generated_statement.?;
+    if (malformed_graph_extraction_weight.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| {
+                _ = graph_ast.extraction_target_tokens orelse return error.TestUnexpectedResult;
+                _ = graph_ast.extraction_weight_tokens orelse return error.TestUnexpectedResult;
+                graph_ast.extraction_weight_tokens.?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_index_extraction.raw_statement, malformed_graph_extraction_weight, &graph_index_extraction.tokenized_sql)),
+    );
+
     var graph_metric = try ParsedSql.initAlloc(alloc, "CREATE GRAPH METRIC docs_pagerank ON doc_edges");
     defer graph_metric.deinit(alloc);
     var malformed_graph_span = graph_metric.generated_statement.?;
@@ -9747,6 +10627,22 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(graph_metric.raw_statement, malformed_graph_span, &graph_metric.tokenized_sql)),
+    );
+
+    var missing_graph_metric_source = graph_metric.generated_statement.?;
+    if (missing_graph_metric_source.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .graph => |*graph_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphKind.create_metric, graph_ast.kind);
+                _ = graph_ast.source_name_tokens orelse return error.TestUnexpectedResult;
+                graph_ast.source_name_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_metric.raw_statement, missing_graph_metric_source, &graph_metric.tokenized_sql)),
     );
 
     var unsupported_copy = try ParsedSql.initAlloc(alloc, "COPY usage_records FROM STDIN");
@@ -10077,6 +10973,301 @@ test "sql adapter parsed sql rejects malformed generated classification payloads
     try std.testing.expectEqual(
         ParsedStatement.unknown,
         std.meta.activeTag(parseStatement(graph_query.raw_statement, malformed_graph_query_reason, &graph_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_path = graph_query.generated_statement.?;
+    if (malformed_graph_query_path.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.graph_path_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_query.raw_statement, malformed_graph_query_path, &graph_query.tokenized_sql)),
+    );
+
+    var graph_source_query = try ParsedSql.initAlloc(alloc, "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN target");
+    defer graph_source_query.deinit(alloc);
+    var missing_graph_query_source_binding = graph_source_query.generated_statement.?;
+    if (missing_graph_query_source_binding.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expect(unsupported_ast.graph_source_binding_tokens != null);
+                unsupported_ast.graph_source_binding_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_source_query.raw_statement, missing_graph_query_source_binding, &graph_source_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_source_index = graph_source_query.generated_statement.?;
+    if (malformed_graph_query_source_index.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expect(unsupported_ast.graph_source_index_tokens != null);
+                unsupported_ast.graph_source_index_tokens.?.start += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_source_query.raw_statement, malformed_graph_query_source_index, &graph_source_query.tokenized_sql)),
+    );
+
+    var missing_graph_query_source_start = graph_source_query.generated_statement.?;
+    if (missing_graph_query_source_start.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expect(unsupported_ast.graph_source_start_tokens != null);
+                unsupported_ast.graph_source_start_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_source_query.raw_statement, missing_graph_query_source_start, &graph_source_query.tokenized_sql)),
+    );
+
+    var graph_where_query = try ParsedSql.initAlloc(alloc, "MATCH (doc)-[:cites]->(target) WHERE target.status = 'published' RETURN target");
+    defer graph_where_query.deinit(alloc);
+    var malformed_graph_query_where = graph_where_query.generated_statement.?;
+    if (malformed_graph_query_where.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expect(unsupported_ast.graph_where_tokens != null);
+                unsupported_ast.graph_where_tokens.?.end -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_where_query.raw_statement, malformed_graph_query_where, &graph_where_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_where_expression = graph_where_query.generated_statement.?;
+    if (malformed_graph_query_where_expression.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_where_expression.tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_where_expression.tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_where_query.raw_statement, malformed_graph_query_where_expression, &graph_where_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_direction = graph_where_query.generated_statement.?;
+    if (malformed_graph_query_direction.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphPathKind.outgoing, unsupported_ast.graph_path_kind.?);
+                unsupported_ast.graph_path_kind = .incoming;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_where_query.raw_statement, malformed_graph_query_direction, &graph_where_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_label = graph_where_query.generated_statement.?;
+    if (malformed_graph_query_label.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_relationship_label_tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_relationship_label_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_where_query.raw_statement, malformed_graph_query_label, &graph_where_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_target_alias = graph_where_query.generated_statement.?;
+    if (malformed_graph_query_target_alias.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.graph_target_alias_tokens = unsupported_ast.graph_source_alias_tokens,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_where_query.raw_statement, malformed_graph_query_target_alias, &graph_where_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_return_tail = graph_where_query.generated_statement.?;
+    if (malformed_graph_query_return_tail.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.graph_return_tail_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_where_query.raw_statement, malformed_graph_query_return_tail, &graph_where_query.tokenized_sql)),
+    );
+
+    var graph_tail_query = try ParsedSql.initAlloc(alloc, "MATCH (doc)-[:cites]->(target) RETURN doc, target ORDER BY target.rank DESC LIMIT 5 OFFSET 2");
+    defer graph_tail_query.deinit(alloc);
+    var malformed_graph_query_return_projection = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_return_projection.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| unsupported_ast.graph_return_projection_tokens = null,
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_return_projection, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_return_projection_count = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_return_projection_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(@as(usize, 2), unsupported_ast.graph_return_projection_items.count);
+                unsupported_ast.graph_return_projection_items.count += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_return_projection_count, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_alias_projection_role = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_alias_projection_role.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(@as(usize, 2), unsupported_ast.graph_return_path_alias_projection_roles.len);
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphPathAliasRole.source, unsupported_ast.graph_return_path_alias_projection_roles[0].?);
+                unsupported_ast.graph_return_path_alias_projection_roles[0] = .target;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_alias_projection_role, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_alias_projection_count = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_alias_projection_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(@as(usize, 2), unsupported_ast.graph_return_path_alias_projection_count);
+                unsupported_ast.graph_return_path_alias_projection_count -= 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_alias_projection_count, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_order = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_order.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_order_tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_order_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_order, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_order_count = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_order_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                try std.testing.expectEqual(@as(usize, 1), unsupported_ast.graph_order_items.count);
+                unsupported_ast.graph_order_items.count += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_order_count, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_limit = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_limit.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_limit_tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_limit_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_limit, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_limit_expression = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_limit_expression.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_limit_expression.tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_limit_expression.tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_limit_expression, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_offset = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_offset.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_offset_tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_offset_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_offset, &graph_tail_query.tokenized_sql)),
+    );
+
+    var malformed_graph_query_offset_expression = graph_tail_query.generated_statement.?;
+    if (malformed_graph_query_offset_expression.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .unsupported => |*unsupported_ast| {
+                _ = unsupported_ast.graph_offset_expression.tokens orelse return error.TestUnexpectedResult;
+                unsupported_ast.graph_offset_expression.tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    }
+    try std.testing.expectEqual(
+        ParsedStatement.unknown,
+        std.meta.activeTag(parseStatement(graph_tail_query.raw_statement, malformed_graph_query_offset_expression, &graph_tail_query.tokenized_sql)),
     );
 
     var explain = try ParsedSql.initAlloc(alloc, "EXPLAIN (FORMAT JSON) SELECT id FROM usage_records");
@@ -12153,6 +13344,13 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     try std.testing.expect(generated_cte_set_operation_tail_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_set_operation_tail_query.statement));
 
+    var generated_set_operation_right_join_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM usage_records WHERE status = 'open' UNION ALL SELECT c.id FROM usage_records AS c JOIN usage_records AS p ON c.customer_id = p.id WHERE p.enabled IS TRUE ORDER BY id ASC LIMIT 5");
+    defer generated_set_operation_right_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_set_operation_right_join_query.generatedStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.set_operation, generated_set_operation_right_join_query.generatedReadStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.set_operation, generated_set_operation_right_join_query.readStatementKind().?);
+    try std.testing.expectEqual(sql_statement_kind.SqlReadStatementKind.set_operation, generated_set_operation_right_join_query.readStatementKindIncludingGeneratedAst().?);
+
     var generated_multi_cte_query = try ParsedSql.initAlloc(alloc, "WITH first_rows AS (SELECT id FROM usage_records), second_rows AS (SELECT id FROM first_rows) SELECT id FROM second_rows");
     defer generated_multi_cte_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_multi_cte_query.generatedStatementKind().?);
@@ -12424,6 +13622,23 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     try std.testing.expect(generated_cte_join_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_join_query.statement));
 
+    var generated_cte_multi_join_query = try ParsedSql.initAlloc(alloc, "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts ON usage_records.account_id = accounts.id JOIN tenants ON accounts.tenant_id = tenants.id) SELECT id FROM joined_rows");
+    defer generated_cte_multi_join_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_multi_join_query.generatedStatementKind().?);
+
+    var malformed_cte_multi_join_child_generated = generated_cte_multi_join_query.generated_statement.?;
+    if (malformed_cte_multi_join_child_generated.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| read_ast.cte_items[0].body_join_items[1].left_child_index = null,
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_multi_join_query.statement = parseStatement(generated_cte_multi_join_query.raw_statement, malformed_cte_multi_join_child_generated, &generated_cte_multi_join_query.tokenized_sql);
+    try std.testing.expect(generated_cte_multi_join_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_multi_join_query.statement));
+
     var generated_cte_using_join_query = try ParsedSql.initAlloc(alloc, "WITH joined_rows AS (SELECT usage_records.id FROM usage_records JOIN accounts USING (account_id)) SELECT id FROM joined_rows");
     defer generated_cte_using_join_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_using_join_query.generatedStatementKind().?);
@@ -12455,6 +13670,23 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
         return error.TestUnexpectedResult;
     }
     generated_graph_source_query.statement = parseStatement(generated_graph_source_query.raw_statement, malformed_antfly_source_count, &generated_graph_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_source_query.statement));
+
+    var malformed_graph_source_count = generated_graph_source_query.generated_statement.?;
+    if (malformed_graph_source_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expect(read_ast.source_graph_function_count != 0);
+                try std.testing.expect(read_ast.source_graph_function_items.len != 0);
+                read_ast.source_graph_function_count += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_source_query.statement = parseStatement(generated_graph_source_query.raw_statement, malformed_graph_source_count, &generated_graph_source_query.tokenized_sql);
     try std.testing.expect(generated_graph_source_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_source_query.statement));
 
@@ -12510,6 +13742,149 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
     try std.testing.expect(generated_graph_source_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_source_query.statement));
 
+    var generated_graph_traverse_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_traverse(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', max_depth => 2) AS walk");
+    defer generated_graph_traverse_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_graph_traverse_source_query.generatedStatementKind().?);
+
+    var malformed_graph_traverse_start = generated_graph_traverse_source_query.generated_statement.?;
+    if (malformed_graph_traverse_start.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.traverse, read_ast.source_graph_function_items[0].kind);
+                _ = read_ast.source_graph_function_items[0].start_value_tokens orelse return error.TestUnexpectedResult;
+                read_ast.source_graph_function_items[0].start_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_traverse_source_query.statement = parseStatement(generated_graph_traverse_source_query.raw_statement, malformed_graph_traverse_start, &generated_graph_traverse_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_traverse_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_traverse_source_query.statement));
+
+    var generated_graph_neighbors_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_neighbors(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', direction => 'out') AS neighbors");
+    defer generated_graph_neighbors_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_graph_neighbors_source_query.generatedStatementKind().?);
+
+    var malformed_graph_neighbors_start = generated_graph_neighbors_source_query.generated_statement.?;
+    if (malformed_graph_neighbors_start.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.neighbors, read_ast.source_graph_function_items[0].kind);
+                _ = read_ast.source_graph_function_items[0].start_value_tokens orelse return error.TestUnexpectedResult;
+                read_ast.source_graph_function_items[0].start_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_neighbors_source_query.statement = parseStatement(generated_graph_neighbors_source_query.raw_statement, malformed_graph_neighbors_start, &generated_graph_neighbors_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_neighbors_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_neighbors_source_query.statement));
+
+    var generated_graph_shortest_path_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_shortest_path(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:a', target => 'doc:z', max_depth => 4) AS path");
+    defer generated_graph_shortest_path_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_graph_shortest_path_source_query.generatedStatementKind().?);
+
+    var malformed_graph_shortest_path_target = generated_graph_shortest_path_source_query.generated_statement.?;
+    if (malformed_graph_shortest_path_target.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.shortest_path, read_ast.source_graph_function_items[0].kind);
+                _ = read_ast.source_graph_function_items[0].target_value_tokens orelse return error.TestUnexpectedResult;
+                read_ast.source_graph_function_items[0].target_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_shortest_path_source_query.statement = parseStatement(generated_graph_shortest_path_source_query.raw_statement, malformed_graph_shortest_path_target, &generated_graph_shortest_path_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_shortest_path_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_shortest_path_source_query.statement));
+
+    var generated_graph_k_shortest_paths_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_k_shortest_paths(table_name => 'usage_records', index => 'docs_edge_graph', result_ref => '$starts', target_result_ref => '$targets', k => 3, max_depth => 6) AS paths");
+    defer generated_graph_k_shortest_paths_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_graph_k_shortest_paths_source_query.generatedStatementKind().?);
+
+    var malformed_graph_k_shortest_paths_start_ref = generated_graph_k_shortest_paths_source_query.generated_statement.?;
+    if (malformed_graph_k_shortest_paths_start_ref.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.k_shortest_paths, read_ast.source_graph_function_items[0].kind);
+                _ = read_ast.source_graph_function_items[0].start_result_ref_value_tokens orelse return error.TestUnexpectedResult;
+                read_ast.source_graph_function_items[0].start_result_ref_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_k_shortest_paths_source_query.statement = parseStatement(generated_graph_k_shortest_paths_source_query.raw_statement, malformed_graph_k_shortest_paths_start_ref, &generated_graph_k_shortest_paths_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_k_shortest_paths_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_k_shortest_paths_source_query.statement));
+
+    var malformed_graph_k_shortest_paths_target_ref = generated_graph_k_shortest_paths_source_query.generated_statement.?;
+    if (malformed_graph_k_shortest_paths_target_ref.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.k_shortest_paths, read_ast.source_graph_function_items[0].kind);
+                _ = read_ast.source_graph_function_items[0].target_result_ref_value_tokens orelse return error.TestUnexpectedResult;
+                read_ast.source_graph_function_items[0].target_result_ref_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_k_shortest_paths_source_query.statement = parseStatement(generated_graph_k_shortest_paths_source_query.raw_statement, malformed_graph_k_shortest_paths_target_ref, &generated_graph_k_shortest_paths_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_k_shortest_paths_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_k_shortest_paths_source_query.statement));
+
+    var generated_graph_metric_rerank_source_query = try ParsedSql.initAlloc(alloc, "SELECT id FROM antfly.graph_metric_rerank(table_name => 'usage_records', full_text_index => 'docs_body_fts', field => 'body', query => 'refund', graph_index => 'docs_edge_graph', graph_metric => 'pagerank', weight => 1.5, base_weight => 0.25) AS ranked");
+    defer generated_graph_metric_rerank_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_graph_metric_rerank_source_query.generatedStatementKind().?);
+
+    var malformed_graph_metric_rerank_query = generated_graph_metric_rerank_source_query.generated_statement.?;
+    if (malformed_graph_metric_rerank_query.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.metric_rerank, read_ast.source_graph_function_items[0].kind);
+                _ = read_ast.source_graph_function_items[0].query_value_tokens orelse return error.TestUnexpectedResult;
+                read_ast.source_graph_function_items[0].query_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_graph_metric_rerank_source_query.statement = parseStatement(generated_graph_metric_rerank_source_query.raw_statement, malformed_graph_metric_rerank_query, &generated_graph_metric_rerank_source_query.tokenized_sql);
+    try std.testing.expect(generated_graph_metric_rerank_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_graph_metric_rerank_source_query.statement));
+
+    var generated_joined_graph_source_query = try ParsedSql.initAlloc(alloc, "SELECT gm.id AS graph_id, ranked.score AS metric_score FROM antfly.graph_match(table_name => 'usage_records', index => 'docs_edge_graph', start => 'doc:root', pattern => '(a)-[:cites]->(b)', return => 'b') AS gm JOIN antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS ranked ON gm.id = ranked.id");
+    defer generated_joined_graph_source_query.deinit(alloc);
+    try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_joined_graph_source_query.generatedStatementKind().?);
+
+    var malformed_joined_graph_source_metric = generated_joined_graph_source_query.generated_statement.?;
+    if (malformed_joined_graph_source_metric.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expect(read_ast.source_graph_function_items.len == 2);
+                try std.testing.expectEqual(generated_parser.GeneratedSqlGraphTableFunctionKind.metric, read_ast.source_graph_function_items[1].kind);
+                read_ast.source_graph_function_items[1].metric_value_tokens = null;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_joined_graph_source_query.statement = parseStatement(generated_joined_graph_source_query.raw_statement, malformed_joined_graph_source_metric, &generated_joined_graph_source_query.tokenized_sql);
+    try std.testing.expect(generated_joined_graph_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_joined_graph_source_query.statement));
+
     var generated_cte_graph_source_query = try ParsedSql.initAlloc(alloc, "WITH ranked AS (SELECT * FROM antfly.graph_metric(table_name => 'usage_records', index => 'docs_edge_graph', metric => 'pagerank', top_k => 5) AS gm) SELECT id FROM ranked");
     defer generated_cte_graph_source_query.deinit(alloc);
     try std.testing.expectEqual(generated_parser.GeneratedSqlStatementKind.read, generated_cte_graph_source_query.generatedStatementKind().?);
@@ -12524,6 +13899,24 @@ test "sql adapter parsed sql read statement kind is generated-owned for covered 
         return error.TestUnexpectedResult;
     }
     generated_cte_graph_source_query.statement = parseStatement(generated_cte_graph_source_query.raw_statement, malformed_cte_graph_source, &generated_cte_graph_source_query.tokenized_sql);
+    try std.testing.expect(generated_cte_graph_source_query.readStatementKind() == null);
+    try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_graph_source_query.statement));
+
+    var malformed_cte_graph_source_count = generated_cte_graph_source_query.generated_statement.?;
+    if (malformed_cte_graph_source_count.ast) |*generated_ast| {
+        switch (generated_ast.*) {
+            .read => |read_ast| {
+                try std.testing.expect(read_ast.cte_items.len != 0);
+                try std.testing.expect(read_ast.cte_items[0].body_source_graph_function_items.len != 0);
+                try std.testing.expect(read_ast.cte_items[0].body_source_graph_function_count != 0);
+                read_ast.cte_items[0].body_source_graph_function_count += 1;
+            },
+            else => return error.TestUnexpectedResult,
+        }
+    } else {
+        return error.TestUnexpectedResult;
+    }
+    generated_cte_graph_source_query.statement = parseStatement(generated_cte_graph_source_query.raw_statement, malformed_cte_graph_source_count, &generated_cte_graph_source_query.tokenized_sql);
     try std.testing.expect(generated_cte_graph_source_query.readStatementKind() == null);
     try std.testing.expectEqual(@as(std.meta.Tag(ParsedStatement), .unknown), std.meta.activeTag(generated_cte_graph_source_query.statement));
 

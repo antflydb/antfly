@@ -49,13 +49,15 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             i += 1;
             while (i < sql.len and (std.ascii.isAlphanumeric(sql[i]) or sql[i] == '_' or sql[i] == '.')) i += 1;
             const end = i;
-            i = skipSqlCast(sql, i);
+            const cast_type = sqlCastTypeAt(sql, i);
+            i = if (cast_type) |ct| ct.end else i;
             try tokens.append(alloc, .{
                 .kind = .identifier,
                 .text = sql[start..end],
                 .source_start = start,
                 .source_end = end,
                 .keyword = token_mod.keywordFromIdentifier(sql[start..end]),
+                .postfix_cast_type = if (cast_type) |ct| sqlPostfixCastType(ct.name) else null,
             });
             continue;
         }
@@ -67,12 +69,14 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
             if (i >= sql.len) return error.UnsupportedSqlShape;
             i += 1;
             const source_end = i;
-            i = skipSqlCast(sql, i);
+            const cast_type = sqlCastTypeAt(sql, i);
+            i = if (cast_type) |ct| ct.end else i;
             try tokens.append(alloc, .{
                 .kind = .identifier,
                 .text = sql[start .. source_end - 1],
                 .source_start = source_start,
                 .source_end = source_end,
+                .postfix_cast_type = if (cast_type) |ct| sqlPostfixCastType(ct.name) else null,
             });
             continue;
         }
@@ -151,6 +155,11 @@ pub fn tokenizeAlloc(alloc: std.mem.Allocator, sql: []const u8) !std.ArrayListUn
         switch (ch) {
             ',' => {
                 try tokens.append(alloc, .{ .kind = .comma, .text = sql[i .. i + 1] });
+                i += 1;
+            },
+            ':' => {
+                if (i + 1 < sql.len and sql[i + 1] == ':') return error.UnsupportedSqlShape;
+                try tokens.append(alloc, .{ .kind = .colon, .text = sql[i .. i + 1] });
                 i += 1;
             },
             '*' => {
@@ -416,6 +425,17 @@ fn sqlCastTypeIsBoolean(type_name: []const u8) bool {
         std.ascii.eqlIgnoreCase(type_name, "boolean");
 }
 
+fn sqlPostfixCastType(type_name: []const u8) ?token_mod.TokenPostfixCastType {
+    if (std.ascii.eqlIgnoreCase(type_name, "text")) return .text;
+    if (sqlCastTypeIsNumeric(type_name)) return .numeric;
+    if (sqlCastTypeIsBoolean(type_name)) return .bool;
+    if (std.ascii.eqlIgnoreCase(type_name, "datetime") or
+        std.ascii.eqlIgnoreCase(type_name, "timestamp") or
+        std.ascii.eqlIgnoreCase(type_name, "timestamptz") or
+        std.ascii.eqlIgnoreCase(type_name, "date")) return .datetime;
+    return null;
+}
+
 fn sqlStringIsJsonNumber(text: []const u8) bool {
     if (text.len == 0) return false;
     var i: usize = 0;
@@ -479,9 +499,76 @@ test "sql adapter lexer records source spans and dollar quoted literals" {
     try std.testing.expectEqualStrings("$1", sql[tokens.items[tokens.items.len - 1].source_start..tokens.items[tokens.items.len - 1].source_end]);
 }
 
+test "sql adapter lexer records postfix cast metadata without widening identifier spans" {
+    const alloc = std.testing.allocator;
+    const sql = "SELECT docs.amount::text AS amount_text, docs.active::bool AS active_bool";
+
+    var tokens = try tokenizeAlloc(alloc, sql);
+    defer freeTokens(alloc, &tokens);
+
+    try std.testing.expect(tokens.items.len >= 7);
+    try std.testing.expectEqual(TokenKind.identifier, tokens.items[1].kind);
+    try std.testing.expectEqualStrings("docs.amount", tokens.items[1].text);
+    try std.testing.expectEqual(token_mod.TokenPostfixCastType.text, tokens.items[1].postfix_cast_type.?);
+    try std.testing.expectEqualStrings("docs.amount", sql[tokens.items[1].source_start..tokens.items[1].source_end]);
+
+    try std.testing.expectEqual(TokenKind.identifier, tokens.items[5].kind);
+    try std.testing.expectEqualStrings("docs.active", tokens.items[5].text);
+    try std.testing.expectEqual(token_mod.TokenPostfixCastType.bool, tokens.items[5].postfix_cast_type.?);
+    try std.testing.expectEqualStrings("docs.active", sql[tokens.items[5].source_start..tokens.items[5].source_end]);
+}
+
 test "sql adapter lexer rejects unterminated dollar quoted literals" {
     const alloc = std.testing.allocator;
     try std.testing.expectError(error.UnsupportedSqlShape, tokenizeAlloc(alloc, "SELECT $tag$unterminated"));
+}
+
+test "sql adapter lexer tokenizes graph relationship labels" {
+    const alloc = std.testing.allocator;
+    const sql_cases = [_][]const u8{
+        "MATCH (doc)-[:cites]->(target) RETURN target",
+        "MATCH (target)<-[:cites]-(doc) RETURN target",
+        "MATCH (doc)-[:cites]->(target) WITH GRAPH docs_edge_graph ON usage_records START 'doc:root' RETURN doc.key AS source_id, target.key AS target_id ORDER BY target.depth ASC LIMIT 5",
+    };
+
+    for (sql_cases) |sql| {
+        var tokens = try tokenizeAlloc(alloc, sql);
+        defer freeTokens(alloc, &tokens);
+
+        var saw_colon = false;
+        var saw_edge_operator = false;
+        var saw_match = false;
+        var saw_graph = false;
+        var saw_start = false;
+        var saw_return = false;
+        var saw_doc_key = false;
+        var saw_target_key = false;
+        var saw_target_depth = false;
+        for (tokens.items, 0..) |token, index| {
+            saw_colon = saw_colon or token.kind == .colon;
+            saw_edge_operator = saw_edge_operator or token.kind == .arrow_json;
+            saw_edge_operator = saw_edge_operator or (token.kind == .lt and
+                index + 1 < tokens.items.len and tokens.items[index + 1].kind == .minus);
+            saw_match = saw_match or token.matchesKeywordTag(.match);
+            saw_graph = saw_graph or token.matchesKeywordTag(.graph);
+            saw_start = saw_start or token.matchesKeywordTag(.start);
+            saw_return = saw_return or token.matchesKeywordTag(.@"return");
+            saw_doc_key = saw_doc_key or std.mem.eql(u8, token.text, "doc.key");
+            saw_target_key = saw_target_key or std.mem.eql(u8, token.text, "target.key");
+            saw_target_depth = saw_target_depth or std.mem.eql(u8, token.text, "target.depth");
+        }
+        try std.testing.expect(saw_colon);
+        try std.testing.expect(saw_edge_operator);
+        try std.testing.expect(saw_match);
+        try std.testing.expect(saw_return);
+        if (std.mem.indexOf(u8, sql, "WITH GRAPH") != null) {
+            try std.testing.expect(saw_graph);
+            try std.testing.expect(saw_start);
+            try std.testing.expect(saw_doc_key);
+            try std.testing.expect(saw_target_key);
+            try std.testing.expect(saw_target_depth);
+        }
+    }
 }
 
 test "sql adapter lexer validates numeric casts without JSON allocation" {
