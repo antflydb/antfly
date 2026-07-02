@@ -52,7 +52,16 @@ export type QueryRequest = Omit<
 };
 export type QueryResult = components["schemas"]["QueryResult"];
 export type QueryHit = components["schemas"]["QueryHit"];
+export type QueryHitsTotal = components["schemas"]["QueryHitsTotal"];
 export type QueryResponses = components["schemas"]["QueryResponses"];
+
+export function queryHitsTotalValue(total: QueryHitsTotal | null | undefined): number | undefined {
+  return total?.value;
+}
+
+export function queryResultTotalHits(result: QueryResult | null | undefined): number | undefined {
+  return queryHitsTotalValue(result?.hits?.total);
+}
 
 // Fix BatchRequest to allow any object for inserts
 export interface BatchRequest {

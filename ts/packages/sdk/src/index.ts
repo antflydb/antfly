@@ -222,6 +222,7 @@ export type {
   QueryBuilderRequest,
   QueryBuilderResult,
   QueryHit,
+  QueryHitsTotal,
   QueryOptions,
   QueryProfile,
   QueryRequest,
@@ -263,7 +264,12 @@ export type {
   WebSearchResultItem,
   WriteOptions,
 } from "./types.js";
-export { embedderProviders, generatorProviders } from "./types.js";
+export {
+  embedderProviders,
+  generatorProviders,
+  queryHitsTotalValue,
+  queryResultTotalHits,
+} from "./types.js";
 
 // Default export for convenience
 import { Client } from "./sdk.js";

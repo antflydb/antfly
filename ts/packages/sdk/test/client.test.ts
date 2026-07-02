@@ -94,7 +94,7 @@ describe("AntflyClient", () => {
         responses: [
           {
             hits: {
-              total: 1,
+              total: { value: 1, relation: "exact" },
               hits: [{ _id: "test", _score: 1.0, _source: { name: "test" } }],
             },
             took: 10,
@@ -125,7 +125,7 @@ describe("AntflyClient", () => {
         responses: [
           {
             hits: {
-              total: 2,
+              total: { value: 2, relation: "exact" },
               hits: [
                 { _id: "1", _score: 1.5, _source: { name: "laptop" } },
                 { _id: "2", _score: 1.2, _source: { name: "notebook" } },
@@ -152,7 +152,7 @@ describe("AntflyClient", () => {
       };
 
       const result = await client.query(request);
-      expect(result?.hits?.total).toBe(2);
+      expect(result?.hits?.total).toEqual({ value: 2, relation: "exact" });
       expect(mockPost).toHaveBeenCalledWith("/db/v1/query", {
         body: request,
       });
@@ -218,7 +218,7 @@ describe("AntflyClient", () => {
         responses: [
           {
             hits: {
-              total: 1,
+              total: { value: 1, relation: "exact" },
               hits: [{ _id: "prod1", _score: 1.0, _source: { name: "Product 1" } }],
             },
             took: 20,

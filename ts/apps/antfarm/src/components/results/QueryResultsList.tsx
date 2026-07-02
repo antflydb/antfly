@@ -7,7 +7,7 @@ import {
   TableHeader,
   TableRow,
 } from "@antfly/design-system";
-import type { QueryResult } from "@antfly/sdk";
+import { type QueryResult, queryResultTotalHits } from "@antfly/sdk";
 import React, { useCallback, useMemo, useState } from "react";
 import JsonViewer from "../JsonViewer";
 import FieldValueDisplay from "./FieldValueDisplay";
@@ -185,7 +185,7 @@ const QueryResultsList: React.FC<QueryResultsListProps> = ({ result, className }
         expandAll={expandAll}
         onExpandAllChange={handleExpandAllChange}
         onExport={handleExport}
-        totalHits={result.hits?.total}
+        totalHits={queryResultTotalHits(result)}
         queryTime={result.took}
       />
 

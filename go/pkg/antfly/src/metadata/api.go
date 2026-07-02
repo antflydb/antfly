@@ -895,7 +895,7 @@ func (t *TableApi) docMatchesRowFilter(ctx context.Context, tableName, key strin
 		Count:       true,
 	}
 	result := t.runQuery(ctx, qr)
-	return result.Status == http.StatusOK && result.Hits.Total > 0
+	return result.Status == http.StatusOK && queryHitsTotalValue(result.Hits.Total) > 0
 }
 
 // hasSpecialFieldsOnly returns true if all fields are special fields (_embeddings, _summaries, _chunks)
