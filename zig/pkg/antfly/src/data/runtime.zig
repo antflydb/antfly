@@ -54,6 +54,7 @@ const data_raft_metadata_sync_interval_ms: u64 = 250;
 const metadata_bootstrap_retry_base_ms: u64 = 250;
 const metadata_bootstrap_retry_max_ms: u64 = 5 * std.time.ms_per_s;
 const metadata_bootstrap_retry_jitter_ms: u64 = 250;
+const public_api_max_connection_threads: u32 = 64;
 const trusted_principal_secret_key = "antfly.trusted_principal.secret";
 const trusted_principal_issuer_key = "antfly.trusted_principal.issuer";
 
@@ -120,12 +121,16 @@ fn publicApiListenerConfig(bind_host: []const u8, bind_port: u16) antfly.raft.tr
         .bind_host = bind_host,
         .bind_port = bind_port,
         .max_request_bytes = antfly.public_api.http_server.public_api_max_request_body_bytes,
+        .serve_in_connection_threads = true,
+        .max_connection_threads = public_api_max_connection_threads,
     };
 }
 
 test "data public API listener uses public API request body limit" {
     const cfg = publicApiListenerConfig("127.0.0.1", 8080);
     try std.testing.expectEqual(antfly.public_api.http_server.public_api_max_request_body_bytes, cfg.max_request_bytes);
+    try std.testing.expect(cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(public_api_max_connection_threads, cfg.max_connection_threads);
 }
 
 const DataDescriptorFactory = struct {
@@ -6492,10 +6497,7 @@ pub const DataServer = struct {
                             .replica_catalog_path = cfg.replica_catalog_path,
                             .replica_state_backend = cfg.data_raft_state_backend,
                         },
-                        .listener = .{
-                            .bind_host = cfg.raft_bind_host,
-                            .bind_port = cfg.raft_bind_port,
-                        },
+                        .listener = antfly.raft.httpListenerConfig(cfg.raft_bind_host, cfg.raft_bind_port),
                         .transport = .{
                             .snapshot = .{
                                 .root_dir = cfg.snapshot_root_dir orelse cfg.replica_root_dir,

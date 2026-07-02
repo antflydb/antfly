@@ -437,10 +437,7 @@ pub const Server = struct {
                         .replica_state_backend = cfg.replica_state_backend,
                         .trace_logger = if (build_options.with_tla) tracing.stderrRaftTraceLogger() else null,
                     },
-                    .listener = .{
-                        .bind_host = result.bind_host,
-                        .bind_port = cfg.bind_port,
-                    },
+                    .listener = antfly.raft.httpListenerConfig(result.bind_host, cfg.bind_port),
                     .transport = .{
                         .snapshot = .{
                             .root_dir = result.snapshot_root_dir,
@@ -1642,7 +1639,7 @@ test "metadata runtime scales bootstrap campaign retry interval with tick" {
     );
 }
 
-test "metadata runtime serves admin listener requests on threaded io connections" {
+test "metadata runtime serves raft and admin listener requests on threaded io connections" {
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
 
@@ -1661,6 +1658,9 @@ test "metadata runtime serves admin listener requests on threaded io connections
     defer server.deinit();
 
     const admin_listener = server.server.owned_admin_listener orelse return error.MissingMetadataAdminListener;
+    const raft_listener = server.server.svc.raft.host.http_host.listener;
+    try std.testing.expect(raft_listener.cfg.serve_in_connection_threads);
+    try std.testing.expectEqual(antfly.raft.default_http_listener_max_connection_threads, raft_listener.cfg.max_connection_threads);
     try std.testing.expect(admin_listener.cfg.serve_in_connection_threads);
     try std.testing.expectEqual(@as(u32, 32), admin_listener.cfg.max_connection_threads);
     try std.testing.expect(server.metadataHttpService().apiIoImpl() != null);
